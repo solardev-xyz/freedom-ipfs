@@ -1854,3 +1854,39 @@ summary included `run_total_ms`, `gateway_rss_kib`, `gateway_fd_count`,
 
 This is a harness/diagnostics improvement only. It does not change gateway or
 retrieval behavior.
+
+## Daicowtf Same-Window Resource Baseline
+
+After adding resource summaries, rerun `daicowtf-page-assets` against Kubo to
+collect a current resource-aware comparison:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/daicowtf-resource-summary-kubo-r3.json \
+  --trace-output /tmp/daicowtf-resource-summary-kubo-r3-trace.jsonl
+```
+
+Result: not an optimization signal. Rust failed `3/3`, and Kubo also failed
+`3/3` in the same window. Rust returned root `504` responses with root
+`p50=11044ms`, `p95=max=30938ms`; Kubo returned `504` responses around the
+30-second request cap with root `p50=30005ms`, `p95=max=30006ms`. Assets were
+not crawled for either engine because the root response never passed.
+
+Resource summary from the same report:
+
+- Rust: max RSS `46464KiB`, max FD count `20`, child processes `0`
+- Kubo: max RSS `153536KiB`, max FD count `202`, child processes `0`, max repo
+  bytes `33700`
+
+Rust trace shape: statuses `3x504`, limiter denials `0`,
+`provider_diversity_low` failures `3`, DHT provider lookup timeouts `3`, and
+`bitswap_session_shortcut` misses `3`. Treat this as another sparse-provider /
+content-availability window for `daicowtf`, not evidence that the current Rust
+branch regressed relative to Kubo.
