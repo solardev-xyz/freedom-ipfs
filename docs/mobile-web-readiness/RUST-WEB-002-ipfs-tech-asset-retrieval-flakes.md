@@ -1612,3 +1612,75 @@ page-load cliff for mixed trusted/provider candidate sets while preserving
 cold-request timeout behavior and mobile resource bounds. The `4s` cap improves
 the `ipfs.tech` asset tail compared with `5s` and avoids the root p95 regression
 seen at `3s`. Continue measuring asset/session behavior next.
+
+## Rejected: Cross-Request Bitswap DNS Expansion Cache
+
+Hypothesis: the `4s` `ipfs.tech` trace still showed slow `bitswap_peer_expand`
+outliers. In `/tmp/ipfs-tech-trusted-timeout-4s-kubo-r3-trace.jsonl`,
+`bootstrap.libp2p.io` was expanded `45` times with `42` uncached DNS lookups,
+because DNS expansion caches were local to one provider set. A bounded
+per-retriever DNS expansion cache might reduce sibling-asset latency without
+changing provider records or block verification.
+
+Implementation tried:
+
+- cache `/dnsaddr` TXT expansions and DNS-to-IP expansions on the retriever
+- cap entries at `64` DNSADDR hosts and `128` DNS/IP hosts
+- TTL `5m`
+- first variant cached empty/failed expansions; second variant cached only
+  successful non-empty expansions
+
+Validation before live runs:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib cached_dns_expansion_reuses_dnsaddr_and_ip_results
+cargo build -p freedom-ipfs-gateway
+```
+
+Live run, first variant:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/ipfs-tech-dns-expansion-cache-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-dns-expansion-cache-kubo-r3-trace.jsonl
+```
+
+The run stopped making progress and was interrupted without producing
+comparison JSON. Partial trace: `970` events, request statuses `23x200`,
+`7x206`, `9x503`, `1x504`, and `9` gateway-limiter denials. DNS expansion did
+get faster: `bitswap_peer_expand` p95 was `44ms`, max `72ms`, versus the
+previous `4s` run's p95 `164ms`, max `3188ms`. Reliability regressed, likely
+because page-wide negative DNS caching is too risky.
+
+Live run, positive-only variant:
+
+```sh
+timeout 240s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/ipfs-tech-dns-expansion-cache-positive-kubo-r1.json \
+  --trace-output /tmp/ipfs-tech-dns-expansion-cache-positive-kubo-r1-trace.jsonl
+```
+
+Result: outer timeout exited `124`; no comparison JSON. Partial trace had
+`449` events, request statuses `11x200`, `1x206`, and `13x503`, with `13`
+gateway-limiter denials. DNS expansion remained faster (`bitswap_peer_expand`
+p95 `128ms`, max `170ms`), but the live page run still did not complete
+cleanly.
+
+Decision: revert. The measurement confirmed DNS expansion can be a real
+latency component, but the cache experiment did not preserve page-load
+reliability. Future work should revisit this only with request coalescing or
+stricter per-host success semantics, and must pass a full same-window
+Rust/Kubo page run before keeping any DNS expansion cache.
