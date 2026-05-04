@@ -64,7 +64,10 @@ gateway's SQLite cache. Combined with `--fresh-gateway-per-run --warmup-runs 1`,
 the warmup process populates the DB and measured runs start new gateway
 processes against the same persistent cache. On Linux, spawned-gateway RSS is
 sampled from `/proc/<pid>/status` after each run and included in the JSON report,
-along with FD count and direct child process count when available.
+along with FD count, direct child process count, and cache/repo storage bytes
+when available. Measured-run summaries aggregate run time, RSS, FD count, child
+process count, and storage bytes so resource regressions are visible without
+manual per-run JSON parsing.
 
 For gateway phase tracing, pass `--trace-output /tmp/run.jsonl`. When the
 harness spawns the Rust gateway it forwards this path to the gateway, parses the

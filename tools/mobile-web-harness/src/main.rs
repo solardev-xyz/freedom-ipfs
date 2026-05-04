@@ -537,6 +537,16 @@ fn print_summary(report: &RunReport) {
         report.summary.fail_count,
         report.summary.pass_rate * 100.0
     );
+    if report.summary.has_resource_metrics() {
+        println!(
+            "resources: run_total={} rss_kib={} fds={} children={} storage_bytes={}",
+            report.summary.run_total_ms,
+            report.summary.gateway_rss_kib,
+            report.summary.gateway_fd_count,
+            report.summary.gateway_child_process_count,
+            report.summary.gateway_storage_bytes
+        );
+    }
 
     for case in &report.summary.cases {
         println!(
@@ -749,14 +759,16 @@ fn print_comparison_summary(report: &ComparisonReport) {
     );
     for case in &report.cases {
         println!(
-            "case {}: rust root_p50={} kubo root_p50={} ratio={} rust asset_p50={} kubo asset_p50={} ratio={}",
+            "case {}: rust root_p50={} kubo root_p50={} ratio={} rust asset_p50={} kubo asset_p50={} ratio={} rust_rss_max={} kubo_rss_max={}",
             case.id,
             display_option_ms(case.rust_root_ttfb_p50_ms),
             display_option_ms(case.kubo_root_ttfb_p50_ms),
             display_option_f64(case.root_ttfb_p50_ratio),
             display_option_ms(case.rust_asset_ttfb_p50_ms),
             display_option_ms(case.kubo_asset_ttfb_p50_ms),
-            display_option_f64(case.asset_ttfb_p50_ratio)
+            display_option_f64(case.asset_ttfb_p50_ratio),
+            display_option_u64_unit(case.rust_max_rss_kib, "KiB"),
+            display_option_u64_unit(case.kubo_max_rss_kib, "KiB")
         );
     }
 }
@@ -770,6 +782,12 @@ fn display_option_ms(value: Option<u128>) -> String {
 fn display_option_f64(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.2}x"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn display_option_u64_unit(value: Option<u64>, unit: &str) -> String {
+    value
+        .map(|value| format!("{value}{unit}"))
         .unwrap_or_else(|| "n/a".to_string())
 }
 
@@ -2103,6 +2121,9 @@ struct ComparisonCase {
     rust_max_rss_kib: Option<u64>,
     kubo_max_rss_kib: Option<u64>,
     rss_ratio: Option<f64>,
+    rust_max_fd_count: Option<u64>,
+    kubo_max_fd_count: Option<u64>,
+    fd_ratio: Option<f64>,
     rust_max_child_process_count: Option<usize>,
     kubo_max_child_process_count: Option<usize>,
     rust_max_storage_bytes: Option<u64>,
@@ -2128,16 +2149,22 @@ impl ComparisonCase {
             .filter_map(|id| {
                 let rust_case = rust.summary.cases.iter().find(|case| case.id == id)?;
                 let kubo_case = kubo.summary.cases.iter().find(|case| case.id == id)?;
-                let rust_max_rss_kib = max_run_u64(&rust.runs, |run| run.gateway_rss_kib);
-                let kubo_max_rss_kib = max_run_u64(&kubo.runs, |run| run.gateway_rss_kib);
-                let rust_max_child_process_count =
-                    max_run_usize(&rust.runs, |run| run.gateway_child_process_count);
-                let kubo_max_child_process_count =
-                    max_run_usize(&kubo.runs, |run| run.gateway_child_process_count);
-                let rust_max_storage_bytes =
-                    max_run_u64(&rust.runs, |run| run.gateway_storage_bytes);
-                let kubo_max_storage_bytes =
-                    max_run_u64(&kubo.runs, |run| run.gateway_storage_bytes);
+                let rust_max_rss_kib = rust.summary.gateway_rss_kib.max;
+                let kubo_max_rss_kib = kubo.summary.gateway_rss_kib.max;
+                let rust_max_fd_count = rust.summary.gateway_fd_count.max;
+                let kubo_max_fd_count = kubo.summary.gateway_fd_count.max;
+                let rust_max_child_process_count = rust
+                    .summary
+                    .gateway_child_process_count
+                    .max
+                    .and_then(|value| usize::try_from(value).ok());
+                let kubo_max_child_process_count = kubo
+                    .summary
+                    .gateway_child_process_count
+                    .max
+                    .and_then(|value| usize::try_from(value).ok());
+                let rust_max_storage_bytes = rust.summary.gateway_storage_bytes.max;
+                let kubo_max_storage_bytes = kubo.summary.gateway_storage_bytes.max;
                 Some(Self {
                     id,
                     rust_pass_rate: rust_case.pass_rate,
@@ -2169,6 +2196,9 @@ impl ComparisonCase {
                     rust_max_rss_kib,
                     kubo_max_rss_kib,
                     rss_ratio: ratio_u64(rust_max_rss_kib, kubo_max_rss_kib),
+                    rust_max_fd_count,
+                    kubo_max_fd_count,
+                    fd_ratio: ratio_u64(rust_max_fd_count, kubo_max_fd_count),
                     rust_max_child_process_count,
                     kubo_max_child_process_count,
                     rust_max_storage_bytes,
@@ -2178,20 +2208,6 @@ impl ComparisonCase {
             })
             .collect()
     }
-}
-
-fn max_run_u64<F>(runs: &[RunResult], mut value: F) -> Option<u64>
-where
-    F: FnMut(&RunResult) -> Option<u64>,
-{
-    runs.iter().filter_map(&mut value).max()
-}
-
-fn max_run_usize<F>(runs: &[RunResult], mut value: F) -> Option<usize>
-where
-    F: FnMut(&RunResult) -> Option<usize>,
-{
-    runs.iter().filter_map(&mut value).max()
 }
 
 fn ratio(left: Option<u128>, right: Option<u128>) -> Option<f64> {
@@ -2219,6 +2235,11 @@ struct RepeatSummary {
     pass_count: usize,
     fail_count: usize,
     pass_rate: f64,
+    run_total_ms: LatencySummary,
+    gateway_rss_kib: ResourceSummary,
+    gateway_fd_count: ResourceSummary,
+    gateway_child_process_count: ResourceSummary,
+    gateway_storage_bytes: ResourceSummary,
     cases: Vec<CaseAggregate>,
 }
 
@@ -2231,6 +2252,38 @@ impl RepeatSummary {
         let pass_count = measured.iter().filter(|run| run.passed).count();
         let fail_count = measured.len().saturating_sub(pass_count);
         let pass_rate = rate(pass_count, measured.len());
+        let run_total_ms = LatencySummary::from_values(
+            measured
+                .iter()
+                .map(|run| run.elapsed_ms)
+                .collect::<Vec<_>>(),
+        );
+        let gateway_rss_kib = ResourceSummary::from_values(
+            measured
+                .iter()
+                .filter_map(|run| run.gateway_rss_kib)
+                .collect::<Vec<_>>(),
+        );
+        let gateway_fd_count = ResourceSummary::from_values(
+            measured
+                .iter()
+                .filter_map(|run| run.gateway_fd_count)
+                .filter_map(|value| u64::try_from(value).ok())
+                .collect::<Vec<_>>(),
+        );
+        let gateway_child_process_count = ResourceSummary::from_values(
+            measured
+                .iter()
+                .filter_map(|run| run.gateway_child_process_count)
+                .filter_map(|value| u64::try_from(value).ok())
+                .collect::<Vec<_>>(),
+        );
+        let gateway_storage_bytes = ResourceSummary::from_values(
+            measured
+                .iter()
+                .filter_map(|run| run.gateway_storage_bytes)
+                .collect::<Vec<_>>(),
+        );
 
         let mut case_ids = Vec::new();
         for run in &measured {
@@ -2251,8 +2304,21 @@ impl RepeatSummary {
             pass_count,
             fail_count,
             pass_rate,
+            run_total_ms,
+            gateway_rss_kib,
+            gateway_fd_count,
+            gateway_child_process_count,
+            gateway_storage_bytes,
             cases,
         }
+    }
+
+    fn has_resource_metrics(&self) -> bool {
+        self.run_total_ms.count > 0
+            || self.gateway_rss_kib.count > 0
+            || self.gateway_fd_count.count > 0
+            || self.gateway_child_process_count.count > 0
+            || self.gateway_storage_bytes.count > 0
     }
 }
 
@@ -2397,6 +2463,44 @@ impl std::fmt::Display for LatencySummary {
             self.p90_ms.unwrap_or_default(),
             self.p95_ms.unwrap_or_default(),
             self.max_ms.unwrap_or_default()
+        )
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ResourceSummary {
+    count: usize,
+    p50: Option<u64>,
+    p90: Option<u64>,
+    p95: Option<u64>,
+    max: Option<u64>,
+}
+
+impl ResourceSummary {
+    fn from_values(mut values: Vec<u64>) -> Self {
+        values.sort_unstable();
+        Self {
+            count: values.len(),
+            p50: percentile_u64(&values, 50),
+            p90: percentile_u64(&values, 90),
+            p95: percentile_u64(&values, 95),
+            max: values.last().copied(),
+        }
+    }
+}
+
+impl std::fmt::Display for ResourceSummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.count == 0 {
+            return formatter.write_str("n/a");
+        }
+        write!(
+            formatter,
+            "p50={} p90={} p95={} max={}",
+            self.p50.unwrap_or_default(),
+            self.p90.unwrap_or_default(),
+            self.p95.unwrap_or_default(),
+            self.max.unwrap_or_default()
         )
     }
 }
@@ -3001,6 +3105,14 @@ fn percentile(values: &[u128], percentile: usize) -> Option<u128> {
     values.get(rank - 1).copied()
 }
 
+fn percentile_u64(values: &[u64], percentile: usize) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    let rank = (values.len() * percentile).div_ceil(100).max(1);
+    values.get(rank - 1).copied()
+}
+
 #[derive(Debug, Serialize)]
 struct CaseResult {
     id: String,
@@ -3319,6 +3431,55 @@ mod tests {
     }
 
     #[test]
+    fn repeat_summary_aggregates_measured_resource_metrics() {
+        let runs = vec![
+            run_result(
+                RunPhase::Warmup,
+                0,
+                999,
+                Some(999),
+                Some(999),
+                Some(999),
+                Some(999),
+            ),
+            run_result(
+                RunPhase::Measured,
+                1,
+                300,
+                Some(60),
+                Some(52),
+                Some(0),
+                Some(1200),
+            ),
+            run_result(
+                RunPhase::Measured,
+                2,
+                100,
+                Some(40),
+                Some(48),
+                Some(1),
+                None,
+            ),
+        ];
+
+        let summary = RepeatSummary::from_runs(&runs);
+
+        assert_eq!(summary.measured_runs, 2);
+        assert_eq!(summary.run_total_ms.count, 2);
+        assert_eq!(summary.run_total_ms.p50_ms, Some(100));
+        assert_eq!(summary.run_total_ms.p95_ms, Some(300));
+        assert_eq!(summary.gateway_rss_kib.count, 2);
+        assert_eq!(summary.gateway_rss_kib.p50, Some(40));
+        assert_eq!(summary.gateway_rss_kib.max, Some(60));
+        assert_eq!(summary.gateway_fd_count.max, Some(52));
+        assert_eq!(summary.gateway_child_process_count.max, Some(1));
+        assert_eq!(summary.gateway_storage_bytes.count, 1);
+        assert_eq!(summary.gateway_storage_bytes.max, Some(1200));
+        assert_eq!(summary.cases.len(), 1);
+        assert_eq!(summary.cases[0].root_ttfb_ms.count, 2);
+    }
+
+    #[test]
     fn run_timeout_failure_results_marks_matching_cases_failed() {
         let corpus = Corpus {
             entries: vec![
@@ -3367,5 +3528,45 @@ mod tests {
         assert_eq!(results[0].url, "http://127.0.0.1:8080/ipfs/second");
         assert!(!results[0].passed);
         assert_eq!(results[0].failures, vec!["run timed out after 7s"]);
+    }
+
+    fn run_result(
+        phase: RunPhase,
+        run_index: usize,
+        elapsed_ms: u128,
+        gateway_rss_kib: Option<u64>,
+        gateway_fd_count: Option<usize>,
+        gateway_child_process_count: Option<usize>,
+        gateway_storage_bytes: Option<u64>,
+    ) -> RunResult {
+        RunResult {
+            phase,
+            run_index,
+            gateway_url: "http://127.0.0.1:8080".to_string(),
+            elapsed_ms,
+            gateway_rss_kib,
+            gateway_fd_count,
+            gateway_child_process_count,
+            gateway_storage_bytes,
+            gateway_storage_path: None,
+            passed: true,
+            results: vec![CaseResult {
+                id: "case".to_string(),
+                description: None,
+                method: "GET".to_string(),
+                url: "http://127.0.0.1:8080/ipfs/root".to_string(),
+                status: Some(200),
+                content_type: Some("text/plain".to_string()),
+                content_range: None,
+                body_bytes: 5,
+                ttfb_ms: elapsed_ms / 2,
+                total_ms: elapsed_ms,
+                body_preview: "hello".to_string(),
+                asset_summary: None,
+                assets: Vec::new(),
+                passed: true,
+                failures: Vec::new(),
+            }],
+        }
     }
 }

@@ -1807,3 +1807,50 @@ they did not improve the page-level result in the same diagnostic window, and
 the new start counter shows extra background work. Keep `150ms` until there is
 a bounded design that can make recent-peer starts selective, cancellable, or
 fairly scheduled against provider lookup.
+
+## Harness Resource Summary
+
+The 25ms shortcut-grace analysis again required checking RSS, file descriptors,
+child processes, and cache/repo storage alongside latency. Those fields already
+existed per measured run, but the top-level summary and comparison JSON did not
+aggregate them. That made resource checks more manual than the roadmap's
+Priority 0 benchmark loop wants.
+
+Harness change:
+
+- add measured-run `run_total_ms` summary to `summary`
+- add measured-run `gateway_rss_kib`, `gateway_fd_count`,
+  `gateway_child_process_count`, and `gateway_storage_bytes` summaries
+- include FD max/ratio in Rust-vs-Kubo `cases` comparison JSON
+- print a compact resource summary in normal harness output
+- print Rust/Kubo max RSS in comparison output
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Smoke:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 60 \
+  --output /tmp/harness-resource-summary-smoke.json \
+  --trace-output /tmp/harness-resource-summary-smoke-trace.jsonl
+```
+
+Result: `1/1`, root TTFB `518ms`, RSS `37760KiB`, FD count `27`, and child
+process count `0`. The console printed the new `resources:` line and the JSON
+summary included `run_total_ms`, `gateway_rss_kib`, `gateway_fd_count`,
+`gateway_child_process_count`, and `gateway_storage_bytes`.
+
+This is a harness/diagnostics improvement only. It does not change gateway or
+retrieval behavior.
