@@ -2477,3 +2477,25 @@ faster on the same target (`707/746ms` root p50/p95, `1092ms` asset p95).
 Decision: reject the adaptive subtraction rule. Trusted session peers are useful,
 but keeping two unknown direct races still helps avoid stale or incomplete warm
 peer state during page loads.
+
+Rejected `3500ms` mixed-trusted timeout follow-up under fixed direct-2:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/ipfs-tech-trusted-timeout-3500ms-direct-two-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-trusted-timeout-3500ms-direct-two-kubo-r3-trace.jsonl
+```
+
+Result: Rust and Kubo both passed `3/3`, but it did not beat the fixed direct-2
+baseline at `4s`. Rust root TTFB p50/p95 was `778/2095ms`; asset TTFB p50/p95
+was `232/1347ms`. The kept direct-2 baseline was better on the same target:
+root p50/p95 `707/746ms` and asset p95 `1092ms`. Decision: reject `3500ms` and
+keep the mixed-trusted cap at `4s`; the remaining tail is not solved by trimming
+that timeout further.
