@@ -2430,3 +2430,25 @@ fallback, serving unverifiable data, or broadening the full peer/address fanout.
 Continue testing this against provider-sparse pages and consider a future
 adaptive rule that raises or lowers the direct count based on observed provider
 quality.
+
+Rejected direct `3` follow-up:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/ipfs-tech-direct-three-want-block-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-direct-three-want-block-kubo-r3-trace.jsonl
+```
+
+Result: Rust regressed to `1/3` while Kubo passed `3/3`. Rust root TTFB stayed
+fast at p50/p95 `759/923ms` versus Kubo `1415/1573ms`, but Rust asset p95
+blew out to `8844ms` versus Kubo `183ms`. Max RSS/FD stayed acceptable at
+`55964KiB`/`45`, so this was not a resource exhaustion signal; the third direct
+unknown peer likely increases request contention/noise without improving peer
+quality. Decision: reject direct `3` and keep direct `2`.
