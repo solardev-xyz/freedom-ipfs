@@ -1994,3 +1994,73 @@ to compare against.
 
 This is diagnostic only. It does not change peer selection, connection limits,
 Bitswap request behavior, or block verification.
+
+## Rejected Direct QUIC-First Address Scoring
+
+Hypothesis: since direct QUIC addresses are available for many `ipfs.tech`
+providers, ranking direct QUIC before direct TCP in `bitswap_addr_score` might
+avoid slow TCP dials and reduce page-load tails.
+
+Baseline, current TCP-first scoring:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/ipfs-tech-transport-tcp-first-r3.json \
+  --trace-output /tmp/ipfs-tech-transport-tcp-first-r3-trace.jsonl
+```
+
+Result: `3/3`. Root TTFB p50/p95/max `1529/1685/1685ms`; asset TTFB
+p50/p95/max `268/1603/4264ms`; max RSS `53372KiB`; max FD count `50`;
+established transports `tcp=36`; rejected dial transports `tcp=275`,
+`quic=88`, `ws=22`. One mixed trusted Bitswap request hit the 4s cap.
+
+Experiment: temporarily rank direct QUIC before direct TCP and rebuild
+`freedom-ipfs-gateway`.
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/ipfs-tech-transport-quic-first-r3.json \
+  --trace-output /tmp/ipfs-tech-transport-quic-first-r3-trace.jsonl
+```
+
+Result: `3/3`. Root TTFB p50/p95/max worsened to `1932/2732/2732ms`; asset
+TTFB p50 improved to `215ms`, but p95 worsened to `1779ms`; asset max improved
+to `1919ms`. Max RSS rose to `54436KiB`, max FD count fell to `33`,
+established transports became `quic=18`, `tcp=18`, and rejected dial transports
+shifted to `quic=270`, `tcp=107`, `ws=16`.
+
+Same-window TCP-first recheck:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/ipfs-tech-transport-tcp-first-recheck-r3.json \
+  --trace-output /tmp/ipfs-tech-transport-tcp-first-recheck-r3-trace.jsonl
+```
+
+Result: `3/3`. Root TTFB p50/p95/max `2124/2590/2590ms`; asset TTFB
+p50/p95/max `170/1037/1411ms`; max RSS `54456KiB`; max FD count `52`;
+established transports `tcp=40`; rejected dial transports `tcp=265`,
+`quic=75`, `ws=17`.
+
+Decision: reject broad QUIC-first scoring and leave TCP-first behavior. The
+experiment proved QUIC can establish and sometimes lowers per-block Bitswap
+latency, but broad QUIC-first increased QUIC rejected-dial pressure and did not
+beat the same-window TCP recheck on asset p50, asset p95, asset max, or run
+total. Future transport work should be selective, for example by preferring
+QUIC only for peers with recent QUIC success or by adding per-peer transport
+quality, not by globally ranking QUIC ahead of TCP.
