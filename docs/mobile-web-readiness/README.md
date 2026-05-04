@@ -75,13 +75,15 @@ bounded target summaries. The console output prints the top slow events so
 optimization runs immediately show which URL/CID caused the tail. Reports also
 include `block_sources` and `bitswap_source_peers` counts, which help quantify
 cache/Bitswap/HTTP-provider mix and peer reuse during provider/session
-experiments. Trace errors are grouped by phase and sanitized error string so
-provider-quality runs can show repeated DHT/Bitswap failure signatures without
-manual JSONL greps. Bitswap peer expansion traces include address mix counters,
-and the report aggregates them as `bitswap_addr_mix` for transport policy work.
-UnixFS metadata-cache traces are also aggregated so reports show cache events,
-hits, misses, inserts, evictions, skip counts, maximum length, and capacity
-without manual JSONL greps.
+experiments. Gateway response statuses and limiter denials are aggregated as
+well, making overload or `503` pressure visible in the normal report. Trace
+errors are grouped by phase and sanitized error string so provider-quality runs
+can show repeated DHT/Bitswap failure signatures without manual JSONL greps.
+Bitswap peer expansion traces include address mix counters, and the report
+aggregates them as `bitswap_addr_mix` for transport policy work. UnixFS
+metadata-cache traces are also aggregated so reports show cache events, hits,
+misses, inserts, evictions, skip counts, maximum length, and capacity without
+manual JSONL greps.
 Bitswap DNS expansion traces are aggregated as well, including cached versus
 uncached expansion events, failed DNSAddr lookups, TXT records, and resolved IPs.
 The `slow_cids` list groups elapsed trace events by CID with phase and path
