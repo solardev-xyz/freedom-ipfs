@@ -745,7 +745,6 @@ impl HttpRetriever {
                 existing.addrs.dedup();
                 existing.addrs.truncate(MAX_BITSWAP_ADDRS_PER_PEER);
             } else {
-                recent.skip_want_have = false;
                 session_only_peers.push(recent);
             }
         }
@@ -1119,11 +1118,24 @@ async fn run_shared_bitswap_swarm(
 
                 let mut peer_targets = Vec::new();
                 let mut dial_peers = Vec::new();
+                let mut connected_peer_count = 0usize;
+                let mut pending_dial_peer_count = 0usize;
                 for peer in command.peers {
                     tracing::debug!(peer = %peer.id, addrs = ?peer.addrs, "adding bitswap peer");
-                    let connection_ready = if connected_peers.contains_key(&peer.id) {
+                    let already_connected = connected_peers.contains_key(&peer.id);
+                    let already_pending = !already_connected && connection_waiters.contains_key(&peer.id);
+                    let should_dial = should_start_bitswap_dial(
+                        &peer.id,
+                        &connected_peers,
+                        &connection_waiters,
+                    );
+                    let connection_ready = if already_connected {
+                        connected_peer_count += 1;
                         None
                     } else {
+                        if already_pending {
+                            pending_dial_peer_count += 1;
+                        }
                         let (ready, wait) = oneshot::channel();
                         connection_wait_started
                             .entry(peer.id)
@@ -1140,13 +1152,32 @@ async fn run_shared_bitswap_swarm(
                     for addr in &peer.addrs {
                         swarm.add_peer_address(peer.id, addr.clone());
                     }
-                    dial_peers.push(peer);
+                    if should_dial {
+                        dial_peers.push(peer);
+                    }
                 }
+                tracing::info!(
+                    phase = "bitswap_dial_plan",
+                    cid = %command.cid,
+                    peer_count = peer_targets.len(),
+                    new_dial_peer_count = dial_peers.len(),
+                    pending_dial_peer_count,
+                    connected_peer_count
+                );
 
                 for (peer_id, addr) in interleaved_bitswap_dials(&dial_peers) {
                     let dial_addr = addr.with_p2p(peer_id).unwrap_or_else(|addr| addr);
                     if let Err(err) = swarm.dial(dial_addr) {
-                        tracing::debug!(peer = %peer_id, error = %err, "bitswap dial rejected");
+                        let error_detail = format_error_detail(&err);
+                        let connection_limit = is_connection_limit_error(&error_detail);
+                        record_dial_error(&dial_errors, peer_id, error_detail.clone()).await;
+                        tracing::info!(
+                            phase = "bitswap_dial_rejected",
+                            peer = %peer_id,
+                            connection_limit,
+                            error = %err,
+                            error_debug = ?err
+                        );
                     }
                 }
 
@@ -1283,6 +1314,14 @@ fn prune_connection_waiters(
     started.retain(|peer, _| waiters.contains_key(peer));
 }
 
+fn should_start_bitswap_dial(
+    peer: &PeerId,
+    connected_peers: &HashMap<PeerId, usize>,
+    connection_waiters: &HashMap<PeerId, Vec<oneshot::Sender<()>>>,
+) -> bool {
+    !connected_peers.contains_key(peer) && !connection_waiters.contains_key(peer)
+}
+
 async fn record_dial_error(errors: &DialErrorLog, peer: PeerId, detail: String) {
     let mut errors = errors.lock().await;
     let peer_errors = errors.entry(peer).or_default();
@@ -1364,6 +1403,10 @@ where
     }
 
     detail
+}
+
+fn is_connection_limit_error(detail: &str) -> bool {
+    detail.contains("ConnectionDenied") && detail.contains("Exceeded")
 }
 
 #[derive(Clone)]
@@ -3124,6 +3167,40 @@ mod bitswap_tests {
         assert!(!peers[1].skip_want_have);
     }
 
+    #[tokio::test]
+    async fn recent_session_only_bitswap_peers_keep_want_block_shortcut() {
+        let session_peer =
+            parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let provider_peer =
+            parse_peer_id("12D3KooWAtxJkDLacJdK7yZkk2iPp8iMdSVh1bDHzmJ3t8oKUkqA").unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store,
+        );
+        retriever
+            .record_successful_bitswap_peer(
+                session_peer,
+                vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()],
+            )
+            .await;
+        let mut peers = vec![BitswapPeer {
+            id: provider_peer,
+            addrs: Vec::new(),
+            skip_want_have: false,
+        }];
+
+        let inserted = retriever
+            .insert_recent_bitswap_session_peers(&mut peers)
+            .await;
+
+        assert_eq!(inserted, 1);
+        assert_eq!(peers[0].id, session_peer);
+        assert!(peers[0].skip_want_have);
+        assert_eq!(peers[1].id, provider_peer);
+        assert!(!peers[1].skip_want_have);
+    }
+
     #[test]
     fn detects_bitswap_connection_ready_failures() {
         let err = RetrievalError::Bitswap(format!(
@@ -3134,6 +3211,44 @@ mod bitswap_tests {
 
         let err = RetrievalError::Bitswap("all bitswap stream requests failed".to_string());
         assert!(!is_bitswap_connection_ready_failure(&err));
+    }
+
+    #[test]
+    fn detects_connection_limit_dial_errors() {
+        assert!(is_connection_limit_error(
+            "ConnectionDenied { cause: Exceeded { limit: 16, kind: EstablishedOutgoing } }"
+        ));
+        assert!(!is_connection_limit_error("Transport failed"));
+    }
+
+    #[test]
+    fn skips_bitswap_dials_for_connected_or_pending_peers() {
+        let connected =
+            parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let pending =
+            parse_peer_id("12D3KooWAtxJkDLacJdK7yZkk2iPp8iMdSVh1bDHzmJ3t8oKUkqA").unwrap();
+        let fresh = parse_peer_id("12D3KooWLSFr3c4K1dxWavx5XFsUjeSXap3VPMuEbe28zeL5B1v3").unwrap();
+        let mut connected_peers = HashMap::new();
+        connected_peers.insert(connected, 1);
+        let (ready, _wait) = oneshot::channel();
+        let mut connection_waiters = HashMap::new();
+        connection_waiters.insert(pending, vec![ready]);
+
+        assert!(!should_start_bitswap_dial(
+            &connected,
+            &connected_peers,
+            &connection_waiters
+        ));
+        assert!(!should_start_bitswap_dial(
+            &pending,
+            &connected_peers,
+            &connection_waiters
+        ));
+        assert!(should_start_bitswap_dial(
+            &fresh,
+            &connected_peers,
+            &connection_waiters
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3185,7 +3300,7 @@ mod bitswap_tests {
         let (missing_peer_id, missing_addr, missing_swarm, missing_stream) =
             spawn_want_have_bitswap_peer(cid, data.to_vec(), false).await;
         let (session_peer_id, session_addr, session_swarm, session_stream) =
-            spawn_want_have_bitswap_peer(cid, data.to_vec(), true).await;
+            spawn_local_bitswap_peer(cid, data.to_vec()).await;
 
         let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
         let retriever = HttpRetriever::new(
