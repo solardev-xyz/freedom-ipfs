@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 const DEFAULT_CORPUS: &str = "tools/mobile-web-harness/corpus/mobile-web.json";
 const DEFAULT_KUBO_BIN: &str = "target/tools/kubo/kubo/ipfs";
@@ -87,6 +87,9 @@ struct Args {
     /// Request timeout in seconds.
     #[arg(long, default_value_t = 180)]
     timeout_secs: u64,
+    /// Optional wall-clock timeout for one full corpus run. Timed-out runs are reported as failures.
+    #[arg(long, default_value_t = 0)]
+    run_timeout_secs: u64,
     /// Gateway request concurrency budget when spawning a gateway.
     #[arg(long, alias = "gateway-max-concurrent-requests", default_value_t = DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS)]
     max_concurrent_requests: usize,
@@ -208,6 +211,8 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
     }
 
     let timeout = Duration::from_secs(args.timeout_secs);
+    let run_timeout =
+        (args.run_timeout_secs > 0).then(|| Duration::from_secs(args.run_timeout_secs));
     let measured_runs = args.repeat.max(1);
     let total_runs = args.warmup_runs + measured_runs;
     let mut persistent_gateway = None;
@@ -245,14 +250,23 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
         };
 
         let started = Instant::now();
-        let results = run_corpus_once(
+        let run = run_corpus_once(
             &gateway_url,
             corpus,
             timeout,
             args.asset_concurrency,
             &args.cases,
-        )
-        .await?;
+        );
+        let results = if let Some(run_timeout) = run_timeout {
+            match tokio::time::timeout(run_timeout, run).await {
+                Ok(results) => results?,
+                Err(_) => {
+                    run_timeout_failure_results(&gateway_url, corpus, &args.cases, run_timeout)?
+                }
+            }
+        } else {
+            run.await?
+        };
         let elapsed_ms = started.elapsed().as_millis();
         let gateway_rss_kib = if let Some(gateway) = run_gateway.as_ref() {
             gateway.rss_kib()
@@ -326,6 +340,7 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
         warmup_runs: args.warmup_runs,
         fresh_gateway_per_run: args.fresh_gateway_per_run,
         asset_concurrency: args.asset_concurrency,
+        run_timeout_secs: (args.run_timeout_secs > 0).then_some(args.run_timeout_secs),
         engine: args.engine,
         gateway_db: args
             .gateway_db
@@ -362,6 +377,30 @@ async fn run_corpus_once(
             continue;
         }
         results.push(run_case(&client, gateway_url, entry, asset_concurrency).await);
+    }
+    if results.is_empty() {
+        bail!("no corpus entries matched the requested case filters");
+    }
+    Ok(results)
+}
+
+fn run_timeout_failure_results(
+    gateway_url: &str,
+    corpus: &Corpus,
+    cases: &[String],
+    timeout: Duration,
+) -> Result<Vec<CaseResult>> {
+    let mut results = Vec::new();
+    for entry in &corpus.entries {
+        if !cases.is_empty() && !cases.iter().any(|case| case == &entry.id) {
+            continue;
+        }
+        let url = format!("{}{}", gateway_url.trim_end_matches('/'), entry.path);
+        results.push(CaseResult::failed(
+            entry,
+            url,
+            vec![format!("run timed out after {}s", timeout.as_secs())],
+        ));
     }
     if results.is_empty() {
         bail!("no corpus entries matched the requested case filters");
@@ -489,6 +528,9 @@ fn print_summary(report: &RunReport) {
         "runs: measured={} warmup={} fresh_gateway_per_run={} asset_concurrency={}",
         report.repeat, report.warmup_runs, report.fresh_gateway_per_run, report.asset_concurrency
     );
+    if let Some(run_timeout_secs) = report.run_timeout_secs {
+        println!("run_timeout_secs: {run_timeout_secs}");
+    }
     println!(
         "summary: passed={} failed={} pass_rate={:.1}%",
         report.summary.pass_count,
@@ -926,19 +968,19 @@ async fn fetch_assets(
     max_bytes: usize,
 ) -> Vec<FetchedAsset> {
     let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
-    let mut tasks = Vec::new();
+    let mut tasks = JoinSet::new();
     for asset in assets {
         let client = client.clone();
         let semaphore = semaphore.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.spawn(async move {
             let _permit = semaphore.acquire_owned().await.ok();
             fetch_asset(&client, asset, max_bytes).await
-        }));
+        });
     }
 
     let mut fetched = Vec::new();
-    for task in tasks {
-        if let Ok(asset) = task.await {
+    while let Some(result) = tasks.join_next().await {
+        if let Ok(asset) = result {
             fetched.push(asset);
         }
     }
@@ -2007,6 +2049,7 @@ struct RunReport {
     warmup_runs: usize,
     fresh_gateway_per_run: bool,
     asset_concurrency: usize,
+    run_timeout_secs: Option<u64>,
     engine: HarnessEngine,
     gateway_db: Option<String>,
     kubo_repo: Option<String>,
@@ -3266,5 +3309,56 @@ mod tests {
         assert_eq!(summary.slow_cids[2].cid, "cid1");
         assert_eq!(summary.slow_cids[2].total_ms, 30);
         assert_eq!(summary.slow_cids[2].count, 2);
+    }
+
+    #[test]
+    fn run_timeout_failure_results_marks_matching_cases_failed() {
+        let corpus = Corpus {
+            entries: vec![
+                CorpusEntry {
+                    id: "first".to_string(),
+                    description: Some("first case".to_string()),
+                    path: "/ipfs/first".to_string(),
+                    method: None,
+                    range: None,
+                    crawl: None,
+                    expect_status: Some(200),
+                    expect_content_type_prefix: None,
+                    expect_content_range_prefix: None,
+                    expect_body_contains: None,
+                    min_bytes: None,
+                    max_ttfb_ms: None,
+                },
+                CorpusEntry {
+                    id: "second".to_string(),
+                    description: None,
+                    path: "/ipfs/second".to_string(),
+                    method: Some("HEAD".to_string()),
+                    range: None,
+                    crawl: None,
+                    expect_status: Some(200),
+                    expect_content_type_prefix: None,
+                    expect_content_range_prefix: None,
+                    expect_body_contains: None,
+                    min_bytes: None,
+                    max_ttfb_ms: None,
+                },
+            ],
+        };
+
+        let results = run_timeout_failure_results(
+            "http://127.0.0.1:8080/",
+            &corpus,
+            &["second".to_string()],
+            Duration::from_secs(7),
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "second");
+        assert_eq!(results[0].method, "HEAD");
+        assert_eq!(results[0].url, "http://127.0.0.1:8080/ipfs/second");
+        assert!(!results[0].passed);
+        assert_eq!(results[0].failures, vec!["run timed out after 7s"]);
     }
 }

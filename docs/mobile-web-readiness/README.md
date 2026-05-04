@@ -52,6 +52,12 @@ the same routing, DHT, request-concurrency, and asset-concurrency knobs as the
 single-run harness, with an 8-request gateway default and a 6-asset crawl
 default to model bounded browser pressure.
 
+For noisy live experiments, `--run-timeout-secs N` adds a wall-clock cap around
+one full corpus run. If the cap fires, the harness records matching cases as
+failed with `run timed out after Ns`, still writes the JSON report, and stops
+the spawned gateway. This is separate from `--timeout-secs`, which remains the
+per-request HTTP timeout.
+
 For fresh-process warm-store measurements, pass `--gateway-db /tmp/cache.db`
 while the harness is spawning the gateway. This forwards the path to the
 gateway's SQLite cache. Combined with `--fresh-gateway-per-run --warmup-runs 1`,

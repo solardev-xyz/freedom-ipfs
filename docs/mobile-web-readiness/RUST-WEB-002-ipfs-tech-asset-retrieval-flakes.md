@@ -1684,3 +1684,47 @@ latency component, but the cache experiment did not preserve page-load
 reliability. Future work should revisit this only with request coalescing or
 stricter per-host success semantics, and must pass a full same-window
 Rust/Kubo page run before keeping any DNS expansion cache.
+
+## Harness Run Timeout Guard
+
+The rejected DNS-cache experiment exposed a harness sharp edge: live page runs
+could sit for multiple request-timeout waves before producing JSON. That makes
+failed experiments harder to compare and can leave the useful trace evidence
+separate from the structured report.
+
+Harness change:
+
+- add `--run-timeout-secs N` as an optional wall-clock cap around one full corpus
+  run
+- synthesize failed `CaseResult`s for matched cases when the cap fires
+- keep writing JSON reports before returning the normal failure exit status
+- switch asset fetch scheduling from detached `JoinHandle`s to `JoinSet`, so
+  dropping a timed-out crawl aborts in-flight asset tasks instead of leaving
+  them running in the background
+
+Validation:
+
+```sh
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Smoke:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 1 \
+  --output /tmp/harness-run-timeout-smoke.json \
+  --trace-output /tmp/harness-run-timeout-smoke-trace.jsonl
+```
+
+Result: exited with the expected harness failure status after writing
+`/tmp/harness-run-timeout-smoke.json`. The report recorded one failed
+`ipfs-tech-page-assets` case with `run timed out after 1s`, and the trace
+summary was still present. This is a harness/diagnostics improvement only; it
+does not change gateway behavior.
