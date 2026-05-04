@@ -720,6 +720,31 @@ bitswap source peers: 12D3KooWHoyPRFHDVesYiActeZtUmqQPaJHdSw2qGJTMi3YejoJ4=2
 This gives later content-root session experiments an automatic signal for source
 peer reuse instead of requiring manual trace parsing.
 
+Trace summaries now also aggregate error signatures by phase. A noisy
+`daicowtf` sample shows the intended provider-quality signal:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case daicowtf-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --output /tmp/daicowtf-trace-errors.json \
+  --trace-output /tmp/daicowtf-trace-errors-trace.jsonl
+```
+
+```text
+passed=0 failed=1 pass_rate=0.0%
+root_ttfb p50=10920ms max=10920ms
+block sources: bitswap=1
+trace errors: bitswap_session_shortcut: ok=false=1, provider_diversity_low: ok=false=1
+slow failed CID: bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u
+```
+
+This is still the known `daicowtf` sparse-provider failure shape. The useful
+change is that future provider-quality runs now expose repeated error
+signatures directly in the report.
+
 ## 2026-05-04 Multi-Want Groundwork
 
 Priority 1 in the long-running roadmap is bounded Bitswap multi-want batching.

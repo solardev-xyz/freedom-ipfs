@@ -74,7 +74,9 @@ bounded target summaries. The console output prints the top slow events so
 optimization runs immediately show which URL/CID caused the tail. Reports also
 include `block_sources` and `bitswap_source_peers` counts, which help quantify
 cache/Bitswap/HTTP-provider mix and peer reuse during provider/session
-experiments.
+experiments. Trace errors are grouped by phase and sanitized error string so
+provider-quality runs can show repeated DHT/Bitswap failure signatures without
+manual JSONL greps.
 
 The harness can also spawn Kubo as a comparison engine when a Kubo `ipfs`
 binary is available:

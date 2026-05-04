@@ -543,6 +543,12 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.bitswap_source_peers)
             );
         }
+        if !trace.trace_errors.is_empty() {
+            println!(
+                "  trace errors: {}",
+                format_trace_counts(&trace.trace_errors)
+            );
+        }
         if !trace.slow_events.is_empty() {
             println!("  slow events:");
             for event in trace.slow_events.iter().take(8) {
@@ -2222,6 +2228,7 @@ struct TraceSummary {
     slow_events: Vec<TraceSlowEvent>,
     block_sources: Vec<TraceValueCount>,
     bitswap_source_peers: Vec<TraceValueCount>,
+    trace_errors: Vec<TraceValueCount>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2254,6 +2261,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut slow_events = Vec::<TraceSlowEvent>::new();
     let mut block_sources = BTreeMap::<String, usize>::new();
     let mut bitswap_source_peers = BTreeMap::<String, usize>::new();
+    let mut trace_errors = BTreeMap::<String, usize>::new();
 
     for line in text.lines() {
         line_count += 1;
@@ -2273,6 +2281,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             if let Some(peer) = value.get("source_peer").and_then(|peer| peer.as_str()) {
                 *bitswap_source_peers.entry(peer.to_string()).or_default() += 1;
             }
+        }
+        if let Some(error) = trace_error_key(phase, &value) {
+            *trace_errors.entry(error).or_default() += 1;
         }
         let Some(elapsed_ms) = value.get("elapsed_ms").and_then(json_u128) else {
             continue;
@@ -2323,6 +2334,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         slow_events,
         block_sources: sorted_trace_counts(block_sources),
         bitswap_source_peers: sorted_trace_counts(bitswap_source_peers),
+        trace_errors: sorted_trace_counts(trace_errors),
     })
 }
 
@@ -2348,6 +2360,16 @@ fn format_trace_counts(counts: &[TraceValueCount]) -> String {
         .map(|entry| format!("{}={}", entry.value, entry.count))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn trace_error_key(phase: &str, value: &serde_json::Value) -> Option<String> {
+    if let Some(error) = json_detail_string(value.get("error")) {
+        return Some(format!("{phase}: {error}"));
+    }
+    if value.get("ok").and_then(|ok| ok.as_bool()) == Some(false) {
+        return Some(format!("{phase}: ok=false"));
+    }
+    None
 }
 
 fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
@@ -2651,7 +2673,8 @@ mod tests {
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":\"25\",\"cid\":\"cid1\",\"ok\":true,\"source\":\"bitswap\",\"source_peer\":\"peer1\",\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9}}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":5,\"cid\":\"cid1\",\"source\":\"bitswap\"}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":4,\"cid\":\"cid5\",\"source\":\"cache\"}\n",
-                "{\"phase\":\"provider_lookup\",\"elapsed_ms\":10,\"cid\":\"cid2\",\"provider_count\":3}\n",
+                "{\"phase\":\"provider_lookup\",\"elapsed_ms\":10,\"cid\":\"cid2\",\"provider_count\":3,\"error\":\"dht: timeout\"}\n",
+                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":12,\"cid\":\"cid6\",\"ok\":false}\n",
                 "not json\n",
                 "{\"phase\":\"request_start\",\"path\":\"/ipns/site/\"}\n",
                 "{\"phase\":\"unixfs_file_size\",\"elapsed_ms\":50,\"cid\":\"cid3\",\"unixfs_path\":\"index.html\",\"ok\":true}\n",
@@ -2663,9 +2686,9 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 8);
-        assert_eq!(summary.event_count, 7);
-        assert_eq!(summary.slow_events.len(), 6);
+        assert_eq!(summary.line_count, 9);
+        assert_eq!(summary.event_count, 8);
+        assert_eq!(summary.slow_events.len(), 7);
         assert_eq!(
             summary.slow_events[0].phase,
             "bitswap_request_timeout_detail"
@@ -2702,5 +2725,11 @@ mod tests {
         assert_eq!(summary.bitswap_source_peers.len(), 1);
         assert_eq!(summary.bitswap_source_peers[0].value, "peer1");
         assert_eq!(summary.bitswap_source_peers[0].count, 1);
+        assert_eq!(summary.trace_errors.len(), 2);
+        assert_eq!(summary.trace_errors[0].value, "bitswap_fetch: ok=false");
+        assert_eq!(
+            summary.trace_errors[1].value,
+            "provider_lookup: dht: timeout"
+        );
     }
 }
