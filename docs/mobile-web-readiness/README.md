@@ -68,6 +68,42 @@ The spawned gateway uses a trace-friendly filter by default whenever
 `--trace-output` is set, so an ambient `RUST_LOG=warn` will not hide phase
 events. Use `--trace-filter` only when intentionally overriding the default.
 
+The harness can also spawn Kubo as a comparison engine when a Kubo `ipfs`
+binary is available:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --engine kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --output /tmp/ipfs-tech-kubo.json
+```
+
+Omit `--kubo-repo` to create an isolated temporary repo per spawned Kubo daemon,
+or pass `--kubo-repo /tmp/kubo-repo` to reuse a repo across fresh daemon runs.
+Kubo is configured with loopback API/gateway/swarm listeners and lowpower
+profile settings so comparisons stay local to the harness process except for
+normal outbound IPFS retrieval.
+
+For a paired Rust-vs-Kubo run with the same corpus and repeat settings:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --output /tmp/vitalik-rust-vs-kubo.json
+```
+
+The comparison report embeds both engine reports and adds per-case ratios for
+root/asset TTFB plus RSS and storage size. Rust-only trace summaries still use
+`--trace-output`; Kubo runs do not produce Rust gateway phase traces.
+
 The default live corpus is `tools/mobile-web-harness/corpus/mobile-web.json`.
 It captures browser-facing checks such as status, MIME type, byte ranges,
 minimum body size, body snippets, TTFB, and total response time. The corpus now
