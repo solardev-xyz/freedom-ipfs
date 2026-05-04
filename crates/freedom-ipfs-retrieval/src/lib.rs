@@ -55,6 +55,10 @@ const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
 // The per-peer read path has its own 10s timeout. This caps broader shared
 // swarm stalls so one stuck command cannot sit on a browser request for 45s.
 const BITSWAP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+// Follow-on page blocks with a recent successful peer should either reuse that
+// peer quickly or move to a fresh swarm/retry. Keep this narrower than the cold
+// request cap, but only for mixed trusted+provider candidate sets.
+const BITSWAP_TRUSTED_MIXED_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const BITSWAP_MAX_PENDING_OUTGOING_CONNECTIONS: u32 = 16;
 const BITSWAP_MAX_ESTABLISHED_CONNECTIONS: u32 = 16;
 // Keep one command from filling every pending outgoing dial slot. Page loads
@@ -673,6 +677,7 @@ impl HttpRetriever {
                         cid = %cid,
                         peer_count,
                         trusted_peer_count,
+                        timeout_ms = bitswap_request_timeout(peer_count, trusted_peer_count).as_millis(),
                         elapsed_ms = bitswap_started.elapsed().as_millis()
                     );
                     self.reset_shared_bitswap_client().await;
@@ -1138,6 +1143,7 @@ impl SharedBitswapClient {
     async fn fetch(&self, cid: Cid, peers: Vec<BitswapPeer>) -> Result<Result<BitswapFetchResult>> {
         let peer_count = peers.len();
         let trusted_peer_count = peers.iter().filter(|peer| peer.skip_want_have).count();
+        let request_timeout = bitswap_request_timeout(peer_count, trusted_peer_count);
         let target_summary =
             tracing::enabled!(tracing::Level::INFO).then(|| format_bitswap_peers(&peers));
         let (respond, response) = oneshot::channel();
@@ -1152,7 +1158,7 @@ impl SharedBitswapClient {
             .map_err(|_| RetrievalError::Bitswap("shared bitswap swarm stopped".into()))?;
 
         let wait_started = Instant::now();
-        match timeout(BITSWAP_REQUEST_TIMEOUT, response).await {
+        match timeout(request_timeout, response).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => Err(RetrievalError::Bitswap(
                 "shared bitswap response dropped".into(),
@@ -1163,12 +1169,21 @@ impl SharedBitswapClient {
                     cid = %cid,
                     peer_count,
                     trusted_peer_count,
+                    timeout_ms = request_timeout.as_millis(),
                     elapsed_ms = wait_started.elapsed().as_millis(),
                     targets = %target_summary.as_deref().unwrap_or("")
                 );
                 Err(RetrievalError::BitswapTimeout)
             }
         }
+    }
+}
+
+fn bitswap_request_timeout(peer_count: usize, trusted_peer_count: usize) -> Duration {
+    if trusted_peer_count > 0 && peer_count > trusted_peer_count {
+        BITSWAP_TRUSTED_MIXED_REQUEST_TIMEOUT
+    } else {
+        BITSWAP_REQUEST_TIMEOUT
     }
 }
 
@@ -3705,6 +3720,16 @@ mod bitswap_tests {
         assert!(peers[0].skip_want_have);
         assert_eq!(peers[1].id, provider_peer);
         assert!(!peers[1].skip_want_have);
+    }
+
+    #[test]
+    fn shortens_request_timeout_for_mixed_trusted_bitswap_candidates() {
+        assert_eq!(
+            bitswap_request_timeout(10, 1),
+            BITSWAP_TRUSTED_MIXED_REQUEST_TIMEOUT
+        );
+        assert_eq!(bitswap_request_timeout(10, 0), BITSWAP_REQUEST_TIMEOUT);
+        assert_eq!(bitswap_request_timeout(1, 1), BITSWAP_REQUEST_TIMEOUT);
     }
 
     #[test]

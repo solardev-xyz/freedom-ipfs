@@ -1422,3 +1422,130 @@ stall. Decision: do not add the shorter trusted-peer timeout behavior yet. Keep
 collecting this counter across harder page/asset runs and only change behavior
 when the trace shows repeatable `request_timeouts_with_trusted` or
 `trusted_failures` under same-window comparison.
+
+## Mixed Trusted-Peer Request Timeout
+
+The harder `ipfs-tech-page-assets` case did reproduce the stale trusted-peer
+pattern under same-window Rust/Kubo comparison.
+
+Baseline diagnostic run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/ipfs-tech-session-kubo-r1.json \
+  --trace-output /tmp/ipfs-tech-session-kubo-r1-trace.jsonl
+```
+
+Result: Rust and Kubo both passed, but Rust root TTFB was `17081ms` while Kubo
+was `1351ms` (`12.64x`). The slow root path fetched the root DAG-PB block, then
+the `/index.html` child CID `bafkreibnzgajg3gsyn5c4p5e2h7racpy6dy7tnhwe5l4v4vx5e32qmn4bi`
+had `trusted_peer_count=1`, hit the full `15000ms` Bitswap request timeout, and
+then fetched from the trusted peer in `244ms` after the shared client reset.
+
+Experiment:
+
+- Add `BITSWAP_TRUSTED_MIXED_REQUEST_TIMEOUT = 5s`.
+- Use it only when a Bitswap command has at least one trusted peer and at least
+  one non-trusted provider candidate.
+- Keep the existing `15s` cap for cold requests and trusted-only requests.
+- Emit `timeout_ms` on `bitswap_request_timeout` and
+  `bitswap_request_timeout_detail` so traces prove which cap fired.
+
+This keeps the change narrow: it does not raise timeout budgets, add public
+gateway fallback, increase fanout, or bypass block verification.
+
+Deterministic validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib shortens_request_timeout_for_mixed_trusted_bitswap_candidates
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+cargo build -p freedom-ipfs-gateway
+```
+
+Same-window check after change:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/ipfs-tech-trusted-timeout-kubo-r1.json \
+  --trace-output /tmp/ipfs-tech-trusted-timeout-kubo-r1-trace.jsonl
+```
+
+Result: Rust and Kubo both passed. Rust root TTFB was `2971ms`; Kubo was
+`3185ms` (`0.93x`). One mixed trusted request still timed out, but at
+`timeout_ms=5000`, then recovered on retry.
+
+Repeat check:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/ipfs-tech-trusted-timeout-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-trusted-timeout-kubo-r3-trace.jsonl
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root TTFB p50 was `1890ms`; Kubo
+root TTFB p50 was `2237ms` (`0.84x`). Rust p95 was `1904ms`; Kubo p95 was
+`2971ms` (`0.64x`). Rust RSS stayed around `51956-53104 KiB` with `34-56` FDs;
+Kubo RSS was `122052-228044 KiB` with `49-218` FDs.
+
+Asset fetches are still slower than Kubo: Rust asset TTFB p50 was `449ms`
+versus Kubo `153ms`, and Rust asset p95 was `2882ms` versus Kubo `312ms`.
+That leaves a separate asset/session optimization track.
+
+Regression checks:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/vitalik-trusted-timeout-kubo-r3.json \
+  --trace-output /tmp/vitalik-trusted-timeout-kubo-r3-trace.jsonl
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root TTFB p50 was `3128ms`; Kubo
+was `2833ms` (`1.10x`). There were no `request_timeouts_with_trusted`; Rust RSS
+was `37760-38144 KiB` versus Kubo `106560-116964 KiB`.
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case daicowtf-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/daicowtf-trusted-timeout-kubo-r1.json \
+  --trace-output /tmp/daicowtf-trusted-timeout-kubo-r1-trace.jsonl
+```
+
+Result: both Rust and Kubo failed with `504`s in this network window. Rust root
+TTFB was `10934ms`; Kubo was `30004ms`. Rust failed on a follow-on child
+provider lookup DHT timeout, not on a mixed trusted Bitswap timeout
+(`request_timeouts_with_trusted=0`). This is not evidence against the mixed
+trusted timeout experiment.
+
+Decision: keep. The experiment removes a repeatable 15-second page-load cliff
+for mixed trusted/provider candidate sets while preserving cold-request timeout
+behavior and mobile resource bounds. Continue measuring asset p95 tails next.
