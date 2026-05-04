@@ -555,6 +555,17 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.bitswap_addr_mix)
             );
         }
+        if !trace.slow_cids.is_empty() {
+            println!("  slow cids:");
+            for cid in trace.slow_cids.iter().take(8) {
+                let phases = format_trace_counts(&cid.phases);
+                let paths = format_trace_counts(&cid.paths);
+                println!(
+                    "    {}: count={} total={}ms max={}ms phases={} paths={}",
+                    cid.cid, cid.count, cid.total_ms, cid.max_ms, phases, paths
+                );
+            }
+        }
         if !trace.slow_events.is_empty() {
             println!("  slow events:");
             for event in trace.slow_events.iter().take(8) {
@@ -2236,6 +2247,7 @@ struct TraceSummary {
     bitswap_source_peers: Vec<TraceValueCount>,
     trace_errors: Vec<TraceValueCount>,
     bitswap_addr_mix: Vec<TraceValueCount>,
+    slow_cids: Vec<TraceCidAggregate>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2259,6 +2271,25 @@ struct TraceValueCount {
     count: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct TraceCidAggregate {
+    cid: String,
+    count: usize,
+    total_ms: u128,
+    max_ms: u128,
+    phases: Vec<TraceValueCount>,
+    paths: Vec<TraceValueCount>,
+}
+
+#[derive(Default)]
+struct TraceCidBuilder {
+    count: usize,
+    total_ms: u128,
+    max_ms: u128,
+    phases: BTreeMap<String, usize>,
+    paths: BTreeMap<String, usize>,
+}
+
 fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read trace output {}", path.display()))?;
@@ -2270,6 +2301,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_source_peers = BTreeMap::<String, usize>::new();
     let mut trace_errors = BTreeMap::<String, usize>::new();
     let mut bitswap_addr_mix = BTreeMap::<String, usize>::new();
+    let mut slow_cids = BTreeMap::<String, TraceCidBuilder>::new();
 
     for line in text.lines() {
         line_count += 1;
@@ -2314,6 +2346,16 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             elapsed_ms,
             details: trace_event_details(&value),
         });
+        if let Some(cid) = json_detail_string(value.get("cid")) {
+            let entry = slow_cids.entry(cid).or_default();
+            entry.count += 1;
+            entry.total_ms += elapsed_ms;
+            entry.max_ms = entry.max_ms.max(elapsed_ms);
+            *entry.phases.entry(phase.to_string()).or_default() += 1;
+            if let Some(path) = trace_event_path(&value) {
+                *entry.paths.entry(path).or_default() += 1;
+            }
+        }
     }
 
     let mut phases = phases
@@ -2353,7 +2395,31 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_source_peers: sorted_trace_counts(bitswap_source_peers),
         trace_errors: sorted_trace_counts(trace_errors),
         bitswap_addr_mix: sorted_trace_counts(bitswap_addr_mix),
+        slow_cids: sorted_trace_cids(slow_cids),
     })
+}
+
+fn sorted_trace_cids(counts: BTreeMap<String, TraceCidBuilder>) -> Vec<TraceCidAggregate> {
+    let mut values = counts
+        .into_iter()
+        .map(|(cid, builder)| TraceCidAggregate {
+            cid,
+            count: builder.count,
+            total_ms: builder.total_ms,
+            max_ms: builder.max_ms,
+            phases: sorted_trace_counts(builder.phases),
+            paths: sorted_trace_counts(builder.paths),
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right
+            .total_ms
+            .cmp(&left.total_ms)
+            .then_with(|| right.max_ms.cmp(&left.max_ms))
+            .then_with(|| left.cid.cmp(&right.cid))
+    });
+    values.truncate(MAX_TRACE_SLOW_EVENTS);
+    values
 }
 
 fn accumulate_trace_count(
@@ -2402,6 +2468,11 @@ fn trace_error_key(phase: &str, value: &serde_json::Value) -> Option<String> {
     None
 }
 
+fn trace_event_path(value: &serde_json::Value) -> Option<String> {
+    json_detail_string(value.get("path"))
+        .or_else(|| json_detail_string(value.get("span").and_then(|span| span.get("path"))))
+}
+
 fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
     let mut details = BTreeMap::new();
     for key in [
@@ -2436,9 +2507,7 @@ fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
         }
     }
     if !details.contains_key("path") {
-        if let Some(span_path) =
-            json_detail_string(value.get("span").and_then(|span| span.get("path")))
-        {
+        if let Some(span_path) = trace_event_path(value) {
             details.insert("path".to_string(), span_path);
         }
     }
@@ -2715,7 +2784,7 @@ mod tests {
                 "{\"phase\":\"bitswap_peer_expand\",\"elapsed_ms\":3,\"cid\":\"cid7\",\"tcp_addr_count\":4,\"quic_addr_count\":2,\"ws_addr_count\":1,\"wss_addr_count\":0,\"dns_addr_count\":1,\"ip4_addr_count\":3,\"ip6_addr_count\":1}\n",
                 "not json\n",
                 "{\"phase\":\"request_start\",\"path\":\"/ipns/site/\"}\n",
-                "{\"phase\":\"unixfs_file_size\",\"elapsed_ms\":50,\"cid\":\"cid3\",\"unixfs_path\":\"index.html\",\"ok\":true}\n",
+                "{\"phase\":\"unixfs_file_size\",\"elapsed_ms\":50,\"cid\":\"cid3\",\"path\":\"/ipfs/root/index.html\",\"unixfs_path\":\"index.html\",\"ok\":true}\n",
                 "{\"phase\":\"bitswap_request_timeout_detail\",\"elapsed_ms\":60,\"cid\":\"cid4\",\"peer_count\":16,\"trusted_peer_count\":2,\"targets\":\"peer@[/ip4/127.0.0.1/tcp/4001]\"}\n",
             ),
         )
@@ -2775,5 +2844,17 @@ mod tests {
         assert_eq!(summary.bitswap_addr_mix[1].count, 3);
         assert_eq!(summary.bitswap_addr_mix[2].value, "quic");
         assert_eq!(summary.bitswap_addr_mix[2].count, 2);
+        assert_eq!(summary.slow_cids[0].cid, "cid4");
+        assert_eq!(summary.slow_cids[0].total_ms, 60);
+        assert_eq!(summary.slow_cids[0].max_ms, 60);
+        assert_eq!(
+            summary.slow_cids[0].phases[0].value,
+            "bitswap_request_timeout_detail"
+        );
+        assert_eq!(summary.slow_cids[1].cid, "cid3");
+        assert_eq!(summary.slow_cids[1].paths[0].value, "/ipfs/root/index.html");
+        assert_eq!(summary.slow_cids[2].cid, "cid1");
+        assert_eq!(summary.slow_cids[2].total_ms, 30);
+        assert_eq!(summary.slow_cids[2].count, 2);
     }
 }

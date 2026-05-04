@@ -769,6 +769,30 @@ The counts are summed from `bitswap_peer_expand` events, so they are intended
 for comparing policies in the same harness window rather than as globally unique
 provider counts.
 
+The harness now also groups slow trace events by CID:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --output /tmp/vitalik-slow-cids.json \
+  --trace-output /tmp/vitalik-slow-cids-trace.jsonl
+```
+
+```text
+passed=1 failed=0 pass_rate=100.0%
+root_ttfb p50=14668ms max=14668ms
+slow cids:
+  bafkreibny3ionuayaittbxl2tn5dgfae7sbu45ymd35vhdm3634lmakxqi total=37938ms max=12649ms
+  bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u total=35332ms max=14659ms
+```
+
+The totals are trace-phase sums, not wall-clock exclusive time. Their value is
+ranking: they show which CIDs repeatedly sit under slow phases and which URL
+paths referenced them.
+
 ## 2026-05-04 Multi-Want Groundwork
 
 Priority 1 in the long-running roadmap is bounded Bitswap multi-want batching.

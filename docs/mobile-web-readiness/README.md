@@ -78,6 +78,8 @@ experiments. Trace errors are grouped by phase and sanitized error string so
 provider-quality runs can show repeated DHT/Bitswap failure signatures without
 manual JSONL greps. Bitswap peer expansion traces include address mix counters,
 and the report aggregates them as `bitswap_addr_mix` for transport policy work.
+The `slow_cids` list groups elapsed trace events by CID with phase and path
+counts, which helps separate a slow root from a slow child block.
 
 The harness can also spawn Kubo as a comparison engine when a Kubo `ipfs`
 binary is available:
