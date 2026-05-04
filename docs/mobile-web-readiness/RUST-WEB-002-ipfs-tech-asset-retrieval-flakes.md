@@ -1295,3 +1295,34 @@ verification-before-cache behavior. The next measurement improvement should
 aggregate DNS expansion cache hit/miss counts in the harness trace summary, and
 the next behavior experiment can revisit multi-want or session-aware child CID
 fetching now that root peer expansion has less avoidable overhead.
+
+Follow-up: the harness now aggregates Bitswap DNS expansion traces directly:
+event count, cached versus uncached events, failed DNSAddr expansions, TXT
+records, and resolved IPs. This makes future DNS/provider-expansion experiments
+visible in the console report and JSON output without manual greps.
+
+Harness summary smoke:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --trace-output /tmp/vitalik-dns-summary-trace.jsonl \
+  --output /tmp/vitalik-dns-summary.json
+```
+
+Result: `1/1` with a slow-but-successful child block retry path. The console
+summary now printed:
+
+```text
+bitswap dns expansion: events=19 cached=11 uncached=8 failed=0 records=117 ips=25
+```
+
+The same run also showed the remaining child-CID session/provider tail:
+`bitswap_request_timeout_detail count=1` for child CID
+`bafkreibny3ionuayaittbxl2tn5dgfae7sbu45ymd35vhdm3634lmakxqi`, then recovery
+from the same source peer. That reinforces that DNS expansion was avoidable
+overhead, while the next larger behavior gap is still child-CID session
+reliability.

@@ -586,6 +586,18 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.bitswap_addr_mix)
             );
         }
+        if trace.bitswap_dns_expansion.events > 0 {
+            let dns = &trace.bitswap_dns_expansion;
+            println!(
+                "  bitswap dns expansion: events={} cached={} uncached={} failed={} records={} ips={}",
+                dns.events,
+                dns.cached,
+                dns.uncached,
+                dns.failed,
+                dns.records,
+                dns.ips
+            );
+        }
         if !trace.slow_cids.is_empty() {
             println!("  slow cids:");
             for cid in trace.slow_cids.iter().take(8) {
@@ -2335,6 +2347,7 @@ struct TraceSummary {
     bitswap_peer_fetches: Vec<TracePeerAggregate>,
     trace_errors: Vec<TraceValueCount>,
     bitswap_addr_mix: Vec<TraceValueCount>,
+    bitswap_dns_expansion: TraceBitswapDnsExpansionAggregate,
     slow_cids: Vec<TraceCidAggregate>,
 }
 
@@ -2369,6 +2382,16 @@ struct TraceUnixfsMetadataCacheAggregate {
     oversized_skips: u128,
     max_len: u128,
     max_capacity: u128,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceBitswapDnsExpansionAggregate {
+    events: usize,
+    cached: usize,
+    uncached: usize,
+    failed: usize,
+    records: u128,
+    ips: u128,
 }
 
 #[derive(Debug, Serialize)]
@@ -2420,6 +2443,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_peer_fetches = BTreeMap::<String, TracePeerBuilder>::new();
     let mut trace_errors = BTreeMap::<String, usize>::new();
     let mut bitswap_addr_mix = BTreeMap::<String, usize>::new();
+    let mut bitswap_dns_expansion = TraceBitswapDnsExpansionAggregate::default();
     let mut slow_cids = BTreeMap::<String, TraceCidBuilder>::new();
 
     for line in text.lines() {
@@ -2482,6 +2506,27 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             accumulate_trace_count(&mut bitswap_addr_mix, "dns", &value, "dns_addr_count");
             accumulate_trace_count(&mut bitswap_addr_mix, "ip4", &value, "ip4_addr_count");
             accumulate_trace_count(&mut bitswap_addr_mix, "ip6", &value, "ip6_addr_count");
+        }
+        if phase == "bitswap_dnsaddr_expand" || phase == "bitswap_dns_multiaddr_expand" {
+            bitswap_dns_expansion.events += 1;
+            if value.get("cached").and_then(|cached| cached.as_bool()) == Some(true) {
+                bitswap_dns_expansion.cached += 1;
+            } else {
+                bitswap_dns_expansion.uncached += 1;
+            }
+            if phase == "bitswap_dnsaddr_expand"
+                && value.get("ok").and_then(|ok| ok.as_bool()) == Some(false)
+            {
+                bitswap_dns_expansion.failed += 1;
+            }
+            bitswap_dns_expansion.records += value
+                .get("record_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            bitswap_dns_expansion.ips += value
+                .get("ip_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
         }
         let Some(elapsed_ms) = value.get("elapsed_ms").and_then(json_u128) else {
             continue;
@@ -2555,6 +2600,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_peer_fetches: sorted_trace_peers(bitswap_peer_fetches),
         trace_errors: sorted_trace_counts(trace_errors),
         bitswap_addr_mix: sorted_trace_counts(bitswap_addr_mix),
+        bitswap_dns_expansion,
         slow_cids: sorted_trace_cids(slow_cids),
     })
 }
@@ -2977,6 +3023,11 @@ mod tests {
                 "{\"phase\":\"provider_lookup\",\"elapsed_ms\":10,\"cid\":\"cid2\",\"provider_count\":3,\"error\":\"dht: timeout\"}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":12,\"cid\":\"cid6\",\"ok\":false}\n",
                 "{\"phase\":\"bitswap_peer_expand\",\"elapsed_ms\":3,\"cid\":\"cid7\",\"tcp_addr_count\":4,\"quic_addr_count\":2,\"ws_addr_count\":1,\"wss_addr_count\":0,\"dns_addr_count\":1,\"ip4_addr_count\":3,\"ip6_addr_count\":1}\n",
+                "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bootstrap.example\",\"cached\":false,\"ok\":true,\"record_count\":2}\n",
+                "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bootstrap.example\",\"cached\":true,\"ok\":true,\"record_count\":2}\n",
+                "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bad.example\",\"cached\":false,\"ok\":false,\"record_count\":0}\n",
+                "{\"phase\":\"bitswap_dns_multiaddr_expand\",\"host\":\"peer.example\",\"cached\":false,\"ip_count\":2}\n",
+                "{\"phase\":\"bitswap_dns_multiaddr_expand\",\"host\":\"peer.example\",\"cached\":true,\"ip_count\":2}\n",
                 "{\"phase\":\"unixfs_metadata_cache\",\"elapsed_ms\":0,\"hits\":3,\"misses\":2,\"inserts\":2,\"evictions\":1,\"oversized_skips\":0,\"cache_len\":4,\"cache_capacity\":256}\n",
                 "not json\n",
                 "{\"phase\":\"request_start\",\"path\":\"/ipns/site/\"}\n",
@@ -2989,8 +3040,8 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 11);
-        assert_eq!(summary.event_count, 10);
+        assert_eq!(summary.line_count, 16);
+        assert_eq!(summary.event_count, 15);
         assert_eq!(summary.slow_events.len(), 9);
         assert_eq!(
             summary.slow_events[0].phase,
@@ -3042,10 +3093,14 @@ mod tests {
         assert_eq!(summary.bitswap_peer_fetches[0].total_ms, 25);
         assert_eq!(summary.bitswap_peer_fetches[0].max_ms, 25);
         assert_eq!(summary.bitswap_peer_fetches[0].bytes, 100);
-        assert_eq!(summary.trace_errors.len(), 2);
-        assert_eq!(summary.trace_errors[0].value, "bitswap_fetch: ok=false");
+        assert_eq!(summary.trace_errors.len(), 3);
         assert_eq!(
-            summary.trace_errors[1].value,
+            summary.trace_errors[0].value,
+            "bitswap_dnsaddr_expand: ok=false"
+        );
+        assert_eq!(summary.trace_errors[1].value, "bitswap_fetch: ok=false");
+        assert_eq!(
+            summary.trace_errors[2].value,
             "provider_lookup: dht: timeout"
         );
         assert_eq!(summary.bitswap_addr_mix[0].value, "tcp");
@@ -3054,6 +3109,12 @@ mod tests {
         assert_eq!(summary.bitswap_addr_mix[1].count, 3);
         assert_eq!(summary.bitswap_addr_mix[2].value, "quic");
         assert_eq!(summary.bitswap_addr_mix[2].count, 2);
+        assert_eq!(summary.bitswap_dns_expansion.events, 5);
+        assert_eq!(summary.bitswap_dns_expansion.cached, 2);
+        assert_eq!(summary.bitswap_dns_expansion.uncached, 3);
+        assert_eq!(summary.bitswap_dns_expansion.failed, 1);
+        assert_eq!(summary.bitswap_dns_expansion.records, 4);
+        assert_eq!(summary.bitswap_dns_expansion.ips, 4);
         assert_eq!(summary.slow_cids[0].cid, "cid4");
         assert_eq!(summary.slow_cids[0].total_ms, 60);
         assert_eq!(summary.slow_cids[0].max_ms, 60);

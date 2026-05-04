@@ -82,6 +82,8 @@ and the report aggregates them as `bitswap_addr_mix` for transport policy work.
 UnixFS metadata-cache traces are also aggregated so reports show cache events,
 hits, misses, inserts, evictions, skip counts, maximum length, and capacity
 without manual JSONL greps.
+Bitswap DNS expansion traces are aggregated as well, including cached versus
+uncached expansion events, failed DNSAddr lookups, TXT records, and resolved IPs.
 The `slow_cids` list groups elapsed trace events by CID with phase and path
 counts, which helps separate a slow root from a slow child block. Successful
 Bitswap source peers are also summarized with count, total/max latency, and
