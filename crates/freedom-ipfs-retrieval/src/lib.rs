@@ -57,6 +57,10 @@ const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
 const BITSWAP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const BITSWAP_MAX_PENDING_OUTGOING_CONNECTIONS: u32 = 16;
 const BITSWAP_MAX_ESTABLISHED_CONNECTIONS: u32 = 16;
+// Keep one command from filling every pending outgoing dial slot. Page loads
+// often request child blocks immediately after the root, so preserving headroom
+// lets follow-on blocks dial instead of waiting behind stale public providers.
+const MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND: usize = 8;
 const MAX_BITSWAP_PEERS_PER_BLOCK: usize = 16;
 const MAX_BITSWAP_SESSION_PEERS: usize = 4;
 const MAX_BITSWAP_ADDRS_PER_PEER: usize = 4;
@@ -1143,10 +1147,8 @@ async fn run_shared_bitswap_swarm(
                 pending_incoming.entry(command.cid).or_default().push(incoming_result);
                 *pending_counts.entry(command.cid).or_default() += 1;
 
-                let mut peer_targets = Vec::new();
-                let mut dial_peers = Vec::new();
-                let mut connected_peer_count = 0usize;
-                let mut pending_dial_peer_count = 0usize;
+                let mut peer_plans = Vec::new();
+                let mut dial_candidates = Vec::new();
                 for peer in command.peers {
                     tracing::debug!(peer = %peer.id, addrs = ?peer.addrs, "adding bitswap peer");
                     let already_connected = connected_peers.contains_key(&peer.id);
@@ -1156,10 +1158,34 @@ async fn run_shared_bitswap_swarm(
                         &connected_peers,
                         &connection_waiters,
                     );
+                    for addr in &peer.addrs {
+                        swarm.add_peer_address(peer.id, addr.clone());
+                    }
+                    if should_dial {
+                        dial_candidates.push(peer.clone());
+                    }
+                    peer_plans.push((peer, already_connected, already_pending));
+                }
+                let (dial_addrs, suppressed_dial_addr_count) =
+                    limited_interleaved_bitswap_dials(&dial_candidates);
+                let scheduled_dial_peers = dial_addrs
+                    .iter()
+                    .map(|(peer, _)| *peer)
+                    .collect::<BTreeSet<_>>();
+                let candidate_dial_peer_count = dial_candidates.len();
+                let suppressed_dial_peer_count = dial_candidates
+                    .iter()
+                    .filter(|peer| !scheduled_dial_peers.contains(&peer.id))
+                    .count();
+                let mut peer_targets = Vec::new();
+                let mut connected_peer_count = 0usize;
+                let mut pending_dial_peer_count = 0usize;
+                let candidate_peer_count = peer_plans.len();
+                for (peer, already_connected, already_pending) in peer_plans {
                     let connection_ready = if already_connected {
                         connected_peer_count += 1;
                         None
-                    } else {
+                    } else if already_pending || scheduled_dial_peers.contains(&peer.id) {
                         if already_pending {
                             pending_dial_peer_count += 1;
                         }
@@ -1169,31 +1195,32 @@ async fn run_shared_bitswap_swarm(
                             .or_insert_with(Instant::now);
                         connection_waiters.entry(peer.id).or_default().push(ready);
                         Some(wait)
+                    } else {
+                        continue;
                     };
                     peer_targets.push(BitswapPeerTarget {
                         id: peer.id,
-                        addrs: peer.addrs.clone(),
+                        addrs: peer.addrs,
                         skip_want_have: peer.skip_want_have,
                         connection_ready,
                     });
-                    for addr in &peer.addrs {
-                        swarm.add_peer_address(peer.id, addr.clone());
-                    }
-                    if should_dial {
-                        dial_peers.push(peer);
-                    }
                 }
                 tracing::info!(
                     phase = "bitswap_dial_plan",
                     cid = %command.cid,
                     peer_count = peer_targets.len(),
-                    new_dial_peer_count = dial_peers.len(),
+                    candidate_peer_count,
+                    candidate_dial_peer_count,
+                    new_dial_peer_count = scheduled_dial_peers.len(),
+                    new_dial_addr_count = dial_addrs.len(),
+                    suppressed_dial_addr_count,
+                    suppressed_dial_peer_count,
                     pending_dial_peer_count,
                     connected_peer_count,
                     command_queued_ms
                 );
 
-                for (peer_id, addr) in interleaved_bitswap_dials(&dial_peers) {
+                for (peer_id, addr) in dial_addrs {
                     let dial_addr = addr.with_p2p(peer_id).unwrap_or_else(|addr| addr);
                     if let Err(err) = swarm.dial(dial_addr) {
                         let error_detail = format_error_detail(&err);
@@ -1613,6 +1640,20 @@ fn interleaved_bitswap_dials(peers: &[BitswapPeer]) -> Vec<(PeerId, Multiaddr)> 
         }
     }
     dials
+}
+
+fn limited_interleaved_bitswap_dials(peers: &[BitswapPeer]) -> (Vec<(PeerId, Multiaddr)>, usize) {
+    let all_dials = interleaved_bitswap_dials(peers);
+    let suppressed_dial_count = all_dials
+        .len()
+        .saturating_sub(MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND);
+    (
+        all_dials
+            .into_iter()
+            .take(MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND)
+            .collect(),
+        suppressed_dial_count,
+    )
 }
 
 #[derive(Default)]
@@ -2763,6 +2804,53 @@ mod bitswap_tests {
                 "/ip4/127.0.0.1/tcp/2001",
                 "/ip4/127.0.0.1/tcp/1002",
                 "/ip4/127.0.0.1/tcp/2002",
+            ]
+        );
+    }
+
+    #[test]
+    fn caps_bitswap_dial_addresses_per_command() {
+        let peer_ids = [
+            "12D3KooWLSFr3c4K1dxWavx5XFsUjeSXap3VPMuEbe28zeL5B1v3",
+            "12D3KooWGU3fJrHaWtRSWyrrzCpdgFX5bxbS69hqL1MSdKMGez12",
+            "12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP",
+            "12D3KooWGtYkBAaqJMJEmywMxaCiNP7LCEFUAFiLEBASe232c2VH",
+        ];
+        let peers = peer_ids
+            .iter()
+            .enumerate()
+            .map(|(index, peer)| BitswapPeer {
+                id: parse_peer_id(peer).unwrap(),
+                addrs: (1..=4)
+                    .map(|rank| {
+                        format!("/ip4/127.0.0.{}/tcp/{}", index + 1, 1000 + rank)
+                            .parse()
+                            .unwrap()
+                    })
+                    .collect(),
+                skip_want_have: false,
+            })
+            .collect::<Vec<_>>();
+
+        let (dials, suppressed) = limited_interleaved_bitswap_dials(&peers);
+        let addr_order = dials
+            .iter()
+            .map(|(_, addr)| addr.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(dials.len(), MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND);
+        assert_eq!(suppressed, 8);
+        assert_eq!(
+            addr_order,
+            vec![
+                "/ip4/127.0.0.1/tcp/1001",
+                "/ip4/127.0.0.2/tcp/1001",
+                "/ip4/127.0.0.3/tcp/1001",
+                "/ip4/127.0.0.4/tcp/1001",
+                "/ip4/127.0.0.1/tcp/1002",
+                "/ip4/127.0.0.2/tcp/1002",
+                "/ip4/127.0.0.3/tcp/1002",
+                "/ip4/127.0.0.4/tcp/1002",
             ]
         );
     }

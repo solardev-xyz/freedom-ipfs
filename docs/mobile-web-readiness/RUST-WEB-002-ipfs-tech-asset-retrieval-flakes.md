@@ -841,6 +841,81 @@ For the Rust gateway this should normally stay at zero. The field is most useful
 when paired with `--compare-kubo`, where resource comparisons should not hide
 extra worker processes behind a single parent PID.
 
+## 2026-05-04 Bitswap Dial Headroom Experiment
+
+Hypothesis: one Bitswap command was filling all 16 pending outgoing dial slots
+with speculative public-provider addresses, leaving immediate child-block
+requests unable to dial and forcing slow request-timeout retries.
+
+Baseline same-window command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/vitalik-rust-kubo-child-process-0e28390.json \
+  --trace-output /tmp/vitalik-rust-kubo-child-process-0e28390-trace.jsonl
+```
+
+Baseline result: Rust failed the cold range request with `504` after `32180ms`;
+Kubo passed in `1939ms`. The Rust trace had `54` `bitswap_dial_rejected`
+events from `PendingOutgoing` connection-limit denials before the child CID timed
+out twice.
+
+Experiment: cap scheduled Bitswap dial addresses per command at `8`, below the
+swarm's global pending-outgoing limit of `16`. Suppressed peers are not registered
+as connection waiters for that command. The dial plan now reports
+`candidate_peer_count`, `candidate_dial_peer_count`, `new_dial_addr_count`,
+`suppressed_dial_addr_count`, and `suppressed_dial_peer_count`.
+
+Focused Rust validation:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --output /tmp/vitalik-dial-cap-targeted-rust-r3.json \
+  --trace-output /tmp/vitalik-dial-cap-targeted-rust-r3-trace.jsonl
+```
+
+```text
+passed=3 failed=0 pass_rate=100.0%
+root_ttfb p50=1519ms max=1944ms
+bitswap_dial_rejected=0
+bitswap_request_timeout=0
+```
+
+Same-window Kubo comparison:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/vitalik-rust-kubo-dial-cap-targeted.json \
+  --trace-output /tmp/vitalik-rust-kubo-dial-cap-targeted-trace.jsonl
+```
+
+```text
+rust passed=true ttfb=1135ms rss=37376KiB fds=29 children=0
+kubo passed=true ttfb=2020ms rss=117420KiB fds=85 children=0
+root_ttfb_ratio=0.56x
+bitswap_dial_rejected=0
+bitswap_request_timeout=0
+```
+
+Decision: keep. This is a mobile-resource-friendly reliability improvement and
+the trace proves it removes pending-dial-limit churn. It does not eliminate all
+remaining tail latency; future experiments should tune provider/session
+selection and retry timing.
+
 ## 2026-05-04 Multi-Want Groundwork
 
 Priority 1 in the long-running roadmap is bounded Bitswap multi-want batching.
