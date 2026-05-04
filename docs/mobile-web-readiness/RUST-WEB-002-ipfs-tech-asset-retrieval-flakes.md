@@ -1016,6 +1016,28 @@ asset fetches under page concurrency: pass rate dropped to `2/3`, one run took
 The next version needs fair queuing or session-aware peer selection, not a blunt
 global dial-address cap.
 
+Rejected follow-up: exact `(root CID, UnixFS path)` gateway resource metadata
+cache.
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --output /tmp/ipfs-tech-resource-cache-r3.json \
+  --trace-output /tmp/ipfs-tech-resource-cache-r3-trace.jsonl
+```
+
+Result: not useful for this workload. The run landed in a bad provider window
+and failed `0/3`, but the important finding is diagnostic: the new
+`unixfs_resource_cache` trace saw only three root-path misses and no useful hits.
+The repeated work in `ipfs-tech` is not mostly exact duplicate path resolution;
+it is repeated directory/root decoding across many different asset paths.
+Decision: revert. A useful metadata cache needs to live at the decoded DAG-PB /
+directory-entry level or in UnixFS path traversal, not only at the final gateway
+resource result.
+
 ## 2026-05-04 Multi-Want Groundwork
 
 Priority 1 in the long-running roadmap is bounded Bitswap multi-want batching.
