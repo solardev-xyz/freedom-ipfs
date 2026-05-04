@@ -68,6 +68,10 @@ const MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND: usize = 8;
 const MAX_BITSWAP_PEERS_PER_BLOCK: usize = 16;
 const MAX_BITSWAP_SESSION_PEERS: usize = 4;
 const MAX_BITSWAP_ADDRS_PER_PEER: usize = 2;
+// Race a small number of untrusted providers with WANT_BLOCK before falling
+// back to conservative WANT_HAVE probes for the rest. This lowers page-asset
+// tails without requesting every block from every provider candidate.
+const MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS: usize = 2;
 const MAX_BITSWAP_FAILURE_DETAILS: usize = 8;
 const MAX_RECORDED_DIAL_ERRORS_PER_PEER: usize = 6;
 const MAX_INFLIGHT_BLOCK_FETCHES: usize = 256;
@@ -2217,8 +2221,15 @@ async fn fetch_bitswap_over_outgoing_streams(
     let mut attempts = FuturesUnordered::new();
     let has_multiple_peers = peers.len() > 1;
     let target_summary = format_bitswap_targets(&peers);
+    let mut direct_untrusted_want_block_count = 0usize;
     for peer in peers {
-        let prefer_want_have = has_multiple_peers && !peer.skip_want_have;
+        let direct_untrusted_want_block = !peer.skip_want_have
+            && direct_untrusted_want_block_count < MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS;
+        if !peer.skip_want_have {
+            direct_untrusted_want_block_count += 1;
+        }
+        let prefer_want_have =
+            has_multiple_peers && !peer.skip_want_have && !direct_untrusted_want_block;
         attempts.push(request_bitswap_block_after_connection(
             control.clone(),
             peer,
@@ -3570,11 +3581,13 @@ mod bitswap_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn multi_peer_bitswap_uses_want_have_before_want_block() {
+    async fn multi_peer_bitswap_directs_first_untrusted_then_uses_want_have() {
         let data = b"want-have selected block";
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
-        let (missing_peer_id, missing_addr, missing_swarm, missing_stream) =
-            spawn_want_have_bitswap_peer(cid, data.to_vec(), false).await;
+        let (first_peer_id, first_addr, first_swarm, first_stream) =
+            spawn_closing_bitswap_peer_expect_want_block(cid).await;
+        let (second_peer_id, second_addr, second_swarm, second_stream) =
+            spawn_closing_bitswap_peer_expect_want_block(cid).await;
         let (present_peer_id, present_addr, present_swarm, present_stream) =
             spawn_want_have_bitswap_peer_with_presence_delay(
                 cid,
@@ -3591,8 +3604,13 @@ mod bitswap_tests {
         );
         let providers = vec![
             Provider::from_parts(
-                Some(missing_peer_id.to_string()),
-                vec![missing_addr.to_string()],
+                Some(first_peer_id.to_string()),
+                vec![first_addr.to_string()],
+            )
+            .unwrap(),
+            Provider::from_parts(
+                Some(second_peer_id.to_string()),
+                vec![second_addr.to_string()],
             )
             .unwrap(),
             Provider::from_parts(
@@ -3609,7 +3627,11 @@ mod bitswap_tests {
 
         assert_eq!(source, RetrievalSource::Bitswap);
         assert_eq!(block.data(), data);
-        tokio::time::timeout(Duration::from_secs(5), missing_stream)
+        tokio::time::timeout(Duration::from_secs(5), first_stream)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), second_stream)
             .await
             .unwrap()
             .unwrap();
@@ -3617,7 +3639,8 @@ mod bitswap_tests {
             .await
             .unwrap()
             .unwrap();
-        missing_swarm.abort();
+        first_swarm.abort();
+        second_swarm.abort();
         present_swarm.abort();
     }
 
@@ -3625,6 +3648,10 @@ mod bitswap_tests {
     async fn want_have_probe_falls_back_to_want_block_quickly() {
         let data = b"want-have timeout fallback block";
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
+        let (first_peer_id, first_addr, first_swarm, first_stream) =
+            spawn_closing_bitswap_peer_expect_want_block(cid).await;
+        let (second_peer_id, second_addr, second_swarm, second_stream) =
+            spawn_closing_bitswap_peer_expect_want_block(cid).await;
         let (missing_peer_id, missing_addr, missing_swarm, missing_stream) =
             spawn_want_have_bitswap_peer(cid, data.to_vec(), false).await;
         let (present_peer_id, present_addr, present_swarm, present_stream) =
@@ -3636,6 +3663,16 @@ mod bitswap_tests {
             store.clone(),
         );
         let providers = vec![
+            Provider::from_parts(
+                Some(first_peer_id.to_string()),
+                vec![first_addr.to_string()],
+            )
+            .unwrap(),
+            Provider::from_parts(
+                Some(second_peer_id.to_string()),
+                vec![second_addr.to_string()],
+            )
+            .unwrap(),
             Provider::from_parts(
                 Some(missing_peer_id.to_string()),
                 vec![missing_addr.to_string()],
@@ -3660,6 +3697,14 @@ mod bitswap_tests {
             started.elapsed() < Duration::from_secs(4),
             "WANT_HAVE fallback should not add seconds to TTFB"
         );
+        tokio::time::timeout(Duration::from_secs(5), first_stream)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), second_stream)
+            .await
+            .unwrap()
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(5), missing_stream)
             .await
             .unwrap()
@@ -3668,6 +3713,8 @@ mod bitswap_tests {
             .await
             .unwrap()
             .unwrap();
+        first_swarm.abort();
+        second_swarm.abort();
         missing_swarm.abort();
         present_swarm.abort();
     }
@@ -4006,7 +4053,7 @@ mod bitswap_tests {
         let data = b"session peer candidate block";
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
         let (missing_peer_id, missing_addr, missing_swarm, missing_stream) =
-            spawn_want_have_bitswap_peer(cid, data.to_vec(), false).await;
+            spawn_closing_bitswap_peer_expect_want_block(cid).await;
         let (session_peer_id, session_addr, session_swarm, session_stream) =
             spawn_local_bitswap_peer(cid, data.to_vec()).await;
 
@@ -4032,10 +4079,7 @@ mod bitswap_tests {
         assert_eq!(source, RetrievalSource::Bitswap);
         assert_eq!(block.data(), data);
         assert_eq!(store.get(&cid).unwrap().unwrap().data(), data);
-        tokio::time::timeout(Duration::from_secs(5), missing_stream)
-            .await
-            .unwrap()
-            .unwrap();
+        missing_stream.abort();
         tokio::time::timeout(Duration::from_secs(5), session_stream)
             .await
             .unwrap()
@@ -4726,6 +4770,59 @@ mod bitswap_tests {
         tokio::task::JoinHandle<()>,
     ) {
         spawn_want_have_bitswap_peer_with_presence_delay(cid, data, true, None).await
+    }
+
+    async fn spawn_closing_bitswap_peer_expect_want_block(
+        cid: Cid,
+    ) -> (
+        PeerId,
+        Multiaddr,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut swarm = SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                (tls::Config::new, noise::Config::new),
+                yamux::Config::default,
+            )
+            .unwrap()
+            .with_behaviour(|_| libp2p_stream::Behaviour::new())
+            .unwrap()
+            .build();
+        let peer_id = *swarm.local_peer_id();
+        let mut control = swarm.behaviour().new_control();
+        let mut incoming = control
+            .accept(StreamProtocol::new("/ipfs/bitswap/1.2.0"))
+            .unwrap();
+        swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let addr = loop {
+            if let libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } =
+                swarm.select_next_some().await
+            {
+                break address;
+            }
+        };
+
+        let swarm_task = tokio::spawn(async move {
+            loop {
+                let _ = swarm.select_next_some().await;
+            }
+        });
+        let stream_task = tokio::spawn(async move {
+            let (_peer, mut stream) = incoming.next().await.unwrap();
+            let want_bytes = read_length_prefixed(&mut stream, 1024).await.unwrap();
+            let want = BitswapMessage::decode(want_bytes.as_slice()).unwrap();
+            let entry = want.wantlist.unwrap().entries.remove(0);
+            assert_eq!(entry.block, cid.to_bytes());
+            assert_eq!(entry.want_type, WantType::Block as i32);
+            assert!(!entry.cancel);
+        });
+
+        (peer_id, addr, swarm_task, stream_task)
     }
 
     async fn spawn_want_have_bitswap_peer_with_presence_delay(

@@ -2340,3 +2340,93 @@ startup in this window, but the active gap is asset p95 versus Kubo, and the
 same-window recheck showed worse Rust asset p50/p95 at `500ms`. Future
 WANT_HAVE work should compare direct WANT_BLOCK or batched session requests,
 not just trim this timeout.
+
+## Kept Direct WANT_BLOCK For Two Untrusted Providers
+
+Hypothesis: the remaining `ipfs.tech` asset p95 gap is caused by spending one
+`WANT_HAVE` probe round trip on all unknown provider peers. Racing a small
+number of unknown providers with direct `WANT_BLOCK` should reduce page-asset
+tails while keeping the rest of the provider set conservative and bounded.
+
+Temporary experiment with at most two unknown provider peers using direct
+`WANT_BLOCK`; later unknown peers still use `WANT_HAVE`:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/ipfs-tech-direct-two-want-block-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-direct-two-want-block-kubo-r3-trace.jsonl
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root TTFB p50/p95 was
+`707/746ms`; Kubo was `1321/1392ms`, so Rust was `0.54x` Kubo on root startup.
+Rust asset TTFB p50/p95 was `251/1092ms`; Kubo was `88/203ms`. That is still
+slower than Kubo for small assets, but materially better than the current cap-2
+baseline asset p95 of `2408ms` and the same-window `750ms` WANT_HAVE recheck at
+`1509ms`. Rust stayed small: max RSS/FD `54432KiB`/`45` versus Kubo
+`127692KiB`/`50`.
+
+Control with only one unknown direct `WANT_BLOCK`:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/ipfs-tech-direct-one-want-block-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-direct-one-want-block-kubo-r3-trace.jsonl
+```
+
+Result: Rust and Kubo both passed `3/3`, and Rust root startup was fast
+(`653/744ms` p50/p95 versus Kubo `1447/1794ms`), but Rust asset p95 regressed
+to `3159ms` versus Kubo `327ms`. Decision: reject direct `1`; it does not give
+enough parallelism to collapse the asset tail.
+
+Regression checks:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/vitalik-direct-two-want-block-r3.json \
+  --trace-output /tmp/vitalik-direct-two-want-block-r3-trace.jsonl
+
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case daicowtf-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/daicowtf-direct-two-want-block-kubo-r1.json \
+  --trace-output /tmp/daicowtf-direct-two-want-block-kubo-r1-trace.jsonl
+```
+
+`vitalik-root-html-range` passed `3/3` with root TTFB p50/p95/max
+`6062/6441/6441ms`, max RSS `39168KiB`, and max FD count `35`; the trace still
+showed `3` request timeouts with trusted peers on a child CID, so keep watching
+that path in later sessions. `daicowtf-page-assets` failed for both Rust and
+Kubo in the same network window: Rust root TTFB was `30990ms`, Kubo was
+`30003ms`, and Rust stayed smaller at max RSS/FD `45184KiB`/`17` versus Kubo
+`144428KiB`/`181`. That failure remains a sparse/stale public provider problem,
+not a Rust-only regression from this change.
+
+Decision: keep direct `WANT_BLOCK` for the first two untrusted provider peers.
+It improves the active `ipfs.tech` asset tail without adding public gateway
+fallback, serving unverifiable data, or broadening the full peer/address fanout.
+Continue testing this against provider-sparse pages and consider a future
+adaptive rule that raises or lowers the direct count based on observed provider
+quality.
