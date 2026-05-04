@@ -636,3 +636,60 @@ slowest block_fetch_total: 3595ms source=bitswap
 
 This makes future live runs much easier to triage: the report points directly at
 the slow URL/CID pair instead of requiring manual trace greps.
+
+Secondary same-window checks:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --output /tmp/daicowtf-current-ab83a70.json \
+  --trace-output /tmp/daicowtf-current-ab83a70-trace.jsonl
+```
+
+```text
+branch ab83a70: passed=1 failed=2 pass_rate=33.3%
+root_ttfb p50=10920ms p95=30938ms max=30938ms
+slowest failed block: bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u
+slow-event finding: one run had provider_lookup DHT timeout; one had provider_count=0; one one-peer Bitswap attempt timed out after 10009ms
+```
+
+The same command on canonical `origin/main` in the same network window failed
+0/3 with the same root `504` shape:
+
+```text
+main 113d2d9: passed=0 failed=3 pass_rate=0.0%
+root_ttfb p50=10949ms p95=30984ms max=30984ms
+```
+
+Conclusion: this `daicowtf` sample was not evidence of a regression from the
+branch. It is a useful provider-quality failure sample for the next lab: the
+slow CID had sparse/stale providers and light-DHT fallback did not recover it in
+that window.
+
+The exact branch also passed the `vitalik` range case while proving the new
+timeout diagnostic:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --output /tmp/vitalik-current-ab83a70.json \
+  --trace-output /tmp/vitalik-current-ab83a70-trace.jsonl
+```
+
+```text
+passed=3 failed=0 pass_rate=100.0%
+root_ttfb p50=1782ms p95=16994ms max=16994ms
+bitswap_request_timeout_detail count=1
+bitswap_dial_plan count=7
+command_queued_ms p50=0ms p90=0ms max=0ms
+```
+
+The `vitalik` timeout detail showed 16 candidate peers, zero trusted/session
+peers, and 0ms command queue time. That makes the remaining tail look like peer
+quality / Bitswap session behavior, not shared-swarm command starvation.
