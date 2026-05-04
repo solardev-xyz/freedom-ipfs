@@ -816,6 +816,31 @@ In that run, successful peer fetches were fast; the tail came from a separate
 timeout path for the same child CID. That is exactly the split future session
 experiments need to see.
 
+The harness now records direct child process counts for spawned gateways on
+Linux, which keeps Kubo comparisons honest about process shape as well as RSS,
+FD count, and storage:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --output /tmp/vitalik-child-process-count.json \
+  --trace-output /tmp/vitalik-child-process-count-trace.jsonl
+```
+
+```text
+passed=1 failed=0 pass_rate=100.0%
+gateway_child_process_count=0
+gateway_fd_count=34
+gateway_rss_kib=39296
+```
+
+For the Rust gateway this should normally stay at zero. The field is most useful
+when paired with `--compare-kubo`, where resource comparisons should not hide
+extra worker processes behind a single parent PID.
+
 ## 2026-05-04 Multi-Want Groundwork
 
 Priority 1 in the long-running roadmap is bounded Bitswap multi-want batching.

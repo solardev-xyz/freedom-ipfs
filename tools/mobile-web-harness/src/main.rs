@@ -268,6 +268,13 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
                 .as_ref()
                 .and_then(SpawnedGateway::fd_count)
         };
+        let gateway_child_process_count = if let Some(gateway) = run_gateway.as_ref() {
+            gateway.child_process_count()
+        } else {
+            persistent_gateway
+                .as_ref()
+                .and_then(SpawnedGateway::child_process_count)
+        };
         let gateway_storage_bytes = if let Some(gateway) = run_gateway.as_ref() {
             gateway.storage_bytes()
         } else {
@@ -290,6 +297,7 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             elapsed_ms,
             gateway_rss_kib,
             gateway_fd_count,
+            gateway_child_process_count,
             gateway_storage_bytes,
             gateway_storage_path,
             passed,
@@ -618,12 +626,16 @@ fn print_summary(report: &RunReport) {
                 .gateway_fd_count
                 .map(|fds| format!(" fds={fds}"))
                 .unwrap_or_default();
+            let children = run
+                .gateway_child_process_count
+                .map(|children| format!(" children={children}"))
+                .unwrap_or_default();
             let storage = run
                 .gateway_storage_bytes
                 .map(|bytes| format!(" storage={}B", bytes))
                 .unwrap_or_default();
             println!(
-                "{mark} measured run {:02} total={}ms{rss}{fds}{storage}",
+                "{mark} measured run {:02} total={}ms{rss}{fds}{children}{storage}",
                 run.run_index, run.elapsed_ms
             );
         }
@@ -1700,6 +1712,11 @@ impl SpawnedGateway {
         child_fd_count(pid)
     }
 
+    fn child_process_count(&self) -> Option<usize> {
+        let pid = self.child.id()?;
+        child_process_count(pid)
+    }
+
     fn storage_bytes(&self) -> Option<u64> {
         self.storage_path
             .as_ref()
@@ -1735,6 +1752,36 @@ fn child_fd_count(pid: u32) -> Option<usize> {
 #[cfg(not(target_os = "linux"))]
 fn child_fd_count(_pid: u32) -> Option<usize> {
     None
+}
+
+#[cfg(target_os = "linux")]
+fn child_process_count(parent_pid: u32) -> Option<usize> {
+    let mut count = 0usize;
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let entry = entry.ok()?;
+        let file_name = entry.file_name();
+        let pid = file_name.to_string_lossy();
+        if !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+        if parse_proc_stat_ppid(&stat) == Some(parent_pid) {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn child_process_count(_parent_pid: u32) -> Option<usize> {
+    None
+}
+
+fn parse_proc_stat_ppid(stat: &str) -> Option<u32> {
+    let after_name = stat.rsplit_once(") ")?;
+    let mut fields = after_name.1.split_whitespace();
+    let _state = fields.next()?;
+    fields.next()?.parse().ok()
 }
 
 fn log_child_lines<R>(prefix: &'static str, stream: R) -> JoinHandle<()>
@@ -1929,6 +1976,7 @@ struct RunResult {
     elapsed_ms: u128,
     gateway_rss_kib: Option<u64>,
     gateway_fd_count: Option<usize>,
+    gateway_child_process_count: Option<usize>,
     gateway_storage_bytes: Option<u64>,
     gateway_storage_path: Option<String>,
     passed: bool,
@@ -1963,6 +2011,8 @@ struct ComparisonCase {
     rust_max_rss_kib: Option<u64>,
     kubo_max_rss_kib: Option<u64>,
     rss_ratio: Option<f64>,
+    rust_max_child_process_count: Option<usize>,
+    kubo_max_child_process_count: Option<usize>,
     rust_max_storage_bytes: Option<u64>,
     kubo_max_storage_bytes: Option<u64>,
     storage_ratio: Option<f64>,
@@ -1988,6 +2038,10 @@ impl ComparisonCase {
                 let kubo_case = kubo.summary.cases.iter().find(|case| case.id == id)?;
                 let rust_max_rss_kib = max_run_u64(&rust.runs, |run| run.gateway_rss_kib);
                 let kubo_max_rss_kib = max_run_u64(&kubo.runs, |run| run.gateway_rss_kib);
+                let rust_max_child_process_count =
+                    max_run_usize(&rust.runs, |run| run.gateway_child_process_count);
+                let kubo_max_child_process_count =
+                    max_run_usize(&kubo.runs, |run| run.gateway_child_process_count);
                 let rust_max_storage_bytes =
                     max_run_u64(&rust.runs, |run| run.gateway_storage_bytes);
                 let kubo_max_storage_bytes =
@@ -2023,6 +2077,8 @@ impl ComparisonCase {
                     rust_max_rss_kib,
                     kubo_max_rss_kib,
                     rss_ratio: ratio_u64(rust_max_rss_kib, kubo_max_rss_kib),
+                    rust_max_child_process_count,
+                    kubo_max_child_process_count,
                     rust_max_storage_bytes,
                     kubo_max_storage_bytes,
                     storage_ratio: ratio_u64(rust_max_storage_bytes, kubo_max_storage_bytes),
@@ -2035,6 +2091,13 @@ impl ComparisonCase {
 fn max_run_u64<F>(runs: &[RunResult], mut value: F) -> Option<u64>
 where
     F: FnMut(&RunResult) -> Option<u64>,
+{
+    runs.iter().filter_map(&mut value).max()
+}
+
+fn max_run_usize<F>(runs: &[RunResult], mut value: F) -> Option<usize>
+where
+    F: FnMut(&RunResult) -> Option<usize>,
 {
     runs.iter().filter_map(&mut value).max()
 }
@@ -2823,6 +2886,19 @@ impl ParsedTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_linux_proc_stat_parent_pid() {
+        assert_eq!(
+            parse_proc_stat_ppid("12345 (freedom-ipfs) S 42 1 1 0 -1 4194560"),
+            Some(42)
+        );
+        assert_eq!(
+            parse_proc_stat_ppid("12345 (name with spaces) R 4242 1 1 0"),
+            Some(4242)
+        );
+        assert_eq!(parse_proc_stat_ppid("not a stat line"), None);
+    }
 
     #[test]
     fn trace_summary_includes_slowest_events_with_details() {
