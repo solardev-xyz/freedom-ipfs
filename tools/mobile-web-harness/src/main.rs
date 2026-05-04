@@ -2307,10 +2307,12 @@ fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
         "status",
         "provider_count",
         "peer_count",
+        "trusted_peer_count",
         "bytes",
         "cache_hit",
         "request_id",
         "command_queued_ms",
+        "targets",
     ] {
         if let Some(detail) = json_detail_string(value.get(key)) {
             details.insert(key.to_string(), detail);
@@ -2593,6 +2595,7 @@ mod tests {
                 "not json\n",
                 "{\"phase\":\"request_start\",\"path\":\"/ipns/site/\"}\n",
                 "{\"phase\":\"unixfs_file_size\",\"elapsed_ms\":50,\"cid\":\"cid3\",\"unixfs_path\":\"index.html\",\"ok\":true}\n",
+                "{\"phase\":\"bitswap_request_timeout_detail\",\"elapsed_ms\":60,\"cid\":\"cid4\",\"peer_count\":16,\"trusted_peer_count\":2,\"targets\":\"peer@[/ip4/127.0.0.1/tcp/4001]\"}\n",
             ),
         )
         .unwrap();
@@ -2600,24 +2603,37 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 5);
-        assert_eq!(summary.event_count, 4);
-        assert_eq!(summary.slow_events.len(), 3);
-        assert_eq!(summary.slow_events[0].phase, "unixfs_file_size");
-        assert_eq!(summary.slow_events[0].elapsed_ms, 50);
+        assert_eq!(summary.line_count, 6);
+        assert_eq!(summary.event_count, 5);
+        assert_eq!(summary.slow_events.len(), 4);
         assert_eq!(
-            summary.slow_events[0].details.get("unixfs_path"),
+            summary.slow_events[0].phase,
+            "bitswap_request_timeout_detail"
+        );
+        assert_eq!(summary.slow_events[0].elapsed_ms, 60);
+        assert_eq!(
+            summary.slow_events[0].details.get("trusted_peer_count"),
+            Some(&"2".to_string())
+        );
+        assert_eq!(
+            summary.slow_events[0].details.get("targets"),
+            Some(&"peer@[/ip4/127.0.0.1/tcp/4001]".to_string())
+        );
+        assert_eq!(summary.slow_events[1].phase, "unixfs_file_size");
+        assert_eq!(summary.slow_events[1].elapsed_ms, 50);
+        assert_eq!(
+            summary.slow_events[1].details.get("unixfs_path"),
             Some(&"index.html".to_string())
         );
-        assert_eq!(summary.slow_events[1].phase, "bitswap_fetch");
+        assert_eq!(summary.slow_events[2].phase, "bitswap_fetch");
         assert_eq!(
-            summary.slow_events[1].details.get("path"),
+            summary.slow_events[2].details.get("path"),
             Some(&"/ipns/site/asset.js".to_string())
         );
         assert_eq!(
-            summary.slow_events[1].details.get("request_id"),
+            summary.slow_events[2].details.get("request_id"),
             Some(&"9".to_string())
         );
-        assert_eq!(summary.phases.len(), 3);
+        assert_eq!(summary.phases.len(), 4);
     }
 }

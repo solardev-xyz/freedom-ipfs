@@ -69,9 +69,9 @@ The spawned gateway uses a trace-friendly filter by default whenever
 events. Use `--trace-filter` only when intentionally overriding the default.
 The trace summary also includes a bounded `slow_events` list with the slowest
 elapsed trace events and useful fields such as CID, path, source, provider
-count, peer count, request ID, and source peer. The console output prints the
-top slow events so optimization runs immediately show which URL/CID caused the
-tail.
+count, peer count, trusted/session peer count, request ID, source peer, and
+bounded target summaries. The console output prints the top slow events so
+optimization runs immediately show which URL/CID caused the tail.
 
 The harness can also spawn Kubo as a comparison engine when a Kubo `ipfs`
 binary is available:

@@ -1081,6 +1081,7 @@ impl SharedBitswapClient {
             .await
             .map_err(|_| RetrievalError::Bitswap("shared bitswap swarm stopped".into()))?;
 
+        let wait_started = Instant::now();
         match timeout(BITSWAP_REQUEST_TIMEOUT, response).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => Err(RetrievalError::Bitswap(
@@ -1092,6 +1093,7 @@ impl SharedBitswapClient {
                     cid = %cid,
                     peer_count,
                     trusted_peer_count,
+                    elapsed_ms = wait_started.elapsed().as_millis(),
                     targets = %target_summary.as_deref().unwrap_or("")
                 );
                 Err(RetrievalError::BitswapTimeout)

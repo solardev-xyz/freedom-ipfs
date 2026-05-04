@@ -691,5 +691,8 @@ command_queued_ms p50=0ms p90=0ms max=0ms
 ```
 
 The `vitalik` timeout detail showed 16 candidate peers, zero trusted/session
-peers, and 0ms command queue time. That makes the remaining tail look like peer
-quality / Bitswap session behavior, not shared-swarm command starvation.
+peers, and 0ms command queue time. Follow-up instrumentation adds elapsed timing
+to `bitswap_request_timeout_detail` and lets the harness slow-event summary keep
+trusted peer count plus a bounded target summary. That makes the remaining tail
+look like peer quality / Bitswap session behavior, not shared-swarm command
+starvation.
