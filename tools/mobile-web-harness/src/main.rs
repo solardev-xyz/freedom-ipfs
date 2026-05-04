@@ -531,6 +531,18 @@ fn print_summary(report: &RunReport) {
                 phase.phase, phase.count, phase.total_ms, phase.elapsed_ms
             );
         }
+        if !trace.block_sources.is_empty() {
+            println!(
+                "  block sources: {}",
+                format_trace_counts(&trace.block_sources)
+            );
+        }
+        if !trace.bitswap_source_peers.is_empty() {
+            println!(
+                "  bitswap source peers: {}",
+                format_trace_counts(&trace.bitswap_source_peers)
+            );
+        }
         if !trace.slow_events.is_empty() {
             println!("  slow events:");
             for event in trace.slow_events.iter().take(8) {
@@ -2208,6 +2220,8 @@ struct TraceSummary {
     event_count: usize,
     phases: Vec<TracePhaseAggregate>,
     slow_events: Vec<TraceSlowEvent>,
+    block_sources: Vec<TraceValueCount>,
+    bitswap_source_peers: Vec<TraceValueCount>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2225,6 +2239,12 @@ struct TraceSlowEvent {
     details: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Serialize)]
+struct TraceValueCount {
+    value: String,
+    count: usize,
+}
+
 fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read trace output {}", path.display()))?;
@@ -2232,6 +2252,8 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut event_count = 0usize;
     let mut phases = BTreeMap::<String, Vec<u128>>::new();
     let mut slow_events = Vec::<TraceSlowEvent>::new();
+    let mut block_sources = BTreeMap::<String, usize>::new();
+    let mut bitswap_source_peers = BTreeMap::<String, usize>::new();
 
     for line in text.lines() {
         line_count += 1;
@@ -2242,6 +2264,16 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             continue;
         };
         event_count += 1;
+        if phase == "block_fetch_total" {
+            if let Some(source) = value.get("source").and_then(|source| source.as_str()) {
+                *block_sources.entry(source.to_string()).or_default() += 1;
+            }
+        }
+        if phase == "bitswap_fetch" && value.get("ok").and_then(|ok| ok.as_bool()) == Some(true) {
+            if let Some(peer) = value.get("source_peer").and_then(|peer| peer.as_str()) {
+                *bitswap_source_peers.entry(peer.to_string()).or_default() += 1;
+            }
+        }
         let Some(elapsed_ms) = value.get("elapsed_ms").and_then(json_u128) else {
             continue;
         };
@@ -2289,7 +2321,33 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         event_count,
         phases,
         slow_events,
+        block_sources: sorted_trace_counts(block_sources),
+        bitswap_source_peers: sorted_trace_counts(bitswap_source_peers),
     })
+}
+
+fn sorted_trace_counts(counts: BTreeMap<String, usize>) -> Vec<TraceValueCount> {
+    let mut values = counts
+        .into_iter()
+        .map(|(value, count)| TraceValueCount { value, count })
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    values.truncate(MAX_TRACE_SLOW_EVENTS);
+    values
+}
+
+fn format_trace_counts(counts: &[TraceValueCount]) -> String {
+    counts
+        .iter()
+        .take(8)
+        .map(|entry| format!("{}={}", entry.value, entry.count))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
@@ -2590,7 +2648,9 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":\"25\",\"cid\":\"cid1\",\"source\":\"bitswap\",\"source_peer\":\"peer1\",\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9}}\n",
+                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":\"25\",\"cid\":\"cid1\",\"ok\":true,\"source\":\"bitswap\",\"source_peer\":\"peer1\",\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9}}\n",
+                "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":5,\"cid\":\"cid1\",\"source\":\"bitswap\"}\n",
+                "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":4,\"cid\":\"cid5\",\"source\":\"cache\"}\n",
                 "{\"phase\":\"provider_lookup\",\"elapsed_ms\":10,\"cid\":\"cid2\",\"provider_count\":3}\n",
                 "not json\n",
                 "{\"phase\":\"request_start\",\"path\":\"/ipns/site/\"}\n",
@@ -2603,9 +2663,9 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 6);
-        assert_eq!(summary.event_count, 5);
-        assert_eq!(summary.slow_events.len(), 4);
+        assert_eq!(summary.line_count, 8);
+        assert_eq!(summary.event_count, 7);
+        assert_eq!(summary.slow_events.len(), 6);
         assert_eq!(
             summary.slow_events[0].phase,
             "bitswap_request_timeout_detail"
@@ -2634,6 +2694,13 @@ mod tests {
             summary.slow_events[2].details.get("request_id"),
             Some(&"9".to_string())
         );
-        assert_eq!(summary.phases.len(), 4);
+        assert_eq!(summary.phases.len(), 5);
+        assert_eq!(summary.block_sources.len(), 2);
+        assert_eq!(summary.block_sources[0].value, "bitswap");
+        assert_eq!(summary.block_sources[0].count, 1);
+        assert_eq!(summary.block_sources[1].value, "cache");
+        assert_eq!(summary.bitswap_source_peers.len(), 1);
+        assert_eq!(summary.bitswap_source_peers[0].value, "peer1");
+        assert_eq!(summary.bitswap_source_peers[0].count, 1);
     }
 }

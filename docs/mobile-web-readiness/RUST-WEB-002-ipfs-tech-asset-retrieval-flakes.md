@@ -696,3 +696,26 @@ to `bitswap_request_timeout_detail` and lets the harness slow-event summary keep
 trusted peer count plus a bounded target summary. That makes the remaining tail
 look like peer quality / Bitswap session behavior, not shared-swarm command
 starvation.
+
+The trace summary now also aggregates block source and successful Bitswap source
+peer counts for provider/session experiments:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --output /tmp/vitalik-trace-aggregation.json \
+  --trace-output /tmp/vitalik-trace-aggregation-trace.jsonl
+```
+
+```text
+passed=1 failed=0 pass_rate=100.0%
+root_ttfb p50=1495ms max=1495ms
+block sources: bitswap=2
+bitswap source peers: 12D3KooWHoyPRFHDVesYiActeZtUmqQPaJHdSw2qGJTMi3YejoJ4=2
+```
+
+This gives later content-root session experiments an automatic signal for source
+peer reuse instead of requiring manual trace parsing.

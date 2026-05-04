@@ -71,7 +71,10 @@ The trace summary also includes a bounded `slow_events` list with the slowest
 elapsed trace events and useful fields such as CID, path, source, provider
 count, peer count, trusted/session peer count, request ID, source peer, and
 bounded target summaries. The console output prints the top slow events so
-optimization runs immediately show which URL/CID caused the tail.
+optimization runs immediately show which URL/CID caused the tail. Reports also
+include `block_sources` and `bitswap_source_peers` counts, which help quantify
+cache/Bitswap/HTTP-provider mix and peer reuse during provider/session
+experiments.
 
 The harness can also spawn Kubo as a comparison engine when a Kubo `ipfs`
 binary is available:
