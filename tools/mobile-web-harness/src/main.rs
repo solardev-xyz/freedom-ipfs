@@ -17,6 +17,7 @@ const DEFAULT_CORPUS: &str = "tools/mobile-web-harness/corpus/mobile-web.json";
 const DEFAULT_KUBO_BIN: &str = "target/tools/kubo/kubo/ipfs";
 const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 const DEFAULT_ASSET_CONCURRENCY: usize = 6;
+const MAX_TRACE_SLOW_EVENTS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -529,6 +530,22 @@ fn print_summary(report: &RunReport) {
                 "  phase {}: count={} total={}ms latency={}",
                 phase.phase, phase.count, phase.total_ms, phase.elapsed_ms
             );
+        }
+        if !trace.slow_events.is_empty() {
+            println!("  slow events:");
+            for event in trace.slow_events.iter().take(8) {
+                let details = event
+                    .details
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if details.is_empty() {
+                    println!("    {}: {}ms", event.phase, event.elapsed_ms);
+                } else {
+                    println!("    {}: {}ms {}", event.phase, event.elapsed_ms, details);
+                }
+            }
         }
     }
 
@@ -2190,6 +2207,7 @@ struct TraceSummary {
     line_count: usize,
     event_count: usize,
     phases: Vec<TracePhaseAggregate>,
+    slow_events: Vec<TraceSlowEvent>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2200,12 +2218,20 @@ struct TracePhaseAggregate {
     elapsed_ms: LatencySummary,
 }
 
+#[derive(Debug, Serialize)]
+struct TraceSlowEvent {
+    phase: String,
+    elapsed_ms: u128,
+    details: BTreeMap<String, String>,
+}
+
 fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read trace output {}", path.display()))?;
     let mut line_count = 0usize;
     let mut event_count = 0usize;
     let mut phases = BTreeMap::<String, Vec<u128>>::new();
+    let mut slow_events = Vec::<TraceSlowEvent>::new();
 
     for line in text.lines() {
         line_count += 1;
@@ -2223,6 +2249,11 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             .entry(phase.to_string())
             .or_default()
             .push(elapsed_ms);
+        slow_events.push(TraceSlowEvent {
+            phase: phase.to_string(),
+            elapsed_ms,
+            details: trace_event_details(&value),
+        });
     }
 
     let mut phases = phases
@@ -2245,12 +2276,78 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             .then_with(|| right.elapsed_ms.max_ms.cmp(&left.elapsed_ms.max_ms))
             .then_with(|| left.phase.cmp(&right.phase))
     });
+    slow_events.sort_by(|left, right| {
+        right
+            .elapsed_ms
+            .cmp(&left.elapsed_ms)
+            .then_with(|| left.phase.cmp(&right.phase))
+    });
+    slow_events.truncate(MAX_TRACE_SLOW_EVENTS);
 
     Ok(TraceSummary {
         line_count,
         event_count,
         phases,
+        slow_events,
     })
+}
+
+fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
+    let mut details = BTreeMap::new();
+    for key in [
+        "cid",
+        "path",
+        "unixfs_path",
+        "name",
+        "resolved_target",
+        "source",
+        "source_peer",
+        "ok",
+        "error",
+        "status",
+        "provider_count",
+        "peer_count",
+        "bytes",
+        "cache_hit",
+        "request_id",
+        "command_queued_ms",
+    ] {
+        if let Some(detail) = json_detail_string(value.get(key)) {
+            details.insert(key.to_string(), detail);
+        }
+    }
+    if !details.contains_key("path") {
+        if let Some(span_path) =
+            json_detail_string(value.get("span").and_then(|span| span.get("path")))
+        {
+            details.insert("path".to_string(), span_path);
+        }
+    }
+    if !details.contains_key("request_id") {
+        if let Some(request_id) =
+            json_detail_string(value.get("span").and_then(|span| span.get("request_id")))
+        {
+            details.insert("request_id".to_string(), request_id);
+        }
+    }
+    details
+}
+
+fn json_detail_string(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    let rendered = match value {
+        serde_json::Value::Null => return None,
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => value.clone(),
+        _ => serde_json::to_string(value).ok()?,
+    };
+    if rendered.chars().count() > 240 {
+        let prefix = rendered.chars().take(240).collect::<String>();
+        Some(format!("{prefix}..."))
+    } else {
+        Some(rendered)
+    }
 }
 
 fn json_u128(value: &serde_json::Value) -> Option<u128> {
@@ -2470,5 +2567,57 @@ impl ParsedTag {
             .iter()
             .find(|(attr_name, _)| attr_name == name)
             .map(|(_, value)| value.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_summary_includes_slowest_events_with_details() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":\"25\",\"cid\":\"cid1\",\"source\":\"bitswap\",\"source_peer\":\"peer1\",\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9}}\n",
+                "{\"phase\":\"provider_lookup\",\"elapsed_ms\":10,\"cid\":\"cid2\",\"provider_count\":3}\n",
+                "not json\n",
+                "{\"phase\":\"request_start\",\"path\":\"/ipns/site/\"}\n",
+                "{\"phase\":\"unixfs_file_size\",\"elapsed_ms\":50,\"cid\":\"cid3\",\"unixfs_path\":\"index.html\",\"ok\":true}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(summary.line_count, 5);
+        assert_eq!(summary.event_count, 4);
+        assert_eq!(summary.slow_events.len(), 3);
+        assert_eq!(summary.slow_events[0].phase, "unixfs_file_size");
+        assert_eq!(summary.slow_events[0].elapsed_ms, 50);
+        assert_eq!(
+            summary.slow_events[0].details.get("unixfs_path"),
+            Some(&"index.html".to_string())
+        );
+        assert_eq!(summary.slow_events[1].phase, "bitswap_fetch");
+        assert_eq!(
+            summary.slow_events[1].details.get("path"),
+            Some(&"/ipns/site/asset.js".to_string())
+        );
+        assert_eq!(
+            summary.slow_events[1].details.get("request_id"),
+            Some(&"9".to_string())
+        );
+        assert_eq!(summary.phases.len(), 3);
     }
 }

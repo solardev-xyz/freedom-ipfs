@@ -613,3 +613,26 @@ bitswap_dial_plan count=35
 bitswap_request_timeout_detail count=0
 command_queued_ms p50=0ms p90=80ms max=134ms
 ```
+
+The harness trace summary now also records bounded slow-event details. A smoke
+run of that report shape:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --output /tmp/ipfs-tech-slow-events.json \
+  --trace-output /tmp/ipfs-tech-slow-events-trace.jsonl
+```
+
+```text
+passed=1 failed=0 pass_rate=100.0%
+root_ttfb p50=2018ms max=2018ms
+asset_ttfb p50=203ms p95=2617ms max=3601ms
+slowest event: request_done 3598ms path=/ipns/ipfs.tech/_nuxt/DlAUqK2U.js request_id=28 status=200
+slowest block: bafkreiglqwypey634jhik4zygaoamjyhmwjot4pruvtcskpynuwbezcevi
+slowest block_fetch_total: 3595ms source=bitswap
+```
+
+This makes future live runs much easier to triage: the report points directly at
+the slow URL/CID pair instead of requiring manual trace greps.
