@@ -793,6 +793,29 @@ The totals are trace-phase sums, not wall-clock exclusive time. Their value is
 ranking: they show which CIDs repeatedly sit under slow phases and which URL
 paths referenced them.
 
+Successful Bitswap source peers now get latency/byte aggregates too:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --output /tmp/vitalik-peer-fetches.json \
+  --trace-output /tmp/vitalik-peer-fetches-trace.jsonl
+```
+
+```text
+passed=1 failed=0 pass_rate=100.0%
+bitswap source peers: 12D3KooWGtYkBAaqJMJEmywMxaCiNP7LCEFUAFiLEBASe232c2VH=2
+bitswap peer fetches:
+  12D3KooWGtYkBAaqJMJEmywMxaCiNP7LCEFUAFiLEBASe232c2VH count=2 total=1526ms max=763ms bytes=38773
+```
+
+In that run, successful peer fetches were fast; the tail came from a separate
+timeout path for the same child CID. That is exactly the split future session
+experiments need to see.
+
 ## 2026-05-04 Multi-Want Groundwork
 
 Priority 1 in the long-running roadmap is bounded Bitswap multi-want batching.
