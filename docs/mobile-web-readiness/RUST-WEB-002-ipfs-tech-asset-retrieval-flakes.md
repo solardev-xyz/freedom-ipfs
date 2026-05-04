@@ -996,6 +996,26 @@ longer shortcut did not recover the child block and allowed the failure path to
 stack a `5000ms` session shortcut, two empty/slow child provider lookups, and a
 `10009ms` one-peer Bitswap failure. Decision: revert the timeout to `2s`.
 
+Rejected follow-up: adding a swarm-level scheduled pending dial-address cap of
+`12` on top of the per-command cap.
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --output /tmp/ipfs-tech-global-dial-cap-r3.json \
+  --trace-output /tmp/ipfs-tech-global-dial-cap-r3-trace.jsonl
+```
+
+Result: worse. The cap reduced `bitswap_dial_rejected` to `0`, but it starved
+asset fetches under page concurrency: pass rate dropped to `2/3`, one run took
+`62778ms`, and trace showed `15` Bitswap request timeouts. The trace also showed
+`47` dial plans with candidates but `new_dial_addr_count=0`. Decision: revert.
+The next version needs fair queuing or session-aware peer selection, not a blunt
+global dial-address cap.
+
 ## 2026-05-04 Multi-Want Groundwork
 
 Priority 1 in the long-running roadmap is bounded Bitswap multi-want batching.
