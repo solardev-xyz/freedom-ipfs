@@ -67,7 +67,7 @@ const BITSWAP_MAX_ESTABLISHED_CONNECTIONS: u32 = 16;
 const MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND: usize = 8;
 const MAX_BITSWAP_PEERS_PER_BLOCK: usize = 16;
 const MAX_BITSWAP_SESSION_PEERS: usize = 4;
-const MAX_BITSWAP_ADDRS_PER_PEER: usize = 4;
+const MAX_BITSWAP_ADDRS_PER_PEER: usize = 2;
 const MAX_BITSWAP_FAILURE_DETAILS: usize = 8;
 const MAX_RECORDED_DIAL_ERRORS_PER_PEER: usize = 6;
 const MAX_INFLIGHT_BLOCK_FETCHES: usize = 256;
@@ -3140,7 +3140,7 @@ mod bitswap_tests {
         assert_eq!(
             format_bitswap_peers(&peers),
             format!(
-                "{first}:want-block@[/ip4/127.0.0.1/tcp/1001,/ip4/127.0.0.1/tcp/1002,/ip4/127.0.0.1/tcp/1003,/ip4/127.0.0.1/tcp/1004,+1 more]; {second}:want-have@[]"
+                "{first}:want-block@[/ip4/127.0.0.1/tcp/1001,/ip4/127.0.0.1/tcp/1002,+3 more]; {second}:want-have@[]"
             )
         );
     }

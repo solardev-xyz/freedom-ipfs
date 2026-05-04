@@ -2104,3 +2104,145 @@ connection limits, Bitswap request behavior, or block verification. Future
 selective QUIC experiments should use this signal to prove that a transport
 preference changes the transport that actually returns verified blocks, not just
 the transport mix of connection attempts.
+
+## Keep Two Addresses Per Bitswap Peer
+
+Hypothesis: each Bitswap peer currently retains up to four ranked dial addresses,
+but recent page traces show verified successful blocks coming almost entirely
+from TCP while secondary QUIC/WS addresses still add rejected-dial pressure.
+Capping each peer at its best two addresses may keep one fallback path while
+reducing speculative address churn.
+
+Same-window default cap `4` baseline:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/ipfs-tech-source-transport-baseline-r3.json \
+  --trace-output /tmp/ipfs-tech-source-transport-baseline-r3-trace.jsonl
+```
+
+Result: `3/3`. Run total p50/p95/max `11038/12750/12750ms`; root TTFB
+p50/p95/max `8146/11250/11250ms`; asset TTFB p50/p95/max
+`224/1143/1924ms`; source transports `tcp=105`; rejected dial transports
+`tcp=285`, `quic=73`, `ws=14`.
+
+Temporary cap `1`:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/ipfs-tech-peer-addr-cap1-r3.json \
+  --trace-output /tmp/ipfs-tech-peer-addr-cap1-r3-trace.jsonl
+```
+
+Result: `3/3`. Run total p50/p95/max improved to `7459/9887/9887ms`, and
+root TTFB p50/p95/max improved to `2560/4698/4698ms`, but asset TTFB
+p50/p95/max worsened to `278/2592/4576ms` and the trace introduced two 4s
+trusted Bitswap request timeouts. Decision: reject cap `1`; it removes too much
+fallback.
+
+Temporary cap `2`:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/ipfs-tech-peer-addr-cap2-r3.json \
+  --trace-output /tmp/ipfs-tech-peer-addr-cap2-r3-trace.jsonl
+```
+
+Result: `3/3`. Run total p50/p95/max `5373/6644/6644ms`; root TTFB
+p50/p95/max `2097/4026/4026ms`; asset TTFB p50/p95/max `180/1712/2717ms`;
+source transports `tcp=105`; rejected dial transports `tcp=243`, `quic=49`,
+`ws=5`; no Bitswap request timeouts. This was a better balance than cap `1`.
+
+Same-window default cap `4` recheck:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/ipfs-tech-peer-addr-cap4-recheck-r3.json \
+  --trace-output /tmp/ipfs-tech-peer-addr-cap4-recheck-r3-trace.jsonl
+```
+
+Result: `3/3`, but worse than cap `2` in the same window: run total
+p50/p95/max `10505/14994/14994ms`; root TTFB p50/p95/max
+`4306/12454/12454ms`; asset TTFB p50/p95/max `226/2073/4424ms`; one 4s
+trusted Bitswap request timeout; rejected dial transports `tcp=250`, `quic=79`,
+`ws=22`.
+
+Secondary range case:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/vitalik-peer-addr-cap2-r3.json \
+  --trace-output /tmp/vitalik-peer-addr-cap2-r3-trace.jsonl
+```
+
+Cap `2` passed `3/3`, root TTFB p50/p95/max `5919/7645/7645ms`, source
+transports `tcp=6`, and two trusted request timeouts.
+
+Default cap `4` in the same window:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/vitalik-peer-addr-cap4-recheck-r3.json \
+  --trace-output /tmp/vitalik-peer-addr-cap4-recheck-r3-trace.jsonl
+```
+
+Result: `0/3`. All three requests returned `504`, with six trusted Bitswap
+request timeouts on the child CID. This is the strongest keep signal for cap
+`2`: it passed a case that default cap `4` failed in the same network window.
+
+Daicowtf check:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/daicowtf-peer-addr-cap2-r3.json \
+  --trace-output /tmp/daicowtf-peer-addr-cap2-r3-trace.jsonl
+```
+
+Cap `2` failed `0/3` with root `504` after about `30960ms`. Default cap `4` in
+the same window also failed `0/3`:
+`/tmp/daicowtf-peer-addr-cap4-recheck-r3.json` and
+`/tmp/daicowtf-peer-addr-cap4-recheck-r3-trace.jsonl`. The failing child CID was
+again dominated by low provider diversity and DHT/provider lookup timeouts, so
+this remains a provider discovery/session fallback gap rather than evidence for
+or against the per-peer address cap.
+
+Decision: keep cap `2`. It reduces secondary transport dial pressure while
+preserving one fallback address, improves `ipfs.tech` page tails in same-window
+A/B, and avoids the vitalik child-CID failure seen with cap `4`. Continue
+watching daicowtf separately; that case needs better sparse-provider fallback,
+not more addresses per peer.
