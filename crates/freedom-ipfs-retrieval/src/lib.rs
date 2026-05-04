@@ -446,17 +446,24 @@ impl HttpRetriever {
                         return Err(err);
                     }
                 };
+                let same_providers = same_provider_set(&providers, &refreshed);
+                let same_bitswap_peers = if request_timeout {
+                    same_bitswap_peer_set(&providers, &refreshed).await
+                } else {
+                    false
+                };
                 tracing::info!(
                     phase = "retry_provider_count",
                     cid = %cid,
                     previous_provider_count = providers.len(),
                     retry_provider_count = refreshed.len(),
-                    same_provider_set = same_provider_set(&providers, &refreshed),
+                    same_provider_set = same_providers,
+                    same_bitswap_peer_set = same_bitswap_peers,
                     timeout_peer_count,
                     connection_timeout_peer_count,
                     request_timeout
                 );
-                if same_provider_set(&providers, &refreshed) {
+                if same_providers {
                     if timeout_peer_count > 0 || request_timeout {
                         tracing::info!(
                             phase = if request_timeout {
@@ -2178,6 +2185,27 @@ fn suppress_bitswap_timeout_suppression(
 
 fn same_provider_set(left: &[Provider], right: &[Provider]) -> bool {
     normalized_provider_set(left) == normalized_provider_set(right)
+}
+
+async fn same_bitswap_peer_set(left: &[Provider], right: &[Provider]) -> bool {
+    normalized_bitswap_peer_set(left).await == normalized_bitswap_peer_set(right).await
+}
+
+async fn normalized_bitswap_peer_set(providers: &[Provider]) -> BTreeSet<(String, Vec<String>)> {
+    bitswap_peers(providers)
+        .await
+        .into_iter()
+        .map(|peer| {
+            let mut addrs = peer
+                .addrs
+                .into_iter()
+                .map(|addr| addr.to_string())
+                .collect::<Vec<_>>();
+            addrs.sort();
+            addrs.dedup();
+            (peer.id.to_string(), addrs)
+        })
+        .collect()
 }
 
 fn normalized_provider_set(providers: &[Provider]) -> BTreeSet<(Option<String>, Vec<String>)> {

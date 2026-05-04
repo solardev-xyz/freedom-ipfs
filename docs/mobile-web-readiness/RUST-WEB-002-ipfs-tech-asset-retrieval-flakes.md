@@ -2729,3 +2729,118 @@ assets returned `504`, asset p95 rose to `4712ms`, and
 `request_timeouts_with_trusted` jumped to `7`. The narrower wait skipped useful
 single-peer opportunities and let the full mixed-provider request path recreate
 the timeout tail.
+
+## 2026-05-04 Provider Refresh Equivalence Follow-Up
+
+Hypothesis: a later `ipfs.tech` failure window was not caused by low provider
+counts alone. Delegated routing returned different raw provider counts across
+the initial lookup and timeout refresh, but the useful expanded Bitswap peer set
+often stayed effectively the same. That makes the retry look fresh while still
+asking the same reachable public-network peers for the root block.
+
+Baseline:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --trace-output /tmp/ipfs-tech-postlookup100-current-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-postlookup100-current-kubo-r3.json
+```
+
+Result: Rust failed `0/3`; Kubo passed `3/3`. Rust root p50/p95 was
+`30331/30388ms`; Kubo root p50/p95 was `1372/2989ms`. Rust spent two bounded
+`15s` Bitswap request windows per root against delegated providers. The first
+delegated lookup returned about `10-11` providers expanding to `6` Bitswap
+peers; refresh returned about `11-14` providers expanding to the same or similar
+`6-8` usable peers.
+
+Kept diagnostic:
+
+- `retry_provider_count` now logs both `same_provider_set` and
+  `same_bitswap_peer_set`.
+- `same_bitswap_peer_set` normalizes expanded Bitswap peers by peer ID plus
+  sorted deduped multiaddrs, after DNS multiaddr expansion.
+- This is intentionally diagnostic only. It does not change provider selection,
+  retries, timeout budgets, trust rules, block verification, or caching.
+
+Rejected experiment: after a Bitswap request timeout, force a short light-DHT
+provider augmentation when the refreshed delegated lookup produced the same
+expanded Bitswap peer set.
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --trace-output /tmp/ipfs-tech-quality-fallback-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-quality-fallback-kubo-r3.json
+
+FREEDOM_IPFS_LIVE_DHT_CID=bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq \
+timeout 35s cargo test -p freedom-ipfs-routing \
+  live_light_dht_finds_public_providers -- --ignored --nocapture
+```
+
+Result: reject. Rust still failed `0/3`; Kubo passed `3/3`. Rust root p50/p95
+was `31268/31420ms`; Kubo root p50/p95 was `1471/1598ms`; RSS/FD stayed modest
+at `42496KiB`/`20` for Rust versus `310728KiB`/`481` for Kubo. The fallback did
+trigger, but the short DHT lookup timed out after `750ms` and added no
+providers. The live DHT test also found `0` providers for
+`bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq` after `22.12s`.
+Conclusion: light-DHT augmentation is not the missing recovery path for this
+root in this network window.
+
+Rejected experiment: cap each expanded Bitswap peer to transport-diverse
+addresses, preferring one TCP address plus one QUIC address instead of the first
+two TCP addresses.
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --trace-output /tmp/ipfs-tech-transport-diverse-cap2-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-transport-diverse-cap2-kubo-r3.json
+```
+
+Result: reject. Rust still failed `0/3`; Kubo passed `3/3`. Rust root p50/p95
+was `30493/30980ms`; Kubo root p50/p95 was `2555/3225ms`; RSS/FD stayed modest
+at `43392KiB`/`18` for Rust versus `314720KiB`/`514` for Kubo. The trace showed
+QUIC was not simply absent: first expanded providers included
+`peer_count=8,tcp=9,quic=6,ws=1`, later refreshes included
+`peer_count=6,tcp=6,quic=6,ws=0`, and established transports included
+`tcp=5` and `quic=4`. QUIC fallback connected, but no peer returned the root.
+
+Rejected investigation: delegated provider cap prioritization by direct HTTP or
+Bitswap dialability. A direct delegated response saved at
+`/tmp/ipfs-tech-delegated-providers.ndjson` had only `21` providers and `8`
+direct provider peers, so the existing cap did not appear to be dropping a large
+tail of directly dialable providers for this root in this window.
+
+Kubo comparison notes:
+
+- Kubo `v0.41.0` lowpower config used `Routing.Type = autoclient` and
+  `Routing.DelegatedRouters = ["auto"]`.
+- Kubo autoconf included `https://cid.contact` for IPNI provider lookups and
+  `https://delegated-ipfs.dev` for AminoDHT/IPNI providers, peers, and IPNS.
+- `https://cid.contact/routing/v1/providers/<root>` returned `404` in this
+  window.
+- Kubo local provider discovery returned many more provider IDs than Rust can
+  use directly from delegated provider records.
+- Some peer-routing lookups for those provider IDs returned mostly relay/circuit
+  addresses. Rust currently rejects `/p2p-circuit`, WebRTC Direct, and
+  WebTransport addresses and only dials usable direct addresses in provider
+  records.
+
+Next hypothesis: the remaining Kubo gap for this root is likely peer-routing and
+provider-address quality, not raw delegated provider count or a short DHT
+fallback. Future work should add explicit diagnostics for unsupported provider
+address families and investigate a bounded peer-routing address-resolution path
+for ID-only providers before considering heavier relay support.
