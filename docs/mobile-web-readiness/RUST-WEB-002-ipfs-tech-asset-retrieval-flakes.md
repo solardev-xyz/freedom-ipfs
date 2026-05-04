@@ -916,6 +916,41 @@ the trace proves it removes pending-dial-limit churn. It does not eliminate all
 remaining tail latency; future experiments should tune provider/session
 selection and retry timing.
 
+Additional coverage after the keep decision:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --output /tmp/ipfs-tech-dial-cap-targeted-r3.json \
+  --trace-output /tmp/ipfs-tech-dial-cap-targeted-r3-trace.jsonl
+```
+
+Result: `3/3`, root TTFB p50 `1954ms`, asset TTFB p95 `1770ms`, asset max
+`4164ms`. This high-concurrency page still produced `bitswap_dial_rejected`
+events, so the cap fixes single-command pending-slot saturation but not aggregate
+page-level dial pressure across many concurrent assets.
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --output /tmp/daicowtf-dial-cap-targeted-r3.json \
+  --trace-output /tmp/daicowtf-dial-cap-targeted-r3-trace.jsonl
+```
+
+Result: `0/3`, same as canonical main in the same window:
+`/tmp/daicowtf-main-same-window-r3.json` and
+`/tmp/daicowtf-main-same-window-r3-trace.jsonl`. Both failed with root `504`
+around `10950ms`, `provider_diversity_low`, and `bitswap_session_shortcut`
+failures for child CID `bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u`.
+That points at the existing sparse-provider/session fallback gap rather than the
+dial-headroom cap.
+
 ## 2026-05-04 Multi-Want Groundwork
 
 Priority 1 in the long-running roadmap is bounded Bitswap multi-want batching.
