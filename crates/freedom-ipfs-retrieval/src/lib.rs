@@ -603,6 +603,7 @@ impl HttpRetriever {
         self.apply_successful_bitswap_peer_scores(&mut peers).await;
         let session_peer_count = self.insert_recent_bitswap_session_peers(&mut peers).await;
         let addr_stats = bitswap_peer_addr_stats(&peers);
+        let trusted_peer_count = peers.iter().filter(|peer| peer.skip_want_have).count();
         tracing::info!(
             phase = "bitswap_peer_expand",
             cid = %cid,
@@ -610,7 +611,7 @@ impl HttpRetriever {
             peer_count = peers.len(),
             provider_peer_count,
             session_peer_count,
-            trusted_peer_count = peers.iter().filter(|peer| peer.skip_want_have).count(),
+            trusted_peer_count,
             tcp_addr_count = addr_stats.tcp,
             quic_addr_count = addr_stats.quic,
             ws_addr_count = addr_stats.ws,
@@ -656,6 +657,9 @@ impl HttpRetriever {
                     phase = "bitswap_fetch",
                     cid = %cid,
                     peer_count,
+                    provider_peer_count,
+                    session_peer_count,
+                    trusted_peer_count,
                     ok = false,
                     error = %err,
                     elapsed_ms = bitswap_started.elapsed().as_millis()
@@ -668,6 +672,7 @@ impl HttpRetriever {
                         phase = "bitswap_request_timeout",
                         cid = %cid,
                         peer_count,
+                        trusted_peer_count,
                         elapsed_ms = bitswap_started.elapsed().as_millis()
                     );
                     self.reset_shared_bitswap_client().await;
@@ -676,6 +681,9 @@ impl HttpRetriever {
                     phase = "bitswap_fetch",
                     cid = %cid,
                     peer_count,
+                    provider_peer_count,
+                    session_peer_count,
+                    trusted_peer_count,
                     ok = false,
                     error = %err,
                     elapsed_ms = bitswap_started.elapsed().as_millis()
@@ -683,17 +691,29 @@ impl HttpRetriever {
                 return Err(err);
             }
         };
+        let source_peer = result.source_peer;
+        let source_peer_trusted = source_peer
+            .map(|peer| {
+                peers_for_record
+                    .iter()
+                    .any(|candidate| candidate.id == peer && candidate.skip_want_have)
+            })
+            .unwrap_or(false);
         tracing::info!(
             phase = "bitswap_fetch",
             cid = %cid,
             peer_count,
+            provider_peer_count,
+            session_peer_count,
+            trusted_peer_count,
             ok = true,
-            source_peer = result.source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
+            source_peer = source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
+            source_peer_trusted,
             extra_blocks = result.extra_blocks.len(),
             bytes = result.requested_block.len(),
             elapsed_ms = bitswap_started.elapsed().as_millis()
         );
-        if let Some(peer) = result.source_peer {
+        if let Some(peer) = source_peer {
             self.record_successful_bitswap_peer_from_peers(peer, &peers_for_record)
                 .await;
         }
@@ -878,6 +898,7 @@ impl HttpRetriever {
                     phase = "bitswap_session_shortcut",
                     cid = %cid,
                     peer_count,
+                    trusted_peer_count = peer_count,
                     ok = false,
                     error = %err,
                     elapsed_ms = started.elapsed().as_millis()
@@ -889,6 +910,7 @@ impl HttpRetriever {
                     phase = "bitswap_session_shortcut",
                     cid = %cid,
                     peer_count,
+                    trusted_peer_count = peer_count,
                     ok = false,
                     error = %err,
                     elapsed_ms = started.elapsed().as_millis()
@@ -900,6 +922,7 @@ impl HttpRetriever {
                     phase = "bitswap_session_shortcut",
                     cid = %cid,
                     peer_count,
+                    trusted_peer_count = peer_count,
                     ok = false,
                     timeout = true,
                     elapsed_ms = started.elapsed().as_millis()
@@ -912,8 +935,10 @@ impl HttpRetriever {
             phase = "bitswap_session_shortcut",
             cid = %cid,
             peer_count,
+            trusted_peer_count = peer_count,
             ok = true,
             source_peer = result.source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
+            source_peer_trusted = true,
             extra_blocks = result.extra_blocks.len(),
             bytes = result.requested_block.len(),
             elapsed_ms = started.elapsed().as_millis()

@@ -1326,3 +1326,70 @@ The same run also showed the remaining child-CID session/provider tail:
 from the same source peer. That reinforces that DNS expansion was avoidable
 overhead, while the next larger behavior gap is still child-CID session
 reliability.
+
+## Bitswap Session/Trusted-Peer Diagnostics
+
+Hypothesis: some slow follow-on UnixFS child blocks are not provider lookup
+limited. They are session/reuse limited: the root block source is promoted to a
+trusted want-block target for the child, but an existing shared Bitswap
+connection can stall until the 15-second shared request timeout. A fresh-client
+retry then often succeeds quickly, sometimes from the same peer.
+
+The previous DNS-summary smoke provided the motivating sample:
+
+- root CID `bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u`
+  succeeded from peer
+  `12D3KooWGtYkBAaqJMJEmywMxaCiNP7LCEFUAFiLEBASe232c2VH`.
+- child CID `bafkreibny3ionuayaittbxl2tn5dgfae7sbu45ymd35vhdm3634lmakxqi`
+  then expanded `trusted_peer_count=1` with that same peer first in the target
+  list as `want-block`.
+- the first child request hit `bitswap_request_timeout_detail` after about
+  `15002ms`.
+- the same-provider retry reset the shared Bitswap client and then fetched the
+  child from `12D3KooWGtYkBAaqJMJEmywMxaCiNP7LCEFUAFiLEBASe232c2VH` in
+  `751ms`.
+
+Implementation:
+
+- `bitswap_fetch` now emits `provider_peer_count`, `session_peer_count`,
+  `trusted_peer_count`, and `source_peer_trusted`.
+- `bitswap_request_timeout` now includes `trusted_peer_count`.
+- `bitswap_session_shortcut` now includes `trusted_peer_count` and marks
+  successful shortcut sources as trusted.
+- The mobile web harness now aggregates a `bitswap_session` trace summary:
+  total fetches, fetches with trusted peers, trusted versus untrusted
+  successes, trusted failures, request timeouts with trusted peers, and session
+  shortcut hits/misses.
+
+Deterministic validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval --lib
+cargo test -p mobile-web-harness
+```
+
+Live smoke:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --trace-output /tmp/vitalik-session-summary-trace.jsonl \
+  --output /tmp/vitalik-session-summary.json
+```
+
+Result: `1/1`. Root TTFB was `4241ms`; RSS/FD checks stayed within the harness
+defaults. The trace summary printed:
+
+```text
+bitswap session: fetches=2 with_trusted=1 trusted_successes=0 untrusted_successes=2 trusted_failures=0 request_timeouts_with_trusted=0 shortcut_attempts=0 shortcut_hits=0 shortcut_misses=0
+```
+
+This smoke did not reproduce the 15-second trusted-peer stall. It did show that
+one child fetch had a trusted candidate, but the winning source was a different
+peer. Keep this diagnostic slice. It gives future iterations a direct counter
+for the stale trusted-peer case before trying a behavior change such as a
+shorter trusted-peer request retry budget or a fresh-session retry for child
+CIDs.

@@ -574,6 +574,21 @@ fn print_summary(report: &RunReport) {
                 );
             }
         }
+        if trace.bitswap_session.has_events() {
+            let session = &trace.bitswap_session;
+            println!(
+                "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_attempts={} shortcut_hits={} shortcut_misses={}",
+                session.fetches,
+                session.with_trusted_peers,
+                session.trusted_successes,
+                session.untrusted_successes,
+                session.trusted_failures,
+                session.request_timeouts_with_trusted,
+                session.session_shortcut_attempts,
+                session.session_shortcut_hits,
+                session.session_shortcut_misses
+            );
+        }
         if !trace.trace_errors.is_empty() {
             println!(
                 "  trace errors: {}",
@@ -2345,6 +2360,7 @@ struct TraceSummary {
     unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
     bitswap_source_peers: Vec<TraceValueCount>,
     bitswap_peer_fetches: Vec<TracePeerAggregate>,
+    bitswap_session: TraceBitswapSessionAggregate,
     trace_errors: Vec<TraceValueCount>,
     bitswap_addr_mix: Vec<TraceValueCount>,
     bitswap_dns_expansion: TraceBitswapDnsExpansionAggregate,
@@ -2392,6 +2408,25 @@ struct TraceBitswapDnsExpansionAggregate {
     failed: usize,
     records: u128,
     ips: u128,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceBitswapSessionAggregate {
+    fetches: usize,
+    with_trusted_peers: usize,
+    trusted_successes: usize,
+    untrusted_successes: usize,
+    trusted_failures: usize,
+    request_timeouts_with_trusted: usize,
+    session_shortcut_attempts: usize,
+    session_shortcut_hits: usize,
+    session_shortcut_misses: usize,
+}
+
+impl TraceBitswapSessionAggregate {
+    fn has_events(&self) -> bool {
+        self.fetches > 0 || self.session_shortcut_attempts > 0
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2444,6 +2479,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut trace_errors = BTreeMap::<String, usize>::new();
     let mut bitswap_addr_mix = BTreeMap::<String, usize>::new();
     let mut bitswap_dns_expansion = TraceBitswapDnsExpansionAggregate::default();
+    let mut bitswap_session = TraceBitswapSessionAggregate::default();
     let mut slow_cids = BTreeMap::<String, TraceCidBuilder>::new();
 
     for line in text.lines() {
@@ -2490,6 +2526,47 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         }
         let successful_bitswap_fetch =
             phase == "bitswap_fetch" && value.get("ok").and_then(|ok| ok.as_bool()) == Some(true);
+        if phase == "bitswap_fetch" {
+            bitswap_session.fetches += 1;
+            let trusted_peer_count = value
+                .get("trusted_peer_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            let has_trusted_peers = trusted_peer_count > 0;
+            if has_trusted_peers {
+                bitswap_session.with_trusted_peers += 1;
+            }
+            if value.get("ok").and_then(|ok| ok.as_bool()) == Some(true) {
+                if value
+                    .get("source_peer_trusted")
+                    .and_then(|trusted| trusted.as_bool())
+                    == Some(true)
+                {
+                    bitswap_session.trusted_successes += 1;
+                } else {
+                    bitswap_session.untrusted_successes += 1;
+                }
+            } else if has_trusted_peers {
+                bitswap_session.trusted_failures += 1;
+            }
+        }
+        if phase == "bitswap_request_timeout_detail"
+            && value
+                .get("trusted_peer_count")
+                .and_then(json_u128)
+                .unwrap_or_default()
+                > 0
+        {
+            bitswap_session.request_timeouts_with_trusted += 1;
+        }
+        if phase == "bitswap_session_shortcut" {
+            bitswap_session.session_shortcut_attempts += 1;
+            if value.get("ok").and_then(|ok| ok.as_bool()) == Some(true) {
+                bitswap_session.session_shortcut_hits += 1;
+            } else {
+                bitswap_session.session_shortcut_misses += 1;
+            }
+        }
         if successful_bitswap_fetch {
             if let Some(peer) = value.get("source_peer").and_then(|peer| peer.as_str()) {
                 *bitswap_source_peers.entry(peer.to_string()).or_default() += 1;
@@ -2598,6 +2675,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         unixfs_metadata_cache,
         bitswap_source_peers: sorted_trace_counts(bitswap_source_peers),
         bitswap_peer_fetches: sorted_trace_peers(bitswap_peer_fetches),
+        bitswap_session,
         trace_errors: sorted_trace_counts(trace_errors),
         bitswap_addr_mix: sorted_trace_counts(bitswap_addr_mix),
         bitswap_dns_expansion,
@@ -2711,10 +2789,13 @@ fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
         "resolved_target",
         "source",
         "source_peer",
+        "source_peer_trusted",
         "ok",
         "error",
         "status",
         "provider_count",
+        "provider_peer_count",
+        "session_peer_count",
         "peer_count",
         "trusted_peer_count",
         "tcp_addr_count",
@@ -3017,12 +3098,14 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":\"25\",\"cid\":\"cid1\",\"ok\":true,\"bytes\":100,\"source\":\"bitswap\",\"source_peer\":\"peer1\",\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9}}\n",
+                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":\"25\",\"cid\":\"cid1\",\"ok\":true,\"bytes\":100,\"source\":\"bitswap\",\"source_peer\":\"peer1\",\"source_peer_trusted\":true,\"trusted_peer_count\":1,\"provider_peer_count\":2,\"session_peer_count\":0,\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9}}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":5,\"cid\":\"cid1\",\"source\":\"bitswap\"}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":4,\"cid\":\"cid5\",\"source\":\"cache\"}\n",
                 "{\"phase\":\"provider_lookup\",\"elapsed_ms\":10,\"cid\":\"cid2\",\"provider_count\":3,\"error\":\"dht: timeout\"}\n",
-                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":12,\"cid\":\"cid6\",\"ok\":false}\n",
+                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":12,\"cid\":\"cid6\",\"ok\":false,\"trusted_peer_count\":1}\n",
                 "{\"phase\":\"bitswap_peer_expand\",\"elapsed_ms\":3,\"cid\":\"cid7\",\"tcp_addr_count\":4,\"quic_addr_count\":2,\"ws_addr_count\":1,\"wss_addr_count\":0,\"dns_addr_count\":1,\"ip4_addr_count\":3,\"ip6_addr_count\":1}\n",
+                "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":2,\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":true,\"source_peer\":\"peer1\",\"source_peer_trusted\":true}\n",
+                "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":3,\"cid\":\"cid9\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":false,\"timeout\":true}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bootstrap.example\",\"cached\":false,\"ok\":true,\"record_count\":2}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bootstrap.example\",\"cached\":true,\"ok\":true,\"record_count\":2}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bad.example\",\"cached\":false,\"ok\":false,\"record_count\":0}\n",
@@ -3040,9 +3123,9 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 16);
-        assert_eq!(summary.event_count, 15);
-        assert_eq!(summary.slow_events.len(), 9);
+        assert_eq!(summary.line_count, 18);
+        assert_eq!(summary.event_count, 17);
+        assert_eq!(summary.slow_events.len(), 11);
         assert_eq!(
             summary.slow_events[0].phase,
             "bitswap_request_timeout_detail"
@@ -3071,7 +3154,11 @@ mod tests {
             summary.slow_events[2].details.get("request_id"),
             Some(&"9".to_string())
         );
-        assert_eq!(summary.phases.len(), 7);
+        assert_eq!(
+            summary.slow_events[2].details.get("source_peer_trusted"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(summary.phases.len(), 8);
         assert_eq!(summary.block_sources.len(), 2);
         assert_eq!(summary.block_sources[0].value, "bitswap");
         assert_eq!(summary.block_sources[0].count, 1);
@@ -3093,7 +3180,16 @@ mod tests {
         assert_eq!(summary.bitswap_peer_fetches[0].total_ms, 25);
         assert_eq!(summary.bitswap_peer_fetches[0].max_ms, 25);
         assert_eq!(summary.bitswap_peer_fetches[0].bytes, 100);
-        assert_eq!(summary.trace_errors.len(), 3);
+        assert_eq!(summary.bitswap_session.fetches, 2);
+        assert_eq!(summary.bitswap_session.with_trusted_peers, 2);
+        assert_eq!(summary.bitswap_session.trusted_successes, 1);
+        assert_eq!(summary.bitswap_session.untrusted_successes, 0);
+        assert_eq!(summary.bitswap_session.trusted_failures, 1);
+        assert_eq!(summary.bitswap_session.request_timeouts_with_trusted, 1);
+        assert_eq!(summary.bitswap_session.session_shortcut_attempts, 2);
+        assert_eq!(summary.bitswap_session.session_shortcut_hits, 1);
+        assert_eq!(summary.bitswap_session.session_shortcut_misses, 1);
+        assert_eq!(summary.trace_errors.len(), 4);
         assert_eq!(
             summary.trace_errors[0].value,
             "bitswap_dnsaddr_expand: ok=false"
@@ -3101,6 +3197,10 @@ mod tests {
         assert_eq!(summary.trace_errors[1].value, "bitswap_fetch: ok=false");
         assert_eq!(
             summary.trace_errors[2].value,
+            "bitswap_session_shortcut: ok=false"
+        );
+        assert_eq!(
+            summary.trace_errors[3].value,
             "provider_lookup: dht: timeout"
         );
         assert_eq!(summary.bitswap_addr_mix[0].value, "tcp");
