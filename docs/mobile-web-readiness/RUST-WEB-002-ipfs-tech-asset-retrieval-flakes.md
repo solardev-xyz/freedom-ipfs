@@ -745,6 +745,30 @@ This is still the known `daicowtf` sparse-provider failure shape. The useful
 change is that future provider-quality runs now expose repeated error
 signatures directly in the report.
 
+Bitswap peer expansion now also reports provider address mix for transport
+policy work:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --output /tmp/vitalik-addr-mix-final.json \
+  --trace-output /tmp/vitalik-addr-mix-final-trace.jsonl
+```
+
+```text
+passed=1 failed=0 pass_rate=100.0%
+root_ttfb p50=8808ms max=8808ms
+block sources: bitswap=2
+bitswap addr mix: ip4=68, tcp=58, quic=28, ip6=15, dns=3, ws=3, wss=0
+```
+
+The counts are summed from `bitswap_peer_expand` events, so they are intended
+for comparing policies in the same harness window rather than as globally unique
+provider counts.
+
 ## 2026-05-04 Multi-Want Groundwork
 
 Priority 1 in the long-running roadmap is bounded Bitswap multi-want batching.

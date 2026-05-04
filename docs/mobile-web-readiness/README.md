@@ -76,7 +76,8 @@ include `block_sources` and `bitswap_source_peers` counts, which help quantify
 cache/Bitswap/HTTP-provider mix and peer reuse during provider/session
 experiments. Trace errors are grouped by phase and sanitized error string so
 provider-quality runs can show repeated DHT/Bitswap failure signatures without
-manual JSONL greps.
+manual JSONL greps. Bitswap peer expansion traces include address mix counters,
+and the report aggregates them as `bitswap_addr_mix` for transport policy work.
 
 The harness can also spawn Kubo as a comparison engine when a Kubo `ipfs`
 binary is available:

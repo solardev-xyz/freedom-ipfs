@@ -549,6 +549,12 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.trace_errors)
             );
         }
+        if !trace.bitswap_addr_mix.is_empty() {
+            println!(
+                "  bitswap addr mix: {}",
+                format_trace_counts(&trace.bitswap_addr_mix)
+            );
+        }
         if !trace.slow_events.is_empty() {
             println!("  slow events:");
             for event in trace.slow_events.iter().take(8) {
@@ -2229,6 +2235,7 @@ struct TraceSummary {
     block_sources: Vec<TraceValueCount>,
     bitswap_source_peers: Vec<TraceValueCount>,
     trace_errors: Vec<TraceValueCount>,
+    bitswap_addr_mix: Vec<TraceValueCount>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2262,6 +2269,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut block_sources = BTreeMap::<String, usize>::new();
     let mut bitswap_source_peers = BTreeMap::<String, usize>::new();
     let mut trace_errors = BTreeMap::<String, usize>::new();
+    let mut bitswap_addr_mix = BTreeMap::<String, usize>::new();
 
     for line in text.lines() {
         line_count += 1;
@@ -2284,6 +2292,15 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         }
         if let Some(error) = trace_error_key(phase, &value) {
             *trace_errors.entry(error).or_default() += 1;
+        }
+        if phase == "bitswap_peer_expand" {
+            accumulate_trace_count(&mut bitswap_addr_mix, "tcp", &value, "tcp_addr_count");
+            accumulate_trace_count(&mut bitswap_addr_mix, "quic", &value, "quic_addr_count");
+            accumulate_trace_count(&mut bitswap_addr_mix, "ws", &value, "ws_addr_count");
+            accumulate_trace_count(&mut bitswap_addr_mix, "wss", &value, "wss_addr_count");
+            accumulate_trace_count(&mut bitswap_addr_mix, "dns", &value, "dns_addr_count");
+            accumulate_trace_count(&mut bitswap_addr_mix, "ip4", &value, "ip4_addr_count");
+            accumulate_trace_count(&mut bitswap_addr_mix, "ip6", &value, "ip6_addr_count");
         }
         let Some(elapsed_ms) = value.get("elapsed_ms").and_then(json_u128) else {
             continue;
@@ -2335,7 +2352,20 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         block_sources: sorted_trace_counts(block_sources),
         bitswap_source_peers: sorted_trace_counts(bitswap_source_peers),
         trace_errors: sorted_trace_counts(trace_errors),
+        bitswap_addr_mix: sorted_trace_counts(bitswap_addr_mix),
     })
+}
+
+fn accumulate_trace_count(
+    counts: &mut BTreeMap<String, usize>,
+    label: &str,
+    value: &serde_json::Value,
+    field: &str,
+) {
+    let Some(count) = value.get(field).and_then(json_u128) else {
+        return;
+    };
+    *counts.entry(label.to_string()).or_default() += count as usize;
 }
 
 fn sorted_trace_counts(counts: BTreeMap<String, usize>) -> Vec<TraceValueCount> {
@@ -2388,6 +2418,13 @@ fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
         "provider_count",
         "peer_count",
         "trusted_peer_count",
+        "tcp_addr_count",
+        "quic_addr_count",
+        "ws_addr_count",
+        "wss_addr_count",
+        "dns_addr_count",
+        "ip4_addr_count",
+        "ip6_addr_count",
         "bytes",
         "cache_hit",
         "request_id",
@@ -2675,6 +2712,7 @@ mod tests {
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":4,\"cid\":\"cid5\",\"source\":\"cache\"}\n",
                 "{\"phase\":\"provider_lookup\",\"elapsed_ms\":10,\"cid\":\"cid2\",\"provider_count\":3,\"error\":\"dht: timeout\"}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":12,\"cid\":\"cid6\",\"ok\":false}\n",
+                "{\"phase\":\"bitswap_peer_expand\",\"elapsed_ms\":3,\"cid\":\"cid7\",\"tcp_addr_count\":4,\"quic_addr_count\":2,\"ws_addr_count\":1,\"wss_addr_count\":0,\"dns_addr_count\":1,\"ip4_addr_count\":3,\"ip6_addr_count\":1}\n",
                 "not json\n",
                 "{\"phase\":\"request_start\",\"path\":\"/ipns/site/\"}\n",
                 "{\"phase\":\"unixfs_file_size\",\"elapsed_ms\":50,\"cid\":\"cid3\",\"unixfs_path\":\"index.html\",\"ok\":true}\n",
@@ -2686,9 +2724,9 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 9);
-        assert_eq!(summary.event_count, 8);
-        assert_eq!(summary.slow_events.len(), 7);
+        assert_eq!(summary.line_count, 10);
+        assert_eq!(summary.event_count, 9);
+        assert_eq!(summary.slow_events.len(), 8);
         assert_eq!(
             summary.slow_events[0].phase,
             "bitswap_request_timeout_detail"
@@ -2717,7 +2755,7 @@ mod tests {
             summary.slow_events[2].details.get("request_id"),
             Some(&"9".to_string())
         );
-        assert_eq!(summary.phases.len(), 5);
+        assert_eq!(summary.phases.len(), 6);
         assert_eq!(summary.block_sources.len(), 2);
         assert_eq!(summary.block_sources[0].value, "bitswap");
         assert_eq!(summary.block_sources[0].count, 1);
@@ -2731,5 +2769,11 @@ mod tests {
             summary.trace_errors[1].value,
             "provider_lookup: dht: timeout"
         );
+        assert_eq!(summary.bitswap_addr_mix[0].value, "tcp");
+        assert_eq!(summary.bitswap_addr_mix[0].count, 4);
+        assert_eq!(summary.bitswap_addr_mix[1].value, "ip4");
+        assert_eq!(summary.bitswap_addr_mix[1].count, 3);
+        assert_eq!(summary.bitswap_addr_mix[2].value, "quic");
+        assert_eq!(summary.bitswap_addr_mix[2].count, 2);
     }
 }

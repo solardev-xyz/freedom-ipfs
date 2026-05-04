@@ -570,6 +570,7 @@ impl HttpRetriever {
         }
         self.apply_successful_bitswap_peer_scores(&mut peers).await;
         let session_peer_count = self.insert_recent_bitswap_session_peers(&mut peers).await;
+        let addr_stats = bitswap_peer_addr_stats(&peers);
         tracing::info!(
             phase = "bitswap_peer_expand",
             cid = %cid,
@@ -578,6 +579,13 @@ impl HttpRetriever {
             provider_peer_count,
             session_peer_count,
             trusted_peer_count = peers.iter().filter(|peer| peer.skip_want_have).count(),
+            tcp_addr_count = addr_stats.tcp,
+            quic_addr_count = addr_stats.quic,
+            ws_addr_count = addr_stats.ws,
+            wss_addr_count = addr_stats.wss,
+            dns_addr_count = addr_stats.dns,
+            ip4_addr_count = addr_stats.ip4,
+            ip6_addr_count = addr_stats.ip6,
             elapsed_ms = peer_started.elapsed().as_millis()
         );
         peers.retain(
@@ -1605,6 +1613,52 @@ fn interleaved_bitswap_dials(peers: &[BitswapPeer]) -> Vec<(PeerId, Multiaddr)> 
         }
     }
     dials
+}
+
+#[derive(Default)]
+struct BitswapPeerAddrStats {
+    tcp: usize,
+    quic: usize,
+    ws: usize,
+    wss: usize,
+    dns: usize,
+    ip4: usize,
+    ip6: usize,
+}
+
+fn bitswap_peer_addr_stats(peers: &[BitswapPeer]) -> BitswapPeerAddrStats {
+    let mut stats = BitswapPeerAddrStats::default();
+    for addr in peers.iter().flat_map(|peer| &peer.addrs) {
+        let mut has_tcp = false;
+        let mut has_quic = false;
+        let mut has_ws = false;
+        let mut has_wss = false;
+        let mut has_dns = false;
+        let mut has_ip4 = false;
+        let mut has_ip6 = false;
+        for protocol in addr.iter() {
+            match protocol {
+                Protocol::Tcp(_) => has_tcp = true,
+                Protocol::Quic | Protocol::QuicV1 => has_quic = true,
+                Protocol::Ws(_) => has_ws = true,
+                Protocol::Wss(_) => has_wss = true,
+                Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => {
+                    has_dns = true
+                }
+                Protocol::Ip4(_) => has_ip4 = true,
+                Protocol::Ip6(_) => has_ip6 = true,
+                _ => {}
+            }
+        }
+        stats.tcp += usize::from(has_tcp);
+        stats.quic += usize::from(has_quic);
+        stats.ws += usize::from(has_ws);
+        stats.wss += usize::from(has_wss);
+        stats.dns += usize::from(has_dns);
+        stats.ip4 += usize::from(has_ip4);
+        stats.ip6 += usize::from(has_ip6);
+    }
+    stats
 }
 
 async fn expand_provider_multiaddrs(addrs: &[String]) -> Vec<String> {
@@ -3483,6 +3537,31 @@ mod bitswap_tests {
             &connected_peers,
             &connection_waiters
         ));
+    }
+
+    #[test]
+    fn summarizes_bitswap_peer_address_mix() {
+        let peer = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let peers = vec![BitswapPeer {
+            id: peer,
+            addrs: vec![
+                "/ip4/127.0.0.1/tcp/4001".parse().unwrap(),
+                "/ip6/::1/udp/4001/quic-v1".parse().unwrap(),
+                "/dns4/example.com/tcp/443/wss".parse().unwrap(),
+                "/dnsaddr/bootstrap.example/tcp/4001/ws".parse().unwrap(),
+            ],
+            skip_want_have: false,
+        }];
+
+        let stats = bitswap_peer_addr_stats(&peers);
+
+        assert_eq!(stats.tcp, 3);
+        assert_eq!(stats.quic, 1);
+        assert_eq!(stats.ws, 1);
+        assert_eq!(stats.wss, 1);
+        assert_eq!(stats.dns, 2);
+        assert_eq!(stats.ip4, 1);
+        assert_eq!(stats.ip6, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
