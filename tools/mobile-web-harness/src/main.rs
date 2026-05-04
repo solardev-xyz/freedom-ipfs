@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use reqwest::header::{CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -14,10 +14,27 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 const DEFAULT_CORPUS: &str = "tools/mobile-web-harness/corpus/mobile-web.json";
+const DEFAULT_KUBO_BIN: &str = "target/tools/kubo/kubo/ipfs";
 const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 const DEFAULT_ASSET_CONCURRENCY: usize = 6;
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum HarnessEngine {
+    Rust,
+    Kubo,
+}
+
+impl HarnessEngine {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Kubo => "kubo",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Parser)]
 #[command(
     author,
     version,
@@ -27,12 +44,27 @@ struct Args {
     /// Existing gateway URL to test, for example http://127.0.0.1:50017.
     #[arg(long, env = "GATEWAY_URL")]
     gateway_url: Option<String>,
+    /// Gateway engine to spawn when --gateway-url is not provided.
+    #[arg(long, value_enum, default_value_t = HarnessEngine::Rust)]
+    engine: HarnessEngine,
     /// Standalone gateway binary to spawn when --gateway-url is not provided.
     #[arg(long, env = "FREEDOM_IPFS_GATEWAY_BIN")]
     gateway_bin: Option<PathBuf>,
     /// SQLite cache DB path for spawned gateways; useful for fresh-process warm-store runs.
     #[arg(long)]
     gateway_db: Option<PathBuf>,
+    /// Kubo ipfs binary to spawn when --engine kubo is selected.
+    #[arg(long, env = "KUBO_BIN", default_value = DEFAULT_KUBO_BIN)]
+    kubo_bin: PathBuf,
+    /// Kubo repo path. Omit for an isolated temporary repo per spawned Kubo daemon.
+    #[arg(long, env = "IPFS_PATH")]
+    kubo_repo: Option<PathBuf>,
+    /// Run paired Rust and Kubo harness passes with the same corpus/options.
+    #[arg(long)]
+    compare_kubo: bool,
+    /// Optional paired Rust-vs-Kubo JSON comparison report output path.
+    #[arg(long)]
+    comparison_output: Option<PathBuf>,
     /// JSON corpus file.
     #[arg(long, default_value = DEFAULT_CORPUS)]
     corpus: PathBuf,
@@ -82,6 +114,20 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let corpus = Corpus::read(&args.corpus)?;
 
+    if args.compare_kubo {
+        let report = run_comparison(&args, &corpus).await?;
+        print_comparison_summary(&report);
+        if let Some(output) = args.comparison_output.or(args.output) {
+            let json = serde_json::to_string_pretty(&report)?;
+            std::fs::write(&output, json).with_context(|| format!("write {}", output.display()))?;
+            eprintln!("wrote comparison report to {}", output.display());
+        }
+        if report.rust.summary.fail_count > 0 || report.kubo.summary.fail_count > 0 {
+            bail!("mobile web comparison found failures");
+        }
+        return Ok(());
+    }
+
     let report = run_harness(&args, &corpus).await?;
     print_summary(&report);
     if let Some(output) = args.output {
@@ -96,12 +142,46 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn run_comparison(args: &Args, corpus: &Corpus) -> Result<ComparisonReport> {
+    if args.gateway_url.is_some() {
+        bail!("--compare-kubo cannot be used with --gateway-url");
+    }
+    let mut rust_args = args.clone();
+    rust_args.engine = HarnessEngine::Rust;
+    rust_args.compare_kubo = false;
+    rust_args.comparison_output = None;
+
+    let mut kubo_args = args.clone();
+    kubo_args.engine = HarnessEngine::Kubo;
+    kubo_args.compare_kubo = false;
+    kubo_args.comparison_output = None;
+    kubo_args.gateway_db = None;
+    kubo_args.trace_output = None;
+    kubo_args.trace_filter = None;
+
+    let rust = run_harness(&rust_args, corpus).await?;
+    let kubo = run_harness(&kubo_args, corpus).await?;
+    let cases = ComparisonCase::from_reports(&rust, &kubo);
+    Ok(ComparisonReport {
+        generated_at_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        rust,
+        kubo,
+        cases,
+    })
+}
+
 async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
     if args.gateway_url.is_some() && args.fresh_gateway_per_run {
         bail!("--fresh-gateway-per-run cannot be used with --gateway-url");
     }
     if args.gateway_url.is_some() && args.gateway_db.is_some() {
         bail!("--gateway-db can only be used when the harness spawns the gateway");
+    }
+    if args.engine == HarnessEngine::Kubo && args.gateway_db.is_some() {
+        bail!("--gateway-db only applies to --engine rust");
+    }
+    if args.engine == HarnessEngine::Kubo && args.trace_output.is_some() {
+        bail!("--trace-output is only supported for --engine rust");
     }
     if args.gateway_url.is_none() {
         if let Some(gateway_db) = &args.gateway_db {
@@ -180,6 +260,34 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
                 .as_ref()
                 .and_then(SpawnedGateway::rss_kib)
         };
+        let gateway_fd_count = if let Some(gateway) = run_gateway.as_ref() {
+            gateway.fd_count()
+        } else {
+            persistent_gateway
+                .as_ref()
+                .and_then(SpawnedGateway::fd_count)
+        };
+        let gateway_child_process_count = if let Some(gateway) = run_gateway.as_ref() {
+            gateway.child_process_count()
+        } else {
+            persistent_gateway
+                .as_ref()
+                .and_then(SpawnedGateway::child_process_count)
+        };
+        let gateway_storage_bytes = if let Some(gateway) = run_gateway.as_ref() {
+            gateway.storage_bytes()
+        } else {
+            persistent_gateway
+                .as_ref()
+                .and_then(SpawnedGateway::storage_bytes)
+        };
+        let gateway_storage_path = if let Some(gateway) = run_gateway.as_ref() {
+            gateway.storage_path()
+        } else {
+            persistent_gateway
+                .as_ref()
+                .and_then(SpawnedGateway::storage_path)
+        };
         let passed = results.iter().all(|result| result.passed);
         runs.push(RunResult {
             phase,
@@ -187,6 +295,10 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             gateway_url,
             elapsed_ms,
             gateway_rss_kib,
+            gateway_fd_count,
+            gateway_child_process_count,
+            gateway_storage_bytes,
+            gateway_storage_path,
             passed,
             results,
         });
@@ -213,8 +325,13 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
         warmup_runs: args.warmup_runs,
         fresh_gateway_per_run: args.fresh_gateway_per_run,
         asset_concurrency: args.asset_concurrency,
+        engine: args.engine,
         gateway_db: args
             .gateway_db
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        kubo_repo: args
+            .kubo_repo
             .as_ref()
             .map(|path| path.display().to_string()),
         trace_output: args
@@ -356,12 +473,16 @@ async fn run_case(
 }
 
 fn print_summary(report: &RunReport) {
+    println!("engine: {}", report.engine.as_str());
     println!(
         "gateway: {}",
         report.gateway_url.as_deref().unwrap_or("fresh per run")
     );
     if let Some(gateway_db) = &report.gateway_db {
         println!("gateway_db: {gateway_db}");
+    }
+    if let Some(kubo_repo) = &report.kubo_repo {
+        println!("kubo_repo: {kubo_repo}");
     }
     println!(
         "runs: measured={} warmup={} fresh_gateway_per_run={} asset_concurrency={}",
@@ -440,12 +561,75 @@ fn print_summary(report: &RunReport) {
                 .gateway_rss_kib
                 .map(|rss| format!(" rss={}KiB", rss))
                 .unwrap_or_default();
+            let fds = run
+                .gateway_fd_count
+                .map(|fds| format!(" fds={fds}"))
+                .unwrap_or_default();
+            let children = run
+                .gateway_child_process_count
+                .map(|children| format!(" children={children}"))
+                .unwrap_or_default();
+            let storage = run
+                .gateway_storage_bytes
+                .map(|bytes| format!(" storage={}B", bytes))
+                .unwrap_or_default();
             println!(
-                "{mark} measured run {:02} total={}ms{rss}",
+                "{mark} measured run {:02} total={}ms{rss}{fds}{children}{storage}",
                 run.run_index, run.elapsed_ms
             );
         }
     }
+}
+
+fn print_comparison_summary(report: &ComparisonReport) {
+    println!("comparison: rust vs kubo");
+    println!(
+        "rust: passed={} failed={} pass_rate={:.1}%",
+        report.rust.summary.pass_count,
+        report.rust.summary.fail_count,
+        report.rust.summary.pass_rate * 100.0
+    );
+    println!(
+        "kubo: passed={} failed={} pass_rate={:.1}%",
+        report.kubo.summary.pass_count,
+        report.kubo.summary.fail_count,
+        report.kubo.summary.pass_rate * 100.0
+    );
+    for case in &report.cases {
+        println!(
+            "case {}: rust root_p50={} kubo root_p50={} ratio={} rust asset_p50={} kubo asset_p50={} ratio={} rss_ratio={} rust_fds={} kubo_fds={} rust_children={} kubo_children={}",
+            case.id,
+            display_option_ms(case.rust_root_ttfb_p50_ms),
+            display_option_ms(case.kubo_root_ttfb_p50_ms),
+            display_option_f64(case.root_ttfb_p50_ratio),
+            display_option_ms(case.rust_asset_ttfb_p50_ms),
+            display_option_ms(case.kubo_asset_ttfb_p50_ms),
+            display_option_f64(case.asset_ttfb_p50_ratio),
+            display_option_f64(case.rss_ratio),
+            display_option_usize(case.rust_max_fd_count),
+            display_option_usize(case.kubo_max_fd_count),
+            display_option_usize(case.rust_max_child_process_count),
+            display_option_usize(case.kubo_max_child_process_count)
+        );
+    }
+}
+
+fn display_option_ms(value: Option<u128>) -> String {
+    value
+        .map(|value| format!("{value}ms"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn display_option_f64(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.2}x"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn display_option_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
 }
 
 fn print_case_result(result: &CaseResult) {
@@ -1318,11 +1502,21 @@ fn normalize_gateway_url(url: &str) -> String {
 struct SpawnedGateway {
     child: Child,
     url: String,
+    storage_path: Option<PathBuf>,
+    remove_storage_on_stop: bool,
+    stdout_task: Option<JoinHandle<()>>,
     stderr_task: Option<JoinHandle<()>>,
 }
 
 impl SpawnedGateway {
     async fn start(args: &Args) -> Result<Self> {
+        match args.engine {
+            HarnessEngine::Rust => Self::start_rust(args).await,
+            HarnessEngine::Kubo => Self::start_kubo(args).await,
+        }
+    }
+
+    async fn start_rust(args: &Args) -> Result<Self> {
         let bin = args
             .gateway_bin
             .clone()
@@ -1381,6 +1575,9 @@ impl SpawnedGateway {
                 return Ok(Self {
                     child,
                     url: normalize_gateway_url(url),
+                    storage_path: args.gateway_db.clone(),
+                    remove_storage_on_stop: false,
+                    stdout_task: None,
                     stderr_task: Some(stderr_task),
                 });
             }
@@ -1388,18 +1585,98 @@ impl SpawnedGateway {
         }
     }
 
+    async fn start_kubo(args: &Args) -> Result<Self> {
+        let kubo = &args.kubo_bin;
+        let (repo, remove_storage_on_stop) = match &args.kubo_repo {
+            Some(repo) => (repo.clone(), false),
+            None => (unique_temp_path("freedom-ipfs-kubo-repo"), true),
+        };
+        std::fs::create_dir_all(&repo)
+            .with_context(|| format!("create Kubo repo {}", repo.display()))?;
+
+        let api_port = reserve_loopback_port().context("reserve Kubo API port")?;
+        let gateway_port = reserve_loopback_port().context("reserve Kubo gateway port")?;
+        prepare_kubo_repo(kubo, &repo, api_port, gateway_port)?;
+
+        let mut command = Command::new(kubo);
+        command
+            .kill_on_drop(true)
+            .env("IPFS_PATH", &repo)
+            .env("IPFS_TELEMETRY", "off")
+            .arg("daemon")
+            .arg("--migrate=true")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("spawn Kubo daemon {}", kubo.display()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("Kubo stdout was not piped"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("Kubo stderr was not piped"))?;
+        let stdout_task = Some(log_child_lines("kubo", stdout));
+        let stderr_task = Some(log_child_lines("kubo", stderr));
+        wait_for_kubo_api(&mut child, api_port).await?;
+        let url = format!("http://127.0.0.1:{gateway_port}");
+        eprintln!("kubo gateway listening on {url}");
+
+        Ok(Self {
+            child,
+            url,
+            storage_path: Some(repo),
+            remove_storage_on_stop,
+            stdout_task,
+            stderr_task,
+        })
+    }
+
     async fn stop(&mut self) {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
+        if let Some(stdout_task) = self.stdout_task.take() {
+            stdout_task.abort();
+            let _ = stdout_task.await;
+        }
         if let Some(stderr_task) = self.stderr_task.take() {
             stderr_task.abort();
             let _ = stderr_task.await;
+        }
+        if self.remove_storage_on_stop {
+            if let Some(path) = &self.storage_path {
+                let _ = std::fs::remove_dir_all(path);
+            }
         }
     }
 
     fn rss_kib(&self) -> Option<u64> {
         let pid = self.child.id()?;
         child_rss_kib(pid)
+    }
+
+    fn fd_count(&self) -> Option<usize> {
+        let pid = self.child.id()?;
+        child_fd_count(pid)
+    }
+
+    fn child_process_count(&self) -> Option<usize> {
+        let pid = self.child.id()?;
+        child_process_count(pid)
+    }
+
+    fn storage_bytes(&self) -> Option<u64> {
+        self.storage_path
+            .as_ref()
+            .and_then(|path| path_size_bytes(path).ok())
+    }
+
+    fn storage_path(&self) -> Option<String> {
+        self.storage_path
+            .as_ref()
+            .map(|path| path.display().to_string())
     }
 }
 
@@ -1415,6 +1692,175 @@ fn child_rss_kib(pid: u32) -> Option<u64> {
 #[cfg(not(target_os = "linux"))]
 fn child_rss_kib(_pid: u32) -> Option<u64> {
     None
+}
+
+#[cfg(target_os = "linux")]
+fn child_fd_count(pid: u32) -> Option<usize> {
+    Some(std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?.count())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn child_fd_count(_pid: u32) -> Option<usize> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn child_process_count(parent_pid: u32) -> Option<usize> {
+    let mut count = 0usize;
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        if status.lines().any(|line| {
+            line.strip_prefix("PPid:")
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u32>().ok())
+                == Some(parent_pid)
+        }) {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn child_process_count(_parent_pid: u32) -> Option<usize> {
+    None
+}
+
+fn log_child_lines<R>(prefix: &'static str, stream: R) -> JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut lines = BufReader::new(stream).lines();
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("{prefix}: {line}");
+        }
+    })
+}
+
+fn unique_temp_path(prefix: &str) -> PathBuf {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!("{prefix}-{}-{millis}", std::process::id()))
+}
+
+fn reserve_loopback_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn prepare_kubo_repo(
+    kubo: &PathBuf,
+    repo: &PathBuf,
+    api_port: u16,
+    gateway_port: u16,
+) -> Result<()> {
+    if !repo.join("config").exists() {
+        kubo_ok(kubo, repo, ["init", "--empty-repo"])?;
+        kubo_ok(kubo, repo, ["config", "profile", "apply", "lowpower"])?;
+    }
+    kubo_ok(
+        kubo,
+        repo,
+        [
+            "config",
+            "Addresses.API",
+            &format!("/ip4/127.0.0.1/tcp/{api_port}"),
+        ],
+    )?;
+    kubo_ok(
+        kubo,
+        repo,
+        [
+            "config",
+            "Addresses.Gateway",
+            &format!("/ip4/127.0.0.1/tcp/{gateway_port}"),
+        ],
+    )?;
+    kubo_ok(
+        kubo,
+        repo,
+        [
+            "config",
+            "--json",
+            "Addresses.Swarm",
+            r#"["/ip4/127.0.0.1/tcp/0","/ip4/127.0.0.1/udp/0/quic-v1"]"#,
+        ],
+    )?;
+    kubo_ok(
+        kubo,
+        repo,
+        ["config", "--json", "Swarm.DisableNatPortMap", "true"],
+    )?;
+    kubo_ok(
+        kubo,
+        repo,
+        ["config", "--json", "Discovery.MDNS.Enabled", "false"],
+    )?;
+    Ok(())
+}
+
+fn kubo_ok<const N: usize>(kubo: &PathBuf, repo: &PathBuf, args: [&str; N]) -> Result<()> {
+    let output = std::process::Command::new(kubo)
+        .env("IPFS_PATH", repo)
+        .env("IPFS_TELEMETRY", "off")
+        .args(args)
+        .output()
+        .with_context(|| format!("run Kubo command {}", kubo.display()))?;
+    if !output.status.success() {
+        bail!(
+            "Kubo command failed with status {}: stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+async fn wait_for_kubo_api(child: &mut Child, api_port: u16) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{api_port}/api/v0/version");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if let Some(status) = child.try_wait().context("check Kubo daemon status")? {
+            bail!("Kubo daemon exited before readiness with {status}");
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for Kubo API at {url}");
+        }
+        match client.post(&url).send().await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            _ => tokio::time::sleep(Duration::from_millis(150)).await,
+        }
+    }
+}
+
+fn path_size_bytes(path: &PathBuf) -> std::io::Result<u64> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        total = total.saturating_add(path_size_bytes(&entry.path())?);
+    }
+    Ok(total)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1463,7 +1909,9 @@ struct RunReport {
     warmup_runs: usize,
     fresh_gateway_per_run: bool,
     asset_concurrency: usize,
+    engine: HarnessEngine,
     gateway_db: Option<String>,
+    kubo_repo: Option<String>,
     trace_output: Option<String>,
     trace_summary: Option<TraceSummary>,
     summary: RepeatSummary,
@@ -1477,8 +1925,149 @@ struct RunResult {
     gateway_url: String,
     elapsed_ms: u128,
     gateway_rss_kib: Option<u64>,
+    gateway_fd_count: Option<usize>,
+    gateway_child_process_count: Option<usize>,
+    gateway_storage_bytes: Option<u64>,
+    gateway_storage_path: Option<String>,
     passed: bool,
     results: Vec<CaseResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct ComparisonReport {
+    generated_at_unix_seconds: u64,
+    rust: RunReport,
+    kubo: RunReport,
+    cases: Vec<ComparisonCase>,
+}
+
+#[derive(Debug, Serialize)]
+struct ComparisonCase {
+    id: String,
+    rust_pass_rate: f64,
+    kubo_pass_rate: f64,
+    rust_root_ttfb_p50_ms: Option<u128>,
+    kubo_root_ttfb_p50_ms: Option<u128>,
+    root_ttfb_p50_ratio: Option<f64>,
+    rust_root_ttfb_p95_ms: Option<u128>,
+    kubo_root_ttfb_p95_ms: Option<u128>,
+    root_ttfb_p95_ratio: Option<f64>,
+    rust_asset_ttfb_p50_ms: Option<u128>,
+    kubo_asset_ttfb_p50_ms: Option<u128>,
+    asset_ttfb_p50_ratio: Option<f64>,
+    rust_asset_ttfb_p95_ms: Option<u128>,
+    kubo_asset_ttfb_p95_ms: Option<u128>,
+    asset_ttfb_p95_ratio: Option<f64>,
+    rust_max_rss_kib: Option<u64>,
+    kubo_max_rss_kib: Option<u64>,
+    rss_ratio: Option<f64>,
+    rust_max_fd_count: Option<usize>,
+    kubo_max_fd_count: Option<usize>,
+    rust_max_child_process_count: Option<usize>,
+    kubo_max_child_process_count: Option<usize>,
+    rust_max_storage_bytes: Option<u64>,
+    kubo_max_storage_bytes: Option<u64>,
+    storage_ratio: Option<f64>,
+}
+
+impl ComparisonCase {
+    fn from_reports(rust: &RunReport, kubo: &RunReport) -> Vec<Self> {
+        let mut ids = Vec::new();
+        for case in &rust.summary.cases {
+            if !ids.contains(&case.id) {
+                ids.push(case.id.clone());
+            }
+        }
+        for case in &kubo.summary.cases {
+            if !ids.contains(&case.id) {
+                ids.push(case.id.clone());
+            }
+        }
+
+        ids.into_iter()
+            .filter_map(|id| {
+                let rust_case = rust.summary.cases.iter().find(|case| case.id == id)?;
+                let kubo_case = kubo.summary.cases.iter().find(|case| case.id == id)?;
+                let rust_max_rss_kib = max_run_u64(&rust.runs, |run| run.gateway_rss_kib);
+                let kubo_max_rss_kib = max_run_u64(&kubo.runs, |run| run.gateway_rss_kib);
+                let rust_max_fd_count = max_run_usize(&rust.runs, |run| run.gateway_fd_count);
+                let kubo_max_fd_count = max_run_usize(&kubo.runs, |run| run.gateway_fd_count);
+                let rust_max_child_process_count =
+                    max_run_usize(&rust.runs, |run| run.gateway_child_process_count);
+                let kubo_max_child_process_count =
+                    max_run_usize(&kubo.runs, |run| run.gateway_child_process_count);
+                let rust_max_storage_bytes =
+                    max_run_u64(&rust.runs, |run| run.gateway_storage_bytes);
+                let kubo_max_storage_bytes =
+                    max_run_u64(&kubo.runs, |run| run.gateway_storage_bytes);
+                Some(Self {
+                    id,
+                    rust_pass_rate: rust_case.pass_rate,
+                    kubo_pass_rate: kubo_case.pass_rate,
+                    rust_root_ttfb_p50_ms: rust_case.root_ttfb_ms.p50_ms,
+                    kubo_root_ttfb_p50_ms: kubo_case.root_ttfb_ms.p50_ms,
+                    root_ttfb_p50_ratio: ratio(
+                        rust_case.root_ttfb_ms.p50_ms,
+                        kubo_case.root_ttfb_ms.p50_ms,
+                    ),
+                    rust_root_ttfb_p95_ms: rust_case.root_ttfb_ms.p95_ms,
+                    kubo_root_ttfb_p95_ms: kubo_case.root_ttfb_ms.p95_ms,
+                    root_ttfb_p95_ratio: ratio(
+                        rust_case.root_ttfb_ms.p95_ms,
+                        kubo_case.root_ttfb_ms.p95_ms,
+                    ),
+                    rust_asset_ttfb_p50_ms: rust_case.asset_ttfb_ms.p50_ms,
+                    kubo_asset_ttfb_p50_ms: kubo_case.asset_ttfb_ms.p50_ms,
+                    asset_ttfb_p50_ratio: ratio(
+                        rust_case.asset_ttfb_ms.p50_ms,
+                        kubo_case.asset_ttfb_ms.p50_ms,
+                    ),
+                    rust_asset_ttfb_p95_ms: rust_case.asset_ttfb_ms.p95_ms,
+                    kubo_asset_ttfb_p95_ms: kubo_case.asset_ttfb_ms.p95_ms,
+                    asset_ttfb_p95_ratio: ratio(
+                        rust_case.asset_ttfb_ms.p95_ms,
+                        kubo_case.asset_ttfb_ms.p95_ms,
+                    ),
+                    rust_max_rss_kib,
+                    kubo_max_rss_kib,
+                    rss_ratio: ratio_u64(rust_max_rss_kib, kubo_max_rss_kib),
+                    rust_max_fd_count,
+                    kubo_max_fd_count,
+                    rust_max_child_process_count,
+                    kubo_max_child_process_count,
+                    rust_max_storage_bytes,
+                    kubo_max_storage_bytes,
+                    storage_ratio: ratio_u64(rust_max_storage_bytes, kubo_max_storage_bytes),
+                })
+            })
+            .collect()
+    }
+}
+
+fn max_run_u64<F>(runs: &[RunResult], mut value: F) -> Option<u64>
+where
+    F: FnMut(&RunResult) -> Option<u64>,
+{
+    runs.iter().filter_map(&mut value).max()
+}
+
+fn max_run_usize<F>(runs: &[RunResult], mut value: F) -> Option<usize>
+where
+    F: FnMut(&RunResult) -> Option<usize>,
+{
+    runs.iter().filter_map(&mut value).max()
+}
+
+fn ratio(left: Option<u128>, right: Option<u128>) -> Option<f64> {
+    let left = left?;
+    let right = right?;
+    (right > 0).then_some(left as f64 / right as f64)
+}
+
+fn ratio_u64(left: Option<u64>, right: Option<u64>) -> Option<f64> {
+    let left = left?;
+    let right = right?;
+    (right > 0).then_some(left as f64 / right as f64)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
