@@ -501,3 +501,115 @@ Rust cold full-page latency is now materially better for this case, but Kubo is
 still much faster on the first load and dramatically faster once its repo is
 warm. Remaining evidence points to provider quality/session behavior and root
 UnixFS path startup cost.
+
+## 2026-05-04 Kubo Harness And Dial-Dedupe Follow-Up
+
+The harness now has a Kubo engine and paired comparison mode, so Rust changes
+can be checked against the same corpus/options instead of comparing separate
+manual runs:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --output /tmp/ipfs-tech-rust-vs-kubo-dial-dedupe.json
+```
+
+After deduplicating shared Bitswap dials for peers that are already connected or
+already have a pending connection waiter:
+
+```text
+Rust: passed=3 failed=0
+Kubo: passed=3 failed=0
+Rust root_ttfb p50=1888ms p95=2154ms
+Kubo root_ttfb p50=4731ms p95=5398ms
+Rust asset_ttfb p50=230ms p95=1893ms
+Kubo asset_ttfb p50=242ms p95=493ms
+Rust max RSS=53148 KiB
+Kubo max RSS=307812 KiB
+```
+
+Focused Rust trace:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --trace-output /tmp/ipfs-tech-dial-dedupe-trace.jsonl \
+  --output /tmp/ipfs-tech-dial-dedupe.json
+```
+
+```text
+passed=3 failed=0 pass_rate=100.0%
+root_ttfb p50=1712ms p95=1914ms max=1914ms
+asset_ttfb p50=278ms p95=1857ms max=3715ms
+bitswap_fetch count=105 total=36437ms p50=113ms p95=1294ms max=2226ms
+```
+
+The earlier same-window trace before pending-dial dedupe logged 3827
+connection-limit `bitswap_dial_rejected` events. After dedupe the same focused
+case logged 1115, while keeping 3/3 pass rate. This is a resource win: less
+connection churn under page asset fan-out without raising mobile connection
+limits.
+
+## 2026-05-04 Lightweight Timeout Diagnostics
+
+A later live trace showed that the heaviest missing evidence was whether a
+15-second shared Bitswap request timeout meant "all peers stalled" or "the
+command never got meaningful swarm time." The current diagnostics add:
+
+- `command_queued_ms` on `bitswap_dial_plan`, measured from enqueue to swarm
+  command processing.
+- `bitswap_request_timeout_detail` when the shared Bitswap request timeout
+  fires, including CID, peer count, trusted/session peer count, and a bounded
+  target summary.
+
+Validation command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --output /tmp/ipfs-tech-light-timeout-detail.json \
+  --trace-output /tmp/ipfs-tech-light-timeout-detail-trace.jsonl
+```
+
+Result:
+
+```text
+passed=5 failed=0 pass_rate=100.0%
+root_ttfb p50=43ms p95=2119ms max=2119ms
+asset_ttfb p50=52ms p95=932ms max=2533ms
+bitswap_fetch count=29 total=11625ms p50=189ms p95=1266ms max=1330ms
+bitswap_dial_plan count=40
+bitswap_request_timeout_detail count=0
+command_queued_ms p50=4ms p90=109ms max=146ms
+bitswap_dial_rejected count=324, all connection-limit rejections
+```
+
+This run did not reproduce the 15-second shared request timeout, so the timeout
+detail event remains a diagnostic hook for the next bad live sample rather than
+evidence for a behavior change. The low queue times in the successful run argue
+against command-queue starvation during normal `ipfs.tech` fan-out.
+
+After making the target summary lazy so normal non-INFO runs avoid formatting
+work, the exact-code follow-up remained clean:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --output /tmp/ipfs-tech-light-timeout-detail-final.json \
+  --trace-output /tmp/ipfs-tech-light-timeout-detail-final-trace.jsonl
+```
+
+```text
+passed=3 failed=0 pass_rate=100.0%
+root_ttfb p50=43ms p95=1660ms max=1660ms
+asset_ttfb p50=63ms p95=1440ms max=3639ms
+bitswap_dial_plan count=35
+bitswap_request_timeout_detail count=0
+command_queued_ms p50=0ms p90=80ms max=134ms
+```

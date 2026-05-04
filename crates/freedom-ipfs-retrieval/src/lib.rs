@@ -1049,6 +1049,7 @@ struct SharedBitswapClient {
 struct BitswapCommand {
     cid: Cid,
     peers: Vec<BitswapPeer>,
+    sent_at: Instant,
     respond: oneshot::Sender<Result<BitswapFetchResult>>,
 }
 
@@ -1066,11 +1067,15 @@ impl SharedBitswapClient {
 
     async fn fetch(&self, cid: Cid, peers: Vec<BitswapPeer>) -> Result<Result<BitswapFetchResult>> {
         let peer_count = peers.len();
+        let trusted_peer_count = peers.iter().filter(|peer| peer.skip_want_have).count();
+        let target_summary =
+            tracing::enabled!(tracing::Level::INFO).then(|| format_bitswap_peers(&peers));
         let (respond, response) = oneshot::channel();
         self.commands
             .send(BitswapCommand {
                 cid,
                 peers,
+                sent_at: Instant::now(),
                 respond,
             })
             .await
@@ -1082,7 +1087,13 @@ impl SharedBitswapClient {
                 "shared bitswap response dropped".into(),
             )),
             Err(_) => {
-                tracing::debug!(cid = %cid, peer_count, "bitswap request timed out");
+                tracing::info!(
+                    phase = "bitswap_request_timeout_detail",
+                    cid = %cid,
+                    peer_count,
+                    trusted_peer_count,
+                    targets = %target_summary.as_deref().unwrap_or("")
+                );
                 Err(RetrievalError::BitswapTimeout)
             }
         }
@@ -1111,6 +1122,7 @@ async fn run_shared_bitswap_swarm(
                 let Some(command) = command else {
                     break;
                 };
+                let command_queued_ms = command.sent_at.elapsed().as_millis();
                 prune_connection_waiters(&mut connection_waiters, &mut connection_wait_started);
                 let (incoming_result, incoming_results) = mpsc::unbounded_channel();
                 pending_incoming.entry(command.cid).or_default().push(incoming_result);
@@ -1162,7 +1174,8 @@ async fn run_shared_bitswap_swarm(
                     peer_count = peer_targets.len(),
                     new_dial_peer_count = dial_peers.len(),
                     pending_dial_peer_count,
-                    connected_peer_count
+                    connected_peer_count,
+                    command_queued_ms
                 );
 
                 for (peer_id, addr) in interleaved_bitswap_dials(&dial_peers) {
@@ -1338,6 +1351,22 @@ async fn recent_dial_errors(errors: &DialErrorLog, peer: PeerId) -> String {
         Some(values) if !values.is_empty() => values.join(" | "),
         _ => "none".to_string(),
     }
+}
+
+fn format_bitswap_peers(peers: &[BitswapPeer]) -> String {
+    peers
+        .iter()
+        .take(MAX_BITSWAP_FAILURE_DETAILS)
+        .map(|peer| {
+            let mode = if peer.skip_want_have {
+                "want-block"
+            } else {
+                "want-have"
+            };
+            format!("{}:{}@{}", peer.id, mode, format_multiaddrs(&peer.addrs))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn format_bitswap_targets(peers: &[BitswapPeerTarget]) -> String {
@@ -2622,6 +2651,37 @@ mod bitswap_tests {
                 "/ip4/127.0.0.1/tcp/1002",
                 "/ip4/127.0.0.1/tcp/2002",
             ]
+        );
+    }
+
+    #[test]
+    fn formats_bitswap_peer_timeout_summary() {
+        let first = parse_peer_id("12D3KooWLSFr3c4K1dxWavx5XFsUjeSXap3VPMuEbe28zeL5B1v3").unwrap();
+        let second = parse_peer_id("12D3KooWGU3fJrHaWtRSWyrrzCpdgFX5bxbS69hqL1MSdKMGez12").unwrap();
+        let peers = vec![
+            BitswapPeer {
+                id: first,
+                addrs: vec![
+                    "/ip4/127.0.0.1/tcp/1001".parse().unwrap(),
+                    "/ip4/127.0.0.1/tcp/1002".parse().unwrap(),
+                    "/ip4/127.0.0.1/tcp/1003".parse().unwrap(),
+                    "/ip4/127.0.0.1/tcp/1004".parse().unwrap(),
+                    "/ip4/127.0.0.1/tcp/1005".parse().unwrap(),
+                ],
+                skip_want_have: true,
+            },
+            BitswapPeer {
+                id: second,
+                addrs: Vec::new(),
+                skip_want_have: false,
+            },
+        ];
+
+        assert_eq!(
+            format_bitswap_peers(&peers),
+            format!(
+                "{first}:want-block@[/ip4/127.0.0.1/tcp/1001,/ip4/127.0.0.1/tcp/1002,/ip4/127.0.0.1/tcp/1003,/ip4/127.0.0.1/tcp/1004,+1 more]; {second}:want-have@[]"
+            )
         );
     }
 
