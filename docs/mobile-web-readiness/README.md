@@ -96,7 +96,8 @@ Bitswap session shortcut summaries include both started shortcut races and
 completed shortcut attempts, which makes hidden dropped background work visible
 when tuning recent-peer races. `bitswap_session_shortcut_post_lookup_wait`
 marks cases where a quick provider lookup was briefly held to let a recent
-known-good peer finish first.
+known-good peer finish first, and the session summary counts those waits as
+`shortcut_post_lookup_waits`.
 Bitswap peer expansion traces include address mix counters, and the report
 aggregates them as `bitswap_addr_mix` for transport policy work. Established
 Bitswap connections are also counted by transport as

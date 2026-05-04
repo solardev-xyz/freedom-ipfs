@@ -643,7 +643,7 @@ fn print_summary(report: &RunReport) {
         if trace.bitswap_session.has_events() {
             let session = &trace.bitswap_session;
             println!(
-                "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_starts={} shortcut_attempts={} shortcut_hits={} shortcut_misses={}",
+                "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_starts={} shortcut_post_lookup_waits={} shortcut_attempts={} shortcut_hits={} shortcut_misses={}",
                 session.fetches,
                 session.with_trusted_peers,
                 session.trusted_successes,
@@ -651,6 +651,7 @@ fn print_summary(report: &RunReport) {
                 session.trusted_failures,
                 session.request_timeouts_with_trusted,
                 session.session_shortcut_starts,
+                session.session_shortcut_post_lookup_waits,
                 session.session_shortcut_attempts,
                 session.session_shortcut_hits,
                 session.session_shortcut_misses
@@ -2648,6 +2649,7 @@ struct TraceBitswapSessionAggregate {
     trusted_failures: usize,
     request_timeouts_with_trusted: usize,
     session_shortcut_starts: usize,
+    session_shortcut_post_lookup_waits: usize,
     session_shortcut_attempts: usize,
     session_shortcut_hits: usize,
     session_shortcut_misses: usize,
@@ -2655,7 +2657,10 @@ struct TraceBitswapSessionAggregate {
 
 impl TraceBitswapSessionAggregate {
     fn has_events(&self) -> bool {
-        self.fetches > 0 || self.session_shortcut_starts > 0 || self.session_shortcut_attempts > 0
+        self.fetches > 0
+            || self.session_shortcut_starts > 0
+            || self.session_shortcut_post_lookup_waits > 0
+            || self.session_shortcut_attempts > 0
     }
 }
 
@@ -2907,6 +2912,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         }
         if phase == "bitswap_session_shortcut_start" {
             bitswap_session.session_shortcut_starts += 1;
+        }
+        if phase == "bitswap_session_shortcut_post_lookup_wait" {
+            bitswap_session.session_shortcut_post_lookup_waits += 1;
         }
         if phase == "bitswap_session_shortcut" {
             bitswap_session.session_shortcut_attempts += 1;
@@ -3511,6 +3519,7 @@ mod tests {
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":12,\"cid\":\"cid6\",\"ok\":false,\"trusted_peer_count\":1}\n",
                 "{\"phase\":\"bitswap_peer_expand\",\"elapsed_ms\":3,\"cid\":\"cid7\",\"tcp_addr_count\":4,\"quic_addr_count\":2,\"ws_addr_count\":1,\"wss_addr_count\":0,\"dns_addr_count\":1,\"ip4_addr_count\":3,\"ip6_addr_count\":1}\n",
                 "{\"phase\":\"bitswap_session_shortcut_start\",\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1}\n",
+                "{\"phase\":\"bitswap_session_shortcut_post_lookup_wait\",\"cid\":\"cid8\",\"timeout_ms\":100}\n",
                 "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":2,\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":true,\"source_peer\":\"peer1\",\"source_peer_trusted\":true}\n",
                 "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":3,\"cid\":\"cid9\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":false,\"timeout\":true}\n",
                 "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer1\",\"remote_addr\":\"/ip4/127.0.0.1/tcp/4001\",\"transport\":\"tcp\"}\n",
@@ -3535,8 +3544,8 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 26);
-        assert_eq!(summary.event_count, 25);
+        assert_eq!(summary.line_count, 27);
+        assert_eq!(summary.event_count, 26);
         assert_eq!(summary.slow_events.len(), 12);
         assert_eq!(
             summary.slow_events[0].phase,
@@ -3613,6 +3622,10 @@ mod tests {
         assert_eq!(summary.bitswap_session.trusted_failures, 1);
         assert_eq!(summary.bitswap_session.request_timeouts_with_trusted, 1);
         assert_eq!(summary.bitswap_session.session_shortcut_starts, 1);
+        assert_eq!(
+            summary.bitswap_session.session_shortcut_post_lookup_waits,
+            1
+        );
         assert_eq!(summary.bitswap_session.session_shortcut_attempts, 2);
         assert_eq!(summary.bitswap_session.session_shortcut_hits, 1);
         assert_eq!(summary.bitswap_session.session_shortcut_misses, 1);
