@@ -1068,3 +1068,117 @@ Decision: keep as test-covered groundwork only. The live retriever still request
 one block at a time. The next experiment should wire this into a tiny bounded
 window only for known-good session peers and measure `bitswap_fetch` count,
 source-peer reuse, RSS, and asset p95 before keeping any behavior change.
+
+## 2026-05-04 UnixFS Decoded Metadata Cache
+
+Hypothesis:
+The rejected exact `(root CID, UnixFS path)` gateway resource cache missed the
+real repeated work. Browser page loads walk many different paths under the same
+root and then re-check the same DAG-PB file metadata for file size, MIME/range,
+and streaming. A small decoded DAG-PB metadata cache inside UnixFS traversal can
+remove repeated block-store reads and protobuf decodes without changing
+retrieval policy, trust boundaries, or public-network behavior.
+
+Implementation:
+
+- Added `UnixfsResolver`, a per-gateway resolver with a bounded decoded DAG-PB
+  metadata cache.
+- Default cache capacity is `256` decoded nodes; individual DAG-PB blocks larger
+  than `64 KiB` are skipped to keep mobile memory bounded.
+- Cache entries store only metadata decoded from already verified blocks; the
+  block provider remains responsible for fetching/verifying blocks before they
+  can enter this path.
+- Existing stateless UnixFS free functions remain uncached for compatibility.
+- Gateway state now owns one resolver and reuses it across resource detection,
+  MIME sniffing, range responses, and streaming responses.
+- Gateway tracing emits `unixfs_metadata_cache` with per-request cache hit/miss,
+  insert, eviction, skip, capacity, and length counters.
+
+Deterministic validation:
+
+```sh
+cargo test -p freedom-ipfs-unixfs
+cargo test -p freedom-ipfs-gateway
+```
+
+Key covered cases:
+
+- sibling paths under the same directory read the root directory block once
+- repeated ranges over the same DAG-PB file read/decode the file metadata once
+- capacity `1` evicts older metadata and re-fetches it when needed
+- a gateway DAG-PB directory/index response reads the directory and file
+  metadata blocks once while still streaming the response body
+
+Live baseline attempt before the patch:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-unixfs-metadata-cache-baseline-trace.jsonl \
+  --output /tmp/ipfs-tech-unixfs-metadata-cache-baseline.json
+```
+
+Result: not useful as a cache comparator. The run landed in a bad provider
+window and failed `0/3` before asset traversal:
+
+```text
+status 504 x3
+root_ttfb p50=30251ms max=30471ms
+bitswap_request_timeout_detail count=6
+failed CID bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq
+```
+
+Live smoke after the patch:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --trace-output /tmp/vitalik-unixfs-metadata-cache-r3-trace.jsonl \
+  --output /tmp/vitalik-unixfs-metadata-cache-r3.json
+```
+
+Result: `3/3`, root TTFB p50 `4286ms`, max `4416ms`, RSS about `37 MiB`,
+FD count `28-29`, child processes `0`.
+
+Final trace-shape check after adding `elapsed_ms=0` to the cache event:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --trace-output /tmp/vitalik-unixfs-metadata-cache-final-trace.jsonl \
+  --output /tmp/vitalik-unixfs-metadata-cache-final.json
+```
+
+Result: `1/1`; trace summary includes `unixfs_metadata_cache`. The raw event
+showed:
+
+```text
+cache_capacity=256 cache_len=1 hits=1 misses=1 inserts=1 evictions=0 oversized_skips=0
+```
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-unixfs
+cargo test -p freedom-ipfs-gateway
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Decision: keep. This is a bounded CPU/store-read optimization with deterministic
+evidence and no additional network fanout, timeout budget, public gateway
+fallback, or unverified-block cache path. Live timing remains provider dominated
+for cold roots, so this is not expected to fix root 504s by itself. The next
+metadata follow-up should measure full-page `ipfs.tech` in a cleaner provider
+window and consider caching decoded directory entry vectors for HAMT/listing
+heavy paths if traces show directory-entry rebuilding cost.

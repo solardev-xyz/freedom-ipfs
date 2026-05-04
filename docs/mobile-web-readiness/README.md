@@ -157,7 +157,11 @@ status, MIME type, byte count, and timing.
   1.8s, while live root TTFB still varied from 4.0s to 10.4s. Interleaving
   Bitswap dials by address rank then removed that root tail in the next
   same-window sample: fresh `ipfs.tech-page-assets` repeat=5 passed 5/5 with
-  root p50 1.4s, root max 1.8s, asset p95 1.2s, and asset max 1.5s.
+  root p50 1.4s, root max 1.8s, asset p95 1.2s, and asset max 1.5s. A later
+  UnixFS follow-up added a bounded per-gateway decoded DAG-PB metadata cache so
+  path traversal, MIME/range checks, and streaming can reuse verified directory
+  and file metadata without extra network fanout. Gateway traces now include
+  `unixfs_metadata_cache` hit/miss/insert/eviction counters.
 
 ## Next Scenario Targets
 

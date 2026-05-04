@@ -11,7 +11,8 @@ use freedom_ipfs_core::{parse_cid, BlockProvider};
 use freedom_ipfs_namesys::{NameResolver, NamesysError};
 use freedom_ipfs_store::SqliteBlockStore;
 use freedom_ipfs_unixfs::{
-    file_size, list_directory, read_file_range, DirectoryEntry, UnixfsError,
+    DirectoryEntry, UnixfsError, UnixfsMetadataCacheStats, UnixfsResolver,
+    DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY,
 };
 use futures::stream;
 use std::collections::HashSet;
@@ -31,17 +32,28 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     max_concurrent_requests: usize,
+    unixfs_metadata_cache_capacity: usize,
 }
 
 impl GatewayConfig {
     pub fn new(max_concurrent_requests: usize) -> Self {
         Self {
             max_concurrent_requests: max_concurrent_requests.max(1),
+            unixfs_metadata_cache_capacity: DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY,
         }
     }
 
     pub fn max_concurrent_requests(&self) -> usize {
         self.max_concurrent_requests
+    }
+
+    pub fn unixfs_metadata_cache_capacity(&self) -> usize {
+        self.unixfs_metadata_cache_capacity
+    }
+
+    pub fn with_unixfs_metadata_cache_capacity(mut self, capacity: usize) -> Self {
+        self.unixfs_metadata_cache_capacity = capacity;
+        self
     }
 }
 
@@ -55,6 +67,7 @@ impl Default for GatewayConfig {
 pub struct GatewayState {
     provider: Arc<dyn BlockProvider>,
     name_resolver: Arc<dyn NameResolver>,
+    unixfs: UnixfsResolver,
     request_limiter: Arc<Semaphore>,
 }
 
@@ -91,9 +104,12 @@ impl GatewayState {
         name_resolver: Arc<dyn NameResolver>,
         config: GatewayConfig,
     ) -> Self {
+        let unixfs =
+            UnixfsResolver::with_metadata_cache_capacity(config.unixfs_metadata_cache_capacity());
         Self {
             provider,
             name_resolver,
+            unixfs,
             request_limiter: Arc::new(Semaphore::new(config.max_concurrent_requests())),
         }
     }
@@ -241,11 +257,17 @@ async fn ipfs_get(
             elapsed_ms = limiter_started.elapsed().as_millis()
         );
 
-        let response =
-            match serve_ipfs_path(state.provider.clone(), &path, headers.get(RANGE)).await {
-                Ok(response) => response,
-                Err(err) => gateway_error(err),
-            };
+        let response = match serve_ipfs_path(
+            state.provider.clone(),
+            state.unixfs.clone(),
+            &path,
+            headers.get(RANGE),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => gateway_error(err),
+        };
         tracing::info!(
             phase = "request_done",
             request_id,
@@ -304,6 +326,7 @@ async fn ipns_get(
 
         let response = match serve_ipns_path(
             state.provider.clone(),
+            state.unixfs.clone(),
             state.name_resolver.as_ref(),
             &path,
             headers.get(RANGE),
@@ -334,14 +357,16 @@ fn header_value_for_trace(value: Option<&HeaderValue>) -> String {
 
 async fn serve_ipfs_path(
     provider: Arc<dyn BlockProvider>,
+    unixfs: UnixfsResolver,
     path: &str,
     range: Option<&HeaderValue>,
 ) -> Result<Response, GatewayError> {
-    serve_ipfs_path_with_listing_path(provider, path, range, None).await
+    serve_ipfs_path_with_listing_path(provider, unixfs, path, range, None).await
 }
 
 async fn serve_ipfs_path_with_listing_path(
     provider: Arc<dyn BlockProvider>,
+    unixfs: UnixfsResolver,
     path: &str,
     range: Option<&HeaderValue>,
     listing_path: Option<&DirectoryListingPath>,
@@ -355,8 +380,9 @@ async fn serve_ipfs_path_with_listing_path(
         elapsed_ms = parse_started.elapsed().as_millis()
     );
 
+    let cache_before = unixfs.metadata_cache_stats();
     let resource_started = Instant::now();
-    let resource = served_resource(provider.as_ref(), &cid, unixfs_path)?;
+    let resource = served_resource(&unixfs, provider.as_ref(), &cid, unixfs_path)?;
     let resource_elapsed_ms = resource_started.elapsed().as_millis();
     let response = match resource {
         ServedResource::File { path, len } => {
@@ -369,7 +395,7 @@ async fn serve_ipfs_path_with_listing_path(
                 elapsed_ms = resource_elapsed_ms
             );
             let mime_started = Instant::now();
-            let mime = mime_for_served_file(provider.as_ref(), &cid, &path, len)?;
+            let mime = mime_for_served_file(&unixfs, provider.as_ref(), &cid, &path, len)?;
             tracing::info!(
                 phase = "mime_total",
                 cid = %cid,
@@ -378,9 +404,9 @@ async fn serve_ipfs_path_with_listing_path(
                 elapsed_ms = mime_started.elapsed().as_millis()
             );
             if let Some(range) = range {
-                ranged_response(provider, cid, path, len, range, &mime)?
+                ranged_response(provider, unixfs.clone(), cid, path, len, range, &mime)?
             } else {
-                streaming_response(provider, cid, path, len, &mime)?
+                streaming_response(provider, unixfs.clone(), cid, path, len, &mime)?
             }
         }
         ServedResource::Directory { path, entries } => {
@@ -407,10 +433,29 @@ async fn serve_ipfs_path_with_listing_path(
             directory_listing_response(listing_path, &entries)?
         }
     };
+    trace_unixfs_metadata_cache_delta(cache_before, unixfs.metadata_cache_stats());
     Ok(response)
 }
 
+fn trace_unixfs_metadata_cache_delta(
+    before: UnixfsMetadataCacheStats,
+    after: UnixfsMetadataCacheStats,
+) {
+    tracing::info!(
+        phase = "unixfs_metadata_cache",
+        elapsed_ms = 0u64,
+        cache_capacity = after.capacity,
+        cache_len = after.len,
+        hits = after.hits.saturating_sub(before.hits),
+        misses = after.misses.saturating_sub(before.misses),
+        inserts = after.inserts.saturating_sub(before.inserts),
+        evictions = after.evictions.saturating_sub(before.evictions),
+        oversized_skips = after.oversized_skips.saturating_sub(before.oversized_skips)
+    );
+}
+
 fn mime_for_served_file(
+    unixfs: &UnixfsResolver,
     provider: &dyn BlockProvider,
     cid: &Cid,
     path: &str,
@@ -430,7 +475,9 @@ fn mime_for_served_file(
     if len > 0 {
         let end = (len - 1).min(512);
         let sniff_started = Instant::now();
-        let prefix = read_file_range(provider, cid, path, 0, end).map_err(GatewayError::Unixfs)?;
+        let prefix = unixfs
+            .read_file_range(provider, cid, path, 0, end)
+            .map_err(GatewayError::Unixfs)?;
         tracing::info!(
             phase = "mime_sniff_read",
             cid = %cid,
@@ -511,12 +558,13 @@ impl DirectoryListingPath {
 }
 
 fn served_resource(
+    unixfs: &UnixfsResolver,
     provider: &dyn BlockProvider,
     cid: &Cid,
     unixfs_path: &str,
 ) -> Result<ServedResource, GatewayError> {
     let file_size_started = Instant::now();
-    match file_size(provider, cid, unixfs_path) {
+    match unixfs.file_size(provider, cid, unixfs_path) {
         Ok(len) => {
             tracing::info!(
                 phase = "unixfs_file_size",
@@ -541,7 +589,7 @@ fn served_resource(
             );
             let index_path = append_path(unixfs_path, "index.html");
             let index_started = Instant::now();
-            match file_size(provider, cid, &index_path) {
+            match unixfs.file_size(provider, cid, &index_path) {
                 Ok(len) => {
                     tracing::info!(
                         phase = "unixfs_index_lookup",
@@ -565,8 +613,9 @@ fn served_resource(
                         elapsed_ms = index_started.elapsed().as_millis()
                     );
                     let list_started = Instant::now();
-                    let entries =
-                        list_directory(provider, cid, unixfs_path).map_err(GatewayError::Unixfs)?;
+                    let entries = unixfs
+                        .list_directory(provider, cid, unixfs_path)
+                        .map_err(GatewayError::Unixfs)?;
                     tracing::info!(
                         phase = "unixfs_list_directory",
                         cid = %cid,
@@ -642,6 +691,7 @@ fn split_ipfs_path(path: &str) -> Result<(Cid, &str), GatewayError> {
 
 async fn serve_ipns_path(
     provider: Arc<dyn BlockProvider>,
+    unixfs: UnixfsResolver,
     name_resolver: &dyn NameResolver,
     path: &str,
     range: Option<&HeaderValue>,
@@ -653,6 +703,7 @@ async fn serve_ipns_path(
         if let Some(ipfs) = target.strip_prefix("/ipfs/") {
             return serve_ipfs_path_with_listing_path(
                 provider.clone(),
+                unixfs.clone(),
                 ipfs,
                 range,
                 Some(&listing_path),
@@ -803,6 +854,7 @@ fn percent_encode_segment(segment: &str) -> String {
 
 fn streaming_response(
     provider: Arc<dyn BlockProvider>,
+    unixfs: UnixfsResolver,
     cid: Cid,
     path: String,
     len: u64,
@@ -811,6 +863,7 @@ fn streaming_response(
     let provider = Arc::new(ScopedBlockProvider::new(provider));
     let stream = stream::unfold(Some(0u64), move |offset| {
         let provider = provider.clone();
+        let unixfs = unixfs.clone();
         let path = path.clone();
         async move {
             let offset = offset?;
@@ -822,15 +875,16 @@ fn streaming_response(
                 .saturating_add(GATEWAY_STREAM_CHUNK_SIZE - 1)
                 .min(last);
             let next = if end == last { None } else { Some(end + 1) };
-            let chunk = read_file_range(
-                provider.as_ref() as &dyn BlockProvider,
-                &cid,
-                &path,
-                offset,
-                end,
-            )
-            .map(Bytes::from)
-            .map_err(|err| io::Error::other(err.to_string()));
+            let chunk = unixfs
+                .read_file_range(
+                    provider.as_ref() as &dyn BlockProvider,
+                    &cid,
+                    &path,
+                    offset,
+                    end,
+                )
+                .map(Bytes::from)
+                .map_err(|err| io::Error::other(err.to_string()));
             Some((chunk, next))
         }
     });
@@ -907,6 +961,7 @@ impl Drop for ScopedBlockProvider {
 
 fn ranged_response(
     provider: Arc<dyn BlockProvider>,
+    unixfs: UnixfsResolver,
     cid: Cid,
     path: String,
     total_len: u64,
@@ -925,6 +980,7 @@ fn ranged_response(
     let provider = Arc::new(ScopedBlockProvider::new(provider));
     let stream = stream::unfold(Some(start), move |offset| {
         let provider = provider.clone();
+        let unixfs = unixfs.clone();
         let path = path.clone();
         async move {
             let offset = offset?;
@@ -936,15 +992,16 @@ fn ranged_response(
             } else {
                 Some(chunk_end + 1)
             };
-            let chunk = read_file_range(
-                provider.as_ref() as &dyn BlockProvider,
-                &cid,
-                &path,
-                offset,
-                chunk_end,
-            )
-            .map(Bytes::from)
-            .map_err(|err| io::Error::other(err.to_string()));
+            let chunk = unixfs
+                .read_file_range(
+                    provider.as_ref() as &dyn BlockProvider,
+                    &cid,
+                    &path,
+                    offset,
+                    chunk_end,
+                )
+                .map(Bytes::from)
+                .map_err(|err| io::Error::other(err.to_string()));
             Some((chunk, next))
         }
     });
@@ -1107,6 +1164,7 @@ mod tests {
     };
     use freedom_ipfs_namesys::{NamesysError, Result as NamesysResult};
     use prost::Message;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::net::TcpListener;
@@ -1158,6 +1216,35 @@ mod tests {
             HeaderValue::from_static("text/html")
         );
         assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(index));
+    }
+
+    #[tokio::test]
+    async fn gateway_reuses_unixfs_metadata_within_dagpb_response() {
+        let data = b"<!doctype html><html>cached metadata</html>";
+        let file_block = test_pb_file(data);
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_block);
+        let dir_block = test_pb_directory(vec![test_link("index.html", &file_cid)]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (dir_cid, dir_block),
+            (file_cid, file_block),
+        ])));
+        let state = GatewayState::with_provider(provider.clone());
+
+        let response = ipfs_get(
+            State(state),
+            Path(format!("{dir_cid}/index.html")),
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), data);
+        assert_eq!(provider.call_count(&dir_cid), 1);
+        assert_eq!(provider.call_count(&file_cid), 1);
     }
 
     #[tokio::test]
@@ -1874,6 +1961,43 @@ mod tests {
             }
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Some(Block::unchecked(*cid, self.data.clone())))
+        }
+    }
+
+    struct MultiCountingProvider {
+        blocks: HashMap<Cid, Vec<u8>>,
+        calls: std::sync::Mutex<HashMap<Cid, usize>>,
+    }
+
+    impl MultiCountingProvider {
+        fn new(blocks: HashMap<Cid, Vec<u8>>) -> Self {
+            Self {
+                blocks,
+                calls: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn call_count(&self, cid: &Cid) -> usize {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(cid)
+                .unwrap_or(&0)
+        }
+    }
+
+    impl BlockProvider for MultiCountingProvider {
+        fn get_block(&self, cid: &Cid) -> CoreResult<Option<Block>> {
+            if let Some(data) = self.blocks.get(cid) {
+                let mut calls = self
+                    .calls
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *calls.entry(*cid).or_default() += 1;
+                return Ok(Some(Block::unchecked(*cid, data.clone())));
+            }
+            Ok(None)
         }
     }
 
