@@ -978,6 +978,24 @@ That makes the next experiment concrete: child-CID fallback needs either better
 provider discovery diversity, a bounded retry policy after DHT timeout, or a
 stronger content-root session model than "ask the root source peer once for 2s".
 
+Rejected follow-up: increasing `BITSWAP_SESSION_SHORTCUT_TIMEOUT` from `2s` to
+`5s`.
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case daicowtf-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --output /tmp/daicowtf-session-shortcut-5s.json \
+  --trace-output /tmp/daicowtf-session-shortcut-5s-trace.jsonl
+```
+
+Result: worse. The request still failed, but TTFB stretched to `30973ms`. The
+longer shortcut did not recover the child block and allowed the failure path to
+stack a `5000ms` session shortcut, two empty/slow child provider lookups, and a
+`10009ms` one-peer Bitswap failure. Decision: revert the timeout to `2s`.
+
 ## 2026-05-04 Multi-Want Groundwork
 
 Priority 1 in the long-running roadmap is bounded Bitswap multi-want batching.
