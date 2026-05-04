@@ -1165,12 +1165,38 @@ showed:
 cache_capacity=256 cache_len=1 hits=1 misses=1 inserts=1 evictions=0 oversized_skips=0
 ```
 
+Follow-up: the harness trace summary now aggregates `unixfs_metadata_cache`
+events directly, including total hits, misses, inserts, evictions, oversize
+skips, maximum cache length, and capacity, so future UnixFS runs do not need
+manual JSONL greps for cache effectiveness.
+
+Post-summary live attempt:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --trace-output /tmp/vitalik-unixfs-cache-summary-trace.jsonl \
+  --output /tmp/vitalik-unixfs-cache-summary.json
+```
+
+Result: failed `0/1` with a child block Bitswap timeout after the root block had
+loaded: status `504`, TTFB `33314ms`, child CID
+`bafkreibny3ionuayaittbxl2tn5dgfae7sbu45ymd35vhdm3634lmakxqi`, and
+`bitswap_request_timeout_detail count=2`. This did not exercise the successful
+cache-summary path because the gateway returned an error before building the
+served resource response. Treat it as another provider/session-quality sample,
+not as evidence against the metadata cache or harness aggregation.
+
 Validation:
 
 ```sh
 cargo fmt --all --check
 cargo test -p freedom-ipfs-unixfs
 cargo test -p freedom-ipfs-gateway
+cargo test -p mobile-web-harness
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 ```

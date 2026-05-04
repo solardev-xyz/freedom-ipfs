@@ -545,6 +545,20 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.block_sources)
             );
         }
+        if trace.unixfs_metadata_cache.events > 0 {
+            let cache = &trace.unixfs_metadata_cache;
+            println!(
+                "  unixfs metadata cache: events={} hits={} misses={} inserts={} evictions={} oversized_skips={} max_len={} capacity={}",
+                cache.events,
+                cache.hits,
+                cache.misses,
+                cache.inserts,
+                cache.evictions,
+                cache.oversized_skips,
+                cache.max_len,
+                cache.max_capacity
+            );
+        }
         if !trace.bitswap_source_peers.is_empty() {
             println!(
                 "  bitswap source peers: {}",
@@ -2316,6 +2330,7 @@ struct TraceSummary {
     phases: Vec<TracePhaseAggregate>,
     slow_events: Vec<TraceSlowEvent>,
     block_sources: Vec<TraceValueCount>,
+    unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
     bitswap_source_peers: Vec<TraceValueCount>,
     bitswap_peer_fetches: Vec<TracePeerAggregate>,
     trace_errors: Vec<TraceValueCount>,
@@ -2342,6 +2357,18 @@ struct TraceSlowEvent {
 struct TraceValueCount {
     value: String,
     count: usize,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceUnixfsMetadataCacheAggregate {
+    events: usize,
+    hits: u128,
+    misses: u128,
+    inserts: u128,
+    evictions: u128,
+    oversized_skips: u128,
+    max_len: u128,
+    max_capacity: u128,
 }
 
 #[derive(Debug, Serialize)]
@@ -2388,6 +2415,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut phases = BTreeMap::<String, Vec<u128>>::new();
     let mut slow_events = Vec::<TraceSlowEvent>::new();
     let mut block_sources = BTreeMap::<String, usize>::new();
+    let mut unixfs_metadata_cache = TraceUnixfsMetadataCacheAggregate::default();
     let mut bitswap_source_peers = BTreeMap::<String, usize>::new();
     let mut bitswap_peer_fetches = BTreeMap::<String, TracePeerBuilder>::new();
     let mut trace_errors = BTreeMap::<String, usize>::new();
@@ -2407,6 +2435,34 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             if let Some(source) = value.get("source").and_then(|source| source.as_str()) {
                 *block_sources.entry(source.to_string()).or_default() += 1;
             }
+        }
+        if phase == "unixfs_metadata_cache" {
+            unixfs_metadata_cache.events += 1;
+            unixfs_metadata_cache.hits += value.get("hits").and_then(json_u128).unwrap_or_default();
+            unixfs_metadata_cache.misses +=
+                value.get("misses").and_then(json_u128).unwrap_or_default();
+            unixfs_metadata_cache.inserts +=
+                value.get("inserts").and_then(json_u128).unwrap_or_default();
+            unixfs_metadata_cache.evictions += value
+                .get("evictions")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            unixfs_metadata_cache.oversized_skips += value
+                .get("oversized_skips")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            unixfs_metadata_cache.max_len = unixfs_metadata_cache.max_len.max(
+                value
+                    .get("cache_len")
+                    .and_then(json_u128)
+                    .unwrap_or_default(),
+            );
+            unixfs_metadata_cache.max_capacity = unixfs_metadata_cache.max_capacity.max(
+                value
+                    .get("cache_capacity")
+                    .and_then(json_u128)
+                    .unwrap_or_default(),
+            );
         }
         let successful_bitswap_fetch =
             phase == "bitswap_fetch" && value.get("ok").and_then(|ok| ok.as_bool()) == Some(true);
@@ -2494,6 +2550,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         phases,
         slow_events,
         block_sources: sorted_trace_counts(block_sources),
+        unixfs_metadata_cache,
         bitswap_source_peers: sorted_trace_counts(bitswap_source_peers),
         bitswap_peer_fetches: sorted_trace_peers(bitswap_peer_fetches),
         trace_errors: sorted_trace_counts(trace_errors),
@@ -2920,6 +2977,7 @@ mod tests {
                 "{\"phase\":\"provider_lookup\",\"elapsed_ms\":10,\"cid\":\"cid2\",\"provider_count\":3,\"error\":\"dht: timeout\"}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":12,\"cid\":\"cid6\",\"ok\":false}\n",
                 "{\"phase\":\"bitswap_peer_expand\",\"elapsed_ms\":3,\"cid\":\"cid7\",\"tcp_addr_count\":4,\"quic_addr_count\":2,\"ws_addr_count\":1,\"wss_addr_count\":0,\"dns_addr_count\":1,\"ip4_addr_count\":3,\"ip6_addr_count\":1}\n",
+                "{\"phase\":\"unixfs_metadata_cache\",\"elapsed_ms\":0,\"hits\":3,\"misses\":2,\"inserts\":2,\"evictions\":1,\"oversized_skips\":0,\"cache_len\":4,\"cache_capacity\":256}\n",
                 "not json\n",
                 "{\"phase\":\"request_start\",\"path\":\"/ipns/site/\"}\n",
                 "{\"phase\":\"unixfs_file_size\",\"elapsed_ms\":50,\"cid\":\"cid3\",\"path\":\"/ipfs/root/index.html\",\"unixfs_path\":\"index.html\",\"ok\":true}\n",
@@ -2931,9 +2989,9 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 10);
-        assert_eq!(summary.event_count, 9);
-        assert_eq!(summary.slow_events.len(), 8);
+        assert_eq!(summary.line_count, 11);
+        assert_eq!(summary.event_count, 10);
+        assert_eq!(summary.slow_events.len(), 9);
         assert_eq!(
             summary.slow_events[0].phase,
             "bitswap_request_timeout_detail"
@@ -2962,11 +3020,19 @@ mod tests {
             summary.slow_events[2].details.get("request_id"),
             Some(&"9".to_string())
         );
-        assert_eq!(summary.phases.len(), 6);
+        assert_eq!(summary.phases.len(), 7);
         assert_eq!(summary.block_sources.len(), 2);
         assert_eq!(summary.block_sources[0].value, "bitswap");
         assert_eq!(summary.block_sources[0].count, 1);
         assert_eq!(summary.block_sources[1].value, "cache");
+        assert_eq!(summary.unixfs_metadata_cache.events, 1);
+        assert_eq!(summary.unixfs_metadata_cache.hits, 3);
+        assert_eq!(summary.unixfs_metadata_cache.misses, 2);
+        assert_eq!(summary.unixfs_metadata_cache.inserts, 2);
+        assert_eq!(summary.unixfs_metadata_cache.evictions, 1);
+        assert_eq!(summary.unixfs_metadata_cache.oversized_skips, 0);
+        assert_eq!(summary.unixfs_metadata_cache.max_len, 4);
+        assert_eq!(summary.unixfs_metadata_cache.max_capacity, 256);
         assert_eq!(summary.bitswap_source_peers.len(), 1);
         assert_eq!(summary.bitswap_source_peers[0].value, "peer1");
         assert_eq!(summary.bitswap_source_peers[0].count, 1);
