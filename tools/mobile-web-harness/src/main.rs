@@ -624,12 +624,19 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.bitswap_source_peers)
             );
         }
+        if !trace.bitswap_source_transports.is_empty() {
+            println!(
+                "  bitswap source transports: {}",
+                format_trace_counts(&trace.bitswap_source_transports)
+            );
+        }
         if !trace.bitswap_peer_fetches.is_empty() {
             println!("  bitswap peer fetches:");
             for peer in trace.bitswap_peer_fetches.iter().take(8) {
+                let transports = format_trace_counts(&peer.transports);
                 println!(
-                    "    {}: count={} total={}ms max={}ms bytes={}",
-                    peer.peer, peer.count, peer.total_ms, peer.max_ms, peer.bytes
+                    "    {}: count={} total={}ms max={}ms bytes={} transports={}",
+                    peer.peer, peer.count, peer.total_ms, peer.max_ms, peer.bytes, transports
                 );
             }
         }
@@ -2558,6 +2565,7 @@ struct TraceSummary {
     gateway_limiter_denials: usize,
     unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
     bitswap_source_peers: Vec<TraceValueCount>,
+    bitswap_source_transports: Vec<TraceValueCount>,
     bitswap_peer_fetches: Vec<TracePeerAggregate>,
     bitswap_session: TraceBitswapSessionAggregate,
     trace_errors: Vec<TraceValueCount>,
@@ -2648,6 +2656,7 @@ struct TracePeerAggregate {
     total_ms: u128,
     max_ms: u128,
     bytes: u128,
+    transports: Vec<TraceValueCount>,
 }
 
 #[derive(Default)]
@@ -2665,6 +2674,7 @@ struct TracePeerBuilder {
     total_ms: u128,
     max_ms: u128,
     bytes: u128,
+    transports: BTreeMap<String, usize>,
 }
 
 fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
@@ -2679,6 +2689,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut gateway_limiter_denials = 0usize;
     let mut unixfs_metadata_cache = TraceUnixfsMetadataCacheAggregate::default();
     let mut bitswap_source_peers = BTreeMap::<String, usize>::new();
+    let mut bitswap_source_transports = BTreeMap::<String, usize>::new();
     let mut bitswap_peer_fetches = BTreeMap::<String, TracePeerBuilder>::new();
     let mut trace_errors = BTreeMap::<String, usize>::new();
     let mut bitswap_addr_mix = BTreeMap::<String, usize>::new();
@@ -2793,6 +2804,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             if let Some(peer) = value.get("source_peer").and_then(|peer| peer.as_str()) {
                 *bitswap_source_peers.entry(peer.to_string()).or_default() += 1;
             }
+            if let Some(transport) = json_detail_string(value.get("source_transport")) {
+                *bitswap_source_transports.entry(transport).or_default() += 1;
+            }
         }
         if let Some(error) = trace_error_key(phase, &value) {
             *trace_errors.entry(error).or_default() += 1;
@@ -2858,6 +2872,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 entry.total_ms += elapsed_ms;
                 entry.max_ms = entry.max_ms.max(elapsed_ms);
                 entry.bytes += value.get("bytes").and_then(json_u128).unwrap_or_default();
+                if let Some(transport) = json_detail_string(value.get("source_transport")) {
+                    *entry.transports.entry(transport).or_default() += 1;
+                }
             }
         }
         if let Some(cid) = json_detail_string(value.get("cid")) {
@@ -2910,6 +2927,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         gateway_limiter_denials,
         unixfs_metadata_cache,
         bitswap_source_peers: sorted_trace_counts(bitswap_source_peers),
+        bitswap_source_transports: sorted_trace_counts(bitswap_source_transports),
         bitswap_peer_fetches: sorted_trace_peers(bitswap_peer_fetches),
         bitswap_session,
         trace_errors: sorted_trace_counts(trace_errors),
@@ -2930,6 +2948,7 @@ fn sorted_trace_peers(counts: BTreeMap<String, TracePeerBuilder>) -> Vec<TracePe
             total_ms: builder.total_ms,
             max_ms: builder.max_ms,
             bytes: builder.bytes,
+            transports: sorted_trace_counts(builder.transports),
         })
         .collect::<Vec<_>>();
     values.sort_by(|left, right| {
@@ -3345,7 +3364,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":\"25\",\"cid\":\"cid1\",\"ok\":true,\"bytes\":100,\"source\":\"bitswap\",\"source_peer\":\"peer1\",\"source_peer_trusted\":true,\"trusted_peer_count\":1,\"provider_peer_count\":2,\"session_peer_count\":0,\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9}}\n",
+                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":\"25\",\"cid\":\"cid1\",\"ok\":true,\"bytes\":100,\"source\":\"bitswap\",\"source_peer\":\"peer1\",\"source_transport\":\"tcp\",\"source_peer_trusted\":true,\"trusted_peer_count\":1,\"provider_peer_count\":2,\"session_peer_count\":0,\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9}}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":5,\"cid\":\"cid1\",\"source\":\"bitswap\"}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":4,\"cid\":\"cid5\",\"source\":\"cache\"}\n",
                 "{\"phase\":\"provider_lookup\",\"elapsed_ms\":10,\"cid\":\"cid2\",\"provider_count\":3,\"error\":\"dht: timeout\"}\n",
@@ -3436,12 +3455,17 @@ mod tests {
         assert_eq!(summary.bitswap_source_peers.len(), 1);
         assert_eq!(summary.bitswap_source_peers[0].value, "peer1");
         assert_eq!(summary.bitswap_source_peers[0].count, 1);
+        assert_eq!(summary.bitswap_source_transports.len(), 1);
+        assert_eq!(summary.bitswap_source_transports[0].value, "tcp");
+        assert_eq!(summary.bitswap_source_transports[0].count, 1);
         assert_eq!(summary.bitswap_peer_fetches.len(), 1);
         assert_eq!(summary.bitswap_peer_fetches[0].peer, "peer1");
         assert_eq!(summary.bitswap_peer_fetches[0].count, 1);
         assert_eq!(summary.bitswap_peer_fetches[0].total_ms, 25);
         assert_eq!(summary.bitswap_peer_fetches[0].max_ms, 25);
         assert_eq!(summary.bitswap_peer_fetches[0].bytes, 100);
+        assert_eq!(summary.bitswap_peer_fetches[0].transports[0].value, "tcp");
+        assert_eq!(summary.bitswap_peer_fetches[0].transports[0].count, 1);
         assert_eq!(summary.bitswap_session.fetches, 2);
         assert_eq!(summary.bitswap_session.with_trusted_peers, 2);
         assert_eq!(summary.bitswap_session.trusted_successes, 1);

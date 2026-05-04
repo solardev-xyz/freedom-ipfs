@@ -24,7 +24,7 @@ use libp2p_stream::{Control as StreamControl, IncomingStreams};
 use multihash::Multihash;
 use multihash_codetable::{Code, MultihashDigest};
 use prost::Message;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error as StdError;
 use std::fmt::Debug;
 use std::io;
@@ -713,6 +713,7 @@ impl HttpRetriever {
             trusted_peer_count,
             ok = true,
             source_peer = source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
+            source_transport = result.source_transport.unwrap_or("unknown"),
             source_peer_trusted,
             extra_blocks = result.extra_blocks.len(),
             bytes = result.requested_block.len(),
@@ -949,6 +950,7 @@ impl HttpRetriever {
             trusted_peer_count = peer_count,
             ok = true,
             source_peer = result.source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
+            source_transport = result.source_transport.unwrap_or("unknown"),
             source_peer_trusted = true,
             extra_blocks = result.extra_blocks.len(),
             bytes = result.requested_block.len(),
@@ -1115,6 +1117,7 @@ struct BitswapFetchResult {
     requested_block: Vec<u8>,
     extra_blocks: Vec<(Cid, Vec<u8>)>,
     source_peer: Option<PeerId>,
+    source_transport: Option<&'static str>,
 }
 
 struct BitswapFetchResults {
@@ -1135,6 +1138,13 @@ struct BitswapCommand {
 }
 
 type DialErrorLog = Arc<tokio::sync::Mutex<HashMap<PeerId, Vec<String>>>>;
+type PeerTransportLog = Arc<tokio::sync::Mutex<HashMap<PeerId, PeerTransportState>>>;
+
+#[derive(Default)]
+struct PeerTransportState {
+    counts: BTreeMap<&'static str, usize>,
+    current: Option<&'static str>,
+}
 
 impl SharedBitswapClient {
     async fn spawn() -> Result<Self> {
@@ -1208,6 +1218,7 @@ async fn run_shared_bitswap_swarm(
     let mut connection_waiters = HashMap::<PeerId, Vec<oneshot::Sender<()>>>::new();
     let mut connection_wait_started = HashMap::<PeerId, Instant>::new();
     let dial_errors = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let peer_transports = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     loop {
         tokio::select! {
@@ -1314,6 +1325,7 @@ async fn run_shared_bitswap_swarm(
 
                 let control = control.clone();
                 let dial_errors = dial_errors.clone();
+                let peer_transports = peer_transports.clone();
                 fetches.push(Box::pin(async move {
                     let result = fetch_bitswap_with_incoming_streams(
                         control,
@@ -1321,6 +1333,7 @@ async fn run_shared_bitswap_swarm(
                         command.cid,
                         incoming_results,
                         dial_errors,
+                        peer_transports,
                     ).await;
                     let _ = command.respond.send(result);
                     command.cid
@@ -1342,9 +1355,12 @@ async fn run_shared_bitswap_swarm(
                 match read_bitswap_blocks(&mut stream).await {
                     Ok(blocks) => {
                         let mut matched = false;
+                        let source_transport =
+                            current_peer_transport(&peer_transports, peer).await;
                         for cid in pending_incoming.keys().copied().collect::<Vec<_>>() {
                             if let Some(mut result) = collect_bitswap_result(&cid, blocks.clone()) {
                                 result.source_peer = Some(peer);
+                                result.source_transport = source_transport;
                                 matched = true;
                                 if let Some(senders) = pending_incoming.get_mut(&cid) {
                                     senders.retain(|sender| sender.send(result.clone()).is_ok());
@@ -1379,11 +1395,14 @@ async fn run_shared_bitswap_swarm(
                         let failed_dial_count =
                             concurrent_dial_errors.as_ref().map_or(0, Vec::len);
                         let remote_addr = endpoint.get_remote_address();
+                        let transport = bitswap_transport_label(remote_addr);
+                        record_peer_transport_established(&peer_transports, peer_id, transport)
+                            .await;
                         tracing::info!(
                             phase = "bitswap_connection_established",
                             peer = %peer_id,
                             remote_addr = %remote_addr,
-                            transport = bitswap_transport_label(remote_addr),
+                            transport,
                             endpoint = ?endpoint,
                             num_established = num_established.get(),
                             established_ms = established_in.as_millis(),
@@ -1403,9 +1422,13 @@ async fn run_shared_bitswap_swarm(
                         cause,
                         ..
                     } => {
+                        let remote_addr = endpoint.get_remote_address();
+                        let transport = bitswap_transport_label(remote_addr);
+                        record_peer_transport_closed(&peer_transports, peer_id, transport).await;
                         tracing::debug!(
                             phase = "bitswap_connection_closed",
                             peer = %peer_id,
+                            transport,
                             endpoint = ?endpoint,
                             num_established,
                             cause = cause.as_ref().map(ToString::to_string).unwrap_or_default()
@@ -1472,6 +1495,50 @@ async fn recent_dial_errors(errors: &DialErrorLog, peer: PeerId) -> String {
         Some(values) if !values.is_empty() => values.join(" | "),
         _ => "none".to_string(),
     }
+}
+
+async fn record_peer_transport_established(
+    transports: &PeerTransportLog,
+    peer: PeerId,
+    transport: &'static str,
+) {
+    let mut transports = transports.lock().await;
+    let state = transports.entry(peer).or_default();
+    *state.counts.entry(transport).or_default() += 1;
+    state.current = Some(transport);
+}
+
+async fn record_peer_transport_closed(
+    transports: &PeerTransportLog,
+    peer: PeerId,
+    transport: &'static str,
+) {
+    let mut transports = transports.lock().await;
+    let Some(state) = transports.get_mut(&peer) else {
+        return;
+    };
+    if let Some(count) = state.counts.get_mut(transport) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            state.counts.remove(transport);
+        }
+    }
+    if state.counts.is_empty() {
+        transports.remove(&peer);
+    } else if state.current == Some(transport) {
+        state.current = state.counts.keys().next().copied();
+    }
+}
+
+async fn current_peer_transport(
+    transports: &PeerTransportLog,
+    peer: PeerId,
+) -> Option<&'static str> {
+    transports
+        .lock()
+        .await
+        .get(&peer)
+        .and_then(|state| state.current)
 }
 
 fn format_bitswap_peers(peers: &[BitswapPeer]) -> String {
@@ -2130,9 +2197,10 @@ async fn fetch_bitswap_with_incoming_streams(
     cid: Cid,
     mut incoming_results: mpsc::UnboundedReceiver<BitswapFetchResult>,
     dial_errors: DialErrorLog,
+    peer_transports: PeerTransportLog,
 ) -> Result<BitswapFetchResult> {
     tokio::select! {
-        result = fetch_bitswap_over_outgoing_streams(control, peers, cid, dial_errors) => result,
+        result = fetch_bitswap_over_outgoing_streams(control, peers, cid, dial_errors, peer_transports) => result,
         incoming = incoming_results.recv() => incoming.ok_or_else(|| {
             RetrievalError::Bitswap("incoming bitswap result channel closed".into())
         }),
@@ -2144,6 +2212,7 @@ async fn fetch_bitswap_over_outgoing_streams(
     peers: Vec<BitswapPeerTarget>,
     cid: Cid,
     dial_errors: DialErrorLog,
+    peer_transports: PeerTransportLog,
 ) -> Result<BitswapFetchResult> {
     let mut attempts = FuturesUnordered::new();
     let has_multiple_peers = peers.len() > 1;
@@ -2156,6 +2225,7 @@ async fn fetch_bitswap_over_outgoing_streams(
             cid,
             prefer_want_have,
             dial_errors.clone(),
+            peer_transports.clone(),
         ));
     }
 
@@ -2206,6 +2276,7 @@ async fn request_bitswap_block_after_connection(
     cid: Cid,
     prefer_want_have: bool,
     dial_errors: DialErrorLog,
+    peer_transports: PeerTransportLog,
 ) -> std::result::Result<BitswapFetchResult, BitswapPeerFailure> {
     let BitswapPeerTarget {
         id: peer_id,
@@ -2243,7 +2314,15 @@ async fn request_bitswap_block_after_connection(
             }
         }
     }
-    request_bitswap_block(control, peer_id, addrs, cid, prefer_want_have).await
+    request_bitswap_block(
+        control,
+        peer_id,
+        addrs,
+        cid,
+        prefer_want_have,
+        peer_transports,
+    )
+    .await
 }
 
 async fn request_bitswap_block(
@@ -2252,6 +2331,7 @@ async fn request_bitswap_block(
     addrs: Vec<Multiaddr>,
     cid: Cid,
     prefer_want_have: bool,
+    peer_transports: PeerTransportLog,
 ) -> std::result::Result<BitswapFetchResult, BitswapPeerFailure> {
     let mut failures = Vec::new();
     for protocol in bitswap_protocols() {
@@ -2283,6 +2363,8 @@ async fn request_bitswap_block(
             match request_bitswap_block_after_want_have(&mut stream, &cid, &protocol_name).await {
                 Ok(mut result) => {
                     result.source_peer = Some(peer_id);
+                    result.source_transport =
+                        current_peer_transport(&peer_transports, peer_id).await;
                     return Ok(result);
                 }
                 Err(WantHaveFailure::TryOtherProtocols(err)) => {
@@ -2303,6 +2385,7 @@ async fn request_bitswap_block(
         match request_bitswap_block_on_stream(&mut stream, &cid, &protocol_name).await {
             Ok(mut result) => {
                 result.source_peer = Some(peer_id);
+                result.source_transport = current_peer_transport(&peer_transports, peer_id).await;
                 return Ok(result);
             }
             Err(err) => {
@@ -2406,6 +2489,7 @@ where
         requested_block,
         extra_blocks: results.extra_blocks,
         source_peer: None,
+        source_transport: None,
     })
 }
 
@@ -2602,6 +2686,7 @@ fn collect_bitswap_result(
         requested_block,
         extra_blocks: results.extra_blocks,
         source_peer: None,
+        source_transport: None,
     })
 }
 
@@ -3229,6 +3314,29 @@ mod bitswap_tests {
         assert_eq!(bitswap_transport_label(&ws), "ws");
         assert_eq!(bitswap_transport_label(&wss), "wss");
         assert_eq!(bitswap_transport_label(&memory), "other");
+    }
+
+    #[tokio::test]
+    async fn tracks_current_bitswap_peer_transport() {
+        let transports = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let peer = PeerId::random();
+
+        assert_eq!(current_peer_transport(&transports, peer).await, None);
+
+        record_peer_transport_established(&transports, peer, "tcp").await;
+        assert_eq!(current_peer_transport(&transports, peer).await, Some("tcp"));
+
+        record_peer_transport_established(&transports, peer, "quic").await;
+        assert_eq!(
+            current_peer_transport(&transports, peer).await,
+            Some("quic")
+        );
+
+        record_peer_transport_closed(&transports, peer, "quic").await;
+        assert_eq!(current_peer_transport(&transports, peer).await, Some("tcp"));
+
+        record_peer_transport_closed(&transports, peer, "tcp").await;
+        assert_eq!(current_peer_transport(&transports, peer).await, None);
     }
 
     #[tokio::test]

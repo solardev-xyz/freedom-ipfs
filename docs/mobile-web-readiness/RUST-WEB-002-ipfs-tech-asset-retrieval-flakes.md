@@ -2064,3 +2064,43 @@ beat the same-window TCP recheck on asset p50, asset p95, asset max, or run
 total. Future transport work should be selective, for example by preferring
 QUIC only for peers with recent QUIC success or by adding per-peer transport
 quality, not by globally ranking QUIC ahead of TCP.
+
+## Bitswap Source Transport Attribution
+
+After rejecting broad QUIC-first scoring, the next missing signal was source
+transport attribution: we could count established connection transports and
+rejected dial transports, but not which transport supplied successful Bitswap
+blocks.
+
+This change records the currently known transport for a successful Bitswap
+source peer and emits it on successful `bitswap_fetch` and
+`bitswap_session_shortcut` events as `source_transport`. The harness summarizes
+that as global `bitswap source transports` and per-peer transport counts in
+`bitswap peer fetches`.
+
+Validation smoke:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/ipfs-tech-source-transport-smoke.json \
+  --trace-output /tmp/ipfs-tech-source-transport-smoke-trace.jsonl
+```
+
+Result: `1/1`. Run total `6146ms`; root TTFB `2042ms`; asset TTFB
+p50/p95/max `280/2740/3524ms`; max RSS `55600KiB`; max FD count `48`;
+gateway statuses `27x200`, `6x206`; no limiter denials. The trace reported
+`bitswap source transports: tcp=27`, connection transports `tcp=13`, rejected
+dial transports `tcp=68`, `quic=15`, `ws=5`, and per-peer source transport
+counts of `tcp=8`, `tcp=7`, and `tcp=12`.
+
+This is diagnostic only. It does not change peer selection, address scoring,
+connection limits, Bitswap request behavior, or block verification. Future
+selective QUIC experiments should use this signal to prove that a transport
+preference changes the transport that actually returns verified blocks, not just
+the transport mix of connection attempts.
