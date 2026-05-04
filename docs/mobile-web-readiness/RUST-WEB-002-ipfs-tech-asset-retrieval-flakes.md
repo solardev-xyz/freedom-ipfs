@@ -2265,3 +2265,78 @@ preserving one fallback address, improves `ipfs.tech` page tails in same-window
 A/B, and avoids the vitalik child-CID failure seen with cap `4`. Continue
 watching daicowtf separately; that case needs better sparse-provider fallback,
 not more addresses per peer.
+
+## Current Cap-2 Kubo Comparison
+
+After keeping the two-address Bitswap peer cap, run a fresh Rust/Kubo comparison
+before changing another behavior knob.
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/ipfs-tech-cap2-kubo-compare-r3.json \
+  --trace-output /tmp/ipfs-tech-cap2-kubo-compare-r3-trace.jsonl
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root TTFB p50/p95 was
+`1752/2086ms`; Kubo was `1268/1303ms`. Rust asset TTFB p50/p95 was
+`254/2408ms`; Kubo was `109/377ms`. Rust stayed much smaller:
+max RSS/FD `53152KiB`/`51` versus Kubo `137284KiB`/`66`. Trace summary showed
+Rust source transports `tcp=98`, connection transports `tcp=37`, rejected dial
+transports `tcp=263`, `quic=56`, `ws=9`, no trusted request timeouts, and
+asset tails dominated by successful per-block Bitswap fetches rather than
+gateway/UnixFS work.
+
+## Rejected 500ms WANT_HAVE Probe
+
+Hypothesis: untrusted provider peers currently get a `750ms` `WANT_HAVE` probe
+before falling back to `WANT_BLOCK`. Lowering the probe budget to `500ms` might
+reduce small asset tails without changing dial fanout or block verification.
+
+Temporary 500ms experiment:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/ipfs-tech-want-have-500ms-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-want-have-500ms-kubo-r3-trace.jsonl
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root TTFB p50/p95 improved to
+`1129/1245ms`, but Rust asset TTFB p50/p95 was `334/1763ms`.
+
+Same-window 750ms recheck:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/ipfs-tech-want-have-750ms-recheck-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-want-have-750ms-recheck-kubo-r3-trace.jsonl
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root TTFB p50/p95 was
+`1555/1580ms`; Rust asset TTFB p50/p95 was better at `306/1509ms`.
+
+Decision: reject `500ms` and keep `750ms`. The lower probe budget helps root
+startup in this window, but the active gap is asset p95 versus Kubo, and the
+same-window recheck showed worse Rust asset p50/p95 at `500ms`. Future
+WANT_HAVE work should compare direct WANT_BLOCK or batched session requests,
+not just trim this timeout.
