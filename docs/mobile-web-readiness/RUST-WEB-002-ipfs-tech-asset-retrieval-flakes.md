@@ -2554,3 +2554,10 @@ included the same `4000ms` mixed trusted Bitswap timeout seen in `slow_events`,
 but without losing the request-level context. This is diagnostic only; it does
 not change gateway/retrieval behavior, public fallback policy, block
 verification, or resource limits.
+
+Follow-up diagnostic fix: timeout target summaries now use the same direct
+`WANT_BLOCK` versus `WANT_HAVE` mode planner as the actual Bitswap request path.
+Before this, `bitswap_request_timeout_detail.targets` could label the first
+untrusted direct-2 peers as `want-have` because it formatted the pre-plan peer
+list. Future timeout traces should now describe the actual request mode used for
+each listed peer.

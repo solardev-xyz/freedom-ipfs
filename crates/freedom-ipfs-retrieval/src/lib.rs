@@ -1546,14 +1546,21 @@ async fn current_peer_transport(
 }
 
 fn format_bitswap_peers(peers: &[BitswapPeer]) -> String {
+    let has_multiple_peers = peers.len() > 1;
+    let mut direct_untrusted_want_block_count = 0usize;
     peers
         .iter()
         .take(MAX_BITSWAP_FAILURE_DETAILS)
         .map(|peer| {
-            let mode = if peer.skip_want_have {
-                "want-block"
-            } else {
+            let prefer_want_have = bitswap_prefer_want_have(
+                has_multiple_peers,
+                peer.skip_want_have,
+                &mut direct_untrusted_want_block_count,
+            );
+            let mode = if prefer_want_have {
                 "want-have"
+            } else {
+                "want-block"
             };
             format!("{}:{}@{}", peer.id, mode, format_multiaddrs(&peer.addrs))
         })
@@ -2223,13 +2230,11 @@ async fn fetch_bitswap_over_outgoing_streams(
     let target_summary = format_bitswap_targets(&peers);
     let mut direct_untrusted_want_block_count = 0usize;
     for peer in peers {
-        let direct_untrusted_want_block = !peer.skip_want_have
-            && direct_untrusted_want_block_count < MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS;
-        if !peer.skip_want_have {
-            direct_untrusted_want_block_count += 1;
-        }
-        let prefer_want_have =
-            has_multiple_peers && !peer.skip_want_have && !direct_untrusted_want_block;
+        let prefer_want_have = bitswap_prefer_want_have(
+            has_multiple_peers,
+            peer.skip_want_have,
+            &mut direct_untrusted_want_block_count,
+        );
         attempts.push(request_bitswap_block_after_connection(
             control.clone(),
             peer,
@@ -2279,6 +2284,19 @@ async fn fetch_bitswap_over_outgoing_streams(
             connection_timeout_peers,
         })
     }
+}
+
+fn bitswap_prefer_want_have(
+    has_multiple_peers: bool,
+    skip_want_have: bool,
+    direct_untrusted_want_block_count: &mut usize,
+) -> bool {
+    let direct_untrusted_want_block = !skip_want_have
+        && *direct_untrusted_want_block_count < MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS;
+    if !skip_want_have {
+        *direct_untrusted_want_block_count += 1;
+    }
+    has_multiple_peers && !skip_want_have && !direct_untrusted_want_block
 }
 
 async fn request_bitswap_block_after_connection(
@@ -3151,7 +3169,7 @@ mod bitswap_tests {
         assert_eq!(
             format_bitswap_peers(&peers),
             format!(
-                "{first}:want-block@[/ip4/127.0.0.1/tcp/1001,/ip4/127.0.0.1/tcp/1002,+3 more]; {second}:want-have@[]"
+                "{first}:want-block@[/ip4/127.0.0.1/tcp/1001,/ip4/127.0.0.1/tcp/1002,+3 more]; {second}:want-block@[]"
             )
         );
     }
