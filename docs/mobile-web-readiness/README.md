@@ -85,6 +85,9 @@ experiments. Gateway response statuses and limiter denials are aggregated as
 well, making overload or `503` pressure visible in the normal report. Trace
 errors are grouped by phase and sanitized error string so provider-quality runs
 can show repeated DHT/Bitswap failure signatures without manual JSONL greps.
+Bitswap session shortcut summaries include both started shortcut races and
+completed shortcut attempts, which makes hidden dropped background work visible
+when tuning recent-peer races.
 Bitswap peer expansion traces include address mix counters, and the report
 aggregates them as `bitswap_addr_mix` for transport policy work. UnixFS
 metadata-cache traces are also aggregated so reports show cache events, hits,

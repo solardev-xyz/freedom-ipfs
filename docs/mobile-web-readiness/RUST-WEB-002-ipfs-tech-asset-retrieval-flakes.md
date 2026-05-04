@@ -1358,8 +1358,8 @@ Implementation:
   successful shortcut sources as trusted.
 - The mobile web harness now aggregates a `bitswap_session` trace summary:
   total fetches, fetches with trusted peers, trusted versus untrusted
-  successes, trusted failures, request timeouts with trusted peers, and session
-  shortcut hits/misses.
+  successes, trusted failures, request timeouts with trusted peers, session
+  shortcut starts, and shortcut hits/misses.
 
 Deterministic validation:
 
@@ -1384,7 +1384,7 @@ Result: `1/1`. Root TTFB was `4241ms`; RSS/FD checks stayed within the harness
 defaults. The trace summary printed:
 
 ```text
-bitswap session: fetches=2 with_trusted=1 trusted_successes=0 untrusted_successes=2 trusted_failures=0 request_timeouts_with_trusted=0 shortcut_attempts=0 shortcut_hits=0 shortcut_misses=0
+bitswap session: fetches=2 with_trusted=1 trusted_successes=0 untrusted_successes=2 trusted_failures=0 request_timeouts_with_trusted=0 shortcut_starts=0 shortcut_attempts=0 shortcut_hits=0 shortcut_misses=0
 ```
 
 This smoke did not reproduce the 15-second trusted-peer stall. It did show that
@@ -1728,3 +1728,82 @@ Result: exited with the expected harness failure status after writing
 `ipfs-tech-page-assets` case with `run timed out after 1s`, and the trace
 summary was still present. This is a harness/diagnostics improvement only; it
 does not change gateway behavior.
+
+## Rejected Session Shortcut 25ms Grace
+
+Hypothesis: lowering `BITSWAP_SESSION_SHORTCUT_GRACE` from `150ms` to `25ms`
+would let recent Bitswap session peers win more asset fetches before provider
+lookup completes, improving warm page asset latency without increasing mobile
+resource pressure.
+
+First, keep the behavior at `150ms` but add an explicit
+`bitswap_session_shortcut_start` trace before the shortcut request is sent. The
+existing `bitswap_session_shortcut` event only records completed shortcut
+futures. If provider lookup wins the race after the shortcut request starts,
+the future can be dropped without a completed hit/miss event, hiding background
+work. The mobile web harness now aggregates this as
+`bitswap_session.session_shortcut_starts`.
+
+Diagnostic validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib recent_bitswap
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Then run the live A/B:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/ipfs-tech-session-grace-25ms-start-trace-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-session-grace-25ms-start-trace-kubo-r3-trace.jsonl
+```
+
+Result at `25ms`: Rust and Kubo both passed `3/3`, with no limiter denials and
+statuses `81x200`, `18x206`. Rust root latency regressed badly
+(`p50=3168ms`, `p95=max=5270ms`) versus Kubo (`p50=1350ms`, `p95=max=1632ms`).
+Rust assets were still slower than Kubo (`p50=223ms`, `p95=1813ms`,
+`max=2271ms` versus Kubo `p50=83ms`, `p95=240ms`, `max=342ms`). The trace
+showed `session_shortcut_starts=33`, but only `session_shortcut_attempts=11`;
+all completed attempts were hits. That confirms the lower grace can start
+background shortcut work that does not produce a completed shortcut event.
+
+Same-diagnostics `150ms` control:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/ipfs-tech-session-grace-150ms-start-trace-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-session-grace-150ms-start-trace-kubo-r3-trace.jsonl
+```
+
+Result at `150ms`: Rust and Kubo both passed `3/3`, with no limiter denials and
+the same `81x200`, `18x206` response mix. Rust root latency was much closer to
+Kubo (`p50=1427ms`, `p95=max=3650ms` versus Kubo `p50=1366ms`,
+`p95=max=2680ms`). Asset latency remained slower (`p50=264ms`, `p95=1648ms`,
+`max=2689ms` versus Kubo `p50=115ms`, `p95=424ms`, `max=567ms`), but the
+session summary showed `session_shortcut_starts=0`, `attempts=0`, and no hidden
+shortcut pressure.
+
+Decision: reject the `25ms` grace. The completed shortcut hits are real, but
+they did not improve the page-level result in the same diagnostic window, and
+the new start counter shows extra background work. Keep `150ms` until there is
+a bounded design that can make recent-peer starts selective, cancellable, or
+fairly scheduled against provider lookup.
