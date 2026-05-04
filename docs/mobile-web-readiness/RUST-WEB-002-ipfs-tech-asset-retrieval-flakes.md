@@ -951,6 +951,33 @@ failures for child CID `bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3
 That points at the existing sparse-provider/session fallback gap rather than the
 dial-headroom cap.
 
+Follow-up diagnostic patch:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case daicowtf-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --output /tmp/daicowtf-provider-lookup-error-trace.json \
+  --trace-output /tmp/daicowtf-provider-lookup-error-trace.jsonl
+```
+
+Result: still expected failure, but the trace now includes the missing child-CID
+provider lookup error:
+
+```text
+trace errors: bitswap_session_shortcut: ok=false=1,
+  provider_diversity_low: ok=false=1,
+  provider_lookup: dht: the request timed out=1
+slow event: provider_lookup cid=bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u
+  elapsed=10020ms error="dht: the request timed out"
+```
+
+That makes the next experiment concrete: child-CID fallback needs either better
+provider discovery diversity, a bounded retry policy after DHT timeout, or a
+stronger content-root session model than "ask the root source peer once for 2s".
+
 ## 2026-05-04 Multi-Want Groundwork
 
 Priority 1 in the long-running roadmap is bounded Bitswap multi-want batching.

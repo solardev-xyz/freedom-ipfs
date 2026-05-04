@@ -309,7 +309,18 @@ impl HttpRetriever {
                 tokio::pin!(provider_lookup);
                 let recent_peers = self.recent_bitswap_peers_for_fetch().await;
                 let providers = if recent_peers.is_empty() {
-                    provider_lookup.await?
+                    match provider_lookup.await {
+                        Ok(providers) => providers,
+                        Err(err) => {
+                            tracing::info!(
+                                phase = "provider_lookup",
+                                cid = %cid,
+                                error = %err,
+                                elapsed_ms = routing_started.elapsed().as_millis()
+                            );
+                            return Err(err.into());
+                        }
+                    }
                 } else {
                     let shortcut = async {
                         tokio::time::sleep(BITSWAP_SESSION_SHORTCUT_GRACE).await;
@@ -322,7 +333,18 @@ impl HttpRetriever {
                             if let Some(block) = shortcut_result? {
                                 return Ok((block, RetrievalSource::Bitswap));
                             }
-                            provider_lookup.await?
+                            match provider_lookup.await {
+                                Ok(providers) => providers,
+                                Err(err) => {
+                                    tracing::info!(
+                                        phase = "provider_lookup",
+                                        cid = %cid,
+                                        error = %err,
+                                        elapsed_ms = routing_started.elapsed().as_millis()
+                                    );
+                                    return Err(err.into());
+                                }
+                            }
                         }
                         lookup_result = &mut provider_lookup => {
                             match lookup_result {
@@ -331,6 +353,12 @@ impl HttpRetriever {
                                     if let Some(block) = shortcut.await? {
                                         return Ok((block, RetrievalSource::Bitswap));
                                     }
+                                    tracing::info!(
+                                        phase = "provider_lookup",
+                                        cid = %cid,
+                                        error = %lookup_err,
+                                        elapsed_ms = routing_started.elapsed().as_millis()
+                                    );
                                     return Err(lookup_err.into());
                                 }
                             }
