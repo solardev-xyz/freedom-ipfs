@@ -50,7 +50,8 @@ const BITSWAP_CONNECTION_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const BITSWAP_WANT_HAVE_TIMEOUT: Duration = Duration::from_millis(750);
 const BITSWAP_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const BITSWAP_SUCCESSFUL_PEER_TTL: Duration = Duration::from_secs(10 * 60);
-const BITSWAP_SESSION_SHORTCUT_GRACE: Duration = Duration::from_millis(150);
+const BITSWAP_SESSION_SHORTCUT_GRACE: Duration = Duration::from_millis(0);
+const BITSWAP_SESSION_POST_LOOKUP_GRACE: Duration = Duration::from_millis(100);
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
 // The per-peer read path has its own 10s timeout. This caps broader shared
 // swarm stalls so one stuck command cannot sit on a browser request for 45s.
@@ -356,7 +357,23 @@ impl HttpRetriever {
                         }
                         lookup_result = &mut provider_lookup => {
                             match lookup_result {
-                                Ok(providers) => providers,
+                                Ok(providers) => {
+                                    match timeout(BITSWAP_SESSION_POST_LOOKUP_GRACE, &mut shortcut).await {
+                                        Ok(shortcut_result) => {
+                                            if let Some(block) = shortcut_result? {
+                                                return Ok((block, RetrievalSource::Bitswap));
+                                            }
+                                        }
+                                        Err(_) => {
+                                            tracing::info!(
+                                                phase = "bitswap_session_shortcut_post_lookup_wait",
+                                                cid = %cid,
+                                                timeout_ms = BITSWAP_SESSION_POST_LOOKUP_GRACE.as_millis()
+                                            );
+                                        }
+                                    }
+                                    providers
+                                }
                                 Err(lookup_err) => {
                                     if let Some(block) = shortcut.await? {
                                         return Ok((block, RetrievalSource::Bitswap));
@@ -4067,6 +4084,51 @@ mod bitswap_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn recent_bitswap_peer_can_win_after_fast_provider_lookup() {
+        let data = b"post lookup session shortcut block";
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
+        let (session_peer_id, session_addr, session_swarm, session_stream) =
+            spawn_local_bitswap_peer(cid, data.to_vec()).await;
+        let http_requests = Arc::new(AtomicU64::new(0));
+        let (http_addr, http_task) = spawn_hanging_http_provider(http_requests.clone()).await;
+        let response = format!(
+            r#"{{"Providers":[{{"ID":"slow-http","Addrs":["/ip4/127.0.0.1/tcp/{}/http"]}}]}}"#,
+            http_addr.port()
+        );
+        let (endpoint, routing_task) = spawn_sequence_delegated_response(vec![response]).await;
+
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new(endpoint),
+            store.clone(),
+        );
+        retriever
+            .record_successful_bitswap_peer(session_peer_id, vec![session_addr])
+            .await;
+
+        let (block, source) = tokio::time::timeout(
+            Duration::from_secs(2),
+            retriever.fetch_block_with_source(&cid),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(source, RetrievalSource::Bitswap);
+        assert_eq!(block.data(), data);
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), data);
+        assert_eq!(http_requests.load(Ordering::Relaxed), 0);
+
+        tokio::time::timeout(Duration::from_secs(5), session_stream)
+            .await
+            .unwrap()
+            .unwrap();
+        session_swarm.abort();
+        http_task.abort();
+        routing_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn recent_bitswap_session_peers_are_raced_with_provider_candidates() {
         let data = b"session peer candidate block";
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
@@ -4263,6 +4325,29 @@ mod bitswap_tests {
                     .chain(data)
                     .collect::<Vec<_>>();
                     let _ = stream.write_all(&response).await;
+                });
+            }
+        });
+        (addr, task)
+    }
+
+    async fn spawn_hanging_http_provider(
+        requests: Arc<AtomicU64>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let requests = requests.clone();
+                tokio::spawn(async move {
+                    let mut request = vec![0u8; 4096];
+                    if stream.read(&mut request).await.is_ok() {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
                 });
             }
         });

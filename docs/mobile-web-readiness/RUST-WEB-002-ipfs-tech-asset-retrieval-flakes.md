@@ -2614,3 +2614,118 @@ multiple resets on the child CID. The small `ipfs.tech` tail improvement does
 not justify a reliability regression on a known mobile smoke path. Keep the
 shared Bitswap connection limits at `16`; future connection-limit work needs a
 more selective policy than globally raising the swarm cap.
+
+## 2026-05-04 Post-Lookup Session Shortcut
+
+Hypothesis: the existing recent-peer shortcut was usually losing before it
+started. Delegated provider lookup often returns in `20-60ms`, while the
+shortcut slept `150ms` before asking known-good Bitswap peers. That meant page
+asset requests still entered the full provider fanout, where mixed
+trusted/provider commands occasionally hit the `4000ms` timeout.
+
+Baseline:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/ipfs-tech-session-grace150-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-session-grace150-kubo-r3-trace.jsonl
+```
+
+Result: Rust/Kubo both passed `3/3`. Rust root p50/p95 was `672/710ms` versus
+Kubo `3560/4377ms`, but Rust asset p50/p95 was `193/2073ms` versus Kubo
+`226/583ms`. The trace showed `session_shortcut_starts=11`,
+`session_shortcut_hits=9`, and `request_timeouts_with_trusted=1`.
+
+Rejected first try: set the shortcut grace to `0ms` without changing the
+provider-lookup race.
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/ipfs-tech-session-grace0-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-session-grace0-kubo-r3-trace.jsonl
+```
+
+Result: Rust/Kubo both passed `3/3`, and Rust asset p95 moved to `1577ms`, but
+the trace showed `session_shortcut_starts=102` with `0` completed attempts or
+hits. Provider lookup still won and cancelled the shortcut before it could
+return, so this was mostly extra hidden work plus network variance. Decision:
+reject grace-only `0ms`.
+
+Kept experiment: start the shortcut immediately and, when provider lookup wins
+first, wait up to `100ms` for the recent-peer fetch before falling back to the
+normal provider fanout. This keeps the full provider path as a fallback, keeps
+the node read-only, and still verifies every returned block before caching.
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/ipfs-tech-session-postlookup100-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-session-postlookup100-kubo-r3-trace.jsonl
+```
+
+Result: Rust/Kubo both passed `3/3`. Rust root p50/p95 was `913/934ms` versus
+Kubo `3871/5305ms`; Rust asset p50/p95 improved to `168/1306ms` versus Kubo
+`197/642ms`. Max RSS/FD stayed mobile-friendly at `51448KiB`/`51`, and the
+trace showed a real behavior change: `session_shortcut_hits=59`,
+`request_timeouts_with_trusted=0`, `bitswap_fetch` count dropped to `46`, and
+`bitswap_dial_rejected` dropped to `144`. Decision: keep the post-lookup
+`100ms` wait despite the small root p50 cost because it materially reduces
+asset tail latency and provider-fanout pressure.
+
+Regression check:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/session-postlookup100-regression-kubo-r3.json \
+  --trace-output /tmp/session-postlookup100-regression-kubo-r3-trace.jsonl
+```
+
+`vitalik-root-html-range` passed `3/3` for both Rust and Kubo; Rust root
+p50/p95 was `479/2217ms` versus Kubo `1953/2017ms`. `daicowtf-page-assets`
+failed `0/3` for both Rust and Kubo with root `504` responses and small error
+bodies, so this run is not a Rust-only regression signal; rerun daicowtf in a
+later network window before drawing behavior conclusions for that corpus item.
+
+Rejected follow-up: only allow the post-lookup wait when at least two recent
+session peers are available.
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/ipfs-tech-session-postlookup100-min2-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-session-postlookup100-min2-kubo-r3-trace.jsonl
+```
+
+Result: reject. Rust regressed to `2/3` while Kubo passed `3/3`; two script
+assets returned `504`, asset p95 rose to `4712ms`, and
+`request_timeouts_with_trusted` jumped to `7`. The narrower wait skipped useful
+single-peer opportunities and let the full mixed-provider request path recreate
+the timeout tail.

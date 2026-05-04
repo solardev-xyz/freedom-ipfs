@@ -94,7 +94,9 @@ errors are grouped by phase and sanitized error string so provider-quality runs
 can show repeated DHT/Bitswap failure signatures without manual JSONL greps.
 Bitswap session shortcut summaries include both started shortcut races and
 completed shortcut attempts, which makes hidden dropped background work visible
-when tuning recent-peer races.
+when tuning recent-peer races. `bitswap_session_shortcut_post_lookup_wait`
+marks cases where a quick provider lookup was briefly held to let a recent
+known-good peer finish first.
 Bitswap peer expansion traces include address mix counters, and the report
 aggregates them as `bitswap_addr_mix` for transport policy work. Established
 Bitswap connections are also counted by transport as
