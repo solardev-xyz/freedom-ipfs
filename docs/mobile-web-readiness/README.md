@@ -67,7 +67,9 @@ sampled from `/proc/<pid>/status` after each run and included in the JSON report
 along with FD count, direct child process count, and cache/repo storage bytes
 when available. Measured-run summaries aggregate run time, RSS, FD count, child
 process count, and storage bytes so resource regressions are visible without
-manual per-run JSON parsing.
+manual per-run JSON parsing. Rust-vs-Kubo comparison output prints p50 and p95
+root/asset TTFB ratios plus max RSS, FD, and storage ratios for quick terminal
+triage.
 
 For gateway phase tracing, pass `--trace-output /tmp/run.jsonl`. When the
 harness spawns the Rust gateway it forwards this path to the gateway, parses the

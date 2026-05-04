@@ -1823,7 +1823,8 @@ Harness change:
   `gateway_child_process_count`, and `gateway_storage_bytes` summaries
 - include FD max/ratio in Rust-vs-Kubo `cases` comparison JSON
 - print a compact resource summary in normal harness output
-- print Rust/Kubo max RSS in comparison output
+- print p50/p95 root and asset ratios plus max RSS, FD, and storage ratios in
+  comparison output
 
 Validation:
 
@@ -1851,6 +1852,25 @@ Result: `1/1`, root TTFB `518ms`, RSS `37760KiB`, FD count `27`, and child
 process count `0`. The console printed the new `resources:` line and the JSON
 summary included `run_total_ms`, `gateway_rss_kib`, `gateway_fd_count`,
 `gateway_child_process_count`, and `gateway_storage_bytes`.
+
+Comparison-output smoke after adding p95/resource ratios:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 60 \
+  --comparison-output /tmp/vitalik-comparison-output-smoke.json \
+  --trace-output /tmp/vitalik-comparison-output-smoke-trace.jsonl
+```
+
+Result: Rust and Kubo both passed `1/1`. The terminal summary printed
+`root_ttfb` p50/p95 ratios and resource ratios directly: Rust root p50/p95
+`2441ms`, Kubo root p50/p95 `3420ms`, RSS ratio `0.33x`, and FD ratio `0.37x`.
 
 This is a harness/diagnostics improvement only. It does not change gateway or
 retrieval behavior.

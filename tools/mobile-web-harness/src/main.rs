@@ -759,16 +759,40 @@ fn print_comparison_summary(report: &ComparisonReport) {
     );
     for case in &report.cases {
         println!(
-            "case {}: rust root_p50={} kubo root_p50={} ratio={} rust asset_p50={} kubo asset_p50={} ratio={} rust_rss_max={} kubo_rss_max={}",
+            "case {}: pass_rate rust={:.1}% kubo={:.1}%",
             case.id,
+            case.rust_pass_rate * 100.0,
+            case.kubo_pass_rate * 100.0
+        );
+        println!(
+            "  root_ttfb: rust_p50={} kubo_p50={} p50_ratio={} rust_p95={} kubo_p95={} p95_ratio={}",
             display_option_ms(case.rust_root_ttfb_p50_ms),
             display_option_ms(case.kubo_root_ttfb_p50_ms),
             display_option_f64(case.root_ttfb_p50_ratio),
+            display_option_ms(case.rust_root_ttfb_p95_ms),
+            display_option_ms(case.kubo_root_ttfb_p95_ms),
+            display_option_f64(case.root_ttfb_p95_ratio)
+        );
+        println!(
+            "  asset_ttfb: rust_p50={} kubo_p50={} p50_ratio={} rust_p95={} kubo_p95={} p95_ratio={}",
             display_option_ms(case.rust_asset_ttfb_p50_ms),
             display_option_ms(case.kubo_asset_ttfb_p50_ms),
             display_option_f64(case.asset_ttfb_p50_ratio),
+            display_option_ms(case.rust_asset_ttfb_p95_ms),
+            display_option_ms(case.kubo_asset_ttfb_p95_ms),
+            display_option_f64(case.asset_ttfb_p95_ratio)
+        );
+        println!(
+            "  resources: rust_rss_max={} kubo_rss_max={} rss_ratio={} rust_fd_max={} kubo_fd_max={} fd_ratio={} rust_storage_max={} kubo_storage_max={} storage_ratio={}",
             display_option_u64_unit(case.rust_max_rss_kib, "KiB"),
-            display_option_u64_unit(case.kubo_max_rss_kib, "KiB")
+            display_option_u64_unit(case.kubo_max_rss_kib, "KiB"),
+            display_option_f64(case.rss_ratio),
+            display_option_u64(case.rust_max_fd_count),
+            display_option_u64(case.kubo_max_fd_count),
+            display_option_f64(case.fd_ratio),
+            display_option_u64_unit(case.rust_max_storage_bytes, "B"),
+            display_option_u64_unit(case.kubo_max_storage_bytes, "B"),
+            display_option_f64(case.storage_ratio)
         );
     }
 }
@@ -788,6 +812,12 @@ fn display_option_f64(value: Option<f64>) -> String {
 fn display_option_u64_unit(value: Option<u64>, unit: &str) -> String {
     value
         .map(|value| format!("{value}{unit}"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn display_option_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
         .unwrap_or_else(|| "n/a".to_string())
 }
 
