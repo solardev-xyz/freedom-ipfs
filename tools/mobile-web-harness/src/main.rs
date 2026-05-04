@@ -3116,7 +3116,7 @@ mod tests {
                 "not json\n",
                 "{\"phase\":\"request_start\",\"path\":\"/ipns/site/\"}\n",
                 "{\"phase\":\"unixfs_file_size\",\"elapsed_ms\":50,\"cid\":\"cid3\",\"path\":\"/ipfs/root/index.html\",\"unixfs_path\":\"index.html\",\"ok\":true}\n",
-                "{\"phase\":\"bitswap_request_timeout_detail\",\"elapsed_ms\":60,\"cid\":\"cid4\",\"peer_count\":16,\"trusted_peer_count\":2,\"timeout_ms\":5000,\"targets\":\"peer@[/ip4/127.0.0.1/tcp/4001]\"}\n",
+                "{\"phase\":\"bitswap_request_timeout_detail\",\"elapsed_ms\":60,\"cid\":\"cid4\",\"peer_count\":16,\"trusted_peer_count\":2,\"timeout_ms\":4000,\"targets\":\"peer@[/ip4/127.0.0.1/tcp/4001]\"}\n",
             ),
         )
         .unwrap();
@@ -3138,7 +3138,7 @@ mod tests {
         );
         assert_eq!(
             summary.slow_events[0].details.get("timeout_ms"),
-            Some(&"5000".to_string())
+            Some(&"4000".to_string())
         );
         assert_eq!(
             summary.slow_events[0].details.get("targets"),

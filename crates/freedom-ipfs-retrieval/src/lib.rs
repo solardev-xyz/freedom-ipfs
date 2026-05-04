@@ -58,7 +58,7 @@ const BITSWAP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 // Follow-on page blocks with a recent successful peer should either reuse that
 // peer quickly or move to a fresh swarm/retry. Keep this narrower than the cold
 // request cap, but only for mixed trusted+provider candidate sets.
-const BITSWAP_TRUSTED_MIXED_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const BITSWAP_TRUSTED_MIXED_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const BITSWAP_MAX_PENDING_OUTGOING_CONNECTIONS: u32 = 16;
 const BITSWAP_MAX_ESTABLISHED_CONNECTIONS: u32 = 16;
 // Keep one command from filling every pending outgoing dial slot. Page loads

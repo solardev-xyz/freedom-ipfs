@@ -1450,7 +1450,9 @@ then fetched from the trusted peer in `244ms` after the shared client reset.
 
 Experiment:
 
-- Add `BITSWAP_TRUSTED_MIXED_REQUEST_TIMEOUT = 5s`.
+- Add `BITSWAP_TRUSTED_MIXED_REQUEST_TIMEOUT` as a narrow cap for mixed
+  trusted/provider candidate sets. The initial live run used `5s`; follow-up
+  tuning below keeps `4s`.
 - Use it only when a Bitswap command has at least one trusted peer and at least
   one non-trusted provider candidate.
 - Keep the existing `15s` cap for cold requests and trusted-only requests.
@@ -1546,6 +1548,67 @@ provider lookup DHT timeout, not on a mixed trusted Bitswap timeout
 (`request_timeouts_with_trusted=0`). This is not evidence against the mixed
 trusted timeout experiment.
 
-Decision: keep. The experiment removes a repeatable 15-second page-load cliff
-for mixed trusted/provider candidate sets while preserving cold-request timeout
-behavior and mobile resource bounds. Continue measuring asset p95 tails next.
+Follow-up tuning:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/ipfs-tech-trusted-timeout-3s-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-trusted-timeout-3s-kubo-r3-trace.jsonl
+```
+
+Result: Rust and Kubo both passed `3/3`, but `3s` was too aggressive. Rust root
+TTFB p50 was `2837ms` and p95 was `7591ms`, compared with Kubo p50 `3681ms` and
+p95 `6017ms`. The trace summary showed `request_timeouts_with_trusted=3` and
+`session_shortcut_hits=3`, meaning the cap was firing on too many root/session
+requests. Decision: reject `3s`.
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/ipfs-tech-trusted-timeout-4s-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-trusted-timeout-4s-kubo-r3-trace.jsonl
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root TTFB p50 was `1943ms`; Kubo
+was `1750ms` (`1.11x`). Rust p95 was `2173ms`; Kubo p95 was `1774ms`
+(`1.22x`). Rust asset TTFB p50 was `315ms` versus Kubo `122ms`, and Rust asset
+p95 was `2089ms` versus Kubo `1249ms`. Rust RSS stayed at `52604-53320 KiB`
+with `33-50` FDs; Kubo reached `181952 KiB` and `178` FDs. The trace had one
+mixed trusted timeout at `timeout_ms=4000` and avoided the `3s` root p95
+regression while improving the asset tail relative to `5s`.
+
+Regression check for the `4s` tuning:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/vitalik-trusted-timeout-4s-kubo-r3.json \
+  --trace-output /tmp/vitalik-trusted-timeout-4s-kubo-r3-trace.jsonl
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root TTFB p50 was `1461ms`; Kubo
+was `2951ms` (`0.50x`). Rust p95 was `1549ms`; Kubo p95 was `3009ms`
+(`0.51x`). The trace summary showed `request_timeouts_with_trusted=0`. Rust RSS
+stayed at `37632-37888 KiB`; Kubo reached `164472 KiB`.
+
+Decision: keep at `4s`. The experiment removes a repeatable 15-second
+page-load cliff for mixed trusted/provider candidate sets while preserving
+cold-request timeout behavior and mobile resource bounds. The `4s` cap improves
+the `ipfs.tech` asset tail compared with `5s` and avoids the root p95 regression
+seen at `3s`. Continue measuring asset/session behavior next.
