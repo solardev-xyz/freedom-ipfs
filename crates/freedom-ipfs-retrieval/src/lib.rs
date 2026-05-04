@@ -890,6 +890,12 @@ impl HttpRetriever {
         }
 
         let peer_count = peers.len();
+        tracing::info!(
+            phase = "bitswap_session_shortcut_start",
+            cid = %cid,
+            peer_count,
+            trusted_peer_count = peer_count
+        );
         let peers_for_record = peers.clone();
         let started = Instant::now();
         let fetch = async {
