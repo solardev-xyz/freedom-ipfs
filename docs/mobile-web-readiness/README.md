@@ -79,12 +79,14 @@ path traversal, MIME sniffing, and gateway limiter behavior during live runs.
 The spawned gateway uses a trace-friendly filter by default whenever
 `--trace-output` is set, so an ambient `RUST_LOG=warn` will not hide phase
 events. Use `--trace-filter` only when intentionally overriding the default.
-The trace summary also includes a bounded `slow_events` list with the slowest
-elapsed trace events and useful fields such as CID, path, source, provider
-count, peer count, trusted/session peer count, request ID, source peer, and
-bounded target summaries. The console output prints the top slow events so
-optimization runs immediately show which URL/CID caused the tail. Reports also
-include `block_sources` and `bitswap_source_peers` counts, which help quantify
+The trace summary also includes bounded `slow_requests` and `slow_events` lists.
+`slow_requests` groups each gateway request by path/request ID, status, phases,
+CIDs, max event latency, and total elapsed time; `slow_events` preserves the
+slowest individual events with useful fields such as CID, path, source, provider
+count, peer count, trusted/session peer count, source peer, and bounded target
+summaries. The console output prints both sections so optimization runs
+immediately show which URL/CID/request caused the tail. Reports also include
+`block_sources` and `bitswap_source_peers` counts, which help quantify
 cache/Bitswap/HTTP-provider mix and peer reuse during provider/session
 experiments. Gateway response statuses and limiter denials are aggregated as
 well, making overload or `503` pressure visible in the normal report. Trace

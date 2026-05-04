@@ -2521,3 +2521,36 @@ fixed direct-2/concurrency-6 baseline at `1092ms`. Rust RSS/FD improved slightly
 to `50688KiB`/`47`, but latency is the active gap. Decision: do not prototype an
 internal lower fetch-concurrency limiter from this signal; it likely trades away
 parallelism without solving slow connected-peer stalls.
+
+## Slow Request Trace Summary
+
+The direct-2 runs exposed a diagnostic gap: `slow_events` showed individual
+phase tails, but a page load with many overlapping assets still required manual
+JSONL greps to reconstruct which gateway request owned the slow Bitswap,
+UnixFS, and response events. The harness now emits a bounded `slow_requests`
+summary that groups trace events by gateway request path/request ID, including
+status, request elapsed time, max event time, phase counts, and top CIDs.
+
+Validation smoke:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/ipfs-tech-slow-requests-smoke-r1.json \
+  --trace-output /tmp/ipfs-tech-slow-requests-smoke-r1-trace.jsonl
+```
+
+Result: Rust passed `1/1`. Root TTFB was `4934ms`; asset TTFB p50/p95/max was
+`223/807/1036ms`; max RSS/FD was `53436KiB`/`67`. The new `slow_requests`
+console section immediately pointed at the root request:
+`/ipns/ipfs.tech/` with status `200`, request ID `1`, elapsed `4920ms`, and CIDs
+`bafkreibnzgajg3gsyn5c4p5e2h7racpy6dy7tnhwe5l4v4vx5e32qmn4bi` plus
+`bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq`. Its top events
+included the same `4000ms` mixed trusted Bitswap timeout seen in `slow_events`,
+but without losing the request-level context. This is diagnostic only; it does
+not change gateway/retrieval behavior, public fallback policy, block
+verification, or resource limits.

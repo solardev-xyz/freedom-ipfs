@@ -703,6 +703,25 @@ fn print_summary(report: &RunReport) {
                 );
             }
         }
+        if !trace.slow_requests.is_empty() {
+            println!("  slow requests:");
+            for request in trace.slow_requests.iter().take(8) {
+                let phases = format_trace_counts(&request.phases);
+                let cids = format_trace_counts(&request.cids);
+                let status = request.status.as_deref().unwrap_or("unknown");
+                println!(
+                    "    {}: {}ms status={} request_id={} events={} max_event={}ms phases={} cids={}",
+                    request.path,
+                    request.elapsed_ms,
+                    status,
+                    request.request_id,
+                    request.event_count,
+                    request.max_event_ms,
+                    phases,
+                    cids
+                );
+            }
+        }
         if !trace.slow_events.is_empty() {
             println!("  slow events:");
             for event in trace.slow_events.iter().take(8) {
@@ -2574,6 +2593,7 @@ struct TraceSummary {
     bitswap_dial_rejected_transports: Vec<TraceValueCount>,
     bitswap_dns_expansion: TraceBitswapDnsExpansionAggregate,
     slow_cids: Vec<TraceCidAggregate>,
+    slow_requests: Vec<TraceRequestAggregate>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2650,6 +2670,79 @@ struct TraceCidAggregate {
 }
 
 #[derive(Debug, Serialize)]
+struct TraceRequestAggregate {
+    path: String,
+    request_id: String,
+    status: Option<String>,
+    elapsed_ms: u128,
+    max_event_ms: u128,
+    event_count: usize,
+    phases: Vec<TraceValueCount>,
+    cids: Vec<TraceValueCount>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct TraceRequestKey {
+    request_id: String,
+    path: String,
+}
+
+#[derive(Debug)]
+struct TraceRequestBuilder {
+    path: String,
+    request_id: String,
+    status: Option<String>,
+    elapsed_ms: Option<u128>,
+    max_event_ms: u128,
+    event_count: usize,
+    phases: BTreeMap<String, usize>,
+    cids: BTreeMap<String, usize>,
+}
+
+impl TraceRequestBuilder {
+    fn new(key: TraceRequestKey) -> Self {
+        Self {
+            path: key.path,
+            request_id: key.request_id,
+            status: None,
+            elapsed_ms: None,
+            max_event_ms: 0,
+            event_count: 0,
+            phases: BTreeMap::new(),
+            cids: BTreeMap::new(),
+        }
+    }
+
+    fn record_event(&mut self, phase: &str, value: &serde_json::Value, elapsed_ms: Option<u128>) {
+        self.event_count += 1;
+        *self.phases.entry(phase.to_string()).or_default() += 1;
+        if let Some(cid) = json_detail_string(value.get("cid")) {
+            *self.cids.entry(cid).or_default() += 1;
+        }
+        if phase == "request_done" {
+            self.status = json_detail_string(value.get("status"));
+            self.elapsed_ms = elapsed_ms;
+        }
+        if let Some(elapsed_ms) = elapsed_ms {
+            self.max_event_ms = self.max_event_ms.max(elapsed_ms);
+        }
+    }
+
+    fn into_aggregate(self) -> TraceRequestAggregate {
+        TraceRequestAggregate {
+            path: self.path,
+            request_id: self.request_id,
+            status: self.status,
+            elapsed_ms: self.elapsed_ms.unwrap_or(self.max_event_ms),
+            max_event_ms: self.max_event_ms,
+            event_count: self.event_count,
+            phases: sorted_trace_counts(self.phases),
+            cids: sorted_trace_counts(self.cids),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 struct TracePeerAggregate {
     peer: String,
     count: usize,
@@ -2698,6 +2791,8 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_dns_expansion = TraceBitswapDnsExpansionAggregate::default();
     let mut bitswap_session = TraceBitswapSessionAggregate::default();
     let mut slow_cids = BTreeMap::<String, TraceCidBuilder>::new();
+    let mut active_requests = BTreeMap::<TraceRequestKey, TraceRequestBuilder>::new();
+    let mut slow_requests = Vec::<TraceRequestAggregate>::new();
 
     for line in text.lines() {
         line_count += 1;
@@ -2708,6 +2803,27 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             continue;
         };
         event_count += 1;
+        let elapsed_ms = value.get("elapsed_ms").and_then(json_u128);
+        let request_key = trace_request_key(&value);
+        if phase == "request_start" {
+            if let Some(key) = request_key.clone() {
+                active_requests
+                    .entry(key.clone())
+                    .or_insert_with(|| TraceRequestBuilder::new(key));
+            }
+        }
+        if let Some(key) = request_key.as_ref() {
+            if let Some(request) = active_requests.get_mut(key) {
+                request.record_event(phase, &value, elapsed_ms);
+            }
+        }
+        if phase == "request_done" {
+            if let Some(key) = request_key {
+                if let Some(request) = active_requests.remove(&key) {
+                    slow_requests.push(request.into_aggregate());
+                }
+            }
+        }
         if phase == "block_fetch_total" {
             if let Some(source) = value.get("source").and_then(|source| source.as_str()) {
                 *block_sources.entry(source.to_string()).or_default() += 1;
@@ -2853,7 +2969,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 .and_then(json_u128)
                 .unwrap_or_default();
         }
-        let Some(elapsed_ms) = value.get("elapsed_ms").and_then(json_u128) else {
+        let Some(elapsed_ms) = elapsed_ms else {
             continue;
         };
         phases
@@ -2916,6 +3032,19 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             .then_with(|| left.phase.cmp(&right.phase))
     });
     slow_events.truncate(MAX_TRACE_SLOW_EVENTS);
+    slow_requests.extend(
+        active_requests
+            .into_values()
+            .map(TraceRequestBuilder::into_aggregate),
+    );
+    slow_requests.sort_by(|left, right| {
+        right
+            .elapsed_ms
+            .cmp(&left.elapsed_ms)
+            .then_with(|| right.max_event_ms.cmp(&left.max_event_ms))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    slow_requests.truncate(MAX_TRACE_SLOW_EVENTS);
 
     Ok(TraceSummary {
         line_count,
@@ -2936,6 +3065,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_dial_rejected_transports: sorted_trace_counts(bitswap_dial_rejected_transports),
         bitswap_dns_expansion,
         slow_cids: sorted_trace_cids(slow_cids),
+        slow_requests,
     })
 }
 
@@ -3034,6 +3164,14 @@ fn trace_error_key(phase: &str, value: &serde_json::Value) -> Option<String> {
 fn trace_event_path(value: &serde_json::Value) -> Option<String> {
     json_detail_string(value.get("path"))
         .or_else(|| json_detail_string(value.get("span").and_then(|span| span.get("path"))))
+}
+
+fn trace_request_key(value: &serde_json::Value) -> Option<TraceRequestKey> {
+    let request_id = json_detail_string(value.get("request_id")).or_else(|| {
+        json_detail_string(value.get("span").and_then(|span| span.get("request_id")))
+    })?;
+    let path = trace_event_path(value)?;
+    Some(TraceRequestKey { request_id, path })
 }
 
 fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
@@ -3364,7 +3502,9 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
+                "{\"phase\":\"request_start\",\"request_id\":9,\"path\":\"/ipns/site/asset.js\"}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":\"25\",\"cid\":\"cid1\",\"ok\":true,\"bytes\":100,\"source\":\"bitswap\",\"source_peer\":\"peer1\",\"source_transport\":\"tcp\",\"source_peer_trusted\":true,\"trusted_peer_count\":1,\"provider_peer_count\":2,\"session_peer_count\":0,\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9}}\n",
+                "{\"phase\":\"request_done\",\"request_id\":9,\"path\":\"/ipns/site/asset.js\",\"status\":200,\"elapsed_ms\":1}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":5,\"cid\":\"cid1\",\"source\":\"bitswap\"}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":4,\"cid\":\"cid5\",\"source\":\"cache\"}\n",
                 "{\"phase\":\"provider_lookup\",\"elapsed_ms\":10,\"cid\":\"cid2\",\"provider_count\":3,\"error\":\"dht: timeout\"}\n",
@@ -3395,9 +3535,9 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 24);
-        assert_eq!(summary.event_count, 23);
-        assert_eq!(summary.slow_events.len(), 11);
+        assert_eq!(summary.line_count, 26);
+        assert_eq!(summary.event_count, 25);
+        assert_eq!(summary.slow_events.len(), 12);
         assert_eq!(
             summary.slow_events[0].phase,
             "bitswap_request_timeout_detail"
@@ -3434,14 +3574,14 @@ mod tests {
             summary.slow_events[2].details.get("source_peer_trusted"),
             Some(&"true".to_string())
         );
-        assert_eq!(summary.phases.len(), 8);
+        assert_eq!(summary.phases.len(), 9);
         assert_eq!(summary.block_sources.len(), 2);
         assert_eq!(summary.block_sources[0].value, "bitswap");
         assert_eq!(summary.block_sources[0].count, 1);
         assert_eq!(summary.block_sources[1].value, "cache");
         assert_eq!(summary.request_statuses.len(), 2);
         assert_eq!(summary.request_statuses[0].value, "200");
-        assert_eq!(summary.request_statuses[0].count, 1);
+        assert_eq!(summary.request_statuses[0].count, 2);
         assert_eq!(summary.request_statuses[1].value, "503");
         assert_eq!(summary.gateway_limiter_denials, 1);
         assert_eq!(summary.unixfs_metadata_cache.events, 1);
@@ -3517,6 +3657,16 @@ mod tests {
         assert_eq!(summary.slow_cids[2].cid, "cid1");
         assert_eq!(summary.slow_cids[2].total_ms, 30);
         assert_eq!(summary.slow_cids[2].count, 2);
+        assert_eq!(summary.slow_requests.len(), 1);
+        assert_eq!(summary.slow_requests[0].path, "/ipns/site/asset.js");
+        assert_eq!(summary.slow_requests[0].request_id, "9");
+        assert_eq!(summary.slow_requests[0].status.as_deref(), Some("200"));
+        assert_eq!(summary.slow_requests[0].elapsed_ms, 1);
+        assert_eq!(summary.slow_requests[0].max_event_ms, 25);
+        assert_eq!(summary.slow_requests[0].event_count, 3);
+        assert_eq!(summary.slow_requests[0].cids[0].value, "cid1");
+        assert_eq!(summary.slow_requests[0].cids[0].count, 1);
+        assert_eq!(summary.slow_requests[0].phases.len(), 3);
     }
 
     #[test]
