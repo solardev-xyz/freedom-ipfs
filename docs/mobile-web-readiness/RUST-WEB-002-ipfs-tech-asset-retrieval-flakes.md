@@ -2452,3 +2452,28 @@ blew out to `8844ms` versus Kubo `183ms`. Max RSS/FD stayed acceptable at
 `55964KiB`/`45`, so this was not a resource exhaustion signal; the third direct
 unknown peer likely increases request contention/noise without improving peer
 quality. Decision: reject direct `3` and keep direct `2`.
+
+Rejected adaptive direct-budget follow-up:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/ipfs-tech-adaptive-direct-want-block-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-adaptive-direct-want-block-kubo-r3-trace.jsonl
+```
+
+This variant reduced the unknown direct `WANT_BLOCK` budget by the number of
+trusted session peers already in the race. Result: Rust and Kubo both passed
+`3/3`, and Rust asset p50 was near Kubo (`202ms` versus `213ms`), but absolute
+latency regressed versus the fixed direct-2 baseline: Rust root TTFB p50/p95
+was `2133/2486ms`, and asset p95 was `2149ms`. The fixed direct-2 run was much
+faster on the same target (`707/746ms` root p50/p95, `1092ms` asset p95).
+Decision: reject the adaptive subtraction rule. Trusted session peers are useful,
+but keeping two unknown direct races still helps avoid stale or incomplete warm
+peer state during page loads.
