@@ -1393,3 +1393,32 @@ peer. Keep this diagnostic slice. It gives future iterations a direct counter
 for the stale trusted-peer case before trying a behavior change such as a
 shorter trusted-peer request retry budget or a fresh-session retry for child
 CIDs.
+
+Same-window Rust/Kubo baseline with the new diagnostics:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/vitalik-session-baseline-kubo.json \
+  --trace-output /tmp/vitalik-session-baseline-kubo-trace.jsonl
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root TTFB p50 was `2808ms`; Kubo
+root TTFB p50 was `2807ms` (`1.00x`). Rust p95 was `3969ms`; Kubo p95 was
+`3034ms` (`1.31x`). Rust stayed much smaller: RSS samples around
+`37248-37376 KiB` and `25-27` FDs versus Kubo `115200-166736 KiB` and `51-81`
+FDs.
+
+The Rust trace summary showed `fetches=6`, `with_trusted=3`,
+`trusted_successes=0`, `untrusted_successes=6`, `trusted_failures=0`, and
+`request_timeouts_with_trusted=0`. In this network window the child blocks had
+trusted candidates, but the trusted peer was not the winning source and did not
+stall. Decision: do not add the shorter trusted-peer timeout behavior yet. Keep
+collecting this counter across harder page/asset runs and only change behavior
+when the trace shows repeatable `request_timeouts_with_trusted` or
+`trusted_failures` under same-window comparison.
