@@ -1376,9 +1376,12 @@ async fn run_shared_bitswap_swarm(
                             .unwrap_or_default();
                         let failed_dial_count =
                             concurrent_dial_errors.as_ref().map_or(0, Vec::len);
-                        tracing::debug!(
+                        let remote_addr = endpoint.get_remote_address();
+                        tracing::info!(
                             phase = "bitswap_connection_established",
                             peer = %peer_id,
+                            remote_addr = %remote_addr,
+                            transport = bitswap_transport_label(remote_addr),
                             endpoint = ?endpoint,
                             num_established = num_established.get(),
                             established_ms = established_in.as_millis(),
@@ -1778,6 +1781,24 @@ fn bitswap_peer_addr_stats(peers: &[BitswapPeer]) -> BitswapPeerAddrStats {
         stats.ip6 += usize::from(has_ip6);
     }
     stats
+}
+
+fn bitswap_transport_label(addr: &Multiaddr) -> &'static str {
+    let mut has_tcp = false;
+    for protocol in addr.iter() {
+        match protocol {
+            Protocol::Wss(_) => return "wss",
+            Protocol::Ws(_) => return "ws",
+            Protocol::Quic | Protocol::QuicV1 => return "quic",
+            Protocol::Tcp(_) => has_tcp = true,
+            _ => {}
+        }
+    }
+    if has_tcp {
+        "tcp"
+    } else {
+        "other"
+    }
 }
 
 async fn expand_provider_multiaddrs(
@@ -3191,6 +3212,21 @@ mod bitswap_tests {
             .iter()
             .all(|entry| entry.want_type == WantType::Block as i32));
         assert!(entries.iter().all(|entry| entry.send_dont_have));
+    }
+
+    #[test]
+    fn labels_bitswap_connection_transport_from_multiaddr() {
+        let tcp = Multiaddr::from_str("/ip4/127.0.0.1/tcp/4001").unwrap();
+        let quic = Multiaddr::from_str("/ip4/127.0.0.1/udp/4001/quic-v1").unwrap();
+        let ws = Multiaddr::from_str("/dns4/example.com/tcp/443/ws").unwrap();
+        let wss = Multiaddr::from_str("/dns4/example.com/tcp/443/wss").unwrap();
+        let memory = Multiaddr::from_str("/memory/1").unwrap();
+
+        assert_eq!(bitswap_transport_label(&tcp), "tcp");
+        assert_eq!(bitswap_transport_label(&quic), "quic");
+        assert_eq!(bitswap_transport_label(&ws), "ws");
+        assert_eq!(bitswap_transport_label(&wss), "wss");
+        assert_eq!(bitswap_transport_label(&memory), "other");
     }
 
     #[tokio::test]

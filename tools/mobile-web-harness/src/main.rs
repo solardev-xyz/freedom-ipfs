@@ -661,6 +661,12 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.bitswap_addr_mix)
             );
         }
+        if !trace.bitswap_connection_transports.is_empty() {
+            println!(
+                "  bitswap connection transports: {}",
+                format_trace_counts(&trace.bitswap_connection_transports)
+            );
+        }
         if trace.bitswap_dns_expansion.events > 0 {
             let dns = &trace.bitswap_dns_expansion;
             println!(
@@ -2550,6 +2556,7 @@ struct TraceSummary {
     bitswap_session: TraceBitswapSessionAggregate,
     trace_errors: Vec<TraceValueCount>,
     bitswap_addr_mix: Vec<TraceValueCount>,
+    bitswap_connection_transports: Vec<TraceValueCount>,
     bitswap_dns_expansion: TraceBitswapDnsExpansionAggregate,
     slow_cids: Vec<TraceCidAggregate>,
 }
@@ -2668,6 +2675,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_peer_fetches = BTreeMap::<String, TracePeerBuilder>::new();
     let mut trace_errors = BTreeMap::<String, usize>::new();
     let mut bitswap_addr_mix = BTreeMap::<String, usize>::new();
+    let mut bitswap_connection_transports = BTreeMap::<String, usize>::new();
     let mut bitswap_dns_expansion = TraceBitswapDnsExpansionAggregate::default();
     let mut bitswap_session = TraceBitswapSessionAggregate::default();
     let mut slow_cids = BTreeMap::<String, TraceCidBuilder>::new();
@@ -2790,6 +2798,11 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             accumulate_trace_count(&mut bitswap_addr_mix, "ip4", &value, "ip4_addr_count");
             accumulate_trace_count(&mut bitswap_addr_mix, "ip6", &value, "ip6_addr_count");
         }
+        if phase == "bitswap_connection_established" {
+            if let Some(transport) = json_detail_string(value.get("transport")) {
+                *bitswap_connection_transports.entry(transport).or_default() += 1;
+            }
+        }
         if phase == "bitswap_dnsaddr_expand" || phase == "bitswap_dns_multiaddr_expand" {
             bitswap_dns_expansion.events += 1;
             if value.get("cached").and_then(|cached| cached.as_bool()) == Some(true) {
@@ -2886,6 +2899,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_session,
         trace_errors: sorted_trace_counts(trace_errors),
         bitswap_addr_mix: sorted_trace_counts(bitswap_addr_mix),
+        bitswap_connection_transports: sorted_trace_counts(bitswap_connection_transports),
         bitswap_dns_expansion,
         slow_cids: sorted_trace_cids(slow_cids),
     })
@@ -3324,6 +3338,7 @@ mod tests {
                 "{\"phase\":\"bitswap_session_shortcut_start\",\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1}\n",
                 "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":2,\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":true,\"source_peer\":\"peer1\",\"source_peer_trusted\":true}\n",
                 "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":3,\"cid\":\"cid9\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":false,\"timeout\":true}\n",
+                "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer1\",\"remote_addr\":\"/ip4/127.0.0.1/tcp/4001\",\"transport\":\"tcp\"}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bootstrap.example\",\"cached\":false,\"ok\":true,\"record_count\":2}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bootstrap.example\",\"cached\":true,\"ok\":true,\"record_count\":2}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bad.example\",\"cached\":false,\"ok\":false,\"record_count\":0}\n",
@@ -3344,8 +3359,8 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 22);
-        assert_eq!(summary.event_count, 21);
+        assert_eq!(summary.line_count, 23);
+        assert_eq!(summary.event_count, 22);
         assert_eq!(summary.slow_events.len(), 11);
         assert_eq!(
             summary.slow_events[0].phase,
@@ -3440,6 +3455,9 @@ mod tests {
         assert_eq!(summary.bitswap_addr_mix[1].count, 3);
         assert_eq!(summary.bitswap_addr_mix[2].value, "quic");
         assert_eq!(summary.bitswap_addr_mix[2].count, 2);
+        assert_eq!(summary.bitswap_connection_transports.len(), 1);
+        assert_eq!(summary.bitswap_connection_transports[0].value, "tcp");
+        assert_eq!(summary.bitswap_connection_transports[0].count, 1);
         assert_eq!(summary.bitswap_dns_expansion.events, 5);
         assert_eq!(summary.bitswap_dns_expansion.cached, 2);
         assert_eq!(summary.bitswap_dns_expansion.uncached, 3);

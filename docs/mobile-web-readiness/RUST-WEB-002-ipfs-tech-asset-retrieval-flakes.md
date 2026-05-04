@@ -1910,3 +1910,41 @@ Rust trace shape: statuses `3x504`, limiter denials `0`,
 `bitswap_session_shortcut` misses `3`. Treat this as another sparse-provider /
 content-availability window for `daicowtf`, not evidence that the current Rust
 branch regressed relative to Kubo.
+
+## Bitswap Connection Transport Trace
+
+Provider and session experiments need to know not only which transports appear
+in candidate multiaddrs, but which transports actually connect. The gateway now
+emits `bitswap_connection_established` at info level with `remote_addr` and a
+bounded `transport` label (`tcp`, `quic`, `ws`, `wss`, or `other`). The mobile
+web harness aggregates this as `bitswap_connection_transports`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib labels_bitswap_connection_transport_from_multiaddr
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Live smoke:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 60 \
+  --output /tmp/vitalik-connection-transport-smoke-2.json \
+  --trace-output /tmp/vitalik-connection-transport-smoke-2-trace.jsonl
+```
+
+Result: `1/1`, root TTFB `3975ms`, RSS `38144KiB`, FD count `28`, and the
+trace summary printed `bitswap connection transports: tcp=10`.
+
+This is diagnostic only. It does not change peer selection, connection limits,
+Bitswap request behavior, or block verification.

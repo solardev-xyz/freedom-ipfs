@@ -94,10 +94,12 @@ Bitswap session shortcut summaries include both started shortcut races and
 completed shortcut attempts, which makes hidden dropped background work visible
 when tuning recent-peer races.
 Bitswap peer expansion traces include address mix counters, and the report
-aggregates them as `bitswap_addr_mix` for transport policy work. UnixFS
-metadata-cache traces are also aggregated so reports show cache events, hits,
-misses, inserts, evictions, skip counts, maximum length, and capacity without
-manual JSONL greps.
+aggregates them as `bitswap_addr_mix` for transport policy work. Established
+Bitswap connections are also counted by transport as
+`bitswap_connection_transports`, so provider experiments can see whether actual
+connections are using TCP, QUIC, WS, or WSS. UnixFS metadata-cache traces are
+also aggregated so reports show cache events, hits, misses, inserts, evictions,
+skip counts, maximum length, and capacity without manual JSONL greps.
 Bitswap DNS expansion traces are aggregated as well, including cached versus
 uncached expansion events, failed DNSAddr lookups, TXT records, and resolved IPs.
 The `slow_cids` list groups elapsed trace events by CID with phase and path
