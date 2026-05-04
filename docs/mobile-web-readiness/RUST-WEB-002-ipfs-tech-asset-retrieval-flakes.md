@@ -2499,3 +2499,25 @@ was `232/1347ms`. The kept direct-2 baseline was better on the same target:
 root p50/p95 `707/746ms` and asset p95 `1092ms`. Decision: reject `3500ms` and
 keep the mixed-trusted cap at `4s`; the remaining tail is not solved by trimming
 that timeout further.
+
+Rejected harness-side asset concurrency `4` signal:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 4 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/ipfs-tech-direct-two-concurrency4-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-direct-two-concurrency4-kubo-r3-trace.jsonl
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root TTFB stayed good at
+`806/976ms` p50/p95, but Rust asset TTFB p95 worsened to `1448ms` versus the
+fixed direct-2/concurrency-6 baseline at `1092ms`. Rust RSS/FD improved slightly
+to `50688KiB`/`47`, but latency is the active gap. Decision: do not prototype an
+internal lower fetch-concurrency limiter from this signal; it likely trades away
+parallelism without solving slow connected-peer stalls.
