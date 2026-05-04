@@ -719,3 +719,34 @@ bitswap source peers: 12D3KooWHoyPRFHDVesYiActeZtUmqQPaJHdSw2qGJTMi3YejoJ4=2
 
 This gives later content-root session experiments an automatic signal for source
 peer reuse instead of requiring manual trace parsing.
+
+## 2026-05-04 Multi-Want Groundwork
+
+Priority 1 in the long-running roadmap is bounded Bitswap multi-want batching.
+The first safe step is deterministic support and tests, without enabling page
+load batching yet.
+
+Implementation:
+
+- Single-block stream fetch now goes through a multi-CID stream helper with a
+  one-CID slice, preserving current live behavior.
+- Bitswap want/cancel message construction accepts multiple CIDs.
+- Response collection can verify and return multiple requested blocks while
+  still treating verified non-requested blocks as extras.
+
+Focused validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval --lib
+```
+
+```text
+test bitswap_tests::multi_want_message_preserves_requested_cids ... ok
+test bitswap_tests::collects_multiple_requested_bitswap_payload_blocks ... ok
+test bitswap_tests::multi_want_stream_collects_requested_blocks_and_cancels ... ok
+```
+
+Decision: keep as test-covered groundwork only. The live retriever still requests
+one block at a time. The next experiment should wire this into a tiny bounded
+window only for known-good session peers and measure `bitswap_fetch` count,
+source-peer reuse, RSS, and asset p95 before keeping any behavior change.

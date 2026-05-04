@@ -1041,6 +1041,11 @@ struct BitswapFetchResult {
     source_peer: Option<PeerId>,
 }
 
+struct BitswapFetchResults {
+    requested_blocks: HashMap<Cid, Vec<u8>>,
+    extra_blocks: Vec<(Cid, Vec<u8>)>,
+}
+
 #[derive(Clone)]
 struct SharedBitswapClient {
     commands: mpsc::Sender<BitswapCommand>,
@@ -2158,7 +2163,28 @@ async fn request_bitswap_block_on_stream<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    if let Err(err) = write_bitswap_want(stream, cid).await {
+    let mut results = request_bitswap_blocks_on_stream(stream, &[*cid], protocol_name).await?;
+    let Some(requested_block) = results.requested_blocks.remove(cid) else {
+        return Err(BitswapProtocolFailure::other(format!(
+            "{protocol_name}: no valid block returned"
+        )));
+    };
+    Ok(BitswapFetchResult {
+        requested_block,
+        extra_blocks: results.extra_blocks,
+        source_peer: None,
+    })
+}
+
+async fn request_bitswap_blocks_on_stream<T>(
+    stream: &mut T,
+    cids: &[Cid],
+    protocol_name: &str,
+) -> std::result::Result<BitswapFetchResults, BitswapProtocolFailure>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Err(err) = write_bitswap_wants(stream, cids).await {
         return Err(BitswapProtocolFailure::other(format!(
             "{protocol_name}: write failed: {err}"
         )));
@@ -2176,9 +2202,10 @@ where
             )))
         }
     };
-    if let Some(result) = collect_bitswap_result(cid, blocks) {
-        let _ = write_bitswap_cancel(stream, cid).await;
-        return Ok(result);
+    let results = collect_bitswap_results(cids, blocks);
+    if results.requested_blocks.len() == cids.len() {
+        let _ = write_bitswap_cancels(stream, cids).await;
+        return Ok(results);
     }
     Err(BitswapProtocolFailure::other(format!(
         "{protocol_name}: no valid block returned"
@@ -2193,11 +2220,11 @@ fn bitswap_protocols() -> [StreamProtocol; 3] {
     ]
 }
 
-async fn write_bitswap_want<T>(io: &mut T, cid: &Cid) -> io::Result<()>
+async fn write_bitswap_wants<T>(io: &mut T, cids: &[Cid]) -> io::Result<()>
 where
     T: AsyncWrite + Unpin,
 {
-    let message = bitswap_want_message_with_type(cid, false, WantType::Block);
+    let message = bitswap_want_message_with_type(cids, false, WantType::Block);
     write_length_prefixed(io, &message.encode_to_vec()).await?;
     io.flush().await
 }
@@ -2206,7 +2233,7 @@ async fn write_bitswap_want_have<T>(io: &mut T, cid: &Cid) -> io::Result<()>
 where
     T: AsyncWrite + Unpin,
 {
-    let message = bitswap_want_message_with_type(cid, false, WantType::Have);
+    let message = bitswap_want_message_with_type(&[*cid], false, WantType::Have);
     write_length_prefixed(io, &message.encode_to_vec()).await?;
     io.flush().await
 }
@@ -2215,7 +2242,14 @@ async fn write_bitswap_cancel<T>(io: &mut T, cid: &Cid) -> io::Result<()>
 where
     T: AsyncWrite + Unpin,
 {
-    let message = bitswap_want_message(cid, true);
+    write_bitswap_cancels(io, &[*cid]).await
+}
+
+async fn write_bitswap_cancels<T>(io: &mut T, cids: &[Cid]) -> io::Result<()>
+where
+    T: AsyncWrite + Unpin,
+{
+    let message = bitswap_want_message(cids, true);
     write_length_prefixed(io, &message.encode_to_vec()).await?;
     io.flush().await
 }
@@ -2228,21 +2262,28 @@ where
     io.flush().await
 }
 
-fn bitswap_want_message(cid: &Cid, cancel: bool) -> BitswapMessage {
-    bitswap_want_message_with_type(cid, cancel, WantType::Block)
+fn bitswap_want_message(cids: &[Cid], cancel: bool) -> BitswapMessage {
+    bitswap_want_message_with_type(cids, cancel, WantType::Block)
 }
 
-fn bitswap_want_message_with_type(cid: &Cid, cancel: bool, want_type: WantType) -> BitswapMessage {
+fn bitswap_want_message_with_type(
+    cids: &[Cid],
+    cancel: bool,
+    want_type: WantType,
+) -> BitswapMessage {
     BitswapMessage {
         wantlist: Some(Wantlist {
-            entries: vec![WantEntry {
-                block: cid.to_bytes(),
-                priority: 1,
-                cancel,
-                want_type: want_type as i32,
-                send_dont_have: true,
-                tokens: Vec::new(),
-            }],
+            entries: cids
+                .iter()
+                .map(|cid| WantEntry {
+                    block: cid.to_bytes(),
+                    priority: 1,
+                    cancel,
+                    want_type: want_type as i32,
+                    send_dont_have: true,
+                    tokens: Vec::new(),
+                })
+                .collect(),
             full: false,
         }),
         blocks: Vec::new(),
@@ -2322,14 +2363,28 @@ fn collect_bitswap_result(
     requested: &Cid,
     blocks: Vec<ReceivedBitswapBlock>,
 ) -> Option<BitswapFetchResult> {
-    let mut requested_block = None;
+    let mut results = collect_bitswap_results(&[*requested], blocks);
+    let requested_block = results.requested_blocks.remove(requested)?;
+    Some(BitswapFetchResult {
+        requested_block,
+        extra_blocks: results.extra_blocks,
+        source_peer: None,
+    })
+}
+
+fn collect_bitswap_results(
+    requested: &[Cid],
+    blocks: Vec<ReceivedBitswapBlock>,
+) -> BitswapFetchResults {
+    let requested = requested.iter().copied().collect::<BTreeSet<_>>();
+    let mut requested_blocks = HashMap::new();
     let mut extra_blocks = Vec::new();
 
     for block in blocks {
         match block.cid {
-            Some(block_cid) if &block_cid == requested => {
-                if verify_block(requested, &block.data).is_ok() {
-                    requested_block = Some(block.data);
+            Some(block_cid) if requested.contains(&block_cid) => {
+                if verify_block(&block_cid, &block.data).is_ok() {
+                    requested_blocks.insert(block_cid, block.data);
                 }
             }
             Some(block_cid) => {
@@ -2338,18 +2393,20 @@ fn collect_bitswap_result(
                 }
             }
             None => {
-                if verify_block(requested, &block.data).is_ok() {
-                    requested_block = Some(block.data);
+                for requested in &requested {
+                    if verify_block(requested, &block.data).is_ok() {
+                        requested_blocks.insert(*requested, block.data);
+                        break;
+                    }
                 }
             }
         }
     }
 
-    requested_block.map(|requested_block| BitswapFetchResult {
-        requested_block,
+    BitswapFetchResults {
+        requested_blocks,
         extra_blocks,
-        source_peer: None,
-    })
+    }
 }
 
 fn cid_from_bitswap_payload_prefix(prefix: &[u8], data: &[u8]) -> Option<Cid> {
@@ -2760,10 +2817,49 @@ mod bitswap_tests {
     }
 
     #[test]
+    fn collects_multiple_requested_bitswap_payload_blocks() {
+        let first_data = b"first requested block";
+        let second_data = b"second requested block";
+        let invalid_data = b"invalid requested block";
+        let extra_data = b"extra multi-want block";
+        let first = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, first_data);
+        let second = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, second_data);
+        let invalid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, invalid_data);
+        let extra = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, extra_data);
+
+        let result = collect_bitswap_results(
+            &[first, second, invalid],
+            vec![
+                ReceivedBitswapBlock {
+                    cid: Some(second),
+                    data: second_data.to_vec(),
+                },
+                ReceivedBitswapBlock {
+                    cid: Some(extra),
+                    data: extra_data.to_vec(),
+                },
+                ReceivedBitswapBlock {
+                    cid: Some(first),
+                    data: first_data.to_vec(),
+                },
+                ReceivedBitswapBlock {
+                    cid: Some(invalid),
+                    data: b"wrong bytes".to_vec(),
+                },
+            ],
+        );
+
+        assert_eq!(result.requested_blocks.get(&first).unwrap(), first_data);
+        assert_eq!(result.requested_blocks.get(&second).unwrap(), second_data);
+        assert!(!result.requested_blocks.contains_key(&invalid));
+        assert_eq!(result.extra_blocks, vec![(extra, extra_data.to_vec())]);
+    }
+
+    #[test]
     fn cancel_bitswap_message_revokes_block_want() {
         let data = b"cancel me";
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
-        let message = bitswap_want_message(&cid, true);
+        let message = bitswap_want_message(&[cid], true);
         let wantlist = message.wantlist.unwrap();
         let entry = wantlist.entries.first().unwrap();
 
@@ -2776,7 +2872,7 @@ mod bitswap_tests {
     fn want_have_message_queries_block_presence() {
         let data = b"want-have me";
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
-        let message = bitswap_want_message_with_type(&cid, false, WantType::Have);
+        let message = bitswap_want_message_with_type(&[cid], false, WantType::Have);
         let wantlist = message.wantlist.unwrap();
         let entry = wantlist.entries.first().unwrap();
 
@@ -2784,6 +2880,82 @@ mod bitswap_tests {
         assert_eq!(entry.block, cid.to_bytes());
         assert_eq!(entry.want_type, WantType::Have as i32);
         assert!(entry.send_dont_have);
+    }
+
+    #[test]
+    fn multi_want_message_preserves_requested_cids() {
+        let first = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, b"first");
+        let second = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, b"second");
+        let message = bitswap_want_message_with_type(&[first, second], false, WantType::Block);
+        let wantlist = message.wantlist.unwrap();
+        let entries = wantlist.entries;
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].block, first.to_bytes());
+        assert_eq!(entries[1].block, second.to_bytes());
+        assert!(entries.iter().all(|entry| !entry.cancel));
+        assert!(entries
+            .iter()
+            .all(|entry| entry.want_type == WantType::Block as i32));
+        assert!(entries.iter().all(|entry| entry.send_dont_have));
+    }
+
+    #[tokio::test]
+    async fn multi_want_stream_collects_requested_blocks_and_cancels() {
+        let first_data = b"first multi-want stream block";
+        let second_data = b"second multi-want stream block";
+        let first = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, first_data);
+        let second = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, second_data);
+        let response = BitswapMessage {
+            payload: vec![
+                BlockPayload {
+                    prefix: bitswap_payload_prefix(&second),
+                    data: second_data.to_vec(),
+                    tokens: Vec::new(),
+                },
+                BlockPayload {
+                    prefix: bitswap_payload_prefix(&first),
+                    data: first_data.to_vec(),
+                    tokens: Vec::new(),
+                },
+            ],
+            ..BitswapMessage::default()
+        };
+        let mut stream = ScriptedBitswapStream::new(length_prefixed_bytes(&response));
+
+        let result =
+            request_bitswap_blocks_on_stream(&mut stream, &[first, second], "/ipfs/bitswap/1.2.0")
+                .await
+                .unwrap();
+
+        assert_eq!(result.requested_blocks.get(&first).unwrap(), first_data);
+        assert_eq!(result.requested_blocks.get(&second).unwrap(), second_data);
+        let mut written = futures::io::Cursor::new(stream.written);
+        let want = BitswapMessage::decode(
+            read_length_prefixed(&mut written, 1024)
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        let want_entries = want.wantlist.unwrap().entries;
+        assert_eq!(want_entries.len(), 2);
+        assert_eq!(want_entries[0].block, first.to_bytes());
+        assert_eq!(want_entries[1].block, second.to_bytes());
+        assert!(want_entries.iter().all(|entry| !entry.cancel));
+
+        let cancel = BitswapMessage::decode(
+            read_length_prefixed(&mut written, 1024)
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        let cancel_entries = cancel.wantlist.unwrap().entries;
+        assert_eq!(cancel_entries.len(), 2);
+        assert_eq!(cancel_entries[0].block, first.to_bytes());
+        assert_eq!(cancel_entries[1].block, second.to_bytes());
+        assert!(cancel_entries.iter().all(|entry| entry.cancel));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3614,6 +3786,67 @@ mod bitswap_tests {
     fn append_uvarint(buffer: &mut Vec<u8>, value: u64) {
         let mut encode_buffer = unsigned_varint::encode::u64_buffer();
         buffer.extend_from_slice(unsigned_varint::encode::u64(value, &mut encode_buffer));
+    }
+
+    fn length_prefixed_bytes(message: &BitswapMessage) -> Vec<u8> {
+        let bytes = message.encode_to_vec();
+        let mut buffer = Vec::new();
+        let mut encode_buffer = unsigned_varint::encode::u32_buffer();
+        buffer.extend_from_slice(unsigned_varint::encode::u32(
+            bytes.len() as u32,
+            &mut encode_buffer,
+        ));
+        buffer.extend_from_slice(&bytes);
+        buffer
+    }
+
+    struct ScriptedBitswapStream {
+        read: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl ScriptedBitswapStream {
+        fn new(read: Vec<u8>) -> Self {
+            Self {
+                read: std::io::Cursor::new(read),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl AsyncRead for ScriptedBitswapStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(std::io::Read::read(&mut self.read, buf))
+        }
+    }
+
+    impl AsyncWrite for ScriptedBitswapStream {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.written.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
     }
 
     async fn spawn_local_bitswap_peer(
