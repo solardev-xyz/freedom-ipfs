@@ -545,6 +545,13 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.block_sources)
             );
         }
+        if !trace.request_statuses.is_empty() || trace.gateway_limiter_denials > 0 {
+            println!(
+                "  gateway responses: statuses={} limiter_denials={}",
+                format_trace_counts(&trace.request_statuses),
+                trace.gateway_limiter_denials
+            );
+        }
         if trace.unixfs_metadata_cache.events > 0 {
             let cache = &trace.unixfs_metadata_cache;
             println!(
@@ -2357,6 +2364,8 @@ struct TraceSummary {
     phases: Vec<TracePhaseAggregate>,
     slow_events: Vec<TraceSlowEvent>,
     block_sources: Vec<TraceValueCount>,
+    request_statuses: Vec<TraceValueCount>,
+    gateway_limiter_denials: usize,
     unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
     bitswap_source_peers: Vec<TraceValueCount>,
     bitswap_peer_fetches: Vec<TracePeerAggregate>,
@@ -2473,6 +2482,8 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut phases = BTreeMap::<String, Vec<u128>>::new();
     let mut slow_events = Vec::<TraceSlowEvent>::new();
     let mut block_sources = BTreeMap::<String, usize>::new();
+    let mut request_statuses = BTreeMap::<String, usize>::new();
+    let mut gateway_limiter_denials = 0usize;
     let mut unixfs_metadata_cache = TraceUnixfsMetadataCacheAggregate::default();
     let mut bitswap_source_peers = BTreeMap::<String, usize>::new();
     let mut bitswap_peer_fetches = BTreeMap::<String, TracePeerBuilder>::new();
@@ -2495,6 +2506,19 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             if let Some(source) = value.get("source").and_then(|source| source.as_str()) {
                 *block_sources.entry(source.to_string()).or_default() += 1;
             }
+        }
+        if phase == "request_done" {
+            if let Some(status) = json_detail_string(value.get("status")) {
+                *request_statuses.entry(status).or_default() += 1;
+            }
+        }
+        if phase == "gateway_limiter"
+            && value
+                .get("acquired")
+                .and_then(|acquired| acquired.as_bool())
+                == Some(false)
+        {
+            gateway_limiter_denials += 1;
         }
         if phase == "unixfs_metadata_cache" {
             unixfs_metadata_cache.events += 1;
@@ -2672,6 +2696,8 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         phases,
         slow_events,
         block_sources: sorted_trace_counts(block_sources),
+        request_statuses: sorted_trace_counts(request_statuses),
+        gateway_limiter_denials,
         unixfs_metadata_cache,
         bitswap_source_peers: sorted_trace_counts(bitswap_source_peers),
         bitswap_peer_fetches: sorted_trace_peers(bitswap_peer_fetches),
@@ -3115,6 +3141,9 @@ mod tests {
                 "{\"phase\":\"unixfs_metadata_cache\",\"elapsed_ms\":0,\"hits\":3,\"misses\":2,\"inserts\":2,\"evictions\":1,\"oversized_skips\":0,\"cache_len\":4,\"cache_capacity\":256}\n",
                 "not json\n",
                 "{\"phase\":\"request_start\",\"path\":\"/ipns/site/\"}\n",
+                "{\"phase\":\"gateway_limiter\",\"acquired\":false}\n",
+                "{\"phase\":\"request_done\",\"status\":503}\n",
+                "{\"phase\":\"request_done\",\"status\":200}\n",
                 "{\"phase\":\"unixfs_file_size\",\"elapsed_ms\":50,\"cid\":\"cid3\",\"path\":\"/ipfs/root/index.html\",\"unixfs_path\":\"index.html\",\"ok\":true}\n",
                 "{\"phase\":\"bitswap_request_timeout_detail\",\"elapsed_ms\":60,\"cid\":\"cid4\",\"peer_count\":16,\"trusted_peer_count\":2,\"timeout_ms\":4000,\"targets\":\"peer@[/ip4/127.0.0.1/tcp/4001]\"}\n",
             ),
@@ -3124,8 +3153,8 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 18);
-        assert_eq!(summary.event_count, 17);
+        assert_eq!(summary.line_count, 21);
+        assert_eq!(summary.event_count, 20);
         assert_eq!(summary.slow_events.len(), 11);
         assert_eq!(
             summary.slow_events[0].phase,
@@ -3168,6 +3197,11 @@ mod tests {
         assert_eq!(summary.block_sources[0].value, "bitswap");
         assert_eq!(summary.block_sources[0].count, 1);
         assert_eq!(summary.block_sources[1].value, "cache");
+        assert_eq!(summary.request_statuses.len(), 2);
+        assert_eq!(summary.request_statuses[0].value, "200");
+        assert_eq!(summary.request_statuses[0].count, 1);
+        assert_eq!(summary.request_statuses[1].value, "503");
+        assert_eq!(summary.gateway_limiter_denials, 1);
         assert_eq!(summary.unixfs_metadata_cache.events, 1);
         assert_eq!(summary.unixfs_metadata_cache.hits, 3);
         assert_eq!(summary.unixfs_metadata_cache.misses, 2);
