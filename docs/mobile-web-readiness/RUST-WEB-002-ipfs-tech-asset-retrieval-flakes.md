@@ -2561,3 +2561,56 @@ Before this, `bitswap_request_timeout_detail.targets` could label the first
 untrusted direct-2 peers as `want-have` because it formatted the pre-plan peer
 list. Future timeout traces should now describe the actual request mode used for
 each listed peer.
+
+Rejected Bitswap connection limit `24`:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/ipfs-tech-conn-limit-24-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-conn-limit-24-kubo-r3-trace.jsonl
+
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/ipfs-tech-conn-limit-16-recheck-kubo-r3.json \
+  --trace-output /tmp/ipfs-tech-conn-limit-16-recheck-kubo-r3-trace.jsonl
+```
+
+The same-window `ipfs.tech` A/B made `24` look plausible: Rust root p50/p95 was
+`752/756ms` at limit `24` versus `672/917ms` at limit `16`, and asset p95
+improved from `1601ms` to `1293ms`. RSS stayed flat near `54MiB`; FD max rose
+from `47` to `57`.
+
+Regression check:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/vitalik-conn-limit-24-r3.json \
+  --trace-output /tmp/vitalik-conn-limit-24-r3-trace.jsonl
+```
+
+Result: reject. `vitalik-root-html-range` regressed to `2/3` with one `504`.
+Root p50/p95/max was `6667/9278/9278ms`; max RSS/FD remained modest at
+`38784KiB`/`31`, but the trace had `3` `request_timeouts_with_trusted` and
+multiple resets on the child CID. The small `ipfs.tech` tail improvement does
+not justify a reliability regression on a known mobile smoke path. Keep the
+shared Bitswap connection limits at `16`; future connection-limit work needs a
+more selective policy than globally raising the swarm cap.
