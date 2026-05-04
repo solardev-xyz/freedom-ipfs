@@ -1946,5 +1946,27 @@ cargo run -p mobile-web-harness -- \
 Result: `1/1`, root TTFB `3975ms`, RSS `38144KiB`, FD count `28`, and the
 trace summary printed `bitswap connection transports: tcp=10`.
 
+First page-load baseline with the new transport counter:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/ipfs-tech-connection-transport-r3.json \
+  --trace-output /tmp/ipfs-tech-connection-transport-r3-trace.jsonl
+```
+
+Result: `3/3`, root TTFB p50/p95/max `1390/2453/2453ms`, asset TTFB
+p50/p95/max `214/1210/2157ms`, max RSS `52912KiB`, max FD count `53`, response
+statuses `81x200`, `18x206`, limiter denials `0`. Candidate address mix
+included `tcp=2363`, `quic=895`, `ws=252`, and `wss=0`, but established
+connections were `tcp=35`. This is evidence that current successful
+`ipfs.tech` Bitswap retrieval is effectively TCP-only in this window; future
+transport experiments should measure whether QUIC/WSS can improve tails without
+raising dial pressure.
+
 This is diagnostic only. It does not change peer selection, connection limits,
 Bitswap request behavior, or block verification.
