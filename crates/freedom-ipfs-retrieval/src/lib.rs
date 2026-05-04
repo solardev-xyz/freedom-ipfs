@@ -1610,13 +1610,17 @@ fn cloudflare_websocket_transport(
 
 async fn bitswap_peers(providers: &[Provider]) -> Vec<BitswapPeer> {
     let mut peers = Vec::new();
+    let mut dnsaddr_cache = HashMap::<String, Vec<String>>::new();
+    let mut dns_ip_cache = HashMap::<String, Vec<IpAddr>>::new();
 
     for provider in providers {
         let provider_peer = provider.id.as_deref().and_then(parse_peer_id);
         let mut addrs = Vec::new();
         let mut peer_id = provider_peer;
 
-        for addr in expand_provider_multiaddrs(&provider.addrs).await {
+        for addr in
+            expand_provider_multiaddrs(&provider.addrs, &mut dnsaddr_cache, &mut dns_ip_cache).await
+        {
             let Some((addr_peer, dial_addr)) = parse_bitswap_multiaddr(&addr, provider_peer) else {
                 continue;
             };
@@ -1730,7 +1734,11 @@ fn bitswap_peer_addr_stats(peers: &[BitswapPeer]) -> BitswapPeerAddrStats {
     stats
 }
 
-async fn expand_provider_multiaddrs(addrs: &[String]) -> Vec<String> {
+async fn expand_provider_multiaddrs(
+    addrs: &[String],
+    dnsaddr_cache: &mut HashMap<String, Vec<String>>,
+    dns_ip_cache: &mut HashMap<String, Vec<IpAddr>>,
+) -> Vec<String> {
     let resolver = CloudflareDohResolver::default();
     let mut expanded_dnsaddr = Vec::new();
 
@@ -1739,28 +1747,31 @@ async fn expand_provider_multiaddrs(addrs: &[String]) -> Vec<String> {
             expanded_dnsaddr.push(addr.clone());
             continue;
         };
-        let lookup = format!("_dnsaddr.{host}");
-        let Ok(records) = resolver.txt_lookup(&lookup).await else {
+        if let Some(records) = dnsaddr_cache.get(host) {
             tracing::info!(
                 phase = "bitswap_dnsaddr_expand",
                 host,
-                ok = false,
-                record_count = 0
+                cached = true,
+                ok = true,
+                record_count = records.len()
             );
+            expanded_dnsaddr.extend(records.iter().cloned());
             continue;
+        }
+        let lookup = format!("_dnsaddr.{host}");
+        let records = match resolver.txt_lookup(&lookup).await {
+            Ok(records) => dnsaddr_records(records),
+            Err(_) => Vec::new(),
         };
         tracing::info!(
             phase = "bitswap_dnsaddr_expand",
             host,
-            ok = true,
+            cached = false,
+            ok = !records.is_empty(),
             record_count = records.len()
         );
-        expanded_dnsaddr.extend(records.into_iter().filter_map(|record| {
-            record
-                .trim()
-                .strip_prefix("dnsaddr=")
-                .map(ToOwned::to_owned)
-        }));
+        dnsaddr_cache.insert(host.to_string(), records.clone());
+        expanded_dnsaddr.extend(records);
     }
 
     let mut expanded = Vec::new();
@@ -1773,19 +1784,37 @@ async fn expand_provider_multiaddrs(addrs: &[String]) -> Vec<String> {
             expanded.push(addr);
             continue;
         };
-        let Ok(addrs) = resolver.ip_lookup(&dns_name).await else {
-            expanded.push(addr);
-            continue;
+        let addrs = if let Some(addrs) = dns_ip_cache.get(&dns_name) {
+            tracing::info!(
+                phase = "bitswap_dns_multiaddr_expand",
+                host = %dns_name,
+                cached = true,
+                ip_count = addrs.len()
+            );
+            addrs.clone()
+        } else {
+            match resolver.ip_lookup(&dns_name).await {
+                Ok(addrs) => {
+                    tracing::info!(
+                        phase = "bitswap_dns_multiaddr_expand",
+                        host = %dns_name,
+                        cached = false,
+                        ip_count = addrs.len()
+                    );
+                    dns_ip_cache.insert(dns_name.clone(), addrs.clone());
+                    addrs
+                }
+                Err(_) => {
+                    dns_ip_cache.insert(dns_name.clone(), Vec::new());
+                    expanded.push(addr);
+                    continue;
+                }
+            }
         };
         if addrs.is_empty() {
             expanded.push(addr);
             continue;
         }
-        tracing::info!(
-            phase = "bitswap_dns_multiaddr_expand",
-            host = %dns_name,
-            ip_count = addrs.len()
-        );
         expanded.extend(
             addrs
                 .into_iter()
@@ -1795,6 +1824,18 @@ async fn expand_provider_multiaddrs(addrs: &[String]) -> Vec<String> {
     }
 
     expanded
+}
+
+fn dnsaddr_records(records: Vec<String>) -> Vec<String> {
+    records
+        .into_iter()
+        .filter_map(|record| {
+            record
+                .trim()
+                .strip_prefix("dnsaddr=")
+                .map(ToOwned::to_owned)
+        })
+        .collect()
 }
 
 fn dnsaddr_host(addr: &str) -> Option<&str> {
@@ -2753,6 +2794,42 @@ mod bitswap_tests {
             replaced.to_string(),
             "/ip4/203.0.113.10/tcp/4001/p2p/12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP"
         );
+    }
+
+    #[tokio::test]
+    async fn cached_dns_expansion_reuses_dnsaddr_and_ip_results() {
+        let mut dnsaddr_cache = HashMap::from([(
+            "bootstrap.example".to_string(),
+            vec![
+                "/dns4/example.com/tcp/4001".to_string(),
+                "/dns4/ws.example/tcp/443/wss".to_string(),
+            ],
+        )]);
+        let mut dns_ip_cache = HashMap::from([(
+            "example.com".to_string(),
+            vec!["203.0.113.10".parse().unwrap()],
+        )]);
+
+        let expanded = expand_provider_multiaddrs(
+            &[
+                "/dnsaddr/bootstrap.example".to_string(),
+                "/dns4/example.com/tcp/4002".to_string(),
+            ],
+            &mut dnsaddr_cache,
+            &mut dns_ip_cache,
+        )
+        .await;
+
+        assert_eq!(
+            expanded,
+            vec![
+                "/ip4/203.0.113.10/tcp/4001",
+                "/dns4/ws.example/tcp/443/wss",
+                "/ip4/203.0.113.10/tcp/4002",
+            ]
+        );
+        assert_eq!(dnsaddr_cache.len(), 1);
+        assert_eq!(dns_ip_cache.len(), 1);
     }
 
     #[test]

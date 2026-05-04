@@ -1208,3 +1208,90 @@ for cold roots, so this is not expected to fix root 504s by itself. The next
 metadata follow-up should measure full-page `ipfs.tech` in a cleaner provider
 window and consider caching decoded directory entry vectors for HAMT/listing
 heavy paths if traces show directory-entry rebuilding cost.
+
+## 2026-05-04 Bitswap DNS Expansion Cache
+
+Hypothesis:
+Bitswap peer candidate construction repeats `/dnsaddr` TXT expansion and
+ordinary DNS multiaddr IP expansion for the same host several times within one
+provider set. On mobile cold loads this is wasted network/CPU time before the
+node even starts dialing peers. A per-candidate-set cache should lower
+`bitswap_peer_expand` latency without changing provider selection, dial caps,
+timeouts, or trust boundaries.
+
+Evidence before change:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/vitalik-rust-kubo-post-cache-timeout.json \
+  --trace-output /tmp/vitalik-rust-kubo-post-cache-timeout-trace.jsonl
+```
+
+Result: Rust and Kubo both passed, but Rust root TTFB was `4907ms` versus Kubo
+`2037ms` (`2.41x`). Trace showed root `bitswap_peer_expand=1397ms`; repeated
+events included `bitswap.filebase.io` DNS multiaddr expansion and
+`bitswap.dget.top` DNSAddr expansion in the same request.
+
+Implementation:
+
+- `bitswap_peers()` now keeps two local caches while expanding one provider set:
+  `/dnsaddr` host -> TXT-derived multiaddrs, and DNS host -> resolved IPs.
+- WebSocket/WSS multiaddrs are still preserved as DNS names for SNI.
+- The cache is per provider-set expansion only; it does not persist stale DNS
+  answers across gateway requests.
+- Trace events include `cached=true|false` on `bitswap_dnsaddr_expand` and
+  `bitswap_dns_multiaddr_expand`.
+
+Deterministic validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval --lib
+```
+
+Added coverage: `cached_dns_expansion_reuses_dnsaddr_and_ip_results`, using
+pre-seeded caches so the test performs no live DNS.
+
+Same-window check after change:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --comparison-output /tmp/vitalik-rust-kubo-dns-expand-cache.json \
+  --trace-output /tmp/vitalik-rust-kubo-dns-expand-cache-trace.jsonl
+```
+
+Result: Rust and Kubo both passed. Rust root TTFB improved to `3080ms`; Kubo was
+`2030ms` (`1.52x`). Root `bitswap_peer_expand` dropped to `940ms`; child
+`bitswap_peer_expand` was `79ms`. Trace showed cached expansion hits for
+`bitswap.filebase.io` and `bitswap.dget.top`. Rust stayed resource-light:
+`37248 KiB` RSS, `28` FDs, `0` child processes versus Kubo `180700 KiB`, `89`
+FDs, `0` child processes.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib
+cargo test -p freedom-ipfs-gateway
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build -p freedom-ipfs-gateway
+```
+
+Decision: keep. This is a bounded, low-risk latency/resource optimization:
+fewer repeated DNS queries while preserving DNS names for WSS and all existing
+verification-before-cache behavior. The next measurement improvement should
+aggregate DNS expansion cache hit/miss counts in the harness trace summary, and
+the next behavior experiment can revisit multi-want or session-aware child CID
+fetching now that root peer expansion has less avoidable overhead.

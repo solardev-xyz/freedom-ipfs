@@ -164,7 +164,11 @@ status, MIME type, byte count, and timing.
   UnixFS follow-up added a bounded per-gateway decoded DAG-PB metadata cache so
   path traversal, MIME/range checks, and streaming can reuse verified directory
   and file metadata without extra network fanout. Gateway traces now include
-  `unixfs_metadata_cache` hit/miss/insert/eviction counters.
+  `unixfs_metadata_cache` hit/miss/insert/eviction counters. A Bitswap DNS
+  follow-up now reuses `/dnsaddr` and DNS multiaddr expansion results within one
+  provider candidate set; a same-window `vitalik-root-html-range` comparison
+  dropped Rust root TTFB from `4907ms` to `3080ms` and root
+  `bitswap_peer_expand` from `1397ms` to `940ms`.
 
 ## Next Scenario Targets
 
