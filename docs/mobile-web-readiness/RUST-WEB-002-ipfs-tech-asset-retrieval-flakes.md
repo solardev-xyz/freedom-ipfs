@@ -2241,6 +2241,25 @@ again dominated by low provider diversity and DHT/provider lookup timeouts, so
 this remains a provider discovery/session fallback gap rather than evidence for
 or against the per-peer address cap.
 
+Same-window Kubo comparison:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case daicowtf-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --comparison-output /tmp/daicowtf-cap2-kubo-compare-r1.json \
+  --trace-output /tmp/daicowtf-cap2-kubo-compare-r1-trace.jsonl
+```
+
+Result: Rust and Kubo both failed `1/1`. Rust root TTFB was `30950ms`; Kubo
+root TTFB was `30003ms`. Rust RSS/FD max was `42880KiB`/`21`; Kubo RSS/FD max
+was `158484KiB`/`295`. This confirms the daicowtf window was not a Rust-only cap
+regression.
+
 Decision: keep cap `2`. It reduces secondary transport dial pressure while
 preserving one fallback address, improves `ipfs.tech` page tails in same-window
 A/B, and avoids the vitalik child-CID failure seen with cap `4`. Continue
