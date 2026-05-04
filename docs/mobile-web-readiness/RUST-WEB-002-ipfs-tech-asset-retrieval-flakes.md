@@ -1917,7 +1917,10 @@ Provider and session experiments need to know not only which transports appear
 in candidate multiaddrs, but which transports actually connect. The gateway now
 emits `bitswap_connection_established` at info level with `remote_addr` and a
 bounded `transport` label (`tcp`, `quic`, `ws`, `wss`, or `other`). The mobile
-web harness aggregates this as `bitswap_connection_transports`.
+web harness aggregates this as `bitswap_connection_transports`. Immediate
+`swarm.dial` rejections also include the attempted transport and are aggregated
+as `bitswap_dial_rejected_transports`, making connection-limit pressure easier
+to distinguish from remote transport failures.
 
 Validation:
 
@@ -1964,9 +1967,30 @@ p50/p95/max `214/1210/2157ms`, max RSS `52912KiB`, max FD count `53`, response
 statuses `81x200`, `18x206`, limiter denials `0`. Candidate address mix
 included `tcp=2363`, `quic=895`, `ws=252`, and `wss=0`, but established
 connections were `tcp=35`. This is evidence that current successful
-`ipfs.tech` Bitswap retrieval is effectively TCP-only in this window; future
-transport experiments should measure whether QUIC/WSS can improve tails without
-raising dial pressure.
+`ipfs.tech` Bitswap retrieval is effectively TCP-only in this window. The trace
+was collected before rejected-dial transport aggregation, so rerun it when
+testing transport policy changes. Future transport experiments should measure
+whether QUIC/WSS can improve tails without raising dial pressure.
+
+Rejected-dial transport smoke:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --output /tmp/ipfs-tech-dial-transport-smoke.json \
+  --trace-output /tmp/ipfs-tech-dial-transport-smoke-trace.jsonl
+```
+
+Result: `1/1`, but a slow root TTFB of `11993ms`. The trace showed established
+connection transports `tcp=13`, `quic=1`, `ws=1`, and rejected dial transports
+`tcp=95`, `quic=34`, `ws=8`. This confirms the new rejected-dial aggregation is
+visible in live output and gives future transport experiments a pressure signal
+to compare against.
 
 This is diagnostic only. It does not change peer selection, connection limits,
 Bitswap request behavior, or block verification.

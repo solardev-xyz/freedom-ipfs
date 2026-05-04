@@ -667,6 +667,12 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.bitswap_connection_transports)
             );
         }
+        if !trace.bitswap_dial_rejected_transports.is_empty() {
+            println!(
+                "  bitswap rejected dial transports: {}",
+                format_trace_counts(&trace.bitswap_dial_rejected_transports)
+            );
+        }
         if trace.bitswap_dns_expansion.events > 0 {
             let dns = &trace.bitswap_dns_expansion;
             println!(
@@ -2557,6 +2563,7 @@ struct TraceSummary {
     trace_errors: Vec<TraceValueCount>,
     bitswap_addr_mix: Vec<TraceValueCount>,
     bitswap_connection_transports: Vec<TraceValueCount>,
+    bitswap_dial_rejected_transports: Vec<TraceValueCount>,
     bitswap_dns_expansion: TraceBitswapDnsExpansionAggregate,
     slow_cids: Vec<TraceCidAggregate>,
 }
@@ -2676,6 +2683,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut trace_errors = BTreeMap::<String, usize>::new();
     let mut bitswap_addr_mix = BTreeMap::<String, usize>::new();
     let mut bitswap_connection_transports = BTreeMap::<String, usize>::new();
+    let mut bitswap_dial_rejected_transports = BTreeMap::<String, usize>::new();
     let mut bitswap_dns_expansion = TraceBitswapDnsExpansionAggregate::default();
     let mut bitswap_session = TraceBitswapSessionAggregate::default();
     let mut slow_cids = BTreeMap::<String, TraceCidBuilder>::new();
@@ -2803,6 +2811,13 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 *bitswap_connection_transports.entry(transport).or_default() += 1;
             }
         }
+        if phase == "bitswap_dial_rejected" {
+            if let Some(transport) = json_detail_string(value.get("transport")) {
+                *bitswap_dial_rejected_transports
+                    .entry(transport)
+                    .or_default() += 1;
+            }
+        }
         if phase == "bitswap_dnsaddr_expand" || phase == "bitswap_dns_multiaddr_expand" {
             bitswap_dns_expansion.events += 1;
             if value.get("cached").and_then(|cached| cached.as_bool()) == Some(true) {
@@ -2900,6 +2915,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         trace_errors: sorted_trace_counts(trace_errors),
         bitswap_addr_mix: sorted_trace_counts(bitswap_addr_mix),
         bitswap_connection_transports: sorted_trace_counts(bitswap_connection_transports),
+        bitswap_dial_rejected_transports: sorted_trace_counts(bitswap_dial_rejected_transports),
         bitswap_dns_expansion,
         slow_cids: sorted_trace_cids(slow_cids),
     })
@@ -3339,6 +3355,7 @@ mod tests {
                 "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":2,\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":true,\"source_peer\":\"peer1\",\"source_peer_trusted\":true}\n",
                 "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":3,\"cid\":\"cid9\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":false,\"timeout\":true}\n",
                 "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer1\",\"remote_addr\":\"/ip4/127.0.0.1/tcp/4001\",\"transport\":\"tcp\"}\n",
+                "{\"phase\":\"bitswap_dial_rejected\",\"peer\":\"peer2\",\"transport\":\"quic\",\"connection_limit\":true,\"error\":\"Dial error\"}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bootstrap.example\",\"cached\":false,\"ok\":true,\"record_count\":2}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bootstrap.example\",\"cached\":true,\"ok\":true,\"record_count\":2}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bad.example\",\"cached\":false,\"ok\":false,\"record_count\":0}\n",
@@ -3359,8 +3376,8 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 23);
-        assert_eq!(summary.event_count, 22);
+        assert_eq!(summary.line_count, 24);
+        assert_eq!(summary.event_count, 23);
         assert_eq!(summary.slow_events.len(), 11);
         assert_eq!(
             summary.slow_events[0].phase,
@@ -3435,20 +3452,17 @@ mod tests {
         assert_eq!(summary.bitswap_session.session_shortcut_attempts, 2);
         assert_eq!(summary.bitswap_session.session_shortcut_hits, 1);
         assert_eq!(summary.bitswap_session.session_shortcut_misses, 1);
-        assert_eq!(summary.trace_errors.len(), 4);
-        assert_eq!(
-            summary.trace_errors[0].value,
-            "bitswap_dnsaddr_expand: ok=false"
-        );
-        assert_eq!(summary.trace_errors[1].value, "bitswap_fetch: ok=false");
-        assert_eq!(
-            summary.trace_errors[2].value,
-            "bitswap_session_shortcut: ok=false"
-        );
-        assert_eq!(
-            summary.trace_errors[3].value,
-            "provider_lookup: dht: timeout"
-        );
+        let trace_errors = summary
+            .trace_errors
+            .iter()
+            .map(|error| error.value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(trace_errors.len(), 5);
+        assert!(trace_errors.contains(&"bitswap_dial_rejected: Dial error"));
+        assert!(trace_errors.contains(&"bitswap_dnsaddr_expand: ok=false"));
+        assert!(trace_errors.contains(&"bitswap_fetch: ok=false"));
+        assert!(trace_errors.contains(&"bitswap_session_shortcut: ok=false"));
+        assert!(trace_errors.contains(&"provider_lookup: dht: timeout"));
         assert_eq!(summary.bitswap_addr_mix[0].value, "tcp");
         assert_eq!(summary.bitswap_addr_mix[0].count, 4);
         assert_eq!(summary.bitswap_addr_mix[1].value, "ip4");
@@ -3458,6 +3472,9 @@ mod tests {
         assert_eq!(summary.bitswap_connection_transports.len(), 1);
         assert_eq!(summary.bitswap_connection_transports[0].value, "tcp");
         assert_eq!(summary.bitswap_connection_transports[0].count, 1);
+        assert_eq!(summary.bitswap_dial_rejected_transports.len(), 1);
+        assert_eq!(summary.bitswap_dial_rejected_transports[0].value, "quic");
+        assert_eq!(summary.bitswap_dial_rejected_transports[0].count, 1);
         assert_eq!(summary.bitswap_dns_expansion.events, 5);
         assert_eq!(summary.bitswap_dns_expansion.cached, 2);
         assert_eq!(summary.bitswap_dns_expansion.uncached, 3);

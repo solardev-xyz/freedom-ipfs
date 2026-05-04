@@ -1295,6 +1295,7 @@ async fn run_shared_bitswap_swarm(
                 );
 
                 for (peer_id, addr) in dial_addrs {
+                    let transport = bitswap_transport_label(&addr);
                     let dial_addr = addr.with_p2p(peer_id).unwrap_or_else(|addr| addr);
                     if let Err(err) = swarm.dial(dial_addr) {
                         let error_detail = format_error_detail(&err);
@@ -1303,6 +1304,7 @@ async fn run_shared_bitswap_swarm(
                         tracing::info!(
                             phase = "bitswap_dial_rejected",
                             peer = %peer_id,
+                            transport,
                             connection_limit,
                             error = %err,
                             error_debug = ?err
