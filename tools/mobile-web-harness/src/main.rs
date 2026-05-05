@@ -1363,9 +1363,10 @@ fn print_trace_provider_retries(trace: &TraceSummary) {
     }
     let retries = &trace.provider_retries;
     println!(
-        "  provider retries: refresh_timeout={} refresh_failure={} retry_counts={} same_providers={} same_bitswap_peers={} request_timeout_counts={} same_bitswap_request_timeouts={} retry_request_timeout={} retry_timeout={} retry_connection_timeout={}",
+        "  provider retries: refresh_timeout={} refresh_failure={} skipped_empty={} retry_counts={} same_providers={} same_bitswap_peers={} request_timeout_counts={} same_bitswap_request_timeouts={} retry_request_timeout={} retry_timeout={} retry_connection_timeout={}",
         retries.refresh_after_timeout_events,
         retries.refresh_after_failure_events,
+        retries.skipped_empty_provider_set_events,
         retries.retry_count_events,
         retries.same_provider_sets,
         retries.same_bitswap_peer_sets,
@@ -3874,6 +3875,7 @@ struct TraceBlockStoreAggregate {
 struct TraceProviderRetryAggregate {
     refresh_after_timeout_events: usize,
     refresh_after_failure_events: usize,
+    skipped_empty_provider_set_events: usize,
     retry_count_events: usize,
     same_provider_sets: usize,
     same_bitswap_peer_sets: usize,
@@ -3888,6 +3890,7 @@ impl TraceProviderRetryAggregate {
     fn has_events(&self) -> bool {
         self.refresh_after_timeout_events > 0
             || self.refresh_after_failure_events > 0
+            || self.skipped_empty_provider_set_events > 0
             || self.retry_count_events > 0
             || self.request_timeout_retries > 0
             || self.timeout_retries > 0
@@ -4652,6 +4655,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             }
             "provider_refresh_after_failure" => {
                 provider_retries.refresh_after_failure_events += 1;
+            }
+            "provider_refresh_skipped_empty_provider_set" => {
+                provider_retries.skipped_empty_provider_set_events += 1;
             }
             "retry_provider_count" => {
                 provider_retries.retry_count_events += 1;
@@ -5689,6 +5695,7 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         | "provider_retry_after_request_timeout"
         | "provider_refresh_after_timeout"
         | "provider_refresh_after_failure" => "retrying",
+        "provider_refresh_skipped_empty_provider_set" => "failed",
         "ipfs_path_parse"
         | "gateway_direct_body"
         | "mime_total"
@@ -6802,6 +6809,7 @@ mod tests {
                 "{\"phase\":\"bitswap_connection_error\",\"peer\":\"peer-b\",\"error\":\"timeout\"}\n",
                 "{\"phase\":\"bitswap_dial_waiters_dropped\",\"cid\":\"cid-a\",\"waiter_count\":2}\n",
                 "{\"phase\":\"bitswap_incoming_stream_read\",\"peer\":\"peer-c\",\"ok\":false,\"timed_out\":true}\n",
+                "{\"phase\":\"provider_refresh_skipped_empty_provider_set\",\"cid\":\"cid-a\",\"error\":\"No Bitswap providers\",\"initial_error\":\"No Bitswap providers\"}\n",
                 "{\"phase\":\"gateway_limiter\",\"acquired\":false}\n",
                 "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipns/site/\",\"status\":200}\n",
                 "{\"phase\":\"request_done\",\"request_id\":2,\"path\":\"/ipns/missing/\",\"status\":503}\n",
@@ -6865,7 +6873,11 @@ mod tests {
         assert_eq!(summary.gateway_direct_body.max_body_len, 4096);
         assert_eq!(trace_value_count(&summary.progress_phases, "retrying"), 4);
         assert_eq!(trace_value_count(&summary.progress_phases, "completed"), 1);
-        assert_eq!(trace_value_count(&summary.progress_phases, "failed"), 2);
+        assert_eq!(trace_value_count(&summary.progress_phases, "failed"), 3);
+        assert_eq!(
+            summary.provider_retries.skipped_empty_provider_set_events,
+            1
+        );
     }
 
     #[test]
@@ -6938,6 +6950,7 @@ mod tests {
                 "{\"phase\":\"bitswap_incoming_block\",\"cid\":\"cid-a\",\"peer\":\"peer-d\",\"source_transport\":\"tcp\",\"block_count\":2,\"bytes\":256,\"pending_waiter_count\":3,\"delivered_waiter_count\":2,\"dropped_waiter_count\":1,\"oldest_pending_ms\":75,\"newest_pending_ms\":25}\n",
                 "{\"phase\":\"bitswap_incoming_stream_read\",\"peer\":\"peer-e\",\"ok\":false,\"dropped\":true,\"pending_reads\":32}\n",
                 "{\"phase\":\"bitswap_incoming_stream_read\",\"peer\":\"peer-f\",\"ok\":false,\"timed_out\":true,\"timeout_ms\":6000,\"elapsed_ms\":6001}\n",
+                "{\"phase\":\"provider_refresh_skipped_empty_provider_set\",\"cid\":\"cid-a\",\"error\":\"No Bitswap providers\",\"initial_error\":\"No Bitswap providers\"}\n",
             ),
         )
         .unwrap();
@@ -6955,6 +6968,10 @@ mod tests {
         assert_eq!(summary.bitswap_peer_attempts.prefer_want_have, 2);
         assert_eq!(summary.provider_retries.refresh_after_timeout_events, 1);
         assert_eq!(summary.provider_retries.refresh_after_failure_events, 0);
+        assert_eq!(
+            summary.provider_retries.skipped_empty_provider_set_events,
+            1
+        );
         assert_eq!(summary.provider_retries.retry_count_events, 1);
         assert_eq!(summary.provider_retries.same_provider_sets, 1);
         assert_eq!(summary.provider_retries.same_bitswap_peer_sets, 1);

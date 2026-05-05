@@ -410,6 +410,15 @@ impl HttpRetriever {
         }
         match self.fetch_from_providers_with_source(cid, &providers).await {
             Ok((block, source)) => Ok((block, source)),
+            Err(err) if providers.is_empty() && is_no_provider_error(&err) => {
+                tracing::info!(
+                    phase = "provider_refresh_skipped_empty_provider_set",
+                    cid = %cid,
+                    error = %err,
+                    initial_error = %err
+                );
+                Err(err)
+            }
             Err(err) if should_refresh_providers_after_failure(&err) => {
                 let timeout_peer_count = bitswap_timeout_peers(&err).len();
                 let connection_timeout_peer_count = bitswap_connection_timeout_peers(&err).len();
@@ -1026,6 +1035,7 @@ impl HttpRetriever {
                     timeout = true,
                     elapsed_ms = started.elapsed().as_millis()
                 );
+                self.mark_single_session_shortcut_timeout_peer(cid, &peers_for_record);
                 return Ok(None);
             }
         };
@@ -1049,6 +1059,33 @@ impl HttpRetriever {
                 .await;
         }
         self.store_bitswap_result(cid, result).map(Some)
+    }
+
+    fn mark_single_session_shortcut_timeout_peer(&self, cid: &Cid, peers: &[BitswapPeer]) {
+        let [peer] = peers else {
+            if !peers.is_empty() {
+                tracing::info!(
+                    phase = "bitswap_peer_timeout_suppressed",
+                    cid = %cid,
+                    timeout_peer_count = peers.len(),
+                    attempted_peer_count = peers.len(),
+                    reason = "session_shortcut_timeout_broad"
+                );
+            }
+            return;
+        };
+        tracing::info!(
+            phase = "bitswap_peer_timeout",
+            cid = %cid,
+            peer = %peer.id,
+            ttl_secs = BAD_BITSWAP_PROVIDER_TTL.as_secs(),
+            reason = "session_shortcut_timeout"
+        );
+        let _ = self.store.mark_bad_provider(
+            &peer.id.to_string(),
+            "bitswap session shortcut timed out",
+            BAD_BITSWAP_PROVIDER_TTL,
+        );
     }
 
     fn store_bitswap_result(&self, cid: &Cid, result: BitswapFetchResult) -> Result<Block> {
@@ -2653,6 +2690,13 @@ fn should_refresh_providers_after_failure(err: &RetrievalError) -> bool {
             | RetrievalError::BitswapTimeout
             | RetrievalError::NoHttpProviders
             | RetrievalError::NoBitswapProviders
+    )
+}
+
+fn is_no_provider_error(err: &RetrievalError) -> bool {
+    matches!(
+        err,
+        RetrievalError::NoHttpProviders | RetrievalError::NoBitswapProviders
     )
 }
 
@@ -4835,6 +4879,60 @@ mod bitswap_tests {
         assert!(!peers[1].skip_want_have);
     }
 
+    #[tokio::test]
+    async fn single_session_shortcut_timeout_temporarily_suppresses_peer() {
+        let session_peer =
+            parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let cid = "bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u"
+            .parse::<Cid>()
+            .unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let peer = BitswapPeer {
+            id: session_peer,
+            addrs: vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()],
+            skip_want_have: true,
+        };
+
+        retriever.mark_single_session_shortcut_timeout_peer(&cid, &[peer]);
+
+        assert!(store.is_bad_provider(&session_peer.to_string()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn broad_session_shortcut_timeout_does_not_suppress_all_peers() {
+        let first = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let second = parse_peer_id("12D3KooWAtxJkDLacJdK7yZkk2iPp8iMdSVh1bDHzmJ3t8oKUkqA").unwrap();
+        let cid = "bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u"
+            .parse::<Cid>()
+            .unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let peers = [
+            BitswapPeer {
+                id: first,
+                addrs: vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()],
+                skip_want_have: true,
+            },
+            BitswapPeer {
+                id: second,
+                addrs: vec!["/ip4/127.0.0.2/tcp/4001".parse().unwrap()],
+                skip_want_have: true,
+            },
+        ];
+
+        retriever.mark_single_session_shortcut_timeout_peer(&cid, &peers);
+
+        assert!(!store.is_bad_provider(&first.to_string()).unwrap());
+        assert!(!store.is_bad_provider(&second.to_string()).unwrap());
+    }
+
     #[test]
     fn shortens_request_timeout_for_mixed_trusted_bitswap_candidates() {
         assert_eq!(
@@ -4855,6 +4953,15 @@ mod bitswap_tests {
 
         let err = RetrievalError::Bitswap("all bitswap stream requests failed".to_string());
         assert!(!is_bitswap_connection_ready_failure(&err));
+    }
+
+    #[test]
+    fn identifies_no_provider_errors_for_empty_lookup_retry_skip() {
+        assert!(is_no_provider_error(&RetrievalError::NoHttpProviders));
+        assert!(is_no_provider_error(&RetrievalError::NoBitswapProviders));
+        assert!(!is_no_provider_error(&RetrievalError::Bitswap(
+            "peer failed".into()
+        )));
     }
 
     #[test]

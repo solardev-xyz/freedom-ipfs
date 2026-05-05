@@ -536,7 +536,11 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
             "providers_found"
         }
         "provider_cache" => "provider_lookup",
-        "provider_lookup" if fields.get("error").is_some() => "failed",
+        "provider_lookup" | "provider_refresh_skipped_empty_provider_set"
+            if fields.get("error").is_some() =>
+        {
+            "failed"
+        }
         "provider_lookup" => "providers_found",
         "provider_diversity_low" => "provider_diversity_low",
         "light_dht_provider_lookup" | "dht_provider_lookup" => "dht_fallback_started",
@@ -2217,6 +2221,17 @@ mod tests {
                 "active",
             ),
             "retrying"
+        );
+        assert_eq!(
+            progress_phase(
+                "provider_refresh_skipped_empty_provider_set",
+                &progress_fields([
+                    ("phase", "provider_refresh_skipped_empty_provider_set"),
+                    ("error", "no bitswap providers")
+                ]),
+                "active",
+            ),
+            "failed"
         );
     }
 

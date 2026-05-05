@@ -8794,3 +8794,170 @@ DHT budget for page child CIDs when delegated routing returns empty and there is
 already a recent page-session peer attempt, while preserving the longer full
 DHT budget for explicit light-DHT routing and cases that genuinely depend on
 public DHT provider discovery.
+
+Same-window Rust/Kubo repeat with the `3s` DHT cap:
+
+```sh
+timeout 360s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/daicowtf-dht3-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/daicowtf-dht3-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both failed `0/3`, so this does not change the sparse-provider
+  reliability conclusion.
+- Rust root TTFB p50/p95 was `3909/12070ms`; Kubo root TTFB p50/p95 was
+  `30003/30004ms`.
+- Rust max RSS/FD was `50668KiB`/`17`; Kubo max RSS/FD was `160608KiB`/`202`.
+- Rust DHT lookup summary showed `events=5 successes=1 failures=4 providers=0`,
+  `max_timeout_ms=3000`, and `max_query_timeout_ms=3000`.
+- The slower Rust sample exposed the next tail after the DHT cap: the failing
+  child CID first timed out the recent-peer shortcut after `2001ms`, then a
+  delegated-empty/full-DHT lookup returned no providers after about `3012ms`,
+  then the same session-only peer was tried again in the provider fetch path and
+  hit a `6001ms` Bitswap stream read timeout before provider refresh tried DHT
+  once more. That duplicate session-peer retry is a better next hypothesis than
+  simply lowering DHT further.
+
+## 2026-05-05 Keep: Avoid Duplicate Sparse-Provider Retry Waits
+
+Hypothesis:
+When a child CID has only one recent page-session Bitswap peer and delegated/DHT
+provider lookup returns empty, the retriever was spending mobile-visible time on
+two duplicate waits:
+
+- retrying the same single session peer after the `2s` session shortcut already
+  timed it out;
+- immediately refreshing providers after an empty initial provider set produced
+  `NoHttpProviders`/`NoBitswapProviders`, which repeats the same delegated/DHT
+  lookup and adds another DHT cap.
+
+Implementation:
+
+- A `bitswap_session_shortcut` timeout now marks exactly one attempted session
+  peer as temporarily bad for the existing bad-provider TTL, preventing the
+  provider fetch path from re-adding that same stale peer immediately.
+- Broad shortcut timeouts with more than one attempted peer are traced as
+  `bitswap_peer_timeout_suppressed` but do not mass-suppress every candidate.
+- If the initial provider set is empty and provider fetching returns a no-provider
+  error, the retriever emits `provider_refresh_skipped_empty_provider_set` and
+  returns that error instead of doing an immediate provider refresh.
+- The mobile progress mapper and harness summary map
+  `provider_refresh_skipped_empty_provider_set` to `failed` and include a
+  provider-retry aggregate count for skipped empty-provider refreshes.
+
+Experiment commands:
+
+```sh
+timeout 240s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/daicowtf-session-timeout-suppress-r3-trace.jsonl \
+  --output /tmp/daicowtf-session-timeout-suppress-r3.json
+
+timeout 240s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/daicowtf-session-timeout-suppress-skip-refresh-r3-trace.jsonl \
+  --output /tmp/daicowtf-session-timeout-suppress-skip-refresh-r3.json
+
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --timeout-secs 90 \
+  --run-timeout-secs 90 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-session-timeout-suppress-skip-refresh-trace.jsonl \
+  --output /tmp/vitalik-session-timeout-suppress-skip-refresh.json
+
+timeout 240s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-session-timeout-suppress-skip-refresh-trace.jsonl \
+  --output /tmp/ipfs-tech-session-timeout-suppress-skip-refresh.json
+
+timeout 360s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/daicowtf-session-timeout-suppress-skip-refresh-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/daicowtf-session-timeout-suppress-skip-refresh-kubo-r3.json
+```
+
+Results:
+
+- Session-peer suppression alone was the wrong half-step: `daicowtf-page-assets`
+  still failed `0/3` and root p50/p95/max was `6044/6055/6055ms` because the
+  empty-provider refresh added another DHT wait.
+- Combining session-peer suppression with the empty-provider refresh skip still
+  failed `0/3`, but root p50/p95/max improved to `3035/3940/3940ms`, with max
+  RSS `48768KiB` and FD count `17`.
+- `vitalik-root-html-range` passed `1/1` with root TTFB `473ms`, RSS
+  `37632KiB`, FD count `18`, no DHT provider lookups, and delegated provider
+  lookup max `53ms`.
+- `ipfs-tech-page-assets` passed `1/1`; root TTFB was `4194ms`, asset
+  p50/p95/max was `187/462/487ms`, RSS was `50296KiB`, and FD count was `41`.
+  The slow root was a `3558ms` Bitswap root-block fetch; the new sparse-provider
+  branches were not involved.
+- Same-window Rust/Kubo repeat with both changes still failed `0/3` on both
+  engines. Rust root TTFB p50/p95 was `794/7682ms`; Kubo root TTFB p50/p95 was
+  `30004/30005ms`. Rust max RSS/FD was `46848KiB`/`32`; Kubo max RSS/FD was
+  `153348KiB`/`165`. The first Rust run still hit a stale root provider timeout,
+  but later attempts skipped it quickly.
+
+Decision: keep. This is a narrow sparse-provider tail-latency fix. It does not
+add public gateway fallback, change block verification, serve unverified data,
+or lower the global DHT query default. The known remaining gap is reliability:
+`daicowtf` still fails when provider discovery is empty or stale, and the first
+stale provider for a root CID can still cost about one Bitswap stream timeout.
+Future work should explore adaptive stale-provider suppression, bounded
+multi-source racing, and richer provider discovery rather than further lowering
+global DHT timeouts.
+
+Deterministic validation:
+
+- `cargo fmt --all --check`
+- `cargo test -p freedom-ipfs-retrieval session_shortcut_timeout`
+- `cargo test -p freedom-ipfs-retrieval identifies_no_provider_errors_for_empty_lookup_retry_skip`
+- `cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states`
+- `cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases`
+- `cargo test -p mobile-web-harness trace_summary_counts_bitswap_peer_attempts`
+- `cargo test -p freedom-ipfs-retrieval`
+- `cargo test -p freedom-ipfs-mobile`
+- `cargo test -p mobile-web-harness`
+- `cargo check --workspace --all-targets`
+- `cargo clippy -p freedom-ipfs-retrieval -p freedom-ipfs-mobile -p mobile-web-harness --all-targets -- -D warnings`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `git diff --check`
