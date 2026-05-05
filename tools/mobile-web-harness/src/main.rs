@@ -1256,13 +1256,15 @@ fn print_trace_timeout_recovery(trace: &TraceSummary) {
     }
     let recovery = &trace.bitswap_timeout_recovery;
     println!(
-        "  bitswap timeout recovery: request_timeout_details={} cold={} mixed_trusted={} trusted_only={} timeout_ms={} max_peers={} request_timeout_events={} reset_true={} reset_false={} client_resets={} retry_starts={} same_provider_retries={} refreshed_provider_retries={} retry_successes={} trusted_retry_successes={} untrusted_retry_successes={} retry_failures={} retry_unresolved={} retry_success_elapsed={}",
+        "  bitswap timeout recovery: request_timeout_details={} cold={} mixed_trusted={} trusted_only={} timeout_ms={} max_peers={} no_dial_plan={} mixed_no_dial_plan={} request_timeout_events={} reset_true={} reset_false={} client_resets={} retry_starts={} same_provider_retries={} refreshed_provider_retries={} retry_successes={} trusted_retry_successes={} untrusted_retry_successes={} retry_failures={} retry_unresolved={} retry_success_elapsed={}",
         recovery.request_timeouts,
         recovery.cold_request_timeouts,
         recovery.mixed_trusted_request_timeouts,
         recovery.trusted_only_request_timeouts,
         format_trace_counts(&recovery.request_timeout_budgets),
         recovery.max_request_timeout_peer_count,
+        recovery.request_timeouts_without_dial_plan,
+        recovery.mixed_trusted_request_timeouts_without_dial_plan,
         recovery.request_timeout_events,
         recovery.request_timeout_reset_true,
         recovery.request_timeout_reset_false,
@@ -3785,6 +3787,8 @@ struct TraceBitswapTimeoutRecoveryAggregate {
     cold_request_timeouts: usize,
     mixed_trusted_request_timeouts: usize,
     trusted_only_request_timeouts: usize,
+    request_timeouts_without_dial_plan: usize,
+    mixed_trusted_request_timeouts_without_dial_plan: usize,
     request_timeout_budgets: Vec<TraceValueCount>,
     max_request_timeout_peer_count: u128,
     request_timeout_want_block_targets: u128,
@@ -3824,6 +3828,8 @@ struct TraceBitswapTimeoutRecoveryBuilder {
     cold_request_timeouts: usize,
     mixed_trusted_request_timeouts: usize,
     trusted_only_request_timeouts: usize,
+    request_timeouts_without_dial_plan: usize,
+    mixed_trusted_request_timeouts_without_dial_plan: usize,
     request_timeout_budgets: BTreeMap<String, usize>,
     max_request_timeout_peer_count: u128,
     request_timeout_want_block_targets: u128,
@@ -3854,6 +3860,9 @@ impl TraceBitswapTimeoutRecoveryBuilder {
             cold_request_timeouts: self.cold_request_timeouts,
             mixed_trusted_request_timeouts: self.mixed_trusted_request_timeouts,
             trusted_only_request_timeouts: self.trusted_only_request_timeouts,
+            request_timeouts_without_dial_plan: self.request_timeouts_without_dial_plan,
+            mixed_trusted_request_timeouts_without_dial_plan: self
+                .mixed_trusted_request_timeouts_without_dial_plan,
             request_timeout_budgets: sorted_trace_counts(self.request_timeout_budgets),
             max_request_timeout_peer_count: self.max_request_timeout_peer_count,
             request_timeout_want_block_targets: self.request_timeout_want_block_targets,
@@ -4046,6 +4055,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_dial_plans = TraceBitswapDialPlanAggregate::default();
     let mut bitswap_incoming_blocks = TraceBitswapIncomingBlockAggregate::default();
     let mut bitswap_timeout_recovery = TraceBitswapTimeoutRecoveryBuilder::default();
+    let mut provider_fetch_dial_plan_seen = BTreeMap::<String, bool>::new();
     let mut pending_request_timeout_retries = BTreeMap::<String, usize>::new();
     let mut slow_cids = BTreeMap::<String, TraceCidBuilder>::new();
     let mut active_requests = BTreeMap::<TraceRequestKey, TraceRequestBuilder>::new();
@@ -4246,6 +4256,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         }
         if phase == "bitswap_request_timeout_detail" {
             bitswap_timeout_recovery.request_timeouts += 1;
+            let timeout_cid = json_detail_string(value.get("cid"));
             let peer_count = value
                 .get("peer_count")
                 .and_then(json_u128)
@@ -4288,6 +4299,16 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             }
             if trusted_peer_count > 0 && peer_count > trusted_peer_count {
                 bitswap_timeout_recovery.mixed_trusted_request_timeouts += 1;
+            }
+            if timeout_cid
+                .as_ref()
+                .and_then(|cid| provider_fetch_dial_plan_seen.get(cid))
+                == Some(&false)
+            {
+                bitswap_timeout_recovery.request_timeouts_without_dial_plan += 1;
+                if trusted_peer_count > 0 && peer_count > trusted_peer_count {
+                    bitswap_timeout_recovery.mixed_trusted_request_timeouts_without_dial_plan += 1;
+                }
             }
         }
         if phase == "bitswap_client_reset" {
@@ -4346,6 +4367,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             }
         }
         if phase == "bitswap_dial_plan" {
+            if let Some(cid) = json_detail_string(value.get("cid")) {
+                provider_fetch_dial_plan_seen.insert(cid, true);
+            }
             bitswap_dial_plans.events += 1;
             bitswap_dial_plans.peer_targets += value
                 .get("peer_count")
@@ -4386,6 +4410,11 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                         .and_then(json_u128)
                         .unwrap_or_default(),
                 );
+        }
+        if phase == "provider_fetch_start" {
+            if let Some(cid) = json_detail_string(value.get("cid")) {
+                provider_fetch_dial_plan_seen.insert(cid, false);
+            }
         }
         if phase == "bitswap_incoming_block" {
             bitswap_incoming_blocks.matches += 1;
@@ -5866,12 +5895,15 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
+                "{\"phase\":\"provider_fetch_start\",\"cid\":\"cid-a\",\"provider_count\":4}\n",
                 "{\"phase\":\"bitswap_request_timeout_detail\",\"elapsed_ms\":4000,\"cid\":\"cid-a\",\"peer_count\":10,\"trusted_peer_count\":2,\"want_block_target_count\":4,\"want_have_target_count\":6,\"timeout_ms\":4000}\n",
                 "{\"phase\":\"bitswap_client_reset\"}\n",
                 "{\"phase\":\"bitswap_request_timeout\",\"elapsed_ms\":4001,\"cid\":\"cid-a\",\"peer_count\":10,\"trusted_peer_count\":2,\"timeout_ms\":4000,\"reset_client\":true}\n",
                 "{\"phase\":\"retry_provider_count\",\"cid\":\"cid-a\",\"same_provider_set\":true,\"same_bitswap_peer_set\":true,\"request_timeout\":true}\n",
                 "{\"phase\":\"provider_retry_after_request_timeout\",\"cid\":\"cid-a\",\"provider_count\":8,\"request_timeout\":true}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":75,\"cid\":\"cid-a\",\"ok\":true,\"trusted_peer_count\":2,\"source_peer_trusted\":false,\"source_peer\":\"peer-a\",\"source_transport\":\"tcp\",\"bitswap_delivery\":\"incoming\",\"extra_blocks\":0,\"bytes\":123}\n",
+                "{\"phase\":\"provider_fetch_start\",\"cid\":\"cid-b\",\"provider_count\":1}\n",
+                "{\"phase\":\"bitswap_dial_plan\",\"cid\":\"cid-b\",\"peer_count\":1,\"candidate_peer_count\":1,\"new_dial_peer_count\":1,\"new_dial_addr_count\":1,\"suppressed_dial_peer_count\":0,\"suppressed_dial_addr_count\":0,\"pending_dial_peer_count\":0,\"connected_peer_count\":0,\"command_queued_ms\":3}\n",
                 "{\"phase\":\"bitswap_request_timeout_detail\",\"elapsed_ms\":15000,\"cid\":\"cid-b\",\"peer_count\":1,\"trusted_peer_count\":0,\"want_block_target_count\":1,\"want_have_target_count\":0,\"timeout_ms\":15000}\n",
                 "{\"phase\":\"bitswap_request_timeout\",\"elapsed_ms\":15001,\"cid\":\"cid-b\",\"peer_count\":1,\"trusted_peer_count\":0,\"timeout_ms\":15000,\"reset_client\":false}\n",
                 "{\"phase\":\"retry_provider_count\",\"cid\":\"cid-b\",\"same_provider_set\":false,\"same_bitswap_peer_set\":false,\"request_timeout\":true}\n",
@@ -5898,6 +5930,18 @@ mod tests {
                 .bitswap_timeout_recovery
                 .trusted_only_request_timeouts,
             0
+        );
+        assert_eq!(
+            summary
+                .bitswap_timeout_recovery
+                .request_timeouts_without_dial_plan,
+            1
+        );
+        assert_eq!(
+            summary
+                .bitswap_timeout_recovery
+                .mixed_trusted_request_timeouts_without_dial_plan,
+            1
         );
         assert_eq!(
             summary

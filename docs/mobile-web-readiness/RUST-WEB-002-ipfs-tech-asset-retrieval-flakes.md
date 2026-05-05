@@ -6498,3 +6498,55 @@ did not remove the timeout shape and made the retry path noisier. The next usefu
 step should improve diagnostics for request timeouts that lack a dial-plan event,
 or target peer scoring/selection for the stale trusted peer, not globally bias
 the swarm event loop.
+
+## 2026-05-05 Keep: Timeout Without Dial Plan Summary
+
+Goal:
+Future experiments need to distinguish a real peer stall from a caller-side
+Bitswap request timeout that fires before the shared swarm records any
+`bitswap_dial_plan` for that provider fetch.
+
+Implementation:
+
+- Track `provider_fetch_start` by CID in the harness trace summarizer.
+- Mark the CID when a later `bitswap_dial_plan` is observed.
+- When `bitswap_request_timeout_detail` arrives before a dial plan for that
+  provider fetch, increment:
+  - `request_timeouts_without_dial_plan`
+  - `mixed_trusted_request_timeouts_without_dial_plan` when the timeout was a
+    mixed trusted/provider timeout.
+- Print these as `no_dial_plan` and `mixed_no_dial_plan` in the existing
+  `bitswap timeout recovery` summary line.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts
+cargo test -p mobile-web-harness
+cargo build -p freedom-ipfs-gateway
+
+timeout 180s cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/vitalik-timeout-no-dial-plan-summary-trace.jsonl \
+  --output /tmp/vitalik-timeout-no-dial-plan-summary.json
+```
+
+Live smoke result:
+
+- Rust passed `1/1`.
+- Root TTFB: `6568ms`.
+- Trace summary reported:
+  `request_timeout_details=1`, `mixed_trusted=1`, `timeout_ms=4000=1`,
+  `no_dial_plan=1`, `mixed_no_dial_plan=1`.
+- Evidence:
+  - `/tmp/vitalik-timeout-no-dial-plan-summary.json`
+  - `/tmp/vitalik-timeout-no-dial-plan-summary-trace.jsonl`
+
+Decision: keep. This is harness-only and does not change gateway or retrieval
+behavior. It turns the current `vitalik` failure shape into a first-class metric
+for future behavior experiments.
