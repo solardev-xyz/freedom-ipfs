@@ -9569,6 +9569,10 @@ Rejected sub-experiment:
 - `50ms` was too aggressive. `cargo test -p freedom-ipfs-retrieval` failed
   `recent_bitswap_peer_can_win_after_fast_provider_lookup`, proving the window
   was too short for the deterministic local fast-session case.
+- `75ms` was also too aggressive. The focused command
+  `cargo test -p freedom-ipfs-retrieval recent_bitswap_peer_can_win_after_fast_provider_lookup`
+  failed the same local fast-session case, so it was reverted without live
+  benchmarking.
 
 Implementation:
 
