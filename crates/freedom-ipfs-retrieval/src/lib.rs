@@ -45,9 +45,11 @@ const BAD_BITSWAP_PROVIDER_TTL: Duration = Duration::from_secs(30);
 const HTTP_PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
 const HTTP_PROVIDER_RACE_WIDTH: usize = 2;
 const HTTP_PROVIDER_HEDGE_AFTER: Duration = Duration::from_millis(250);
+const SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER: Duration = Duration::from_millis(350);
 const HTTP_PROVIDER_SCORE_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_HTTP_PROVIDER_SCORE_ENTRIES: usize = 64;
 const DISABLE_HTTP_PROVIDER_SCORING_ENV: &str = "FREEDOM_IPFS_DISABLE_HTTP_PROVIDER_SCORING";
+const DISABLE_SINGLE_HTTP_SELF_HEDGE_ENV: &str = "FREEDOM_IPFS_DISABLE_SINGLE_HTTP_SELF_HEDGE";
 const MAX_CONCURRENT_HTTP_PROVIDER_FETCHES: usize = 4;
 const BITSWAP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 // Start provider retry before a full dial timeout can dominate gateway TTFB.
@@ -933,6 +935,21 @@ impl HttpRetriever {
             scoring_enabled
         );
 
+        if provider_count == 1 && single_http_provider_self_hedge_enabled() {
+            let Some(candidate) = candidates.into_iter().next() else {
+                return Ok(None);
+            };
+            return self
+                .fetch_single_http_provider_candidate_with_self_hedge(
+                    cid,
+                    candidate,
+                    provider_count,
+                    scored_provider_count,
+                    started,
+                )
+                .await;
+        }
+
         let mut next_bases = candidates.into_iter().enumerate();
         let mut pending = FuturesUnordered::new();
         let mut attempted_provider_count = 0usize;
@@ -1039,6 +1056,130 @@ impl HttpRetriever {
             ok = false,
             provider_count,
             race_width = HTTP_PROVIDER_RACE_WIDTH,
+            attempted_provider_count,
+            failed_provider_count,
+            hedge_fired,
+            elapsed_ms = started.elapsed().as_millis()
+        );
+        Ok(None)
+    }
+
+    async fn fetch_single_http_provider_candidate_with_self_hedge(
+        &self,
+        cid: &Cid,
+        candidate: ScoredHttpProviderBase,
+        provider_count: usize,
+        scored_provider_count: usize,
+        started: Instant,
+    ) -> Result<Option<Block>> {
+        let mut pending = FuturesUnordered::new();
+        pending.push(self.fetch_from_http_provider_candidate_with_index(
+            *cid,
+            0,
+            candidate.clone(),
+        ));
+        let hedge = tokio::time::sleep(SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER);
+        tokio::pin!(hedge);
+        let mut attempted_provider_count = 1usize;
+        let mut failed_provider_count = 0usize;
+        let mut hedge_fired = false;
+
+        while !pending.is_empty() {
+            tokio::select! {
+                biased;
+
+                result = pending.next() => {
+                    let Some(result) = result else {
+                        break;
+                    };
+                    match result.result {
+                        Ok(block) => {
+                            tracing::info!(
+                                phase = "http_provider_race_result",
+                                cid = %cid,
+                                ok = true,
+                                provider = %result.base,
+                                winner_provider_index = result.provider_index,
+                                winner_provider_rank = result.provider_index + 1,
+                                winner_original_provider_rank = result.original_provider_index + 1,
+                                winner_within_initial_width = true,
+                                provider_count,
+                                race_width = HTTP_PROVIDER_RACE_WIDTH,
+                                scored_provider_count,
+                                winner_provider_scored = result.score_elapsed.is_some(),
+                                winner_provider_score_ms = result
+                                    .score_elapsed
+                                    .map(|elapsed| elapsed.as_millis())
+                                    .unwrap_or_default(),
+                                single_provider_self_hedge = true,
+                                attempted_provider_count,
+                                failed_provider_count,
+                                hedge_fired,
+                                elapsed_ms = started.elapsed().as_millis()
+                            );
+                            return Ok(Some(block));
+                        }
+                        Err(_) => {
+                            failed_provider_count += 1;
+                            if pending.is_empty() && !hedge_fired {
+                                attempted_provider_count += 1;
+                                hedge_fired = true;
+                                tracing::info!(
+                                    phase = "http_provider_self_hedge",
+                                    cid = %cid,
+                                    provider = %candidate.base,
+                                    timeout_ms = SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER.as_millis(),
+                                    provider_index = 0,
+                                    original_provider_rank = candidate.original_index + 1,
+                                    provider_scored = candidate.score_elapsed.is_some(),
+                                    provider_score_ms = candidate
+                                        .score_elapsed
+                                        .map(|elapsed| elapsed.as_millis())
+                                        .unwrap_or_default(),
+                                    reason = "initial_failure"
+                                );
+                                pending.push(self.fetch_from_http_provider_candidate_with_index(
+                                    *cid,
+                                    0,
+                                    candidate.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                _ = &mut hedge, if !hedge_fired => {
+                    hedge_fired = true;
+                    attempted_provider_count += 1;
+                    tracing::info!(
+                        phase = "http_provider_self_hedge",
+                        cid = %cid,
+                        provider = %candidate.base,
+                        timeout_ms = SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER.as_millis(),
+                        provider_index = 0,
+                        original_provider_rank = candidate.original_index + 1,
+                        provider_scored = candidate.score_elapsed.is_some(),
+                        provider_score_ms = candidate
+                            .score_elapsed
+                            .map(|elapsed| elapsed.as_millis())
+                            .unwrap_or_default(),
+                        reason = "slow_single_provider"
+                    );
+                    pending.push(self.fetch_from_http_provider_candidate_with_index(
+                        *cid,
+                        0,
+                        candidate.clone(),
+                    ));
+                }
+            }
+        }
+
+        tracing::info!(
+            phase = "http_provider_race_result",
+            cid = %cid,
+            ok = false,
+            provider_count,
+            race_width = HTTP_PROVIDER_RACE_WIDTH,
+            single_provider_self_hedge = true,
             attempted_provider_count,
             failed_provider_count,
             hedge_fired,
@@ -2042,6 +2183,7 @@ struct HttpProviderResponseStats {
     body_elapsed: Duration,
 }
 
+#[derive(Clone)]
 struct ScoredHttpProviderBase {
     original_index: usize,
     score_elapsed: Option<Duration>,
@@ -2068,6 +2210,10 @@ fn http_provider_score_key(base: &Url) -> Option<String> {
 
 fn http_provider_scoring_enabled() -> bool {
     std::env::var_os(DISABLE_HTTP_PROVIDER_SCORING_ENV).is_none()
+}
+
+fn single_http_provider_self_hedge_enabled() -> bool {
+    std::env::var_os(DISABLE_SINGLE_HTTP_SELF_HEDGE_ENV).is_none()
 }
 
 fn weighted_duration_average(
@@ -6369,6 +6515,48 @@ mod bitswap_tests {
         fast_task.abort();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn self_hedges_slow_single_http_provider() {
+        let expected = b"verified single HTTP self hedge block";
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, expected);
+        let requests = Arc::new(AtomicU64::new(0));
+        let (addr, task) = spawn_sequenced_http_provider(
+            expected.to_vec(),
+            std::collections::VecDeque::from([
+                SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER + Duration::from_millis(300),
+                Duration::ZERO,
+            ]),
+            requests.clone(),
+        )
+        .await;
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let provider = Provider::from_parts(
+            None,
+            vec![format!("/ip4/{}/tcp/{}/http", addr.ip(), addr.port())],
+        )
+        .unwrap_or_else(|_| panic!("failed to build single HTTP provider"));
+
+        let started = Instant::now();
+        let (block, source) = retriever
+            .fetch_from_providers_with_source(&cid, &[provider])
+            .await
+            .unwrap();
+
+        assert_eq!(source, RetrievalSource::HttpProvider);
+        assert_eq!(block.data(), expected);
+        assert!(
+            started.elapsed() < SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER + Duration::from_millis(250),
+            "self hedge should return before the first slow request"
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
+        task.abort();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn limited_http_response_bytes_reports_body_stats() {
         let data = b"http response byte stats";
@@ -7407,6 +7595,45 @@ mod bitswap_tests {
                         return;
                     }
                     requests.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(delay).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        data.len()
+                    )
+                    .into_bytes()
+                    .into_iter()
+                    .chain(data)
+                    .collect::<Vec<_>>();
+                    let _ = stream.write_all(&response).await;
+                });
+            }
+        });
+        (addr, task)
+    }
+
+    async fn spawn_sequenced_http_provider(
+        data: Vec<u8>,
+        delays: std::collections::VecDeque<Duration>,
+        requests: Arc<AtomicU64>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let delays = Arc::new(tokio::sync::Mutex::new(delays));
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let data = data.clone();
+                let requests = requests.clone();
+                let delays = delays.clone();
+                tokio::spawn(async move {
+                    let mut request = vec![0u8; 4096];
+                    if stream.read(&mut request).await.is_err() {
+                        return;
+                    }
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    let delay = delays.lock().await.pop_front().unwrap_or_default();
                     tokio::time::sleep(delay).await;
                     let response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",

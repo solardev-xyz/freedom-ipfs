@@ -18783,3 +18783,138 @@ change is that browser bursts no longer drop subresources immediately while the
 gateway still enforces the same active request cap and still fails sustained
 saturation after a bounded wait. That is a better mobile browser default than
 turning transient fan-out into page-level `503` failures.
+
+## 2026-05-05 Keep: Self-Hedge Slow Single HTTP Provider Requests
+
+Question:
+The remaining HTTP-provider tail is concentrated in single-provider races where
+the only HTTP provider is often `https://ipfs-bridge.sia.dev/`. Static host
+suppression and broad Bitswap substitution were rejected. Can a narrower
+duplicate request to the same HTTP provider trim that tail without increasing
+active gateway concurrency or adding public gateway fallback?
+
+Implementation:
+
+- When there is exactly one HTTP-provider candidate, start the normal verified
+  HTTP raw-block fetch.
+- If it is still pending after `350ms`, start one duplicate request to the same
+  provider.
+- Both requests use the existing global `MAX_CONCURRENT_HTTP_PROVIDER_FETCHES=4`
+  semaphore.
+- The first verified block wins; dropped futures cancel the slower duplicate
+  where the HTTP stack allows cancellation.
+- Block verification and cache insertion stay on the existing path.
+- Add kill switch:
+  `FREEDOM_IPFS_DISABLE_SINGLE_HTTP_SELF_HEDGE=1`.
+- Emit `http_provider_self_hedge` trace events.
+- Extend the harness HTTP-provider race summary with self-hedge count and max
+  self-hedge timeout.
+- Add a deterministic local test where the second same-provider request returns
+  before the first slow request.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval self_hedges_slow_single_http_provider
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo test -p mobile-web-harness trace_summary_counts_http_provider_fetches
+cargo check -p mobile-web-harness --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+git diff --check
+```
+
+Focused result:
+
+- Formatting passed.
+- Focused retrieval self-hedge test passed.
+- Retrieval all-target check passed.
+- Retrieval clippy passed with `-D warnings`.
+- Focused harness HTTP-provider trace summary test passed.
+- Harness all-target check passed.
+- Harness clippy passed with `-D warnings`.
+- Diff whitespace check passed.
+
+Same-window disabled baseline:
+
+```sh
+FREEDOM_IPFS_DISABLE_SINGLE_HTTP_SELF_HEDGE=1 timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-single-http-self-hedge-disabled-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-single-http-self-hedge-disabled-r3.json
+```
+
+Disabled result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1551ms` / `1826ms` / `1826ms`.
+- Asset TTFB p50/p95/max: `238ms` / `968ms` / `1608ms`.
+- Run total p50/p95/max: `3812ms` / `3963ms` / `3963ms`.
+- Max RSS/FD: `53536KiB` / `36`.
+- Block sources: `http_provider=74`, `bitswap=46`.
+- HTTP-provider fetch p50/p95/max: `157ms` / `734ms` / `1040ms`.
+- Single-provider HTTP winners: `30`, all `https://ipfs-bridge.sia.dev/`,
+  p50/p95/max `347ms` / `869ms` / `1041ms`.
+- `https://ipfs-bridge.sia.dev/` fetch p50/p95/max:
+  `231ms` / `869ms` / `1040ms`.
+- Self-hedge events: `0`.
+
+Same-window enabled experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-single-http-self-hedge-enabled-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-single-http-self-hedge-enabled-r3.json
+```
+
+Enabled result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max improved to `926ms` / `955ms` / `955ms`.
+- Asset TTFB p50/p95/max: `253ms` / `933ms` / `1637ms`.
+- Run total p50/p95/max improved to `3029ms` / `3246ms` / `3246ms`.
+- Max RSS/FD stayed comparable at `53524KiB` / `36`.
+- Block sources shifted to `http_provider=113`, `bitswap=7`.
+- HTTP-provider fetch p50/p95/max improved to `163ms` / `537ms` / `721ms`.
+- Single-provider HTTP winners: `56`, all `https://ipfs-bridge.sia.dev/`,
+  p50/p95/max improved to `207ms` / `698ms` / `747ms`.
+- `https://ipfs-bridge.sia.dev/` fetch p50/p95/max improved to
+  `186ms` / `572ms` / `721ms`.
+- Self-hedge events: `12`.
+
+Comparison:
+
+- Root p95 improved from `1826ms` to `955ms`.
+- Run-total p95 improved from `3963ms` to `3246ms`.
+- HTTP-provider fetch p95 improved from `734ms` to `537ms`.
+- Single-provider winner p95 improved from `869ms` to `698ms`.
+- `ipfs-bridge.sia.dev` fetch p95 improved from `869ms` to `572ms`.
+- Asset p95 improved slightly from `968ms` to `933ms`; asset max worsened
+  slightly from `1608ms` to `1637ms`, but the enabled max was dominated by a
+  separate slow Bitswap block for `ZT0_SuSb.js`, not by the targeted HTTP
+  provider path.
+
+Decision:
+Keep. This is a narrow same-provider hedge, not public gateway fallback and not
+provider suppression. It uses the existing verified raw-block path and the
+existing global HTTP-provider concurrency cap, and it directly improved the
+single-provider `ipfs-bridge.sia.dev` tail in the same-window A/B run. Continue
+watching self-hedge counts, HTTP-provider bytes, and FD/RSS in future runs.

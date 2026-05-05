@@ -1747,7 +1747,7 @@ fn print_trace_http_provider_races(trace: &TraceSummary) {
         return;
     }
     println!(
-        "  http provider races: events={} providers={} single={} multi={} above_width={} race_width_max={} max_provider_count={} scored_events={} scored_providers={} max_scored={} hedges={} hedge_pending_max={} hedge_remaining_max={} results={} result_ok={} result_fail={} winner_initial={} winner_late={} winner_rank1={} winner_rank2={} winner_rank3_plus={} winner_rank_max={} attempted_max={} result_elapsed_max={}ms",
+        "  http provider races: events={} providers={} single={} multi={} above_width={} race_width_max={} max_provider_count={} scored_events={} scored_providers={} max_scored={} hedges={} self_hedges={} self_hedge_timeout_max={}ms hedge_pending_max={} hedge_remaining_max={} results={} result_ok={} result_fail={} winner_initial={} winner_late={} winner_rank1={} winner_rank2={} winner_rank3_plus={} winner_rank_max={} attempted_max={} result_elapsed_max={}ms",
         race.events,
         race.provider_count_total,
         race.single_provider_events,
@@ -1759,6 +1759,8 @@ fn print_trace_http_provider_races(trace: &TraceSummary) {
         race.scored_provider_count_total,
         race.max_scored_provider_count,
         race.hedges,
+        race.self_hedges,
+        race.max_self_hedge_timeout_ms,
         race.max_hedge_pending_count,
         race.max_hedge_remaining_provider_count,
         race.result_events,
@@ -4828,6 +4830,8 @@ struct TraceHttpProviderRaceAggregate {
     scored_provider_count_total: u128,
     max_scored_provider_count: u128,
     hedges: usize,
+    self_hedges: usize,
+    max_self_hedge_timeout_ms: u128,
     max_hedge_pending_count: u128,
     max_hedge_remaining_provider_count: u128,
     result_events: usize,
@@ -4895,6 +4899,13 @@ impl TraceHttpProviderRaceAggregate {
         self.max_hedge_remaining_provider_count = self
             .max_hedge_remaining_provider_count
             .max(trace_count_field(value, "remaining_provider_count"));
+    }
+
+    fn record_self_hedge(&mut self, value: &serde_json::Value) {
+        self.self_hedges += 1;
+        self.max_self_hedge_timeout_ms = self
+            .max_self_hedge_timeout_ms
+            .max(trace_count_field(value, "timeout_ms"));
     }
 
     fn record_result(&mut self, value: &serde_json::Value, elapsed_ms: Option<u128>) {
@@ -4986,7 +4997,7 @@ impl TraceHttpProviderRaceAggregate {
     }
 
     fn has_events(&self) -> bool {
-        self.events > 0 || self.hedges > 0 || self.result_events > 0
+        self.events > 0 || self.hedges > 0 || self.self_hedges > 0 || self.result_events > 0
     }
 }
 
@@ -6366,6 +6377,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         }
         if phase == "http_provider_hedge" {
             http_provider_races.record_hedge(&value);
+        }
+        if phase == "http_provider_self_hedge" {
+            http_provider_races.record_self_hedge(&value);
         }
         if phase == "http_provider_race_result" {
             http_provider_races.record_result(&value, elapsed_ms);
@@ -7872,6 +7886,7 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         "http_provider_fetch"
         | "http_provider_hedge"
         | "http_provider_race"
+        | "http_provider_self_hedge"
         | "http_provider_race_result" => "fetching_http_provider",
         "bitswap_fetch"
         | "bitswap_connection_established"
@@ -10382,6 +10397,7 @@ mod tests {
                 "{\"phase\":\"http_provider_race\",\"cid\":\"cid-single-ok\",\"provider_count\":1,\"race_width\":2}\n",
                 "{\"phase\":\"http_provider_race\",\"cid\":\"cid-single-fail\",\"provider_count\":1,\"race_width\":2}\n",
                 "{\"phase\":\"http_provider_hedge\",\"cid\":\"cid-b\",\"provider\":\"https://provider-c.example\",\"timeout_ms\":250,\"pending_count\":2,\"remaining_provider_count\":1}\n",
+                "{\"phase\":\"http_provider_self_hedge\",\"cid\":\"cid-single-ok\",\"provider\":\"https://provider-single.example\",\"timeout_ms\":350,\"provider_index\":0,\"original_provider_rank\":1,\"reason\":\"slow_single_provider\"}\n",
                 "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-a\",\"ok\":true,\"provider\":\"https://provider-a.example\",\"winner_provider_index\":1,\"winner_provider_rank\":2,\"winner_original_provider_rank\":3,\"winner_within_initial_width\":true,\"winner_provider_scored\":true,\"winner_provider_score_ms\":42,\"provider_count\":2,\"race_width\":2,\"attempted_provider_count\":2,\"failed_provider_count\":0,\"hedge_fired\":false,\"elapsed_ms\":25}\n",
                 "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-b\",\"ok\":false,\"provider_count\":4,\"race_width\":2,\"attempted_provider_count\":4,\"failed_provider_count\":4,\"hedge_fired\":true,\"elapsed_ms\":300}\n",
                 "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-single-ok\",\"ok\":true,\"provider\":\"https://provider-single.example\",\"winner_provider_index\":0,\"winner_provider_rank\":1,\"winner_original_provider_rank\":1,\"winner_within_initial_width\":true,\"winner_provider_scored\":false,\"provider_count\":1,\"race_width\":2,\"attempted_provider_count\":1,\"failed_provider_count\":0,\"hedge_fired\":false,\"elapsed_ms\":450}\n",
@@ -10407,6 +10423,8 @@ mod tests {
         assert_eq!(summary.http_provider_races.scored_provider_count_total, 2);
         assert_eq!(summary.http_provider_races.max_scored_provider_count, 2);
         assert_eq!(summary.http_provider_races.hedges, 1);
+        assert_eq!(summary.http_provider_races.self_hedges, 1);
+        assert_eq!(summary.http_provider_races.max_self_hedge_timeout_ms, 350);
         assert_eq!(summary.http_provider_races.max_hedge_pending_count, 2);
         assert_eq!(
             summary
@@ -10583,7 +10601,7 @@ mod tests {
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_http_provider"),
-            12
+            13
         );
     }
 
