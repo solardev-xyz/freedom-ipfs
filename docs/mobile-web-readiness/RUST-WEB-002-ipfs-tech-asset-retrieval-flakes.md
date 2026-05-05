@@ -10730,3 +10730,86 @@ Decision: keep the `75ms` grace. The `100ms` variant bought fewer provider
 lookups at too much latency cost. The `75ms` variant repeatedly reduced Bitswap
 fetches, peer attempts, FD/RSS pressure, and cold page tail versus nearby `50ms`
 controls while preserving the same bounded fallback behavior.
+
+## 2026-05-05 Reject: Generic UnixFS Linked-Child Prefetch Hook
+
+Hypothesis:
+A bounded `BlockProvider` prefetch hook could let UnixFS start fetching linked
+file children before walking them serially. This would be a small step toward
+content-root session batching without changing verification, provider trust, or
+gateway fallback policy.
+
+Prototype:
+
+- Added a default no-op `BlockProvider::prefetch_blocks(&[Cid])`.
+- Had UnixFS call it before full linked-file reads and before range reads over
+  intersecting child links.
+- Implemented `FetchingBlockProvider` as a best-effort background fetch of up to
+  `8` missing CIDs through the normal verified `fetch_block_with_source` path.
+- Forwarded through `ScopedBlockProvider`.
+- Added focused UnixFS tests proving full reads and range reads exposed the
+  expected child CIDs.
+
+Focused tests:
+
+```sh
+cargo test -p freedom-ipfs-unixfs prefetches_
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+```
+
+Result: both passed.
+
+Live checks:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-unixfs-prefetch-page-assets-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-unixfs-prefetch-page-assets-r3.json
+
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/vitalik-unixfs-prefetch-range-r1-trace.jsonl \
+  --output /tmp/vitalik-unixfs-prefetch-range-r1.json
+
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-developers-hero-range \
+  --repeat 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-hero-unixfs-prefetch-r1-trace.jsonl \
+  --output /tmp/ipfs-tech-hero-unixfs-prefetch-r1.json
+```
+
+Result:
+
+- All three live checks passed.
+- None of the traces contained `unixfs_link_prefetch` events.
+- The current live corpus resolves these paths mostly as directory/path metadata
+  plus raw leaf CIDs, not as multi-link DAG-PB file CIDs. The prototype's target
+  path therefore was not exercised.
+- The `ipfs.tech-page-assets` run looked good on asset tail, but since the new
+  phase never appeared, that improvement is network/session noise rather than a
+  keep signal for this code.
+
+Decision: revert the code and keep only this note. This is still a plausible
+future experiment, but it needs a corpus case that definitely exercises
+multi-block UnixFS file CIDs before it should be carried in production. A good
+next step is to add a deterministic harness fixture or stable public media file
+where the requested file CID is a DAG-PB file with multiple raw children, then
+retest bounded prefetch or true Bitswap multi-want against that case.
