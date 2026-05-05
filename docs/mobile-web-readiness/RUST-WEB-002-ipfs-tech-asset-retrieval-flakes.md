@@ -12326,3 +12326,72 @@ Keep. This is diagnostics-only and does not change retrieval behavior. It makes
 seeded comparison artifacts explicit that Kubo's seeded root TTFB excludes the
 seed dial/connect step while Rust's seeded root TTFB includes provider lookup
 and Bitswap connection establishment.
+
+## 2026-05-05 Keep: Record Kubo Seed Preconnect Cost
+
+Hypothesis:
+After labeling the seeded setup, the harness should also record the actual
+elapsed cost of Kubo's pre-request `ipfs swarm connect`. That connect cost is
+outside the timed root request, so without recording it the JSON artifact still
+does not show how much setup work Kubo has already completed before TTFB starts.
+
+Change:
+
+- Time the Kubo seed `swarm connect` call in `SpawnedGateway::start_kubo`.
+- Store the elapsed value as `bitswap_seed_connect_elapsed_ms` on each
+  `RunResult`.
+- Add `bitswap_seed_connect_ms` to `RepeatSummary`.
+- Print `bitswap seed connect: rust=... kubo=...` in comparison summaries when
+  either engine has a measured seed connect value.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness bitswap_seed
+cargo test -p mobile-web-harness repeat_summary_aggregates_measured_resource_metrics
+cargo test -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Result:
+
+- focused Bitswap seed harness tests passed: `6 passed; 0 failed`
+- focused repeat-summary metric test passed: `1 passed; 0 failed`
+- full mobile web harness tests passed: `30 passed; 0 failed`
+- harness clippy passed with `-D warnings`
+
+Live sanity check:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 1 \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-seed-connect-elapsed-r1-trace.jsonl \
+  --comparison-output /tmp/harness-seed-connect-elapsed-r1.json
+```
+
+Live result:
+
+- Rust and Kubo passed `bitswap-seeded-multiblock-boundary-range`.
+- Comparison summary printed:
+  `bitswap seed connect: rust=n/a kubo=p50=57ms p90=57ms p95=57ms max=57ms`.
+- JSON artifact recorded Rust `bitswap_seed_connect_elapsed_ms: null` and Kubo
+  `bitswap_seed_connect_elapsed_ms: 57`.
+- Rust root TTFB `205ms`; Kubo root TTFB `53ms`.
+- Rust max RSS/FD `39112KiB` / `13`; Kubo max RSS/FD `90980KiB` / `37`.
+- Rust Bitswap connection establishment remained inside request timing:
+  `established_ms` p50/max `66ms`, `wait_elapsed_ms` p50/max `67ms`.
+
+Decision:
+Keep. This is diagnostics-only and does not change retrieval behavior. Seeded
+Kubo comparisons now make the excluded preconnect cost visible next to request
+TTFB, which prevents the remaining Rust-vs-Kubo gap from being interpreted as
+pure block-transfer speed.

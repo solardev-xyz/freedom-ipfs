@@ -470,6 +470,13 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
                 .as_ref()
                 .and_then(SpawnedGateway::storage_path)
         };
+        let bitswap_seed_connect_elapsed_ms = if let Some(gateway) = run_gateway.as_ref() {
+            gateway.bitswap_seed_connect_elapsed_ms
+        } else {
+            persistent_gateway
+                .as_ref()
+                .and_then(|gateway| gateway.bitswap_seed_connect_elapsed_ms)
+        };
         let passed = results.iter().all(|result| result.passed);
         runs.push(RunResult {
             phase,
@@ -481,6 +488,7 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             gateway_child_process_count,
             gateway_storage_bytes,
             gateway_storage_path,
+            bitswap_seed_connect_elapsed_ms,
             passed,
             results,
         });
@@ -802,6 +810,12 @@ fn print_summary(report: &RunReport) {
             report.summary.gateway_storage_bytes
         );
     }
+    if report.summary.bitswap_seed_connect_ms.count > 0 {
+        println!(
+            "bitswap_seed_connect_ms: {}",
+            report.summary.bitswap_seed_connect_ms
+        );
+    }
 
     for case in &report.summary.cases {
         println!(
@@ -1055,6 +1069,15 @@ fn print_comparison_summary(report: &ComparisonReport) {
         report.kubo.summary.fail_count,
         report.kubo.summary.pass_rate * 100.0
     );
+    if report.rust.summary.bitswap_seed_connect_ms.count > 0
+        || report.kubo.summary.bitswap_seed_connect_ms.count > 0
+    {
+        println!(
+            "bitswap seed connect: rust={} kubo={}",
+            report.rust.summary.bitswap_seed_connect_ms,
+            report.kubo.summary.bitswap_seed_connect_ms
+        );
+    }
     for case in &report.cases {
         println!(
             "case {}: pass_rate rust={:.1}% kubo={:.1}%",
@@ -3038,6 +3061,7 @@ struct SpawnedGateway {
     remove_storage_on_stop: bool,
     stdout_task: Option<JoinHandle<()>>,
     stderr_task: Option<JoinHandle<()>>,
+    bitswap_seed_connect_elapsed_ms: Option<u128>,
 }
 
 impl SpawnedGateway {
@@ -3124,6 +3148,7 @@ impl SpawnedGateway {
                     remove_storage_on_stop: false,
                     stdout_task: None,
                     stderr_task: Some(stderr_task),
+                    bitswap_seed_connect_elapsed_ms: None,
                 });
             }
             eprintln!("gateway: {line}");
@@ -3177,7 +3202,8 @@ impl SpawnedGateway {
         let stdout_task = Some(log_child_lines("kubo", stdout));
         let stderr_task = Some(log_child_lines("kubo", stderr));
         wait_for_kubo_api(&mut child, api_port).await?;
-        if let Some(seed) = bitswap_seed {
+        let bitswap_seed_connect_elapsed_ms = if let Some(seed) = bitswap_seed {
+            let started = Instant::now();
             kubo_ok_os(
                 kubo,
                 &repo,
@@ -3187,7 +3213,10 @@ impl SpawnedGateway {
                     OsStr::new(seed.provider_addr.as_str()),
                 ],
             )?;
-        }
+            Some(started.elapsed().as_millis())
+        } else {
+            None
+        };
         let url = format!("http://127.0.0.1:{gateway_port}");
         eprintln!("kubo gateway listening on {url}");
 
@@ -3198,6 +3227,7 @@ impl SpawnedGateway {
             remove_storage_on_stop,
             stdout_task,
             stderr_task,
+            bitswap_seed_connect_elapsed_ms,
         })
     }
 
@@ -3656,6 +3686,7 @@ struct RunResult {
     gateway_child_process_count: Option<usize>,
     gateway_storage_bytes: Option<u64>,
     gateway_storage_path: Option<String>,
+    bitswap_seed_connect_elapsed_ms: Option<u128>,
     passed: bool,
     results: Vec<CaseResult>,
 }
@@ -3897,6 +3928,7 @@ struct RepeatSummary {
     gateway_fd_count: ResourceSummary,
     gateway_child_process_count: ResourceSummary,
     gateway_storage_bytes: ResourceSummary,
+    bitswap_seed_connect_ms: LatencySummary,
     cases: Vec<CaseAggregate>,
 }
 
@@ -3941,6 +3973,12 @@ impl RepeatSummary {
                 .filter_map(|run| run.gateway_storage_bytes)
                 .collect::<Vec<_>>(),
         );
+        let bitswap_seed_connect_ms = LatencySummary::from_values(
+            measured
+                .iter()
+                .filter_map(|run| run.bitswap_seed_connect_elapsed_ms)
+                .collect::<Vec<_>>(),
+        );
 
         let mut case_ids = Vec::new();
         for run in &measured {
@@ -3966,6 +4004,7 @@ impl RepeatSummary {
             gateway_fd_count,
             gateway_child_process_count,
             gateway_storage_bytes,
+            bitswap_seed_connect_ms,
             cases,
         }
     }
@@ -8049,7 +8088,7 @@ mod tests {
 
     #[test]
     fn repeat_summary_aggregates_measured_resource_metrics() {
-        let runs = vec![
+        let mut runs = vec![
             run_result(
                 RunPhase::Warmup,
                 0,
@@ -8078,6 +8117,9 @@ mod tests {
                 None,
             ),
         ];
+        runs[0].bitswap_seed_connect_elapsed_ms = Some(999);
+        runs[1].bitswap_seed_connect_elapsed_ms = Some(42);
+        runs[2].bitswap_seed_connect_elapsed_ms = Some(21);
 
         let summary = RepeatSummary::from_runs(&runs);
 
@@ -8092,6 +8134,9 @@ mod tests {
         assert_eq!(summary.gateway_child_process_count.max, Some(1));
         assert_eq!(summary.gateway_storage_bytes.count, 1);
         assert_eq!(summary.gateway_storage_bytes.max, Some(1200));
+        assert_eq!(summary.bitswap_seed_connect_ms.count, 2);
+        assert_eq!(summary.bitswap_seed_connect_ms.p50_ms, Some(21));
+        assert_eq!(summary.bitswap_seed_connect_ms.max_ms, Some(42));
         assert_eq!(summary.cases.len(), 1);
         assert_eq!(summary.cases[0].root_ttfb_ms.count, 2);
     }
@@ -8492,6 +8537,7 @@ mod tests {
             gateway_child_process_count,
             gateway_storage_bytes,
             gateway_storage_path: None,
+            bitswap_seed_connect_elapsed_ms: None,
             passed: true,
             results: vec![CaseResult {
                 id: "case".to_string(),
