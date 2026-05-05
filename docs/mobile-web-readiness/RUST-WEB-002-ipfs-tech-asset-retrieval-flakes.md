@@ -14791,3 +14791,56 @@ lookup latency in that live window, not with a meaningful number of earlier
 HTTP hedges. Keep the existing `250ms` delay until a broader same-window sweep
 or a deterministic provider-order corpus shows that a lower hedge delay wins
 without extra mobile fanout.
+
+## 2026-05-05 Observe: Warm Same-Daemon Rust-vs-Kubo Refresh After Target3
+
+Goal:
+Refresh the warm same-daemon `ipfs.tech` comparison after the accepted streamed
+HTTP-provider target change and the rejected shorter HTTP hedge experiment. This
+checks whether the next work should chase warm-cache behavior or stay focused
+on cold provider/retrieval tails.
+
+Command:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --warmup-runs 1 \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-warm-same-daemon-target3-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-warm-same-daemon-target3-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `2ms` / `49ms`, Kubo `2ms` / `4ms`.
+- Asset TTFB p50/p95: Rust `3ms` / `6ms`, Kubo `3ms` / `5ms`.
+- Rust max RSS/FD: `50668KiB` / `32`.
+- Kubo max RSS/FD: `197708KiB` / `110`.
+- Rust/Kubo resource ratios: RSS `0.26x`, FD `0.29x`.
+- Rust trace included the warmup plus measured requests:
+  - Warmup/root group still had cold work: root max `733ms`, asset max
+    `566ms`.
+  - Measured warm groups were effectively cache-hot: p50 `1-2ms`, p95 `2-3ms`,
+    max `3-4ms`.
+- Warmup cold fetches still showed provider/retrieval work:
+  - Delegated lookup events `35`, max `178ms`.
+  - HTTP-provider fetch p50/p95/max `159ms` / `321ms` / `395ms`.
+  - HTTP-provider winners: `ipfs-bridge.sia.dev=20`, `dag.w3s.link=14`.
+  - Bitswap work was low: `3` commands, `7` peer-attempt starts, `1` successful
+    source block.
+
+Interpretation:
+Warm same-daemon behavior is already close to Kubo while using much less memory
+and fewer file descriptors. The small Rust root p95 gap is worth watching, but
+the larger remaining opportunity is still cold and first-warmup behavior:
+provider lookup tails, single-HTTP-provider delegated records, HTTP-provider
+header waits, and session-scoped reuse before provider lookup completes.
