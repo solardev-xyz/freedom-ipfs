@@ -5472,3 +5472,85 @@ fast `connection_waiter_dropped` failures, but under asset load that caused many
 mixed trusted/provider retries and did not eliminate failures. A better version
 would need queueing/backpressure or peer selection changes, not immediate waiter
 failure.
+
+## 2026-05-05 Reject: Suppress Completed Unusable Peer Attempts
+
+Experiment: add a narrow `unusable_peers` lane to `BitswapPeerFailures` and
+temporarily suppress peers whose completed outgoing Bitswap attempt failed with
+clear unusable-peer strings such as protocol negotiation failure, connection
+refused, or connection reset. Keep the existing broad-failure guard so a whole
+provider set is not mass-suppressed.
+
+Rationale:
+
+- Rejected waiter-drop runs showed repeated protocol negotiation and connection
+  refused errors for the same public peers.
+- Current suppression only marks read-timeout peers. Protocol failures can be
+  retried repeatedly across warm asset requests.
+
+Prototype validation before live runs:
+
+```sh
+cargo test -p freedom-ipfs-retrieval --lib single_unusable_bitswap_peer_is_temporarily_suppressed
+cargo test -p freedom-ipfs-retrieval --lib broad_unusable_bitswap_peers_are_not_mass_suppressed
+cargo test -p freedom-ipfs-retrieval --lib classifies_suppressible_bitswap_peer_failures
+cargo test -p freedom-ipfs-retrieval --lib
+cargo fmt --all --check
+git diff --check
+cargo build -p freedom-ipfs-gateway
+```
+
+First live run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-unusable-peer-suppression-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-unusable-peer-suppression-r3.json
+```
+
+Result: Rust passed `3/3`; Kubo passed `3/3`. Rust root TTFB p50/p95 was
+`1029/19986ms` versus Kubo `4693/4768ms`; Rust asset TTFB p50/p95 was
+`134/331ms` versus Kubo `210/519ms`. But the trace did not exercise the new
+path: `unusable_peer_count=0`, no `bitswap_peer_unusable` events, and the only
+completed peer-attempt failures were connection timeouts.
+
+Second live run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-unusable-peer-suppression-r3b-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-unusable-peer-suppression-r3b.json
+```
+
+Result: reject. Rust failed `0/3`; Kubo passed `3/3`. Rust root TTFB p50/p95
+was `11484/30640ms` versus Kubo `1646/1680ms`.
+
+Trace summary:
+
+- `bitswap timeout recovery: request_timeout_details=16 cold=2
+  mixed_trusted=14 trusted_only=0 timeout_ms=4000=14, 15000=2`
+- `bitswap peer attempts: starts=157 outgoing_completed=7 successes=0
+  failures=7 connection_timeouts=7 read_timeouts=0 other_failures=0`
+- Trace errors still showed repeated protocol negotiation/connection refused
+  failures, but they surfaced as `bitswap_connection_error` swarm events and
+  then request-level connection timeouts, not as completed `Other` peer attempts.
+
+Decision: reject and revert. The hypothesis targeted the wrong layer. Repeated
+protocol negotiation failures need to be tracked from swarm dial/connection
+events or addressed with peer selection/backpressure, not by suppressing
+completed outgoing Bitswap attempts that rarely materialize for this failure
+shape.
