@@ -11824,3 +11824,84 @@ path delivers another block. Future multi-want work should first prove Kubo
 responds through our outgoing multi-want path without adding a blocking fallback
 penalty, or should race without materially increasing mobile network/resource
 usage.
+
+## 2026-05-05 Reject: Deferred Large Bitswap Store Writes
+
+Hypothesis:
+The bounded raw range batching trace showed child blocks arriving before the
+gateway response completes. For 262KB raw child blocks, part of the tail appears
+between `bitswap_session_shortcut` and `block_fetch_total`, which includes the
+synchronous SQLite `put_block`. Deferring large no-extra Bitswap block writes to
+a background blocking task might shave TTFB while still verifying before
+serving.
+
+Prototype:
+
+- For Bitswap results with no extra blocks and requested block size at least
+  `64KiB`, verify the requested block immediately, return it to the caller, and
+  run `store.put_block` in `tokio::task::spawn_blocking`.
+- Emit `bitswap_store_deferred` when the background write finishes.
+- Keep small blocks and extra-block results on the synchronous path.
+
+Focused validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval fetches_block_from_local_bitswap_peer
+cargo test -p freedom-ipfs-retrieval recent_bitswap_peer_shortcut_fetches_when_provider_lookup_fails
+```
+
+Seeded validation:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 1 \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-deferred-store-boundary-rust-trace.jsonl \
+  --comparison-output /tmp/harness-deferred-store-boundary-rust-vs-kubo.json
+
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-deferred-store-boundary-r3-rust-trace.jsonl \
+  --comparison-output /tmp/harness-deferred-store-boundary-r3-rust-vs-kubo.json
+```
+
+Result:
+
+- focused tests passed
+- one-run seeded comparison passed Rust and Kubo:
+  - Rust root TTFB `186ms`; Kubo `52ms`
+  - Rust max RSS/FD `39288KiB` / `12`; Kubo `87696KiB` / `45`
+- three-run fresh-gateway seeded comparison passed Rust and Kubo `3/3`:
+  - Rust root TTFB p50/p95 `188ms` / `194ms`
+  - Kubo root TTFB p50/p95 `55ms` / `57ms`
+  - Rust max RSS/FD `39236KiB` / `13`; Kubo `87472KiB` / `43`
+- Compared with the kept bounded range-batch repeat baseline
+  (`194ms` / `196ms` Rust p50/p95), this was a small p50 improvement and only a
+  tiny p95 improvement.
+
+Decision:
+Reject and revert. The latency signal is real but modest, and the semantic cost
+is not worth it: `fetch_block_with_source` can return a large Bitswap block
+before that block is durably cached. That weakens offline/cache-after-browse
+behavior for exactly the large media/range blocks we care about. A future cache
+write optimization should preserve the post-fetch cache contract, for example
+by making the store path cheaper or adding a bounded write-behind queue with an
+explicit flush/visibility contract.
