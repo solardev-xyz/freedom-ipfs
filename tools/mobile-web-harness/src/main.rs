@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
-use reqwest::header::{CONTENT_RANGE, CONTENT_TYPE, RANGE};
+use reqwest::header::{CACHE_CONTROL, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH, RANGE};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -111,6 +111,9 @@ struct Args {
     /// Concurrent subresource fetches for page crawls.
     #[arg(long, default_value_t = DEFAULT_ASSET_CONCURRENCY)]
     asset_concurrency: usize,
+    /// Re-fetch successful non-range GETs with If-None-Match when the first response has an ETag.
+    #[arg(long)]
+    conditional_revalidate: bool,
     /// Gateway JSONL trace output path when spawning a gateway; parsed into the report.
     #[arg(long)]
     trace_output: Option<PathBuf>,
@@ -341,6 +344,7 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             corpus,
             timeout,
             args.asset_concurrency,
+            args.conditional_revalidate,
             &args.cases,
         );
         let results = if let Some(run_timeout) = run_timeout {
@@ -426,6 +430,7 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
         warmup_runs: args.warmup_runs,
         fresh_gateway_per_run: args.fresh_gateway_per_run,
         asset_concurrency: args.asset_concurrency,
+        conditional_revalidate: args.conditional_revalidate,
         run_timeout_secs: (args.run_timeout_secs > 0).then_some(args.run_timeout_secs),
         engine: args.engine,
         gateway_db: args
@@ -451,6 +456,7 @@ async fn run_corpus_once(
     corpus: &Corpus,
     timeout: Duration,
     asset_concurrency: usize,
+    conditional_revalidate: bool,
     cases: &[String],
 ) -> Result<Vec<CaseResult>> {
     let client = reqwest::Client::builder()
@@ -462,7 +468,16 @@ async fn run_corpus_once(
         if !cases.is_empty() && !cases.iter().any(|case| case == &entry.id) {
             continue;
         }
-        results.push(run_case(&client, gateway_url, entry, asset_concurrency).await);
+        results.push(
+            run_case(
+                &client,
+                gateway_url,
+                entry,
+                asset_concurrency,
+                conditional_revalidate,
+            )
+            .await,
+        );
     }
     if results.is_empty() {
         bail!("no corpus entries matched the requested case filters");
@@ -499,6 +514,7 @@ async fn run_case(
     gateway_url: &str,
     entry: &CorpusEntry,
     asset_concurrency: usize,
+    conditional_revalidate: bool,
 ) -> CaseResult {
     let url = format!("{}{}", gateway_url.trim_end_matches('/'), entry.path);
     let method = entry.method.as_deref().unwrap_or("GET");
@@ -568,12 +584,38 @@ async fn run_case(
             ));
         }
     }
+    let revalidation = maybe_revalidate_response(
+        client,
+        &url,
+        method,
+        entry.range.as_deref(),
+        &response,
+        conditional_revalidate,
+    )
+    .await;
+    if let Some(revalidation) = &revalidation {
+        if !revalidation.passed {
+            failures.extend(
+                revalidation
+                    .failures
+                    .iter()
+                    .map(|failure| format!("conditional revalidation: {failure}")),
+            );
+        }
+    }
 
     let mut asset_summary = None;
     let mut assets = Vec::new();
     if let Some(crawl) = &entry.crawl {
-        let (summary, mut crawled_assets, crawl_failures) =
-            run_page_crawl(client, &url, &response.body, crawl, asset_concurrency).await;
+        let (summary, mut crawled_assets, crawl_failures) = run_page_crawl(
+            client,
+            &url,
+            &response.body,
+            crawl,
+            asset_concurrency,
+            conditional_revalidate,
+        )
+        .await;
         failures.extend(crawl_failures);
         asset_summary = Some(summary);
         assets.append(&mut crawled_assets);
@@ -587,10 +629,13 @@ async fn run_case(
         status: Some(response.status),
         content_type: response.content_type,
         content_range: response.content_range,
+        etag: response.etag,
+        cache_control: response.cache_control,
         body_bytes: response.body.len(),
         ttfb_ms: response.ttfb_ms,
         total_ms: response.total_ms,
         body_preview,
+        revalidation,
         asset_summary,
         assets,
         passed: failures.is_empty(),
@@ -611,8 +656,12 @@ fn print_summary(report: &RunReport) {
         println!("kubo_repo: {kubo_repo}");
     }
     println!(
-        "runs: measured={} warmup={} fresh_gateway_per_run={} asset_concurrency={}",
-        report.repeat, report.warmup_runs, report.fresh_gateway_per_run, report.asset_concurrency
+        "runs: measured={} warmup={} fresh_gateway_per_run={} asset_concurrency={} conditional_revalidate={}",
+        report.repeat,
+        report.warmup_runs,
+        report.fresh_gateway_per_run,
+        report.asset_concurrency,
+        report.conditional_revalidate
     );
     if let Some(run_timeout_secs) = report.run_timeout_secs {
         println!("run_timeout_secs: {run_timeout_secs}");
@@ -660,6 +709,19 @@ fn print_summary(report: &RunReport) {
             for example in &group.examples {
                 println!("    - {example}");
             }
+        }
+        if case.root_revalidation_attempts > 0 || case.asset_revalidation_attempts > 0 {
+            println!(
+                "  revalidation: root={}/{} failed={} ttfb={} assets={}/{} failed={} ttfb={}",
+                case.root_revalidation_passed,
+                case.root_revalidation_attempts,
+                case.root_revalidation_failed,
+                case.root_revalidation_ttfb_ms,
+                case.asset_revalidation_passed,
+                case.asset_revalidation_attempts,
+                case.asset_revalidation_failed,
+                case.asset_revalidation_ttfb_ms
+            );
         }
     }
 
@@ -1318,7 +1380,7 @@ fn display_option_u64(value: Option<u64>) -> String {
 fn print_case_result(result: &CaseResult) {
     let mark = if result.passed { "PASS" } else { "FAIL" };
     println!(
-        "{mark} {:32} status={} type={} bytes={} ttfb={}ms total={}ms",
+        "{mark} {:32} status={} type={} bytes={} ttfb={}ms total={}ms etag={} cache_control={}",
         result.id,
         result
             .status
@@ -1327,8 +1389,13 @@ fn print_case_result(result: &CaseResult) {
         result.content_type.as_deref().unwrap_or("-"),
         result.body_bytes,
         result.ttfb_ms,
-        result.total_ms
+        result.total_ms,
+        result.etag.as_deref().unwrap_or("-"),
+        result.cache_control.as_deref().unwrap_or("-")
     );
+    if let Some(revalidation) = &result.revalidation {
+        print_revalidation_result("  revalidation", revalidation);
+    }
     for failure in &result.failures {
         println!("  - {failure}");
     }
@@ -1359,8 +1426,27 @@ fn print_case_result(result: &CaseResult) {
             for failure in &asset.failures {
                 println!("      - {failure}");
             }
+            if let Some(revalidation) = &asset.revalidation {
+                print_revalidation_result("      revalidation", revalidation);
+            }
         }
     }
+}
+
+fn print_revalidation_result(prefix: &str, result: &RevalidationResult) {
+    let mark = if result.passed { "PASS" } else { "FAIL" };
+    println!(
+        "{prefix}: {mark} status={} bytes={} ttfb={}ms total={}ms etag={} cache_control={}",
+        result
+            .status
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        result.body_bytes,
+        result.ttfb_ms,
+        result.total_ms,
+        result.etag.as_deref().unwrap_or("-"),
+        result.cache_control.as_deref().unwrap_or("-")
+    );
 }
 
 async fn fetch_response(
@@ -1399,6 +1485,16 @@ async fn fetch_response(
         .get(CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    let etag = response
+        .headers()
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let cache_control = response
+        .headers()
+        .get(CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let body = response
         .bytes()
         .await
@@ -1410,10 +1506,100 @@ async fn fetch_response(
         status,
         content_type,
         content_range,
+        etag,
+        cache_control,
         body,
         ttfb_ms,
         total_ms,
     })
+}
+
+async fn maybe_revalidate_response(
+    client: &reqwest::Client,
+    url: &str,
+    method: &str,
+    range: Option<&str>,
+    response: &FetchResponse,
+    conditional_revalidate: bool,
+) -> Option<RevalidationResult> {
+    if !conditional_revalidate
+        || method != "GET"
+        || range.is_some()
+        || !(200..=299).contains(&response.status)
+    {
+        return None;
+    }
+    let etag = response.etag.as_deref()?;
+    Some(fetch_revalidation(client, url, etag).await)
+}
+
+async fn fetch_revalidation(client: &reqwest::Client, url: &str, etag: &str) -> RevalidationResult {
+    let started = Instant::now();
+    let response = match client.get(url).header(IF_NONE_MATCH, etag).send().await {
+        Ok(response) => response,
+        Err(err) => {
+            return RevalidationResult {
+                status: None,
+                etag: None,
+                cache_control: None,
+                body_bytes: 0,
+                ttfb_ms: started.elapsed().as_millis(),
+                total_ms: started.elapsed().as_millis(),
+                passed: false,
+                failures: vec![format!("request error: {err}")],
+            };
+        }
+    };
+
+    let ttfb_ms = started.elapsed().as_millis();
+    let status = response.status().as_u16();
+    let response_etag = response
+        .headers()
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let cache_control = response
+        .headers()
+        .get(CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = match response.bytes().await {
+        Ok(body) => body,
+        Err(err) => {
+            return RevalidationResult {
+                status: Some(status),
+                etag: response_etag,
+                cache_control,
+                body_bytes: 0,
+                ttfb_ms,
+                total_ms: started.elapsed().as_millis(),
+                passed: false,
+                failures: vec![format!("body error: {err}")],
+            };
+        }
+    };
+    let total_ms = started.elapsed().as_millis();
+    let mut failures = Vec::new();
+    if status != 304 {
+        failures.push(format!("status {status}, expected 304"));
+    }
+    if !body.is_empty() {
+        failures.push(format!(
+            "body {} bytes, expected empty 304 body",
+            body.len()
+        ));
+    }
+
+    RevalidationResult {
+        status: Some(status),
+        etag: response_etag,
+        cache_control,
+        body_bytes: body.len(),
+        ttfb_ms,
+        total_ms,
+        passed: failures.is_empty(),
+        failures,
+    }
 }
 
 async fn run_page_crawl(
@@ -1422,6 +1608,7 @@ async fn run_page_crawl(
     page_body: &[u8],
     config: &CrawlConfig,
     asset_concurrency: usize,
+    conditional_revalidate: bool,
 ) -> (AssetSummary, Vec<AssetResult>, Vec<String>) {
     let max_assets = config.max_assets.unwrap_or(32);
     let same_origin_only = config.same_origin_only.unwrap_or(true);
@@ -1446,6 +1633,7 @@ async fn run_page_crawl(
         discovery.assets.clone(),
         asset_concurrency,
         config.asset_max_bytes.unwrap_or(2_000_000),
+        conditional_revalidate,
     )
     .await;
 
@@ -1463,6 +1651,7 @@ async fn run_page_crawl(
                 css_assets,
                 asset_concurrency,
                 config.asset_max_bytes.unwrap_or(2_000_000),
+                conditional_revalidate,
             )
             .await;
             fetched.append(&mut css_fetched);
@@ -1509,6 +1698,7 @@ async fn fetch_assets(
     assets: Vec<DiscoveredAsset>,
     concurrency: usize,
     max_bytes: usize,
+    conditional_revalidate: bool,
 ) -> Vec<FetchedAsset> {
     let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut tasks = JoinSet::new();
@@ -1517,7 +1707,7 @@ async fn fetch_assets(
         let semaphore = semaphore.clone();
         tasks.spawn(async move {
             let _permit = semaphore.acquire_owned().await.ok();
-            fetch_asset(&client, asset, max_bytes).await
+            fetch_asset(&client, asset, max_bytes, conditional_revalidate).await
         });
     }
 
@@ -1534,6 +1724,7 @@ async fn fetch_asset(
     client: &reqwest::Client,
     asset: DiscoveredAsset,
     max_bytes: usize,
+    conditional_revalidate: bool,
 ) -> FetchedAsset {
     let range = range_for_kind(asset.kind);
     let started_url = asset.url.to_string();
@@ -1546,10 +1737,13 @@ async fn fetch_asset(
         status: None,
         content_type: None,
         content_range: None,
+        etag: None,
+        cache_control: None,
         body_bytes: 0,
         ttfb_ms: 0,
         total_ms: 0,
         body_preview: String::new(),
+        revalidation: None,
         passed: false,
         failures: Vec::new(),
     };
@@ -1568,6 +1762,8 @@ async fn fetch_asset(
     result.status = Some(response.status);
     result.content_type = response.content_type.clone();
     result.content_range = response.content_range.clone();
+    result.etag = response.etag.clone();
+    result.cache_control = response.cache_control.clone();
     result.body_bytes = response.body.len();
     result.ttfb_ms = response.ttfb_ms;
     result.total_ms = response.total_ms;
@@ -1599,6 +1795,25 @@ async fn fetch_asset(
             "body {} bytes exceeded asset cap {max_bytes}",
             response.body.len()
         ));
+    }
+    result.revalidation = maybe_revalidate_response(
+        client,
+        &result.url,
+        "GET",
+        range,
+        &response,
+        conditional_revalidate,
+    )
+    .await;
+    if let Some(revalidation) = &result.revalidation {
+        if !revalidation.passed {
+            failures.extend(
+                revalidation
+                    .failures
+                    .iter()
+                    .map(|failure| format!("conditional revalidation: {failure}")),
+            );
+        }
     }
 
     let body_text = if asset.kind == AssetKind::Stylesheet
@@ -2714,6 +2929,7 @@ struct RunReport {
     warmup_runs: usize,
     fresh_gateway_per_run: bool,
     asset_concurrency: usize,
+    conditional_revalidate: bool,
     run_timeout_secs: Option<u64>,
     engine: HarnessEngine,
     gateway_db: Option<String>,
@@ -3069,6 +3285,14 @@ struct CaseAggregate {
     root_total_ms: LatencySummary,
     asset_ttfb_ms: LatencySummary,
     asset_total_ms: LatencySummary,
+    root_revalidation_attempts: usize,
+    root_revalidation_passed: usize,
+    root_revalidation_failed: usize,
+    root_revalidation_ttfb_ms: LatencySummary,
+    asset_revalidation_attempts: usize,
+    asset_revalidation_passed: usize,
+    asset_revalidation_failed: usize,
+    asset_revalidation_ttfb_ms: LatencySummary,
     asset_kind_failures: Vec<AssetKindFailure>,
     failure_groups: Vec<FailureGroup>,
 }
@@ -3081,6 +3305,12 @@ impl CaseAggregate {
         let mut root_total = Vec::new();
         let mut asset_ttfb = Vec::new();
         let mut asset_total = Vec::new();
+        let mut root_revalidation_attempts = 0usize;
+        let mut root_revalidation_passed = 0usize;
+        let mut root_revalidation_ttfb = Vec::new();
+        let mut asset_revalidation_attempts = 0usize;
+        let mut asset_revalidation_passed = 0usize;
+        let mut asset_revalidation_ttfb = Vec::new();
         let mut kind_failures = BTreeMap::<String, usize>::new();
         let mut failure_groups = BTreeMap::<String, FailureGroupBuilder>::new();
 
@@ -3094,6 +3324,13 @@ impl CaseAggregate {
             }
             root_ttfb.push(result.ttfb_ms);
             root_total.push(result.total_ms);
+            if let Some(revalidation) = &result.revalidation {
+                root_revalidation_attempts += 1;
+                if revalidation.passed {
+                    root_revalidation_passed += 1;
+                }
+                root_revalidation_ttfb.push(revalidation.ttfb_ms);
+            }
             if !result.passed {
                 for failure in &result.failures {
                     push_failure_group(
@@ -3106,6 +3343,13 @@ impl CaseAggregate {
             for asset in &result.assets {
                 asset_ttfb.push(asset.ttfb_ms);
                 asset_total.push(asset.total_ms);
+                if let Some(revalidation) = &asset.revalidation {
+                    asset_revalidation_attempts += 1;
+                    if revalidation.passed {
+                        asset_revalidation_passed += 1;
+                    }
+                    asset_revalidation_ttfb.push(revalidation.ttfb_ms);
+                }
                 if asset.passed {
                     continue;
                 }
@@ -3159,6 +3403,16 @@ impl CaseAggregate {
             root_total_ms: LatencySummary::from_values(root_total),
             asset_ttfb_ms: LatencySummary::from_values(asset_ttfb),
             asset_total_ms: LatencySummary::from_values(asset_total),
+            root_revalidation_attempts,
+            root_revalidation_passed,
+            root_revalidation_failed: root_revalidation_attempts
+                .saturating_sub(root_revalidation_passed),
+            root_revalidation_ttfb_ms: LatencySummary::from_values(root_revalidation_ttfb),
+            asset_revalidation_attempts,
+            asset_revalidation_passed,
+            asset_revalidation_failed: asset_revalidation_attempts
+                .saturating_sub(asset_revalidation_passed),
+            asset_revalidation_ttfb_ms: LatencySummary::from_values(asset_revalidation_ttfb),
             asset_kind_failures,
             failure_groups,
         }
@@ -4861,10 +5115,13 @@ struct CaseResult {
     status: Option<u16>,
     content_type: Option<String>,
     content_range: Option<String>,
+    etag: Option<String>,
+    cache_control: Option<String>,
     body_bytes: usize,
     ttfb_ms: u128,
     total_ms: u128,
     body_preview: String,
+    revalidation: Option<RevalidationResult>,
     asset_summary: Option<AssetSummary>,
     assets: Vec<AssetResult>,
     passed: bool,
@@ -4881,10 +5138,13 @@ impl CaseResult {
             status: None,
             content_type: None,
             content_range: None,
+            etag: None,
+            cache_control: None,
             body_bytes: 0,
             ttfb_ms: 0,
             total_ms: 0,
             body_preview: String::new(),
+            revalidation: None,
             asset_summary: None,
             assets: Vec::new(),
             passed: false,
@@ -4897,9 +5157,23 @@ struct FetchResponse {
     status: u16,
     content_type: Option<String>,
     content_range: Option<String>,
+    etag: Option<String>,
+    cache_control: Option<String>,
     body: Vec<u8>,
     ttfb_ms: u128,
     total_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
+struct RevalidationResult {
+    status: Option<u16>,
+    etag: Option<String>,
+    cache_control: Option<String>,
+    body_bytes: usize,
+    ttfb_ms: u128,
+    total_ms: u128,
+    passed: bool,
+    failures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -4950,10 +5224,13 @@ struct AssetResult {
     status: Option<u16>,
     content_type: Option<String>,
     content_range: Option<String>,
+    etag: Option<String>,
+    cache_control: Option<String>,
     body_bytes: usize,
     ttfb_ms: u128,
     total_ms: u128,
     body_preview: String,
+    revalidation: Option<RevalidationResult>,
     passed: bool,
     failures: Vec<String>,
 }
@@ -5735,6 +6012,72 @@ mod tests {
     }
 
     #[test]
+    fn case_aggregate_counts_conditional_revalidations() {
+        let mut run = run_result(
+            RunPhase::Measured,
+            1,
+            100,
+            Some(40),
+            Some(48),
+            Some(0),
+            Some(1200),
+        );
+        run.results[0].revalidation = Some(RevalidationResult {
+            status: Some(304),
+            etag: Some("\"root\"".to_string()),
+            cache_control: Some("public, max-age=31536000, immutable".to_string()),
+            body_bytes: 0,
+            ttfb_ms: 3,
+            total_ms: 3,
+            passed: true,
+            failures: Vec::new(),
+        });
+        run.results[0].assets = vec![AssetResult {
+            kind: AssetKind::Script,
+            source: "app.js".to_string(),
+            url: "http://127.0.0.1:8080/ipfs/root/app.js".to_string(),
+            status: Some(200),
+            content_type: Some("text/javascript".to_string()),
+            content_range: None,
+            etag: Some("\"asset\"".to_string()),
+            cache_control: Some("public, max-age=31536000, immutable".to_string()),
+            body_bytes: 128,
+            ttfb_ms: 5,
+            total_ms: 6,
+            body_preview: String::new(),
+            revalidation: Some(RevalidationResult {
+                status: Some(200),
+                etag: Some("\"asset\"".to_string()),
+                cache_control: Some("public, max-age=31536000, immutable".to_string()),
+                body_bytes: 128,
+                ttfb_ms: 4,
+                total_ms: 5,
+                passed: false,
+                failures: vec!["status 200, expected 304".to_string()],
+            }),
+            passed: false,
+            failures: vec!["conditional revalidation: status 200, expected 304".to_string()],
+        }];
+
+        let runs = [run];
+        let aggregate = CaseAggregate::from_runs("case", &[&runs[0]]);
+
+        assert_eq!(aggregate.root_revalidation_attempts, 1);
+        assert_eq!(aggregate.root_revalidation_passed, 1);
+        assert_eq!(aggregate.root_revalidation_failed, 0);
+        assert_eq!(aggregate.root_revalidation_ttfb_ms.p50_ms, Some(3));
+        assert_eq!(aggregate.asset_revalidation_attempts, 1);
+        assert_eq!(aggregate.asset_revalidation_passed, 0);
+        assert_eq!(aggregate.asset_revalidation_failed, 1);
+        assert_eq!(aggregate.asset_revalidation_ttfb_ms.p50_ms, Some(4));
+        assert_eq!(aggregate.asset_kind_failures[0].kind, "script");
+        assert!(aggregate
+            .failure_groups
+            .iter()
+            .any(|group| group.key.contains("conditional revalidation")));
+    }
+
+    #[test]
     fn run_timeout_failure_results_marks_matching_cases_failed() {
         let corpus = Corpus {
             entries: vec![
@@ -5819,10 +6162,13 @@ mod tests {
                 status: Some(504),
                 content_type: Some("text/html".to_string()),
                 content_range: None,
+                etag: None,
+                cache_control: None,
                 body_bytes: 0,
                 ttfb_ms: 10,
                 total_ms: 10,
                 body_preview: String::new(),
+                revalidation: None,
                 passed: false,
                 failures: vec!["status 504, expected 200".to_string()],
             },
@@ -5833,10 +6179,13 @@ mod tests {
                 status: Some(200),
                 content_type: Some("image/png".to_string()),
                 content_range: None,
+                etag: None,
+                cache_control: None,
                 body_bytes: 128,
                 ttfb_ms: 5,
                 total_ms: 5,
                 body_preview: String::new(),
+                revalidation: None,
                 passed: true,
                 failures: Vec::new(),
             },
@@ -5849,6 +6198,7 @@ mod tests {
             warmup_runs: 0,
             fresh_gateway_per_run: false,
             asset_concurrency: 1,
+            conditional_revalidate: false,
             run_timeout_secs: None,
             engine: HarnessEngine::Rust,
             gateway_db: Some("/tmp/replay.db".to_string()),
@@ -5991,10 +6341,13 @@ mod tests {
                 status: Some(200),
                 content_type: Some("text/plain".to_string()),
                 content_range: None,
+                etag: None,
+                cache_control: None,
                 body_bytes: 5,
                 ttfb_ms: elapsed_ms / 2,
                 total_ms: elapsed_ms,
                 body_preview: "hello".to_string(),
+                revalidation: None,
                 asset_summary: None,
                 assets: Vec::new(),
                 passed: true,

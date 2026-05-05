@@ -77,6 +77,12 @@ file responses use `Cache-Control: no-cache` so browsers revalidate mutable
 names. Matching non-range `If-None-Match` requests return `304 Not Modified`,
 while range responses keep `ETag`, `Cache-Control`, `Accept-Ranges`, and
 `Content-Range`.
+To exercise this browser path in live runs, pass `--conditional-revalidate`.
+For each successful non-range GET with an `ETag`, the harness immediately sends
+a second GET with `If-None-Match`, records the `304` result in the JSON report,
+and includes root/asset revalidation counts plus latency summaries in console
+output. Range requests are intentionally skipped because browsers still need the
+requested byte slice and the gateway preserves `206` range semantics.
 
 For cache-completeness checks, pass `--offline-replay`. The harness starts a
 Rust gateway online against a persistent SQLite DB, runs the selected corpus,
