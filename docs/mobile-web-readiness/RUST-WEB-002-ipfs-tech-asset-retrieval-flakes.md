@@ -5764,6 +5764,9 @@ Implementation:
   - Swift `FreedomIpfsReader.clearProgress()`
 - Add `docs/mobile-progress-api.md` with JSON shape and suggested Swift UI
   mapping.
+- Include snapshot-level `generated_at_unix_ms`, `active_count`, and
+  `event_count` metadata so Swift can cheaply inspect polling freshness and
+  bounded history size.
 - Update `FetchingBlockProvider` to emit `block_store_get` for direct store
   hits/misses, so cache activity is visible to the same progress recorder.
 - Update the XCFramework verifier to require the new C exports and make the

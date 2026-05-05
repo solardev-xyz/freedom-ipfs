@@ -172,6 +172,9 @@ struct ProgressTarget {
 
 #[derive(Serialize)]
 struct ProgressSnapshot {
+    generated_at_unix_ms: u64,
+    active_count: usize,
+    event_count: usize,
     active: Vec<ProgressTarget>,
     events: Vec<ProgressEvent>,
 }
@@ -274,10 +277,16 @@ impl ProgressRecorder {
     fn snapshot_json(&self) -> String {
         let snapshot = match self.inner.lock() {
             Ok(inner) => ProgressSnapshot {
+                generated_at_unix_ms: now_ms(),
+                active_count: inner.active_targets.len(),
+                event_count: inner.events.len(),
                 active: inner.active_targets.values().cloned().collect(),
                 events: inner.events.iter().cloned().collect(),
             },
             Err(_) => ProgressSnapshot {
+                generated_at_unix_ms: now_ms(),
+                active_count: 0,
+                event_count: 0,
                 active: Vec::new(),
                 events: Vec::new(),
             },
@@ -1837,6 +1846,9 @@ mod tests {
             let snapshot = progress_snapshot_json(node);
             let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
             let events = value["events"].as_array().unwrap();
+            assert!(value["generated_at_unix_ms"].as_u64().unwrap() > 0);
+            assert_eq!(value["active_count"].as_u64().unwrap(), 0);
+            assert_eq!(value["event_count"].as_u64().unwrap(), events.len() as u64);
             assert!(
                 events.iter().any(|event| event["path"] == path
                     && event["phase"] == "started"

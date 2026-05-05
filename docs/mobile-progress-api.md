@@ -14,6 +14,9 @@ The returned string is owned by Rust and must be released with
 
 ```json
 {
+  "generated_at_unix_ms": 1777956660888,
+  "active_count": 1,
+  "event_count": 18,
   "active": [
     {
       "id": 1,
@@ -56,9 +59,11 @@ The returned string is owned by Rust and must be released with
 }
 ```
 
-`events` is capped to the most recent 512 events. `active` contains currently
-active targets only; completed, failed, and cancelled targets remain visible in
-recent `events`.
+`events` is capped to the most recent 512 events. `event_count` is the current
+bounded event array length, not a lifetime total. `active_count` mirrors the
+number of currently active targets. `active` contains currently active targets
+only; completed, failed, and cancelled targets remain visible in recent
+`events`.
 
 For gateway requests, Swift may pass optional correlation headers:
 
