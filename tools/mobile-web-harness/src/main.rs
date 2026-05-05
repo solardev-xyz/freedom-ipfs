@@ -591,6 +591,7 @@ fn print_summary(report: &RunReport) {
                 phase.phase, phase.count, phase.total_ms, phase.elapsed_ms
             );
         }
+        print_trace_progress_phases(trace);
         if !trace.block_sources.is_empty() {
             println!(
                 "  block sources: {}",
@@ -950,6 +951,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
             store.recheck_misses
         );
     }
+    print_trace_progress_phases(trace);
     print_trace_provider_retries(trace);
     print_trace_timeout_recovery(trace);
     print_trace_bitswap_peer_attempts(trace);
@@ -1006,6 +1008,16 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
             format_trace_counts(&trace.trace_errors)
         );
     }
+}
+
+fn print_trace_progress_phases(trace: &TraceSummary) {
+    if trace.progress_phases.is_empty() {
+        return;
+    }
+    println!(
+        "  progress phases: {}",
+        format_trace_counts(&trace.progress_phases)
+    );
 }
 
 fn print_trace_provider_retries(trace: &TraceSummary) {
@@ -2882,6 +2894,7 @@ struct TraceSummary {
     line_count: usize,
     event_count: usize,
     phases: Vec<TracePhaseAggregate>,
+    progress_phases: Vec<TraceValueCount>,
     slow_events: Vec<TraceSlowEvent>,
     block_sources: Vec<TraceValueCount>,
     block_store: TraceBlockStoreAggregate,
@@ -3372,6 +3385,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut line_count = 0usize;
     let mut event_count = 0usize;
     let mut phases = BTreeMap::<String, Vec<u128>>::new();
+    let mut progress_phases = BTreeMap::<String, usize>::new();
     let mut slow_events = Vec::<TraceSlowEvent>::new();
     let mut block_sources = BTreeMap::<String, usize>::new();
     let mut block_store = TraceBlockStoreAggregate::default();
@@ -3420,6 +3434,10 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             continue;
         };
         event_count += 1;
+        let progress_phase = trace_progress_phase(phase, &value);
+        *progress_phases
+            .entry(progress_phase.to_string())
+            .or_default() += 1;
         let elapsed_ms = value.get("elapsed_ms").and_then(json_u128);
         let request_key = trace_request_key(&value);
         if phase == "request_start" {
@@ -4009,6 +4027,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         line_count,
         event_count,
         phases,
+        progress_phases: sorted_trace_counts(progress_phases),
         slow_events,
         block_sources: sorted_trace_counts(block_sources),
         block_store,
@@ -4128,6 +4147,88 @@ fn sorted_trace_counts(counts: BTreeMap<String, usize>) -> Vec<TraceValueCount> 
     });
     values.truncate(MAX_TRACE_SLOW_EVENTS);
     values
+}
+
+fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'a str {
+    match raw_phase {
+        "request_start" | "preload_start" => "started",
+        "request_done" => match value.get("status").and_then(json_u128) {
+            Some(status) if status >= 400 => "failed",
+            _ => "completed",
+        },
+        "preload_done" => match value.get("ok").and_then(|ok| ok.as_bool()) {
+            Some(false) => "failed",
+            _ => "completed",
+        },
+        "preload_cancelled" => "cancelled",
+        "block_store_get" => match value.get("cache_hit").and_then(|hit| hit.as_bool()) {
+            Some(true) => "cache_hit",
+            _ => "checking_cache",
+        },
+        "block_fetch_total" => match value.get("source").and_then(|source| source.as_str()) {
+            Some("cache") => "cache_hit",
+            Some("bitswap") => "fetching_bitswap",
+            Some("http_provider") => "fetching_http_provider",
+            _ => "streaming",
+        },
+        "block_fetch_coalesced" => "streaming",
+        "name_cache" => match value.get("cache_hit").and_then(|hit| hit.as_bool()) {
+            Some(true) => "name_resolved",
+            _ => "resolving_name",
+        },
+        "name_resolve" => match value.get("ok").and_then(|ok| ok.as_bool()) {
+            Some(false) => "failed",
+            _ => "name_resolved",
+        },
+        "provider_cache" => match value.get("cache_hit").and_then(|hit| hit.as_bool()) {
+            Some(true) => "providers_found",
+            _ => "provider_lookup",
+        },
+        "provider_lookup" if value.get("error").is_some() => "failed",
+        "provider_lookup" => "providers_found",
+        "provider_diversity_low" => "provider_diversity_low",
+        "light_dht_provider_lookup" | "dht_provider_lookup" => "dht_fallback_started",
+        "provider_fetch_start" => "providers_found",
+        "http_provider_fetch" => "fetching_http_provider",
+        "bitswap_fetch"
+        | "bitswap_peer_attempt"
+        | "bitswap_peer_attempt_start"
+        | "bitswap_peer_expand"
+        | "bitswap_dial_plan"
+        | "bitswap_session_shortcut"
+        | "bitswap_session_shortcut_start"
+        | "bitswap_session_shortcut_post_lookup_wait" => "fetching_bitswap",
+        "bitswap_fetch_cancelled" => "cancelled",
+        "bitswap_request_timeout_detail"
+        | "retry_provider_count"
+        | "provider_retry_after_connection_timeout"
+        | "bitswap_connection_error_backoff"
+        | "bitswap_connection_error_peer_skipped"
+        | "bitswap_request_timeout"
+        | "provider_retry_after_timeout"
+        | "provider_retry_after_request_timeout"
+        | "provider_refresh_after_timeout"
+        | "provider_refresh_after_failure" => "retrying",
+        "ipfs_path_parse"
+        | "mime_total"
+        | "mime_detect"
+        | "mime_sniff_read"
+        | "unixfs_resource"
+        | "unixfs_metadata_cache"
+        | "unixfs_file_size"
+        | "unixfs_index_lookup"
+        | "unixfs_list_directory" => "streaming",
+        "gateway_limiter"
+            if value
+                .get("acquired")
+                .and_then(|acquired| acquired.as_bool())
+                == Some(false) =>
+        {
+            "failed"
+        }
+        "gateway_limiter" => "queued",
+        _ => raw_phase,
+    }
 }
 
 fn format_trace_counts(counts: &[TraceValueCount]) -> String {
@@ -4852,6 +4953,82 @@ mod tests {
     }
 
     #[test]
+    fn trace_summary_derives_mobile_progress_phases() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-progress-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"request_start\",\"request_id\":1,\"path\":\"/ipns/site/\"}\n",
+                "{\"phase\":\"name_cache\",\"name\":\"site.test\",\"cache_hit\":false}\n",
+                "{\"phase\":\"name_resolve\",\"name\":\"site.test\",\"ok\":true,\"resolved_target\":\"/ipfs/root\"}\n",
+                "{\"phase\":\"provider_cache\",\"cid\":\"cid-a\",\"cache_hit\":false}\n",
+                "{\"phase\":\"provider_lookup\",\"cid\":\"cid-a\",\"provider_count\":3}\n",
+                "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid-a\",\"provider_count\":1,\"fallback\":\"light_dht\"}\n",
+                "{\"phase\":\"block_store_get\",\"cid\":\"cid-a\",\"cache_hit\":false}\n",
+                "{\"phase\":\"block_store_get\",\"cid\":\"cid-b\",\"cache_hit\":true}\n",
+                "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-a\",\"ok\":true}\n",
+                "{\"phase\":\"bitswap_peer_expand\",\"cid\":\"cid-a\",\"peer_count\":2}\n",
+                "{\"phase\":\"unixfs_resource\",\"path\":\"/ipns/site/\",\"ok\":true}\n",
+                "{\"phase\":\"bitswap_request_timeout\",\"cid\":\"cid-a\",\"peer_count\":2}\n",
+                "{\"phase\":\"gateway_limiter\",\"acquired\":false}\n",
+                "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipns/site/\",\"status\":200}\n",
+                "{\"phase\":\"request_done\",\"request_id\":2,\"path\":\"/ipns/missing/\",\"status\":503}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(trace_value_count(&summary.progress_phases, "started"), 1);
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "resolving_name"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "name_resolved"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "provider_lookup"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "providers_found"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "provider_diversity_low"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "checking_cache"),
+            1
+        );
+        assert_eq!(trace_value_count(&summary.progress_phases, "cache_hit"), 1);
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "fetching_http_provider"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "fetching_bitswap"),
+            1
+        );
+        assert_eq!(trace_value_count(&summary.progress_phases, "streaming"), 1);
+        assert_eq!(trace_value_count(&summary.progress_phases, "retrying"), 1);
+        assert_eq!(trace_value_count(&summary.progress_phases, "completed"), 1);
+        assert_eq!(trace_value_count(&summary.progress_phases, "failed"), 2);
+    }
+
+    #[test]
     fn trace_summary_keeps_restarted_gateway_request_ids_separate() {
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -5234,6 +5411,14 @@ mod tests {
         assert_eq!(results[0].url, "http://127.0.0.1:8080/ipfs/second");
         assert!(!results[0].passed);
         assert_eq!(results[0].failures, vec!["run timed out after 7s"]);
+    }
+
+    fn trace_value_count(counts: &[TraceValueCount], value: &str) -> usize {
+        counts
+            .iter()
+            .find(|count| count.value == value)
+            .map(|count| count.count)
+            .unwrap_or_default()
     }
 
     fn run_result(

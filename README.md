@@ -154,9 +154,9 @@ Live retrieval soak with cold gateway rounds:
 make live-soak
 ```
 
-The mobile web harness trace summary also reports Bitswap source peers, DNS
-expansion cache hits, UnixFS metadata cache reuse, and trusted/session peer
-outcomes for child-block reliability experiments.
+The mobile web harness trace summary also reports UI-style progress phases,
+Bitswap source peers, DNS expansion cache hits, UnixFS metadata cache reuse, and
+trusted/session peer outcomes for child-block reliability experiments.
 
 Light-DHT provider discovery smoke:
 

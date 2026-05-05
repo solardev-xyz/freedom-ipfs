@@ -5790,6 +5790,53 @@ public gateway fallback, or mobile resource caps.
 
 Known follow-up:
 
-- Extend the live harness to collect progress snapshots during page loads.
 - Add richer page-load grouping semantics on top of the current request-header
   correlation if Swift needs more than numeric parent/top-level IDs.
+
+## 2026-05-05 Harness Progress Phase Summary
+
+Goal:
+
+- Make long-running live harness runs show whether a page is spending time in
+  user-visible progress states, without manually grepping raw gateway JSONL.
+- Keep this diagnostics-only and reuse existing trace events; do not change the
+  gateway retrieval path.
+
+Implementation:
+
+- Extend `TraceSummary` with `progress_phases`.
+- Derive progress phases from existing trace events using the same UI-oriented
+  vocabulary as the mobile progress API: `queued`, `started`,
+  `resolving_name`, `name_resolved`, `checking_cache`, `cache_hit`,
+  `provider_lookup`, `providers_found`, `provider_diversity_low`,
+  `dht_fallback_started`, `fetching_bitswap`, `fetching_http_provider`,
+  `streaming`, `retrying`, `completed`, `cancelled`, and `failed`.
+- Print `progress phases: ...` in normal and Rust-vs-Kubo comparison trace
+  summaries when `--trace-output` is enabled.
+- This harness summary does not poll the mobile FFI snapshot because the current
+  harness usually drives an out-of-process CLI gateway, not an in-process mobile
+  node.
+- Tighten the mobile progress mapper for name cache/resolution, provider cache,
+  Bitswap peer expansion/dial plans, retry/backoff events, block-source totals,
+  and UnixFS/MIME response work so Swift sees stable UI phases instead of raw
+  trace names for common page-load events.
+- Update `docs/mobile-progress-api.md`, `docs/mobile-web-readiness/README.md`,
+  and the top-level README with the new harness summary and stable phase list.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+cargo test -p mobile-web-harness
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+cargo test -p freedom-ipfs-mobile
+cargo test -p freedom-ipfs-gateway --lib
+cargo test -p freedom-ipfs-retrieval --lib
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result: validation passed. No live public-network harness run was performed for
+this small diagnostics increment.

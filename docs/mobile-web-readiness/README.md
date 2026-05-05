@@ -73,9 +73,11 @@ triage.
 
 For gateway phase tracing, pass `--trace-output /tmp/run.jsonl`. When the
 harness spawns the Rust gateway it forwards this path to the gateway, parses the
-JSONL events, and adds a phase summary to the report. This is the preferred way
-to distinguish DNSLink/name resolution, provider lookup, Bitswap fetch, UnixFS
-path traversal, MIME sniffing, and gateway limiter behavior during live runs.
+JSONL events, and adds raw phase and mobile-style progress phase summaries to
+the report. This is the preferred way to distinguish DNSLink/name resolution,
+provider lookup, cache checks, Bitswap fetch, HTTP-provider fetch, retry,
+UnixFS path traversal, MIME sniffing, and gateway limiter behavior during live
+runs.
 The spawned gateway uses a trace-friendly filter by default whenever
 `--trace-output` is set, so an ambient `RUST_LOG=warn` will not hide phase
 events. Use `--trace-filter` only when intentionally overriding the default.
@@ -86,12 +88,13 @@ slowest individual events with useful fields such as CID, path, source, provider
 count, peer count, trusted/session peer count, source peer, and bounded target
 summaries. The console output prints both sections so optimization runs
 immediately show which URL/CID/request caused the tail. Reports also include
-`block_sources` and `bitswap_source_peers` counts, which help quantify
-cache/Bitswap/HTTP-provider mix and peer reuse during provider/session
-experiments. Gateway response statuses and limiter denials are aggregated as
-well, making overload or `503` pressure visible in the normal report. Trace
-errors are grouped by phase and sanitized error string so provider-quality runs
-can show repeated DHT/Bitswap failure signatures without manual JSONL greps.
+`progress_phases`, `block_sources`, and `bitswap_source_peers` counts, which
+help quantify user-visible loading states, cache/Bitswap/HTTP-provider mix, and
+peer reuse during provider/session experiments. Gateway response statuses and
+limiter denials are aggregated as well, making overload or `503` pressure
+visible in the normal report. Trace errors are grouped by phase and sanitized
+error string so provider-quality runs can show repeated DHT/Bitswap failure
+signatures without manual JSONL greps.
 Bitswap session shortcut summaries include both started shortcut races and
 completed shortcut attempts, which makes hidden dropped background work visible
 when tuning recent-peer races. `bitswap_session_shortcut_post_lookup_wait`

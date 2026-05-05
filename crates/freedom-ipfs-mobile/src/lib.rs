@@ -451,19 +451,62 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
             "cache_hit"
         }
         "block_store_get" => "checking_cache",
+        "block_fetch_total" if fields.get("source").map(String::as_str) == Some("cache") => {
+            "cache_hit"
+        }
+        "block_fetch_total" if fields.get("source").map(String::as_str) == Some("bitswap") => {
+            "fetching_bitswap"
+        }
+        "block_fetch_total"
+            if fields.get("source").map(String::as_str) == Some("http_provider") =>
+        {
+            "fetching_http_provider"
+        }
+        "block_fetch_total" | "block_fetch_coalesced" => "streaming",
+        "name_cache" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
+            "name_resolved"
+        }
+        "name_cache" => "resolving_name",
+        "name_resolve" if fields.get("ok").map(String::as_str) == Some("false") => "failed",
+        "name_resolve" => "name_resolved",
+        "provider_cache" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
+            "providers_found"
+        }
+        "provider_cache" => "provider_lookup",
         "provider_lookup" if fields.get("error").is_some() => "failed",
         "provider_lookup" => "providers_found",
         "provider_diversity_low" => "provider_diversity_low",
         "light_dht_provider_lookup" | "dht_provider_lookup" => "dht_fallback_started",
+        "provider_fetch_start" => "providers_found",
         "http_provider_fetch" => "fetching_http_provider",
-        "bitswap_fetch" | "bitswap_session_shortcut" | "bitswap_peer_attempt_start" => {
-            "fetching_bitswap"
-        }
+        "bitswap_fetch"
+        | "bitswap_peer_attempt"
+        | "bitswap_peer_attempt_start"
+        | "bitswap_peer_expand"
+        | "bitswap_dial_plan"
+        | "bitswap_session_shortcut"
+        | "bitswap_session_shortcut_start"
+        | "bitswap_session_shortcut_post_lookup_wait" => "fetching_bitswap",
+        "bitswap_fetch_cancelled" => "cancelled",
+        "bitswap_request_timeout_detail"
+        | "retry_provider_count"
+        | "provider_retry_after_connection_timeout"
+        | "bitswap_connection_error_backoff"
+        | "bitswap_connection_error_peer_skipped" => "retrying",
         "bitswap_request_timeout"
         | "provider_retry_after_timeout"
         | "provider_retry_after_request_timeout"
         | "provider_refresh_after_timeout"
         | "provider_refresh_after_failure" => "retrying",
+        "ipfs_path_parse"
+        | "mime_total"
+        | "mime_detect"
+        | "mime_sniff_read"
+        | "unixfs_resource"
+        | "unixfs_metadata_cache"
+        | "unixfs_file_size"
+        | "unixfs_index_lookup"
+        | "unixfs_list_directory" => "streaming",
         "gateway_limiter" if fields.get("acquired").map(String::as_str) == Some("false") => {
             "failed"
         }
@@ -1822,6 +1865,66 @@ mod tests {
     }
 
     #[test]
+    fn progress_phase_maps_trace_events_to_ui_states() {
+        assert_eq!(
+            progress_phase(
+                "name_cache",
+                &progress_fields([("phase", "name_cache"), ("cache_hit", "false")]),
+                "active",
+            ),
+            "resolving_name"
+        );
+        assert_eq!(
+            progress_phase(
+                "name_resolve",
+                &progress_fields([("phase", "name_resolve"), ("ok", "true")]),
+                "active",
+            ),
+            "name_resolved"
+        );
+        assert_eq!(
+            progress_phase(
+                "provider_cache",
+                &progress_fields([("phase", "provider_cache"), ("cache_hit", "false")]),
+                "active",
+            ),
+            "provider_lookup"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_peer_expand",
+                &progress_fields([("phase", "bitswap_peer_expand"), ("peer_count", "3")]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "unixfs_resource",
+                &progress_fields([("phase", "unixfs_resource")]),
+                "active",
+            ),
+            "streaming"
+        );
+        assert_eq!(
+            progress_phase(
+                "block_fetch_total",
+                &progress_fields([("phase", "block_fetch_total"), ("source", "http_provider")]),
+                "active",
+            ),
+            "fetching_http_provider"
+        );
+        assert_eq!(
+            progress_phase(
+                "provider_retry_after_connection_timeout",
+                &progress_fields([("phase", "provider_retry_after_connection_timeout")]),
+                "active",
+            ),
+            "retrying"
+        );
+    }
+
+    #[test]
     fn restarts_online_gateway_for_routing_mode_changes() {
         unsafe {
             let node = freedom_ipfs_node_new_in_memory();
@@ -2180,5 +2283,16 @@ mod tests {
         let snapshot = CStr::from_ptr(snapshot_ptr).to_str().unwrap().to_string();
         freedom_ipfs_string_free(snapshot_ptr);
         snapshot
+    }
+
+    fn progress_fields(
+        values: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> ProgressFields {
+        ProgressFields {
+            values: values
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        }
     }
 }

@@ -78,14 +78,19 @@ and retrieval/Bitswap paths. It also records explicit mobile preload
 
 Important stable phases Swift can map immediately:
 
+- `queued`
 - `started`
+- `resolving_name`
+- `name_resolved`
 - `checking_cache`
 - `cache_hit`
+- `provider_lookup`
 - `providers_found`
 - `provider_diversity_low`
 - `dht_fallback_started`
 - `fetching_bitswap`
 - `fetching_http_provider`
+- `streaming`
 - `retrying`
 - `completed`
 - `failed`
@@ -105,11 +110,15 @@ let snapshot = reader.progressSnapshotJSON
 The app should treat `phase` as the UI-facing state and keep `raw_phase`,
 `last_error_code`, and `last_error_message` for diagnostics. A simple mapping is:
 
+- `queued`: "Waiting for gateway capacity"
+- `resolving_name`: "Resolving IPNS name"
+- `name_resolved`: "Name resolved"
 - `checking_cache` / `cache_hit`: "Checking local cache"
-- `providers_found` / `provider_diversity_low`: "Finding providers"
+- `provider_lookup` / `providers_found` / `provider_diversity_low`: "Finding providers"
 - `dht_fallback_started`: "Searching the network"
 - `fetching_bitswap`: "Fetching from IPFS peers"
 - `fetching_http_provider`: "Fetching from HTTP provider"
+- `streaming`: "Receiving content"
 - `retrying`: "Retrying slow provider"
 - `completed`: loaded
 - `failed`: failed
