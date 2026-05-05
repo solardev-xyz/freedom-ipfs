@@ -145,6 +145,7 @@ struct ProgressEvent {
     transport: Option<String>,
     delivery: Option<String>,
     bytes_loaded: Option<u64>,
+    bytes_total: Option<u64>,
     providers_found: Option<u64>,
     candidate_peers: Option<u64>,
     blocks_loaded: u64,
@@ -169,6 +170,8 @@ struct ProgressTarget {
     source: Option<String>,
     transport: Option<String>,
     delivery: Option<String>,
+    bytes_loaded: Option<u64>,
+    bytes_total: Option<u64>,
     elapsed_ms: Option<u64>,
     blocks_loaded: u64,
     retry_count: u64,
@@ -225,8 +228,20 @@ impl ProgressRecorder {
         inner.next_event_id = inner.next_event_id.saturating_add(1);
         let target_key = format!("{kind}:{target_id}");
         let previous_target = inner.active_targets.get(&target_key);
-        let (previous_blocks_loaded, previous_retry_count) = previous_target
-            .map(|target| (target.blocks_loaded, target.retry_count))
+        let (
+            previous_bytes_loaded,
+            previous_bytes_total,
+            previous_blocks_loaded,
+            previous_retry_count,
+        ) = previous_target
+            .map(|target| {
+                (
+                    target.bytes_loaded,
+                    target.bytes_total,
+                    target.blocks_loaded,
+                    target.retry_count,
+                )
+            })
             .unwrap_or_default();
         let target_source = source
             .clone()
@@ -240,6 +255,8 @@ impl ProgressRecorder {
         let blocks_loaded =
             previous_blocks_loaded.saturating_add(u64::from(raw_phase == "block_fetch_total"));
         let retry_count = previous_retry_count.saturating_add(u64::from(phase == "retrying"));
+        let bytes_loaded = progress_bytes_loaded(&fields).or(previous_bytes_loaded);
+        let bytes_total = progress_bytes_total(&fields).or(previous_bytes_total);
         let event = ProgressEvent {
             event_id: inner.next_event_id,
             target_id,
@@ -255,9 +272,8 @@ impl ProgressRecorder {
             source: target_source.clone(),
             transport: target_transport.clone(),
             delivery: target_delivery.clone(),
-            bytes_loaded: fields
-                .get_u64("bytes")
-                .or_else(|| fields.get_u64("body_len")),
+            bytes_loaded,
+            bytes_total,
             providers_found: fields
                 .get_u64("provider_count")
                 .or_else(|| fields.get_u64("retry_provider_count")),
@@ -294,6 +310,8 @@ impl ProgressRecorder {
                     source: target_source,
                     transport: target_transport,
                     delivery: target_delivery,
+                    bytes_loaded,
+                    bytes_total,
                     elapsed_ms,
                     blocks_loaded,
                     retry_count,
@@ -429,6 +447,19 @@ fn ensure_progress_tracing() {
         let subscriber = Registry::default().with(layer);
         let _ = tracing::subscriber::set_global_default(subscriber);
     });
+}
+
+fn progress_bytes_loaded(fields: &ProgressFields) -> Option<u64> {
+    fields
+        .get_u64("bytes")
+        .or_else(|| fields.get_u64("body_len"))
+}
+
+fn progress_bytes_total(fields: &ProgressFields) -> Option<u64> {
+    fields
+        .get_u64("bytes_total")
+        .or_else(|| fields.get_u64("file_len"))
+        .or_else(|| fields.get_u64("body_len"))
 }
 
 fn progress_kind(fields: &ProgressFields, raw_phase: &str, span: &ProgressSpanFields) -> String {
@@ -2111,6 +2142,15 @@ mod tests {
         recorder.record_event(
             span.clone(),
             progress_fields([
+                ("phase", "unixfs_resource"),
+                ("resource", "file"),
+                ("file_len", "600000"),
+            ]),
+            "test",
+        );
+        recorder.record_event(
+            span.clone(),
+            progress_fields([
                 ("phase", "request_done"),
                 ("status", "200"),
                 ("body_mode", "stream"),
@@ -2137,6 +2177,7 @@ mod tests {
             .unwrap();
         assert_eq!(response_ready["phase"], "streaming");
         assert_eq!(response_ready["status"], "active");
+        assert_eq!(response_ready["bytes_total"].as_u64().unwrap(), 600000);
         let completed = events
             .iter()
             .find(|event| event["raw_phase"] == "gateway_stream_done")
@@ -2146,6 +2187,7 @@ mod tests {
         assert_eq!(completed["phase"], "completed");
         assert_eq!(completed["status"], "completed");
         assert_eq!(completed["bytes_loaded"].as_u64().unwrap(), 600000);
+        assert_eq!(completed["bytes_total"].as_u64().unwrap(), 600000);
     }
 
     #[test]

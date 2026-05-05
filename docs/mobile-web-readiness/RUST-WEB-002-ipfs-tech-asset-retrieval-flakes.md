@@ -11145,6 +11145,8 @@ Change:
   `request_done`.
 - Add `gateway_stream_failed` so a stream read error after headers have been
   produced can still fail mobile progress instead of leaving the target active.
+- Add mobile progress `bytes_total`, populated from `file_len`, `body_len`, or
+  explicit `bytes_total` fields and carried forward on the active target.
 
 Implementation note:
 An earlier version emitted from the stream terminal `None` state. The
@@ -11161,6 +11163,7 @@ Validation:
 cargo fmt --all --check
 cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
 cargo test -p freedom-ipfs-mobile progress_snapshot_records_stream_body_bytes
+cargo test -p freedom-ipfs-mobile progress_snapshot_records_gateway_request_phases
 cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
 cargo test -p freedom-ipfs-gateway
 
@@ -11179,6 +11182,7 @@ Result:
 
 - focused mobile progress test passed
 - focused mobile streamed-byte snapshot test passed
+- focused gateway progress snapshot test passed
 - focused harness progress summary test passed
 - all gateway tests passed
 - deterministic full-response fixture passed `1/1`
@@ -11203,6 +11207,8 @@ Result:
   the JSONL trace
 - slow event details include `body_mode=stream` on `request_done` and
   `body_len=600000`, `chunks=10` on `gateway_stream_done`
+- mobile progress JSON now carries `bytes_total`; streamed completion events
+  report `bytes_loaded=600000` and `bytes_total=600000`
 
 Decision:
 Keep. The event closes the diagnostic gap identified by the stream/range

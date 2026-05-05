@@ -28,6 +28,8 @@ The returned string is owned by Rust and must be released with
       "source": "bitswap",
       "transport": "tcp",
       "delivery": "incoming",
+      "bytes_loaded": null,
+      "bytes_total": 600000,
       "elapsed_ms": 812,
       "blocks_loaded": 2,
       "retry_count": 1,
@@ -54,6 +56,7 @@ The returned string is owned by Rust and must be released with
       "transport": "tcp",
       "delivery": "incoming",
       "bytes_loaded": 38394,
+      "bytes_total": 600000,
       "providers_found": null,
       "candidate_peers": 10,
       "blocks_loaded": 2,
@@ -73,9 +76,11 @@ number of currently active targets. `active` contains currently active targets
 only; completed, failed, and cancelled targets remain visible in recent
 `events`.
 
-`blocks_loaded` and `retry_count` are per-target counters. They accumulate while
-the target is active, and the final completed/failed/cancelled event carries
-the last values even though the target is removed from `active`.
+`bytes_loaded`, `bytes_total`, `blocks_loaded`, and `retry_count` are per-target
+fields. `bytes_total` is filled when the gateway knows the UnixFS file length or
+streamed response body length. `blocks_loaded` and `retry_count` accumulate
+while the target is active, and the final completed/failed/cancelled event
+carries the last values even though the target is removed from `active`.
 
 `source` is a stable high-level source such as `cache`, `bitswap`,
 `http_provider`, `delegated_routing`, or `dht`. `transport` is the network
