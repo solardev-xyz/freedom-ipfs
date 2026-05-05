@@ -19238,3 +19238,57 @@ Decision:
 Keep as range guardrail evidence. The range path stays fast and resource-light,
 and neither self-hedge fires on already-fast delegated or HTTP-provider
 lookups.
+
+## 2026-05-05 Baseline: DAICO And Vitalik Post-Self-Hedge Kubo Comparison
+
+Question:
+After the HTTP-provider and delegated-router self-hedge changes, where do the
+two lightweight guardrail cases stand against Kubo?
+
+Command:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daico-vitalik-post-self-hedges-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/daico-vitalik-post-self-hedges-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- `daicowtf-page-assets`:
+  - Root TTFB p50/p95: Rust `289ms` / `320ms`; Kubo `2366ms` /
+    `3557ms`.
+  - Rust ratio p50/p95: `0.12x` / `0.09x`.
+- `vitalik-root-html-range`:
+  - Root/range TTFB p50/p95: Rust `99ms` / `119ms`; Kubo `1819ms` /
+    `2672ms`.
+  - Rust ratio p50/p95: `0.05x` / `0.04x`.
+- Shared resource maxima across the paired run:
+  - Rust max RSS/FD: `34440KiB` / `14`.
+  - Kubo max RSS/FD: `149108KiB` / `110`.
+  - Rust/Kubo resource ratios: RSS `0.23x`, FD `0.13x`.
+- Rust block sources: `http_provider=15`.
+- Rust delegated provider lookup p50/p90/p95/max:
+  `14ms` / `43ms` / `48ms` / `48ms`.
+- Rust delegated self-hedges: `0`.
+- Rust HTTP-provider fetch p50/p90/p95/max:
+  `48ms` / `85ms` / `94ms` / `94ms`.
+- Rust HTTP-provider self-hedges: `0`.
+
+Conclusion:
+Current Rust is meaningfully faster than Kubo on these two small guardrail
+cases while using much less RSS and far fewer file descriptors. Both
+self-hedge mechanisms stay idle on these already-fast paths, which supports
+keeping them as bounded rare-tail guards rather than active steady-state work.
