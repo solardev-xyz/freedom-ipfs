@@ -555,7 +555,9 @@ fn progress_source(raw_phase: &str, fields: &ProgressFields) -> Option<String> {
             Some("cache".into())
         }
         "http_provider_fetch" | "http_provider_race" => Some("http_provider".into()),
-        "delegated_provider_lookup" => Some("delegated_routing".into()),
+        "delegated_provider_lookup" | "delegated_provider_empty_retry" => {
+            Some("delegated_routing".into())
+        }
         "provider_diversity_low" | "light_dht_provider_lookup" | "dht_provider_lookup" => {
             Some("dht".into())
         }
@@ -626,6 +628,7 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         "light_dht_provider_lookup" | "dht_provider_lookup" => "dht_fallback_started",
         "provider_fetch_start" => "providers_found",
         "delegated_provider_lookup"
+        | "delegated_provider_empty_retry"
         | "bitswap_dns_prefetch"
         | "bitswap_dnsaddr_expand"
         | "bitswap_dns_multiaddr_expand" => "provider_lookup",
@@ -2287,6 +2290,14 @@ mod tests {
         );
         assert_eq!(
             progress_source(
+                "delegated_provider_empty_retry",
+                &progress_fields([("phase", "delegated_provider_empty_retry")]),
+            )
+            .as_deref(),
+            Some("delegated_routing")
+        );
+        assert_eq!(
+            progress_source(
                 "http_provider_race",
                 &progress_fields([("phase", "http_provider_race")]),
             )
@@ -2343,6 +2354,17 @@ mod tests {
                 &progress_fields([
                     ("phase", "delegated_provider_lookup"),
                     ("provider_count", "8")
+                ]),
+                "active",
+            ),
+            "provider_lookup"
+        );
+        assert_eq!(
+            progress_phase(
+                "delegated_provider_empty_retry",
+                &progress_fields([
+                    ("phase", "delegated_provider_empty_retry"),
+                    ("provider_count", "1")
                 ]),
                 "active",
             ),

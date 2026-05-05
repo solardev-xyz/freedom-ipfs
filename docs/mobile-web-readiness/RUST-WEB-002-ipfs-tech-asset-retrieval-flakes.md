@@ -12844,3 +12844,179 @@ candidates, preserves verification-before-store/serve semantics, avoids public
 gateway fallback, and improves the live public range workload that motivated the
 experiment without regressing the deterministic seeded Bitswap case or mobile
 resource profile.
+
+## 2026-05-05 Keep: Retry Empty Delegated Provider Results Once
+
+Hypothesis:
+`daicowtf-page-assets` still exposes a sparse-provider reliability gap. In one
+same-window Rust/Kubo comparison, Kubo passed all three fresh runs while Rust
+passed only one. The two Rust failures were for the recurring child CID
+`bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u`: delegated
+routing returned `0` providers, the full `3s` DHT lookup found none, and the
+request failed. Seconds later, the same delegated router returned the Pinata WSS
+provider for that CID. A single short delegated retry after an empty result may
+catch transient router misses before spending the full DHT budget.
+
+Change:
+
+- In `AutoRoutingClient`, when delegated routing returns an empty provider set,
+  wait `100ms` and query delegated routing once more before falling through to
+  full light-DHT provider lookup.
+- Keep this scoped to empty delegated results only. Non-empty low-diversity
+  results keep the existing short DHT merge path.
+- Record normal delegated lookup stats for the retry and emit a
+  `delegated_provider_empty_retry` trace event.
+- Map the new trace phase to `provider_lookup` progress and
+  `delegated_routing` source in the mobile FFI progress snapshot and harness
+  summary.
+- No public gateway fallback is added; retrieval still uses only routing records
+  and verified block fetches.
+
+Baseline failure that motivated the change:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-http-provider-race-r3-trace.jsonl \
+  --comparison-output /tmp/daicowtf-http-provider-race-r3.json
+```
+
+Baseline result:
+
+- Rust passed `1/3`; Kubo passed `3/3`.
+- Rust root TTFB p50/p95 `3297ms` / `4097ms`; Kubo `3327ms` / `4444ms`.
+- Rust max RSS/FD `44492KiB` / `20`; Kubo `105668KiB` / `61`.
+- Failed Rust responses were `504`.
+- Failed child CID:
+  `bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u`.
+- Failure shape: delegated provider lookup returned `0`, full DHT provider
+  lookup timed out after about `3008-3012ms`, and the recent root-serving
+  session peer timed out for that child.
+- The one successful Rust run saw delegated routing return one WSS provider for
+  that child, then fetched it from `Qmdv6yNikmUWUWXufLJLRNkv6Y9sY5cmgeX5RVWA4WNMz4`
+  over WSS in `559ms`.
+
+Direct delegated-router sample after the failure:
+
+```sh
+for i in $(seq 1 12); do
+  curl -fsS -H 'Accept: application/x-ndjson' \
+    'https://delegated-ipfs.dev/routing/v1/providers/bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u' |
+    wc -l
+  sleep 1
+done
+```
+
+Result: all twelve samples returned `1` line. The provider record was:
+
+```json
+{"Addrs":["/dnsaddr/bitswap-v3.pinata.cloud"],"ID":"Qmdv6yNikmUWUWXufLJLRNkv6Y9sY5cmgeX5RVWA4WNMz4","Protocols":["transport-bitswap"],"Schema":"peer","transport-bitswap":"gBI="}
+```
+
+Focused validation:
+
+```sh
+cargo test -p freedom-ipfs-routing auto_routing_retries_empty_delegated_result_before_dht
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+```
+
+Result: all focused tests passed. The routing test proves an empty delegated
+response followed by a non-empty delegated retry avoids DHT fallback.
+
+Live follow-up:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-empty-delegated-retry-r3-trace.jsonl \
+  --comparison-output /tmp/daicowtf-empty-delegated-retry-r3.json
+```
+
+Live result:
+
+- Rust and Kubo both passed `3/3`.
+- Rust root TTFB p50/p95 `1632ms` / `1826ms`; Kubo `3108ms` / `3116ms`.
+- Rust max RSS/FD `44100KiB` / `20`; Kubo `107224KiB` / `74`.
+- Rust source peers: root from
+  `12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP` over TCP; child
+  blocks from `Qmdv6yNikmUWUWXufLJLRNkv6Y9sY5cmgeX5RVWA4WNMz4` over WSS.
+- The new `delegated_provider_empty_retry` event did not fire in this follow-up
+  because delegated routing returned the WSS provider on the first lookup in
+  each repeat. Treat this run as a guardrail, not proof of a direct live speed
+  win.
+
+Additional live guardrail:
+
+```sh
+timeout 480s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-empty-delegated-retry-r3-trace.jsonl \
+  --comparison-output /tmp/vitalik-empty-delegated-retry-r3.json
+```
+
+Guardrail result:
+
+- Rust and Kubo both passed `3/3`.
+- Rust root TTFB p50/p95 `162ms` / `514ms`; Kubo `2913ms` / `3145ms`.
+- Rust max RSS/FD `31488KiB` / `15`; Kubo `123456KiB` / `78`.
+- HTTP provider fetches remained healthy: events `6`, successes `6`, failures
+  `0`, p50/p95 `21ms` / `47ms`.
+- The new retry did not fire because delegated routing returned providers.
+
+Regression validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing
+cargo test -p freedom-ipfs-mobile
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy -p freedom-ipfs-routing --all-targets -- -D warnings
+cargo clippy -p freedom-ipfs-mobile --all-targets -- -D warnings
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Result:
+
+- routing suite passed: `21 passed; 0 failed; 1 ignored`
+- mobile suite passed: `26 passed; 0 failed`
+- mobile web harness suite passed: `32 passed; 0 failed`
+- workspace check passed
+- routing, mobile, and harness clippy passed with `-D warnings`
+
+Decision:
+Keep, but do not overstate the result. The live trace that motivated this
+showed transient empty delegated results for a CID whose provider record became
+available seconds later; the deterministic test proves the new path handles that
+exact shape. The successful live follow-ups did not exercise the retry, so this
+is a bounded robustness change rather than a measured live performance win. The
+cost is one extra delegated request and `100ms` only when delegated routing
+returns empty, before a much more expensive DHT lookup would already happen.

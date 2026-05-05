@@ -31,6 +31,7 @@ const MAX_DELEGATED_ROUTING_PROVIDERS: usize = 64;
 const MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY: usize = 2;
 const LOW_DIVERSITY_DELEGATED_MERGE_TIMEOUT: Duration = Duration::from_millis(750);
 const LOW_DIVERSITY_DHT_FALLBACK_TIMEOUT: Duration = Duration::from_millis(750);
+const EMPTY_DELEGATED_PROVIDER_RETRY_DELAY: Duration = Duration::from_millis(100);
 const DHT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const DHT_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const DHT_MAX_PENDING_OUTGOING_CONNECTIONS: u32 = 8;
@@ -431,90 +432,19 @@ impl AutoRoutingClient {
                 if let Some(stats) = stats {
                     stats.record_delegated_result(providers.len());
                 }
-                let bitswap_provider_count = bitswap_provider_diversity(&providers);
-                if bitswap_provider_count >= MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY {
-                    return Ok(providers);
-                }
-                tracing::info!(
-                    phase = "provider_diversity_low",
-                    cid = %cid,
-                    provider_count = providers.len(),
-                    bitswap_provider_count,
-                    min_bitswap_provider_count = MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY,
-                    fallback = "light_dht"
-                );
-                if let Some(stats) = stats {
-                    stats.record_dht_lookup();
-                }
-                let dht_started = Instant::now();
-                match tokio::time::timeout(
-                    LOW_DIVERSITY_DHT_FALLBACK_TIMEOUT,
-                    self.dht.providers(cid),
-                )
-                .await
-                {
-                    Ok(Ok(dht_providers)) => {
-                        if let Some(stats) = stats {
-                            stats.record_dht_result(dht_providers.len());
-                        }
-                        let dht_provider_count = dht_providers.len();
-                        let merged = merge_provider_lists(providers, dht_providers)?;
-                        tracing::info!(
-                            phase = "provider_diversity_low",
-                            cid = %cid,
-                            provider_count = merged.len(),
-                            dht_provider_count,
-                            bitswap_provider_count = bitswap_provider_diversity(&merged),
-                            fallback = "light_dht",
-                            ok = true
-                        );
-                        Ok(merged)
-                    }
-                    Ok(Err(err)) => {
-                        if let Some(stats) = stats {
-                            stats.record_dht_error();
-                        }
-                        tracing::info!(
-                            phase = "provider_diversity_low",
-                            cid = %cid,
-                            bitswap_provider_count,
-                            fallback = "light_dht",
-                            ok = false,
-                            error = %err
-                        );
-                        Ok(providers)
-                    }
-                    Err(_) => {
-                        if let Some(stats) = stats {
-                            stats.record_dht_error();
-                        }
-                        tracing::info!(
-                            phase = "dht_provider_lookup",
-                            cid = %cid,
-                            ok = false,
-                            error = "low diversity DHT fallback timed out",
-                            fallback = "light_dht",
-                            cancelled = true,
-                            max_providers = self.dht.max_providers,
-                            timeout_ms = LOW_DIVERSITY_DHT_FALLBACK_TIMEOUT.as_millis(),
-                            query_timeout_ms = self.dht.query_timeout.as_millis(),
-                            elapsed_ms = dht_started.elapsed().as_millis()
-                        );
-                        tracing::info!(
-                            phase = "provider_diversity_low",
-                            cid = %cid,
-                            bitswap_provider_count,
-                            fallback = "light_dht",
-                            ok = false,
-                            timeout_ms = LOW_DIVERSITY_DHT_FALLBACK_TIMEOUT.as_millis()
-                        );
-                        Ok(providers)
-                    }
-                }
+                self.providers_after_delegated_results(cid, providers, stats)
+                    .await
             }
             Ok(_) => {
                 if let Some(stats) = stats {
                     stats.record_delegated_result(0);
+                }
+                if let Some(providers) = self.retry_empty_delegated_lookup(cid, stats).await {
+                    return self
+                        .providers_after_delegated_results(cid, providers, stats)
+                        .await;
+                }
+                if let Some(stats) = stats {
                     stats.record_dht_lookup();
                 }
                 match self.dht.providers(cid).await {
@@ -552,6 +482,137 @@ impl AutoRoutingClient {
                     )))
                 }
             },
+        }
+    }
+
+    async fn providers_after_delegated_results(
+        &self,
+        cid: &Cid,
+        providers: Vec<Provider>,
+        stats: Option<&RoutingStatsHandle>,
+    ) -> Result<Vec<Provider>> {
+        let bitswap_provider_count = bitswap_provider_diversity(&providers);
+        if bitswap_provider_count >= MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY {
+            return Ok(providers);
+        }
+        tracing::info!(
+            phase = "provider_diversity_low",
+            cid = %cid,
+            provider_count = providers.len(),
+            bitswap_provider_count,
+            min_bitswap_provider_count = MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY,
+            fallback = "light_dht"
+        );
+        if let Some(stats) = stats {
+            stats.record_dht_lookup();
+        }
+        let dht_started = Instant::now();
+        match tokio::time::timeout(LOW_DIVERSITY_DHT_FALLBACK_TIMEOUT, self.dht.providers(cid))
+            .await
+        {
+            Ok(Ok(dht_providers)) => {
+                if let Some(stats) = stats {
+                    stats.record_dht_result(dht_providers.len());
+                }
+                let dht_provider_count = dht_providers.len();
+                let merged = merge_provider_lists(providers, dht_providers)?;
+                tracing::info!(
+                    phase = "provider_diversity_low",
+                    cid = %cid,
+                    provider_count = merged.len(),
+                    dht_provider_count,
+                    bitswap_provider_count = bitswap_provider_diversity(&merged),
+                    fallback = "light_dht",
+                    ok = true
+                );
+                Ok(merged)
+            }
+            Ok(Err(err)) => {
+                if let Some(stats) = stats {
+                    stats.record_dht_error();
+                }
+                tracing::info!(
+                    phase = "provider_diversity_low",
+                    cid = %cid,
+                    bitswap_provider_count,
+                    fallback = "light_dht",
+                    ok = false,
+                    error = %err
+                );
+                Ok(providers)
+            }
+            Err(_) => {
+                if let Some(stats) = stats {
+                    stats.record_dht_error();
+                }
+                tracing::info!(
+                    phase = "dht_provider_lookup",
+                    cid = %cid,
+                    ok = false,
+                    error = "low diversity DHT fallback timed out",
+                    fallback = "light_dht",
+                    cancelled = true,
+                    max_providers = self.dht.max_providers,
+                    timeout_ms = LOW_DIVERSITY_DHT_FALLBACK_TIMEOUT.as_millis(),
+                    query_timeout_ms = self.dht.query_timeout.as_millis(),
+                    elapsed_ms = dht_started.elapsed().as_millis()
+                );
+                tracing::info!(
+                    phase = "provider_diversity_low",
+                    cid = %cid,
+                    bitswap_provider_count,
+                    fallback = "light_dht",
+                    ok = false,
+                    timeout_ms = LOW_DIVERSITY_DHT_FALLBACK_TIMEOUT.as_millis()
+                );
+                Ok(providers)
+            }
+        }
+    }
+
+    async fn retry_empty_delegated_lookup(
+        &self,
+        cid: &Cid,
+        stats: Option<&RoutingStatsHandle>,
+    ) -> Option<Vec<Provider>> {
+        let started = Instant::now();
+        tokio::time::sleep(EMPTY_DELEGATED_PROVIDER_RETRY_DELAY).await;
+        if let Some(stats) = stats {
+            stats.record_delegated_lookup();
+        }
+        match self.delegated.providers(cid).await {
+            Ok(providers) => {
+                if let Some(stats) = stats {
+                    stats.record_delegated_result(providers.len());
+                }
+                tracing::info!(
+                    phase = "delegated_provider_empty_retry",
+                    cid = %cid,
+                    ok = true,
+                    provider_count = providers.len(),
+                    delay_ms = EMPTY_DELEGATED_PROVIDER_RETRY_DELAY.as_millis(),
+                    elapsed_ms = started.elapsed().as_millis()
+                );
+                if providers.is_empty() {
+                    None
+                } else {
+                    Some(providers)
+                }
+            }
+            Err(err) => {
+                if let Some(stats) = stats {
+                    stats.record_delegated_error();
+                }
+                tracing::info!(
+                    phase = "delegated_provider_empty_retry",
+                    cid = %cid,
+                    ok = false,
+                    error = %err,
+                    delay_ms = EMPTY_DELEGATED_PROVIDER_RETRY_DELAY.as_millis(),
+                    elapsed_ms = started.elapsed().as_millis()
+                );
+                None
+            }
         }
     }
 }
@@ -1439,6 +1500,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn auto_routing_retries_empty_delegated_result_before_dht() {
+        let cid = "bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u"
+            .parse::<Cid>()
+            .unwrap();
+        let (endpoint, delegated_task, request_count) = spawn_sequence_delegated_responses(vec![
+            r#"{"Providers":[]}"#,
+            r#"{"Providers":[{"ID":"peer-a","Addrs":["/ip4/127.0.0.1/tcp/4101"]},{"ID":"peer-b","Addrs":["/ip4/127.0.0.2/tcp/4101"]}]}"#,
+        ])
+        .await;
+        let stats = RoutingStatsHandle::default();
+        let dht = LightDhtClient::new(vec![
+            "/ip4/203.0.113.1/tcp/4001/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
+                .to_string(),
+        ])
+        .with_query_timeout(Duration::from_secs(5))
+        .with_max_providers(1);
+        let client = ProviderRoutingClient::from(AutoRoutingClient::new(
+            DelegatedRoutingClient::new(endpoint),
+            dht,
+        ))
+        .with_stats(stats.clone());
+
+        let providers = client.providers(&cid).await.unwrap();
+
+        assert_eq!(providers.len(), 2);
+        assert!(providers
+            .iter()
+            .any(|provider| provider.id.as_deref() == Some("peer-a")));
+        assert!(providers
+            .iter()
+            .any(|provider| provider.id.as_deref() == Some("peer-b")));
+        assert_eq!(request_count.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            stats.snapshot(),
+            RoutingStats {
+                delegated_provider_lookups: 2,
+                delegated_provider_results: 2,
+                delegated_provider_errors: 0,
+                dht_provider_lookups: 0,
+                dht_provider_results: 0,
+                dht_provider_errors: 0,
+            }
+        );
+        delegated_task.abort();
+        let _ = delegated_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn observed_light_dht_records_provider_lookup_stats() {
         let cid = "bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u"
             .parse::<Cid>()
@@ -1568,6 +1677,37 @@ mod tests {
                 .unwrap();
         });
         (format!("http://{addr}/routing/v1"), task)
+    }
+
+    async fn spawn_sequence_delegated_responses(
+        bodies: Vec<&'static str>,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let task_request_count = request_count.clone();
+        let bodies = bodies.into_iter().map(str::to_string).collect::<Vec<_>>();
+        let task = tokio::spawn(async move {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                task_request_count.fetch_add(1, Ordering::Relaxed);
+                let mut request = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut request).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        (format!("http://{addr}/routing/v1"), task, request_count)
     }
 
     #[test]

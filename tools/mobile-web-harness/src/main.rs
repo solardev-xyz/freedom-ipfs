@@ -6383,6 +6383,7 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         "light_dht_provider_lookup" | "dht_provider_lookup" => "dht_fallback_started",
         "provider_fetch_start" => "providers_found",
         "delegated_provider_lookup"
+        | "delegated_provider_empty_retry"
         | "bitswap_dns_prefetch"
         | "bitswap_dnsaddr_expand"
         | "bitswap_dns_multiaddr_expand" => "provider_lookup",
@@ -7765,6 +7766,7 @@ mod tests {
                 "{\"phase\":\"provider_cache\",\"cid\":\"cid-z\",\"cache_hit\":true,\"provider_count\":0}\n",
                 "{\"phase\":\"provider_lookup\",\"cid\":\"cid-a\",\"provider_count\":3}\n",
                 "{\"phase\":\"delegated_provider_lookup\",\"cid\":\"cid-a\",\"endpoint\":\"https://delegated-ipfs.dev/routing/v1\",\"provider_count\":3,\"elapsed_ms\":8}\n",
+                "{\"phase\":\"delegated_provider_empty_retry\",\"cid\":\"cid-a\",\"provider_count\":1,\"delay_ms\":100,\"elapsed_ms\":116}\n",
                 "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid-a\",\"provider_count\":1,\"fallback\":\"light_dht\"}\n",
                 "{\"phase\":\"bitswap_dns_prefetch\",\"dnsaddr_host_count\":1,\"dns_ip_host_count\":2,\"elapsed_ms\":5}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"peer.test\",\"record_count\":2}\n",
@@ -7805,7 +7807,7 @@ mod tests {
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "provider_lookup"),
-            4
+            5
         );
         assert_eq!(summary.delegated_provider_lookup.events, 1);
         assert_eq!(summary.delegated_provider_lookup.successes, 1);
