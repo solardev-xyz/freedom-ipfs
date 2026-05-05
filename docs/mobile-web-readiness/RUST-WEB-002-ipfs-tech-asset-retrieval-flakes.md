@@ -3895,3 +3895,96 @@ Decision: keep. This is diagnostics-only and confirms the current public
 network success path is overwhelmingly inbound delivery. Future behavior work
 should optimize scheduling, cancellation, and batching around that model rather
 than relying on completed outgoing stream attempts as the primary signal.
+
+## 2026-05-05 Keep 6s Bitswap Stream Read Timeout
+
+Hypothesis:
+The same-stream Bitswap read path still waited up to `10s` for a response, but
+recent public-network traces showed successful blocks arriving through inbound
+Bitswap streams while outgoing stream attempts rarely completed. A shorter
+per-stream read cap should reduce stale attempt pressure and failure tails
+without changing the request-level timeout or the inbound success path.
+
+Implementation:
+
+- Add `BITSWAP_STREAM_READ_TIMEOUT`.
+- Use `6s` instead of the previous inline `10s` timeout in
+  `request_bitswap_blocks_on_stream`.
+- Keep request-level caps unchanged: mixed trusted+provider requests remain
+  `4s`, broader cold Bitswap requests remain `15s`.
+
+Prototype validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib want_have_probe_falls_back_to_want_block_quickly
+cargo test -p freedom-ipfs-retrieval --lib dropped_bitswap_fetch_cancels_open_peer_stream
+cargo build -p freedom-ipfs-gateway
+```
+
+Live `6s` run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-stream-read6-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-stream-read6-r3.json
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root TTFB p50/p95 was
+`921/1776ms` versus Kubo `1718/2362ms`; Rust asset p50/p95 was `134/902ms`
+versus Kubo `162/2297ms`. Trace totals: `bitswap_fetches=26`,
+`session_shortcut_hits=79`, `peer_attempt_starts=427`, inbound
+`max_oldest_pending_ms=1064`, and `bitswap deliveries: incoming=105`.
+
+Same-window `10s` baseline from a detached worktree at `238a019`:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-stream-read10-238a019-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-stream-read10-238a019-r3.json
+```
+
+Baseline result: Rust and Kubo both passed `3/3`. Rust root p50/p95 was
+`1141/2074ms` versus Kubo `1704/2487ms`; Rust asset p50/p95 was `171/1443ms`
+versus Kubo `188/1048ms`. Trace totals: `bitswap_fetches=33`,
+`session_shortcut_hits=72`, `peer_attempt_starts=552`, inbound
+`max_oldest_pending_ms=1601`, and `bitswap deliveries: incoming=105`.
+
+Regression check:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/stream-read6-regression-r3-trace.jsonl \
+  --comparison-output /tmp/stream-read6-regression-r3.json
+```
+
+`vitalik-root-html-range` passed `3/3` for both Rust and Kubo; Rust root
+p50/p95 was `551/563ms` versus Kubo `1970/2043ms`. `daicowtf-page-assets`
+failed `0/3` for both Rust and Kubo with root timeouts, so this is not a
+Rust-only regression signal. Rust failed faster than Kubo in that window:
+root p50/p95 `10970/26949ms` versus Kubo `30002/30002ms`.
+
+Decision: keep. The `6s` cap improved the same-window `ipfs.tech` root and
+asset tails, reduced peer attempts `552 -> 427`, and lowered inbound pending
+age `1601ms -> 1064ms` without producing a Rust-only regression. This is
+consistent with the inbound-delivery model and mobile resource goals.

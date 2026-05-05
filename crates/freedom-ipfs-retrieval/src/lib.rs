@@ -48,6 +48,7 @@ const BITSWAP_CONNECTION_READY_TIMEOUT: Duration = Duration::from_secs(5);
 // Keep WANT_HAVE as a short peer-selection probe; slow probes otherwise sit
 // directly on the gateway TTFB path before we request the block.
 const BITSWAP_WANT_HAVE_TIMEOUT: Duration = Duration::from_millis(750);
+const BITSWAP_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(6);
 const BITSWAP_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const BITSWAP_SUCCESSFUL_PEER_TTL: Duration = Duration::from_secs(10 * 60);
 const BITSWAP_SESSION_SHORTCUT_GRACE: Duration = Duration::from_millis(0);
@@ -2880,7 +2881,7 @@ where
             "{protocol_name}: write failed: {err}"
         )));
     }
-    let blocks = match timeout(Duration::from_secs(10), read_bitswap_blocks(stream)).await {
+    let blocks = match timeout(BITSWAP_STREAM_READ_TIMEOUT, read_bitswap_blocks(stream)).await {
         Ok(Ok(blocks)) => blocks,
         Ok(Err(err)) => {
             return Err(BitswapProtocolFailure::other(format!(
