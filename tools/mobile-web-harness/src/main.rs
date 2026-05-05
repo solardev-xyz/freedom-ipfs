@@ -971,36 +971,7 @@ fn print_summary(report: &RunReport) {
                 );
             }
         }
-        if !trace.progress_request_groups.is_empty() {
-            println!("  progress request groups:");
-            for group in trace.progress_request_groups.iter().take(4) {
-                let statuses = format_trace_counts(&group.statuses);
-                let phases = format_trace_counts(&group.phases);
-                println!(
-                    "    {}: root_progress_id={} requests={} children={} failed={} elapsed={} max_event={}ms statuses={} phases={}",
-                    group.top_level_path,
-                    group.root_progress_request_id.as_deref().unwrap_or("-"),
-                    group.request_count,
-                    group.child_request_count,
-                    group.failed_request_count,
-                    group.request_elapsed_ms,
-                    group.max_event_ms,
-                    statuses,
-                    phases
-                );
-                for request in group.slow_requests.iter().take(3) {
-                    println!(
-                        "      {}: {}ms status={} progress_id={} parent_progress_id={} max_event={}ms",
-                        request.path,
-                        request.elapsed_ms,
-                        request.status.as_deref().unwrap_or("unknown"),
-                        request.progress_request_id.as_deref().unwrap_or("-"),
-                        request.parent_progress_request_id.as_deref().unwrap_or("-"),
-                        request.max_event_ms
-                    );
-                }
-            }
-        }
+        print_trace_progress_request_groups(trace);
         if !trace.slow_events.is_empty() {
             println!("  slow events:");
             for event in trace.slow_events.iter().take(8) {
@@ -1205,6 +1176,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
             trace.gateway_request_elapsed_ms
         );
     }
+    print_trace_progress_request_groups(trace);
     print_trace_timeout_recovery(trace);
     print_trace_gateway_direct_body(trace);
     print_trace_bitswap_peer_attempts(trace);
@@ -5592,6 +5564,40 @@ fn format_trace_counts(counts: &[TraceValueCount]) -> String {
         .map(|entry| format!("{}={}", entry.value, entry.count))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn print_trace_progress_request_groups(trace: &TraceSummary) {
+    if trace.progress_request_groups.is_empty() {
+        return;
+    }
+    println!("  progress request groups:");
+    for group in trace.progress_request_groups.iter().take(4) {
+        let statuses = format_trace_counts(&group.statuses);
+        let phases = format_trace_counts(&group.phases);
+        println!(
+            "    {}: root_progress_id={} requests={} children={} failed={} elapsed={} max_event={}ms statuses={} phases={}",
+            group.top_level_path,
+            group.root_progress_request_id.as_deref().unwrap_or("-"),
+            group.request_count,
+            group.child_request_count,
+            group.failed_request_count,
+            group.request_elapsed_ms,
+            group.max_event_ms,
+            statuses,
+            phases
+        );
+        for request in group.slow_requests.iter().take(3) {
+            println!(
+                "      {}: {}ms status={} progress_id={} parent_progress_id={} max_event={}ms",
+                request.path,
+                request.elapsed_ms,
+                request.status.as_deref().unwrap_or("unknown"),
+                request.progress_request_id.as_deref().unwrap_or("-"),
+                request.parent_progress_request_id.as_deref().unwrap_or("-"),
+                request.max_event_ms
+            );
+        }
+    }
 }
 
 fn format_request_correlation(request: &TraceRequestAggregate) -> String {

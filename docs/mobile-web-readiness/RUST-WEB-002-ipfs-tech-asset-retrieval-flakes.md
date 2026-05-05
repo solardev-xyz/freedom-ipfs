@@ -8425,7 +8425,8 @@ Implementation:
   response statuses, and phases per group.
 - Include request elapsed latency summaries, max event latency, and the slowest
   member requests for each group.
-- Print the top groups in normal harness console output.
+- Print the top groups in normal single-engine and Rust-vs-Kubo comparison
+  console output.
 - Add a focused synthetic trace test for one top-level page with child asset
   requests plus an independent second page.
 - Update `docs/mobile-web-readiness/README.md`.
