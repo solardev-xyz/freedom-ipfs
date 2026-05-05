@@ -3460,3 +3460,34 @@ Decision: keep. This changes diagnostics only. The next behavior experiment
 should account for the inbound-response model, likely by measuring whether
 smaller initial root peer races, a short first-byte hedge, or batching session
 wants can reduce root/asset p95 without increasing mobile dial pressure.
+
+Rejected follow-up: cold-only `500ms` WANT_HAVE fallback.
+
+Temporary experiment:
+
+- keep the existing `750ms` WANT_HAVE probe when a candidate set contains a
+  trusted/session peer
+- use a shorter `500ms` probe only for cold peer sets with no trusted peer
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-cold-want-have500-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-cold-want-have500-r3.json
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root p50/p95 was `2239/3901ms`
+versus Kubo `3068/3319ms`, so the cold root p95 remained worse than Kubo.
+Rust asset p50 matched Kubo (`124ms` versus `123ms`), but asset p95 regressed
+badly: Rust `1739ms` versus Kubo `394ms`. Rust remained mobile-light at max
+RSS/FD `52928KiB`/`48` versus Kubo `239240KiB`/`251`.
+
+Decision: reject and revert. The narrower timeout avoided changing warm/session
+candidate sets directly, but it still did not improve the root tail enough and
+made the asset tail materially worse in the same live window.

@@ -2458,6 +2458,7 @@ async fn fetch_bitswap_over_outgoing_streams(
             peer,
             cid,
             prefer_want_have,
+            BITSWAP_WANT_HAVE_TIMEOUT,
             dial_errors.clone(),
             peer_transports.clone(),
         ));
@@ -2522,6 +2523,7 @@ async fn request_bitswap_block_after_connection(
     peer: BitswapPeerTarget,
     cid: Cid,
     prefer_want_have: bool,
+    want_have_timeout: Duration,
     dial_errors: DialErrorLog,
     peer_transports: PeerTransportLog,
 ) -> std::result::Result<BitswapFetchResult, BitswapPeerFailure> {
@@ -2537,7 +2539,8 @@ async fn request_bitswap_block_after_connection(
         phase = "bitswap_peer_attempt_start",
         cid = %cid,
         peer = %peer_id,
-        prefer_want_have
+        prefer_want_have,
+        want_have_timeout_ms = want_have_timeout.as_millis()
     );
 
     if let Some(connection_ready) = connection_ready {
@@ -2551,6 +2554,7 @@ async fn request_bitswap_block_after_connection(
                     ok = false,
                     failure_kind = "connection_waiter_dropped",
                     prefer_want_have,
+                    want_have_timeout_ms = want_have_timeout.as_millis(),
                     elapsed_ms = attempt_started.elapsed().as_millis()
                 );
                 return Err(BitswapPeerFailure {
@@ -2571,6 +2575,7 @@ async fn request_bitswap_block_after_connection(
                     ok = false,
                     failure_kind = "connection_timeout",
                     prefer_want_have,
+                    want_have_timeout_ms = want_have_timeout.as_millis(),
                     elapsed_ms = attempt_started.elapsed().as_millis()
                 );
                 return Err(BitswapPeerFailure {
@@ -2593,6 +2598,7 @@ async fn request_bitswap_block_after_connection(
         addrs,
         cid,
         prefer_want_have,
+        want_have_timeout,
         peer_transports,
     )
     .await;
@@ -2604,6 +2610,7 @@ async fn request_bitswap_block_after_connection(
                 peer = %peer_id,
                 ok = true,
                 prefer_want_have,
+                want_have_timeout_ms = want_have_timeout.as_millis(),
                 source_transport = result.source_transport.unwrap_or("unknown"),
                 bytes = result.requested_block.len(),
                 extra_blocks = result.extra_blocks.len(),
@@ -2618,6 +2625,7 @@ async fn request_bitswap_block_after_connection(
                 ok = false,
                 failure_kind = bitswap_peer_failure_kind_label(err.kind),
                 prefer_want_have,
+                want_have_timeout_ms = want_have_timeout.as_millis(),
                 error = %err.detail,
                 elapsed_ms = attempt_started.elapsed().as_millis()
             );
@@ -2640,6 +2648,7 @@ async fn request_bitswap_block(
     addrs: Vec<Multiaddr>,
     cid: Cid,
     prefer_want_have: bool,
+    want_have_timeout: Duration,
     peer_transports: PeerTransportLog,
 ) -> std::result::Result<BitswapFetchResult, BitswapPeerFailure> {
     let mut failures = Vec::new();
@@ -2669,7 +2678,14 @@ async fn request_bitswap_block(
         };
 
         if prefer_want_have && protocol_name == "/ipfs/bitswap/1.2.0" {
-            match request_bitswap_block_after_want_have(&mut stream, &cid, &protocol_name).await {
+            match request_bitswap_block_after_want_have(
+                &mut stream,
+                &cid,
+                &protocol_name,
+                want_have_timeout,
+            )
+            .await
+            {
                 Ok(mut result) => {
                     result.source_peer = Some(peer_id);
                     result.source_transport =
@@ -2733,6 +2749,7 @@ async fn request_bitswap_block_after_want_have<T>(
     stream: &mut T,
     cid: &Cid,
     protocol_name: &str,
+    want_have_timeout: Duration,
 ) -> std::result::Result<BitswapFetchResult, WantHaveFailure>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -2744,7 +2761,7 @@ where
             )),
         ));
     }
-    let response = match timeout(BITSWAP_WANT_HAVE_TIMEOUT, read_bitswap_response(stream)).await {
+    let response = match timeout(want_have_timeout, read_bitswap_response(stream)).await {
         Ok(Ok(response)) => response,
         Ok(Err(err)) => {
             return Err(WantHaveFailure::TryOtherProtocols(
