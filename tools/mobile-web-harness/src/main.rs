@@ -528,6 +528,7 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             .bitswap_seed_car
             .as_ref()
             .map(|path| path.display().to_string()),
+        bitswap_seed_connection_setup: bitswap_seed_connection_setup(args),
         kubo_repo: args
             .kubo_repo
             .as_ref()
@@ -767,6 +768,9 @@ fn print_summary(report: &RunReport) {
     }
     if let Some(bitswap_seed_car) = &report.bitswap_seed_car {
         println!("bitswap_seed_car: {bitswap_seed_car}");
+    }
+    if let Some(setup) = report.bitswap_seed_connection_setup {
+        println!("bitswap_seed_connection_setup: {}", setup.as_str());
     }
     if let Some(kubo_repo) = &report.kubo_repo {
         println!("kubo_repo: {kubo_repo}");
@@ -3609,11 +3613,36 @@ struct RunReport {
     gateway_db: Option<String>,
     gateway_import_car: Option<String>,
     bitswap_seed_car: Option<String>,
+    bitswap_seed_connection_setup: Option<BitswapSeedConnectionSetup>,
     kubo_repo: Option<String>,
     trace_output: Option<String>,
     trace_summary: Option<TraceSummary>,
     summary: RepeatSummary,
     runs: Vec<RunResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BitswapSeedConnectionSetup {
+    DelegatedRouterProviderLookup,
+    SwarmConnectBeforeRequest,
+}
+
+impl BitswapSeedConnectionSetup {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DelegatedRouterProviderLookup => "delegated_router_provider_lookup",
+            Self::SwarmConnectBeforeRequest => "swarm_connect_before_request",
+        }
+    }
+}
+
+fn bitswap_seed_connection_setup(args: &Args) -> Option<BitswapSeedConnectionSetup> {
+    args.bitswap_seed_car.as_ref()?;
+    match args.engine {
+        HarnessEngine::Rust => Some(BitswapSeedConnectionSetup::DelegatedRouterProviderLookup),
+        HarnessEngine::Kubo => Some(BitswapSeedConnectionSetup::SwarmConnectBeforeRequest),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -6837,6 +6866,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bitswap_seed_connection_setup_describes_engine_setup() {
+        let rust_args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--engine",
+            "rust",
+            "--bitswap-seed-car",
+            "/tmp/mobile-fixture.car",
+        ])
+        .unwrap();
+        assert_eq!(
+            bitswap_seed_connection_setup(&rust_args),
+            Some(BitswapSeedConnectionSetup::DelegatedRouterProviderLookup)
+        );
+
+        let kubo_args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--engine",
+            "kubo",
+            "--bitswap-seed-car",
+            "/tmp/mobile-fixture.car",
+        ])
+        .unwrap();
+        assert_eq!(
+            bitswap_seed_connection_setup(&kubo_args),
+            Some(BitswapSeedConnectionSetup::SwarmConnectBeforeRequest)
+        );
+    }
+
     #[tokio::test]
     async fn gateway_import_car_requires_spawned_gateway() {
         let args = Args::try_parse_from([
@@ -8303,6 +8361,7 @@ mod tests {
             gateway_db: Some("/tmp/replay.db".to_string()),
             gateway_import_car: None,
             bitswap_seed_car: None,
+            bitswap_seed_connection_setup: None,
             kubo_repo: None,
             trace_output: None,
             trace_summary: None,

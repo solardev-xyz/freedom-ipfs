@@ -12257,3 +12257,42 @@ Decision:
 Keep. This is harness-only and does not change retrieval behavior. It gives the
 next Kubo-gap experiment an explicit dial/connection metric alongside request
 TTFB, provider lookup, and Bitswap batch summaries.
+
+## 2026-05-05 Keep: Record Seeded Harness Connection Setup
+
+Hypothesis:
+The local Bitswap seed harness is useful for deterministic Rust-vs-Kubo range
+comparisons, but the two engines are intentionally wired differently: Rust uses
+the seed delegated router and discovers/dials the provider during the timed
+request, while the Kubo client receives a `swarm connect` to the seed before
+timed requests start. Future Kubo-gap experiments need this context in the JSON
+artifact and console summary, not only in this doc.
+
+Change:
+
+- Add `bitswap_seed_connection_setup` to `RunReport`.
+- Report `delegated_router_provider_lookup` for Rust seeded runs.
+- Report `swarm_connect_before_request` for Kubo seeded runs.
+- Print the same value in the normal harness summary when `--bitswap-seed-car`
+  is active.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness bitswap_seed
+cargo test -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Result:
+
+- focused Bitswap seed harness tests passed: `6 passed; 0 failed`
+- full mobile web harness tests passed: `30 passed; 0 failed`
+- harness clippy passed with `-D warnings`
+
+Decision:
+Keep. This is diagnostics-only and does not change retrieval behavior. It makes
+seeded comparison artifacts explicit that Kubo's seeded root TTFB excludes the
+seed dial/connect step while Rust's seeded root TTFB includes provider lookup
+and Bitswap connection establishment.
