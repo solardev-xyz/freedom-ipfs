@@ -1153,6 +1153,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_progress_phases(trace);
     print_trace_provider_retries(trace);
     print_trace_timeout_recovery(trace);
+    print_trace_gateway_direct_body(trace);
     print_trace_bitswap_peer_attempts(trace);
     if trace.bitswap_session.has_events() {
         let session = &trace.bitswap_session;
@@ -1246,6 +1247,17 @@ fn print_trace_unixfs_metadata_cache(trace: &TraceSummary) {
         cache.file_size_evictions,
         cache.max_file_size_len,
         cache.max_capacity
+    );
+}
+
+fn print_trace_gateway_direct_body(trace: &TraceSummary) {
+    let direct = &trace.gateway_direct_body;
+    if direct.events == 0 {
+        return;
+    }
+    println!(
+        "  gateway direct bodies: events={} bytes={} max_body_len={} max_elapsed_ms={}",
+        direct.events, direct.bytes, direct.max_body_len, direct.max_elapsed_ms
     );
 }
 
@@ -3564,6 +3576,7 @@ struct TraceSummary {
     provider_retries: TraceProviderRetryAggregate,
     request_statuses: Vec<TraceValueCount>,
     gateway_limiter_denials: usize,
+    gateway_direct_body: TraceGatewayDirectBodyAggregate,
     unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
     bitswap_source_peers: Vec<TraceValueCount>,
     bitswap_source_transports: Vec<TraceValueCount>,
@@ -3643,6 +3656,14 @@ impl TraceProviderRetryAggregate {
             || self.timeout_retries > 0
             || self.connection_timeout_retries > 0
     }
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceGatewayDirectBodyAggregate {
+    events: usize,
+    bytes: u128,
+    max_body_len: u128,
+    max_elapsed_ms: u128,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -4084,6 +4105,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut provider_retries = TraceProviderRetryAggregate::default();
     let mut request_statuses = BTreeMap::<String, usize>::new();
     let mut gateway_limiter_denials = 0usize;
+    let mut gateway_direct_body = TraceGatewayDirectBodyAggregate::default();
     let mut unixfs_metadata_cache = TraceUnixfsMetadataCacheAggregate::default();
     let mut bitswap_source_peers = BTreeMap::<String, usize>::new();
     let mut bitswap_source_transports = BTreeMap::<String, usize>::new();
@@ -4245,6 +4267,18 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 == Some(false)
         {
             gateway_limiter_denials += 1;
+        }
+        if phase == "gateway_direct_body" {
+            gateway_direct_body.events += 1;
+            let body_len = value
+                .get("body_len")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            gateway_direct_body.bytes += body_len;
+            gateway_direct_body.max_body_len = gateway_direct_body.max_body_len.max(body_len);
+            gateway_direct_body.max_elapsed_ms = gateway_direct_body
+                .max_elapsed_ms
+                .max(elapsed_ms.unwrap_or_default());
         }
         if phase == "unixfs_metadata_cache" {
             unixfs_metadata_cache.events += 1;
@@ -4824,6 +4858,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         provider_retries,
         request_statuses: sorted_trace_counts(request_statuses),
         gateway_limiter_denials,
+        gateway_direct_body,
         unixfs_metadata_cache,
         bitswap_source_peers: sorted_trace_counts(bitswap_source_peers),
         bitswap_source_transports: sorted_trace_counts(bitswap_source_transports),
@@ -5016,6 +5051,7 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         | "provider_refresh_after_timeout"
         | "provider_refresh_after_failure" => "retrying",
         "ipfs_path_parse"
+        | "gateway_direct_body"
         | "mime_total"
         | "mime_detect"
         | "mime_sniff_read"
@@ -5821,6 +5857,7 @@ mod tests {
                 "{\"phase\":\"bitswap_peer_expand\",\"cid\":\"cid-a\",\"peer_count\":2}\n",
                 "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer-a\",\"transport\":\"tcp\"}\n",
                 "{\"phase\":\"unixfs_resource\",\"path\":\"/ipns/site/\",\"ok\":true}\n",
+                "{\"phase\":\"gateway_direct_body\",\"path\":\"/ipns/site/asset.css\",\"body_len\":4096}\n",
                 "{\"phase\":\"gateway_conditional\",\"path\":\"/ipns/site/\",\"outcome\":\"not_modified\"}\n",
                 "{\"phase\":\"bitswap_request_timeout\",\"cid\":\"cid-a\",\"peer_count\":2}\n",
                 "{\"phase\":\"bitswap_connection_error\",\"peer\":\"peer-b\",\"error\":\"timeout\"}\n",
@@ -5869,7 +5906,10 @@ mod tests {
             trace_value_count(&summary.progress_phases, "fetching_bitswap"),
             2
         );
-        assert_eq!(trace_value_count(&summary.progress_phases, "streaming"), 1);
+        assert_eq!(trace_value_count(&summary.progress_phases, "streaming"), 2);
+        assert_eq!(summary.gateway_direct_body.events, 1);
+        assert_eq!(summary.gateway_direct_body.bytes, 4096);
+        assert_eq!(summary.gateway_direct_body.max_body_len, 4096);
         assert_eq!(trace_value_count(&summary.progress_phases, "retrying"), 3);
         assert_eq!(trace_value_count(&summary.progress_phases, "completed"), 1);
         assert_eq!(trace_value_count(&summary.progress_phases, "failed"), 2);

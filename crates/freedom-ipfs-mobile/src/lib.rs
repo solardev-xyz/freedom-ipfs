@@ -523,6 +523,7 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         | "provider_refresh_after_timeout"
         | "provider_refresh_after_failure" => "retrying",
         "ipfs_path_parse"
+        | "gateway_direct_body"
         | "mime_total"
         | "mime_detect"
         | "mime_sniff_read"
@@ -2006,6 +2007,14 @@ mod tests {
             progress_phase(
                 "unixfs_resource",
                 &progress_fields([("phase", "unixfs_resource")]),
+                "active",
+            ),
+            "streaming"
+        );
+        assert_eq!(
+            progress_phase(
+                "gateway_direct_body",
+                &progress_fields([("phase", "gateway_direct_body"), ("body_len", "4096")]),
                 "active",
             ),
             "streaming"

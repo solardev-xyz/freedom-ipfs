@@ -4,7 +4,7 @@ use axum::http::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
     RANGE,
 };
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -321,6 +321,7 @@ async fn health() -> &'static str {
 async fn ipfs_get(
     State(state): State<GatewayState>,
     Path(path): Path<String>,
+    method: Method,
     headers: HeaderMap,
 ) -> Response {
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
@@ -374,8 +375,11 @@ async fn ipfs_get(
             state.provider.clone(),
             state.unixfs.clone(),
             &path,
-            headers.get(RANGE),
-            headers.get(IF_NONE_MATCH),
+            GatewayRequestHeaders {
+                range: headers.get(RANGE),
+                if_none_match: headers.get(IF_NONE_MATCH),
+                is_head: method == Method::HEAD,
+            },
         )
         .await
         {
@@ -397,6 +401,7 @@ async fn ipfs_get(
 async fn ipns_get(
     State(state): State<GatewayState>,
     Path(path): Path<String>,
+    method: Method,
     headers: HeaderMap,
 ) -> Response {
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
@@ -451,8 +456,11 @@ async fn ipns_get(
             state.unixfs.clone(),
             state.name_resolver.as_ref(),
             &path,
-            headers.get(RANGE),
-            headers.get(IF_NONE_MATCH),
+            GatewayRequestHeaders {
+                range: headers.get(RANGE),
+                if_none_match: headers.get(IF_NONE_MATCH),
+                is_head: method == Method::HEAD,
+            },
         )
         .await
         {
@@ -485,19 +493,24 @@ fn header_u64_for_trace(headers: &HeaderMap, name: &'static str) -> Option<u64> 
         .and_then(|value| value.parse::<u64>().ok())
 }
 
+#[derive(Clone, Copy)]
+struct GatewayRequestHeaders<'a> {
+    range: Option<&'a HeaderValue>,
+    if_none_match: Option<&'a HeaderValue>,
+    is_head: bool,
+}
+
 async fn serve_ipfs_path(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
     path: &str,
-    range: Option<&HeaderValue>,
-    if_none_match: Option<&HeaderValue>,
+    request_headers: GatewayRequestHeaders<'_>,
 ) -> Result<Response, GatewayError> {
     serve_ipfs_path_with_listing_path(
         provider,
         unixfs,
         path,
-        range,
-        if_none_match,
+        request_headers,
         None,
         FileCachePolicy::ImmutableIpfs,
     )
@@ -508,8 +521,7 @@ async fn serve_ipfs_path_with_listing_path(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
     path: &str,
-    range: Option<&HeaderValue>,
-    if_none_match: Option<&HeaderValue>,
+    request_headers: GatewayRequestHeaders<'_>,
     listing_path: Option<&DirectoryListingPath>,
     cache_policy: FileCachePolicy,
 ) -> Result<Response, GatewayError> {
@@ -537,7 +549,9 @@ async fn serve_ipfs_path_with_listing_path(
                 elapsed_ms = resource_elapsed_ms
             );
             let etag = file_etag(&cid, &path, len);
-            if range.is_none() && if_none_match_matches(if_none_match, &etag) {
+            if request_headers.range.is_none()
+                && if_none_match_matches(request_headers.if_none_match, &etag)
+            {
                 tracing::info!(
                     phase = "gateway_conditional",
                     cid = %cid,
@@ -560,8 +574,9 @@ async fn serve_ipfs_path_with_listing_path(
                 mime: &mime,
                 etag: &etag,
                 cache_policy,
+                is_head: request_headers.is_head,
             };
-            if let Some(range) = range {
+            if let Some(range) = request_headers.range {
                 ranged_response(provider, unixfs.clone(), cid, path, len, range, headers)?
             } else {
                 streaming_response(provider, unixfs.clone(), cid, path, len, headers)?
@@ -576,7 +591,7 @@ async fn serve_ipfs_path_with_listing_path(
                 entry_count = entries.len(),
                 elapsed_ms = resource_elapsed_ms
             );
-            if range.is_some() {
+            if request_headers.range.is_some() {
                 return Err(GatewayError::BadRequest(
                     "Range requests are not supported for directory listings".into(),
                 ));
@@ -871,8 +886,7 @@ async fn serve_ipns_path(
     unixfs: UnixfsResolver,
     name_resolver: &dyn NameResolver,
     path: &str,
-    range: Option<&HeaderValue>,
-    if_none_match: Option<&HeaderValue>,
+    request_headers: GatewayRequestHeaders<'_>,
 ) -> Result<Response, GatewayError> {
     let listing_path = DirectoryListingPath::ipns(path);
     let mut target = format!("/ipns/{path}");
@@ -883,8 +897,7 @@ async fn serve_ipns_path(
                 provider.clone(),
                 unixfs.clone(),
                 ipfs,
-                range,
-                if_none_match,
+                request_headers,
                 Some(&listing_path),
                 FileCachePolicy::RevalidateIpns,
             )
@@ -1037,6 +1050,7 @@ struct FileResponseHeaders<'a> {
     mime: &'a str,
     etag: &'a str,
     cache_policy: FileCachePolicy,
+    is_head: bool,
 }
 
 fn streaming_response(
@@ -1047,6 +1061,32 @@ fn streaming_response(
     len: u64,
     headers: FileResponseHeaders<'_>,
 ) -> Result<Response, GatewayError> {
+    if !headers.is_head && len <= GATEWAY_STREAM_CHUNK_SIZE {
+        let end = len.saturating_sub(1);
+        let body = if len == 0 {
+            Bytes::new()
+        } else {
+            let started = Instant::now();
+            let bytes = unixfs
+                .read_file_range(provider.as_ref(), &cid, &path, 0, end)
+                .map(Bytes::from)
+                .map_err(GatewayError::Unixfs)?;
+            tracing::info!(
+                phase = "gateway_direct_body",
+                cid = %cid,
+                unixfs_path = %path,
+                range_start = 0u64,
+                range_end = end,
+                body_len = bytes.len(),
+                elapsed_ms = started.elapsed().as_millis()
+            );
+            bytes
+        };
+        let mut response = Body::from(body).into_response();
+        insert_full_file_headers(&mut response, len, headers)?;
+        return Ok(response);
+    }
+
     let provider = Arc::new(ScopedBlockProvider::new(provider));
     let stream = stream::unfold(Some(0u64), move |offset| {
         let provider = provider.clone();
@@ -1077,6 +1117,15 @@ fn streaming_response(
     });
 
     let mut response = Body::from_stream(stream).into_response();
+    insert_full_file_headers(&mut response, len, headers)?;
+    Ok(response)
+}
+
+fn insert_full_file_headers(
+    response: &mut Response,
+    len: u64,
+    headers: FileResponseHeaders<'_>,
+) -> Result<(), GatewayError> {
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_str(headers.mime)
@@ -1090,8 +1139,8 @@ fn streaming_response(
         HeaderValue::from_str(&len.to_string())
             .map_err(|err| GatewayError::Internal(err.to_string()))?,
     );
-    insert_cache_headers(&mut response, headers.etag, headers.cache_policy)?;
-    Ok(response)
+    insert_cache_headers(response, headers.etag, headers.cache_policy)?;
+    Ok(())
 }
 
 struct ScopedBlockProvider {
@@ -1166,6 +1215,28 @@ fn ranged_response(
         ));
     };
     let (start, end) = parse_range_spec(spec, total_len)?;
+    let range_len = end - start + 1;
+    if !headers.is_head && range_len <= GATEWAY_STREAM_CHUNK_SIZE {
+        let started = Instant::now();
+        let body = unixfs
+            .read_file_range(provider.as_ref(), &cid, &path, start, end)
+            .map(Bytes::from)
+            .map_err(GatewayError::Unixfs)?;
+        tracing::info!(
+            phase = "gateway_direct_body",
+            cid = %cid,
+            unixfs_path = %path,
+            range_start = start,
+            range_end = end,
+            body_len = body.len(),
+            elapsed_ms = started.elapsed().as_millis()
+        );
+        let mut response = Body::from(body).into_response();
+        *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+        insert_range_file_headers(&mut response, total_len, start, end, headers)?;
+        return Ok(response);
+    }
+
     let provider = Arc::new(ScopedBlockProvider::new(provider));
     let stream = stream::unfold(Some(start), move |offset| {
         let provider = provider.clone();
@@ -1197,6 +1268,17 @@ fn ranged_response(
 
     let mut response = Body::from_stream(stream).into_response();
     *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+    insert_range_file_headers(&mut response, total_len, start, end, headers)?;
+    Ok(response)
+}
+
+fn insert_range_file_headers(
+    response: &mut Response,
+    total_len: u64,
+    start: u64,
+    end: u64,
+    headers: FileResponseHeaders<'_>,
+) -> Result<(), GatewayError> {
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_str(headers.mime)
@@ -1215,8 +1297,8 @@ fn ranged_response(
         HeaderValue::from_str(&(end - start + 1).to_string())
             .map_err(|err| GatewayError::Internal(err.to_string()))?,
     );
-    insert_cache_headers(&mut response, headers.etag, headers.cache_policy)?;
-    Ok(response)
+    insert_cache_headers(response, headers.etag, headers.cache_policy)?;
+    Ok(())
 }
 
 fn not_modified_response(
@@ -1550,6 +1632,7 @@ mod tests {
         let response = ipfs_get(
             State(state),
             Path(format!("{dir_cid}/index.html")),
+            Method::GET,
             HeaderMap::new(),
         )
         .await;
@@ -2308,6 +2391,7 @@ mod tests {
         let first = tokio::spawn(ipfs_get(
             State(state.clone()),
             Path(cid.to_string()),
+            Method::GET,
             HeaderMap::new(),
         ));
 
@@ -2319,7 +2403,13 @@ mod tests {
         }
         assert!(entered.load(Ordering::SeqCst));
 
-        let second = ipfs_get(State(state), Path(cid.to_string()), HeaderMap::new()).await;
+        let second = ipfs_get(
+            State(state),
+            Path(cid.to_string()),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let first = first.await.unwrap();

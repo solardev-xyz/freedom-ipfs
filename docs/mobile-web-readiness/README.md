@@ -147,6 +147,9 @@ connection-limit pressure by transport. UnixFS metadata-cache traces are also
 aggregated so reports show decoded DAG-PB cache events, path-resolution cache
 hits/misses, file-size cache hits/misses, inserts, evictions, skip counts,
 maximum lengths, and capacity without manual JSONL greps.
+Single-chunk gateway responses emit `gateway_direct_body` traces, and the
+comparison summary reports direct-body event count, total bytes, maximum body
+length, and maximum elapsed time so small-response fast paths are visible.
 Bitswap DNS expansion traces are aggregated as well, including cached versus
 uncached expansion events, failed DNSAddr lookups, TXT records, and resolved IPs.
 The `slow_cids` list groups elapsed trace events by CID with phase and path
@@ -238,7 +241,12 @@ status, MIME type, byte count, and timing.
   follow-up now reuses `/dnsaddr` and DNS multiaddr expansion results within one
   provider candidate set; a same-window `vitalik-root-html-range` comparison
   dropped Rust root TTFB from `4907ms` to `3080ms` and root
-  `bitswap_peer_expand` from `1397ms` to `940ms`.
+  `bitswap_peer_expand` from `1397ms` to `940ms`. Later warm-path follow-ups
+  added bounded UnixFS path and file-size caches and a conservative direct-body
+  path for non-HEAD responses up to one gateway chunk. In the latest
+  `ipfs.tech-page-assets` warm persistent comparison, Rust passed 3/3 with
+  root p50/p95 `20/20ms`, asset p50/p95 `8/43ms`, and 124 traced direct-body
+  responses, while Kubo passed 3/3 with root `2/3ms` and asset `3/5ms`.
 
 ## Next Scenario Targets
 

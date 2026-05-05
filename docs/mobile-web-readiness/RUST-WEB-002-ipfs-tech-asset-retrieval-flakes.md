@@ -7122,3 +7122,128 @@ Decision: keep. This gives a clear warm-path win: asset p50/p95 improved from
 block-store trace events dropped from `369` to `266` in the same harness mode.
 The cache stays bounded, positive-only, read-only, and in-memory, so it fits the
 mobile resource constraints.
+
+## 2026-05-05 Keep: Serve Single-Chunk Gateway Bodies Directly
+
+Motivation:
+After the UnixFS path and file-size caches, warm `ipfs.tech-page-assets` runs
+still spent a noticeable amount of time on many small asset responses. Most of
+those assets fit in one `GATEWAY_STREAM_CHUNK_SIZE` chunk. For those responses,
+the gateway can read the verified UnixFS range once and return a direct
+`Bytes` body instead of constructing an async stream and scoped block-retention
+wrapper. Large files, large ranges, and `HEAD` requests keep the existing
+streaming path.
+
+Implementation:
+
+- Add a direct-body path for non-HEAD full responses with
+  `len <= GATEWAY_STREAM_CHUNK_SIZE`.
+- Add the same direct-body path for non-HEAD byte ranges whose range length is
+  at most one gateway chunk.
+- Preserve the existing streaming path for larger responses and all `HEAD`
+  requests.
+- Emit `gateway_direct_body` traces with CID, UnixFS path, range bounds, body
+  length, and elapsed time.
+- Map `gateway_direct_body` to the mobile/harness progress phase `streaming`.
+- Add harness summaries for direct-body event count, total bytes, max body
+  length, and max elapsed time.
+
+Baseline:
+Use the file-size cache experiment above as the baseline.
+
+- Warm root TTFB p50/p95: Rust `19/21ms`, Kubo `2/3ms`.
+- Warm asset TTFB p50/p95: Rust `10/42ms`, Kubo `2/5ms`.
+- Max RSS/FD: Rust `50592KiB`/`44`, Kubo `172856KiB`/`137`.
+- Rust trace: `block_store events=266`, `file_size_hits=146`.
+
+Experiment:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --warmup-runs 1 \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-warm-persistent-direct-body-experiment-trace.jsonl \
+  --output /tmp/ipfs-tech-warm-persistent-direct-body-experiment.json
+```
+
+Experiment result:
+
+- Rust and Kubo both passed `3/3`.
+- Measured warm root TTFB p50/p95: Rust `20/20ms`, Kubo `2/3ms`.
+- Measured warm asset TTFB p50/p95: Rust `8/43ms`, Kubo `3/5ms`.
+- Max RSS/FD: Rust `50400KiB`/`37`, Kubo `250156KiB`/`294`.
+- Direct-body trace: `124` events, `916196` bytes total,
+  `max_body_len=61741`, elapsed p50/p95/max `1/13/18ms`.
+
+Cold sanity:
+
+```sh
+timeout 360s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/ipfs-tech-direct-body-cold-rust-vs-kubo-trace.jsonl \
+  --output /tmp/ipfs-tech-direct-body-cold-rust-vs-kubo.json
+```
+
+Cold result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1190/2629ms`, Kubo `1761/2794ms`.
+- Asset TTFB p50/p95: Rust `248/1148ms`, Kubo `139/592ms`.
+- Max RSS/FD: Rust `54036KiB`/`45`, Kubo `194292KiB`/`145`.
+- The run was dominated by public-network/provider variance:
+  `bitswap_dial_rejections=116`, retrying progress events `119`.
+- Direct-body trace: `93` events.
+
+Range-heavy sanity:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/vitalik-direct-body-range-rust-vs-kubo-trace.jsonl \
+  --output /tmp/vitalik-direct-body-range-rust-vs-kubo.json
+```
+
+Range-heavy result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1698/4474ms`, Kubo `1802/1958ms`.
+- Max RSS/FD: Rust `38400KiB`/`23`, Kubo `163956KiB`/`69`.
+- Direct-body trace: `3` events, `384` bytes total, max body `128`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-gateway
+cargo test -p freedom-ipfs-mobile
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Decision: keep. This is not a major retrieval breakthrough, but it is a small,
+bounded warm-path win: asset p50 improved from `10ms` to `8ms` in the warm
+persistent sample, p95 stayed effectively flat, the code path is limited to
+already verified single-chunk responses, and resource use stayed low. Cold
+network runs remain governed by provider discovery and Bitswap peer quality, so
+the next higher-leverage work should return to provider/session behavior rather
+than expanding this direct-body path.
