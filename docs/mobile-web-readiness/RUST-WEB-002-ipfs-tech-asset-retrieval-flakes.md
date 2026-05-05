@@ -2923,3 +2923,54 @@ rejected addrs: `78` relay, `75` WebTransport, and `67` WebRTC. This supports
 the next hypothesis that provider-address quality and possibly bounded
 peer-routing/relay-aware behavior matter more than increasing direct provider
 fanout for this class of Kubo gap.
+
+## 2026-05-05 Rejected ID-Only Peer-Routing Augmentation
+
+Hypothesis: some delegated provider records are provider IDs with no addresses,
+and Kubo may recover those by asking delegated peer routing for `/peers/{peer}`.
+A bounded Rust version might cheaply fill in addresses before Bitswap expansion.
+
+Experiment:
+
+- For each delegated provider response, query `/peers/{peer}` for at most the
+  first `4` ID-only providers.
+- Run those peer-routing requests concurrently.
+- Cap each peer-routing request at `750ms`.
+- Treat peer-routing errors/timeouts as non-fatal and keep the original provider
+  response.
+
+The deterministic test passed, but the live run did not justify keeping the
+behavior:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-peer-routing-idonly-r1-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-peer-routing-idonly-r1.json
+```
+
+Result: Rust and Kubo both passed `1/1`, but Rust asset p95 was still much
+worse: Rust asset p50/p95 `163/1498ms` versus Kubo `153/337ms`. Rust root TTFB
+was `2269ms` versus Kubo `3222ms`, and resources remained mobile-friendly at
+Rust RSS/FD `53348KiB`/`44` versus Kubo `243352KiB`/`225`.
+
+Trace evidence:
+
+```text
+delegated_peer_routing count=6 total_ms=1368 p50=19ms p95=752ms max=752ms
+resolved=0 in every delegated_peer_routing event
+timed_out=2 for one request
+bitswap_provider_quality.id_only_provider_count=17
+bitswap_provider_quality.provider_without_supported_bitswap_addr_count=132
+```
+
+Decision: reject and revert the behavior. In this window, delegated peer
+routing for ID-only provider records added bounded but real latency and resolved
+no useful provider addresses. The more important remaining signal is still the
+large unsupported direct-address mix: relay, WebTransport, and WebRTC records,
+not ID-only records.
