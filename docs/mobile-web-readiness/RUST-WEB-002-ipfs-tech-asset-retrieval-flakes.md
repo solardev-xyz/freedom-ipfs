@@ -8407,3 +8407,64 @@ git diff --check
 Decision: keep. This is diagnostics-only and makes the previous correlation
 header change useful in regular harness output and JSON reports, without
 changing request behavior or gateway runtime paths.
+
+## 2026-05-05 Keep: Page-Level Progress Request Groups
+
+Motivation:
+`slow_requests` shows individual gateway requests, but page loads are a tree:
+root HTML, assets, CSS-discovered assets, and conditional revalidations. After
+adding progress correlation headers and surfacing them in slow requests, the
+next useful diagnostics step is a bounded page-level aggregate that says which
+top-level navigation had slow or failed subrequests.
+
+Implementation:
+
+- Add serialized `progress_request_groups` to trace summaries.
+- Group correlated requests by top-level path and root progress request ID.
+- Count total requests, child requests, completed requests, failed requests,
+  response statuses, and phases per group.
+- Include request elapsed latency summaries, max event latency, and the slowest
+  member requests for each group.
+- Print the top groups in normal harness console output.
+- Add a focused synthetic trace test for one top-level page with child asset
+  requests plus an independent second page.
+- Update `docs/mobile-web-readiness/README.md`.
+
+Validation:
+
+```sh
+cargo fmt --all
+cargo test -p mobile-web-harness trace_summary_groups_progress_correlated_requests
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+timeout 240s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/ipfs-tech-progress-groups-r2-trace.jsonl \
+  --output /tmp/ipfs-tech-progress-groups-r2.json
+git diff --check
+```
+
+Live result:
+
+- `ipfs-tech-page-assets` passed `1/1`.
+- Root TTFB was `509ms`; asset TTFB p50/p90/p95/max was
+  `115/217/347/1226ms`.
+- The JSON report contained one `progress_request_groups` entry for
+  `/ipns/ipfs.tech/` with `root_progress_request_id=1`, `request_count=33`,
+  `child_request_count=32`, `failed_request_count=0`, and max request elapsed
+  `1224ms`.
+- The slowest grouped member request was
+  `/ipns/ipfs.tech/_nuxt/community-hero.Cp0BCcC7.jpg` at `1224ms`.
+- The first live attempt caught a useful edge: root spans carry
+  `parent_request_id=0`. The harness now treats that sentinel as "no parent",
+  so root requests do not count as children and group under their real progress
+  ID.
+
+Decision: keep. This is diagnostics-only and makes page-level tail analysis
+possible from normal JSON reports instead of one-off trace scripts.

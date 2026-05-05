@@ -971,6 +971,36 @@ fn print_summary(report: &RunReport) {
                 );
             }
         }
+        if !trace.progress_request_groups.is_empty() {
+            println!("  progress request groups:");
+            for group in trace.progress_request_groups.iter().take(4) {
+                let statuses = format_trace_counts(&group.statuses);
+                let phases = format_trace_counts(&group.phases);
+                println!(
+                    "    {}: root_progress_id={} requests={} children={} failed={} elapsed={} max_event={}ms statuses={} phases={}",
+                    group.top_level_path,
+                    group.root_progress_request_id.as_deref().unwrap_or("-"),
+                    group.request_count,
+                    group.child_request_count,
+                    group.failed_request_count,
+                    group.request_elapsed_ms,
+                    group.max_event_ms,
+                    statuses,
+                    phases
+                );
+                for request in group.slow_requests.iter().take(3) {
+                    println!(
+                        "      {}: {}ms status={} progress_id={} parent_progress_id={} max_event={}ms",
+                        request.path,
+                        request.elapsed_ms,
+                        request.status.as_deref().unwrap_or("unknown"),
+                        request.progress_request_id.as_deref().unwrap_or("-"),
+                        request.parent_progress_request_id.as_deref().unwrap_or("-"),
+                        request.max_event_ms
+                    );
+                }
+            }
+        }
         if !trace.slow_events.is_empty() {
             println!("  slow events:");
             for event in trace.slow_events.iter().take(8) {
@@ -3790,6 +3820,7 @@ struct TraceSummary {
     bitswap_dns_expansion: TraceBitswapDnsExpansionAggregate,
     slow_cids: Vec<TraceCidAggregate>,
     slow_requests: Vec<TraceRequestAggregate>,
+    progress_request_groups: Vec<TraceProgressRequestGroupAggregate>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4211,7 +4242,7 @@ struct TraceCidAggregate {
     paths: Vec<TraceValueCount>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct TraceRequestAggregate {
     path: String,
     process_id: String,
@@ -4225,6 +4256,31 @@ struct TraceRequestAggregate {
     event_count: usize,
     phases: Vec<TraceValueCount>,
     cids: Vec<TraceValueCount>,
+}
+
+#[derive(Debug, Serialize)]
+struct TraceProgressRequestGroupAggregate {
+    top_level_path: String,
+    root_progress_request_id: Option<String>,
+    request_count: usize,
+    child_request_count: usize,
+    completed_request_count: usize,
+    failed_request_count: usize,
+    request_elapsed_ms: LatencySummary,
+    max_event_ms: u128,
+    statuses: Vec<TraceValueCount>,
+    phases: Vec<TraceValueCount>,
+    slow_requests: Vec<TraceProgressRequestAggregate>,
+}
+
+#[derive(Debug, Serialize)]
+struct TraceProgressRequestAggregate {
+    path: String,
+    progress_request_id: Option<String>,
+    parent_progress_request_id: Option<String>,
+    status: Option<String>,
+    elapsed_ms: u128,
+    max_event_ms: u128,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -4275,7 +4331,7 @@ impl TraceRequestBuilder {
             self.progress_request_id = trace_span_string(value, "progress_request_id");
         }
         if self.parent_progress_request_id.is_none() {
-            self.parent_progress_request_id = trace_span_string(value, "parent_request_id");
+            self.parent_progress_request_id = trace_parent_progress_request_id(value);
         }
         if self.top_level_path.is_none() {
             self.top_level_path = trace_span_string(value, "top_level_path");
@@ -5112,6 +5168,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             .into_values()
             .map(TraceRequestBuilder::into_aggregate),
     );
+    let progress_request_groups = summarize_progress_request_groups(&slow_requests);
     slow_requests.sort_by(|left, right| {
         right
             .elapsed_ms
@@ -5177,7 +5234,148 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_dns_expansion,
         slow_cids: sorted_trace_cids(slow_cids),
         slow_requests,
+        progress_request_groups,
     })
+}
+
+#[derive(Default)]
+struct TraceProgressRequestGroupBuilder {
+    top_level_path: String,
+    root_progress_request_id: Option<String>,
+    request_count: usize,
+    child_request_count: usize,
+    completed_request_count: usize,
+    failed_request_count: usize,
+    request_elapsed_values: Vec<u128>,
+    max_event_ms: u128,
+    statuses: BTreeMap<String, usize>,
+    phases: BTreeMap<String, usize>,
+    slow_requests: Vec<TraceProgressRequestAggregate>,
+}
+
+impl TraceProgressRequestGroupBuilder {
+    fn record(&mut self, request: &TraceRequestAggregate) {
+        self.request_count += 1;
+        if request.parent_progress_request_id.is_some() {
+            self.child_request_count += 1;
+        }
+        if let Some(status) = &request.status {
+            self.completed_request_count += 1;
+            *self.statuses.entry(status.clone()).or_default() += 1;
+            if status.parse::<u16>().is_ok_and(|status| status >= 400) {
+                self.failed_request_count += 1;
+            }
+        } else {
+            *self.statuses.entry("active".to_string()).or_default() += 1;
+        }
+        self.request_elapsed_values.push(request.elapsed_ms);
+        self.max_event_ms = self.max_event_ms.max(request.max_event_ms);
+        for phase in &request.phases {
+            *self.phases.entry(phase.value.clone()).or_default() += phase.count;
+        }
+        self.slow_requests.push(TraceProgressRequestAggregate {
+            path: request.path.clone(),
+            progress_request_id: request.progress_request_id.clone(),
+            parent_progress_request_id: request.parent_progress_request_id.clone(),
+            status: request.status.clone(),
+            elapsed_ms: request.elapsed_ms,
+            max_event_ms: request.max_event_ms,
+        });
+    }
+
+    fn into_aggregate(mut self) -> TraceProgressRequestGroupAggregate {
+        self.slow_requests.sort_by(|left, right| {
+            right
+                .elapsed_ms
+                .cmp(&left.elapsed_ms)
+                .then_with(|| right.max_event_ms.cmp(&left.max_event_ms))
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        self.slow_requests.truncate(8);
+        TraceProgressRequestGroupAggregate {
+            top_level_path: self.top_level_path,
+            root_progress_request_id: self.root_progress_request_id,
+            request_count: self.request_count,
+            child_request_count: self.child_request_count,
+            completed_request_count: self.completed_request_count,
+            failed_request_count: self.failed_request_count,
+            request_elapsed_ms: LatencySummary::from_values(self.request_elapsed_values),
+            max_event_ms: self.max_event_ms,
+            statuses: sorted_trace_counts(self.statuses),
+            phases: sorted_trace_counts(self.phases),
+            slow_requests: self.slow_requests,
+        }
+    }
+}
+
+fn summarize_progress_request_groups(
+    requests: &[TraceRequestAggregate],
+) -> Vec<TraceProgressRequestGroupAggregate> {
+    let by_progress_id = requests
+        .iter()
+        .filter_map(|request| {
+            request
+                .progress_request_id
+                .as_ref()
+                .map(|id| (id.clone(), request))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut groups = BTreeMap::<(String, Option<String>), TraceProgressRequestGroupBuilder>::new();
+    for request in requests {
+        if request.progress_request_id.is_none()
+            && request.parent_progress_request_id.is_none()
+            && request.top_level_path.is_none()
+        {
+            continue;
+        }
+        let top_level_path = request
+            .top_level_path
+            .clone()
+            .unwrap_or_else(|| request.path.clone());
+        let root_progress_request_id = root_progress_request_id(request, &by_progress_id);
+        let key = (top_level_path.clone(), root_progress_request_id.clone());
+        let group = groups
+            .entry(key)
+            .or_insert_with(|| TraceProgressRequestGroupBuilder {
+                top_level_path,
+                root_progress_request_id,
+                ..TraceProgressRequestGroupBuilder::default()
+            });
+        group.record(request);
+    }
+    let mut groups = groups
+        .into_values()
+        .map(TraceProgressRequestGroupBuilder::into_aggregate)
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        right
+            .request_elapsed_ms
+            .max_ms
+            .cmp(&left.request_elapsed_ms.max_ms)
+            .then_with(|| right.max_event_ms.cmp(&left.max_event_ms))
+            .then_with(|| left.top_level_path.cmp(&right.top_level_path))
+    });
+    groups.truncate(MAX_TRACE_SLOW_EVENTS);
+    groups
+}
+
+fn root_progress_request_id(
+    request: &TraceRequestAggregate,
+    by_progress_id: &BTreeMap<String, &TraceRequestAggregate>,
+) -> Option<String> {
+    let mut current_id = request.progress_request_id.clone()?;
+    let mut root_id = current_id.clone();
+    for _ in 0..16 {
+        let Some(current) = by_progress_id.get(&current_id) else {
+            break;
+        };
+        let Some(parent_id) = current.parent_progress_request_id.clone() else {
+            break;
+        };
+        root_id = parent_id.clone();
+        current_id = parent_id;
+    }
+    Some(root_id)
 }
 
 fn sorted_trace_peers(counts: BTreeMap<String, TracePeerBuilder>) -> Vec<TracePeerAggregate> {
@@ -5456,6 +5654,10 @@ fn trace_event_path(value: &serde_json::Value) -> Option<String> {
 fn trace_span_string(value: &serde_json::Value, key: &str) -> Option<String> {
     json_detail_string(value.get(key))
         .or_else(|| json_detail_string(value.get("span").and_then(|span| span.get(key))))
+}
+
+fn trace_parent_progress_request_id(value: &serde_json::Value) -> Option<String> {
+    trace_span_string(value, "parent_request_id").filter(|id| id != "0")
 }
 
 fn trace_request_key(value: &serde_json::Value) -> Option<TraceRequestKey> {
@@ -6292,6 +6494,72 @@ mod tests {
                 .map(String::as_str),
             Some("/ipns/site/")
         );
+    }
+
+    #[test]
+    fn trace_summary_groups_progress_correlated_requests() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-progress-groups-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"request_start\",\"request_id\":1,\"path\":\"/ipns/site/\",\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipns/site/\",\"status\":200,\"elapsed_ms\":20,\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"request_start\",\"request_id\":2,\"path\":\"/ipns/site/app.js\",\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":2,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"provider_lookup\",\"elapsed_ms\":60,\"cid\":\"cid-js\",\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":2,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"request_done\",\"request_id\":2,\"path\":\"/ipns/site/app.js\",\"status\":504,\"elapsed_ms\":70,\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":2,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"request_start\",\"request_id\":3,\"path\":\"/ipns/site/app.css\",\"span\":{\"path\":\"/ipns/site/app.css\",\"request_id\":3,\"progress_request_id\":102,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"request_done\",\"request_id\":3,\"path\":\"/ipns/site/app.css\",\"status\":200,\"elapsed_ms\":5,\"span\":{\"path\":\"/ipns/site/app.css\",\"request_id\":3,\"progress_request_id\":102,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"request_start\",\"request_id\":4,\"path\":\"/ipns/other/\",\"span\":{\"path\":\"/ipns/other/\",\"request_id\":4,\"progress_request_id\":200,\"top_level_path\":\"/ipns/other/\"}}\n",
+                "{\"phase\":\"request_done\",\"request_id\":4,\"path\":\"/ipns/other/\",\"status\":200,\"elapsed_ms\":10,\"span\":{\"path\":\"/ipns/other/\",\"request_id\":4,\"progress_request_id\":200,\"top_level_path\":\"/ipns/other/\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(summary.progress_request_groups.len(), 2);
+        let group = &summary.progress_request_groups[0];
+        assert_eq!(group.top_level_path, "/ipns/site/");
+        assert_eq!(group.root_progress_request_id.as_deref(), Some("100"));
+        assert_eq!(group.request_count, 3);
+        assert_eq!(group.child_request_count, 2);
+        assert_eq!(group.completed_request_count, 3);
+        assert_eq!(group.failed_request_count, 1);
+        assert_eq!(group.request_elapsed_ms.count, 3);
+        assert_eq!(group.request_elapsed_ms.max_ms, Some(70));
+        assert_eq!(group.max_event_ms, 70);
+        assert_eq!(group.statuses[0].value, "200");
+        assert_eq!(group.statuses[0].count, 2);
+        assert_eq!(group.statuses[1].value, "504");
+        assert_eq!(group.statuses[1].count, 1);
+        assert_eq!(group.slow_requests[0].path, "/ipns/site/app.js");
+        assert_eq!(
+            group.slow_requests[0].progress_request_id.as_deref(),
+            Some("101")
+        );
+        assert_eq!(
+            group.slow_requests[0].parent_progress_request_id.as_deref(),
+            Some("100")
+        );
+        assert!(group
+            .phases
+            .iter()
+            .any(|phase| phase.value == "provider_lookup" && phase.count == 1));
+
+        let other = &summary.progress_request_groups[1];
+        assert_eq!(other.top_level_path, "/ipns/other/");
+        assert_eq!(other.root_progress_request_id.as_deref(), Some("200"));
+        assert_eq!(other.request_count, 1);
+        assert_eq!(other.failed_request_count, 0);
     }
 
     #[test]

@@ -137,9 +137,12 @@ Reports also include
 help quantify user-visible loading states, cache/Bitswap/HTTP-provider mix, and
 peer reuse during provider/session experiments. Gateway response statuses and
 limiter denials are aggregated as well, making overload or `503` pressure
-visible in the normal report. Trace errors are grouped by phase and sanitized
-error string so provider-quality runs can show repeated DHT/Bitswap failure
-signatures without manual JSONL greps.
+visible in the normal report. Correlated traces also include
+`progress_request_groups`, which group root, asset, and revalidation requests by
+top-level path and root progress ID with status counts, phase counts, elapsed
+latencies, and the slowest member requests. Trace errors are grouped by phase
+and sanitized error string so provider-quality runs can show repeated
+DHT/Bitswap failure signatures without manual JSONL greps.
 Bitswap session shortcut summaries include both started shortcut races and
 completed shortcut attempts, which makes hidden dropped background work visible
 when tuning recent-peer races. `bitswap_session_shortcut_post_lookup_wait`
