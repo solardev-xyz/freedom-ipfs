@@ -5264,3 +5264,59 @@ summary classified the failure as cold-root, not mixed-session:
 This confirms the next behavior track should address cold provider/peer quality
 or cold Bitswap request timeout recovery, separately from the warm mixed-trusted
 asset/session path.
+
+## 2026-05-05 Keep: Show Peer Attempts In Comparison Summaries
+
+Goal:
+
+- Make Rust/Kubo comparison runs print the Bitswap peer-attempt aggregate that
+  normal single-run summaries already showed.
+- Keep cold-root diagnosis visible without manually grepping trace JSONL for
+  `bitswap_peer_attempt` and `bitswap_peer_attempt_start` events.
+
+Implementation:
+
+- Reuse one formatter for `bitswap peer attempts`.
+- Call it from both normal harness summaries and Rust/Kubo comparison trace
+  summaries.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness bitswap_peer_attempt
+cargo test -p mobile-web-harness
+git diff --check
+```
+
+Live validation:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-peer-attempt-comparison-r1-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-peer-attempt-comparison-r1.json
+```
+
+Result: Rust passed `1/1`; Kubo passed `1/1`. Rust root TTFB was `1063ms`
+versus Kubo `1783ms`; Rust asset TTFB p50/p95 was `143/372ms` versus Kubo
+`96/228ms`. Rust max RSS was `49028KiB` versus Kubo `120576KiB`.
+
+The comparison trace summary now includes:
+
+- `bitswap peer attempts: starts=99 outgoing_completed=0 successes=0
+  failures=0 connection_timeouts=0 read_timeouts=0 other_failures=0
+  prefer_want_have=0`
+- `bitswap incoming blocks: matches=35 blocks=46 bytes=793822
+  delivered_waiters=35 dropped_waiters=0 max_oldest_pending_ms=269`
+
+Decision: keep. This does not change retrieval behavior, but it makes live
+comparison output capture whether a run is dominated by scheduled outgoing
+attempts, completed peer-attempt failures, or incoming-session wins before the
+outgoing attempts finish.

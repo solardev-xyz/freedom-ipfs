@@ -689,20 +689,7 @@ fn print_summary(report: &RunReport) {
             );
         }
         print_trace_timeout_recovery(trace);
-        if trace.bitswap_peer_attempts.has_events() {
-            let attempts = &trace.bitswap_peer_attempts;
-            println!(
-                "  bitswap peer attempts: starts={} outgoing_completed={} successes={} failures={} connection_timeouts={} read_timeouts={} other_failures={} prefer_want_have={}",
-                attempts.starts,
-                attempts.outgoing_completed,
-                attempts.successes,
-                attempts.failures,
-                attempts.connection_timeouts,
-                attempts.read_timeouts,
-                attempts.other_failures,
-                attempts.prefer_want_have
-            );
-        }
+        print_trace_bitswap_peer_attempts(trace);
         if trace.bitswap_dial_plans.events > 0 {
             let plans = &trace.bitswap_dial_plans;
             println!(
@@ -963,6 +950,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     }
     print_trace_provider_retries(trace);
     print_trace_timeout_recovery(trace);
+    print_trace_bitswap_peer_attempts(trace);
     if trace.bitswap_session.has_events() {
         let session = &trace.bitswap_session;
         println!(
@@ -1063,6 +1051,31 @@ fn print_trace_timeout_recovery(trace: &TraceSummary) {
         recovery.retry_unresolved,
         recovery.retry_success_elapsed_ms
     );
+}
+
+fn print_trace_bitswap_peer_attempts(trace: &TraceSummary) {
+    if let Some(line) = format_trace_bitswap_peer_attempts(&trace.bitswap_peer_attempts) {
+        println!("  {line}");
+    }
+}
+
+fn format_trace_bitswap_peer_attempts(
+    attempts: &TraceBitswapPeerAttemptAggregate,
+) -> Option<String> {
+    if !attempts.has_events() {
+        return None;
+    }
+    Some(format!(
+        "bitswap peer attempts: starts={} outgoing_completed={} successes={} failures={} connection_timeouts={} read_timeouts={} other_failures={} prefer_want_have={}",
+        attempts.starts,
+        attempts.outgoing_completed,
+        attempts.successes,
+        attempts.failures,
+        attempts.connection_timeouts,
+        attempts.read_timeouts,
+        attempts.other_failures,
+        attempts.prefer_want_have
+    ))
 }
 
 fn print_trace_dial_rejections(trace: &TraceSummary) {
@@ -4764,6 +4777,31 @@ mod tests {
         assert_eq!(
             summary.slow_events[0].details.get("failure_kind"),
             Some(&"read_timeout".to_string())
+        );
+    }
+
+    #[test]
+    fn formats_bitswap_peer_attempt_summary() {
+        assert!(
+            format_trace_bitswap_peer_attempts(&TraceBitswapPeerAttemptAggregate::default())
+                .is_none()
+        );
+
+        let line = format_trace_bitswap_peer_attempts(&TraceBitswapPeerAttemptAggregate {
+            starts: 3,
+            outgoing_completed: 2,
+            successes: 1,
+            failures: 1,
+            connection_timeouts: 1,
+            read_timeouts: 0,
+            other_failures: 0,
+            prefer_want_have: 2,
+        })
+        .unwrap();
+
+        assert_eq!(
+            line,
+            "bitswap peer attempts: starts=3 outgoing_completed=2 successes=1 failures=1 connection_timeouts=1 read_timeouts=0 other_failures=0 prefer_want_have=2"
         );
     }
 
