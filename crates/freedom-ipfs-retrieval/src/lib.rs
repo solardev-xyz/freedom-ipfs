@@ -762,6 +762,7 @@ impl HttpRetriever {
             ok = true,
             source_peer = source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
             source_transport = result.source_transport.unwrap_or("unknown"),
+            bitswap_delivery = result.delivery,
             source_peer_trusted,
             extra_blocks = result.extra_blocks.len(),
             bytes = result.requested_block.len(),
@@ -999,6 +1000,7 @@ impl HttpRetriever {
             ok = true,
             source_peer = result.source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
             source_transport = result.source_transport.unwrap_or("unknown"),
+            bitswap_delivery = result.delivery,
             source_peer_trusted = true,
             extra_blocks = result.extra_blocks.len(),
             bytes = result.requested_block.len(),
@@ -1166,6 +1168,7 @@ struct BitswapFetchResult {
     extra_blocks: Vec<(Cid, Vec<u8>)>,
     source_peer: Option<PeerId>,
     source_transport: Option<&'static str>,
+    delivery: &'static str,
 }
 
 struct BitswapFetchResults {
@@ -1433,6 +1436,7 @@ async fn run_shared_bitswap_swarm(
                             if let Some(mut result) = collect_bitswap_result(&cid, blocks.clone()) {
                                 result.source_peer = Some(peer);
                                 result.source_transport = source_transport;
+                                result.delivery = "incoming";
                                 matched = true;
                                 let mut pending_waiter_count = 0usize;
                                 let mut oldest_pending_ms = 0u128;
@@ -2859,6 +2863,7 @@ where
         extra_blocks: results.extra_blocks,
         source_peer: None,
         source_transport: None,
+        delivery: "outgoing",
     })
 }
 
@@ -3056,6 +3061,7 @@ fn collect_bitswap_result(
         extra_blocks: results.extra_blocks,
         source_peer: None,
         source_transport: None,
+        delivery: "outgoing",
     })
 }
 

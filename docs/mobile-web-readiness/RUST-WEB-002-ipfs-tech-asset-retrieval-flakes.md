@@ -3843,3 +3843,55 @@ but the prototype reduced hidden Bitswap work in the intended direction:
 peer attempts `490 -> 432`, new dial peers `133 -> 114`, inbound bytes
 `2950417 -> 2395134`, and asset p95 `1101ms -> 1015ms`. This is aligned with
 mobile resource goals and removes work after the caller has already moved on.
+
+## 2026-05-05 Bitswap Delivery Source Trace
+
+Hypothesis:
+Peer-attempt traces repeatedly showed `outgoing_completed=0` while inbound
+Bitswap streams satisfied the requested CIDs. The successful `bitswap_fetch`
+and `bitswap_session_shortcut` events should identify whether the returned
+block was delivered by the inbound stream path or by a direct outgoing stream,
+so future batching/hedging experiments do not infer this indirectly.
+
+Implementation:
+
+- Add `bitswap_delivery="incoming"` to Bitswap results matched from inbound
+  streams.
+- Add `bitswap_delivery="outgoing"` to Bitswap results returned from an
+  outgoing request stream.
+- Include the field on successful `bitswap_fetch` and
+  `bitswap_session_shortcut` trace events.
+- Add a harness `bitswap deliveries:` summary and slow-event detail support.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+cargo test -p freedom-ipfs-retrieval --lib collects_
+cargo build -p freedom-ipfs-gateway
+```
+
+Live trace-shape check:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-bitswap-delivery-r1-trace.jsonl \
+  --output /tmp/ipfs-tech-bitswap-delivery-r1.json
+```
+
+Result: passed `1/1`, root TTFB `1000ms`, asset p50/p95 `138/570ms`,
+RSS/FD `49072KiB`/`46`. The trace showed `bitswap deliveries: incoming=35`,
+`bitswap peer attempts: starts=135 outgoing_completed=0`, and
+`bitswap incoming blocks: matches=35 blocks=35 bytes=793822
+max_oldest_pending_ms=601 max_pending_waiters=2`.
+
+Decision: keep. This is diagnostics-only and confirms the current public
+network success path is overwhelmingly inbound delivery. Future behavior work
+should optimize scheduling, cancellation, and batching around that model rather
+than relying on completed outgoing stream attempts as the primary signal.

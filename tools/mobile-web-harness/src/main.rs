@@ -630,6 +630,12 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.bitswap_source_transports)
             );
         }
+        if !trace.bitswap_deliveries.is_empty() {
+            println!(
+                "  bitswap deliveries: {}",
+                format_trace_counts(&trace.bitswap_deliveries)
+            );
+        }
         if !trace.bitswap_peer_fetches.is_empty() {
             println!("  bitswap peer fetches:");
             for peer in trace.bitswap_peer_fetches.iter().take(8) {
@@ -2656,6 +2662,7 @@ struct TraceSummary {
     unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
     bitswap_source_peers: Vec<TraceValueCount>,
     bitswap_source_transports: Vec<TraceValueCount>,
+    bitswap_deliveries: Vec<TraceValueCount>,
     bitswap_peer_fetches: Vec<TracePeerAggregate>,
     bitswap_session: TraceBitswapSessionAggregate,
     bitswap_peer_attempts: TraceBitswapPeerAttemptAggregate,
@@ -2965,6 +2972,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut unixfs_metadata_cache = TraceUnixfsMetadataCacheAggregate::default();
     let mut bitswap_source_peers = BTreeMap::<String, usize>::new();
     let mut bitswap_source_transports = BTreeMap::<String, usize>::new();
+    let mut bitswap_deliveries = BTreeMap::<String, usize>::new();
     let mut bitswap_peer_fetches = BTreeMap::<String, TracePeerBuilder>::new();
     let mut trace_errors = BTreeMap::<String, usize>::new();
     let mut bitswap_addr_mix = BTreeMap::<String, usize>::new();
@@ -3058,6 +3066,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         }
         let successful_bitswap_fetch =
             phase == "bitswap_fetch" && value.get("ok").and_then(|ok| ok.as_bool()) == Some(true);
+        let successful_bitswap_delivery = (phase == "bitswap_fetch"
+            || phase == "bitswap_session_shortcut")
+            && value.get("ok").and_then(|ok| ok.as_bool()) == Some(true);
         if phase == "bitswap_fetch" {
             bitswap_session.fetches += 1;
             let trusted_peer_count = value
@@ -3205,6 +3216,11 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 *bitswap_source_transports.entry(transport).or_default() += 1;
             }
         }
+        if successful_bitswap_delivery {
+            if let Some(delivery) = json_detail_string(value.get("bitswap_delivery")) {
+                *bitswap_deliveries.entry(delivery).or_default() += 1;
+            }
+        }
         if let Some(error) = trace_error_key(phase, &value) {
             *trace_errors.entry(error).or_default() += 1;
         }
@@ -3339,6 +3355,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         unixfs_metadata_cache,
         bitswap_source_peers: sorted_trace_counts(bitswap_source_peers),
         bitswap_source_transports: sorted_trace_counts(bitswap_source_transports),
+        bitswap_deliveries: sorted_trace_counts(bitswap_deliveries),
         bitswap_peer_fetches: sorted_trace_peers(bitswap_peer_fetches),
         bitswap_session,
         bitswap_peer_attempts,
@@ -3482,6 +3499,7 @@ fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
         "source",
         "source_peer",
         "source_peer_trusted",
+        "bitswap_delivery",
         "ok",
         "error",
         "status",
@@ -3841,7 +3859,7 @@ mod tests {
             &path,
             concat!(
                 "{\"phase\":\"request_start\",\"request_id\":9,\"path\":\"/ipns/site/asset.js\"}\n",
-                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":\"25\",\"cid\":\"cid1\",\"ok\":true,\"bytes\":100,\"source\":\"bitswap\",\"source_peer\":\"peer1\",\"source_transport\":\"tcp\",\"source_peer_trusted\":true,\"trusted_peer_count\":1,\"provider_peer_count\":2,\"session_peer_count\":0,\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9}}\n",
+                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":\"25\",\"cid\":\"cid1\",\"ok\":true,\"bytes\":100,\"source\":\"bitswap\",\"source_peer\":\"peer1\",\"source_transport\":\"tcp\",\"bitswap_delivery\":\"incoming\",\"source_peer_trusted\":true,\"trusted_peer_count\":1,\"provider_peer_count\":2,\"session_peer_count\":0,\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9}}\n",
                 "{\"phase\":\"request_done\",\"request_id\":9,\"path\":\"/ipns/site/asset.js\",\"status\":200,\"elapsed_ms\":1}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":5,\"cid\":\"cid1\",\"source\":\"bitswap\"}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":4,\"cid\":\"cid5\",\"source\":\"cache\"}\n",
@@ -3850,7 +3868,7 @@ mod tests {
                 "{\"phase\":\"bitswap_peer_expand\",\"elapsed_ms\":3,\"cid\":\"cid7\",\"tcp_addr_count\":4,\"quic_addr_count\":2,\"ws_addr_count\":1,\"wss_addr_count\":0,\"dns_addr_count\":1,\"ip4_addr_count\":3,\"ip6_addr_count\":1,\"provider_addr_count\":10,\"expanded_provider_addr_count\":12,\"supported_provider_addr_count\":4,\"rejected_provider_addr_count\":8,\"id_only_provider_count\":1,\"invalid_provider_id_count\":2,\"provider_without_supported_bitswap_addr_count\":3,\"unsupported_relay_addr_count\":4,\"unsupported_webtransport_addr_count\":1,\"unsupported_webrtc_addr_count\":1,\"unsupported_certhash_addr_count\":1,\"unsupported_transport_addr_count\":1,\"missing_peer_addr_count\":1,\"unparsable_addr_count\":1,\"addr_with_relay_count\":6,\"addr_with_webtransport_count\":2,\"addr_with_webrtc_count\":3,\"addr_with_certhash_count\":4}\n",
                 "{\"phase\":\"bitswap_session_shortcut_start\",\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1}\n",
                 "{\"phase\":\"bitswap_session_shortcut_post_lookup_wait\",\"cid\":\"cid8\",\"timeout_ms\":100}\n",
-                "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":2,\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":true,\"source_peer\":\"peer1\",\"source_peer_trusted\":true}\n",
+                "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":2,\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":true,\"source_peer\":\"peer1\",\"bitswap_delivery\":\"outgoing\",\"source_peer_trusted\":true}\n",
                 "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":3,\"cid\":\"cid9\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":false,\"timeout\":true}\n",
                 "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer1\",\"remote_addr\":\"/ip4/127.0.0.1/tcp/4001\",\"transport\":\"tcp\"}\n",
                 "{\"phase\":\"bitswap_dial_rejected\",\"peer\":\"peer2\",\"transport\":\"quic\",\"connection_limit\":true,\"error\":\"Dial error\"}\n",
@@ -3937,6 +3955,11 @@ mod tests {
         assert_eq!(summary.bitswap_source_transports.len(), 1);
         assert_eq!(summary.bitswap_source_transports[0].value, "tcp");
         assert_eq!(summary.bitswap_source_transports[0].count, 1);
+        assert_eq!(summary.bitswap_deliveries.len(), 2);
+        assert_eq!(summary.bitswap_deliveries[0].value, "incoming");
+        assert_eq!(summary.bitswap_deliveries[0].count, 1);
+        assert_eq!(summary.bitswap_deliveries[1].value, "outgoing");
+        assert_eq!(summary.bitswap_deliveries[1].count, 1);
         assert_eq!(summary.bitswap_peer_fetches.len(), 1);
         assert_eq!(summary.bitswap_peer_fetches[0].peer, "peer1");
         assert_eq!(summary.bitswap_peer_fetches[0].count, 1);
