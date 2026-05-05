@@ -19825,3 +19825,73 @@ Bitswap race in the two live samples, raising max FD/RSS modestly, but still
 well below the current Kubo baseline and idle on the already-fast DAICO/Vitalik
 guardrails. Revert or retune if future long soaks show duplicate HTTP pressure
 or Bitswap connection growth during mobile-length sessions.
+
+## 2026-05-05 Baseline: 250ms Self-Hedge `ipfs.tech` vs Kubo
+
+Question:
+After lowering the single HTTP self-hedge threshold to `250ms`, where does the
+current Rust gateway stand against Kubo on the focused cold `ipfs.tech` page
+workload?
+
+Command:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-self-hedge250-kubo-comparison-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-self-hedge250-kubo-comparison-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `844ms` / `984ms`; Kubo `1755ms` /
+  `2006ms`; Rust ratio `0.48x` / `0.49x`.
+- Asset TTFB p50/p95: Rust `129ms` / `539ms`; Kubo `144ms` /
+  `862ms`; Rust ratio `0.90x` / `0.63x`.
+- Max RSS/FD: Rust `53032KiB` / `38`; Kubo `204604KiB` / `108`.
+- Kubo max storage: `835101B`; Rust used the default temporary DB path without
+  storage reporting in this comparison.
+
+Rust trace summary:
+
+- Trace path:
+  `/tmp/ipfs-tech-self-hedge250-kubo-comparison-r3-trace.jsonl`.
+- Comparison JSON:
+  `/tmp/ipfs-tech-self-hedge250-kubo-comparison-r3.json`.
+- Trace events/phases: `2923` events, `28` phases.
+- Gateway statuses: `200=81`, `206=18`, limiter denials `0`.
+- Block sources: `http_provider=63`, `bitswap=56`.
+- HTTP-provider block totals p50/p90/p95/max:
+  `212/345/447/696ms`.
+- Bitswap block totals p50/p90/p95/max:
+  `87/215/228/231ms`.
+- Delegated provider lookups: `80`, successes `80`, failures `0`,
+  providers `1139`, HTTP providers `137`, self-hedges `0`,
+  p50/p90/p95/max `30/46/52/87ms`.
+- HTTP-provider races: `49`, single-provider `27`, multi-provider `22`,
+  self-hedges `11`, result max `674ms`.
+- Single-provider HTTP winner p50/p90/p95/max:
+  `218/453/454/674ms`.
+- HTTP-provider fetch p50/p90/p95/max: `157/216/218/362ms`.
+- `https://ipfs-bridge.sia.dev/`: `27` fetches, p50/p90/p95/max
+  `182/218/218/362ms`.
+- `https://dag.w3s.link/`: `22` fetches, p50/p90/p95/max
+  `68/126/141/213ms`.
+- Bitswap connections established: `14`; max FD remained `38`.
+
+Decision:
+Keep as the current post-250ms Rust-vs-Kubo baseline. In this sample Rust is
+faster than Kubo at root p50/p95 and asset p50/p95 while still using far less
+RSS and fewer file descriptors. The remaining follow-up is resource-oriented:
+watch longer page sessions to make sure the lower HTTP self-hedge threshold does
+not steadily increase Bitswap connections or duplicate HTTP bytes.
