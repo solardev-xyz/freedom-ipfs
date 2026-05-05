@@ -799,6 +799,7 @@ impl HttpRetriever {
                     .any(|candidate| candidate.id == peer && candidate.skip_want_have)
             })
             .unwrap_or(false);
+        let elapsed = bitswap_started.elapsed();
         tracing::info!(
             phase = "bitswap_fetch",
             cid = %cid,
@@ -813,10 +814,10 @@ impl HttpRetriever {
             source_peer_trusted,
             extra_blocks = result.extra_blocks.len(),
             bytes = result.requested_block.len(),
-            elapsed_ms = bitswap_started.elapsed().as_millis()
+            elapsed_ms = elapsed.as_millis()
         );
         if let Some(peer) = source_peer {
-            self.record_successful_bitswap_peer_from_peers(peer, &peers_for_record)
+            self.record_successful_bitswap_peer_from_peers(peer, &peers_for_record, elapsed)
                 .await;
         }
         self.store_bitswap_result(cid, result)
@@ -888,7 +889,10 @@ impl HttpRetriever {
         }
         peers.sort_by(
             |left, right| match (successes.get(&left.id), successes.get(&right.id)) {
-                (Some(left), Some(right)) => right.seen_at.cmp(&left.seen_at),
+                (Some(left), Some(right)) => left
+                    .last_latency
+                    .cmp(&right.last_latency)
+                    .then_with(|| right.seen_at.cmp(&left.seen_at)),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (None, None) => std::cmp::Ordering::Equal,
@@ -924,20 +928,31 @@ impl HttpRetriever {
         inserted.min(peers.len().saturating_sub(insert_at))
     }
 
-    async fn record_successful_bitswap_peer(&self, peer: PeerId, addrs: Vec<Multiaddr>) {
+    async fn record_successful_bitswap_peer(
+        &self,
+        peer: PeerId,
+        addrs: Vec<Multiaddr>,
+        last_latency: Duration,
+    ) {
         let mut successes = self.successful_bitswap_peers.lock().await;
         successes.insert(
             peer,
             SuccessfulBitswapPeer {
                 seen_at: Instant::now(),
                 addrs,
+                last_latency,
             },
         );
     }
 
-    async fn record_successful_bitswap_peer_from_peers(&self, peer: PeerId, peers: &[BitswapPeer]) {
+    async fn record_successful_bitswap_peer_from_peers(
+        &self,
+        peer: PeerId,
+        peers: &[BitswapPeer],
+        last_latency: Duration,
+    ) {
         if let Some(candidate) = peers.iter().find(|candidate| candidate.id == peer) {
-            self.record_successful_bitswap_peer(peer, candidate.addrs.clone())
+            self.record_successful_bitswap_peer(peer, candidate.addrs.clone(), last_latency)
                 .await;
         }
     }
@@ -951,13 +966,20 @@ impl HttpRetriever {
         });
         let mut peers = successes
             .iter()
-            .map(|(id, success)| (*id, success.seen_at, success.addrs.clone()))
+            .map(|(id, success)| {
+                (
+                    *id,
+                    success.seen_at,
+                    success.last_latency,
+                    success.addrs.clone(),
+                )
+            })
             .collect::<Vec<_>>();
-        peers.sort_by_key(|peer| std::cmp::Reverse(peer.1));
+        peers.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| right.1.cmp(&left.1)));
         peers
             .into_iter()
             .take(MAX_BITSWAP_SESSION_PEERS)
-            .map(|(id, _seen_at, addrs)| BitswapPeer {
+            .map(|(id, _seen_at, _last_latency, addrs)| BitswapPeer {
                 id,
                 addrs,
                 skip_want_have: true,
@@ -1043,6 +1065,7 @@ impl HttpRetriever {
             }
         };
 
+        let elapsed = started.elapsed();
         tracing::info!(
             phase = "bitswap_session_shortcut",
             cid = %cid,
@@ -1055,10 +1078,10 @@ impl HttpRetriever {
             source_peer_trusted = true,
             extra_blocks = result.extra_blocks.len(),
             bytes = result.requested_block.len(),
-            elapsed_ms = started.elapsed().as_millis()
+            elapsed_ms = elapsed.as_millis()
         );
         if let Some(peer) = result.source_peer {
-            self.record_successful_bitswap_peer_from_peers(peer, &peers_for_record)
+            self.record_successful_bitswap_peer_from_peers(peer, &peers_for_record, elapsed)
                 .await;
         }
         self.store_bitswap_result(cid, result).map(Some)
@@ -1208,6 +1231,7 @@ struct BitswapPeer {
 struct SuccessfulBitswapPeer {
     seen_at: Instant,
     addrs: Vec<Multiaddr>,
+    last_latency: Duration,
 }
 
 struct BitswapPeerTarget {
@@ -5087,7 +5111,7 @@ mod bitswap_tests {
             store,
         );
         retriever
-            .record_successful_bitswap_peer(preferred, Vec::new())
+            .record_successful_bitswap_peer(preferred, Vec::new(), Duration::from_millis(25))
             .await;
         let mut peers = vec![
             BitswapPeer {
@@ -5113,6 +5137,94 @@ mod bitswap_tests {
     }
 
     #[tokio::test]
+    async fn lower_latency_successful_bitswap_peers_are_preferred() {
+        let slow = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let fast = parse_peer_id("12D3KooWAtxJkDLacJdK7yZkk2iPp8iMdSVh1bDHzmJ3t8oKUkqA").unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store,
+        );
+        let now = Instant::now();
+        {
+            let mut successes = retriever.successful_bitswap_peers.lock().await;
+            successes.insert(
+                slow,
+                SuccessfulBitswapPeer {
+                    seen_at: now,
+                    addrs: Vec::new(),
+                    last_latency: Duration::from_secs(2),
+                },
+            );
+            successes.insert(
+                fast,
+                SuccessfulBitswapPeer {
+                    seen_at: now - Duration::from_secs(1),
+                    addrs: Vec::new(),
+                    last_latency: Duration::from_millis(80),
+                },
+            );
+        }
+        let mut peers = vec![
+            BitswapPeer {
+                id: slow,
+                addrs: Vec::new(),
+                skip_want_have: false,
+            },
+            BitswapPeer {
+                id: fast,
+                addrs: Vec::new(),
+                skip_want_have: false,
+            },
+        ];
+
+        retriever
+            .apply_successful_bitswap_peer_scores(&mut peers)
+            .await;
+
+        assert_eq!(peers[0].id, fast);
+        assert!(peers[0].skip_want_have);
+        assert_eq!(peers[1].id, slow);
+        assert!(peers[1].skip_want_have);
+    }
+
+    #[tokio::test]
+    async fn recent_bitswap_shortcut_peers_are_latency_ordered() {
+        let slow = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let fast = parse_peer_id("12D3KooWAtxJkDLacJdK7yZkk2iPp8iMdSVh1bDHzmJ3t8oKUkqA").unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store,
+        );
+        let now = Instant::now();
+        {
+            let mut successes = retriever.successful_bitswap_peers.lock().await;
+            successes.insert(
+                slow,
+                SuccessfulBitswapPeer {
+                    seen_at: now,
+                    addrs: vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()],
+                    last_latency: Duration::from_secs(2),
+                },
+            );
+            successes.insert(
+                fast,
+                SuccessfulBitswapPeer {
+                    seen_at: now - Duration::from_secs(1),
+                    addrs: vec!["/ip4/127.0.0.1/tcp/4002".parse().unwrap()],
+                    last_latency: Duration::from_millis(80),
+                },
+            );
+        }
+
+        let peers = retriever.recent_bitswap_peers().await;
+
+        assert_eq!(peers[0].id, fast);
+        assert_eq!(peers[1].id, slow);
+    }
+
+    #[tokio::test]
     async fn recent_session_only_bitswap_peers_keep_want_block_shortcut() {
         let session_peer =
             parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
@@ -5127,6 +5239,7 @@ mod bitswap_tests {
             .record_successful_bitswap_peer(
                 session_peer,
                 vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()],
+                Duration::from_millis(25),
             )
             .await;
         let mut peers = vec![BitswapPeer {
@@ -5474,7 +5587,11 @@ mod bitswap_tests {
             store.clone(),
         );
         retriever
-            .record_successful_bitswap_peer(session_peer_id, vec![session_addr])
+            .record_successful_bitswap_peer(
+                session_peer_id,
+                vec![session_addr],
+                Duration::from_millis(25),
+            )
             .await;
 
         let (block, source) = tokio::time::timeout(
@@ -5514,7 +5631,11 @@ mod bitswap_tests {
             store.clone(),
         );
         retriever
-            .record_successful_bitswap_peer(session_peer_id, vec![session_addr])
+            .record_successful_bitswap_peer(
+                session_peer_id,
+                vec![session_addr],
+                Duration::from_millis(25),
+            )
             .await;
         let provider = Provider::from_parts(
             Some(missing_peer_id.to_string()),
