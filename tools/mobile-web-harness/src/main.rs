@@ -911,6 +911,7 @@ fn print_summary(report: &RunReport) {
                 trace.gateway_request_elapsed_ms
             );
         }
+        print_trace_gateway_limiter(trace);
         print_trace_unixfs_metadata_cache(trace);
         print_trace_gateway_direct_body(trace);
         print_trace_gateway_stream_body(trace);
@@ -1303,6 +1304,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
             trace.gateway_request_elapsed_ms
         );
     }
+    print_trace_gateway_limiter(trace);
     print_trace_progress_request_groups(trace);
     print_trace_timeout_recovery(trace);
     print_trace_gateway_direct_body(trace);
@@ -1548,6 +1550,22 @@ fn print_trace_block_fetch_source_latencies(trace: &TraceSummary) {
             source.source, source.count, source.total_ms, source.elapsed_ms
         );
     }
+}
+
+fn print_trace_gateway_limiter(trace: &TraceSummary) {
+    let limiter = &trace.gateway_limiter;
+    if limiter.events == 0 {
+        return;
+    }
+    println!(
+        "  gateway limiter: events={} acquired={} denied={} elapsed={} denied_elapsed={} max_timeout_ms={}",
+        limiter.events,
+        limiter.acquired,
+        limiter.denied,
+        limiter.elapsed_ms,
+        limiter.denied_elapsed_ms,
+        limiter.max_timeout_ms
+    );
 }
 
 fn print_trace_delegated_provider_lookup(trace: &TraceSummary) {
@@ -4626,6 +4644,7 @@ struct TraceSummary {
     provider_diversity_low: TraceProviderDiversityLowAggregate,
     request_statuses: Vec<TraceValueCount>,
     gateway_limiter_denials: usize,
+    gateway_limiter: TraceGatewayLimiterAggregate,
     gateway_request_elapsed_ms: LatencySummary,
     gateway_direct_body: TraceGatewayDirectBodyAggregate,
     gateway_stream_body: TraceGatewayStreamBodyAggregate,
@@ -4689,6 +4708,16 @@ struct TraceSourceLatencyAggregate {
     count: usize,
     total_ms: u128,
     elapsed_ms: LatencySummary,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceGatewayLimiterAggregate {
+    events: usize,
+    acquired: usize,
+    denied: usize,
+    elapsed_ms: LatencySummary,
+    denied_elapsed_ms: LatencySummary,
+    max_timeout_ms: u128,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -6121,6 +6150,11 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut provider_diversity_low = TraceProviderDiversityLowBuilder::default();
     let mut request_statuses = BTreeMap::<String, usize>::new();
     let mut gateway_limiter_denials = 0usize;
+    let mut gateway_limiter_events = 0usize;
+    let mut gateway_limiter_acquired = 0usize;
+    let mut gateway_limiter_elapsed_values = Vec::<u128>::new();
+    let mut gateway_limiter_denied_elapsed_values = Vec::<u128>::new();
+    let mut gateway_limiter_max_timeout_ms = 0u128;
     let mut gateway_request_elapsed_values = Vec::<u128>::new();
     let mut gateway_direct_body = TraceGatewayDirectBodyAggregate::default();
     let mut gateway_stream_body = TraceGatewayStreamBodyAggregate::default();
@@ -6419,13 +6453,30 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 gateway_request_elapsed_values.push(elapsed_ms);
             }
         }
-        if phase == "gateway_limiter"
-            && value
+        if phase == "gateway_limiter" {
+            gateway_limiter_events += 1;
+            if let Some(elapsed_ms) = elapsed_ms {
+                gateway_limiter_elapsed_values.push(elapsed_ms);
+            }
+            gateway_limiter_max_timeout_ms = gateway_limiter_max_timeout_ms.max(
+                value
+                    .get("timeout_ms")
+                    .and_then(json_u128)
+                    .unwrap_or_default(),
+            );
+            match value
                 .get("acquired")
                 .and_then(|acquired| acquired.as_bool())
-                == Some(false)
-        {
-            gateway_limiter_denials += 1;
+            {
+                Some(true) => gateway_limiter_acquired += 1,
+                Some(false) => {
+                    gateway_limiter_denials += 1;
+                    if let Some(elapsed_ms) = elapsed_ms {
+                        gateway_limiter_denied_elapsed_values.push(elapsed_ms);
+                    }
+                }
+                None => {}
+            }
         }
         if phase == "gateway_direct_body" {
             gateway_direct_body.events += 1;
@@ -7302,6 +7353,14 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         provider_diversity_low: provider_diversity_low.into_aggregate(),
         request_statuses: sorted_trace_counts(request_statuses),
         gateway_limiter_denials,
+        gateway_limiter: TraceGatewayLimiterAggregate {
+            events: gateway_limiter_events,
+            acquired: gateway_limiter_acquired,
+            denied: gateway_limiter_denials,
+            elapsed_ms: LatencySummary::from_values(gateway_limiter_elapsed_values),
+            denied_elapsed_ms: LatencySummary::from_values(gateway_limiter_denied_elapsed_values),
+            max_timeout_ms: gateway_limiter_max_timeout_ms,
+        },
         gateway_request_elapsed_ms: LatencySummary::from_values(gateway_request_elapsed_values),
         gateway_direct_body,
         gateway_stream_body,
@@ -8723,7 +8782,7 @@ mod tests {
                 "{\"phase\":\"block_store_get\",\"elapsed_ms\":0,\"cid\":\"cid12\",\"cache_hit\":false,\"rechecked\":true}\n",
                 "not json\n",
                 "{\"phase\":\"request_start\",\"path\":\"/ipns/site/\"}\n",
-                "{\"phase\":\"gateway_limiter\",\"acquired\":false}\n",
+                "{\"phase\":\"gateway_limiter\",\"acquired\":false,\"timeout_ms\":2000,\"elapsed_ms\":2}\n",
                 "{\"phase\":\"request_done\",\"status\":503}\n",
                 "{\"phase\":\"request_done\",\"status\":200}\n",
                 "{\"phase\":\"unixfs_file_size\",\"elapsed_ms\":50,\"cid\":\"cid3\",\"path\":\"/ipfs/root/index.html\",\"unixfs_path\":\"index.html\",\"ok\":true}\n",
@@ -8774,7 +8833,7 @@ mod tests {
             summary.slow_events[2].details.get("source_peer_trusted"),
             Some(&"true".to_string())
         );
-        assert_eq!(summary.phases.len(), 11);
+        assert_eq!(summary.phases.len(), 12);
         assert_eq!(summary.block_sources.len(), 2);
         assert_eq!(summary.block_sources[0].value, "bitswap");
         assert_eq!(summary.block_sources[0].count, 1);
@@ -8801,6 +8860,12 @@ mod tests {
         assert_eq!(summary.request_statuses[0].count, 2);
         assert_eq!(summary.request_statuses[1].value, "503");
         assert_eq!(summary.gateway_limiter_denials, 1);
+        assert_eq!(summary.gateway_limiter.events, 1);
+        assert_eq!(summary.gateway_limiter.acquired, 0);
+        assert_eq!(summary.gateway_limiter.denied, 1);
+        assert_eq!(summary.gateway_limiter.elapsed_ms.p50_ms, Some(2));
+        assert_eq!(summary.gateway_limiter.denied_elapsed_ms.p50_ms, Some(2));
+        assert_eq!(summary.gateway_limiter.max_timeout_ms, 2000);
         assert_eq!(summary.gateway_request_elapsed_ms.count, 1);
         assert_eq!(summary.gateway_request_elapsed_ms.p50_ms, Some(1));
         assert_eq!(summary.gateway_request_elapsed_ms.p95_ms, Some(1));

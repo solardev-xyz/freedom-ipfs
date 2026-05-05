@@ -18690,6 +18690,9 @@ Implementation:
   within that bounded queue window.
 - Keep existing `gateway_limiter` tracing and add `timeout_ms` so queued wait
   time is visible in progress/harness summaries.
+- Extend the harness trace summary with a dedicated `gateway limiter` line for
+  acquired/denied counts, limiter wait latency, denied wait latency, and max
+  timeout.
 - Add deterministic tests proving short bursts queue and succeed while
   sustained saturation still fails.
 
@@ -18701,6 +18704,8 @@ cargo test -p freedom-ipfs-gateway concurrency
 cargo check -p freedom-ipfs-gateway --all-targets
 cargo clippy -p freedom-ipfs-gateway --all-targets -- -D warnings
 cargo test -p freedom-ipfs-gateway
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
 ```
 
 Result:
@@ -18711,6 +18716,8 @@ Result:
 - Gateway clippy passed with `-D warnings`.
 - Full gateway suite passed: `30` lib tests, `4` main tests, CLI test, and
   non-ignored integration tests passed.
+- Focused harness trace-summary test passed.
+- Harness clippy passed with `-D warnings`.
 
 Normal page fan-out check:
 
