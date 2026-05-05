@@ -8681,6 +8681,8 @@ Implementation:
 - Keep successful and normally failed full DHT lookups unchanged.
 - Extend the harness trace-summary fixture so cancelled fallback lookup events
   count as DHT lookup failures and appear in trace errors.
+- Add `max_query_timeout_ms` to the harness DHT lookup summary so reports can
+  distinguish the short fallback cap from the full configured DHT query budget.
 - Add a deterministic routing test that proves low delegated diversity returns
   the delegated provider after the short DHT fallback cap instead of waiting for
   the full DHT query timeout.

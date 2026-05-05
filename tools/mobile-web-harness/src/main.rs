@@ -1314,13 +1314,14 @@ fn print_trace_dht_provider_lookup(trace: &TraceSummary) {
         return;
     }
     println!(
-        "  dht provider lookup: events={} successes={} failures={} providers={} max_providers={} max_timeout_ms={} max_elapsed_ms={}",
+        "  dht provider lookup: events={} successes={} failures={} providers={} max_providers={} max_timeout_ms={} max_query_timeout_ms={} max_elapsed_ms={}",
         dht.events,
         dht.successes,
         dht.failures,
         dht.providers,
         dht.max_providers,
         dht.max_timeout_ms,
+        dht.max_query_timeout_ms,
         dht.max_elapsed_ms
     );
 }
@@ -3937,6 +3938,7 @@ struct TraceDhtProviderLookupAggregate {
     providers: u128,
     max_providers: u128,
     max_timeout_ms: u128,
+    max_query_timeout_ms: u128,
     max_elapsed_ms: u128,
 }
 
@@ -3954,6 +3956,9 @@ impl TraceDhtProviderLookupAggregate {
             .max(trace_count_field(value, "max_providers"));
         if let Some(timeout_ms) = value.get("timeout_ms").and_then(json_u128) {
             self.max_timeout_ms = self.max_timeout_ms.max(timeout_ms);
+        }
+        if let Some(query_timeout_ms) = value.get("query_timeout_ms").and_then(json_u128) {
+            self.max_query_timeout_ms = self.max_query_timeout_ms.max(query_timeout_ms);
         }
         self.max_elapsed_ms = self.max_elapsed_ms.max(elapsed_ms.unwrap_or_default());
     }
@@ -6424,6 +6429,7 @@ mod tests {
         assert_eq!(summary.dht_provider_lookup.providers, 2);
         assert_eq!(summary.dht_provider_lookup.max_providers, 4);
         assert_eq!(summary.dht_provider_lookup.max_timeout_ms, 750);
+        assert_eq!(summary.dht_provider_lookup.max_query_timeout_ms, 10000);
         assert_eq!(summary.dht_provider_lookup.max_elapsed_ms, 20);
         assert_eq!(summary.unixfs_metadata_cache.events, 1);
         assert_eq!(summary.unixfs_metadata_cache.hits, 3);
