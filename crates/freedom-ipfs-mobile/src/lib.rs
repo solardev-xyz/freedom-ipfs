@@ -600,7 +600,20 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         {
             "fetching_http_provider"
         }
-        "block_fetch_total" | "block_fetch_coalesced" => "streaming",
+        "block_range_batch_fetch" if fields.get("source").map(String::as_str) == Some("cache") => {
+            "cache_hit"
+        }
+        "block_range_batch_fetch"
+            if fields.get("source").map(String::as_str) == Some("bitswap") =>
+        {
+            "fetching_bitswap"
+        }
+        "block_range_batch_fetch"
+            if fields.get("source").map(String::as_str) == Some("http_provider") =>
+        {
+            "fetching_http_provider"
+        }
+        "block_fetch_total" | "block_fetch_coalesced" | "block_range_batch_fetch" => "streaming",
         "name_cache" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
             "name_resolved"
         }
@@ -2510,6 +2523,30 @@ mod tests {
             progress_phase(
                 "block_fetch_total",
                 &progress_fields([("phase", "block_fetch_total"), ("source", "http_provider")]),
+                "active",
+            ),
+            "fetching_http_provider"
+        );
+        assert_eq!(
+            progress_phase(
+                "block_range_batch_fetch",
+                &progress_fields([
+                    ("phase", "block_range_batch_fetch"),
+                    ("source", "bitswap"),
+                    ("range_len", "32768")
+                ]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "block_range_batch_fetch",
+                &progress_fields([
+                    ("phase", "block_range_batch_fetch"),
+                    ("source", "http_provider"),
+                    ("range_len", "32768")
+                ]),
                 "active",
             ),
             "fetching_http_provider"

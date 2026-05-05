@@ -897,6 +897,7 @@ fn print_summary(report: &RunReport) {
                 store.put_max_ms
             );
         }
+        print_trace_block_range_batch_fetches(trace);
         print_trace_provider_retries(trace);
         print_trace_delegated_provider_lookup(trace);
         print_trace_dht_provider_lookup(trace);
@@ -1250,6 +1251,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
             store.put_max_ms
         );
     }
+    print_trace_block_range_batch_fetches(trace);
     print_trace_unixfs_metadata_cache(trace);
     print_trace_progress_phases(trace);
     print_trace_provider_retries(trace);
@@ -1461,6 +1463,23 @@ fn print_trace_unixfs_metadata_cache(trace: &TraceSummary) {
         cache.file_size_evictions,
         cache.max_file_size_len,
         cache.max_capacity
+    );
+}
+
+fn print_trace_block_range_batch_fetches(trace: &TraceSummary) {
+    let ranges = &trace.block_range_batch_fetches;
+    if !ranges.has_events() {
+        return;
+    }
+    println!(
+        "  block range batch fetches: events={} bytes={} elapsed={} max_range_len={} max_range_count={} max_uncached_range_count={} sources={}",
+        ranges.events,
+        ranges.bytes,
+        ranges.elapsed_ms,
+        ranges.max_range_len,
+        ranges.max_range_count,
+        ranges.max_uncached_range_count,
+        format_trace_counts(&ranges.sources)
     );
 }
 
@@ -4485,6 +4504,7 @@ struct TraceSummary {
     slow_events: Vec<TraceSlowEvent>,
     block_sources: Vec<TraceValueCount>,
     block_store: TraceBlockStoreAggregate,
+    block_range_batch_fetches: TraceBlockRangeBatchFetchAggregate,
     provider_retries: TraceProviderRetryAggregate,
     delegated_provider_lookup: TraceDelegatedProviderLookupAggregate,
     delegated_provider_lookup_by_endpoint: Vec<TraceDelegatedProviderEndpointAggregate>,
@@ -4562,6 +4582,69 @@ struct TraceBlockStoreAggregate {
     put_failures: usize,
     put_total_ms: u128,
     put_max_ms: u128,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceBlockRangeBatchFetchAggregate {
+    events: usize,
+    bytes: u128,
+    max_range_len: u128,
+    max_range_count: u128,
+    max_uncached_range_count: u128,
+    elapsed_ms: LatencySummary,
+    sources: Vec<TraceValueCount>,
+    #[serde(skip)]
+    elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    source_counts: BTreeMap<String, usize>,
+}
+
+impl TraceBlockRangeBatchFetchAggregate {
+    fn record(&mut self, value: &serde_json::Value, elapsed_ms: Option<u128>) {
+        self.events += 1;
+        let range_len = value
+            .get("range_len")
+            .and_then(json_u128)
+            .or_else(|| {
+                let start = value.get("range_start").and_then(json_u128)?;
+                let end = value.get("range_end").and_then(json_u128)?;
+                Some(if start <= end {
+                    end.saturating_sub(start).saturating_add(1)
+                } else {
+                    0
+                })
+            })
+            .unwrap_or_default();
+        self.bytes += range_len;
+        self.max_range_len = self.max_range_len.max(range_len);
+        self.max_range_count = self.max_range_count.max(
+            value
+                .get("range_count")
+                .and_then(json_u128)
+                .unwrap_or_default(),
+        );
+        self.max_uncached_range_count = self.max_uncached_range_count.max(
+            value
+                .get("uncached_range_count")
+                .and_then(json_u128)
+                .unwrap_or_default(),
+        );
+        if let Some(elapsed_ms) = elapsed_ms {
+            self.elapsed_values.push(elapsed_ms);
+        }
+        if let Some(source) = json_detail_string(value.get("source")) {
+            *self.source_counts.entry(source).or_default() += 1;
+        }
+    }
+
+    fn finish(&mut self) {
+        self.elapsed_ms = LatencySummary::from_values(std::mem::take(&mut self.elapsed_values));
+        self.sources = sorted_trace_counts(std::mem::take(&mut self.source_counts));
+    }
+
+    fn has_events(&self) -> bool {
+        self.events > 0
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -5842,6 +5925,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut slow_events = Vec::<TraceSlowEvent>::new();
     let mut block_sources = BTreeMap::<String, usize>::new();
     let mut block_store = TraceBlockStoreAggregate::default();
+    let mut block_range_batch_fetches = TraceBlockRangeBatchFetchAggregate::default();
     let mut provider_retries = TraceProviderRetryAggregate::default();
     let mut delegated_provider_lookup = TraceDelegatedProviderLookupAggregate::default();
     let mut delegated_provider_lookup_by_endpoint =
@@ -5988,6 +6072,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 block_store.put_total_ms += elapsed_ms;
                 block_store.put_max_ms = block_store.put_max_ms.max(elapsed_ms);
             }
+        }
+        if phase == "block_range_batch_fetch" {
+            block_range_batch_fetches.record(&value, elapsed_ms);
         }
         if phase == "http_provider_fetch" {
             http_provider_fetch_events += 1;
@@ -6946,6 +7033,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     delegated_provider_lookup.finish();
     bitswap_session.finish();
     http_provider_races.finish();
+    block_range_batch_fetches.finish();
 
     Ok(TraceSummary {
         line_count,
@@ -6955,6 +7043,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         slow_events,
         block_sources: sorted_trace_counts(block_sources),
         block_store,
+        block_range_batch_fetches,
         provider_retries,
         delegated_provider_lookup,
         delegated_provider_lookup_by_endpoint: sorted_trace_delegated_provider_endpoints(
@@ -7405,6 +7494,12 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
             _ => "checking_cache",
         },
         "block_fetch_total" => match value.get("source").and_then(|source| source.as_str()) {
+            Some("cache") => "cache_hit",
+            Some("bitswap") => "fetching_bitswap",
+            Some("http_provider") => "fetching_http_provider",
+            _ => "streaming",
+        },
+        "block_range_batch_fetch" => match value.get("source").and_then(|source| source.as_str()) {
             Some("cache") => "cache_hit",
             Some("bitswap") => "fetching_bitswap",
             Some("http_provider") => "fetching_http_provider",
@@ -9798,6 +9893,50 @@ mod tests {
         assert_eq!(summary.block_store.put_total_ms, 20);
         assert_eq!(summary.block_store.put_max_ms, 17);
         assert_eq!(trace_value_count(&summary.progress_phases, "streaming"), 2);
+    }
+
+    #[test]
+    fn trace_summary_counts_block_range_batch_fetches() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-block-range-batch-fetch-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"block_range_batch_fetch\",\"cid\":\"cid-a\",\"source\":\"bitswap\",\"range_start\":10,\"range_end\":19,\"range_len\":10,\"range_count\":2,\"uncached_range_count\":2,\"elapsed_ms\":17}\n",
+                "{\"phase\":\"block_range_batch_fetch\",\"cid\":\"cid-b\",\"source\":\"http_provider\",\"range_start\":20,\"range_end\":39,\"range_len\":20,\"range_count\":2,\"uncached_range_count\":2,\"elapsed_ms\":33}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let ranges = &summary.block_range_batch_fetches;
+
+        assert_eq!(ranges.events, 2);
+        assert_eq!(ranges.bytes, 30);
+        assert_eq!(ranges.max_range_len, 20);
+        assert_eq!(ranges.max_range_count, 2);
+        assert_eq!(ranges.max_uncached_range_count, 2);
+        assert_eq!(ranges.elapsed_ms.count, 2);
+        assert_eq!(ranges.elapsed_ms.p50_ms, Some(17));
+        assert_eq!(ranges.elapsed_ms.p95_ms, Some(33));
+        assert_eq!(trace_value_count(&ranges.sources, "bitswap"), 1);
+        assert_eq!(trace_value_count(&ranges.sources, "http_provider"), 1);
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "fetching_bitswap"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "fetching_http_provider"),
+            1
+        );
     }
 
     #[test]

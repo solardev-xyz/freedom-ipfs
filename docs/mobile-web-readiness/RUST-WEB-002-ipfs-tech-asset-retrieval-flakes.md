@@ -17133,3 +17133,118 @@ Result:
 Decision:
 Keep. This is harness-only diagnostics and preserves current late-peer wait
 behavior.
+
+## 2026-05-05 Keep: Summarize Raw Range Batch Fetches
+
+Question:
+The kept bounded raw range child-fetch path improved the deterministic seeded
+range workload, but the trace only showed that a child block was fetched. It did
+not expose the requested byte span, batch width, uncached width, source, or
+child-fetch latency. That made the remaining Rust-vs-Kubo seeded gap harder to
+attribute.
+
+Implementation:
+
+- Keep retrieval behavior unchanged.
+- Add low-volume fields to `block_range_batch_fetch` trace events:
+  `range_start`, `range_end`, `range_len`, `range_count`,
+  `uncached_range_count`, and `elapsed_ms`.
+- Add a harness aggregate for block range batch fetches:
+  events, requested bytes, latency p50/p90/p95/max, max range length, max batch
+  width, max uncached width, and sources.
+- Map `block_range_batch_fetch` into mobile-facing progress phases by source:
+  Bitswap => `fetching_bitswap`, HTTP provider => `fetching_http_provider`,
+  cache => `cache_hit`, otherwise `streaming`.
+- Add focused harness and mobile progress tests.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_block_range_batch_fetches
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+cargo check -p freedom-ipfs-retrieval --all-targets
+```
+
+Focused result:
+
+- Formatting passed.
+- The block-range summary harness test passed.
+- The mobile progress phase mapping test passed.
+- Retrieval crate check passed.
+
+Live seeded comparison:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-range-batch-summary-r3-trace.jsonl \
+  --comparison-output /tmp/harness-range-batch-summary-r3.json
+```
+
+Live result:
+
+- Rust and Kubo both passed `3/3`.
+- Rust root TTFB p50/p95: `172ms` / `186ms`.
+- Kubo root TTFB p50/p95: `54ms` / `56ms`.
+- Root TTFB ratios: p50 `3.19x`, p95 `3.32x`.
+- Max RSS/FD: Rust `39292KiB` / `13`; Kubo `91392KiB` / `37`.
+- Block range batch fetches: `events=6`, `bytes=900`,
+  elapsed p50/p90/p95/max `70ms` / `99ms` / `99ms` / `99ms`.
+- Batch shape: `max_range_len=150`, `max_range_count=2`,
+  `max_uncached_range_count=2`.
+- Sources: `bitswap=6`.
+- Gateway direct bodies: `3` events, `900` bytes, max elapsed `101ms`.
+- Bitswap connections established: `3`, established p50/p95 `56ms` / `56ms`.
+- Post-lookup session waits all hit: `6` hits, p50/p95/max
+  `13ms` / `43ms` / `43ms`.
+
+Interpretation:
+
+- The remaining seeded gap is now visible as range child Bitswap fetch latency
+  plus Rust's per-run provider lookup/dial work. The actual byte ranges are tiny
+  (`150` bytes each), so optimizing block transfer payload size is not the
+  first lever.
+- The range batch path is doing the right bounded work: two uncached raw child
+  ranges per request, no HTTP provider fallback, no extra public gateway path,
+  and low resource usage.
+- Future seeded work should look for ways to reduce setup and child fetch
+  latency without speculative duplicate work. Compare against the prior rejected
+  range multi-want and prefetch experiments before trying another hook.
+
+Final validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo test -p freedom-ipfs-retrieval
+cargo test -p freedom-ipfs-mobile
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting passed.
+- Full mobile web harness suite passed: `36 passed`.
+- Full retrieval suite passed: `72 passed`, `1 ignored`.
+- Full mobile suite passed: `26 passed`.
+- Workspace check passed.
+- Workspace clippy passed with `-D warnings`.
+- Diff whitespace check passed.
+
+Decision:
+Keep. This is diagnostics plus mobile progress classification only. It preserves
+read-only behavior, avoids public gateway fallback, keeps block verification
+unchanged, and keeps mobile resource usage low.

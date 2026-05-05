@@ -1713,6 +1713,7 @@ impl FetchingBlockProvider {
         &self,
         ranges: Vec<(Cid, u64, u64)>,
     ) -> CoreResult<Vec<Option<Vec<u8>>>> {
+        let range_count = ranges.len();
         let mut results = vec![None; ranges.len()];
         let mut fetches = Vec::new();
         for (index, (cid, start, end)) in ranges.iter().copied().enumerate() {
@@ -1742,25 +1743,40 @@ impl FetchingBlockProvider {
                     );
                     let retriever = self.retriever.clone();
                     fetches.push(async move {
+                        let fetch_started = Instant::now();
+                        let fetched = retriever.fetch_block_with_source(&cid).await;
                         (
                             index,
                             cid,
                             start,
                             end,
-                            retriever.fetch_block_with_source(&cid).await,
+                            fetch_started.elapsed().as_millis(),
+                            fetched,
                         )
                     });
                 }
             }
         }
 
-        for (index, cid, start, end, fetched) in join_all(fetches).await {
+        let uncached_range_count = fetches.len();
+        for (index, cid, start, end, elapsed_ms, fetched) in join_all(fetches).await {
             let (block, source) = fetched.map_err(|err| CoreError::Storage(err.to_string()))?;
             self.stats.record(source);
+            let range_len = if start <= end {
+                end.saturating_sub(start).saturating_add(1)
+            } else {
+                0
+            };
             tracing::info!(
                 phase = "block_range_batch_fetch",
                 cid = %cid,
-                source = retrieval_source_label(source)
+                source = retrieval_source_label(source),
+                range_start = start,
+                range_end = end,
+                range_len,
+                range_count,
+                uncached_range_count,
+                elapsed_ms
             );
             results[index] = Some(block_data_range(block.data(), start, end));
         }
