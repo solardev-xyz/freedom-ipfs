@@ -9390,3 +9390,35 @@ block serving, and still periodically refreshes persistent LRU timestamps for
 long sessions. The live TTFB numbers remain noisy, but the trace-level
 `block_store_get` improvement is directly on the intended path and resource
 usage did not regress.
+
+## 2026-05-05 Keep: Print Slow Trace Details In Kubo Comparisons
+
+Hypothesis:
+The trace summary already records slow CIDs, slow gateway requests, and slow
+events, but the Rust-vs-Kubo comparison console output did not print those
+details. That forced each optimization pass to re-run ad hoc JSON analysis after
+a comparison run. Printing the existing slow trace details in comparison output
+should make the next bottleneck visible directly in the standard benchmark loop.
+
+Implementation:
+
+- Factor the existing slow CID/request/event printer into one helper.
+- Reuse it from both normal harness summaries and Rust-vs-Kubo comparison trace
+  summaries.
+- Keep output-only behavior; no retrieval, gateway, cache, network, or result
+  schema semantics change.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo check -p mobile-web-harness --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Result: all passed.
+
+Decision: keep. This is diagnostics-only and makes same-window Kubo comparisons
+more actionable by surfacing the specific slow paths/CIDs/events that drive the
+aggregate latency numbers.

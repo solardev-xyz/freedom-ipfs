@@ -936,60 +936,8 @@ fn print_summary(report: &RunReport) {
                 dns.ips
             );
         }
-        if !trace.slow_cids.is_empty() {
-            println!("  slow cids:");
-            for cid in trace.slow_cids.iter().take(8) {
-                let phases = format_trace_counts(&cid.phases);
-                let paths = format_trace_counts(&cid.paths);
-                println!(
-                    "    {}: count={} total={}ms max={}ms phases={} paths={}",
-                    cid.cid, cid.count, cid.total_ms, cid.max_ms, phases, paths
-                );
-            }
-        }
-        if !trace.slow_requests.is_empty() {
-            println!("  slow requests:");
-            for request in trace.slow_requests.iter().take(8) {
-                let phases = format_trace_counts(&request.phases);
-                let cids = format_trace_counts(&request.cids);
-                let status = request.status.as_deref().unwrap_or("unknown");
-                let request_id = if request.process_id.is_empty() {
-                    request.request_id.clone()
-                } else {
-                    format!("{}:{}", request.process_id, request.request_id)
-                };
-                let correlation = format_request_correlation(request);
-                println!(
-                    "    {}: {}ms status={} request_id={}{} events={} max_event={}ms phases={} cids={}",
-                    request.path,
-                    request.elapsed_ms,
-                    status,
-                    request_id,
-                    correlation,
-                    request.event_count,
-                    request.max_event_ms,
-                    phases,
-                    cids
-                );
-            }
-        }
+        print_trace_slow_details(trace);
         print_trace_progress_request_groups(trace);
-        if !trace.slow_events.is_empty() {
-            println!("  slow events:");
-            for event in trace.slow_events.iter().take(8) {
-                let details = event
-                    .details
-                    .iter()
-                    .map(|(key, value)| format!("{key}={value}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if details.is_empty() {
-                    println!("    {}: {}ms", event.phase, event.elapsed_ms);
-                } else {
-                    println!("    {}: {}ms {}", event.phase, event.elapsed_ms, details);
-                }
-            }
-        }
     }
 
     if report.repeat == 1 && report.warmup_runs == 0 {
@@ -1235,6 +1183,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_connection_errors(trace);
     print_trace_connection_backoff(trace);
     print_trace_dial_rejections(trace);
+    print_trace_slow_details(trace);
     if !trace.trace_errors.is_empty() {
         println!(
             "  trace errors: {}",
@@ -1251,6 +1200,62 @@ fn print_trace_progress_phases(trace: &TraceSummary) {
         "  progress phases: {}",
         format_trace_counts(&trace.progress_phases)
     );
+}
+
+fn print_trace_slow_details(trace: &TraceSummary) {
+    if !trace.slow_cids.is_empty() {
+        println!("  slow cids:");
+        for cid in trace.slow_cids.iter().take(8) {
+            let phases = format_trace_counts(&cid.phases);
+            let paths = format_trace_counts(&cid.paths);
+            println!(
+                "    {}: count={} total={}ms max={}ms phases={} paths={}",
+                cid.cid, cid.count, cid.total_ms, cid.max_ms, phases, paths
+            );
+        }
+    }
+    if !trace.slow_requests.is_empty() {
+        println!("  slow requests:");
+        for request in trace.slow_requests.iter().take(8) {
+            let phases = format_trace_counts(&request.phases);
+            let cids = format_trace_counts(&request.cids);
+            let status = request.status.as_deref().unwrap_or("unknown");
+            let request_id = if request.process_id.is_empty() {
+                request.request_id.clone()
+            } else {
+                format!("{}:{}", request.process_id, request.request_id)
+            };
+            let correlation = format_request_correlation(request);
+            println!(
+                "    {}: {}ms status={} request_id={}{} events={} max_event={}ms phases={} cids={}",
+                request.path,
+                request.elapsed_ms,
+                status,
+                request_id,
+                correlation,
+                request.event_count,
+                request.max_event_ms,
+                phases,
+                cids
+            );
+        }
+    }
+    if !trace.slow_events.is_empty() {
+        println!("  slow events:");
+        for event in trace.slow_events.iter().take(8) {
+            let details = event
+                .details
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if details.is_empty() {
+                println!("    {}: {}ms", event.phase, event.elapsed_ms);
+            } else {
+                println!("    {}: {}ms {}", event.phase, event.elapsed_ms, details);
+            }
+        }
+    }
 }
 
 fn print_trace_unixfs_metadata_cache(trace: &TraceSummary) {
