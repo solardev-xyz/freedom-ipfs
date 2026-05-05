@@ -15826,3 +15826,143 @@ had more candidates than the race width, but `0/54` winners came from rank 3 or
 later. The useful next speed work is more likely in the page/session path shown
 by the slow requests and Bitswap/session summaries, not broader HTTP-provider
 fanout.
+
+## 2026-05-05 Keep: Retune Session Pre-Lookup Grace Back To 50ms
+
+Question:
+`BITSWAP_SESSION_PRE_LOOKUP_GRACE=75ms` was kept earlier because it reduced
+redundant provider lookups when recent session peers were often useful. Since
+then, delegated routing and verified HTTP-provider retrieval have improved.
+Retest whether the shorter `50ms` head start now gives a better mobile
+latency/resource tradeoff by falling back to the provider path sooner.
+
+Implementation:
+
+- Change `BITSWAP_SESSION_PRE_LOOKUP_GRACE` from `75ms` to `50ms`.
+- Keep `BITSWAP_SESSION_POST_LOOKUP_GRACE=100ms`.
+- Keep the existing `2s` session shortcut cap.
+- No provider fanout increase, no public fallback, and no verification/caching
+  trust change.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval recent_bitswap_peer
+```
+
+Result:
+
+- Formatting passed.
+- Focused recent Bitswap peer tests passed: `4 passed`.
+
+Same-window `75ms` baseline:
+
+- Artifact paths:
+  `/tmp/ipfs-tech-http-race-result-r3-trace.jsonl` and
+  `/tmp/ipfs-tech-http-race-result-r3.json`.
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1200ms` / `1898ms` / `1898ms`.
+- Asset TTFB p50/p95/max: `248ms` / `1338ms` / `1942ms`.
+- Run total p50/p95/max: `3564ms` / `4115ms` / `4115ms`.
+- Max RSS/FD: `51956KiB` / `36`.
+- Delegated provider lookup max: `116ms`.
+- HTTP-provider races: `54` results, `51` rank-1 winners, `3` rank-2 winners,
+  `0` rank-3-or-later winners.
+- Block sources: `http_provider=69`, `bitswap=49`, `cache=2`.
+- Bitswap session: `shortcut_starts=85`, `shortcut_hits=48`,
+  `shortcut_post_lookup_waits=40`.
+
+`50ms` `ipfs.tech` experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-session-prelookup50-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-session-prelookup50-r3.json
+```
+
+Result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1330ms` / `1334ms` / `1334ms`.
+- Asset TTFB p50/p95/max: `237ms` / `834ms` / `1523ms`.
+- Run total p50/p95/max: `3225ms` / `3646ms` / `3646ms`.
+- Max RSS/FD: `51844KiB` / `35`.
+- Delegated provider lookup max: `88ms`.
+- HTTP-provider races: `62` results, `60` rank-1 winners, `2` rank-2 winners,
+  `0` rank-3-or-later winners.
+- HTTP-provider fetch p50/p95/max: `172ms` / `657ms` / `1349ms`.
+- Block sources: `http_provider=77`, `bitswap=43`.
+- Bitswap session: `shortcut_starts=63`, `shortcut_hits=40`,
+  `shortcut_post_lookup_waits=24`.
+- Bitswap peer attempts fell from `106` in the `75ms` baseline to `84`.
+
+Additional checks:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-session-prelookup50-r3-trace.jsonl \
+  --output /tmp/vitalik-session-prelookup50-r3.json
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-session-prelookup50-r3-trace.jsonl \
+  --output /tmp/daicowtf-session-prelookup50-r3.json
+```
+
+Results:
+
+- `vitalik-root-html-range` passed `3/3`; root/range TTFB p50/p95/max
+  `180ms` / `368ms` / `368ms`, max RSS/FD `31616KiB` / `14`, block sources
+  `http_provider=6`. This case did not exercise recent-session shortcuts.
+- `daicowtf-page-assets` passed `3/3`; root TTFB p50/p95/max
+  `1292ms` / `1569ms` / `1569ms`, max RSS/FD `42520KiB` / `17`, block sources
+  `http_provider=6`, `bitswap=3`. This case also did not exercise recent
+  session shortcuts.
+
+Final validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Full retrieval suite passed: `69 passed`, `1 ignored`.
+- Workspace check passed.
+- Workspace clippy passed with `-D warnings`.
+- Diff whitespace check passed.
+
+Decision:
+Keep `50ms`. In the same network window, the shorter pre-lookup grace improved
+`ipfs.tech` asset p95 from `1338ms` to `834ms`, asset max from `1942ms` to
+`1523ms`, run p95 from `4115ms` to `3646ms`, and root p95 from `1898ms` to
+`1334ms`, while slightly reducing FD/RSS and Bitswap peer-attempt pressure. The
+other live checks stayed reliable and resource-light. This supersedes the
+earlier `75ms` keep decision under the newer HTTP-provider/routing behavior.
