@@ -15774,3 +15774,55 @@ width, every successful race was won by a candidate already inside the initial
 two slots. Future HTTP-provider race work should use this result summary as a
 gate: a wider or selective third-provider policy is only worth prototyping when
 live traces show nonzero late winners or repeated slow initial-width winners.
+
+## 2026-05-05 Baseline: HTTP Provider Race Outcomes Over 3 Runs
+
+Question:
+After adding HTTP-provider race-result and winner-rank summaries, collect a
+slightly stronger current baseline before changing provider race policy again.
+
+Command:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-race-result-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-http-race-result-r3.json
+```
+
+Result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1200ms` / `1898ms` / `1898ms`.
+- Asset TTFB p50/p95/max: `248ms` / `1338ms` / `1942ms`.
+- Run total p50/p95/max: `3564ms` / `4115ms` / `4115ms`.
+- Max RSS/FD: `51956KiB` / `36`.
+- Delegated provider lookup max: `116ms`.
+- HTTP provider distribution: `zero=5`, `single=46`, `multi=36`,
+  `single_target_miss=46`, `single_first_http_max=110ms`.
+- HTTP-provider races: `54` events, `108` total providers,
+  `27` single-provider races, `27` multi-provider races, `27` races above the
+  race width, race width max `2`, provider count max `3`, `1` hedge,
+  `54` race results, `54` successes, `0` failures, `54` winners inside the
+  initial race width, `0` late winners, `51` rank-1 winners, `3` rank-2
+  winners, `0` rank-3-or-later winners, max winner rank `2`, max attempted
+  provider count `3`, max race-result elapsed `1351ms`.
+- HTTP-provider fetch p50/p95/max: `161ms` / `727ms` / `1342ms`.
+- Provider spread: `dag.w3s.link=27`, `ipfs-bridge.sia.dev=27`.
+- Block sources: `http_provider=69`, `bitswap=49`, `cache=2`.
+- Bitswap session summary: `shortcut_starts=85`, `shortcut_hits=48`,
+  `shortcut_misses=0`, `shortcut_post_lookup_waits=40`.
+
+Interpretation:
+Do not widen the default HTTP-provider race on this evidence. Half of the races
+had more candidates than the race width, but `0/54` winners came from rank 3 or
+later. The useful next speed work is more likely in the page/session path shown
+by the slow requests and Bitswap/session summaries, not broader HTTP-provider
+fanout.
