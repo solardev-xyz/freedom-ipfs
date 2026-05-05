@@ -513,6 +513,7 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         | "bitswap_client_reset"
         | "bitswap_connection_error"
         | "bitswap_dial_rejected"
+        | "bitswap_incoming_stream_read"
         | "bitswap_peer_timeout"
         | "bitswap_peer_timeout_suppressed"
         | "bitswap_provider_candidates_empty" => "retrying",
@@ -547,6 +548,11 @@ fn progress_error_code(raw_phase: &str, fields: &ProgressFields, status: &str) -
     if raw_phase == "gateway_limiter" && fields.get("acquired").map(String::as_str) == Some("false")
     {
         return Some("gateway_busy".into());
+    }
+    if raw_phase == "bitswap_incoming_stream_read"
+        && fields.get("ok").map(String::as_str) == Some("false")
+    {
+        return Some("bitswap_incoming_stream_read".into());
     }
     if fields.get("error").is_some() {
         Some(raw_phase.to_string())
@@ -2033,11 +2039,39 @@ mod tests {
         );
         assert_eq!(
             progress_phase(
+                "bitswap_incoming_stream_read",
+                &progress_fields([
+                    ("phase", "bitswap_incoming_stream_read"),
+                    ("ok", "false"),
+                    ("timed_out", "true")
+                ]),
+                "active",
+            ),
+            "retrying"
+        );
+        assert_eq!(
+            progress_phase(
                 "provider_retry_after_connection_timeout",
                 &progress_fields([("phase", "provider_retry_after_connection_timeout")]),
                 "active",
             ),
             "retrying"
+        );
+    }
+
+    #[test]
+    fn progress_error_code_marks_incoming_stream_read_failures() {
+        assert_eq!(
+            progress_error_code(
+                "bitswap_incoming_stream_read",
+                &progress_fields([
+                    ("phase", "bitswap_incoming_stream_read"),
+                    ("ok", "false"),
+                    ("timed_out", "true")
+                ]),
+                "active",
+            ),
+            Some("bitswap_incoming_stream_read".into())
         );
     }
 

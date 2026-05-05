@@ -6865,3 +6865,40 @@ trust remote bytes; it only improves provider candidate discovery when the app
 or harness explicitly configures more than one delegated routing endpoint. The
 merge wait is bounded so a slow secondary router cannot add a 10s mobile latency
 tail.
+
+## 2026-05-05 Keep: Map Incoming Bitswap Read Timeouts To Mobile Retrying
+
+Motivation:
+The incoming-read pressure summary made `bitswap_incoming_stream_read` failures
+visible in harness output, but the mobile progress mapper and harness
+progress-phase mapper still treated that raw phase as an unmapped diagnostic
+string. Swift should see a stable UI phase when an incoming Bitswap stream read
+times out or is dropped.
+
+Implementation:
+
+- Map `bitswap_incoming_stream_read` to the stable `retrying` progress phase in
+  `freedom-ipfs-mobile`.
+- Add `bitswap_incoming_stream_read` as a mobile `last_error_code` when the
+  event records `ok=false`.
+- Map the same raw phase to `retrying` in the mobile web harness progress
+  summary.
+- Update `docs/mobile-progress-api.md` to mention incoming Bitswap read timeouts
+  as a `retrying` example.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+cargo test -p freedom-ipfs-mobile progress_error_code_marks_incoming_stream_read_failures
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+cargo test -p freedom-ipfs-mobile
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Decision: keep. This is diagnostics/API polish only; it does not change
+retrieval behavior or the mobile ABI.

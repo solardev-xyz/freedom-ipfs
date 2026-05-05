@@ -124,6 +124,10 @@ The app should treat `phase` as the UI-facing state and keep `raw_phase`,
 - `fetching_bitswap`: "Fetching from IPFS peers"
 - `fetching_http_provider`: "Fetching from HTTP provider"
 - `streaming`: "Receiving content"
-- `retrying`: "Retrying slow provider"
+- `retrying`: "Retrying slow provider" or "Retrying slow peer"
 - `completed`: loaded
 - `failed`: failed
+
+Examples of `retrying` include request timeouts, temporarily skipped peers,
+connection errors, and incoming Bitswap stream read timeouts. `raw_phase`
+distinguishes these cases for logs.
