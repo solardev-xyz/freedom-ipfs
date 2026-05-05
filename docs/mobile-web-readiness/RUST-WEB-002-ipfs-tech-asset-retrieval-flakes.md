@@ -13431,3 +13431,92 @@ resource-light. Rust asset p95 on `ipfs.tech` is still slower than Kubo in this
 window, so the next asset-tail work should look at HTTP-provider fetch latency,
 session shortcut/post-lookup behavior, and the remaining high-provider CIDs
 that have few HTTP candidates.
+
+## 2026-05-05 Reject: Race Single HTTP Provider With Recent Session Peer
+
+Hypothesis:
+After streaming delegated NDJSON, the remaining `ipfs.tech` asset tail was often
+a single routing-provided HTTP provider, usually `ipfs-bridge.sia.dev`, taking
+hundreds of milliseconds while recent Bitswap session peers sometimes served the
+same CIDs in about `130-190ms`. A very narrow race between exactly one HTTP
+provider and only recent session peers might reduce those tails without broad
+provider fanout.
+
+Prototype:
+
+- When provider fetching saw exactly one HTTP provider and at least one recent
+  successful Bitswap session peer, race:
+  - the existing verified single HTTP-provider fetch; and
+  - `fetch_from_recent_bitswap_peers` only, not the full provider Bitswap set.
+- Keep the existing global HTTP provider limiter.
+- Do not add public gateway fallback.
+- Continue verifying blocks before store/serve through both paths.
+- Emit the existing `http_provider_race` trace phase with `session_race=true`.
+
+Focused validation while the temporary patch was applied:
+
+```sh
+cargo fmt --all
+cargo test -p freedom-ipfs-retrieval single_http_provider_is_raced_with_recent_bitswap_peer
+cargo test -p freedom-ipfs-retrieval races_http_provider_candidates_and_returns_first_verified_block
+cargo test -p freedom-ipfs-retrieval recent_bitswap_peer
+```
+
+Result:
+
+- New focused test passed: a recent local Bitswap session peer beat a delayed
+  single HTTP provider and returned a verified Bitswap block.
+- Existing HTTP-provider race test passed.
+- Existing recent Bitswap peer tests passed: `5 passed`.
+
+Live experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-session-race-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-http-session-race-r3.json
+```
+
+Live result:
+
+- Rust and Kubo both passed `3/3`.
+- Rust root TTFB p50/p95 was `1325ms` / `1384ms`; Kubo was `2647ms` /
+  `2668ms`.
+- Rust asset TTFB p50/p95/max was `242ms` / `1589ms` / `7955ms`; Kubo was
+  `152ms` / `1711ms` / roughly the same tail window.
+- Rust max RSS/FD was `51696KiB` / `30`; Kubo max RSS/FD was `205624KiB` /
+  `195`.
+- HTTP provider fetches: events `90`, successes `90`, failures `0`, p50/p95/max
+  `161ms` / `673ms` / `938ms`.
+- Bitswap peer attempts fell to `23`, and FD max was low, but this was not
+  enough to justify the behavior.
+- Delegated provider lookup max was `7361ms`, and the slowest request group had
+  assets at `7955ms`, `7628ms`, and `6037ms`.
+
+Trace interpretation:
+
+- The prototype fired only `4` session races in the whole run.
+- One session race did return through Bitswap, but the request still took
+  `2314ms` because delegated provider lookup had already consumed `2227ms`
+  before the race could start.
+- The largest tails were delegated-provider lookup waits that happened before
+  the proposed single-HTTP/session race was reachable.
+- The experiment therefore targeted the wrong remaining bottleneck for this
+  trace shape. It did not provide clean evidence that the extra session race is
+  worth keeping.
+
+Decision:
+Reject and revert the code. Keep this note as a negative result. A future
+variant would need to address slow provider lookup while a recent session peer
+appears during that lookup, or improve HTTP-provider quality directly, rather
+than racing only after provider lookup has already completed.
