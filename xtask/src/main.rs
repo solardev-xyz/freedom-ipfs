@@ -623,6 +623,8 @@ fn verify_exported_symbols(library: &Path) -> Result<()> {
         "freedom_ipfs_node_routing_stats",
         "freedom_ipfs_node_active_preload_count",
         "freedom_ipfs_node_diagnostics",
+        "freedom_ipfs_node_progress_snapshot_json",
+        "freedom_ipfs_node_clear_progress",
     ] {
         if !stdout.contains(symbol) {
             bail!("{} does not export {symbol}", library.display());
@@ -750,6 +752,9 @@ enum FreedomIpfsSmoke {{
         guard let url = reader.localGatewayURL(for: "/ipfs/{fixture_cid}") else {{
             fatalError("fixture gateway URL missing")
         }}
+        guard reader.clearProgress() else {{
+            fatalError("clear progress failed")
+        }}
         let beforeDiagnostics = reader.diagnostics
         let (data, response) = try await URLSession.shared.data(from: url)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else {{
@@ -757,6 +762,20 @@ enum FreedomIpfsSmoke {{
         }}
         guard data == Data([{fixture_body}]) else {{
             fatalError("fixture body mismatch")
+        }}
+        let progressJSON = reader.progressSnapshotJSON
+        guard let progressData = progressJSON.data(using: .utf8),
+              let progressObject = try JSONSerialization.jsonObject(with: progressData) as? [String: Any],
+              let progressEvents = progressObject["events"] as? [[String: Any]],
+              progressEvents.contains(where: {{ event in
+                  event["kind"] as? String == "gateway_request"
+                      && event["path"] as? String == "/ipfs/{fixture_cid}"
+                      && event["phase"] as? String == "completed"
+              }}) else {{
+            fatalError("progress snapshot missing completed fixture request: \(progressJSON)")
+        }}
+        guard reader.clearProgress() else {{
+            fatalError("clear progress after request failed")
         }}
         let retrievalStats = reader.retrievalStats
         guard retrievalStats.cacheHits > 0,

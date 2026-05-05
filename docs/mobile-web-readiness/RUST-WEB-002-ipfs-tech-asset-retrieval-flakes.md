@@ -5766,6 +5766,8 @@ Implementation:
   mapping.
 - Update `FetchingBlockProvider` to emit `block_store_get` for direct store
   hits/misses, so cache activity is visible to the same progress recorder.
+- Update the XCFramework verifier to require the new C exports and make the
+  generated Swift smoke parse a progress snapshot after a gateway request.
 
 Validation:
 
@@ -5777,6 +5779,7 @@ cargo test -p freedom-ipfs-gateway --lib
 cargo test -p freedom-ipfs-retrieval --lib bitswap_fetch_caches_verified_extra_blocks
 cargo test -p freedom-ipfs-retrieval --lib
 cargo test -p freedom-ipfs-gateway
+cargo check -p xtask --all-targets
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 ```
