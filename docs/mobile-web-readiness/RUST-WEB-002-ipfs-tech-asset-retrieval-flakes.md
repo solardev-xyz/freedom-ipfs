@@ -10890,6 +10890,11 @@ cargo run -p xtask -- generate-mobile-web-fixture \
 - corpus: `/tmp/xtask-mobile-web-multiblock-corpus.json`
 - blocks: `4`
 - bytes: `600000`
+- default range cases:
+  `multiblock-unixfs-range`,
+  `multiblock-unixfs-prefix-range`,
+  `multiblock-unixfs-boundary-range`, and
+  `multiblock-unixfs-suffix-range`
 
 Rust offline import smoke:
 
@@ -11015,3 +11020,84 @@ Decision:
 Keep. This is a bounded range-workload optimization: it avoids fetching data
 outside the requested byte range while preserving HTML sniffing for full
 responses and prefix ranges such as `bytes=0-127`.
+
+## 2026-05-05 Harness: Expand Multi-Block Range Suite
+
+Hypothesis:
+A single deterministic deep range is useful, but it does not cover the range
+shapes that matter for media and UnixFS traversal: prefix sniffing, a range
+crossing a raw-leaf boundary, and suffix reads.
+
+Change:
+
+- `xtask generate-mobile-web-fixture` now emits four cases against the same CAR:
+  - `multiblock-unixfs-range`: `bytes=262100-262399`
+  - `multiblock-unixfs-prefix-range`: `bytes=0-299`
+  - `multiblock-unixfs-boundary-range`: `bytes=261994-262293`
+  - `multiblock-unixfs-suffix-range`: `bytes=599700-599999`
+- The default case ID remains `multiblock-unixfs-range`, so previous one-case
+  commands still work with `--case multiblock-unixfs-range`.
+- MIME trace fallback sources now distinguish `fallback_after_sniff` from
+  `fallback_no_sniff`; the prefix range is the only generated range that emits
+  `mime_sniff_read`.
+
+Validation:
+
+```sh
+cargo run -p xtask -- generate-mobile-web-fixture \
+  --car /tmp/xtask-mobile-web-range-suite.car \
+  --corpus /tmp/xtask-mobile-web-range-suite-corpus.json
+
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --routing-mode offline \
+  --gateway-import-car /tmp/xtask-mobile-web-range-suite.car \
+  --corpus /tmp/xtask-mobile-web-range-suite-corpus.json \
+  --repeat 1 \
+  --trace-output /tmp/xtask-mobile-web-range-suite-rust-trace.jsonl \
+  --output /tmp/xtask-mobile-web-range-suite-rust.json
+```
+
+Result:
+
+- all four Rust range cases passed
+- run total `15ms`
+- case TTFB/total:
+  - deep `4ms` / `4ms`
+  - prefix `3ms` / `3ms`
+  - boundary `3ms` / `3ms`
+  - suffix `3ms` / `3ms`
+- RSS/FD `21524KiB` / `11`
+- trace contained `mime_sniff_read` exactly once, for `bytes=0-299`
+- trace sources:
+  - prefix `source=fallback_after_sniff`
+  - deep/boundary/suffix `source=fallback_no_sniff`
+
+Kubo comparison:
+
+```sh
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --routing-mode offline \
+  --gateway-import-car /tmp/xtask-mobile-web-range-suite.car \
+  --corpus /tmp/xtask-mobile-web-range-suite-corpus.json \
+  --repeat 1 \
+  --comparison-output /tmp/xtask-mobile-web-range-suite-rust-vs-kubo.json
+```
+
+Result:
+
+- Rust and Kubo both passed all four cases
+- TTFB Rust/Kubo:
+  - deep `2ms` / `8ms`
+  - prefix `0ms` / `2ms`
+  - boundary `0ms` / `1ms`
+  - suffix `0ms` / `1ms`
+- RSS/FD: Rust `21004KiB` / `11`, Kubo `88572KiB` / `33`
+
+Decision:
+Keep. This turns the CAR-seeded fixture from a one-off deep-range smoke into a
+small deterministic media/range harness that future prefetch, multi-want, and
+streaming experiments can run without public-network noise.

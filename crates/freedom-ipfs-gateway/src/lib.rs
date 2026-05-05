@@ -691,7 +691,7 @@ fn mime_for_served_file(
         );
         return Ok(mime.to_string());
     }
-    if let Some(end) = sniff_end {
+    let sniffed = if let Some(end) = sniff_end {
         let sniff_started = Instant::now();
         let prefix = unixfs
             .read_file_cid_range(provider, file_cid, 0, end)
@@ -714,15 +714,26 @@ fn mime_for_served_file(
             );
             return Ok("text/html".to_string());
         }
-    }
+        true
+    } else {
+        false
+    };
     tracing::info!(
         phase = "mime_detect",
         cid = %cid,
         unixfs_path = path,
-        source = if len > 0 { "fallback_no_sniff" } else { "fallback_empty" },
+        source = mime_fallback_source(len, sniffed),
         elapsed_ms = started.elapsed().as_millis()
     );
     Ok("application/octet-stream".to_string())
+}
+
+fn mime_fallback_source(len: u64, sniffed: bool) -> &'static str {
+    match (len, sniffed) {
+        (0, _) => "fallback_empty",
+        (_, true) => "fallback_after_sniff",
+        (_, false) => "fallback_no_sniff",
+    }
 }
 
 fn mime_sniff_end(len: u64, parsed_range: Option<(u64, u64)>) -> Option<u64> {
@@ -1911,6 +1922,13 @@ mod tests {
                 "{range}"
             );
         }
+    }
+
+    #[test]
+    fn mime_fallback_source_distinguishes_sniff_status() {
+        assert_eq!(mime_fallback_source(0, false), "fallback_empty");
+        assert_eq!(mime_fallback_source(10, true), "fallback_after_sniff");
+        assert_eq!(mime_fallback_source(10, false), "fallback_no_sniff");
     }
 
     #[tokio::test]
