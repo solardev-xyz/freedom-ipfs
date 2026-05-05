@@ -19147,3 +19147,49 @@ extra trace/progress events when the hedge does not fire. Future comparisons
 should watch `delegated provider lookup self_hedges`, RSS/FD, and slow
 delegated response milestones; revert if self-hedges become frequent without
 reducing request tails.
+
+## 2026-05-05 Guardrail: DAICO Sparse-Provider Page After Self-Hedges
+
+Question:
+Do the HTTP-provider and delegated-router self-hedge changes preserve the
+current fast sparse-provider behavior on `daicowtf-page-assets`?
+
+Command:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-post-self-hedges-r3-trace.jsonl \
+  --output /tmp/daicowtf-post-self-hedges-r3.json
+```
+
+Result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `291ms` / `343ms` / `343ms`.
+- Root total p50/p95/max: `294ms` / `345ms` / `345ms`.
+- Run total p50/p95/max: `308ms` / `358ms` / `358ms`.
+- Max RSS/FD: `33384KiB` / `14`.
+- Block sources: `http_provider=9`.
+- Delegated provider lookup p50/p90/p95/max:
+  `14ms` / `108ms` / `108ms` / `108ms`.
+- Delegated self-hedges: `0`.
+- HTTP-provider races: `9` single-provider wins, all
+  `https://gateway-v3.pinata.cloud/`.
+- HTTP-provider fetch p50/p90/p95/max:
+  `58ms` / `88ms` / `88ms` / `88ms`.
+- HTTP-provider self-hedges: `0`.
+
+Decision:
+Keep as guardrail evidence. The sparse-provider DAICO page remains fast and
+resource-light after the self-hedge changes. Neither hedge fired in this case,
+which is the desired behavior for already-fast delegated and HTTP-provider
+paths.
