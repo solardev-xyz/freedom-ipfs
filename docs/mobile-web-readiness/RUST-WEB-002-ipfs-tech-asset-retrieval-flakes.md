@@ -18385,3 +18385,48 @@ same-window evidence does not justify extra default router traffic or a default
 configuration change. Revisit only with cases where `delegated-ipfs.dev` has
 actual failures/empty responses and the endpoint summary proves another router
 returns useful providers before the client deadline.
+
+Follow-up `cid.contact`-only check:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --delegated-router https://cid.contact/routing/v1 \
+  --trace-output /tmp/ipfs-tech-router-cidcontact-only-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-router-cidcontact-only-r3.json
+```
+
+Result:
+
+- Process exited `1` because the harness found failures.
+- Rust failed `0/3`.
+- Root TTFB p50/p95/max: `3346ms` / `4593ms` / `4593ms`.
+- Run total p50/p95/max: `3347ms` / `4594ms` / `4594ms`.
+- Max RSS/FD: `46976KiB` / `30`.
+- All three requests returned status `502`; bodies were only `328` bytes, no
+  assets were fetched, and the body did not contain `<title>IPFS`.
+- Delegated provider lookups: `3` events, `0` successes, `3` failures, `0`
+  providers, `0` HTTP providers; elapsed p50/p95/max was `25ms` / `1270ms` /
+  `1270ms`.
+- Endpoint summary for `https://cid.contact/routing/v1`: `events=3`,
+  `successes=0`, `failures=3`, `http_zero=3`, no providers.
+- Trace errors were three `404 Not Found` responses for
+  `https://cid.contact/routing/v1/providers/bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq`
+  and three `provider_refresh_skipped_empty_provider_set` events with
+  `no HTTP-capable providers found`.
+- DHT fallback had `3` successful lookup attempts but returned `0` providers;
+  DHT lookup max was `3261ms`.
+- Late peer waits: `3` waits, `3` misses, p50/p95/max all `2001ms`.
+
+Conclusion:
+This strengthens the rejection. `cid.contact` should not be a default router
+and should not be used alone for this workload. The URL shape may be
+incompatible with this CID/routing endpoint, or `cid.contact` may not serve this
+content; either way, it is not a usable default for the mobile read path.
