@@ -9749,3 +9749,68 @@ Decision: keep as baseline evidence. For this page, the current online load
 caches enough verified blocks for root plus discovered JS/CSS/image range assets
 to replay offline through the cache-only gateway when the mutable name is
 rewritten to the observed immutable root.
+
+## 2026-05-05 Baseline: `ipfs.tech` Hero Image Range Versus Kubo
+
+Purpose:
+Measure the media/range workload for a real `206` response after the kept
+Bitswap peer ranking and `100ms` post-lookup grace changes. This case fetches
+the `ipfs.tech` developers hero JPEG with a range request, so it isolates the
+UnixFS path, file-size discovery, range serving, and warm-cache behavior more
+directly than the full page-assets case.
+
+Command:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-developers-hero-range \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-hero-range-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-hero-range-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Range TTFB p50/p95: Rust `79/689ms`, Kubo `3/2667ms`.
+- Rust RSS/FD: `39256KiB`/`18`; Kubo RSS/FD: `136860KiB`/`44`.
+- Rust gateway statuses: `206=3`.
+- Rust gateway direct-body events: `3`, total body bytes `12288`, max body
+  length `4096`, max elapsed `12ms`.
+- Rust Bitswap peer attempts: `7`; successful source request modes:
+  `want_block=3`.
+- Rust incoming Bitswap matched blocks: `3`, bytes `195392`, max oldest pending
+  wait `170ms`.
+
+Trace observations:
+
+- First cold request took `686ms`; the two warm repeat range requests took
+  `14ms` each.
+- The first request fetched three blocks: the `ipfs.tech` root, the `_nuxt`
+  directory, and the raw JPEG block.
+- Slowest phases were `unixfs_file_size` and `unixfs_resource` at `597ms`,
+  followed by root `block_fetch_total=309ms` and JPEG leaf
+  `block_fetch_total=154ms`.
+- Slow CID totals were:
+  - root CID `bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq`:
+    `28` events, total `2193ms`, max `597ms`
+  - JPEG raw CID `bafkreicelmnc3ftqqdshh3eqj2zktconszajoss33mm2yq4lvg4m7j3qga`:
+    `10` events, total `491ms`, max `154ms`
+  - `_nuxt` directory CID `bafybeidaeoj3ctpgrkxromrf3bnregt2g3w6yxpgp6espt7ko3akaxnhua`:
+    `7` events, total `367ms`, max `118ms`
+
+Conclusion:
+The current range path is already materially better than Kubo in tail latency
+and mobile resource footprint for this sample, while Kubo still has a much
+faster warm p50. The remaining Rust cold cost is not the `206` body write path:
+it is the sequential UnixFS/file-size path that must fetch root/index/leaf
+blocks before serving the range. Future range/media experiments should focus on
+path-session reuse, directory metadata locality, or carefully bounded
+multi-block scheduling rather than changing direct body streaming.
