@@ -968,6 +968,17 @@ fn print_summary(report: &RunReport) {
                 session.session_late_peer_misses,
                 session.session_late_peer_max_ms
             );
+            if session.session_shortcut_post_lookup_waits > 0 {
+                println!(
+                    "    post-lookup latency: elapsed={} hits={} timeouts={} single_http={} single_http_hits={} single_http_timeouts={}",
+                    session.session_shortcut_post_lookup_elapsed_ms,
+                    session.session_shortcut_post_lookup_hit_elapsed_ms,
+                    session.session_shortcut_post_lookup_timeout_elapsed_ms,
+                    session.session_shortcut_post_lookup_single_http_elapsed_ms,
+                    session.session_shortcut_post_lookup_single_http_hit_elapsed_ms,
+                    session.session_shortcut_post_lookup_single_http_timeout_elapsed_ms
+                );
+            }
         }
         print_trace_timeout_recovery(trace);
         print_trace_bitswap_peer_attempts(trace);
@@ -1295,6 +1306,17 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
             session.session_late_peer_misses,
             session.session_late_peer_max_ms
         );
+        if session.session_shortcut_post_lookup_waits > 0 {
+            println!(
+                "    post-lookup latency: elapsed={} hits={} timeouts={} single_http={} single_http_hits={} single_http_timeouts={}",
+                session.session_shortcut_post_lookup_elapsed_ms,
+                session.session_shortcut_post_lookup_hit_elapsed_ms,
+                session.session_shortcut_post_lookup_timeout_elapsed_ms,
+                session.session_shortcut_post_lookup_single_http_elapsed_ms,
+                session.session_shortcut_post_lookup_single_http_hit_elapsed_ms,
+                session.session_shortcut_post_lookup_single_http_timeout_elapsed_ms
+            );
+        }
     }
     if trace.bitswap_extra_blocks.events > 0 {
         let extra = &trace.bitswap_extra_blocks;
@@ -5351,6 +5373,12 @@ struct TraceBitswapSessionAggregate {
     session_shortcut_post_lookup_misses: usize,
     session_shortcut_post_lookup_timeouts: usize,
     session_shortcut_post_lookup_errors: usize,
+    session_shortcut_post_lookup_elapsed_ms: LatencySummary,
+    session_shortcut_post_lookup_hit_elapsed_ms: LatencySummary,
+    session_shortcut_post_lookup_timeout_elapsed_ms: LatencySummary,
+    session_shortcut_post_lookup_single_http_elapsed_ms: LatencySummary,
+    session_shortcut_post_lookup_single_http_hit_elapsed_ms: LatencySummary,
+    session_shortcut_post_lookup_single_http_timeout_elapsed_ms: LatencySummary,
     session_shortcut_post_lookup_max_ms: u128,
     session_shortcut_post_lookup_budgets: BTreeMap<String, usize>,
     session_shortcut_post_lookup_timeout_budgets: BTreeMap<String, usize>,
@@ -5362,6 +5390,18 @@ struct TraceBitswapSessionAggregate {
     session_late_peer_hits: usize,
     session_late_peer_misses: usize,
     session_late_peer_max_ms: u128,
+    #[serde(skip)]
+    session_shortcut_post_lookup_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    session_shortcut_post_lookup_hit_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    session_shortcut_post_lookup_timeout_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    session_shortcut_post_lookup_single_http_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    session_shortcut_post_lookup_single_http_hit_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    session_shortcut_post_lookup_single_http_timeout_elapsed_values: Vec<u128>,
 }
 
 impl TraceBitswapSessionAggregate {
@@ -5371,6 +5411,28 @@ impl TraceBitswapSessionAggregate {
             || self.session_shortcut_post_lookup_waits > 0
             || self.session_shortcut_attempts > 0
             || self.session_late_peer_waits > 0
+    }
+
+    fn finish(&mut self) {
+        self.session_shortcut_post_lookup_elapsed_ms = LatencySummary::from_values(std::mem::take(
+            &mut self.session_shortcut_post_lookup_elapsed_values,
+        ));
+        self.session_shortcut_post_lookup_hit_elapsed_ms = LatencySummary::from_values(
+            std::mem::take(&mut self.session_shortcut_post_lookup_hit_elapsed_values),
+        );
+        self.session_shortcut_post_lookup_timeout_elapsed_ms = LatencySummary::from_values(
+            std::mem::take(&mut self.session_shortcut_post_lookup_timeout_elapsed_values),
+        );
+        self.session_shortcut_post_lookup_single_http_elapsed_ms = LatencySummary::from_values(
+            std::mem::take(&mut self.session_shortcut_post_lookup_single_http_elapsed_values),
+        );
+        self.session_shortcut_post_lookup_single_http_hit_elapsed_ms = LatencySummary::from_values(
+            std::mem::take(&mut self.session_shortcut_post_lookup_single_http_hit_elapsed_values),
+        );
+        self.session_shortcut_post_lookup_single_http_timeout_elapsed_ms =
+            LatencySummary::from_values(std::mem::take(
+                &mut self.session_shortcut_post_lookup_single_http_timeout_elapsed_values,
+            ));
     }
 }
 
@@ -6268,21 +6330,37 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         }
         if phase == "bitswap_session_shortcut_post_lookup_wait" {
             bitswap_session.session_shortcut_post_lookup_waits += 1;
-            bitswap_session.session_shortcut_post_lookup_max_ms =
-                bitswap_session.session_shortcut_post_lookup_max_ms.max(
-                    value
-                        .get("elapsed_ms")
-                        .and_then(json_u128)
-                        .unwrap_or_default(),
-                );
+            let post_lookup_elapsed_ms = value.get("elapsed_ms").and_then(json_u128);
+            bitswap_session.session_shortcut_post_lookup_max_ms = bitswap_session
+                .session_shortcut_post_lookup_max_ms
+                .max(post_lookup_elapsed_ms.unwrap_or_default());
+            if let Some(elapsed_ms) = post_lookup_elapsed_ms {
+                bitswap_session
+                    .session_shortcut_post_lookup_elapsed_values
+                    .push(elapsed_ms);
+            }
             let outcome = value
                 .get("outcome")
                 .and_then(|outcome| outcome.as_str())
                 .unwrap_or("timeout");
             match outcome {
-                "hit" => bitswap_session.session_shortcut_post_lookup_hits += 1,
+                "hit" => {
+                    bitswap_session.session_shortcut_post_lookup_hits += 1;
+                    if let Some(elapsed_ms) = post_lookup_elapsed_ms {
+                        bitswap_session
+                            .session_shortcut_post_lookup_hit_elapsed_values
+                            .push(elapsed_ms);
+                    }
+                }
                 "miss" => bitswap_session.session_shortcut_post_lookup_misses += 1,
-                "timeout" => bitswap_session.session_shortcut_post_lookup_timeouts += 1,
+                "timeout" => {
+                    bitswap_session.session_shortcut_post_lookup_timeouts += 1;
+                    if let Some(elapsed_ms) = post_lookup_elapsed_ms {
+                        bitswap_session
+                            .session_shortcut_post_lookup_timeout_elapsed_values
+                            .push(elapsed_ms);
+                    }
+                }
                 "error" => bitswap_session.session_shortcut_post_lookup_errors += 1,
                 _ => {}
             }
@@ -6304,6 +6382,30 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                     .session_shortcut_post_lookup_http_provider_counts
                     .entry(http_provider_count.to_string())
                     .or_default() += 1;
+                if http_provider_count == 1 {
+                    if let Some(elapsed_ms) = post_lookup_elapsed_ms {
+                        bitswap_session
+                            .session_shortcut_post_lookup_single_http_elapsed_values
+                            .push(elapsed_ms);
+                    }
+                    match outcome {
+                        "hit" => {
+                            if let Some(elapsed_ms) = post_lookup_elapsed_ms {
+                                bitswap_session
+                                    .session_shortcut_post_lookup_single_http_hit_elapsed_values
+                                    .push(elapsed_ms);
+                            }
+                        }
+                        "timeout" => {
+                            if let Some(elapsed_ms) = post_lookup_elapsed_ms {
+                                bitswap_session
+                                    .session_shortcut_post_lookup_single_http_timeout_elapsed_values
+                                    .push(elapsed_ms);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         if phase == "bitswap_session_late_peer_wait" {
@@ -6793,6 +6895,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     });
     slow_requests.truncate(MAX_TRACE_SLOW_EVENTS);
     delegated_provider_lookup.finish();
+    bitswap_session.finish();
     http_provider_races.finish();
 
     Ok(TraceSummary {
@@ -9933,6 +10036,48 @@ mod tests {
         assert_eq!(
             summary.bitswap_session.session_shortcut_post_lookup_max_ms,
             251
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_elapsed_ms
+                .p50_ms,
+            Some(81)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_hit_elapsed_ms
+                .p50_ms,
+            Some(81)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_timeout_elapsed_ms
+                .p50_ms,
+            Some(251)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_single_http_elapsed_ms
+                .p95_ms,
+            Some(251)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_single_http_hit_elapsed_ms
+                .p50_ms,
+            Some(81)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_single_http_timeout_elapsed_ms
+                .p50_ms,
+            Some(251)
         );
         assert_eq!(
             summary

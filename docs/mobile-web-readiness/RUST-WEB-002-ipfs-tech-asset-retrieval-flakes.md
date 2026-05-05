@@ -16925,3 +16925,115 @@ Interpretation:
 
 Decision:
 Baseline only. No code change.
+
+## 2026-05-05 Keep: Summarize Post-Lookup Session Wait Latencies
+
+Question:
+Post-lookup session waits now expose hit/miss/timeout outcomes, but the harness
+still only prints counts and max elapsed time. Future tuning of the `100ms`
+generic wait and the `250ms` single-HTTP-provider wait needs latency
+distributions by outcome, especially for single-HTTP-provider waits.
+
+Implementation:
+
+- Keep retrieval behavior unchanged.
+- Extend the harness Bitswap session summary with `LatencySummary` fields for:
+  - all post-lookup waits
+  - post-lookup hits
+  - post-lookup timeouts
+  - single-HTTP-provider post-lookup waits
+  - single-HTTP-provider post-lookup hits
+  - single-HTTP-provider post-lookup timeouts
+- Keep raw sample vectors out of serialized summary output after finalization.
+- Print a second `post-lookup latency` line when post-lookup waits are present.
+- Add focused harness assertions for the new summary fields.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_post_lookup_wait_outcomes
+```
+
+Focused result:
+
+- Formatting passed.
+- The post-lookup outcome summary regression test passed.
+
+Live smoke:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-postlookup-latency-summary-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-postlookup-latency-summary-r3.json
+```
+
+Live result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1290ms` / `1393ms` / `1393ms`.
+- Asset TTFB p50/p95/max: `215ms` / `931ms` / `1227ms`.
+- Run total p50/p95/max: `2395ms` / `4311ms` / `4311ms`.
+- Max RSS/FD: `52248KiB` / `28`.
+- Block sources: `bitswap=74`, `http_provider=44`.
+- Delegated lookup elapsed p50/p95/max: `31ms` / `77ms` / `845ms`.
+- HTTP-provider fetch p50/p95/max: `161ms` / `657ms` / `674ms`.
+- Bitswap session summary: `shortcut_post_lookup_waits=72`,
+  `post_lookup_hits=43`, `post_lookup_timeouts=29`,
+  `post_lookup_budgets=100=39, 250=33`,
+  `post_lookup_timeout_budgets=100=20, 250=9`,
+  `post_lookup_http_counts=3=35, 1=33, 0=4`.
+- Post-lookup elapsed p50/p90/p95/max:
+  `88ms` / `250ms` / `251ms` / `299ms`.
+- Post-lookup hit elapsed p50/p90/p95/max:
+  `53ms` / `118ms` / `125ms` / `164ms`.
+- Post-lookup timeout elapsed p50/p90/p95/max:
+  `101ms` / `251ms` / `251ms` / `299ms`.
+- Single-HTTP-provider elapsed p50/p90/p95/max:
+  `88ms` / `251ms` / `251ms` / `299ms`.
+- Single-HTTP-provider hit elapsed p50/p90/p95/max:
+  `68ms` / `125ms` / `130ms` / `164ms`.
+- Single-HTTP-provider timeout elapsed p50/p90/p95/max:
+  `251ms` / `299ms` / `299ms` / `299ms`.
+
+Interpretation:
+
+- This live window does not support lengthening the single-HTTP post-lookup
+  wait beyond `250ms`. Successful single-HTTP session hits were already well
+  inside the budget, with p95 `130ms` and max `164ms`.
+- The timeout side pays the full budget: single-HTTP timeout p50 was `251ms`
+  and max was `299ms`.
+- This also explains why a smaller retune needs margin: some hits are above
+  `125ms`, and the deterministic `200ms` guard already failed earlier.
+- Keep collecting this summary before any future retune; use repeated p95/max
+  hit data, not isolated samples.
+
+Final validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting passed.
+- Full mobile web harness suite passed: `35 passed`.
+- Workspace check passed.
+- Workspace clippy passed with `-D warnings`.
+- Diff whitespace check passed.
+
+Decision:
+Keep. This is harness-only diagnostics and preserves current session timing,
+provider policy, verification, and resource behavior.
