@@ -688,6 +688,7 @@ fn print_summary(report: &RunReport) {
                 session.session_shortcut_misses
             );
         }
+        print_trace_timeout_recovery(trace);
         if trace.bitswap_peer_attempts.has_events() {
             let attempts = &trace.bitswap_peer_attempts;
             println!(
@@ -961,6 +962,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
         );
     }
     print_trace_provider_retries(trace);
+    print_trace_timeout_recovery(trace);
     if trace.bitswap_session.has_events() {
         let session = &trace.bitswap_session;
         println!(
@@ -1031,6 +1033,28 @@ fn print_trace_provider_retries(trace: &TraceSummary) {
         retries.request_timeout_retries,
         retries.timeout_retries,
         retries.connection_timeout_retries
+    );
+}
+
+fn print_trace_timeout_recovery(trace: &TraceSummary) {
+    if !trace.bitswap_timeout_recovery.has_events() {
+        return;
+    }
+    let recovery = &trace.bitswap_timeout_recovery;
+    println!(
+        "  bitswap timeout recovery: request_timeouts={} mixed_trusted={} client_resets={} retry_starts={} same_provider_retries={} refreshed_provider_retries={} retry_successes={} trusted_retry_successes={} untrusted_retry_successes={} retry_failures={} retry_unresolved={} retry_success_elapsed={}",
+        recovery.request_timeouts,
+        recovery.mixed_trusted_request_timeouts,
+        recovery.client_resets,
+        recovery.provider_retry_starts,
+        recovery.same_provider_retry_starts,
+        recovery.refreshed_provider_retry_starts,
+        recovery.retry_successes,
+        recovery.trusted_retry_successes,
+        recovery.untrusted_retry_successes,
+        recovery.retry_failures,
+        recovery.retry_unresolved,
+        recovery.retry_success_elapsed_ms
     );
 }
 
@@ -2809,6 +2833,7 @@ struct TraceSummary {
     bitswap_peer_attempts: TraceBitswapPeerAttemptAggregate,
     bitswap_dial_plans: TraceBitswapDialPlanAggregate,
     bitswap_incoming_blocks: TraceBitswapIncomingBlockAggregate,
+    bitswap_timeout_recovery: TraceBitswapTimeoutRecoveryAggregate,
     trace_errors: Vec<TraceValueCount>,
     bitswap_addr_mix: Vec<TraceValueCount>,
     bitswap_provider_quality: TraceBitswapProviderQualityAggregate,
@@ -3030,6 +3055,72 @@ struct TraceBitswapIncomingBlockAggregate {
     max_dropped_waiters: u128,
 }
 
+#[derive(Debug, Serialize)]
+struct TraceBitswapTimeoutRecoveryAggregate {
+    request_timeouts: usize,
+    mixed_trusted_request_timeouts: usize,
+    client_resets: usize,
+    provider_retry_starts: usize,
+    same_provider_retry_starts: usize,
+    refreshed_provider_retry_starts: usize,
+    retry_successes: usize,
+    trusted_retry_successes: usize,
+    untrusted_retry_successes: usize,
+    retry_failures: usize,
+    retry_unresolved: usize,
+    retry_success_elapsed_ms: LatencySummary,
+}
+
+impl TraceBitswapTimeoutRecoveryAggregate {
+    fn has_events(&self) -> bool {
+        self.request_timeouts > 0
+            || self.client_resets > 0
+            || self.provider_retry_starts > 0
+            || self.retry_successes > 0
+            || self.retry_failures > 0
+            || self.retry_unresolved > 0
+    }
+}
+
+#[derive(Default)]
+struct TraceBitswapTimeoutRecoveryBuilder {
+    request_timeouts: usize,
+    mixed_trusted_request_timeouts: usize,
+    client_resets: usize,
+    provider_retry_starts: usize,
+    same_provider_retry_starts: usize,
+    refreshed_provider_retry_starts: usize,
+    retry_successes: usize,
+    trusted_retry_successes: usize,
+    untrusted_retry_successes: usize,
+    retry_failures: usize,
+    retry_success_elapsed_values: Vec<u128>,
+}
+
+impl TraceBitswapTimeoutRecoveryBuilder {
+    fn into_aggregate(
+        self,
+        pending_retries: &BTreeMap<String, usize>,
+    ) -> TraceBitswapTimeoutRecoveryAggregate {
+        TraceBitswapTimeoutRecoveryAggregate {
+            request_timeouts: self.request_timeouts,
+            mixed_trusted_request_timeouts: self.mixed_trusted_request_timeouts,
+            client_resets: self.client_resets,
+            provider_retry_starts: self.provider_retry_starts,
+            same_provider_retry_starts: self.same_provider_retry_starts,
+            refreshed_provider_retry_starts: self.refreshed_provider_retry_starts,
+            retry_successes: self.retry_successes,
+            trusted_retry_successes: self.trusted_retry_successes,
+            untrusted_retry_successes: self.untrusted_retry_successes,
+            retry_failures: self.retry_failures,
+            retry_unresolved: pending_retries.values().sum(),
+            retry_success_elapsed_ms: LatencySummary::from_values(
+                self.retry_success_elapsed_values,
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Default, Serialize)]
 struct TraceBitswapExtraBlockAggregate {
     events: usize,
@@ -3185,6 +3276,8 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_peer_attempts = TraceBitswapPeerAttemptAggregate::default();
     let mut bitswap_dial_plans = TraceBitswapDialPlanAggregate::default();
     let mut bitswap_incoming_blocks = TraceBitswapIncomingBlockAggregate::default();
+    let mut bitswap_timeout_recovery = TraceBitswapTimeoutRecoveryBuilder::default();
+    let mut pending_request_timeout_retries = BTreeMap::<String, usize>::new();
     let mut slow_cids = BTreeMap::<String, TraceCidBuilder>::new();
     let mut active_requests = BTreeMap::<TraceRequestKey, TraceRequestBuilder>::new();
     let mut slow_requests = Vec::<TraceRequestAggregate>::new();
@@ -3274,6 +3367,15 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 }
                 if request_timeout {
                     provider_retries.request_timeout_retry_counts += 1;
+                    bitswap_timeout_recovery.provider_retry_starts += 1;
+                    if same_provider_set {
+                        bitswap_timeout_recovery.same_provider_retry_starts += 1;
+                    } else {
+                        bitswap_timeout_recovery.refreshed_provider_retry_starts += 1;
+                    }
+                    if let Some(cid) = json_detail_string(value.get("cid")) {
+                        *pending_request_timeout_retries.entry(cid).or_default() += 1;
+                    }
                     if same_bitswap_peer_set {
                         provider_retries.same_bitswap_request_timeout_retry_counts += 1;
                     }
@@ -3368,6 +3470,23 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 > 0
         {
             bitswap_session.request_timeouts_with_trusted += 1;
+        }
+        if phase == "bitswap_request_timeout_detail" {
+            bitswap_timeout_recovery.request_timeouts += 1;
+            let peer_count = value
+                .get("peer_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            let trusted_peer_count = value
+                .get("trusted_peer_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            if trusted_peer_count > 0 && peer_count > trusted_peer_count {
+                bitswap_timeout_recovery.mixed_trusted_request_timeouts += 1;
+            }
+        }
+        if phase == "bitswap_client_reset" {
+            bitswap_timeout_recovery.client_resets += 1;
         }
         if phase == "bitswap_session_shortcut_start" {
             bitswap_session.session_shortcut_starts += 1;
@@ -3487,6 +3606,39 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             bitswap_incoming_blocks.max_dropped_waiters = bitswap_incoming_blocks
                 .max_dropped_waiters
                 .max(dropped_waiters);
+        }
+        if phase == "bitswap_fetch" {
+            if let Some(cid) = json_detail_string(value.get("cid")) {
+                let mut remove_pending_retry = false;
+                if let Some(pending_retries) = pending_request_timeout_retries.get_mut(&cid) {
+                    if *pending_retries > 0 {
+                        if value.get("ok").and_then(|ok| ok.as_bool()) == Some(true) {
+                            bitswap_timeout_recovery.retry_successes += 1;
+                            if value
+                                .get("source_peer_trusted")
+                                .and_then(|trusted| trusted.as_bool())
+                                == Some(true)
+                            {
+                                bitswap_timeout_recovery.trusted_retry_successes += 1;
+                            } else {
+                                bitswap_timeout_recovery.untrusted_retry_successes += 1;
+                            }
+                            if let Some(elapsed_ms) = elapsed_ms {
+                                bitswap_timeout_recovery
+                                    .retry_success_elapsed_values
+                                    .push(elapsed_ms);
+                            }
+                        } else if value.get("ok").and_then(|ok| ok.as_bool()) == Some(false) {
+                            bitswap_timeout_recovery.retry_failures += 1;
+                        }
+                        *pending_retries -= 1;
+                        remove_pending_retry = *pending_retries == 0;
+                    }
+                }
+                if remove_pending_retry {
+                    pending_request_timeout_retries.remove(&cid);
+                }
+            }
         }
         if successful_bitswap_fetch {
             if let Some(peer) = value.get("source_peer").and_then(|peer| peer.as_str()) {
@@ -3666,6 +3818,8 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_peer_attempts,
         bitswap_dial_plans,
         bitswap_incoming_blocks,
+        bitswap_timeout_recovery: bitswap_timeout_recovery
+            .into_aggregate(&pending_request_timeout_retries),
         trace_errors: sorted_trace_counts(trace_errors),
         bitswap_addr_mix: sorted_trace_counts(bitswap_addr_mix),
         bitswap_provider_quality,
@@ -4556,6 +4710,80 @@ mod tests {
         assert_eq!(
             summary.slow_events[0].details.get("failure_kind"),
             Some(&"read_timeout".to_string())
+        );
+    }
+
+    #[test]
+    fn trace_summary_counts_bitswap_timeout_recovery() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-timeout-recovery-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"bitswap_request_timeout_detail\",\"elapsed_ms\":4000,\"cid\":\"cid-a\",\"peer_count\":10,\"trusted_peer_count\":2,\"timeout_ms\":4000}\n",
+                "{\"phase\":\"bitswap_client_reset\"}\n",
+                "{\"phase\":\"retry_provider_count\",\"cid\":\"cid-a\",\"same_provider_set\":true,\"same_bitswap_peer_set\":true,\"request_timeout\":true}\n",
+                "{\"phase\":\"provider_retry_after_request_timeout\",\"cid\":\"cid-a\",\"provider_count\":8,\"request_timeout\":true}\n",
+                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":75,\"cid\":\"cid-a\",\"ok\":true,\"trusted_peer_count\":2,\"source_peer_trusted\":false,\"source_peer\":\"peer-a\",\"source_transport\":\"tcp\",\"bitswap_delivery\":\"incoming\",\"extra_blocks\":0,\"bytes\":123}\n",
+                "{\"phase\":\"bitswap_request_timeout_detail\",\"elapsed_ms\":15000,\"cid\":\"cid-b\",\"peer_count\":1,\"trusted_peer_count\":0,\"timeout_ms\":15000}\n",
+                "{\"phase\":\"retry_provider_count\",\"cid\":\"cid-b\",\"same_provider_set\":false,\"same_bitswap_peer_set\":false,\"request_timeout\":true}\n",
+                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":15000,\"cid\":\"cid-b\",\"ok\":false,\"trusted_peer_count\":0,\"error\":\"bitswap request timed out\"}\n",
+                "{\"phase\":\"retry_provider_count\",\"cid\":\"cid-c\",\"same_provider_set\":true,\"same_bitswap_peer_set\":true,\"request_timeout\":true}\n",
+                "{\"phase\":\"provider_retry_after_request_timeout\",\"cid\":\"cid-c\",\"provider_count\":1,\"request_timeout\":true}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(summary.bitswap_timeout_recovery.request_timeouts, 2);
+        assert_eq!(
+            summary
+                .bitswap_timeout_recovery
+                .mixed_trusted_request_timeouts,
+            1
+        );
+        assert_eq!(summary.bitswap_timeout_recovery.client_resets, 1);
+        assert_eq!(summary.bitswap_timeout_recovery.provider_retry_starts, 3);
+        assert_eq!(
+            summary.bitswap_timeout_recovery.same_provider_retry_starts,
+            2
+        );
+        assert_eq!(
+            summary
+                .bitswap_timeout_recovery
+                .refreshed_provider_retry_starts,
+            1
+        );
+        assert_eq!(summary.bitswap_timeout_recovery.retry_successes, 1);
+        assert_eq!(summary.bitswap_timeout_recovery.trusted_retry_successes, 0);
+        assert_eq!(
+            summary.bitswap_timeout_recovery.untrusted_retry_successes,
+            1
+        );
+        assert_eq!(summary.bitswap_timeout_recovery.retry_failures, 1);
+        assert_eq!(summary.bitswap_timeout_recovery.retry_unresolved, 1);
+        assert_eq!(
+            summary
+                .bitswap_timeout_recovery
+                .retry_success_elapsed_ms
+                .count,
+            1
+        );
+        assert_eq!(
+            summary
+                .bitswap_timeout_recovery
+                .retry_success_elapsed_ms
+                .p50_ms,
+            Some(75)
         );
     }
 

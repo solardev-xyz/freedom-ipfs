@@ -4832,3 +4832,101 @@ Decision: reject and revert. Resetting the shared client after the mixed
 request timeout is still important for reliability. Keeping it alive can improve
 root latency in a good window, but it worsens connection-limit pressure and can
 turn a passing page session into a failure.
+
+## 2026-05-05 Keep: Summarize Bitswap Timeout Recovery
+
+Goal:
+
+- Before changing retry policy again, make the harness answer whether
+  request-timeout provider retries actually recover the timed-out CID.
+- Distinguish same-provider retries from refreshed-provider retries, and record
+  whether retry success comes from a trusted/session peer or an untrusted
+  provider peer.
+
+Implementation:
+
+- Add `bitswap_timeout_recovery` to the mobile web harness trace summary.
+- Count:
+  - `bitswap_request_timeout_detail` events, including mixed trusted/provider
+    timeouts.
+  - `bitswap_client_reset` events.
+  - `retry_provider_count` with `request_timeout=true`, split into
+    same-provider and refreshed-provider retries.
+  - the next same-CID `bitswap_fetch` success/failure after each retry start.
+  - trusted versus untrusted retry successes and retry success latency.
+- Print the aggregate in both normal trace summaries and Rust/Kubo comparison
+  summaries.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo build -p freedom-ipfs-gateway
+git diff --check
+```
+
+Important validation note: rebuild `freedom-ipfs-gateway` before live harness
+runs after changing retrieval behavior. `cargo run -p mobile-web-harness`
+rebuilds the harness but can still execute an older gateway binary.
+
+Current-source live sanity run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-timeout-recovery-current-r1-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-timeout-recovery-current-r1.json
+```
+
+Result: Rust and Kubo both passed `1/1`; Rust root p50/p95 was `2460/2460ms`
+versus Kubo `3366/3366ms`, Rust asset p50/p95 was `91/1207ms` versus Kubo
+`173/483ms`, and Rust max RSS/FD was `50512KiB`/`46` versus Kubo
+`241740KiB`/`272`. This window did not hit request timeouts, so the new timeout
+recovery aggregate was correctly omitted.
+
+Current-source timeout run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-timeout-recovery-current-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-timeout-recovery-current-r3.json
+```
+
+Result: Rust passed `2/3`; Kubo passed `3/3`. Rust root p50/p95 was
+`1992/2715ms` versus Kubo `2187/3628ms`, but Rust asset p50/p95 was
+`168/4971ms` versus Kubo `129/415ms`. Rust max RSS/FD stayed low at
+`52772KiB`/`56` versus Kubo `278928KiB`/`388`.
+
+Trace summary:
+
+- `bitswap timeout recovery: request_timeouts=15 mixed_trusted=15
+  client_resets=8 retry_starts=14 same_provider_retries=14
+  refreshed_provider_retries=0 retry_successes=13 trusted_retry_successes=9
+  untrusted_retry_successes=4 retry_failures=1 retry_unresolved=0
+  retry_success_elapsed=p50=278ms p90=901ms p95=1076ms max=1076ms`
+- `provider_retries refresh_timeout=14`, `same_bitswap_request_timeouts=14`.
+- `bitswap session request_timeouts_with_trusted=15`.
+- `bitswap incoming blocks: matches=108 blocks=202 bytes=2771754
+  delivered_waiters=108 dropped_waiters=0`.
+- `bitswap dial rejections: events=13 connection_limit=13`.
+
+Decision: keep. This is diagnostics-only and gives the next behavior
+experiment a sharper target: same-provider retry usually recovers
+mixed-trusted request timeouts, but one retry failure can still fail the page
+and asset p95 remains far behind Kubo. The next likely experiment should focus
+on reducing repeated same-provider mixed timeouts under page fan-out without
+discarding the retry path that succeeds most of the time.
