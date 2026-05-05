@@ -7328,3 +7328,63 @@ increased FD usage slightly. The better next experiment is more selective:
 preserve the mobile connection caps while improving which peers get the limited
 pending dial slots, especially by using provider/session quality signals rather
 than simply allowing more simultaneous dials.
+
+## 2026-05-05 Parked: Sorting Provider Peers By Address Quality
+
+Hypothesis:
+Keep the mobile connection caps unchanged, but sort provider-derived Bitswap
+peers by their best dialable address before the 16-peer cap and per-command dial
+cap are applied. The intended effect was to keep direct IP TCP/QUIC peers ahead
+of DNS/WebSocket-style peers when scarce pending dial slots are available.
+
+Change tested:
+
+```rust
+peers.sort_by_key(bitswap_peer_best_addr_score);
+peers.truncate(MAX_BITSWAP_PEERS_PER_BLOCK);
+```
+
+Validation before live run:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval orders_bitswap_peers_by_best_address_quality
+cargo build -p freedom-ipfs-gateway
+```
+
+Experiment:
+
+```sh
+timeout 360s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/ipfs-tech-peer-quality-order-cold-rust-vs-kubo-trace.jsonl \
+  --output /tmp/ipfs-tech-peer-quality-order-cold-rust-vs-kubo.json
+```
+
+Experiment result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `2355/2541ms`, Kubo `5421/12171ms`.
+- Asset TTFB p50/p95: Rust `125/967ms`, Kubo `333/1327ms`.
+- Max RSS/FD: Rust `51400KiB`/`52`, Kubo `434116KiB`/`1048`.
+- Bitswap dial rejections: `44`, all connection-limit, transports
+  `tcp=40`, `ws=3`, `quic=1`.
+- Established Bitswap TCP connections: `35`.
+
+Comparison notes:
+This run beat a very slow Kubo sample, but compared with the same-window cap-16
+baseline immediately above, Rust root p50/p95 regressed from `901/2258ms` to
+`2355/2541ms`, asset p95 regressed from `641ms` to `967ms`, dial rejections
+rose from `14` to `44`, and FD max rose from `48` to `52`.
+
+Decision: do not keep. The peer-quality sort changed which peers consumed dial
+slots, but it did not reduce connection pressure or tail latency in the
+same-window evidence. A better next step is to collect per-peer success/failure
+quality over time and bias peers with observed page-session success, rather
+than ranking cold public providers by static address shape alone.
