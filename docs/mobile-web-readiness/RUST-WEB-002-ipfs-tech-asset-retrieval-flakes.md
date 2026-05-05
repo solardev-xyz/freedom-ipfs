@@ -14684,3 +14684,110 @@ preserving the HTTP-provider race plus hedge width. The two `ipfs.tech` samples
 showed lower delegated milestone tails and lower resource use than the
 immediate previous target-four run, and the Vitalik and daicowtf guards did not
 show regressions in fast HTTP range or sparse Bitswap-only workloads.
+
+## 2026-05-05 Reject: Shorten HTTP Provider Hedge Delay To 150ms
+
+Hypothesis:
+After lowering the streamed delegated HTTP-provider target to three, the
+remaining `ipfs.tech` asset tail still included HTTP-provider header waits,
+especially from `https://ipfs-bridge.sia.dev/`. The accepted HTTP-provider
+hedge fires after `250ms`; shortening that delay to `150ms` might start one
+extra routing-provided provider soon enough to avoid slow-header tails while
+preserving the same initial race width and global provider-fetch cap.
+
+Baseline with the current `250ms` hedge:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-hedge250-target3-r3c-trace.jsonl \
+  --output /tmp/ipfs-tech-http-hedge250-target3-r3c.json
+```
+
+Baseline result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1419ms` / `1614ms` / `1614ms`.
+- Asset TTFB p50/p95/max: `240ms` / `666ms` / `2558ms`.
+- Run total p50/p95/max: `3315ms` / `5434ms` / `5434ms`.
+- Max RSS/FD: `51200KiB` / `32`.
+- Block sources: `http_provider=108`, `bitswap=11`, `cache=1`.
+- HTTP-provider fetch p50/p95/max: `162ms` / `536ms` / `664ms`.
+- HTTP-provider winners: `ipfs-bridge.sia.dev=55`,
+  `dag.w3s.link=38`.
+- Provider milestone split:
+  - `ipfs-bridge.sia.dev`: header max `663ms`.
+  - `dag.w3s.link`: header max `115ms`.
+- Delegated lookup max was `2380ms`, with streamed target-met max `702ms`.
+- `http_provider_hedge` fired `0` times.
+
+Prototype:
+
+- Lowered `HTTP_PROVIDER_HEDGE_AFTER` from `250ms` to `150ms`.
+- No other HTTP-provider race, verification, provider-cache, Bitswap, or
+  routing behavior changed.
+
+Focused validation while the prototype was present:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval hedges_slow_http_provider_race_with_extra_candidate
+```
+
+Focused result:
+
+- Formatting passed.
+- The deterministic hedge test passed.
+
+Live experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-hedge150-target3-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-http-hedge150-target3-r3.json
+```
+
+Live result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1281ms` / `1357ms` / `1357ms`.
+- Asset TTFB p50/p95/max: `215ms` / `827ms` / `1362ms`.
+- Run total p50/p95/max: `2821ms` / `3408ms` / `3408ms`.
+- Max RSS/FD: `51964KiB` / `31`.
+- Block sources: `http_provider=80`, `bitswap=40`.
+- HTTP-provider fetch p50/p95/max: `163ms` / `662ms` / `981ms`.
+- HTTP-provider winners: `ipfs-bridge.sia.dev=42`,
+  `dag.w3s.link=21`, `calib2.ezpdpz.net=2`.
+- Provider milestone split:
+  - `ipfs-bridge.sia.dev`: header max `664ms`, body max `971ms`.
+  - `dag.w3s.link`: header max `170ms`.
+  - `calib2.ezpdpz.net`: header max `84ms`.
+- Delegated lookup max was only `78ms`, so the lower run total was mostly live
+  routing variance rather than evidence for the hedge delay.
+- `http_provider_hedge` fired exactly `1` time, on the favicon CID, hedging
+  to `https://a-fil-http.aur.lu/`.
+
+Decision:
+Reject and revert. The shorter hedge did not produce a causal enough win in
+the target path: only one hedge fired, HTTP-provider p95 worsened
+`536ms -> 662ms`, asset p95 worsened `666ms -> 827ms`, and RSS increased
+slightly. The better run-total and root numbers came with much lower delegated
+lookup latency in that live window, not with a meaningful number of earlier
+HTTP hedges. Keep the existing `250ms` delay until a broader same-window sweep
+or a deterministic provider-order corpus shows that a lower hedge delay wins
+without extra mobile fanout.
