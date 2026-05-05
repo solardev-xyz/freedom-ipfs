@@ -11541,3 +11541,78 @@ Keep. This gives future multi-want/prefetch work a deterministic harness target:
 before a production hook is kept, this seeded boundary-range run should show
 `multi_cid_commands > 0` or otherwise produce better latency/resource evidence
 against the same Kubo-backed seed setup.
+
+## 2026-05-05 Reject: Blocking Session-Only UnixFS Batch Prefetch
+
+Hypothesis:
+With the local Bitswap seed harness mode in place, the earlier session-only
+UnixFS child-prefetch idea could be tested against a deterministic multi-block
+boundary range. The narrow version would synchronously ask recent successful
+Bitswap session peers for the intersecting child CIDs in one `fetch_many` batch
+before the normal serial range reads.
+
+Prototype:
+
+- Reintroduced a default `BlockProvider::prefetch_blocks(&[Cid])` hook.
+- Had UnixFS call it for multi-link full-file reads and for range reads whose
+  byte span intersects at least two child links, capped to a small CID window.
+- Implemented `FetchingBlockProvider` by calling a new
+  `HttpRetriever::prefetch_recent_bitswap_blocks`.
+- The retriever path used only recent successful Bitswap session peers and the
+  shared `fetch_many` path; no provider lookup or public gateway fallback.
+- Added `unixfs_link_batch_prefetch` and `bitswap_batch_prefetch` traces while
+  the prototype was present.
+
+Focused validation while the prototype was present:
+
+```sh
+cargo test -p freedom-ipfs-unixfs prefetches
+cargo test -p freedom-ipfs-retrieval prefetch_recent_bitswap_blocks_batches_missing_children
+```
+
+Focused result:
+
+- UnixFS tests passed: `2 passed; 0 failed`
+- retrieval batch-prefetch test passed: `1 passed; 0 failed`
+
+Seeded harness validation:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 1 \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-bitswap-prefetch-boundary-rust-trace.jsonl \
+  --comparison-output /tmp/harness-bitswap-prefetch-boundary-rust-vs-kubo.json
+```
+
+Seeded result:
+
+- Rust and Kubo both passed the boundary-range case, but Rust latency regressed
+  badly.
+- Baseline seeded run before the hook: Rust root TTFB `205ms`, Kubo `53ms`.
+- Prototype seeded run: Rust root TTFB `2225ms`, Kubo `53ms`.
+- Rust max RSS/FD stayed low at `38424KiB` / `13`, but latency dominated.
+- Trace showed the hook did fire:
+  `bitswap batches: commands=4 multi_cid_commands=1 total_cids=5 max_cids=2`.
+- The multi-CID prefetch command timed out after about `2001ms` and was
+  cancelled; normal single-CID child fetches still delivered the range through
+  incoming Bitswap blocks.
+- `bitswap_batch_prefetch` appeared as `ok=false` and the request spent most of
+  its time in the blocking prefetch path.
+
+Decision:
+Reject and revert the production hook. The deterministic harness did its job:
+it proved this blocking prefetch shape can create a multi-CID Bitswap command,
+but against a real Kubo seed it delays the user-visible response instead of
+improving it. Future work should not add a synchronous UnixFS prefetch barrier.
+If this area is revisited, prefer non-blocking/background overlap or improving
+normal child fetch coalescing/session behavior, and require the seeded harness
+to beat the `205ms` Rust baseline before keeping the change.
