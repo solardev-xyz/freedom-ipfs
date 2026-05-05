@@ -877,6 +877,7 @@ fn print_summary(report: &RunReport) {
                 incoming.max_dropped_waiters
             );
         }
+        print_trace_bitswap_incoming_reads(trace);
         if !trace.trace_errors.is_empty() {
             println!(
                 "  trace errors: {}",
@@ -1203,6 +1204,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
             incoming.max_dropped_waiters
         );
     }
+    print_trace_bitswap_incoming_reads(trace);
     if !trace.bitswap_connection_transports.is_empty() {
         println!(
             "  bitswap connection transports: {}",
@@ -1315,6 +1317,22 @@ fn format_trace_bitswap_peer_attempts(
         attempts.other_failures,
         attempts.prefer_want_have
     ))
+}
+
+fn print_trace_bitswap_incoming_reads(trace: &TraceSummary) {
+    let reads = &trace.bitswap_incoming_reads;
+    if reads.events == 0 {
+        return;
+    }
+    println!(
+        "  bitswap incoming stream reads: events={} failures={} dropped={} timed_out={} max_pending_reads={} max_elapsed_ms={}",
+        reads.events,
+        reads.failures,
+        reads.dropped,
+        reads.timed_out,
+        reads.max_pending_reads,
+        reads.max_elapsed_ms
+    );
 }
 
 fn print_trace_dial_rejections(trace: &TraceSummary) {
@@ -3539,6 +3557,7 @@ struct TraceSummary {
     bitswap_peer_attempts: TraceBitswapPeerAttemptAggregate,
     bitswap_dial_plans: TraceBitswapDialPlanAggregate,
     bitswap_incoming_blocks: TraceBitswapIncomingBlockAggregate,
+    bitswap_incoming_reads: TraceBitswapIncomingReadAggregate,
     bitswap_timeout_recovery: TraceBitswapTimeoutRecoveryAggregate,
     trace_errors: Vec<TraceValueCount>,
     bitswap_addr_mix: Vec<TraceValueCount>,
@@ -3779,6 +3798,16 @@ struct TraceBitswapIncomingBlockAggregate {
     max_oldest_pending_ms: u128,
     max_pending_waiters: u128,
     max_dropped_waiters: u128,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceBitswapIncomingReadAggregate {
+    events: usize,
+    failures: usize,
+    dropped: usize,
+    timed_out: usize,
+    max_pending_reads: u128,
+    max_elapsed_ms: u128,
 }
 
 #[derive(Debug, Serialize)]
@@ -4054,6 +4083,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_peer_attempts = TraceBitswapPeerAttemptAggregate::default();
     let mut bitswap_dial_plans = TraceBitswapDialPlanAggregate::default();
     let mut bitswap_incoming_blocks = TraceBitswapIncomingBlockAggregate::default();
+    let mut bitswap_incoming_reads = TraceBitswapIncomingReadAggregate::default();
     let mut bitswap_timeout_recovery = TraceBitswapTimeoutRecoveryBuilder::default();
     let mut provider_fetch_dial_plan_seen = BTreeMap::<String, bool>::new();
     let mut pending_request_timeout_retries = BTreeMap::<String, usize>::new();
@@ -4452,6 +4482,35 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 .max_dropped_waiters
                 .max(dropped_waiters);
         }
+        if phase == "bitswap_incoming_stream_read" {
+            bitswap_incoming_reads.events += 1;
+            if value.get("ok").and_then(|ok| ok.as_bool()) == Some(false) {
+                bitswap_incoming_reads.failures += 1;
+            }
+            if value.get("dropped").and_then(|dropped| dropped.as_bool()) == Some(true) {
+                bitswap_incoming_reads.dropped += 1;
+            }
+            if value
+                .get("timed_out")
+                .and_then(|timed_out| timed_out.as_bool())
+                == Some(true)
+            {
+                bitswap_incoming_reads.timed_out += 1;
+            }
+            bitswap_incoming_reads.max_pending_reads =
+                bitswap_incoming_reads.max_pending_reads.max(
+                    value
+                        .get("pending_reads")
+                        .and_then(json_u128)
+                        .unwrap_or_default(),
+                );
+            bitswap_incoming_reads.max_elapsed_ms = bitswap_incoming_reads.max_elapsed_ms.max(
+                value
+                    .get("elapsed_ms")
+                    .and_then(json_u128)
+                    .unwrap_or_default(),
+            );
+        }
         if phase == "bitswap_fetch" {
             if let Some(cid) = json_detail_string(value.get("cid")) {
                 let mut remove_pending_retry = false;
@@ -4699,6 +4758,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_peer_attempts,
         bitswap_dial_plans,
         bitswap_incoming_blocks,
+        bitswap_incoming_reads,
         bitswap_timeout_recovery: bitswap_timeout_recovery
             .into_aggregate(&pending_request_timeout_retries),
         trace_errors: sorted_trace_counts(trace_errors),
@@ -5791,6 +5851,8 @@ mod tests {
                 "{\"phase\":\"bitswap_dial_rejected\",\"peer\":\"peer-a\",\"transport\":\"tcp\",\"connection_limit\":true}\n",
                 "{\"phase\":\"bitswap_dial_rejected\",\"peer\":\"peer-b\",\"transport\":\"ws\",\"connection_limit\":false}\n",
                 "{\"phase\":\"bitswap_incoming_block\",\"cid\":\"cid-a\",\"peer\":\"peer-d\",\"source_transport\":\"tcp\",\"block_count\":2,\"bytes\":256,\"pending_waiter_count\":3,\"delivered_waiter_count\":2,\"dropped_waiter_count\":1,\"oldest_pending_ms\":75,\"newest_pending_ms\":25}\n",
+                "{\"phase\":\"bitswap_incoming_stream_read\",\"peer\":\"peer-e\",\"ok\":false,\"dropped\":true,\"pending_reads\":32}\n",
+                "{\"phase\":\"bitswap_incoming_stream_read\",\"peer\":\"peer-f\",\"ok\":false,\"timed_out\":true,\"timeout_ms\":6000,\"elapsed_ms\":6001}\n",
             ),
         )
         .unwrap();
@@ -5846,6 +5908,12 @@ mod tests {
         assert_eq!(summary.bitswap_incoming_blocks.max_pending_waiters, 3);
         assert_eq!(summary.bitswap_incoming_blocks.max_oldest_pending_ms, 75);
         assert_eq!(summary.bitswap_incoming_blocks.max_dropped_waiters, 1);
+        assert_eq!(summary.bitswap_incoming_reads.events, 2);
+        assert_eq!(summary.bitswap_incoming_reads.failures, 2);
+        assert_eq!(summary.bitswap_incoming_reads.dropped, 1);
+        assert_eq!(summary.bitswap_incoming_reads.timed_out, 1);
+        assert_eq!(summary.bitswap_incoming_reads.max_pending_reads, 32);
+        assert_eq!(summary.bitswap_incoming_reads.max_elapsed_ms, 6001);
         assert_eq!(
             summary.slow_events[0].details.get("peer"),
             Some(&"peer-c".to_string())

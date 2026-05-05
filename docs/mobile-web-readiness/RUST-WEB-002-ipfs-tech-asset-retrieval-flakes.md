@@ -6785,3 +6785,40 @@ rejection count substantially while keeping `vitalik` healthy and beating Kubo
 in the measured windows. The remaining follow-up is to rerun `daicowtf` when
 Kubo can load it again, because the same-window failure was public-network or
 provider availability rather than a clear Rust regression.
+
+## 2026-05-05 Keep: Summarize Incoming Bitswap Stream Read Pressure
+
+Motivation:
+Incoming-read offload added protective `bitswap_incoming_stream_read` events for
+two mobile-resource cases:
+
+- dropping an incoming stream when pending incoming reads already hit the cap
+- timing out an incoming stream read after `6s`
+
+Those events showed up in the `daicowtf` cap-5 trace as generic trace errors,
+but the harness did not summarize whether the resource cap was actually being
+hit or whether reads were merely timing out.
+
+Implementation:
+
+- Add `bitswap_incoming_reads` to the trace summary JSON.
+- Track `events`, `failures`, `dropped`, `timed_out`, `max_pending_reads`, and
+  `max_elapsed_ms` from `bitswap_incoming_stream_read` trace events.
+- Print a concise summary line:
+  `bitswap incoming stream reads: events=... failures=... dropped=... timed_out=... max_pending_reads=... max_elapsed_ms=...`
+- Extend deterministic harness coverage with one dropped read and one timed-out
+  read.
+
+Validation:
+
+```sh
+cargo fmt --all
+cargo test -p mobile-web-harness trace_summary_counts_bitswap_peer_attempts
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Decision: keep. This is diagnostics-only and makes future incoming-read cap or
+timeout regressions visible without hand-searching trace errors.
