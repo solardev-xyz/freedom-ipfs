@@ -5392,3 +5392,83 @@ batches are mostly want-have probes, but the completed outgoing attempts are
 overwhelmingly connection timeouts. The next behavior experiment should focus
 on cold provider/peer quality and connection-slot pressure, not on raising
 request timeout budgets.
+
+## 2026-05-05 Reject: Drop Waiters After Rejected Dials
+
+Experiment: when every newly scheduled dial for a peer is rejected immediately
+or all pending dials for a peer later fail, drop that peer's connection waiters
+instead of letting the request sit for the full `BITSWAP_CONNECTION_READY_TIMEOUT`.
+
+Rationale:
+
+- The preceding run showed `bitswap dial rejections: events=34
+  connection_limit=34`.
+- Completed outgoing peer attempts were overwhelmingly connection timeouts.
+- If a dial cannot possibly become ready, waiting `5s` on its waiter only adds
+  latency and holds the request open.
+
+Prototype validation before live runs:
+
+```sh
+cargo test -p freedom-ipfs-retrieval --lib drops_waiters_when_scheduled_dials_are_all_rejected
+cargo test -p freedom-ipfs-retrieval --lib decrements_pending_dial_counts
+cargo test -p freedom-ipfs-retrieval --lib
+cargo fmt --all --check
+git diff --check
+cargo build -p freedom-ipfs-gateway
+```
+
+First live run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-drop-rejected-dial-waiters-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-drop-rejected-dial-waiters-r3.json
+```
+
+Result: promising but not enough evidence. Rust passed `3/3`; Kubo passed
+`3/3`. Rust root TTFB p50/p95 was `648/16687ms` versus Kubo `3701/5376ms`.
+Rust asset TTFB p50/p95 was `150/634ms` versus Kubo `207/672ms`. The trace had
+one recovered cold timeout, only four dial rejections, and one
+`bitswap_connection_waiters_dropped` event that dropped four waiters
+immediately.
+
+Second live run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-drop-rejected-dial-waiters-r3b-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-drop-rejected-dial-waiters-r3b.json
+```
+
+Result: reject. Rust passed `2/3`; Kubo passed `3/3`. Rust root TTFB p50/p95
+was `1101/15732ms` versus Kubo `1914/4518ms`; Rust asset TTFB p95 regressed to
+`16310ms` versus Kubo `979ms`.
+
+The second trace showed the failure mode clearly:
+
+- `bitswap timeout recovery: request_timeout_details=30 cold=1
+  mixed_trusted=29 trusted_only=0 timeout_ms=4000=29, 15000=1`
+- `bitswap peer attempts: starts=581 outgoing_completed=88 successes=0
+  failures=88 connection_timeouts=8 read_timeouts=0 other_failures=80`
+- `bitswap dial rejections: events=37 connection_limit=37 other=0`
+
+Decision: reject and revert. Dropping waiters converts connection pressure into
+fast `connection_waiter_dropped` failures, but under asset load that caused many
+mixed trusted/provider retries and did not eliminate failures. A better version
+would need queueing/backpressure or peer selection changes, not immediate waiter
+failure.
