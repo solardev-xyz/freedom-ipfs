@@ -3384,3 +3384,79 @@ cargo test -p freedom-ipfs-gateway request
 Decision: keep. This is a diagnostics-only fix with no retrieval behavior
 change. Future multi-run live traces should no longer overstate per-request
 event counts or merge CIDs from different gateway processes.
+
+## 2026-05-05 Bitswap Per-Peer Attempt Tracing
+
+Hypothesis:
+The remaining cold-root tail in the corrected `ipfs.tech` comparison is inside
+Bitswap after provider lookup and peer expansion are already done. To tune peer
+selection or batching safely, traces need to show more than the final
+`bitswap_fetch` winner.
+
+Current same-window baseline before this diagnostic patch:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-trace-correlation-current-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-trace-correlation-current-r3.json
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust asset p50/p95 was `190/592ms`
+versus Kubo `253/753ms`, and Rust RSS/FD max was `52104KiB`/`49` versus Kubo
+`313704KiB`/`481`. Rust root p50 was better (`2465ms` versus `3884ms`), but
+root p95 was worse (`6382ms` versus `4086ms`). The corrected slow-request
+summary separated the three root requests by process id. The slow Rust root
+request spent `5821ms` in `bitswap_fetch` for the root CID after a normal
+`47ms` provider lookup and `68ms` peer expansion.
+
+Implementation:
+
+- Trace `bitswap_peer_attempt_start` for every scheduled outgoing peer attempt.
+- Trace `bitswap_peer_attempt` when an outgoing peer attempt completes before
+  the command is satisfied.
+- Trace `bitswap_incoming_block` when an inbound Bitswap stream matches a
+  pending CID.
+- Harness summaries now print outgoing peer-attempt starts/completions and
+  matched incoming block totals.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_bitswap_peer_attempts
+cargo test -p mobile-web-harness
+cargo test -p freedom-ipfs-retrieval --lib
+cargo build -p freedom-ipfs-gateway
+```
+
+Live trace-shape check:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-peer-attempt-incoming-r1-trace.jsonl \
+  --output /tmp/ipfs-tech-peer-attempt-incoming-r1.json
+```
+
+Result: passed `1/1`, root TTFB `1341ms`, asset TTFB p50/p95 `131/1117ms`,
+RSS `49100KiB`, FD count `40`. The trace showed `bitswap peer attempts:
+starts=157 outgoing_completed=0` and `bitswap incoming blocks: matches=36
+blocks=44 bytes=906061`. That confirms the common success path is peers
+responding over inbound Bitswap streams; outgoing futures are usually cancelled
+once the shared swarm receives a matching inbound block.
+
+Decision: keep. This changes diagnostics only. The next behavior experiment
+should account for the inbound-response model, likely by measuring whether
+smaller initial root peer races, a short first-byte hedge, or batching session
+wants can reduce root/asset p95 without increasing mobile dial pressure.

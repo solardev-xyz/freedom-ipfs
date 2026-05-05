@@ -1410,6 +1410,14 @@ async fn run_shared_bitswap_swarm(
                                 result.source_peer = Some(peer);
                                 result.source_transport = source_transport;
                                 matched = true;
+                                tracing::info!(
+                                    phase = "bitswap_incoming_block",
+                                    cid = %cid,
+                                    peer = %peer,
+                                    source_transport = source_transport.unwrap_or("unknown"),
+                                    block_count = blocks.len(),
+                                    bytes = result.requested_block.len()
+                                );
                                 if let Some(senders) = pending_incoming.get_mut(&cid) {
                                     senders.retain(|sender| sender.send(result.clone()).is_ok());
                                 }
@@ -2524,10 +2532,27 @@ async fn request_bitswap_block_after_connection(
         ..
     } = peer;
 
+    let attempt_started = Instant::now();
+    tracing::info!(
+        phase = "bitswap_peer_attempt_start",
+        cid = %cid,
+        peer = %peer_id,
+        prefer_want_have
+    );
+
     if let Some(connection_ready) = connection_ready {
         match timeout(BITSWAP_CONNECTION_READY_TIMEOUT, connection_ready).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
+                tracing::info!(
+                    phase = "bitswap_peer_attempt",
+                    cid = %cid,
+                    peer = %peer_id,
+                    ok = false,
+                    failure_kind = "connection_waiter_dropped",
+                    prefer_want_have,
+                    elapsed_ms = attempt_started.elapsed().as_millis()
+                );
                 return Err(BitswapPeerFailure {
                     id: peer_id,
                     kind: BitswapPeerFailureKind::Other,
@@ -2535,10 +2560,19 @@ async fn request_bitswap_block_after_connection(
                         "{}: bitswap connection waiter was dropped before connection",
                         peer_id
                     ),
-                })
+                });
             }
             Err(_) => {
                 let recent_dial_errors = recent_dial_errors(&dial_errors, peer_id).await;
+                tracing::info!(
+                    phase = "bitswap_peer_attempt",
+                    cid = %cid,
+                    peer = %peer_id,
+                    ok = false,
+                    failure_kind = "connection_timeout",
+                    prefer_want_have,
+                    elapsed_ms = attempt_started.elapsed().as_millis()
+                );
                 return Err(BitswapPeerFailure {
                     id: peer_id,
                     kind: BitswapPeerFailureKind::ConnectionTimeout,
@@ -2553,7 +2587,7 @@ async fn request_bitswap_block_after_connection(
             }
         }
     }
-    request_bitswap_block(
+    let result = request_bitswap_block(
         control,
         peer_id,
         addrs,
@@ -2561,7 +2595,43 @@ async fn request_bitswap_block_after_connection(
         prefer_want_have,
         peer_transports,
     )
-    .await
+    .await;
+    match &result {
+        Ok(result) => {
+            tracing::info!(
+                phase = "bitswap_peer_attempt",
+                cid = %cid,
+                peer = %peer_id,
+                ok = true,
+                prefer_want_have,
+                source_transport = result.source_transport.unwrap_or("unknown"),
+                bytes = result.requested_block.len(),
+                extra_blocks = result.extra_blocks.len(),
+                elapsed_ms = attempt_started.elapsed().as_millis()
+            );
+        }
+        Err(err) => {
+            tracing::info!(
+                phase = "bitswap_peer_attempt",
+                cid = %cid,
+                peer = %peer_id,
+                ok = false,
+                failure_kind = bitswap_peer_failure_kind_label(err.kind),
+                prefer_want_have,
+                error = %err.detail,
+                elapsed_ms = attempt_started.elapsed().as_millis()
+            );
+        }
+    }
+    result
+}
+
+fn bitswap_peer_failure_kind_label(kind: BitswapPeerFailureKind) -> &'static str {
+    match kind {
+        BitswapPeerFailureKind::ConnectionTimeout => "connection_timeout",
+        BitswapPeerFailureKind::ReadTimeout => "read_timeout",
+        BitswapPeerFailureKind::Other => "other",
+    }
 }
 
 async fn request_bitswap_block(
