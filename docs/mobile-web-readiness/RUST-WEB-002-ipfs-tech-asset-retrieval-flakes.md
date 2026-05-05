@@ -10315,3 +10315,132 @@ Decision: reject and revert. The synthetic extensionless-raw case works, but
 the real page workload does not justify another gateway cache. Keep MIME
 optimizations focused on cases where traces show actual sniff reads or MIME
 work on extensionless content, not extension-derived assets.
+
+## 2026-05-05 Keep: Give Recent Bitswap Session Peers A Short Provider-Lookup Head Start
+
+Hypothesis:
+The `ipfs.tech` page trace still showed many delegated provider lookups even
+when recent Bitswap session peers later satisfied the asset block. Starting the
+provider lookup immediately keeps fallback latency low, but it also spends
+mobile network, connection, and routing work on blocks that a known-good peer
+can often serve. Giving recent session peers a very short head start before
+starting delegated routing should reduce duplicate provider work while keeping
+fallback bounded.
+
+Implementation:
+
+- Add `BITSWAP_SESSION_PRE_LOOKUP_GRACE = 50ms`.
+- When no provider cache entry exists and recent Bitswap peers are available,
+  poll the session shortcut for at most `50ms` before starting provider lookup.
+- If the shortcut hits inside that window, return the verified Bitswap block and
+  skip provider lookup for that CID.
+- If the shortcut misses or times out, start the existing provider lookup path
+  and keep the existing `100ms` post-lookup grace.
+- Add `bitswap_session_shortcut_pre_lookup` tracing with `hit`, `miss`, or
+  `timeout` outcome.
+- Add a loopback retrieval test proving a connected recent Bitswap peer can
+  serve a follow-on block without issuing a delegated routing request.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval recent_bitswap_peer_head_start_can_avoid_provider_lookup
+cargo test -p freedom-ipfs-retrieval
+cargo test -p freedom-ipfs-gateway -p freedom-ipfs-mobile
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result: all passed.
+
+Page-assets comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-session-headstart-page-assets-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-session-headstart-page-assets-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `4/662ms`, Kubo `3/3371ms`.
+- Asset TTFB p50/p95: Rust `5/268ms`, Kubo `4/239ms`.
+- Rust RSS/FD: `51780KiB`/`31`; Kubo RSS/FD: `168496KiB`/`178`.
+- Delegated provider lookup events dropped to `19`, compared with `25` in the
+  immediately previous page-assets run.
+- Bitswap peer attempts dropped to `45`, compared with `112` in the immediately
+  previous page-assets run.
+- Bitswap session shortcut attempts/hits were `33/33`; post-lookup waits
+  dropped to `1`.
+- Gateway response p50/p95 was `2/277ms`.
+
+Additional `/ipfs` range check:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/vitalik-session-headstart-range-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/vitalik-session-headstart-range-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root/range TTFB p50/p95: Rust `5/1561ms`, Kubo `4/2894ms`.
+- Rust RSS/FD: `38528KiB`/`23`; Kubo RSS/FD: `120568KiB`/`83`.
+- Warm repeat requests stayed `2ms` each, with gateway direct-body max elapsed
+  still `0ms`.
+- The cold request was network/provider noisy and not the keep signal.
+
+Sparse-provider check:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/daicowtf-session-headstart-page-assets-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/daicowtf-session-headstart-page-assets-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both failed `3/3` in this network window.
+- Rust failed with sparse-provider/no-provider behavior on a child raw CID:
+  delegated lookup found only `1` provider, DHT fallback found `0`, then the
+  cached empty provider set made warm repeats fail quickly.
+- This is not a useful keep/reject signal for the session head-start change,
+  but it remains a useful reminder that sparse-provider reliability still needs
+  more work.
+
+Decision: keep. This is a bounded session optimization: it does not increase
+provider fanout, public fallback, timeouts, or cache trust. It reduces redundant
+provider lookup and Bitswap attempt work on the real `ipfs.tech` page workload
+where recent session peers are useful, while preserving the existing provider
+lookup fallback after a `50ms` cap.
