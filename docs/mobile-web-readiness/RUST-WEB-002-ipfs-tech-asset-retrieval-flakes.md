@@ -8564,3 +8564,41 @@ Conclusion:
   also failed, this is not a parity blocker, but it is the best current target
   for provider-diversity and DHT fallback experiments. Any fix should preserve
   the low RSS/FD profile and avoid public gateway fallback.
+
+## 2026-05-05 Keep: Provider-Diversity-Low Trace Summary
+
+Motivation:
+The `daicowtf` comparison above made the next reliability target obvious, but
+the normal harness report still exposed `provider_diversity_low` mostly through
+progress phase counts and truncated trace errors. The raw trace already has
+structured fields for provider counts, Bitswap provider diversity, DHT fallback
+counts, fallback labels, and timeout caps. The harness should summarize those
+directly before any provider-diversity experiments.
+
+Implementation:
+
+- Add `provider_diversity_low` to serialized trace summaries.
+- Count events and `ok=false` failures.
+- Sum and max `provider_count`, `bitswap_provider_count`, and
+  `dht_provider_count`.
+- Track max `timeout_ms` and fallback labels such as `light_dht`.
+- Print the summary in both single-engine and Rust-vs-Kubo comparison output.
+- Extend the trace-summary fixture with three representative
+  `provider_diversity_low` events, including the `ok=false` timeout shape from
+  the `daicowtf` trace.
+
+Validation:
+
+```sh
+cargo fmt --all
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+git diff --check
+```
+
+Decision: keep. This is diagnostics-only and makes the next sparse-provider
+experiment measurable without changing routing, Bitswap, gateway behavior,
+cache semantics, or public gateway policy.

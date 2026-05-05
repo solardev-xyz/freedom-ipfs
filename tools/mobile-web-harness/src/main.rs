@@ -819,6 +819,7 @@ fn print_summary(report: &RunReport) {
         }
         print_trace_provider_retries(trace);
         print_trace_delegated_provider_lookup(trace);
+        print_trace_provider_diversity_low(trace);
         if !trace.request_statuses.is_empty() || trace.gateway_limiter_denials > 0 {
             println!(
                 "  gateway responses: statuses={} limiter_denials={} elapsed={}",
@@ -1168,6 +1169,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_progress_phases(trace);
     print_trace_provider_retries(trace);
     print_trace_delegated_provider_lookup(trace);
+    print_trace_provider_diversity_low(trace);
     if !trace.request_statuses.is_empty() || trace.gateway_limiter_denials > 0 {
         println!(
             "  gateway responses: statuses={} limiter_denials={} elapsed={}",
@@ -1302,6 +1304,26 @@ fn print_trace_delegated_provider_lookup(trace: &TraceSummary) {
             endpoint.max_elapsed_ms
         );
     }
+}
+
+fn print_trace_provider_diversity_low(trace: &TraceSummary) {
+    let diversity = &trace.provider_diversity_low;
+    if diversity.events == 0 {
+        return;
+    }
+    println!(
+        "  provider diversity low: events={} failures={} providers_total={} bitswap_providers_total={} dht_providers_total={} max_provider_count={} max_bitswap_provider_count={} max_dht_provider_count={} max_timeout_ms={} fallbacks={}",
+        diversity.events,
+        diversity.failures,
+        diversity.provider_count_total,
+        diversity.bitswap_provider_count_total,
+        diversity.dht_provider_count_total,
+        diversity.max_provider_count,
+        diversity.max_bitswap_provider_count,
+        diversity.max_dht_provider_count,
+        diversity.max_timeout_ms,
+        format_trace_counts(&diversity.fallbacks)
+    );
 }
 
 fn print_trace_gateway_direct_body(trace: &TraceSummary) {
@@ -3764,6 +3786,7 @@ struct TraceSummary {
     provider_retries: TraceProviderRetryAggregate,
     delegated_provider_lookup: TraceDelegatedProviderLookupAggregate,
     delegated_provider_lookup_by_endpoint: Vec<TraceDelegatedProviderEndpointAggregate>,
+    provider_diversity_low: TraceProviderDiversityLowAggregate,
     request_statuses: Vec<TraceValueCount>,
     gateway_limiter_denials: usize,
     gateway_request_elapsed_ms: LatencySummary,
@@ -3884,6 +3907,74 @@ struct TraceDelegatedProviderEndpointAggregate {
     failures: usize,
     providers: u128,
     max_elapsed_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
+struct TraceProviderDiversityLowAggregate {
+    events: usize,
+    failures: usize,
+    provider_count_total: u128,
+    bitswap_provider_count_total: u128,
+    dht_provider_count_total: u128,
+    max_provider_count: u128,
+    max_bitswap_provider_count: u128,
+    max_dht_provider_count: u128,
+    max_timeout_ms: u128,
+    fallbacks: Vec<TraceValueCount>,
+}
+
+#[derive(Default)]
+struct TraceProviderDiversityLowBuilder {
+    events: usize,
+    failures: usize,
+    provider_count_total: u128,
+    bitswap_provider_count_total: u128,
+    dht_provider_count_total: u128,
+    max_provider_count: u128,
+    max_bitswap_provider_count: u128,
+    max_dht_provider_count: u128,
+    max_timeout_ms: u128,
+    fallbacks: BTreeMap<String, usize>,
+}
+
+impl TraceProviderDiversityLowBuilder {
+    fn record(&mut self, value: &serde_json::Value) {
+        self.events += 1;
+        if value.get("ok").and_then(|ok| ok.as_bool()) == Some(false) {
+            self.failures += 1;
+        }
+        let provider_count = trace_count_field(value, "provider_count");
+        let bitswap_provider_count = trace_count_field(value, "bitswap_provider_count");
+        let dht_provider_count = trace_count_field(value, "dht_provider_count");
+        self.provider_count_total += provider_count;
+        self.bitswap_provider_count_total += bitswap_provider_count;
+        self.dht_provider_count_total += dht_provider_count;
+        self.max_provider_count = self.max_provider_count.max(provider_count);
+        self.max_bitswap_provider_count =
+            self.max_bitswap_provider_count.max(bitswap_provider_count);
+        self.max_dht_provider_count = self.max_dht_provider_count.max(dht_provider_count);
+        if let Some(timeout_ms) = value.get("timeout_ms").and_then(json_u128) {
+            self.max_timeout_ms = self.max_timeout_ms.max(timeout_ms);
+        }
+        if let Some(fallback) = value.get("fallback").and_then(|fallback| fallback.as_str()) {
+            *self.fallbacks.entry(fallback.to_string()).or_default() += 1;
+        }
+    }
+
+    fn into_aggregate(self) -> TraceProviderDiversityLowAggregate {
+        TraceProviderDiversityLowAggregate {
+            events: self.events,
+            failures: self.failures,
+            provider_count_total: self.provider_count_total,
+            bitswap_provider_count_total: self.bitswap_provider_count_total,
+            dht_provider_count_total: self.dht_provider_count_total,
+            max_provider_count: self.max_provider_count,
+            max_bitswap_provider_count: self.max_bitswap_provider_count,
+            max_dht_provider_count: self.max_dht_provider_count,
+            max_timeout_ms: self.max_timeout_ms,
+            fallbacks: sorted_trace_counts(self.fallbacks),
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -4380,6 +4471,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut delegated_provider_lookup = TraceDelegatedProviderLookupAggregate::default();
     let mut delegated_provider_lookup_by_endpoint =
         BTreeMap::<String, TraceDelegatedProviderLookupAggregate>::new();
+    let mut provider_diversity_low = TraceProviderDiversityLowBuilder::default();
     let mut request_statuses = BTreeMap::<String, usize>::new();
     let mut gateway_limiter_denials = 0usize;
     let mut gateway_request_elapsed_values = Vec::<u128>::new();
@@ -4491,6 +4583,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 .entry(endpoint)
                 .or_default()
                 .record(&value, elapsed_ms);
+        }
+        if phase == "provider_diversity_low" {
+            provider_diversity_low.record(&value);
         }
         match phase {
             "provider_refresh_after_timeout" => {
@@ -5163,6 +5258,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         delegated_provider_lookup_by_endpoint: sorted_trace_delegated_provider_endpoints(
             delegated_provider_lookup_by_endpoint,
         ),
+        provider_diversity_low: provider_diversity_low.into_aggregate(),
         request_statuses: sorted_trace_counts(request_statuses),
         gateway_limiter_denials,
         gateway_request_elapsed_ms: LatencySummary::from_values(gateway_request_elapsed_values),
@@ -6151,6 +6247,9 @@ mod tests {
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":5,\"cid\":\"cid1\",\"source\":\"bitswap\"}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":4,\"cid\":\"cid5\",\"source\":\"cache\"}\n",
                 "{\"phase\":\"provider_lookup\",\"elapsed_ms\":10,\"cid\":\"cid2\",\"provider_count\":3,\"error\":\"dht: timeout\"}\n",
+                "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid2\",\"provider_count\":1,\"bitswap_provider_count\":1,\"min_bitswap_provider_count\":2,\"fallback\":\"light_dht\"}\n",
+                "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid2\",\"provider_count\":3,\"dht_provider_count\":2,\"bitswap_provider_count\":2,\"fallback\":\"light_dht\"}\n",
+                "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid2\",\"bitswap_provider_count\":1,\"fallback\":\"light_dht\",\"ok\":false,\"timeout_ms\":750}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":12,\"cid\":\"cid6\",\"ok\":false,\"trusted_peer_count\":1}\n",
                 "{\"phase\":\"bitswap_peer_expand\",\"elapsed_ms\":3,\"cid\":\"cid7\",\"tcp_addr_count\":4,\"quic_addr_count\":2,\"ws_addr_count\":1,\"wss_addr_count\":0,\"dns_addr_count\":1,\"ip4_addr_count\":3,\"ip6_addr_count\":1,\"provider_addr_count\":10,\"expanded_provider_addr_count\":12,\"supported_provider_addr_count\":4,\"rejected_provider_addr_count\":8,\"id_only_provider_count\":1,\"invalid_provider_id_count\":2,\"provider_without_supported_bitswap_addr_count\":3,\"unsupported_relay_addr_count\":4,\"unsupported_webtransport_addr_count\":1,\"unsupported_webrtc_addr_count\":1,\"unsupported_certhash_addr_count\":1,\"unsupported_transport_addr_count\":1,\"missing_peer_addr_count\":1,\"unparsable_addr_count\":1,\"addr_with_relay_count\":6,\"addr_with_webtransport_count\":2,\"addr_with_webrtc_count\":3,\"addr_with_certhash_count\":4}\n",
                 "{\"phase\":\"bitswap_session_shortcut_start\",\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1}\n",
@@ -6186,8 +6285,8 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 34);
-        assert_eq!(summary.event_count, 33);
+        assert_eq!(summary.line_count, 37);
+        assert_eq!(summary.event_count, 36);
         assert_eq!(summary.slow_events.len(), 15);
         assert_eq!(
             summary.slow_events[0].phase,
@@ -6244,6 +6343,23 @@ mod tests {
         assert_eq!(summary.gateway_request_elapsed_ms.count, 1);
         assert_eq!(summary.gateway_request_elapsed_ms.p50_ms, Some(1));
         assert_eq!(summary.gateway_request_elapsed_ms.p95_ms, Some(1));
+        assert_eq!(summary.provider_diversity_low.events, 3);
+        assert_eq!(summary.provider_diversity_low.failures, 1);
+        assert_eq!(summary.provider_diversity_low.provider_count_total, 4);
+        assert_eq!(
+            summary.provider_diversity_low.bitswap_provider_count_total,
+            4
+        );
+        assert_eq!(summary.provider_diversity_low.dht_provider_count_total, 2);
+        assert_eq!(summary.provider_diversity_low.max_provider_count, 3);
+        assert_eq!(summary.provider_diversity_low.max_bitswap_provider_count, 2);
+        assert_eq!(summary.provider_diversity_low.max_dht_provider_count, 2);
+        assert_eq!(summary.provider_diversity_low.max_timeout_ms, 750);
+        assert_eq!(
+            summary.provider_diversity_low.fallbacks[0].value,
+            "light_dht"
+        );
+        assert_eq!(summary.provider_diversity_low.fallbacks[0].count, 3);
         assert_eq!(summary.unixfs_metadata_cache.events, 1);
         assert_eq!(summary.unixfs_metadata_cache.hits, 3);
         assert_eq!(summary.unixfs_metadata_cache.misses, 2);
@@ -6307,7 +6423,7 @@ mod tests {
             .iter()
             .map(|error| error.value.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(trace_errors.len(), 7);
+        assert_eq!(trace_errors.len(), 8);
         assert!(trace_errors.iter().any(|error| {
             error.starts_with("bitswap_connection_error: Failed to negotiate transport protocol")
         }));
@@ -6316,6 +6432,7 @@ mod tests {
         assert!(trace_errors.contains(&"bitswap_fetch: ok=false"));
         assert!(trace_errors.contains(&"bitswap_session_shortcut: ok=false"));
         assert!(trace_errors.contains(&"provider_lookup: dht: timeout"));
+        assert!(trace_errors.contains(&"provider_diversity_low: ok=false"));
         assert_eq!(summary.bitswap_addr_mix[0].value, "tcp");
         assert_eq!(summary.bitswap_addr_mix[0].count, 4);
         assert_eq!(summary.bitswap_addr_mix[1].value, "ip4");

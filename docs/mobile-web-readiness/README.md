@@ -169,6 +169,10 @@ summarize delegated lookup count, success/failure count, total providers, and
 maximum elapsed time. Reports also break those outcomes down by endpoint so
 slow routing tails and endpoint-specific failures are visible without manual
 JSONL inspection.
+Low-diversity provider fallback traces are summarized separately with event and
+failure counts, total/max provider counts before and after light-DHT fallback,
+timeout caps, and fallback labels. This keeps sparse-provider failures visible
+without relying on truncated trace error strings.
 Rust-vs-Kubo trace output also prints Bitswap source peer, source transport,
 delivery, and per-peer fetch summaries so provider-quality experiments can see
 which peers actually supplied blocks.
