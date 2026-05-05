@@ -43,6 +43,8 @@ const PROVIDER_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const BAD_HTTP_PROVIDER_TTL: Duration = Duration::from_secs(10 * 60);
 const BAD_BITSWAP_PROVIDER_TTL: Duration = Duration::from_secs(30);
 const HTTP_PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
+const HTTP_PROVIDER_RACE_WIDTH: usize = 2;
+const MAX_CONCURRENT_HTTP_PROVIDER_FETCHES: usize = 4;
 const BITSWAP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 // Start provider retry before a full dial timeout can dominate gateway TTFB.
 const BITSWAP_CONNECTION_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -169,6 +171,7 @@ pub struct HttpRetriever {
     bitswap: Arc<tokio::sync::Mutex<Option<SharedBitswapClient>>>,
     inflight: Arc<tokio::sync::Mutex<HashMap<Cid, SharedBlockFetch>>>,
     successful_bitswap_peers: Arc<tokio::sync::Mutex<HashMap<PeerId, SuccessfulBitswapPeer>>>,
+    http_provider_fetch_limiter: Arc<tokio::sync::Semaphore>,
 }
 
 type SharedBlockFetch = Shared<BoxFuture<'static, Arc<SharedBlockFetchResult>>>;
@@ -183,6 +186,9 @@ impl HttpRetriever {
             bitswap: Arc::new(tokio::sync::Mutex::new(None)),
             inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             successful_bitswap_peers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            http_provider_fetch_limiter: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_HTTP_PROVIDER_FETCHES,
+            )),
         }
     }
 
@@ -637,43 +643,21 @@ impl HttpRetriever {
             cid = %cid,
             provider_count = providers.len()
         );
+        let mut http_provider_bases = Vec::new();
         for provider in providers {
             for base in &provider.http_urls {
                 if self.store.is_bad_provider(base.as_str())? {
                     tracing::debug!(provider = %base, "skipping temporarily bad HTTP provider");
                     continue;
                 }
-                let started = Instant::now();
-                match self.fetch_from_http_provider(cid, base).await {
-                    Ok(block) => {
-                        tracing::info!(
-                            phase = "http_provider_fetch",
-                            cid = %cid,
-                            provider = %base,
-                            ok = true,
-                            bytes = block.data().len(),
-                            elapsed_ms = started.elapsed().as_millis()
-                        );
-                        return Ok((block, RetrievalSource::HttpProvider));
-                    }
-                    Err(err) => {
-                        tracing::info!(
-                            phase = "http_provider_fetch",
-                            cid = %cid,
-                            provider = %base,
-                            ok = false,
-                            error = %err,
-                            elapsed_ms = started.elapsed().as_millis()
-                        );
-                        let _ = self.store.mark_bad_provider(
-                            base.as_str(),
-                            &err.to_string(),
-                            BAD_HTTP_PROVIDER_TTL,
-                        );
-                        continue;
-                    }
-                }
+                http_provider_bases.push(base.clone());
             }
+        }
+        if let Some(block) = self
+            .fetch_from_http_provider_candidates(cid, http_provider_bases)
+            .await?
+        {
+            return Ok((block, RetrievalSource::HttpProvider));
         }
         match self.fetch_from_bitswap_providers(cid, providers).await {
             Ok(block) => Ok((block, RetrievalSource::Bitswap)),
@@ -708,6 +692,86 @@ impl HttpRetriever {
         };
         self.store.put_provider_records(cid, &records, ttl)?;
         Ok(())
+    }
+
+    async fn fetch_from_http_provider_candidates(
+        &self,
+        cid: &Cid,
+        bases: Vec<Url>,
+    ) -> Result<Option<Block>> {
+        if bases.is_empty() {
+            return Ok(None);
+        }
+
+        tracing::info!(
+            phase = "http_provider_race",
+            cid = %cid,
+            provider_count = bases.len(),
+            race_width = HTTP_PROVIDER_RACE_WIDTH
+        );
+
+        let mut next_bases = bases.into_iter();
+        let mut pending = FuturesUnordered::new();
+        for _ in 0..HTTP_PROVIDER_RACE_WIDTH {
+            let Some(base) = next_bases.next() else {
+                break;
+            };
+            pending.push(self.fetch_from_http_provider_candidate(*cid, base));
+        }
+
+        while let Some(result) = pending.next().await {
+            match result {
+                Ok(block) => return Ok(Some(block)),
+                Err(_) => {
+                    if let Some(base) = next_bases.next() {
+                        pending.push(self.fetch_from_http_provider_candidate(*cid, base));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn fetch_from_http_provider_candidate(&self, cid: Cid, base: Url) -> Result<Block> {
+        let _permit = self
+            .http_provider_fetch_limiter
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|err| {
+                RetrievalError::Bitswap(format!("HTTP provider limiter closed: {err}"))
+            })?;
+        let started = Instant::now();
+        match self.fetch_from_http_provider(&cid, &base).await {
+            Ok(block) => {
+                tracing::info!(
+                    phase = "http_provider_fetch",
+                    cid = %cid,
+                    provider = %base,
+                    ok = true,
+                    bytes = block.data().len(),
+                    elapsed_ms = started.elapsed().as_millis()
+                );
+                Ok(block)
+            }
+            Err(err) => {
+                tracing::info!(
+                    phase = "http_provider_fetch",
+                    cid = %cid,
+                    provider = %base,
+                    ok = false,
+                    error = %err,
+                    elapsed_ms = started.elapsed().as_millis()
+                );
+                let _ = self.store.mark_bad_provider(
+                    base.as_str(),
+                    &err.to_string(),
+                    BAD_HTTP_PROVIDER_TTL,
+                );
+                Err(err)
+            }
+        }
     }
 
     async fn fetch_from_http_provider(&self, cid: &Cid, base: &Url) -> Result<Block> {
@@ -5555,6 +5619,55 @@ mod bitswap_tests {
         assert!(store.get(&cid).unwrap().is_none());
         assert!(store.is_bad_provider(&provider_url).unwrap());
         server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn races_http_provider_candidates_and_returns_first_verified_block() {
+        let expected = b"verified fast HTTP provider block";
+        let invalid = b"slow invalid HTTP provider block";
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, expected);
+        let slow_requests = Arc::new(AtomicU64::new(0));
+        let fast_requests = Arc::new(AtomicU64::new(0));
+        let (slow_addr, slow_task) = spawn_counting_http_provider(
+            invalid.to_vec(),
+            Duration::from_millis(250),
+            slow_requests.clone(),
+        )
+        .await;
+        let (fast_addr, fast_task) =
+            spawn_counting_http_provider(expected.to_vec(), Duration::ZERO, fast_requests.clone())
+                .await;
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let provider = Provider::from_parts(
+            None,
+            vec![
+                format!("/ip4/{}/tcp/{}/http", slow_addr.ip(), slow_addr.port()),
+                format!("/ip4/{}/tcp/{}/http", fast_addr.ip(), fast_addr.port()),
+            ],
+        )
+        .unwrap_or_else(|_| panic!("failed to build HTTP providers"));
+
+        let started = Instant::now();
+        let (block, source) = retriever
+            .fetch_from_providers_with_source(&cid, &[provider])
+            .await
+            .unwrap();
+
+        assert_eq!(source, RetrievalSource::HttpProvider);
+        assert_eq!(block.data(), expected);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "HTTP provider race should not wait for the slow invalid provider"
+        );
+        assert_eq!(fast_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(slow_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
+        slow_task.abort();
+        fast_task.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

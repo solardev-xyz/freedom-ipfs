@@ -12691,3 +12691,156 @@ Decision:
 Keep. This is diagnostics-only and does not alter provider selection, public
 fallback behavior, block verification, or caching. It makes HTTP-provider
 quality visible enough to safely test provider suppression/racing changes later.
+
+## 2026-05-05 Keep: Race Bounded HTTP Provider Candidates
+
+Hypothesis:
+The previous HTTP-provider quality summary showed a live range request spending
+`994ms` on one HTTP provider that returned a CID hash mismatch before verified
+fallback recovered. When delegated routing returns multiple HTTP providers for a
+CID, trying them strictly one-at-a-time lets one slow, stale, or invalid provider
+dominate TTFB. Racing a very small number of routing-provided HTTP providers
+should reduce public-network tails while preserving the read-only, verified
+retrieval model.
+
+Change:
+
+- Collect routing-provided HTTP provider base URLs after bad-provider filtering.
+- Race at most `2` HTTP provider candidates per CID.
+- Cap global concurrent HTTP-provider fetches at `4` across the retriever.
+- Return the first verified block and drop slower in-flight candidates.
+- Continue to request only provider records returned by routing; no public
+  gateway fallback is added.
+- Continue verifying each block before storing or serving it through the existing
+  `fetch_from_http_provider` and block-store path.
+- Keep per-provider success/failure trace events and add an `http_provider_race`
+  trace event for progress and harness summaries.
+- Map `http_provider_race` to the mobile-facing `fetching_http_provider` phase
+  in both the mobile FFI progress snapshot and harness trace summaries.
+
+Focused validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval races_http_provider_candidates_and_returns_first_verified_block
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+cargo test -p mobile-web-harness trace_summary_counts_http_provider_fetches
+```
+
+Regression validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval
+cargo test -p freedom-ipfs-mobile
+cargo test -p mobile-web-harness
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo clippy -p freedom-ipfs-mobile --all-targets -- -D warnings
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Result:
+
+- focused retrieval HTTP-provider race test passed
+- focused mobile progress mapping test passed
+- focused harness HTTP-provider summary test passed
+- full retrieval suite passed: `67 passed; 0 failed; 1 ignored`
+- full mobile suite passed: `26 passed; 0 failed`
+- full mobile web harness suite passed: `32 passed; 0 failed`
+- retrieval, mobile, and harness clippy passed with `-D warnings`
+
+Live one-run sanity check:
+
+```sh
+timeout 480s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-http-provider-race-r1-trace.jsonl \
+  --comparison-output /tmp/vitalik-http-provider-race-r1.json
+```
+
+One-run result:
+
+- Rust and Kubo passed `vitalik-root-html-range`.
+- Rust root TTFB `154ms`; Kubo root TTFB `1834ms`.
+- Rust max RSS/FD `31104KiB` / `15`; Kubo max RSS/FD `125524KiB` / `71`.
+- HTTP-provider fetches: events `2`, successes `2`, failures `0`, bytes
+  `38773`, elapsed p50/p95 `20ms` / `51ms`.
+- Provider lookups succeeded for both blocks, with max delegated lookup elapsed
+  `50ms`.
+
+Live three-run comparison:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-http-provider-race-r3-trace.jsonl \
+  --comparison-output /tmp/vitalik-http-provider-race-r3.json
+```
+
+Three-run result:
+
+- Rust and Kubo passed `3/3`.
+- Rust root TTFB p50/p95 `156ms` / `168ms`.
+- Kubo root TTFB p50/p95 `2932ms` / `3208ms`.
+- Rust max RSS/FD `31488KiB` / `15`; Kubo max RSS/FD `198856KiB` / `160`.
+- HTTP-provider fetches: events `6`, successes `6`, failures `0`, bytes
+  `116319`, elapsed p50/p95 `21ms` / `36ms`.
+- Compared with the immediately previous HTTP-provider summary sanity run
+  (`1209ms` Rust TTFB with one `994ms` CID hash mismatch), this removes the
+  observed slow-provider tail on this live case. Public-network variance still
+  means this is not a universal speed claim, but the signal is strong and the
+  guardrails are narrow.
+
+Seeded Bitswap boundary regression check:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-http-provider-race-seeded-r3-trace.jsonl \
+  --comparison-output /tmp/harness-http-provider-race-seeded-r3.json
+```
+
+Seeded result:
+
+- Rust and Kubo passed `3/3`.
+- Rust root TTFB p50/p95 `181ms` / `186ms`.
+- Kubo root TTFB p50/p95 `57ms` / `59ms`.
+- Kubo seed preconnect p50/p95 was `54ms` / `54ms`, outside Kubo request timing.
+- Rust max RSS/FD `39232KiB` / `13`; Kubo max RSS/FD `87852KiB` / `33`.
+- The result is neutral against the previous kept seeded baseline
+  (`179ms` / `186ms` Rust p50/p95) and does not introduce HTTP-provider work in
+  the seeded Bitswap-only path.
+
+Decision:
+Keep. The change is narrowly bounded, uses only routing-provided HTTP
+candidates, preserves verification-before-store/serve semantics, avoids public
+gateway fallback, and improves the live public range workload that motivated the
+experiment without regressing the deterministic seeded Bitswap case or mobile
+resource profile.
