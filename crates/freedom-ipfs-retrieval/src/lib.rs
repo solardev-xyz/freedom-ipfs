@@ -63,6 +63,8 @@ const BITSWAP_SESSION_SHORTCUT_GRACE: Duration = Duration::from_millis(0);
 const BITSWAP_SESSION_PRE_LOOKUP_GRACE: Duration = Duration::from_millis(50);
 const BITSWAP_SESSION_POST_LOOKUP_GRACE: Duration = Duration::from_millis(100);
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
+const BITSWAP_SESSION_LATE_PEER_WAIT: Duration = Duration::from_secs(2);
+const BITSWAP_SESSION_LATE_PEER_POLL: Duration = Duration::from_millis(50);
 // The per-peer read path has its own 10s timeout. This caps broader shared
 // swarm stalls so one stuck command cannot sit on a browser request for 45s.
 const BITSWAP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -332,18 +334,134 @@ impl HttpRetriever {
                 let recent_peers = self.recent_bitswap_peers_for_fetch().await;
                 let (providers, provider_lookup_elapsed_ms) = if recent_peers.is_empty() {
                     let routing_started = Instant::now();
-                    match self.routing.providers(cid).await {
-                        Ok(providers) => (providers, routing_started.elapsed().as_millis()),
-                        Err(err) => {
-                            tracing::info!(
-                                phase = "provider_lookup",
-                                cid = %cid,
-                                error = %err,
-                                elapsed_ms = routing_started.elapsed().as_millis()
-                            );
-                            return Err(err.into());
+                    let provider_lookup = self.routing.providers(cid);
+                    tokio::pin!(provider_lookup);
+                    let late_peers = self
+                        .wait_for_recent_bitswap_peers_for_fetch(BITSWAP_SESSION_LATE_PEER_WAIT);
+                    tokio::pin!(late_peers);
+                    let providers = tokio::select! {
+                        lookup_result = &mut provider_lookup => {
+                            match lookup_result {
+                                Ok(providers) => providers,
+                                Err(err) => {
+                                    tracing::info!(
+                                        phase = "provider_lookup",
+                                        cid = %cid,
+                                        error = %err,
+                                        elapsed_ms = routing_started.elapsed().as_millis()
+                                    );
+                                    return Err(err.into());
+                                }
+                            }
                         }
-                    }
+                        (late_recent_peers, late_peer_elapsed_ms) = &mut late_peers => {
+                            if late_recent_peers.is_empty() {
+                                tracing::info!(
+                                    phase = "bitswap_session_late_peer_wait",
+                                    cid = %cid,
+                                    outcome = "miss",
+                                    timeout_ms = BITSWAP_SESSION_LATE_PEER_WAIT.as_millis(),
+                                    elapsed_ms = late_peer_elapsed_ms
+                                );
+                                match provider_lookup.await {
+                                    Ok(providers) => providers,
+                                    Err(err) => {
+                                        tracing::info!(
+                                            phase = "provider_lookup",
+                                            cid = %cid,
+                                            error = %err,
+                                            elapsed_ms = routing_started.elapsed().as_millis()
+                                        );
+                                        return Err(err.into());
+                                    }
+                                }
+                            } else {
+                                tracing::info!(
+                                    phase = "bitswap_session_late_peer_wait",
+                                    cid = %cid,
+                                    outcome = "hit",
+                                    peer_count = late_recent_peers.len(),
+                                    timeout_ms = BITSWAP_SESSION_LATE_PEER_WAIT.as_millis(),
+                                    elapsed_ms = late_peer_elapsed_ms
+                                );
+                                let shortcut = self.fetch_from_recent_bitswap_peers(cid, late_recent_peers);
+                                tokio::pin!(shortcut);
+                                tokio::select! {
+                                    shortcut_result = &mut shortcut => {
+                                        if let Some(block) = shortcut_result? {
+                                            return Ok((block, RetrievalSource::Bitswap));
+                                        }
+                                        match provider_lookup.await {
+                                            Ok(providers) => providers,
+                                            Err(err) => {
+                                                tracing::info!(
+                                                    phase = "provider_lookup",
+                                                    cid = %cid,
+                                                    error = %err,
+                                                    elapsed_ms = routing_started.elapsed().as_millis()
+                                                );
+                                                return Err(err.into());
+                                            }
+                                        }
+                                    }
+                                    lookup_result = &mut provider_lookup => {
+                                        match lookup_result {
+                                            Ok(providers) => {
+                                                if providers.is_empty() {
+                                                    match shortcut.await? {
+                                                        Some(block) => {
+                                                            tracing::info!(
+                                                                phase = "bitswap_session_shortcut_empty_providers_wait",
+                                                                cid = %cid,
+                                                                outcome = "hit"
+                                                            );
+                                                            return Ok((block, RetrievalSource::Bitswap));
+                                                        }
+                                                        None => {
+                                                            tracing::info!(
+                                                                phase = "bitswap_session_shortcut_empty_providers_wait",
+                                                                cid = %cid,
+                                                                outcome = "miss"
+                                                            );
+                                                        }
+                                                    }
+                                                } else {
+                                                    match timeout(BITSWAP_SESSION_POST_LOOKUP_GRACE, &mut shortcut).await {
+                                                        Ok(shortcut_result) => {
+                                                            if let Some(block) = shortcut_result? {
+                                                                return Ok((block, RetrievalSource::Bitswap));
+                                                            }
+                                                        }
+                                                        Err(_) => {
+                                                            tracing::info!(
+                                                                phase = "bitswap_session_shortcut_post_lookup_wait",
+                                                                cid = %cid,
+                                                                timeout_ms = BITSWAP_SESSION_POST_LOOKUP_GRACE.as_millis()
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                providers
+                                            }
+                                            Err(lookup_err) => {
+                                                if let Some(block) = shortcut.await? {
+                                                    return Ok((block, RetrievalSource::Bitswap));
+                                                }
+                                                tracing::info!(
+                                                    phase = "provider_lookup",
+                                                    cid = %cid,
+                                                    error = %lookup_err,
+                                                    elapsed_ms = routing_started.elapsed().as_millis()
+                                                );
+                                                return Err(lookup_err.into());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    (providers, routing_started.elapsed().as_millis())
                 } else {
                     let shortcut = async {
                         tokio::time::sleep(BITSWAP_SESSION_SHORTCUT_GRACE).await;
@@ -1254,6 +1372,24 @@ impl HttpRetriever {
             },
         );
         peers
+    }
+
+    async fn wait_for_recent_bitswap_peers_for_fetch(
+        &self,
+        wait: Duration,
+    ) -> (Vec<BitswapPeer>, u128) {
+        let started = Instant::now();
+        loop {
+            let peers = self.recent_bitswap_peers_for_fetch().await;
+            if !peers.is_empty() {
+                return (peers, started.elapsed().as_millis());
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= wait {
+                return (Vec::new(), elapsed.as_millis());
+            }
+            tokio::time::sleep((wait - elapsed).min(BITSWAP_SESSION_LATE_PEER_POLL)).await;
+        }
     }
 
     async fn fetch_from_recent_bitswap_peers(
@@ -6453,6 +6589,51 @@ mod bitswap_tests {
         assert_eq!(block.data(), second);
         assert_eq!(delegated_requests.load(Ordering::Relaxed), 0);
 
+        tokio::time::timeout(Duration::from_secs(5), stream_task)
+            .await
+            .unwrap()
+            .unwrap();
+        swarm_task.abort();
+        routing_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn late_recent_bitswap_peer_can_win_during_slow_provider_lookup() {
+        let data = b"late session peer shortcut block";
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
+        let (peer_id, addr, swarm_task, stream_task) =
+            spawn_local_bitswap_peer(cid, data.to_vec()).await;
+        let (endpoint, request_seen_rx, release_tx, routing_task) =
+            spawn_gated_delegated_response(r#"{"Providers":[]}"#.into()).await;
+
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new(endpoint),
+            store.clone(),
+        );
+        let fetch_retriever = retriever.clone();
+        let fetch_task =
+            tokio::spawn(async move { fetch_retriever.fetch_block_with_source(&cid).await });
+
+        tokio::time::timeout(Duration::from_secs(2), request_seen_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        retriever
+            .record_successful_bitswap_peer(peer_id, vec![addr], Duration::from_millis(25))
+            .await;
+
+        let (block, source) = tokio::time::timeout(Duration::from_secs(3), fetch_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(source, RetrievalSource::Bitswap);
+        assert_eq!(block.data(), data);
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), data);
+
+        let _ = release_tx.send(());
         tokio::time::timeout(Duration::from_secs(5), stream_task)
             .await
             .unwrap()

@@ -16069,3 +16069,166 @@ but the largest page tail in this sample still came from delegated routing
 failure plus Bitswap fallback, not from HTTP-provider racing. A future
 single-provider mitigation should be gated on repeated slow single-provider
 winners and should not broaden all HTTP fanout.
+
+## 2026-05-05 Keep: Race Late-Arriving Session Peers During Slow Provider Lookup
+
+Question:
+The single HTTP-provider diagnostic run exposed a different tail: one asset had
+no recent session peer at request start, then spent `10001ms` in a failed
+delegated provider lookup and `3504ms` in DHT fallback, but the actual Bitswap
+block fetch took only `49ms` once a session peer was available. The existing
+recent-peer shortcut only snapshots session peers before provider lookup starts,
+so it can miss peers learned by concurrent page requests while routing is
+stalled.
+
+Hypothesis:
+When provider lookup is already slow and no recent peer existed at request
+start, cheaply watching for a late-arriving recent Bitswap peer can avoid
+multi-second routing tails without delaying fast provider lookups or increasing
+provider fanout.
+
+Implementation:
+
+- If a block starts with no recent Bitswap session peers, race provider lookup
+  against a bounded in-memory wait for recent peers.
+- The wait polls only the local recent-peer table for up to `2s` at `50ms`
+  intervals; it does not dial or issue Bitswap requests unless a known-good peer
+  appears.
+- If a late peer appears before provider lookup completes, start the existing
+  verified recent-peer shortcut.
+- If provider lookup completes first, keep the existing provider path.
+- If both are active and provider lookup returns an empty provider set, keep the
+  existing behavior of waiting for the shortcut rather than failing immediately.
+- Add `bitswap_session_late_peer_wait` tracing and map it to
+  `fetching_bitswap` in harness/mobile progress summaries.
+- Count late-peer waits, hits, misses, and max wait time in the harness Bitswap
+  session summary.
+- Add a deterministic test where a gated delegated lookup is held open, a
+  recent Bitswap peer is recorded after lookup starts, and the block must load
+  from Bitswap before the routing response is released.
+
+Focused validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval recent_bitswap_peer
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+```
+
+Result:
+
+- Recent Bitswap peer tests passed: `5 passed`.
+- Mobile progress phase mapping test passed.
+- Harness progress phase mapping test passed.
+
+Same-window baseline:
+
+- Artifact paths:
+  `/tmp/ipfs-tech-single-http-winners-r3-trace.jsonl` and
+  `/tmp/ipfs-tech-single-http-winners-r3.json`.
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1348ms` / `2006ms` / `2006ms`.
+- Asset TTFB p50/p95/max: `269ms` / `1067ms` / `13567ms`.
+- Run total p50/p95/max: `3608ms` / `16090ms` / `16090ms`.
+- Max RSS/FD: `55688KiB` / `38`.
+- Delegated provider lookup max: `10001ms`.
+- Slow asset `/ipns/ipfs.tech/_nuxt/DzK6mLCt.js` spent `13561ms` in
+  `block_fetch_total`, sourced from Bitswap after a `10001ms` delegated routing
+  error and `3504ms` DHT fallback; the final `bitswap_fetch` was only `49ms`.
+
+Experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-late-session-peer-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-late-session-peer-r3.json
+```
+
+Result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1390ms` / `2060ms` / `2060ms`.
+- Asset TTFB p50/p95/max: `164ms` / `939ms` / `1493ms`.
+- Run total p50/p95/max: `3607ms` / `4087ms` / `4087ms`.
+- Max RSS/FD: `53240KiB` / `32`.
+- Delegated provider lookup max: `296ms`; no delegated lookup failures in this
+  sample.
+- `bitswap_session_late_peer_wait` fired once, found one peer after `283ms`,
+  and the following recent-peer shortcut returned a verified block in `74ms`.
+- HTTP-provider races still had `0` rank-3-or-later winners.
+- Block sources: `http_provider=73`, `bitswap=46`, `cache=1`.
+
+Additional checks:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-late-session-peer-r3-trace.jsonl \
+  --output /tmp/vitalik-late-session-peer-r3.json
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-late-session-peer-r3-trace.jsonl \
+  --output /tmp/daicowtf-late-session-peer-r3.json
+```
+
+Results:
+
+- `vitalik-root-html-range` passed `3/3`; root/range TTFB p50/p95/max
+  `145ms` / `416ms` / `416ms`, max RSS/FD `31872KiB` / `14`, block sources
+  `http_provider=6`. The late-peer wait did not fire.
+- `daicowtf-page-assets` passed `3/3`; root TTFB p50/p95/max
+  `1300ms` / `1552ms` / `1552ms`, max RSS/FD `42436KiB` / `17`, block sources
+  `http_provider=6`, `bitswap=3`. The late-peer wait did not fire.
+
+Final validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval
+cargo test -p freedom-ipfs-mobile
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting passed.
+- Full retrieval suite passed: `70 passed`, `1 ignored`.
+- Full mobile suite passed: `26 passed`.
+- Full mobile web harness suite passed: `34 passed`.
+- Workspace check passed.
+- Workspace clippy passed with `-D warnings`.
+- Diff whitespace check passed.
+
+Decision:
+Keep. The same-window `ipfs.tech` comparison is partly helped by live-network
+noise because the baseline had a delegated routing error and the experiment did
+not, but the deterministic test proves the exact missed-session-peer shape and
+the live run shows the new path firing once with low cost. Fast provider
+lookups are not delayed because provider lookup still wins the race, and the
+secondary cases stayed within previous resource and latency envelopes.

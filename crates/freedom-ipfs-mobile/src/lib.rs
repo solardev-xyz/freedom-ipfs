@@ -650,6 +650,7 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         | "bitswap_session_shortcut"
         | "bitswap_session_shortcut_start"
         | "bitswap_session_shortcut_pre_lookup"
+        | "bitswap_session_late_peer_wait"
         | "bitswap_session_shortcut_empty_providers_wait"
         | "bitswap_session_shortcut_post_lookup_wait" => "fetching_bitswap",
         "bitswap_fetch_cancelled" => "cancelled",

@@ -933,7 +933,7 @@ fn print_summary(report: &RunReport) {
         if trace.bitswap_session.has_events() {
             let session = &trace.bitswap_session;
             println!(
-                "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_starts={} shortcut_post_lookup_waits={} shortcut_attempts={} shortcut_hits={} shortcut_misses={}",
+                "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_starts={} shortcut_post_lookup_waits={} shortcut_attempts={} shortcut_hits={} shortcut_misses={} late_peer_waits={} late_peer_hits={} late_peer_misses={} late_peer_max={}ms",
                 session.fetches,
                 session.with_trusted_peers,
                 session.trusted_successes,
@@ -944,7 +944,11 @@ fn print_summary(report: &RunReport) {
                 session.session_shortcut_post_lookup_waits,
                 session.session_shortcut_attempts,
                 session.session_shortcut_hits,
-                session.session_shortcut_misses
+                session.session_shortcut_misses,
+                session.session_late_peer_waits,
+                session.session_late_peer_hits,
+                session.session_late_peer_misses,
+                session.session_late_peer_max_ms
             );
         }
         print_trace_timeout_recovery(trace);
@@ -1238,7 +1242,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     if trace.bitswap_session.has_events() {
         let session = &trace.bitswap_session;
         println!(
-            "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_starts={} shortcut_post_lookup_waits={} shortcut_attempts={} shortcut_hits={} shortcut_misses={}",
+            "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_starts={} shortcut_post_lookup_waits={} shortcut_attempts={} shortcut_hits={} shortcut_misses={} late_peer_waits={} late_peer_hits={} late_peer_misses={} late_peer_max={}ms",
             session.fetches,
             session.with_trusted_peers,
             session.trusted_successes,
@@ -1249,7 +1253,11 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
             session.session_shortcut_post_lookup_waits,
             session.session_shortcut_attempts,
             session.session_shortcut_hits,
-            session.session_shortcut_misses
+            session.session_shortcut_misses,
+            session.session_late_peer_waits,
+            session.session_late_peer_hits,
+            session.session_late_peer_misses,
+            session.session_late_peer_max_ms
         );
     }
     if trace.bitswap_extra_blocks.events > 0 {
@@ -5178,6 +5186,10 @@ struct TraceBitswapSessionAggregate {
     session_shortcut_attempts: usize,
     session_shortcut_hits: usize,
     session_shortcut_misses: usize,
+    session_late_peer_waits: usize,
+    session_late_peer_hits: usize,
+    session_late_peer_misses: usize,
+    session_late_peer_max_ms: u128,
 }
 
 impl TraceBitswapSessionAggregate {
@@ -5186,6 +5198,7 @@ impl TraceBitswapSessionAggregate {
             || self.session_shortcut_starts > 0
             || self.session_shortcut_post_lookup_waits > 0
             || self.session_shortcut_attempts > 0
+            || self.session_late_peer_waits > 0
     }
 }
 
@@ -6083,6 +6096,21 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         }
         if phase == "bitswap_session_shortcut_post_lookup_wait" {
             bitswap_session.session_shortcut_post_lookup_waits += 1;
+        }
+        if phase == "bitswap_session_late_peer_wait" {
+            bitswap_session.session_late_peer_waits += 1;
+            bitswap_session.session_late_peer_max_ms =
+                bitswap_session.session_late_peer_max_ms.max(
+                    value
+                        .get("elapsed_ms")
+                        .and_then(json_u128)
+                        .unwrap_or_default(),
+                );
+            match value.get("outcome").and_then(|outcome| outcome.as_str()) {
+                Some("hit") => bitswap_session.session_late_peer_hits += 1,
+                Some("miss") => bitswap_session.session_late_peer_misses += 1,
+                _ => {}
+            }
         }
         if phase == "bitswap_session_shortcut" {
             bitswap_session.session_shortcut_attempts += 1;
@@ -7039,6 +7067,7 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         | "bitswap_dial_plan"
         | "bitswap_session_shortcut"
         | "bitswap_session_shortcut_start"
+        | "bitswap_session_late_peer_wait"
         | "bitswap_session_shortcut_post_lookup_wait" => "fetching_bitswap",
         "bitswap_fetch_cancelled" => "cancelled",
         "bitswap_request_timeout_detail"
@@ -9481,6 +9510,39 @@ mod tests {
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_http_provider"),
             12
+        );
+    }
+
+    #[test]
+    fn trace_summary_counts_late_session_peer_waits() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-late-session-peer-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"bitswap_session_late_peer_wait\",\"cid\":\"cid-a\",\"outcome\":\"hit\",\"peer_count\":1,\"timeout_ms\":2000,\"elapsed_ms\":283}\n",
+                "{\"phase\":\"bitswap_session_late_peer_wait\",\"cid\":\"cid-b\",\"outcome\":\"miss\",\"timeout_ms\":2000,\"elapsed_ms\":2000}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(summary.bitswap_session.session_late_peer_waits, 2);
+        assert_eq!(summary.bitswap_session.session_late_peer_hits, 1);
+        assert_eq!(summary.bitswap_session.session_late_peer_misses, 1);
+        assert_eq!(summary.bitswap_session.session_late_peer_max_ms, 2000);
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "fetching_bitswap"),
+            2
         );
     }
 
