@@ -3097,12 +3097,12 @@ For this run, `45%` of expanded provider addresses contained `/p2p-circuit`
 dedicated experiment, while WebTransport/WebRTC remain non-trivial native
 transport work in the current dependency set.
 
-## 2026-05-05 Relay Builder Sequencing Caveat
+## 2026-05-05 Relay Builder Sequencing Correction
 
 Follow-up inspection:
 
-The obvious libp2p builder shortcut for relay support is not safe to drop into
-the current Bitswap swarm construction.
+The libp2p relay builder shortcut needs to be inserted at the right phase, but
+it does not require a full manual transport rewrite.
 
 Current Bitswap transport construction in
 `crates/freedom-ipfs-retrieval/src/lib.rs` is:
@@ -3118,7 +3118,8 @@ That custom WebSocket transport is intentional: WSS providers need DNS names
 preserved for SNI, and it uses explicit Cloudflare DNS instead of the builder's
 system-DNS WebSocket shortcut.
 
-Local `libp2p v0.56.0` builder inspection found:
+Local `libp2p v0.56.0` builder inspection initially looked risky because the
+relay shortcut methods route through helpers named `without_*`:
 
 - `OtherTransportPhase::with_relay_client(...)` calls
   `without_any_other_transports().without_dns().without_websocket()...`
@@ -3127,26 +3128,111 @@ Local `libp2p v0.56.0` builder inspection found:
 - `WebsocketPhase::with_relay_client(...)` calls
   `without_websocket()...`
 
+On closer inspection those helpers preserve the already-accumulated transport
+value while moving the type-state builder to the next phase. The unsafe case is
+calling relay before a transport has been added. The safe insertion point for
+the current Bitswap swarm is after:
+
+```text
+with_tcp(...)
+with_quic()
+with_other_transport(cloudflare_websocket_transport)
+```
+
+and before `with_behaviour(...)`.
+
 The inspected crate files were:
 
 - `/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libp2p-0.56.0/src/builder/phase/other_transport.rs`
 - `/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libp2p-0.56.0/src/builder/phase/quic.rs`
 - `/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libp2p-0.56.0/src/builder/phase/websocket.rs`
+- `/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libp2p-0.56.0/src/builder/phase/relay.rs`
 
-Decision: reject a naive `.with_relay_client(...)` insertion. Depending on where
-it is inserted, it would silently discard the custom Cloudflare WSS transport,
-QUIC, or builder WebSocket transport. That would make the public-provider mix
-look different while testing relay and could regress the WSS reliability gap
-that was already closed.
+Decision: the builder insertion point is feasible, but the relay implementation
+experiment was rejected and reverted.
 
-A real relay experiment should instead preserve the existing transport stack
-explicitly. Feasible next implementation paths are:
+Rejected prototype:
 
-- manually compose the transport stack before `Swarm::new`, preserving TCP,
-  QUIC, Cloudflare WSS, and relay
-- or refactor the builder sequence only after a compile-time check proves all
-  existing transports remain present
+- added libp2p `relay`
+- added `relay::client::Behaviour` to the shared Bitswap swarm
+- accepted `/p2p-circuit` addresses with a concrete relay peer
+- kept WebTransport/WebRTC relay records rejected
+- tried both broad relay candidates and fallback/capped relay-only candidates
+- traced accepted relay candidate count with `relay_addr_count`
 
-Before keeping relay support, add deterministic coverage that exercises a relay
-address without losing a WSS-capable transport path, then run the same-window
-Kubo comparison harness.
+Deterministic coverage passed while the prototype existed:
+
+```sh
+cargo test -p freedom-ipfs-retrieval --lib
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo build -p freedom-ipfs-gateway
+```
+
+Live broad relay run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-relay-prototype-r1-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-relay-prototype-r1.json
+```
+
+Result: Rust and Kubo both passed, but Rust did not improve enough to justify
+the added transport surface. Rust root TTFB was `5414ms` versus Kubo `3713ms`;
+Rust asset p50/p95 was `328/7688ms` versus Kubo `191/435ms`. Trace aggregate:
+`relay_addr_count=301`, `conn_relay=3`, and no successful block fetch from a
+relay-connected peer.
+
+Live fallback-only relay run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-relay-fallback-r1-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-relay-fallback-r1.json
+```
+
+Result: reject. Rust failed `0/1` while Kubo passed `1/1`. Rust produced `12`
+gateway `504` responses, `17` Bitswap request timeouts, `relay_addr_count=332`,
+`conn_relay=3`, and no successful relay-served block. One useful concrete error
+was `Relay has no reservation for destination.`
+
+Live capped relay-only run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-relay-capped-r1-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-relay-capped-r1.json
+```
+
+Result: Rust and Kubo both passed, with Rust root TTFB `942ms` versus Kubo
+`3007ms`, and Rust asset p50/p95 `146/1184ms` versus Kubo `149/878ms`.
+However, trace showed `relay_addr_count=43`, `dial_rejected_relay=16`,
+`conn_relay=0`, and all successful Bitswap fetches over direct TCP. The best
+version was effectively a no-op plus extra rejected dials.
+
+Conclusion: do not keep relay support yet. Relay may still be useful for sparse
+provider cases, but it needs a more selective design:
+
+- never let relay-only candidates displace enough direct candidates for a block
+- only consider relay when direct provider diversity is genuinely low
+- budget relay dials separately from direct dials
+- suppress relays that return `NoReservation`
+- add a deterministic relay-loopback test before any future live run
