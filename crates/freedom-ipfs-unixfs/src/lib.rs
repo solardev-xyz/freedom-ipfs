@@ -163,6 +163,10 @@ impl UnixfsResolver {
         UnixfsContext::cached(provider, &self.metadata_cache).file_size(root, path)
     }
 
+    pub fn file_size_cid(&self, provider: &dyn BlockProvider, cid: &Cid) -> Result<u64> {
+        UnixfsContext::cached(provider, &self.metadata_cache).file_size_cid(cid)
+    }
+
     pub fn read_file_range(
         &self,
         provider: &dyn BlockProvider,
@@ -173,6 +177,16 @@ impl UnixfsResolver {
     ) -> Result<Vec<u8>> {
         UnixfsContext::cached(provider, &self.metadata_cache)
             .read_file_range(root, path, start, end)
+    }
+
+    pub fn read_file_cid_range(
+        &self,
+        provider: &dyn BlockProvider,
+        cid: &Cid,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>> {
+        UnixfsContext::cached(provider, &self.metadata_cache).read_file_cid_range(cid, start, end)
     }
 }
 
@@ -1297,6 +1311,37 @@ mod tests {
         assert_eq!(stats.file_size_misses, 1);
         assert_eq!(stats.file_size_inserts, 1);
         assert_eq!(stats.file_size_hits, 1);
+    }
+
+    #[test]
+    fn cid_direct_range_reads_skip_path_resolution_cache() {
+        let file_data = pb_file(b"abcdef", Vec::new());
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_data);
+        let dir_data = pb_directory(vec![link("file.txt", &file_cid)]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_data);
+
+        let provider =
+            CountingProvider::new(HashMap::from([(file_cid, file_data), (dir_cid, dir_data)]));
+        let resolver = UnixfsResolver::with_metadata_cache_capacity(8);
+
+        assert_eq!(
+            resolver.file_size(&provider, &dir_cid, "file.txt").unwrap(),
+            6
+        );
+        let before = resolver.metadata_cache_stats();
+
+        assert_eq!(
+            resolver
+                .read_file_cid_range(&provider, &file_cid, 1, 3)
+                .unwrap(),
+            b"bcd"
+        );
+
+        let after = resolver.metadata_cache_stats();
+        assert_eq!(after.path_hits, before.path_hits);
+        assert_eq!(after.path_misses, before.path_misses);
+        assert_eq!(provider.call_count(&dir_cid), 1);
+        assert_eq!(provider.call_count(&file_cid), 1);
     }
 
     #[test]

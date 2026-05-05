@@ -14,7 +14,7 @@ use freedom_ipfs_core::{parse_cid, BlockProvider};
 use freedom_ipfs_namesys::{NameResolver, NamesysError, ResolvedName};
 use freedom_ipfs_store::SqliteBlockStore;
 use freedom_ipfs_unixfs::{
-    DirectoryEntry, UnixfsError, UnixfsMetadataCacheStats, UnixfsResolver,
+    DirectoryEntry, NodeKind, UnixfsError, UnixfsMetadataCacheStats, UnixfsResolver,
     DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY,
 };
 use futures::stream;
@@ -539,34 +539,54 @@ async fn serve_ipfs_path_with_listing_path(
     let resource = served_resource(&unixfs, provider.as_ref(), &cid, unixfs_path)?;
     let resource_elapsed_ms = resource_started.elapsed().as_millis();
     let response = match resource {
-        ServedResource::File { path, len } => {
+        ServedResource::File {
+            path,
+            cid: file_cid,
+            len,
+        } => {
+            let target = FileResponseTarget {
+                root_cid: cid,
+                file_cid,
+                path,
+                len,
+            };
             tracing::info!(
                 phase = "unixfs_resource",
-                cid = %cid,
-                unixfs_path = %path,
+                cid = %target.root_cid,
+                file_cid = %target.file_cid,
+                unixfs_path = %target.path,
                 resource = "file",
-                file_len = len,
+                file_len = target.len,
                 elapsed_ms = resource_elapsed_ms
             );
-            let etag = file_etag(&cid, &path, len);
+            let etag = file_etag(&target.root_cid, &target.path, target.len);
             if request_headers.range.is_none()
                 && if_none_match_matches(request_headers.if_none_match, &etag)
             {
                 tracing::info!(
                     phase = "gateway_conditional",
-                    cid = %cid,
-                    unixfs_path = %path,
+                    cid = %target.root_cid,
+                    file_cid = %target.file_cid,
+                    unixfs_path = %target.path,
                     etag = %etag,
                     outcome = "not_modified"
                 );
                 return not_modified_response(&etag, cache_policy);
             }
             let mime_started = Instant::now();
-            let mime = mime_for_served_file(&unixfs, provider.as_ref(), &cid, &path, len)?;
+            let mime = mime_for_served_file(
+                &unixfs,
+                provider.as_ref(),
+                &target.root_cid,
+                &target.file_cid,
+                &target.path,
+                target.len,
+            )?;
             tracing::info!(
                 phase = "mime_total",
-                cid = %cid,
-                unixfs_path = %path,
+                cid = %target.root_cid,
+                file_cid = %target.file_cid,
+                unixfs_path = %target.path,
                 mime = %mime,
                 elapsed_ms = mime_started.elapsed().as_millis()
             );
@@ -577,9 +597,9 @@ async fn serve_ipfs_path_with_listing_path(
                 is_head: request_headers.is_head,
             };
             if let Some(range) = request_headers.range {
-                ranged_response(provider, unixfs.clone(), cid, path, len, range, headers)?
+                ranged_response(provider, unixfs.clone(), target, range, headers)?
             } else {
-                streaming_response(provider, unixfs.clone(), cid, path, len, headers)?
+                streaming_response(provider, unixfs.clone(), target, headers)?
             }
         }
         ServedResource::Directory { path, entries } => {
@@ -650,6 +670,7 @@ fn mime_for_served_file(
     unixfs: &UnixfsResolver,
     provider: &dyn BlockProvider,
     cid: &Cid,
+    file_cid: &Cid,
     path: &str,
     len: u64,
 ) -> Result<String, GatewayError> {
@@ -668,11 +689,12 @@ fn mime_for_served_file(
         let end = (len - 1).min(512);
         let sniff_started = Instant::now();
         let prefix = unixfs
-            .read_file_range(provider, cid, path, 0, end)
+            .read_file_cid_range(provider, file_cid, 0, end)
             .map_err(GatewayError::Unixfs)?;
         tracing::info!(
             phase = "mime_sniff_read",
             cid = %cid,
+            file_cid = %file_cid,
             unixfs_path = path,
             bytes = prefix.len(),
             elapsed_ms = sniff_started.elapsed().as_millis()
@@ -713,6 +735,7 @@ fn looks_like_html(bytes: &[u8]) -> bool {
 enum ServedResource {
     File {
         path: String,
+        cid: Cid,
         len: u64,
     },
     Directory {
@@ -756,11 +779,18 @@ fn served_resource(
     unixfs_path: &str,
 ) -> Result<ServedResource, GatewayError> {
     let file_size_started = Instant::now();
-    match unixfs.file_size(provider, cid, unixfs_path) {
-        Ok(len) => {
+    let resolved = unixfs
+        .resolve_path(provider, cid, unixfs_path)
+        .map_err(GatewayError::Unixfs)?;
+    match resolved.kind {
+        NodeKind::Raw | NodeKind::File => {
+            let len = unixfs
+                .file_size_cid(provider, &resolved.cid)
+                .map_err(GatewayError::Unixfs)?;
             tracing::info!(
                 phase = "unixfs_file_size",
                 cid = %cid,
+                file_cid = %resolved.cid,
                 unixfs_path,
                 outcome = "file",
                 file_len = len,
@@ -768,10 +798,11 @@ fn served_resource(
             );
             Ok(ServedResource::File {
                 path: unixfs_path.to_string(),
+                cid: resolved.cid,
                 len,
             })
         }
-        Err(UnixfsError::IsDirectory) => {
+        NodeKind::Directory | NodeKind::HamtShard => {
             tracing::info!(
                 phase = "unixfs_file_size",
                 cid = %cid,
@@ -781,11 +812,17 @@ fn served_resource(
             );
             let index_path = append_path(unixfs_path, "index.html");
             let index_started = Instant::now();
-            match unixfs.file_size(provider, cid, &index_path) {
-                Ok(len) => {
+            match unixfs.resolve_path(provider, cid, &index_path) {
+                Ok(index_resolved)
+                    if matches!(index_resolved.kind, NodeKind::Raw | NodeKind::File) =>
+                {
+                    let len = unixfs
+                        .file_size_cid(provider, &index_resolved.cid)
+                        .map_err(GatewayError::Unixfs)?;
                     tracing::info!(
                         phase = "unixfs_index_lookup",
                         cid = %cid,
+                        file_cid = %index_resolved.cid,
                         unixfs_path = %index_path,
                         outcome = "file",
                         file_len = len,
@@ -793,9 +830,11 @@ fn served_resource(
                     );
                     Ok(ServedResource::File {
                         path: index_path,
+                        cid: index_resolved.cid,
                         len,
                     })
                 }
+                Ok(_) => Err(GatewayError::Unixfs(UnixfsError::IsDirectory)),
                 Err(UnixfsError::PathNotFound(_)) => {
                     tracing::info!(
                         phase = "unixfs_index_lookup",
@@ -823,7 +862,6 @@ fn served_resource(
                 Err(err) => Err(GatewayError::Unixfs(err)),
             }
         }
-        Err(err) => Err(GatewayError::Unixfs(err)),
     }
 }
 
@@ -1053,14 +1091,25 @@ struct FileResponseHeaders<'a> {
     is_head: bool,
 }
 
+struct FileResponseTarget {
+    root_cid: Cid,
+    file_cid: Cid,
+    path: String,
+    len: u64,
+}
+
 fn streaming_response(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
-    cid: Cid,
-    path: String,
-    len: u64,
+    target: FileResponseTarget,
     headers: FileResponseHeaders<'_>,
 ) -> Result<Response, GatewayError> {
+    let FileResponseTarget {
+        root_cid,
+        file_cid,
+        path,
+        len,
+    } = target;
     if !headers.is_head && len <= GATEWAY_STREAM_CHUNK_SIZE {
         let end = len.saturating_sub(1);
         let body = if len == 0 {
@@ -1068,12 +1117,13 @@ fn streaming_response(
         } else {
             let started = Instant::now();
             let bytes = unixfs
-                .read_file_range(provider.as_ref(), &cid, &path, 0, end)
+                .read_file_cid_range(provider.as_ref(), &file_cid, 0, end)
                 .map(Bytes::from)
                 .map_err(GatewayError::Unixfs)?;
             tracing::info!(
                 phase = "gateway_direct_body",
-                cid = %cid,
+                cid = %root_cid,
+                file_cid = %file_cid,
                 unixfs_path = %path,
                 range_start = 0u64,
                 range_end = end,
@@ -1091,7 +1141,6 @@ fn streaming_response(
     let stream = stream::unfold(Some(0u64), move |offset| {
         let provider = provider.clone();
         let unixfs = unixfs.clone();
-        let path = path.clone();
         async move {
             let offset = offset?;
             if offset >= len {
@@ -1103,10 +1152,9 @@ fn streaming_response(
                 .min(last);
             let next = if end == last { None } else { Some(end + 1) };
             let chunk = unixfs
-                .read_file_range(
+                .read_file_cid_range(
                     provider.as_ref() as &dyn BlockProvider,
-                    &cid,
-                    &path,
+                    &file_cid,
                     offset,
                     end,
                 )
@@ -1200,12 +1248,16 @@ impl Drop for ScopedBlockProvider {
 fn ranged_response(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
-    cid: Cid,
-    path: String,
-    total_len: u64,
+    target: FileResponseTarget,
     range: &HeaderValue,
     headers: FileResponseHeaders<'_>,
 ) -> Result<Response, GatewayError> {
+    let FileResponseTarget {
+        root_cid,
+        file_cid,
+        path,
+        len: total_len,
+    } = target;
     let range = range
         .to_str()
         .map_err(|_| GatewayError::BadRequest("invalid Range header".into()))?;
@@ -1219,12 +1271,13 @@ fn ranged_response(
     if !headers.is_head && range_len <= GATEWAY_STREAM_CHUNK_SIZE {
         let started = Instant::now();
         let body = unixfs
-            .read_file_range(provider.as_ref(), &cid, &path, start, end)
+            .read_file_cid_range(provider.as_ref(), &file_cid, start, end)
             .map(Bytes::from)
             .map_err(GatewayError::Unixfs)?;
         tracing::info!(
             phase = "gateway_direct_body",
-            cid = %cid,
+            cid = %root_cid,
+            file_cid = %file_cid,
             unixfs_path = %path,
             range_start = start,
             range_end = end,
@@ -1241,7 +1294,6 @@ fn ranged_response(
     let stream = stream::unfold(Some(start), move |offset| {
         let provider = provider.clone();
         let unixfs = unixfs.clone();
-        let path = path.clone();
         async move {
             let offset = offset?;
             let chunk_end = offset
@@ -1253,10 +1305,9 @@ fn ranged_response(
                 Some(chunk_end + 1)
             };
             let chunk = unixfs
-                .read_file_range(
+                .read_file_cid_range(
                     provider.as_ref() as &dyn BlockProvider,
-                    &cid,
-                    &path,
+                    &file_cid,
                     offset,
                     chunk_end,
                 )

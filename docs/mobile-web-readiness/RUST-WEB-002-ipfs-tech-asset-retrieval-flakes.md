@@ -9814,3 +9814,98 @@ it is the sequential UnixFS/file-size path that must fetch root/index/leaf
 blocks before serving the range. Future range/media experiments should focus on
 path-session reuse, directory metadata locality, or carefully bounded
 multi-block scheduling rather than changing direct body streaming.
+
+## 2026-05-05 Keep: Reuse Resolved File CID For Gateway Body Reads
+
+Hypothesis:
+Gateway file serving already resolves the UnixFS path while determining the file
+size. Range and streaming body reads then used the root CID plus UnixFS path
+again, relying on the path cache for each body read. Passing the already
+resolved file CID into body reads should remove repeated path-cache lookups from
+range and chunked-stream paths without changing block retrieval, verification,
+caching, routing, or fallback behavior.
+
+Implementation:
+
+- Add cached `UnixfsResolver::file_size_cid` and
+  `UnixfsResolver::read_file_cid_range` helpers.
+- Carry the resolved file CID in `ServedResource::File`.
+- Use the resolved file CID for MIME sniff reads, direct small bodies, range
+  bodies, and chunked stream bodies.
+- Preserve root CID/path based ETags and response headers.
+- Keep trace fields for the root CID and add `file_cid` where body reads are
+  now CID-direct.
+
+Focused validation:
+
+```sh
+cargo test -p freedom-ipfs-unixfs cid_direct_range_reads_skip_path_resolution_cache
+cargo test -p freedom-ipfs-unixfs
+cargo test -p freedom-ipfs-gateway
+cargo check -p freedom-ipfs-unixfs -p freedom-ipfs-gateway --all-targets
+cargo clippy -p freedom-ipfs-unixfs -p freedom-ipfs-gateway --all-targets -- -D warnings
+```
+
+Result: all passed.
+
+Range comparison command:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-developers-hero-range \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-cid-direct-range-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-cid-direct-range-rust-vs-kubo-r3.json
+```
+
+Range result:
+
+- Rust and Kubo both passed `3/3`.
+- Rust range TTFB moved from the saved baseline `79/689ms` p50/p95 to
+  `18/648ms`.
+- Kubo range TTFB was `3/1638ms` p50/p95 in the same run.
+- Rust RSS/FD: `39256KiB`/`19`; Kubo RSS/FD: `112128KiB`/`46`.
+- Rust UnixFS metadata cache path hits dropped from `5` to `2`; path misses and
+  inserts stayed at `1`.
+- Rust Bitswap peer attempts stayed at `7`; incoming matched blocks stayed at
+  `3`.
+
+Broader page-assets check:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-cid-direct-page-assets-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-cid-direct-page-assets-rust-vs-kubo-r3.json
+```
+
+Broader result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `19/1542ms`, Kubo `2/1983ms`.
+- Asset TTFB p50/p95: Rust `13/435ms`, Kubo `4/151ms`.
+- Rust RSS/FD: `50348KiB`/`38`; Kubo RSS/FD: `203064KiB`/`119`.
+- Compared with the kept `100ms` post-lookup-grace baseline, Rust asset p95
+  improved from `612ms` to `435ms`; root p95 was effectively unchanged
+  (`1547ms` to `1542ms`).
+
+Decision: keep. This is a small local UnixFS/gateway optimization with direct
+test coverage for the intended cache behavior. It removes redundant path-cache
+work from body reads and improves the real range sample and full `ipfs.tech`
+page-assets run without increasing routing fanout or changing read-only serving
+semantics.
