@@ -19292,3 +19292,56 @@ Current Rust is meaningfully faster than Kubo on these two small guardrail
 cases while using much less RSS and far fewer file descriptors. Both
 self-hedge mechanisms stay idle on these already-fast paths, which supports
 keeping them as bounded rare-tail guards rather than active steady-state work.
+
+## 2026-05-05 Baseline: Warm Same-Daemon `ipfs.tech` vs Kubo
+
+Question:
+After one warmup page load against the same daemon, how close is Rust to Kubo on
+the `ipfs.tech` page workload?
+
+Command:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --warmup-runs 1 \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-warm-same-daemon-post-self-hedges-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-warm-same-daemon-post-self-hedges-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `4ms` / `4ms`; Kubo `2ms` / `2ms`.
+- Asset TTFB p50/p95: Rust `3ms` / `6ms`; Kubo `2ms` / `4ms`.
+- Rust/Kubo latency ratios: root p50/p95 `2.00x` / `2.00x`; asset p50/p95
+  `1.50x` / `1.50x`.
+- Max RSS/FD: Rust `52848KiB` / `30`; Kubo `191044KiB` / `92`.
+- Rust resource ratios: RSS `0.28x`, FD `0.33x`.
+- The Rust trace includes the warmup pass, so its slow request/event summaries
+  show the initial cold fill. The measured passes after warmup are the
+  millisecond-scale results above.
+- During warmup, Rust block-fetch sources were:
+  `http_provider=31`, `bitswap=8`, `cache=1`.
+- Delegated lookup p50/p90/p95/max during the traced warmup/measured window:
+  `34ms` / `174ms` / `424ms` / `541ms`.
+- HTTP-provider fetch p50/p90/p95/max:
+  `105ms` / `452ms` / `540ms` / `664ms`.
+
+Conclusion:
+Warm same-daemon Rust is now effectively hot-cache fast, though Kubo still wins
+by a couple of milliseconds on this synthetic local benchmark. The remaining
+warm gap is not worth aggressive network behavior: the important result is that
+Rust reaches single-digit-millisecond warm page/subresource responses while
+using far less RSS and fewer file descriptors. Future warm-path work should
+focus on preserving this behavior under longer sessions and larger cached
+working sets rather than chasing a 2ms local benchmark delta.
