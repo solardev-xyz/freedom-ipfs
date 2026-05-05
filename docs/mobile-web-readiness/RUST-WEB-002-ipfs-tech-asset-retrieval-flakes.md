@@ -9934,3 +9934,56 @@ test coverage for the intended cache behavior. It removes redundant path-cache
 work from body reads and improves the real range sample and full `ipfs.tech`
 page-assets run without increasing routing fanout or changing read-only serving
 semantics.
+
+## 2026-05-05 Reject: Skip Hot-Cache Reverification On Reads
+
+Hypothesis:
+After CID-direct body reads, warm `ipfs.tech` hero range requests were still
+around `14-16ms`, while the smaller `/ipfs` vitalik range warmed at `1ms`.
+Trace events showed the warm hero cost came almost entirely from
+`block_store_get cache_hit=true` for the 184KB raw JPEG block. Temporarily
+skipping `verify_block` on hot-cache hits would show how much of that local
+cost is repeated verification versus unavoidable copying/body work.
+
+Temporary experiment:
+
+- Remove the hot-cache-hit `verify_block(cid, &hit.data)` call in
+  `SqliteBlockStore::get`.
+- Do not change SQLite reads or writes: persisted blocks are still verified on
+  put and on cold read.
+- Revert immediately after measurement.
+
+Command:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-developers-hero-range \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-hot-no-reverify-range-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-hot-no-reverify-range-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Warm Rust repeat range requests dropped from `16ms`/`14ms` in the CID-direct
+  run to `2ms`/`2ms`.
+- `gateway_direct_body` max elapsed dropped from `13ms` to `0ms`.
+- Cold Rust tail was not useful as a keep signal in this network window:
+  root/range p95 was `2408ms`, with slow Bitswap provider behavior on the
+  first request.
+
+Decision: reject the direct change. It proves repeated hot-cache verification
+is a meaningful warm media-range cost, but skipping verification at this layer
+weakens the current rule that blocks are verified before serving or caching.
+A future keepable version would need an explicit verified-hot-entry design,
+for example storing verified block state in the hot cache and making the safety
+contract clear in the store API, or introducing a CID-range read API that can
+serve from verified hot cache without weakening cold-read verification.
