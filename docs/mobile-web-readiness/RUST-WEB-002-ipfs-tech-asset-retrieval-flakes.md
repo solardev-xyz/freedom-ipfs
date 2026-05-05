@@ -8724,3 +8724,73 @@ Validation results:
 Decision: keep. This is diagnostics-only and makes future low-diversity
 fallback traces internally consistent without changing provider selection,
 fallback timing, retrieval behavior, cache semantics, or public gateway policy.
+
+## 2026-05-05 Observe: 3s DHT Query Cap Smoke
+
+Hypothesis:
+The latest `daicowtf` sparse-provider trace showed the failing child CID had
+zero delegated providers, a failed recent-peer shortcut, and then a full
+`10s` light-DHT provider lookup that found no providers. A lower DHT query cap
+might improve mobile failure latency for sparse/stale CIDs while leaving normal
+delegated-router wins untouched.
+
+Commands:
+
+```sh
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 120 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-dht3-trace.jsonl \
+  --output /tmp/daicowtf-dht3.json
+
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --timeout-secs 90 \
+  --run-timeout-secs 90 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-dht3-trace.jsonl \
+  --output /tmp/vitalik-dht3.json
+
+timeout 240s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-dht3-trace.jsonl \
+  --output /tmp/ipfs-tech-dht3.json
+```
+
+Results:
+
+- `daicowtf-page-assets` still failed as expected with root `504`, but failure
+  latency dropped to `3948ms` versus the previous `10165ms` `10s`-cap smoke.
+  The DHT summary showed `events=2 successes=0 failures=2 providers=0`,
+  `max_timeout_ms=3000`, `max_query_timeout_ms=3000`, and max elapsed `3009ms`.
+  One event was the short low-diversity fallback cancellation; the other was
+  the full delegated-empty child lookup.
+- `vitalik-root-html-range` passed `1/1` with root TTFB `413ms`, RSS
+  `37632KiB`, FD count `17`, and no DHT provider lookup events. Delegated
+  provider lookup returned `41` providers with max elapsed `52ms`.
+- `ipfs-tech-page-assets` passed `1/1`; root TTFB was `1057ms`, asset
+  p50/p95/max was `202/703/703ms`, RSS was `51516KiB`, and FD count was `48`.
+  The trace had no DHT provider lookup events; delegated provider lookups
+  returned `631` providers with max elapsed `62ms`.
+
+Decision:
+Observe only. The `3s` cap is promising for known delegated-empty sparse/stale
+failures and did not affect two delegated-heavy success paths in this small
+sample, but one-run live evidence is not enough to lower the global DHT query
+default. A safer future behavior experiment would be adaptive: use a shorter
+DHT budget for page child CIDs when delegated routing returns empty and there is
+already a recent page-session peer attempt, while preserving the longer full
+DHT budget for explicit light-DHT routing and cases that genuinely depend on
+public DHT provider discovery.
