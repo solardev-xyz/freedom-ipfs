@@ -7537,6 +7537,31 @@ Experiment result:
 - Oldest pending incoming wait dropped from the previous baseline's `777ms` to
   `223ms`.
 
+Range-heavy guard:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/vitalik-drop-failed-dial-waiters-range-trace.jsonl \
+  --output /tmp/vitalik-drop-failed-dial-waiters-range.json
+```
+
+Range-heavy result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `636/5170ms`, Kubo `1941/2011ms`.
+- Max RSS/FD: Rust `36608KiB`/`18`, Kubo `119520KiB`/`84`.
+- Bitswap dial plans: `6` events, `51` candidates, `15` new peers/addrs,
+  `33` suppressed peers, `79` suppressed addrs, `0` pending peers,
+  `3` connected peers.
+- Bitswap dial rejections: none in the summary.
+
 Same-window baseline:
 Use the immediately preceding reverted run:
 `/tmp/ipfs-tech-session-score-revert-samewindow-cold.json` and
