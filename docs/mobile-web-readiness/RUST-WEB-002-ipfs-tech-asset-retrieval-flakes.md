@@ -12474,3 +12474,112 @@ Keep. This is diagnostics-only and preserves read-only, no-public-fallback, and
 verified-before-caching behavior. The next optimization attempt can now measure
 whether any cache-write overlap or duplicate-write reduction actually moves
 request latency instead of guessing from `block_fetch_total`.
+
+## 2026-05-05 Keep: Offload Block Store Writes From Async Workers
+
+Hypothesis:
+The `block_store_put` trace showed 256KiB child block writes sitting on the
+request path. Even if the gateway still waits for durable cache insertion before
+serving, running SQLite writes directly on the async worker can delay sibling
+range fetches and Bitswap progress. Moving the verified `put_block` call to
+Tokio's blocking pool should preserve the existing cache-before-return contract
+while reducing event-loop interference.
+
+Change:
+
+- Make retrieval's traced block-store write helper async.
+- Run `SqliteBlockStore::put_block` inside `tokio::task::spawn_blocking`.
+- Still await the store result before returning HTTP-provider or Bitswap blocks.
+- Continue verifying blocks before serving/caching because `put_block` remains
+  the write path.
+- Preserve best-effort behavior for extra Bitswap blocks.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval shared_bitswap_client_fetch_many_accepts_multi_cid_incoming_blocks
+cargo test -p freedom-ipfs-retrieval recent_bitswap_peer_shortcut_fetches_when_provider_lookup_fails
+```
+
+Regression validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval
+cargo test -p mobile-web-harness
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Result:
+
+- focused retrieval tests passed
+- full retrieval suite passed: `66 passed; 0 failed; 1 ignored`
+- full mobile web harness suite passed: `31 passed; 0 failed`
+- retrieval and harness clippy passed with `-D warnings`
+
+Seeded one-run sanity check:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 1 \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-block-store-spawn-blocking-r1-trace.jsonl \
+  --comparison-output /tmp/harness-block-store-spawn-blocking-r1.json
+```
+
+One-run result:
+
+- Rust and Kubo passed.
+- Rust root TTFB `184ms`; Kubo root TTFB `50ms`.
+- Kubo seed preconnect was `46ms`, outside Kubo request timing.
+- Rust max RSS/FD `39168KiB` / `13`; Kubo max RSS/FD `90748KiB` / `37`.
+- Rust block-store puts: events `3`, bytes `524447`, total elapsed `14ms`,
+  max elapsed `7ms`.
+
+Seeded three-run fresh-gateway comparison:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-block-store-spawn-blocking-r3-trace.jsonl \
+  --comparison-output /tmp/harness-block-store-spawn-blocking-r3.json
+```
+
+Three-run result:
+
+- Rust and Kubo passed `3/3`.
+- Rust root TTFB p50/p95 `179ms` / `186ms`.
+- Kubo root TTFB p50/p95 `56ms` / `58ms`.
+- Kubo seed preconnect p50/p95 `55ms` / `56ms`, outside Kubo request timing.
+- Rust max RSS/FD `39548KiB` / `13`; Kubo max RSS/FD `90752KiB` / `43`.
+- Rust block-store puts: events `9`, bytes `1573341`, total elapsed `66ms`,
+  max elapsed `19ms`.
+- Compared with the previous kept bounded range-batch baseline
+  (`194ms` / `196ms` Rust p50/p95, RSS/FD `39304KiB` / `13`), this improves
+  both p50 and p95 without increasing FD count and with only minor RSS variance.
+
+Decision:
+Keep. This is a measurable latency improvement on the deterministic seeded
+range case, preserves verification and cache-before-return semantics, avoids
+public fallback, and keeps mobile resource use low. The remaining seeded gap is
+now less about SQLite write blocking and more about root-to-child Bitswap
+round-trip structure.

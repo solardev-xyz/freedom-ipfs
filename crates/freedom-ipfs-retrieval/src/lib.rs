@@ -722,7 +722,9 @@ impl HttpRetriever {
             .error_for_status()?;
         let bytes = limited_response_bytes(response, DEFAULT_MAX_BLOCK_SIZE).await?;
         verify_block(cid, &bytes)?;
-        self.store_block_with_trace(cid, &bytes, "http_provider", true)?;
+        let bytes = self
+            .store_block_with_trace(*cid, bytes, "http_provider", true)
+            .await?;
         Ok(Block::unchecked(*cid, bytes))
     }
 
@@ -883,7 +885,7 @@ impl HttpRetriever {
             self.record_successful_bitswap_peer_from_peers(peer, &peers_for_record, elapsed)
                 .await;
         }
-        self.store_bitswap_result(cid, result)
+        self.store_bitswap_result(cid, result).await
     }
 
     fn mark_bitswap_timeout_peers(
@@ -1147,7 +1149,7 @@ impl HttpRetriever {
             self.record_successful_bitswap_peer_from_peers(peer, &peers_for_record, elapsed)
                 .await;
         }
-        self.store_bitswap_result(cid, result).map(Some)
+        self.store_bitswap_result(cid, result).await.map(Some)
     }
 
     fn mark_single_session_shortcut_timeout_peer(&self, cid: &Cid, peers: &[BitswapPeer]) {
@@ -1177,25 +1179,42 @@ impl HttpRetriever {
         );
     }
 
-    fn store_bitswap_result(&self, cid: &Cid, result: BitswapFetchResult) -> Result<Block> {
-        for (extra_cid, extra_data) in &result.extra_blocks {
-            if extra_cid != cid {
-                let _ = self.store_block_with_trace(extra_cid, extra_data, "bitswap_extra", false);
+    async fn store_bitswap_result(&self, cid: &Cid, result: BitswapFetchResult) -> Result<Block> {
+        let BitswapFetchResult {
+            requested_block,
+            extra_blocks,
+            ..
+        } = result;
+        for (extra_cid, extra_data) in extra_blocks {
+            if extra_cid != *cid {
+                let _ = self
+                    .store_block_with_trace(extra_cid, extra_data, "bitswap_extra", false)
+                    .await;
             }
         }
-        self.store_block_with_trace(cid, &result.requested_block, "bitswap", true)?;
-        Ok(Block::unchecked(*cid, result.requested_block))
+        let bytes = self
+            .store_block_with_trace(*cid, requested_block, "bitswap", true)
+            .await?;
+        Ok(Block::unchecked(*cid, bytes))
     }
 
-    fn store_block_with_trace(
+    async fn store_block_with_trace(
         &self,
-        cid: &Cid,
-        bytes: &[u8],
+        cid: Cid,
+        bytes: Vec<u8>,
         source: &'static str,
         required: bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<u8>> {
         let started = Instant::now();
-        match self.store.put_block(cid, bytes) {
+        let byte_count = bytes.len();
+        let store = self.store.clone();
+        let (bytes, result) = tokio::task::spawn_blocking(move || {
+            let result = store.put_block(&cid, &bytes);
+            (bytes, result)
+        })
+        .await
+        .map_err(|err| RetrievalError::Bitswap(format!("block store task failed: {err}")))?;
+        match result {
             Ok(()) => {
                 tracing::info!(
                     phase = "block_store_put",
@@ -1203,10 +1222,10 @@ impl HttpRetriever {
                     source,
                     required,
                     ok = true,
-                    bytes = bytes.len(),
+                    bytes = byte_count,
                     elapsed_ms = started.elapsed().as_millis()
                 );
-                Ok(())
+                Ok(bytes)
             }
             Err(err) => {
                 tracing::info!(
@@ -1215,7 +1234,7 @@ impl HttpRetriever {
                     source,
                     required,
                     ok = false,
-                    bytes = bytes.len(),
+                    bytes = byte_count,
                     error = %err,
                     elapsed_ms = started.elapsed().as_millis()
                 );
