@@ -17705,3 +17705,174 @@ Keep. The same-window seeded comparison improved Rust root TTFB, setup-adjusted
 Kubo ratio, block-store write time, range batch latency, and provider/session
 wait counts while keeping cache correctness explicitly covered by the new
 undersized-cache test.
+
+## 2026-05-05 Keep: Shorten Delegated First-HTTP Provider Grace
+
+Question:
+The current `ipfs.tech` comparison trace showed many delegated-routing lookups
+where the streamed response exposed the first HTTP provider quickly, then waited
+the full single-provider grace without finding additional HTTP diversity. In
+the baseline window, single-HTTP-provider lookups had first-HTTP p95 `49ms` but
+total delegated lookup p95 `277ms` and max `300ms`.
+
+Hypothesis:
+Reducing `STREAMING_DELEGATED_FIRST_HTTP_PROVIDER_GRACE` from `250ms` to
+`100ms` should cut single-provider delegated-routing latency while still giving
+streamed responses a short chance to produce more HTTP providers. The behavior
+still returns verified provider records only, keeps the light-DHT low-diversity
+fallback, does not add public gateway fallback, and does not change block
+verification.
+
+Implementation:
+
+- Change `STREAMING_DELEGATED_FIRST_HTTP_PROVIDER_GRACE` from `250ms` to
+  `100ms`.
+- Keep `STREAMING_DELEGATED_HTTP_PROVIDER_TARGET=3`.
+- Keep max delegated response bytes/provider caps unchanged.
+- Keep existing response milestone tracing so the run can prove whether the
+  shorter grace actually reduces the single-provider wait.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing streamed_delegated_response_returns_after_first_http_provider_grace
+cargo test -p freedom-ipfs-routing
+```
+
+Focused result:
+
+- Formatting passed.
+- The focused streamed first-HTTP-provider grace test passed.
+- Full routing suite passed: `24 passed`, `1 ignored`.
+
+Same-window baseline:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-current-shape-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-current-shape-r3.json
+```
+
+Baseline result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1285ms` / `2097ms`; Kubo `2640ms` /
+  `3728ms`; ratio `0.49x` / `0.56x`.
+- Asset TTFB p50/p95: Rust `280ms` / `1155ms`; Kubo `106ms` /
+  `318ms`; ratio `2.64x` / `3.63x`.
+- Max RSS/FD: Rust `53772KiB` / `32`; Kubo `294276KiB` / `284`.
+- Delegated provider lookups: `91`, p50/p95/max `32ms` / `102ms` /
+  `300ms`.
+- Single-HTTP-provider delegated lookups: `52`, first-HTTP p50/p95/max
+  `31ms` / `49ms` / `98ms`, total p50/p95/max `37ms` / `277ms` /
+  `300ms`.
+- HTTP-provider fetch p50/p95/max: `161ms` / `696ms` / `1045ms`.
+- Bitswap session: `shortcut_starts=89`, `post_lookup_hits=38`,
+  `post_lookup_timeouts=37`.
+
+Experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-first-http-grace100-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-first-http-grace100-r3.json
+```
+
+Experiment result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `857ms` / `886ms`; Kubo `1600ms` /
+  `2173ms`; ratio `0.54x` / `0.41x`.
+- Asset TTFB p50/p95: Rust `232ms` / `702ms`; Kubo `114ms` /
+  `285ms`; ratio `2.04x` / `2.46x`.
+- Max RSS/FD: Rust `53120KiB` / `30`; Kubo `187148KiB` / `95`.
+- Delegated provider lookups: `101`, p50/p95/max `22ms` / `50ms` /
+  `295ms`.
+- Single-HTTP-provider delegated lookups: `57`, first-HTTP p50/p95/max
+  `20ms` / `52ms` / `193ms`, total p50/p95/max `21ms` / `54ms` /
+  `295ms`.
+- HTTP-provider fetch p50/p95/max: `163ms` / `626ms` / `662ms`.
+- Bitswap session work dropped sharply: `shortcut_starts=20`,
+  `post_lookup_hits=13`, `post_lookup_timeouts=3`.
+
+Secondary live checks:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-first-http-grace100-r3-trace.jsonl \
+  --output /tmp/daicowtf-first-http-grace100-r3.json
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-first-http-grace100-r3-trace.jsonl \
+  --output /tmp/vitalik-first-http-grace100-r3.json
+```
+
+Secondary result:
+
+- `daicowtf-page-assets` passed `3/3`; root TTFB p50/p95/max
+  `1516ms` / `1563ms` / `1563ms`, max RSS/FD `42696KiB` / `17`,
+  delegated lookup p50/p95/max `13ms` / `41ms` / `41ms`.
+- `vitalik-root-html-range` passed `3/3`; range TTFB p50/p95/max
+  `159ms` / `256ms` / `256ms`, max RSS/FD `31616KiB` / `13`,
+  delegated lookup p50/p95/max `43ms` / `141ms` / `141ms`.
+
+Final validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-gateway
+cargo test -p freedom-ipfs-retrieval
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Final result:
+
+- Formatting passed.
+- Full gateway suite passed; all non-ignored unit/integration tests passed.
+- Full retrieval suite passed: `72 passed`, `1 ignored`.
+- Workspace all-target compile check passed.
+- Workspace all-target clippy passed with warnings denied.
+
+Decision:
+Keep. The same-window `ipfs.tech` comparison improved Rust root p95, asset
+p50/p95, delegated lookup p95, HTTP provider fetch p95/max, Bitswap session
+pressure, RSS, and FD usage. The secondary page/range checks stayed reliable
+and within mobile resource envelopes.
