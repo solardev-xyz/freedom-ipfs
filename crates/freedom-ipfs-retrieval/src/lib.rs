@@ -623,7 +623,8 @@ impl HttpRetriever {
         providers: &[Provider],
     ) -> Result<Block> {
         let peer_started = Instant::now();
-        let mut peers = bitswap_peers(providers).await;
+        let BitswapProviderCandidates { mut peers, quality } =
+            bitswap_peers_with_quality(providers).await;
         let provider_peer_count = peers.len();
         if provider_peer_count == 0 && !providers.is_empty() {
             tracing::info!(
@@ -651,6 +652,21 @@ impl HttpRetriever {
             dns_addr_count = addr_stats.dns,
             ip4_addr_count = addr_stats.ip4,
             ip6_addr_count = addr_stats.ip6,
+            provider_addr_count = quality.provider_addr_count,
+            expanded_provider_addr_count = quality.expanded_addr_count,
+            supported_provider_addr_count = quality.supported_addr_count,
+            rejected_provider_addr_count = quality.rejected_addr_count(),
+            id_only_provider_count = quality.id_only_provider_count,
+            invalid_provider_id_count = quality.invalid_provider_id_count,
+            provider_without_supported_bitswap_addr_count = quality
+                .provider_without_supported_bitswap_addr_count,
+            unsupported_relay_addr_count = quality.unsupported_relay_addr_count,
+            unsupported_webtransport_addr_count = quality.unsupported_webtransport_addr_count,
+            unsupported_webrtc_addr_count = quality.unsupported_webrtc_addr_count,
+            unsupported_certhash_addr_count = quality.unsupported_certhash_addr_count,
+            unsupported_transport_addr_count = quality.unsupported_transport_addr_count,
+            missing_peer_addr_count = quality.missing_peer_addr_count,
+            unparsable_addr_count = quality.unparsable_addr_count,
             elapsed_ms = peer_started.elapsed().as_millis()
         );
         peers.retain(
@@ -1761,24 +1777,95 @@ fn cloudflare_websocket_transport(
         .boxed())
 }
 
+#[derive(Default)]
+struct BitswapProviderCandidates {
+    peers: Vec<BitswapPeer>,
+    quality: BitswapProviderAddrQuality,
+}
+
+#[derive(Default)]
+struct BitswapProviderAddrQuality {
+    provider_addr_count: usize,
+    expanded_addr_count: usize,
+    supported_addr_count: usize,
+    id_only_provider_count: usize,
+    invalid_provider_id_count: usize,
+    provider_without_supported_bitswap_addr_count: usize,
+    unsupported_relay_addr_count: usize,
+    unsupported_webtransport_addr_count: usize,
+    unsupported_webrtc_addr_count: usize,
+    unsupported_certhash_addr_count: usize,
+    unsupported_transport_addr_count: usize,
+    missing_peer_addr_count: usize,
+    unparsable_addr_count: usize,
+}
+
+impl BitswapProviderAddrQuality {
+    fn rejected_addr_count(&self) -> usize {
+        self.unsupported_relay_addr_count
+            + self.unsupported_webtransport_addr_count
+            + self.unsupported_webrtc_addr_count
+            + self.unsupported_certhash_addr_count
+            + self.unsupported_transport_addr_count
+            + self.missing_peer_addr_count
+            + self.unparsable_addr_count
+    }
+
+    fn record_rejection(&mut self, rejection: BitswapAddrRejection) {
+        match rejection {
+            BitswapAddrRejection::Relay => self.unsupported_relay_addr_count += 1,
+            BitswapAddrRejection::WebTransport => self.unsupported_webtransport_addr_count += 1,
+            BitswapAddrRejection::WebRtc => self.unsupported_webrtc_addr_count += 1,
+            BitswapAddrRejection::Certhash => self.unsupported_certhash_addr_count += 1,
+            BitswapAddrRejection::UnsupportedTransport => {
+                self.unsupported_transport_addr_count += 1
+            }
+            BitswapAddrRejection::MissingPeer => self.missing_peer_addr_count += 1,
+            BitswapAddrRejection::InvalidMultiaddr => self.unparsable_addr_count += 1,
+        }
+    }
+}
+
 async fn bitswap_peers(providers: &[Provider]) -> Vec<BitswapPeer> {
+    bitswap_peers_with_quality(providers).await.peers
+}
+
+async fn bitswap_peers_with_quality(providers: &[Provider]) -> BitswapProviderCandidates {
     let mut peers = Vec::new();
+    let mut quality = BitswapProviderAddrQuality::default();
     let mut dnsaddr_cache = HashMap::<String, Vec<String>>::new();
     let mut dns_ip_cache = HashMap::<String, Vec<IpAddr>>::new();
 
     for provider in providers {
         let provider_peer = provider.id.as_deref().and_then(parse_peer_id);
+        if provider.id.is_some() && provider_peer.is_none() {
+            quality.invalid_provider_id_count += 1;
+        }
+        if provider_peer.is_some() && provider.addrs.is_empty() {
+            quality.id_only_provider_count += 1;
+        }
+        quality.provider_addr_count += provider.addrs.len();
         let mut addrs = Vec::new();
         let mut peer_id = provider_peer;
+        let mut provider_has_supported_addr = false;
 
         for addr in
             expand_provider_multiaddrs(&provider.addrs, &mut dnsaddr_cache, &mut dns_ip_cache).await
         {
-            let Some((addr_peer, dial_addr)) = parse_bitswap_multiaddr(&addr, provider_peer) else {
-                continue;
-            };
-            peer_id.get_or_insert(addr_peer);
-            addrs.push(dial_addr);
+            quality.expanded_addr_count += 1;
+            match classify_bitswap_multiaddr(&addr, provider_peer) {
+                Ok((addr_peer, dial_addr)) => {
+                    quality.supported_addr_count += 1;
+                    provider_has_supported_addr = true;
+                    peer_id.get_or_insert(addr_peer);
+                    addrs.push(dial_addr);
+                }
+                Err(rejection) => quality.record_rejection(rejection),
+            }
+        }
+
+        if provider_peer.is_some() && !provider_has_supported_addr {
+            quality.provider_without_supported_bitswap_addr_count += 1;
         }
 
         if let Some(id) = peer_id {
@@ -1792,7 +1879,7 @@ async fn bitswap_peers(providers: &[Provider]) -> Vec<BitswapPeer> {
     }
 
     peers.truncate(MAX_BITSWAP_PEERS_PER_BLOCK);
-    peers
+    BitswapProviderCandidates { peers, quality }
 }
 
 fn merge_bitswap_peer(peers: &mut Vec<BitswapPeer>, id: PeerId, addrs: Vec<Multiaddr>) {
@@ -2055,11 +2142,31 @@ fn replace_dns_multiaddr(addr: &str, ip: IpAddr) -> Option<Multiaddr> {
     replaced_dns.then_some(replaced)
 }
 
+#[cfg(test)]
 fn parse_bitswap_multiaddr(
     addr: &str,
     provider_peer: Option<PeerId>,
 ) -> Option<(PeerId, Multiaddr)> {
-    let mut multiaddr = Multiaddr::from_str(addr).ok()?;
+    classify_bitswap_multiaddr(addr, provider_peer).ok()
+}
+
+#[derive(Clone, Copy)]
+enum BitswapAddrRejection {
+    InvalidMultiaddr,
+    MissingPeer,
+    Relay,
+    WebTransport,
+    WebRtc,
+    Certhash,
+    UnsupportedTransport,
+}
+
+fn classify_bitswap_multiaddr(
+    addr: &str,
+    provider_peer: Option<PeerId>,
+) -> std::result::Result<(PeerId, Multiaddr), BitswapAddrRejection> {
+    let mut multiaddr =
+        Multiaddr::from_str(addr).map_err(|_| BitswapAddrRejection::InvalidMultiaddr)?;
     let addr_peer = match multiaddr.iter().last() {
         Some(Protocol::P2p(peer)) => {
             multiaddr.pop();
@@ -2067,19 +2174,17 @@ fn parse_bitswap_multiaddr(
         }
         _ => None,
     };
-    let peer_id = addr_peer.or(provider_peer)?;
-    if is_supported_bitswap_addr(&multiaddr) {
-        Some((peer_id, multiaddr))
-    } else {
-        None
-    }
+    let peer_id = addr_peer
+        .or(provider_peer)
+        .ok_or(BitswapAddrRejection::MissingPeer)?;
+    unsupported_bitswap_addr_reason(&multiaddr).map_or(Ok((peer_id, multiaddr)), Err)
 }
 
 fn parse_peer_id(id: &str) -> Option<PeerId> {
     PeerId::from_str(id).ok()
 }
 
-fn is_supported_bitswap_addr(addr: &Multiaddr) -> bool {
+fn unsupported_bitswap_addr_reason(addr: &Multiaddr) -> Option<BitswapAddrRejection> {
     let mut has_tcp = false;
     let mut has_udp = false;
     let mut has_quic = false;
@@ -2088,16 +2193,20 @@ fn is_supported_bitswap_addr(addr: &Multiaddr) -> bool {
             Protocol::Tcp(_) => has_tcp = true,
             Protocol::Udp(_) => has_udp = true,
             Protocol::Quic | Protocol::QuicV1 => has_quic = true,
-            Protocol::WebTransport
-            | Protocol::WebRTC
-            | Protocol::WebRTCDirect
-            | Protocol::P2pWebRtcDirect
-            | Protocol::P2pCircuit
-            | Protocol::Certhash(_) => return false,
+            Protocol::P2pCircuit => return Some(BitswapAddrRejection::Relay),
+            Protocol::WebTransport => return Some(BitswapAddrRejection::WebTransport),
+            Protocol::WebRTC | Protocol::WebRTCDirect | Protocol::P2pWebRtcDirect => {
+                return Some(BitswapAddrRejection::WebRtc);
+            }
+            Protocol::Certhash(_) => return Some(BitswapAddrRejection::Certhash),
             _ => {}
         }
     }
-    has_tcp || (has_udp && has_quic)
+    if has_tcp || (has_udp && has_quic) {
+        None
+    } else {
+        Some(BitswapAddrRejection::UnsupportedTransport)
+    }
 }
 
 fn bitswap_addr_score(addr: &Multiaddr) -> u8 {
@@ -3067,6 +3176,47 @@ mod bitswap_tests {
             parse_bitswap_multiaddr("/ip4/164.92.225.198/tcp/4001/p2p-circuit", provider,)
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn reports_bitswap_provider_address_quality() {
+        let peer = "12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP";
+        let providers = vec![
+            Provider::from_parts(
+                Some(peer.to_string()),
+                vec![
+                    "/ip4/164.92.225.198/tcp/4001".to_string(),
+                    "/ip4/164.92.225.198/tcp/4001/p2p-circuit".to_string(),
+                    "/memory/1234".to_string(),
+                ],
+            )
+            .unwrap(),
+            Provider::from_parts(Some(peer.to_string()), Vec::new()).unwrap(),
+            Provider::from_parts(None, vec!["/ip4/164.92.225.199/tcp/4001".to_string()]).unwrap(),
+            Provider::from_parts(
+                Some("not-a-peer".to_string()),
+                vec!["/ip4/164.92.225.200/tcp/4001".to_string()],
+            )
+            .unwrap(),
+            Provider::from_parts(Some(peer.to_string()), vec!["not-a-multiaddr".to_string()])
+                .unwrap(),
+        ];
+
+        let candidates = bitswap_peers_with_quality(&providers).await;
+        let quality = candidates.quality;
+
+        assert_eq!(candidates.peers.len(), 1);
+        assert_eq!(quality.provider_addr_count, 6);
+        assert_eq!(quality.expanded_addr_count, 6);
+        assert_eq!(quality.supported_addr_count, 1);
+        assert_eq!(quality.rejected_addr_count(), 5);
+        assert_eq!(quality.id_only_provider_count, 1);
+        assert_eq!(quality.invalid_provider_id_count, 1);
+        assert_eq!(quality.provider_without_supported_bitswap_addr_count, 2);
+        assert_eq!(quality.unsupported_relay_addr_count, 1);
+        assert_eq!(quality.unsupported_transport_addr_count, 1);
+        assert_eq!(quality.missing_peer_addr_count, 2);
+        assert_eq!(quality.unparsable_addr_count, 1);
     }
 
     #[tokio::test]

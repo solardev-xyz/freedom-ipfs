@@ -2844,3 +2844,82 @@ provider-address quality, not raw delegated provider count or a short DHT
 fallback. Future work should add explicit diagnostics for unsupported provider
 address families and investigate a bounded peer-routing address-resolution path
 for ID-only providers before considering heavier relay support.
+
+## 2026-05-05 Provider Address Quality Diagnostics
+
+Follow-up diagnostic:
+
+- `bitswap_peer_expand` now reports provider address quality counters, not only
+  the supported expanded peer set.
+- The trace can distinguish direct Bitswap candidates from providers discarded
+  because they are ID-only, have invalid peer IDs, have no embedded/provider
+  peer ID, contain unparsable multiaddrs, or use unsupported address families.
+- Unsupported address families are split into relay (`/p2p-circuit`),
+  WebTransport, WebRTC, certhash, and other unsupported transports.
+- The mobile web harness includes these fields in slow-event details and also
+  aggregates them under `trace_summary.bitswap_provider_quality`, so live Kubo
+  comparisons can show whether Rust is losing because delegated routing returned
+  no providers, because provider records contained only unsupported addresses,
+  or because reachable direct Bitswap peers did not serve the block.
+
+Important fields:
+
+- `provider_addr_count`
+- `expanded_provider_addr_count`
+- `supported_provider_addr_count`
+- `rejected_provider_addr_count`
+- `id_only_provider_count`
+- `invalid_provider_id_count`
+- `provider_without_supported_bitswap_addr_count`
+- `unsupported_relay_addr_count`
+- `unsupported_webtransport_addr_count`
+- `unsupported_webrtc_addr_count`
+- `unsupported_certhash_addr_count`
+- `unsupported_transport_addr_count`
+- `missing_peer_addr_count`
+- `unparsable_addr_count`
+
+This is still diagnostic only. It does not dial relays, change provider ranking,
+change timeout caps, skip verification, or alter the read-only behavior.
+
+Validation run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-provider-quality-aggregate-r1-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-provider-quality-aggregate-r1.json
+```
+
+Result: Rust and Kubo both passed `1/1`. Rust root TTFB was `470ms` versus Kubo
+`3811ms`; Rust asset p50/p95 was `158/995ms` versus Kubo `176/474ms`. Rust
+resource use stayed much lower: max RSS/FD `51504KiB`/`45` versus Kubo
+`296280KiB`/`347`.
+
+The provider-quality aggregate showed that this page load was not provider-poor,
+but most advertised addresses were not usable direct Bitswap dials:
+
+```text
+events=19
+provider_addr_count=5803
+expanded_provider_addr_count=5848
+supported_provider_addr_count=1569
+rejected_provider_addr_count=4279
+id_only_provider_count=34
+provider_without_supported_bitswap_addr_count=183
+unsupported_relay_addr_count=1480
+unsupported_webtransport_addr_count=1338
+unsupported_webrtc_addr_count=1425
+unsupported_transport_addr_count=36
+```
+
+The root CID itself had `297` provider addrs, `77` supported addrs, and `220`
+rejected addrs: `78` relay, `75` WebTransport, and `67` WebRTC. This supports
+the next hypothesis that provider-address quality and possibly bounded
+peer-routing/relay-aware behavior matter more than increasing direct provider
+fanout for this class of Kubo gap.

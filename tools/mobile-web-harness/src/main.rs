@@ -669,6 +669,26 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.bitswap_addr_mix)
             );
         }
+        if trace.bitswap_provider_quality.events > 0 {
+            let quality = &trace.bitswap_provider_quality;
+            println!(
+                "  bitswap provider quality: events={} provider_addrs={} expanded={} supported={} rejected={} id_only={} no_supported={} relay={} webtransport={} webrtc={} certhash={} other_transport={} missing_peer={} unparsable={}",
+                quality.events,
+                quality.provider_addr_count,
+                quality.expanded_provider_addr_count,
+                quality.supported_provider_addr_count,
+                quality.rejected_provider_addr_count,
+                quality.id_only_provider_count,
+                quality.provider_without_supported_bitswap_addr_count,
+                quality.unsupported_relay_addr_count,
+                quality.unsupported_webtransport_addr_count,
+                quality.unsupported_webrtc_addr_count,
+                quality.unsupported_certhash_addr_count,
+                quality.unsupported_transport_addr_count,
+                quality.missing_peer_addr_count,
+                quality.unparsable_addr_count
+            );
+        }
         if !trace.bitswap_connection_transports.is_empty() {
             println!(
                 "  bitswap connection transports: {}",
@@ -2590,6 +2610,7 @@ struct TraceSummary {
     bitswap_session: TraceBitswapSessionAggregate,
     trace_errors: Vec<TraceValueCount>,
     bitswap_addr_mix: Vec<TraceValueCount>,
+    bitswap_provider_quality: TraceBitswapProviderQualityAggregate,
     bitswap_connection_transports: Vec<TraceValueCount>,
     bitswap_dial_rejected_transports: Vec<TraceValueCount>,
     bitswap_dns_expansion: TraceBitswapDnsExpansionAggregate,
@@ -2638,6 +2659,54 @@ struct TraceBitswapDnsExpansionAggregate {
     failed: usize,
     records: u128,
     ips: u128,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceBitswapProviderQualityAggregate {
+    events: usize,
+    provider_addr_count: u128,
+    expanded_provider_addr_count: u128,
+    supported_provider_addr_count: u128,
+    rejected_provider_addr_count: u128,
+    id_only_provider_count: u128,
+    invalid_provider_id_count: u128,
+    provider_without_supported_bitswap_addr_count: u128,
+    unsupported_relay_addr_count: u128,
+    unsupported_webtransport_addr_count: u128,
+    unsupported_webrtc_addr_count: u128,
+    unsupported_certhash_addr_count: u128,
+    unsupported_transport_addr_count: u128,
+    missing_peer_addr_count: u128,
+    unparsable_addr_count: u128,
+}
+
+impl TraceBitswapProviderQualityAggregate {
+    fn accumulate(&mut self, value: &serde_json::Value) {
+        self.events += 1;
+        self.provider_addr_count += trace_count_field(value, "provider_addr_count");
+        self.expanded_provider_addr_count +=
+            trace_count_field(value, "expanded_provider_addr_count");
+        self.supported_provider_addr_count +=
+            trace_count_field(value, "supported_provider_addr_count");
+        self.rejected_provider_addr_count +=
+            trace_count_field(value, "rejected_provider_addr_count");
+        self.id_only_provider_count += trace_count_field(value, "id_only_provider_count");
+        self.invalid_provider_id_count += trace_count_field(value, "invalid_provider_id_count");
+        self.provider_without_supported_bitswap_addr_count +=
+            trace_count_field(value, "provider_without_supported_bitswap_addr_count");
+        self.unsupported_relay_addr_count +=
+            trace_count_field(value, "unsupported_relay_addr_count");
+        self.unsupported_webtransport_addr_count +=
+            trace_count_field(value, "unsupported_webtransport_addr_count");
+        self.unsupported_webrtc_addr_count +=
+            trace_count_field(value, "unsupported_webrtc_addr_count");
+        self.unsupported_certhash_addr_count +=
+            trace_count_field(value, "unsupported_certhash_addr_count");
+        self.unsupported_transport_addr_count +=
+            trace_count_field(value, "unsupported_transport_addr_count");
+        self.missing_peer_addr_count += trace_count_field(value, "missing_peer_addr_count");
+        self.unparsable_addr_count += trace_count_field(value, "unparsable_addr_count");
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -2791,6 +2860,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_peer_fetches = BTreeMap::<String, TracePeerBuilder>::new();
     let mut trace_errors = BTreeMap::<String, usize>::new();
     let mut bitswap_addr_mix = BTreeMap::<String, usize>::new();
+    let mut bitswap_provider_quality = TraceBitswapProviderQualityAggregate::default();
     let mut bitswap_connection_transports = BTreeMap::<String, usize>::new();
     let mut bitswap_dial_rejected_transports = BTreeMap::<String, usize>::new();
     let mut bitswap_dns_expansion = TraceBitswapDnsExpansionAggregate::default();
@@ -2943,6 +3013,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             accumulate_trace_count(&mut bitswap_addr_mix, "dns", &value, "dns_addr_count");
             accumulate_trace_count(&mut bitswap_addr_mix, "ip4", &value, "ip4_addr_count");
             accumulate_trace_count(&mut bitswap_addr_mix, "ip6", &value, "ip6_addr_count");
+            bitswap_provider_quality.accumulate(&value);
         }
         if phase == "bitswap_connection_established" {
             if let Some(transport) = json_detail_string(value.get("transport")) {
@@ -3069,6 +3140,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_session,
         trace_errors: sorted_trace_counts(trace_errors),
         bitswap_addr_mix: sorted_trace_counts(bitswap_addr_mix),
+        bitswap_provider_quality,
         bitswap_connection_transports: sorted_trace_counts(bitswap_connection_transports),
         bitswap_dial_rejected_transports: sorted_trace_counts(bitswap_dial_rejected_transports),
         bitswap_dns_expansion,
@@ -3135,6 +3207,10 @@ fn accumulate_trace_count(
     *counts.entry(label.to_string()).or_default() += count as usize;
 }
 
+fn trace_count_field(value: &serde_json::Value, field: &str) -> u128 {
+    value.get(field).and_then(json_u128).unwrap_or_default()
+}
+
 fn sorted_trace_counts(counts: BTreeMap<String, usize>) -> Vec<TraceValueCount> {
     let mut values = counts
         .into_iter()
@@ -3198,6 +3274,20 @@ fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
         "status",
         "provider_count",
         "provider_peer_count",
+        "provider_addr_count",
+        "expanded_provider_addr_count",
+        "supported_provider_addr_count",
+        "rejected_provider_addr_count",
+        "id_only_provider_count",
+        "invalid_provider_id_count",
+        "provider_without_supported_bitswap_addr_count",
+        "unsupported_relay_addr_count",
+        "unsupported_webtransport_addr_count",
+        "unsupported_webrtc_addr_count",
+        "unsupported_certhash_addr_count",
+        "unsupported_transport_addr_count",
+        "missing_peer_addr_count",
+        "unparsable_addr_count",
         "session_peer_count",
         "peer_count",
         "trusted_peer_count",
@@ -3517,7 +3607,7 @@ mod tests {
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":4,\"cid\":\"cid5\",\"source\":\"cache\"}\n",
                 "{\"phase\":\"provider_lookup\",\"elapsed_ms\":10,\"cid\":\"cid2\",\"provider_count\":3,\"error\":\"dht: timeout\"}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":12,\"cid\":\"cid6\",\"ok\":false,\"trusted_peer_count\":1}\n",
-                "{\"phase\":\"bitswap_peer_expand\",\"elapsed_ms\":3,\"cid\":\"cid7\",\"tcp_addr_count\":4,\"quic_addr_count\":2,\"ws_addr_count\":1,\"wss_addr_count\":0,\"dns_addr_count\":1,\"ip4_addr_count\":3,\"ip6_addr_count\":1}\n",
+                "{\"phase\":\"bitswap_peer_expand\",\"elapsed_ms\":3,\"cid\":\"cid7\",\"tcp_addr_count\":4,\"quic_addr_count\":2,\"ws_addr_count\":1,\"wss_addr_count\":0,\"dns_addr_count\":1,\"ip4_addr_count\":3,\"ip6_addr_count\":1,\"provider_addr_count\":10,\"expanded_provider_addr_count\":12,\"supported_provider_addr_count\":4,\"rejected_provider_addr_count\":8,\"id_only_provider_count\":1,\"invalid_provider_id_count\":2,\"provider_without_supported_bitswap_addr_count\":3,\"unsupported_relay_addr_count\":4,\"unsupported_webtransport_addr_count\":1,\"unsupported_webrtc_addr_count\":1,\"unsupported_certhash_addr_count\":1,\"unsupported_transport_addr_count\":1,\"missing_peer_addr_count\":1,\"unparsable_addr_count\":1}\n",
                 "{\"phase\":\"bitswap_session_shortcut_start\",\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1}\n",
                 "{\"phase\":\"bitswap_session_shortcut_post_lookup_wait\",\"cid\":\"cid8\",\"timeout_ms\":100}\n",
                 "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":2,\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":true,\"source_peer\":\"peer1\",\"source_peer_trusted\":true}\n",
@@ -3646,6 +3736,69 @@ mod tests {
         assert_eq!(summary.bitswap_addr_mix[1].count, 3);
         assert_eq!(summary.bitswap_addr_mix[2].value, "quic");
         assert_eq!(summary.bitswap_addr_mix[2].count, 2);
+        assert_eq!(summary.bitswap_provider_quality.events, 1);
+        assert_eq!(summary.bitswap_provider_quality.provider_addr_count, 10);
+        assert_eq!(
+            summary
+                .bitswap_provider_quality
+                .expanded_provider_addr_count,
+            12
+        );
+        assert_eq!(
+            summary
+                .bitswap_provider_quality
+                .supported_provider_addr_count,
+            4
+        );
+        assert_eq!(
+            summary
+                .bitswap_provider_quality
+                .rejected_provider_addr_count,
+            8
+        );
+        assert_eq!(summary.bitswap_provider_quality.id_only_provider_count, 1);
+        assert_eq!(
+            summary.bitswap_provider_quality.invalid_provider_id_count,
+            2
+        );
+        assert_eq!(
+            summary
+                .bitswap_provider_quality
+                .provider_without_supported_bitswap_addr_count,
+            3
+        );
+        assert_eq!(
+            summary
+                .bitswap_provider_quality
+                .unsupported_relay_addr_count,
+            4
+        );
+        assert_eq!(
+            summary
+                .bitswap_provider_quality
+                .unsupported_webtransport_addr_count,
+            1
+        );
+        assert_eq!(
+            summary
+                .bitswap_provider_quality
+                .unsupported_webrtc_addr_count,
+            1
+        );
+        assert_eq!(
+            summary
+                .bitswap_provider_quality
+                .unsupported_certhash_addr_count,
+            1
+        );
+        assert_eq!(
+            summary
+                .bitswap_provider_quality
+                .unsupported_transport_addr_count,
+            1
+        );
+        assert_eq!(summary.bitswap_provider_quality.missing_peer_addr_count, 1);
+        assert_eq!(summary.bitswap_provider_quality.unparsable_addr_count, 1);
         assert_eq!(summary.bitswap_connection_transports.len(), 1);
         assert_eq!(summary.bitswap_connection_transports[0].value, "tcp");
         assert_eq!(summary.bitswap_connection_transports[0].count, 1);
