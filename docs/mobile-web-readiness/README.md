@@ -147,6 +147,9 @@ connection-limit pressure by transport. UnixFS metadata-cache traces are also
 aggregated so reports show decoded DAG-PB cache events, path-resolution cache
 hits/misses, file-size cache hits/misses, inserts, evictions, skip counts,
 maximum lengths, and capacity without manual JSONL greps.
+Bitswap dial-plan summaries show candidate peers, new dial peers/addrs,
+suppressed peers/addrs, pending peers, connected peers, and max command queue
+time in both single-engine and Rust-vs-Kubo comparison output.
 Single-chunk gateway responses emit `gateway_direct_body` traces, and the
 comparison summary reports direct-body event count, total bytes, maximum body
 length, and maximum elapsed time so small-response fast paths are visible.

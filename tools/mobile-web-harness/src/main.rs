@@ -834,22 +834,7 @@ fn print_summary(report: &RunReport) {
         }
         print_trace_timeout_recovery(trace);
         print_trace_bitswap_peer_attempts(trace);
-        if trace.bitswap_dial_plans.events > 0 {
-            let plans = &trace.bitswap_dial_plans;
-            println!(
-                "  bitswap dial plans: events={} peer_targets={} candidates={} new_peers={} new_addrs={} suppressed_peers={} suppressed_addrs={} pending_peers={} connected_peers={} max_queued_ms={}",
-                plans.events,
-                plans.peer_targets,
-                plans.candidate_peers,
-                plans.new_dial_peers,
-                plans.new_dial_addrs,
-                plans.suppressed_dial_peers,
-                plans.suppressed_dial_addrs,
-                plans.pending_dial_peers,
-                plans.connected_peers,
-                plans.max_command_queued_ms
-            );
-        }
+        print_trace_bitswap_dial_plans(trace);
         if trace.bitswap_incoming_blocks.matches > 0 {
             let incoming = &trace.bitswap_incoming_blocks;
             println!(
@@ -1155,6 +1140,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_timeout_recovery(trace);
     print_trace_gateway_direct_body(trace);
     print_trace_bitswap_peer_attempts(trace);
+    print_trace_bitswap_dial_plans(trace);
     if trace.bitswap_session.has_events() {
         let session = &trace.bitswap_session;
         println!(
@@ -1346,6 +1332,26 @@ fn format_trace_bitswap_peer_attempts(
         attempts.other_failures,
         attempts.prefer_want_have
     ))
+}
+
+fn print_trace_bitswap_dial_plans(trace: &TraceSummary) {
+    let plans = &trace.bitswap_dial_plans;
+    if plans.events == 0 {
+        return;
+    }
+    println!(
+        "  bitswap dial plans: events={} peer_targets={} candidates={} new_peers={} new_addrs={} suppressed_peers={} suppressed_addrs={} pending_peers={} connected_peers={} max_queued_ms={}",
+        plans.events,
+        plans.peer_targets,
+        plans.candidate_peers,
+        plans.new_dial_peers,
+        plans.new_dial_addrs,
+        plans.suppressed_dial_peers,
+        plans.suppressed_dial_addrs,
+        plans.pending_dial_peers,
+        plans.connected_peers,
+        plans.max_command_queued_ms
+    );
 }
 
 fn print_trace_bitswap_incoming_reads(trace: &TraceSummary) {
