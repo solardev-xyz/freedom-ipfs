@@ -10444,3 +10444,42 @@ provider fanout, public fallback, timeouts, or cache trust. It reduces redundant
 provider lookup and Bitswap attempt work on the real `ipfs.tech` page workload
 where recent session peers are useful, while preserving the existing provider
 lookup fallback after a `50ms` cap.
+
+## 2026-05-05 Observe: `cid.contact` Does Not Help Current `daicowtf` Sparse Child CID
+
+Question:
+The `daicowtf-page-assets` check failed in the current network window because a
+child raw CID had no usable providers after delegated lookup plus light-DHT
+fallback. Previous `cid.contact` experiments were on other cases, so run a
+single targeted probe before considering any sparse-provider fallback policy.
+
+Command:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --delegated-router https://delegated-ipfs.dev/routing/v1,https://cid.contact/routing/v1 \
+  --trace-output /tmp/daicowtf-dual-router-sparse-r1-trace.jsonl \
+  --output /tmp/daicowtf-dual-router-sparse-r1.json
+```
+
+Result:
+
+- Rust failed `0/1` with status `504`.
+- `delegated-ipfs.dev` returned the same single provider pattern; total
+  delegated provider records were still `1`.
+- `cid.contact` returned `404 Not Found` for both the root and the failing child
+  raw CID.
+- DHT fallback found `0` providers and timed out for the child CID.
+- The failing child CID was
+  `bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u`.
+
+Decision: no code change. This does not reopen the earlier rejected default
+`cid.contact` change. The sparse-provider issue remains, but this endpoint did
+not add diversity for the failing `daicowtf` child CID in this run.
