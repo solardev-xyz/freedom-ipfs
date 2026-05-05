@@ -25,10 +25,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
 pub const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
+const GATEWAY_REQUEST_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 const GATEWAY_STREAM_CHUNK_SIZE: u64 = 64 * 1024;
 const X_FREEDOM_REQUEST_ID: &str = "x-freedom-request-id";
 const X_FREEDOM_PARENT_REQUEST_ID: &str = "x-freedom-parent-request-id";
@@ -362,14 +363,9 @@ async fn ipfs_get(
         let request_started = Instant::now();
         tracing::info!(phase = "request_start", request_id, path = %request_path);
 
-        let limiter_started = Instant::now();
-        let Ok(_permit) = state.request_limiter.clone().try_acquire_owned() else {
-            tracing::info!(
-                phase = "gateway_limiter",
-                request_id,
-                acquired = false,
-                elapsed_ms = limiter_started.elapsed().as_millis()
-            );
+        let Some(_permit) =
+            acquire_gateway_request_permit(state.request_limiter.clone(), request_id).await
+        else {
             let response = gateway_error(GatewayError::Busy);
             tracing::info!(
                 phase = "request_done",
@@ -380,12 +376,6 @@ async fn ipfs_get(
             );
             return response;
         };
-        tracing::info!(
-            phase = "gateway_limiter",
-            request_id,
-            acquired = true,
-            elapsed_ms = limiter_started.elapsed().as_millis()
-        );
 
         let response = match serve_ipfs_path(
             state.provider.clone(),
@@ -444,14 +434,9 @@ async fn ipns_get(
         let request_started = Instant::now();
         tracing::info!(phase = "request_start", request_id, path = %request_path);
 
-        let limiter_started = Instant::now();
-        let Ok(_permit) = state.request_limiter.clone().try_acquire_owned() else {
-            tracing::info!(
-                phase = "gateway_limiter",
-                request_id,
-                acquired = false,
-                elapsed_ms = limiter_started.elapsed().as_millis()
-            );
+        let Some(_permit) =
+            acquire_gateway_request_permit(state.request_limiter.clone(), request_id).await
+        else {
             let response = gateway_error(GatewayError::Busy);
             tracing::info!(
                 phase = "request_done",
@@ -462,12 +447,6 @@ async fn ipns_get(
             );
             return response;
         };
-        tracing::info!(
-            phase = "gateway_limiter",
-            request_id,
-            acquired = true,
-            elapsed_ms = limiter_started.elapsed().as_millis()
-        );
 
         let response = match serve_ipns_path(
             state.provider.clone(),
@@ -496,6 +475,46 @@ async fn ipns_get(
     }
     .instrument(span)
     .await
+}
+
+async fn acquire_gateway_request_permit(
+    limiter: Arc<Semaphore>,
+    request_id: u64,
+) -> Option<OwnedSemaphorePermit> {
+    let limiter_started = Instant::now();
+    match tokio::time::timeout(GATEWAY_REQUEST_QUEUE_TIMEOUT, limiter.acquire_owned()).await {
+        Ok(Ok(permit)) => {
+            tracing::info!(
+                phase = "gateway_limiter",
+                request_id,
+                acquired = true,
+                timeout_ms = GATEWAY_REQUEST_QUEUE_TIMEOUT.as_millis(),
+                elapsed_ms = limiter_started.elapsed().as_millis()
+            );
+            Some(permit)
+        }
+        Ok(Err(err)) => {
+            tracing::info!(
+                phase = "gateway_limiter",
+                request_id,
+                acquired = false,
+                error = %err,
+                timeout_ms = GATEWAY_REQUEST_QUEUE_TIMEOUT.as_millis(),
+                elapsed_ms = limiter_started.elapsed().as_millis()
+            );
+            None
+        }
+        Err(_) => {
+            tracing::info!(
+                phase = "gateway_limiter",
+                request_id,
+                acquired = false,
+                timeout_ms = GATEWAY_REQUEST_QUEUE_TIMEOUT.as_millis(),
+                elapsed_ms = limiter_started.elapsed().as_millis()
+            );
+            None
+        }
+    }
 }
 
 fn header_value_for_trace(value: Option<&HeaderValue>) -> String {
@@ -2714,7 +2733,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rejects_requests_above_concurrency_limit() {
+    async fn queues_requests_above_concurrency_limit() {
         let data = b"limited gateway";
         let cid = cid_from_data(CODEC_RAW, data);
         let entered = Arc::new(AtomicBool::new(false));
@@ -2722,6 +2741,48 @@ mod tests {
             cid,
             data: data.to_vec(),
             entered: entered.clone(),
+            delay: Duration::from_millis(300),
+        });
+
+        let state = GatewayState::with_provider_config(provider, GatewayConfig::new(1));
+        let first = tokio::spawn(ipfs_get(
+            State(state.clone()),
+            Path(cid.to_string()),
+            Method::GET,
+            HeaderMap::new(),
+        ));
+
+        for _ in 0..50 {
+            if entered.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(entered.load(Ordering::SeqCst));
+
+        let second = ipfs_get(
+            State(state),
+            Path(cid.to_string()),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let first = first.await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn times_out_requests_waiting_too_long_for_concurrency_permit() {
+        let data = b"limited gateway";
+        let cid = cid_from_data(CODEC_RAW, data);
+        let entered = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(SlowProvider {
+            cid,
+            data: data.to_vec(),
+            entered: entered.clone(),
+            delay: GATEWAY_REQUEST_QUEUE_TIMEOUT + Duration::from_millis(250),
         });
 
         let state = GatewayState::with_provider_config(provider, GatewayConfig::new(1));
@@ -2773,6 +2834,7 @@ mod tests {
         cid: Cid,
         data: Vec<u8>,
         entered: Arc<AtomicBool>,
+        delay: Duration,
     }
 
     impl BlockProvider for SlowProvider {
@@ -2781,7 +2843,7 @@ mod tests {
                 return Err(CoreError::Storage("unexpected cid".into()));
             }
             self.entered.store(true, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(300));
+            std::thread::sleep(self.delay);
             Ok(Some(Block::unchecked(*cid, self.data.clone())))
         }
     }

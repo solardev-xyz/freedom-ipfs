@@ -18672,3 +18672,107 @@ not Bitswap or delegated lookup. The next promising target remains narrow
 single-provider HTTP mitigation, especially when the only HTTP provider is
 `ipfs-bridge.sia.dev`, but previous static host suppression and broad Bitswap
 substitution were rejected on resource and latency grounds.
+
+## 2026-05-05 Keep: Queue Bursty Gateway Requests Under The Existing Cap
+
+Question:
+The gateway enforced `DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS=8` with
+`try_acquire_owned()`, so the ninth concurrent browser request failed
+immediately with `503 Service Unavailable`. That is resource-safe, but brittle
+for real WebKit page fan-out where short bursts can exceed the active work cap.
+
+Implementation:
+
+- Keep the active gateway request cap unchanged.
+- Replace immediate limiter failure with a bounded wait for a semaphore permit.
+- Use `GATEWAY_REQUEST_QUEUE_TIMEOUT=2s`.
+- Preserve `503 Service Unavailable` when a request cannot acquire a permit
+  within that bounded queue window.
+- Keep existing `gateway_limiter` tracing and add `timeout_ms` so queued wait
+  time is visible in progress/harness summaries.
+- Add deterministic tests proving short bursts queue and succeed while
+  sustained saturation still fails.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-gateway concurrency
+cargo check -p freedom-ipfs-gateway --all-targets
+cargo clippy -p freedom-ipfs-gateway --all-targets -- -D warnings
+cargo test -p freedom-ipfs-gateway
+```
+
+Result:
+
+- Formatting passed.
+- Focused gateway concurrency tests passed: `2 passed`.
+- Gateway all-target check passed.
+- Gateway clippy passed with `-D warnings`.
+- Full gateway suite passed: `30` lib tests, `4` main tests, CLI test, and
+  non-ignored integration tests passed.
+
+Normal page fan-out check:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-gateway-queue-asset6-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-gateway-queue-asset6-r3.json
+```
+
+Normal result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `887ms` / `979ms` / `979ms`.
+- Asset TTFB p50/p95/max: `246ms` / `630ms` / `1200ms`.
+- Run total p50/p95/max: `2454ms` / `2969ms` / `2969ms`.
+- Max RSS/FD: `54136KiB` / `40`.
+- Gateway limiter denials: `0`.
+- Gateway response elapsed p50/p95/max: `249ms` / `745ms` / `1196ms`.
+- Block sources: `http_provider=81`, `bitswap=39`.
+
+Burst stress check above the old harness-safe asset fan-out:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 12 \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-gateway-queue-asset12-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-gateway-queue-asset12-r3.json
+```
+
+Burst result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1452ms` / `1530ms` / `1530ms`.
+- Asset TTFB p50/p95/max: `526ms` / `1001ms` / `1343ms`.
+- Run total p50/p95/max: `3576ms` / `3639ms` / `3639ms`.
+- Max RSS/FD: `55760KiB` / `46`.
+- Gateway limiter denials: `0`.
+- Gateway limiter wait p50/p95/max: `114ms` / `438ms` / `681ms`.
+- Block sources: `http_provider=117`, `bitswap=9`.
+
+Conclusion:
+Keep. This is not a high-fanout speed optimization; the stress run correctly
+shows queue latency and somewhat higher RSS/FD when the page loader asks for
+more concurrent work than the gateway will actively run. The important behavior
+change is that browser bursts no longer drop subresources immediately while the
+gateway still enforces the same active request cap and still fails sustained
+saturation after a bounded wait. That is a better mobile browser default than
+turning transient fan-out into page-level `503` failures.
