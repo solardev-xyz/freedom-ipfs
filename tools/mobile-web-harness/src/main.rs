@@ -937,6 +937,77 @@ fn print_comparison_summary(report: &ComparisonReport) {
             display_option_f64(case.storage_ratio)
         );
     }
+    print_comparison_trace_summary("rust", &report.rust);
+    print_comparison_trace_summary("kubo", &report.kubo);
+}
+
+fn print_comparison_trace_summary(label: &str, report: &RunReport) {
+    let Some(trace) = &report.trace_summary else {
+        return;
+    };
+    println!(
+        "{label} trace: path={} lines={} events={} phases={}",
+        report.trace_output.as_deref().unwrap_or("-"),
+        trace.line_count,
+        trace.event_count,
+        trace.phases.len()
+    );
+    if trace.block_store.events > 0 {
+        let store = &trace.block_store;
+        println!(
+            "  block store: events={} hits={} misses={} rechecks={} recheck_hits={} recheck_misses={}",
+            store.events,
+            store.hits,
+            store.misses,
+            store.rechecks,
+            store.recheck_hits,
+            store.recheck_misses
+        );
+    }
+    if trace.bitswap_session.has_events() {
+        let session = &trace.bitswap_session;
+        println!(
+            "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_starts={} shortcut_post_lookup_waits={} shortcut_attempts={} shortcut_hits={} shortcut_misses={}",
+            session.fetches,
+            session.with_trusted_peers,
+            session.trusted_successes,
+            session.untrusted_successes,
+            session.trusted_failures,
+            session.request_timeouts_with_trusted,
+            session.session_shortcut_starts,
+            session.session_shortcut_post_lookup_waits,
+            session.session_shortcut_attempts,
+            session.session_shortcut_hits,
+            session.session_shortcut_misses
+        );
+    }
+    if trace.bitswap_extra_blocks.events > 0 {
+        let extra = &trace.bitswap_extra_blocks;
+        println!(
+            "  bitswap extra blocks: events={} total={} max={} incoming={} outgoing={} unknown={}",
+            extra.events, extra.total, extra.max, extra.incoming, extra.outgoing, extra.unknown
+        );
+    }
+    if trace.bitswap_incoming_blocks.matches > 0 {
+        let incoming = &trace.bitswap_incoming_blocks;
+        println!(
+            "  bitswap incoming blocks: matches={} blocks={} bytes={} delivered_waiters={} dropped_waiters={} max_oldest_pending_ms={} max_pending_waiters={} max_dropped_waiters={}",
+            incoming.matches,
+            incoming.blocks,
+            incoming.bytes,
+            incoming.delivered_waiters,
+            incoming.dropped_waiters,
+            incoming.max_oldest_pending_ms,
+            incoming.max_pending_waiters,
+            incoming.max_dropped_waiters
+        );
+    }
+    if !trace.trace_errors.is_empty() {
+        println!(
+            "  trace errors: {}",
+            format_trace_counts(&trace.trace_errors)
+        );
+    }
 }
 
 fn display_option_ms(value: Option<u128>) -> String {

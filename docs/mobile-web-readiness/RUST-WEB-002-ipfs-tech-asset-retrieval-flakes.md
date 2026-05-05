@@ -4471,3 +4471,79 @@ next cancellation/cache-fill experiment. The one-run live check confirms that
 dropped receivers happen in normal `ipfs.tech` page loading, but the count is
 small enough that it does not justify reintroducing the rejected late-cache
 prototype without tighter gating.
+
+## 2026-05-05 Comparison-Mode Trace Console Summary
+
+Problem:
+
+- `--compare-kubo` runs already embed the Rust trace summary in the comparison
+  JSON, but the console only printed pass rates, latency ratios, and resource
+  ratios.
+- That made every live A/B iteration require a separate JSON inspection step to
+  answer the most important Rust-side questions: cache rechecks, trusted-peer
+  timeouts, session shortcut wins, extra blocks, incoming blocks, and trace
+  errors.
+
+Implementation:
+
+- Add a concise comparison-mode trace summary for any engine report with a
+  `trace_summary`.
+- Print the trace path, line/event/phase counts, block-store counters, Bitswap
+  session counters, extra-block counters, incoming-block waiter counters, and
+  trace-error counts.
+- Kubo is silent unless a future Kubo report also has trace data.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+git diff --check
+```
+
+Result: all passed.
+
+Live validation, unstable `ipfs.tech` run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-comparison-trace-print-r1-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-comparison-trace-print-r1.json
+```
+
+Result: command exited with failure because Rust passed `0/1` while Kubo passed
+`1/1`. The new console summary printed immediately and explained the Rust
+failure: `bitswap_fetch: bitswap request timed out=2`,
+`request_timeouts_with_trusted=2`, and incoming block delivery had only
+`matches=1`, `delivered_waiters=1`, `dropped_waiters=0`.
+
+Live validation, smaller passing case:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/vitalik-comparison-trace-print-r1-trace.jsonl \
+  --comparison-output /tmp/vitalik-comparison-trace-print-r1.json
+```
+
+Result: Rust and Kubo both passed `1/1`. Rust root TTFB was `8882ms` versus
+Kubo `2917ms`. Rust stayed lighter at max RSS/FD `39168KiB`/`34` versus Kubo
+`127696KiB`/`112`. The console printed the trace summary, including
+`request_timeouts_with_trusted=1`, incoming `matches=2`, `delivered_waiters=2`,
+and `dropped_waiters=0`.
+
+Decision: keep. This is harness-only, does not change gateway behavior, and
+shortens the evidence loop for every future Rust/Kubo comparison.
