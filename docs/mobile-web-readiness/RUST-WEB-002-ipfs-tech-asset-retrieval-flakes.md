@@ -14844,3 +14844,125 @@ and fewer file descriptors. The small Rust root p95 gap is worth watching, but
 the larger remaining opportunity is still cold and first-warmup behavior:
 provider lookup tails, single-HTTP-provider delegated records, HTTP-provider
 header waits, and session-scoped reuse before provider lookup completes.
+
+## 2026-05-05 Reject: Session-Scoped Recent HTTP Provider Shortcut
+
+Hypothesis:
+Several cold `ipfs.tech` tails come from child CIDs whose delegated lookup
+eventually returns only one HTTP provider, often after waiting on response
+headers. Since trustless HTTP-provider blocks are verified by CID before
+store/serve, a narrowly scoped analogue to recent Bitswap peer reuse might help:
+after a provider lookup stalls, try one HTTP provider that recently returned a
+verified block in the same gateway process, while keeping provider lookup as
+the fallback.
+
+Prototype:
+
+- Track recently successful HTTP provider base URLs in memory.
+- Keep the session TTL very short: `5s`.
+- Try at most one recent HTTP provider.
+- Start the shortcut only after provider lookup stalls.
+- Preserve verification-before-store/serve through the normal
+  `fetch_from_http_provider` path.
+- Do not mark the recent provider bad if this speculative child-CID probe
+  fails, because it was not a provider record for that specific CID.
+- Keep public gateway fallback out of scope: only routing-discovered HTTP
+  providers that already returned a verified block were eligible.
+
+Focused validation while the prototype was present:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval recent_http_provider_shortcut_can_win_slow_provider_lookup
+cargo test -p freedom-ipfs-retrieval http_provider
+```
+
+Focused result:
+
+- Formatting passed.
+- The new deterministic test passed: after a first verified HTTP-provider
+  block, a second CID returned from the recent provider before a gated delegated
+  lookup was released.
+- Existing HTTP-provider tests passed: `6 passed`.
+
+Live experiment, `150ms` provider-lookup stall threshold:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-session-shortcut-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-http-session-shortcut-r3.json
+```
+
+`150ms` result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1577ms` / `1778ms` / `1778ms`.
+- Asset TTFB p50/p95/max: `274ms` / `981ms` / `1101ms`.
+- Run total p50/p95/max: `3680ms` / `4521ms` / `4521ms`.
+- Max RSS/FD: `54016KiB` / `42`.
+- Block sources: `http_provider=87`, `bitswap=32`.
+- HTTP-provider fetch p50/p95/max: `172ms` / `684ms` / `774ms`.
+- Delegated lookup max dropped to `792ms`, but asset p95 worsened versus the
+  preceding target3/250ms-hedge baseline.
+- Recent HTTP shortcut starts: `9`.
+- Recent HTTP shortcut fetches: `8` successes and `1` failure.
+- The failure was a verified miss shape: `dag.w3s.link` returned HTTP `404` for
+  a child CID, then normal provider lookup/fallback continued.
+
+Comparison baseline from the same session, without the prototype:
+
+- Artifact: `/tmp/ipfs-tech-http-hedge250-target3-r3c.json`.
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1419ms` / `1614ms` / `1614ms`.
+- Asset TTFB p50/p95/max: `240ms` / `666ms` / `2558ms`.
+- Run total p50/p95/max: `3315ms` / `5434ms` / `5434ms`.
+- Max RSS/FD: `51200KiB` / `32`.
+- HTTP-provider fetch p50/p95/max: `162ms` / `536ms` / `664ms`.
+- `http_provider_hedge` fired `0` times.
+
+Live experiment, more conservative `300ms` provider-lookup stall threshold:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-session-shortcut300-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-http-session-shortcut300-r3.json
+```
+
+`300ms` result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `851ms` / `1645ms` / `1645ms`.
+- Asset TTFB p50/p95/max: `297ms` / `818ms` / `1175ms`.
+- Run total p50/p95/max: `3119ms` / `3302ms` / `3302ms`.
+- Max RSS/FD: `54180KiB` / `42`.
+- Block sources: `http_provider=89`, `bitswap=31`.
+- HTTP-provider fetch p50/p95/max: `166ms` / `685ms` / `889ms`.
+- Delegated lookup max was only `112ms` in this live window.
+- Recent HTTP shortcut starts: `0`.
+- Recent HTTP shortcut fetches: `0`.
+
+Decision:
+Reject and revert. The deterministic mechanism worked, but live evidence did
+not justify the added machinery. At `150ms`, the shortcut fired and sometimes
+won, but root p95, asset p95, HTTP-provider p95, RSS, FD count, and Bitswap work
+all worsened. At `300ms`, it did not fire at all, so it did not address a real
+tail in that window. The concept may be worth revisiting only with a stronger
+scoping key, such as an explicit page/root session ID and provider success tied
+to the same resolved UnixFS root; a process-global short TTL is still too blunt
+for mobile resource goals.
