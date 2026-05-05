@@ -19895,3 +19895,60 @@ faster than Kubo at root p50/p95 and asset p50/p95 while still using far less
 RSS and fewer file descriptors. The remaining follow-up is resource-oriented:
 watch longer page sessions to make sure the lower HTTP self-hedge threshold does
 not steadily increase Bitswap connections or duplicate HTTP bytes.
+
+## 2026-05-05 Soak: Warm Same-Daemon `ipfs.tech` After 250ms Self-Hedge
+
+Question:
+After the lower single HTTP self-hedge threshold, does a warm same-daemon
+`ipfs.tech` page workload show FD/RSS growth or hot-path latency drift?
+
+Command:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --warmup-runs 1 \
+  --repeat 30 \
+  --asset-concurrency 6 \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-warm-same-daemon-post-250-soak-r30-trace.jsonl \
+  --output /tmp/ipfs-tech-warm-same-daemon-post-250-soak-r30.json
+```
+
+Result:
+
+- Passed: `30/30`.
+- Run total p50/p90/p95/max: `20/26/44/89ms`.
+- Root TTFB p50/p90/p95/max: `1/2/5/43ms`.
+- Asset TTFB p50/p90/p95/max: `2/3/4/10ms`.
+- Gateway RSS p50/p90/p95/max: `53248/53248/53248/53248KiB`.
+- Gateway FD p50/p90/p95/max: `31/31/32/32`.
+- Per-run totals after the first measured runs settled around `19-23ms`.
+- Per-run RSS stayed between `52992KiB` and `53248KiB`.
+- Per-run FDs stayed between `30` and `32`.
+
+Trace summary:
+
+- Trace path:
+  `/tmp/ipfs-tech-warm-same-daemon-post-250-soak-r30-trace.jsonl`.
+- JSON output:
+  `/tmp/ipfs-tech-warm-same-daemon-post-250-soak-r30.json`.
+- Trace includes the warmup plus measured runs.
+- Gateway statuses: `200=837`, `206=186`, limiter denials `0`.
+- Block sources during warm fill: `http_provider=25`, `bitswap=15`.
+- HTTP-provider self-hedges: `5`, all in the warm-fill window.
+- Delegated self-hedges: `0`.
+- Bitswap connections established: `6`.
+- Hot measured groups after the initial fill were cache-local, with page group
+  max events generally in the low single-digit milliseconds.
+
+Decision:
+Keep as the post-250ms resource guardrail. The lower self-hedge threshold does
+not leave obvious hot-path latency drift or FD/RSS growth in this 30-run
+same-daemon page soak. Future longer soaks should still track duplicate HTTP
+bytes and Bitswap connection lifetime, but this sample does not show immediate
+mobile-resource regression.
