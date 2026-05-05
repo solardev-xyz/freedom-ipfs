@@ -934,7 +934,7 @@ fn print_summary(report: &RunReport) {
         if trace.bitswap_session.has_events() {
             let session = &trace.bitswap_session;
             println!(
-                "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_starts={} shortcut_post_lookup_waits={} post_lookup_hits={} post_lookup_misses={} post_lookup_timeouts={} post_lookup_errors={} post_lookup_max={}ms post_lookup_budgets={} post_lookup_timeout_budgets={} post_lookup_http_counts={} shortcut_attempts={} shortcut_hits={} shortcut_misses={} late_peer_waits={} late_peer_hits={} late_peer_misses={} late_peer_max={}ms",
+                "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_starts={} shortcut_pre_lookup_waits={} pre_lookup_hits={} pre_lookup_misses={} pre_lookup_timeouts={} pre_lookup_max={}ms pre_lookup_budgets={} shortcut_post_lookup_waits={} post_lookup_hits={} post_lookup_misses={} post_lookup_timeouts={} post_lookup_errors={} post_lookup_max={}ms post_lookup_budgets={} post_lookup_timeout_budgets={} post_lookup_http_counts={} shortcut_attempts={} shortcut_hits={} shortcut_misses={} late_peer_waits={} late_peer_hits={} late_peer_misses={} late_peer_max={}ms",
                 session.fetches,
                 session.with_trusted_peers,
                 session.trusted_successes,
@@ -942,6 +942,14 @@ fn print_summary(report: &RunReport) {
                 session.trusted_failures,
                 session.request_timeouts_with_trusted,
                 session.session_shortcut_starts,
+                session.session_shortcut_pre_lookup_waits,
+                session.session_shortcut_pre_lookup_hits,
+                session.session_shortcut_pre_lookup_misses,
+                session.session_shortcut_pre_lookup_timeouts,
+                session.session_shortcut_pre_lookup_max_ms,
+                format_trace_counts(&sorted_trace_counts(
+                    session.session_shortcut_pre_lookup_budgets.clone()
+                )),
                 session.session_shortcut_post_lookup_waits,
                 session.session_shortcut_post_lookup_hits,
                 session.session_shortcut_post_lookup_misses,
@@ -969,6 +977,15 @@ fn print_summary(report: &RunReport) {
                 session.session_late_peer_misses,
                 session.session_late_peer_max_ms
             );
+            if session.session_shortcut_pre_lookup_waits > 0 {
+                println!(
+                    "    pre-lookup latency: elapsed={} hits={} misses={} timeouts={}",
+                    session.session_shortcut_pre_lookup_elapsed_ms,
+                    session.session_shortcut_pre_lookup_hit_elapsed_ms,
+                    session.session_shortcut_pre_lookup_miss_elapsed_ms,
+                    session.session_shortcut_pre_lookup_timeout_elapsed_ms
+                );
+            }
             if session.session_shortcut_post_lookup_waits > 0 {
                 println!(
                     "    post-lookup latency: elapsed={} hits={} timeouts={} single_http={} single_http_hits={} single_http_timeouts={}",
@@ -1281,7 +1298,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     if trace.bitswap_session.has_events() {
         let session = &trace.bitswap_session;
         println!(
-            "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_starts={} shortcut_post_lookup_waits={} post_lookup_hits={} post_lookup_misses={} post_lookup_timeouts={} post_lookup_errors={} post_lookup_max={}ms post_lookup_budgets={} post_lookup_timeout_budgets={} post_lookup_http_counts={} shortcut_attempts={} shortcut_hits={} shortcut_misses={} late_peer_waits={} late_peer_hits={} late_peer_misses={} late_peer_max={}ms",
+            "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_starts={} shortcut_pre_lookup_waits={} pre_lookup_hits={} pre_lookup_misses={} pre_lookup_timeouts={} pre_lookup_max={}ms pre_lookup_budgets={} shortcut_post_lookup_waits={} post_lookup_hits={} post_lookup_misses={} post_lookup_timeouts={} post_lookup_errors={} post_lookup_max={}ms post_lookup_budgets={} post_lookup_timeout_budgets={} post_lookup_http_counts={} shortcut_attempts={} shortcut_hits={} shortcut_misses={} late_peer_waits={} late_peer_hits={} late_peer_misses={} late_peer_max={}ms",
             session.fetches,
             session.with_trusted_peers,
             session.trusted_successes,
@@ -1289,6 +1306,14 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
             session.trusted_failures,
             session.request_timeouts_with_trusted,
             session.session_shortcut_starts,
+            session.session_shortcut_pre_lookup_waits,
+            session.session_shortcut_pre_lookup_hits,
+            session.session_shortcut_pre_lookup_misses,
+            session.session_shortcut_pre_lookup_timeouts,
+            session.session_shortcut_pre_lookup_max_ms,
+            format_trace_counts(&sorted_trace_counts(
+                session.session_shortcut_pre_lookup_budgets.clone()
+            )),
             session.session_shortcut_post_lookup_waits,
             session.session_shortcut_post_lookup_hits,
             session.session_shortcut_post_lookup_misses,
@@ -1316,6 +1341,15 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
             session.session_late_peer_misses,
             session.session_late_peer_max_ms
         );
+        if session.session_shortcut_pre_lookup_waits > 0 {
+            println!(
+                "    pre-lookup latency: elapsed={} hits={} misses={} timeouts={}",
+                session.session_shortcut_pre_lookup_elapsed_ms,
+                session.session_shortcut_pre_lookup_hit_elapsed_ms,
+                session.session_shortcut_pre_lookup_miss_elapsed_ms,
+                session.session_shortcut_pre_lookup_timeout_elapsed_ms
+            );
+        }
         if session.session_shortcut_post_lookup_waits > 0 {
             println!(
                 "    post-lookup latency: elapsed={} hits={} timeouts={} single_http={} single_http_hits={} single_http_timeouts={}",
@@ -5467,6 +5501,16 @@ struct TraceBitswapSessionAggregate {
     trusted_failures: usize,
     request_timeouts_with_trusted: usize,
     session_shortcut_starts: usize,
+    session_shortcut_pre_lookup_waits: usize,
+    session_shortcut_pre_lookup_hits: usize,
+    session_shortcut_pre_lookup_misses: usize,
+    session_shortcut_pre_lookup_timeouts: usize,
+    session_shortcut_pre_lookup_elapsed_ms: LatencySummary,
+    session_shortcut_pre_lookup_hit_elapsed_ms: LatencySummary,
+    session_shortcut_pre_lookup_miss_elapsed_ms: LatencySummary,
+    session_shortcut_pre_lookup_timeout_elapsed_ms: LatencySummary,
+    session_shortcut_pre_lookup_max_ms: u128,
+    session_shortcut_pre_lookup_budgets: BTreeMap<String, usize>,
     session_shortcut_post_lookup_waits: usize,
     session_shortcut_post_lookup_hits: usize,
     session_shortcut_post_lookup_misses: usize,
@@ -5493,6 +5537,14 @@ struct TraceBitswapSessionAggregate {
     session_late_peer_miss_elapsed_ms: LatencySummary,
     session_late_peer_max_ms: u128,
     #[serde(skip)]
+    session_shortcut_pre_lookup_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    session_shortcut_pre_lookup_hit_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    session_shortcut_pre_lookup_miss_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    session_shortcut_pre_lookup_timeout_elapsed_values: Vec<u128>,
+    #[serde(skip)]
     session_shortcut_post_lookup_elapsed_values: Vec<u128>,
     #[serde(skip)]
     session_shortcut_post_lookup_hit_elapsed_values: Vec<u128>,
@@ -5516,12 +5568,25 @@ impl TraceBitswapSessionAggregate {
     fn has_events(&self) -> bool {
         self.fetches > 0
             || self.session_shortcut_starts > 0
+            || self.session_shortcut_pre_lookup_waits > 0
             || self.session_shortcut_post_lookup_waits > 0
             || self.session_shortcut_attempts > 0
             || self.session_late_peer_waits > 0
     }
 
     fn finish(&mut self) {
+        self.session_shortcut_pre_lookup_elapsed_ms = LatencySummary::from_values(std::mem::take(
+            &mut self.session_shortcut_pre_lookup_elapsed_values,
+        ));
+        self.session_shortcut_pre_lookup_hit_elapsed_ms = LatencySummary::from_values(
+            std::mem::take(&mut self.session_shortcut_pre_lookup_hit_elapsed_values),
+        );
+        self.session_shortcut_pre_lookup_miss_elapsed_ms = LatencySummary::from_values(
+            std::mem::take(&mut self.session_shortcut_pre_lookup_miss_elapsed_values),
+        );
+        self.session_shortcut_pre_lookup_timeout_elapsed_ms = LatencySummary::from_values(
+            std::mem::take(&mut self.session_shortcut_pre_lookup_timeout_elapsed_values),
+        );
         self.session_shortcut_post_lookup_elapsed_ms = LatencySummary::from_values(std::mem::take(
             &mut self.session_shortcut_post_lookup_elapsed_values,
         ));
@@ -6447,6 +6512,61 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         }
         if phase == "bitswap_session_shortcut_start" {
             bitswap_session.session_shortcut_starts += 1;
+        }
+        if phase == "bitswap_session_shortcut_pre_lookup" {
+            bitswap_session.session_shortcut_pre_lookup_waits += 1;
+            let outcome = value
+                .get("outcome")
+                .and_then(|outcome| outcome.as_str())
+                .unwrap_or("timeout");
+            let pre_lookup_elapsed_ms = value.get("elapsed_ms").and_then(json_u128).or_else(|| {
+                if outcome == "timeout" {
+                    value.get("timeout_ms").and_then(json_u128)
+                } else {
+                    None
+                }
+            });
+            bitswap_session.session_shortcut_pre_lookup_max_ms = bitswap_session
+                .session_shortcut_pre_lookup_max_ms
+                .max(pre_lookup_elapsed_ms.unwrap_or_default());
+            if let Some(elapsed_ms) = pre_lookup_elapsed_ms {
+                bitswap_session
+                    .session_shortcut_pre_lookup_elapsed_values
+                    .push(elapsed_ms);
+            }
+            match outcome {
+                "hit" => {
+                    bitswap_session.session_shortcut_pre_lookup_hits += 1;
+                    if let Some(elapsed_ms) = pre_lookup_elapsed_ms {
+                        bitswap_session
+                            .session_shortcut_pre_lookup_hit_elapsed_values
+                            .push(elapsed_ms);
+                    }
+                }
+                "miss" => {
+                    bitswap_session.session_shortcut_pre_lookup_misses += 1;
+                    if let Some(elapsed_ms) = pre_lookup_elapsed_ms {
+                        bitswap_session
+                            .session_shortcut_pre_lookup_miss_elapsed_values
+                            .push(elapsed_ms);
+                    }
+                }
+                "timeout" => {
+                    bitswap_session.session_shortcut_pre_lookup_timeouts += 1;
+                    if let Some(elapsed_ms) = pre_lookup_elapsed_ms {
+                        bitswap_session
+                            .session_shortcut_pre_lookup_timeout_elapsed_values
+                            .push(elapsed_ms);
+                    }
+                }
+                _ => {}
+            }
+            if let Some(timeout_ms) = value.get("timeout_ms").and_then(json_u128) {
+                *bitswap_session
+                    .session_shortcut_pre_lookup_budgets
+                    .entry(timeout_ms.to_string())
+                    .or_default() += 1;
+            }
         }
         if phase == "bitswap_session_shortcut_post_lookup_wait" {
             bitswap_session.session_shortcut_post_lookup_waits += 1;
@@ -7547,6 +7667,7 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         | "bitswap_dial_plan"
         | "bitswap_session_shortcut"
         | "bitswap_session_shortcut_start"
+        | "bitswap_session_shortcut_pre_lookup"
         | "bitswap_session_late_peer_wait"
         | "bitswap_session_shortcut_post_lookup_wait" => "fetching_bitswap",
         "bitswap_fetch_cancelled" => "cancelled",
@@ -10141,6 +10262,110 @@ mod tests {
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_http_provider"),
             12
+        );
+    }
+
+    #[test]
+    fn trace_summary_counts_pre_lookup_wait_outcomes() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-pre-lookup-wait-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"bitswap_session_shortcut_pre_lookup\",\"cid\":\"cid-a\",\"outcome\":\"hit\",\"timeout_ms\":50,\"elapsed_ms\":41}\n",
+                "{\"phase\":\"bitswap_session_shortcut_pre_lookup\",\"cid\":\"cid-b\",\"outcome\":\"miss\",\"timeout_ms\":50,\"elapsed_ms\":12}\n",
+                "{\"phase\":\"bitswap_session_shortcut_pre_lookup\",\"cid\":\"cid-c\",\"outcome\":\"timeout\",\"timeout_ms\":50,\"elapsed_ms\":51}\n",
+                "{\"phase\":\"bitswap_session_shortcut_pre_lookup\",\"cid\":\"cid-d\",\"outcome\":\"timeout\",\"timeout_ms\":75}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(summary.bitswap_session.session_shortcut_pre_lookup_waits, 4);
+        assert_eq!(summary.bitswap_session.session_shortcut_pre_lookup_hits, 1);
+        assert_eq!(
+            summary.bitswap_session.session_shortcut_pre_lookup_misses,
+            1
+        );
+        assert_eq!(
+            summary.bitswap_session.session_shortcut_pre_lookup_timeouts,
+            2
+        );
+        assert_eq!(
+            summary.bitswap_session.session_shortcut_pre_lookup_max_ms,
+            75
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_pre_lookup_elapsed_ms
+                .count,
+            4
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_pre_lookup_elapsed_ms
+                .p50_ms,
+            Some(41)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_pre_lookup_hit_elapsed_ms
+                .p50_ms,
+            Some(41)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_pre_lookup_miss_elapsed_ms
+                .p50_ms,
+            Some(12)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_pre_lookup_timeout_elapsed_ms
+                .p50_ms,
+            Some(51)
+        );
+        assert_eq!(
+            trace_value_count(
+                &sorted_trace_counts(
+                    summary
+                        .bitswap_session
+                        .session_shortcut_pre_lookup_budgets
+                        .clone()
+                ),
+                "50"
+            ),
+            3
+        );
+        assert_eq!(
+            trace_value_count(
+                &sorted_trace_counts(
+                    summary
+                        .bitswap_session
+                        .session_shortcut_pre_lookup_budgets
+                        .clone()
+                ),
+                "75"
+            ),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "fetching_bitswap"),
+            4
         );
     }
 

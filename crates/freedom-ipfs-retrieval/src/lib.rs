@@ -512,6 +512,7 @@ impl HttpRetriever {
                             .await
                     };
                     tokio::pin!(shortcut);
+                    let pre_lookup_started = Instant::now();
                     match timeout(BITSWAP_SESSION_PRE_LOOKUP_GRACE, &mut shortcut).await {
                         Ok(shortcut_result) => {
                             if let Some(block) = shortcut_result? {
@@ -519,7 +520,8 @@ impl HttpRetriever {
                                     phase = "bitswap_session_shortcut_pre_lookup",
                                     cid = %cid,
                                     timeout_ms = BITSWAP_SESSION_PRE_LOOKUP_GRACE.as_millis(),
-                                    outcome = "hit"
+                                    outcome = "hit",
+                                    elapsed_ms = pre_lookup_started.elapsed().as_millis()
                                 );
                                 return Ok((block, RetrievalSource::Bitswap));
                             }
@@ -527,7 +529,8 @@ impl HttpRetriever {
                                 phase = "bitswap_session_shortcut_pre_lookup",
                                 cid = %cid,
                                 timeout_ms = BITSWAP_SESSION_PRE_LOOKUP_GRACE.as_millis(),
-                                outcome = "miss"
+                                outcome = "miss",
+                                elapsed_ms = pre_lookup_started.elapsed().as_millis()
                             );
                             let routing_started = Instant::now();
                             match self.routing.providers(cid).await {
@@ -548,7 +551,8 @@ impl HttpRetriever {
                                 phase = "bitswap_session_shortcut_pre_lookup",
                                 cid = %cid,
                                 timeout_ms = BITSWAP_SESSION_PRE_LOOKUP_GRACE.as_millis(),
-                                outcome = "timeout"
+                                outcome = "timeout",
+                                elapsed_ms = pre_lookup_started.elapsed().as_millis()
                             );
                             let routing_started = Instant::now();
                             let provider_lookup = self.routing.providers(cid);

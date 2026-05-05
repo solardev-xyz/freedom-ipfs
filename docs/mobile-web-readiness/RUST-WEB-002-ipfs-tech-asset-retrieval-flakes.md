@@ -17248,3 +17248,114 @@ Decision:
 Keep. This is diagnostics plus mobile progress classification only. It preserves
 read-only behavior, avoids public gateway fallback, keeps block verification
 unchanged, and keeps mobile resource usage low.
+
+## 2026-05-05 Keep: Summarize Session Pre-Lookup Wait Latencies
+
+Question:
+The seeded range trace showed raw child range fetches repeatedly hitting the
+recent-session peer path, but the pre-lookup wait event only reported the
+outcome and timeout budget. Without elapsed time and a harness summary, future
+retunes of the `50ms` pre-lookup grace require manual trace scanning and can
+easily repeat already rejected head-start experiments.
+
+Implementation:
+
+- Keep retrieval behavior unchanged.
+- Add `elapsed_ms` to `bitswap_session_shortcut_pre_lookup` events for hit,
+  miss, and timeout outcomes.
+- Extend the harness Bitswap session summary with pre-lookup wait counts,
+  outcomes, budget counts, max elapsed time, and latency summaries for all
+  waits/hits/misses/timeouts.
+- Map `bitswap_session_shortcut_pre_lookup` to the harness progress phase
+  `fetching_bitswap`.
+- Add a focused harness regression test, including backward-compatible timeout
+  handling for older traces without `elapsed_ms`.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_pre_lookup_wait_outcomes
+cargo test -p freedom-ipfs-retrieval recent_bitswap_peer_head_start_can_avoid_provider_lookup
+```
+
+Focused result:
+
+- Formatting passed.
+- Focused pre-lookup harness summary test passed.
+- Focused retrieval session head-start test passed.
+
+Live seeded comparison:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-prelookup-latency-summary-r3-trace.jsonl \
+  --comparison-output /tmp/harness-prelookup-latency-summary-r3.json
+```
+
+Live result:
+
+- Rust and Kubo both passed `3/3`.
+- Rust root TTFB p50/p95: `193ms` / `310ms`.
+- Kubo root TTFB p50/p95: `53ms` / `58ms`.
+- Max RSS/FD: Rust `40572KiB` / `13`; Kubo `90840KiB` / `37`.
+- Block range batch fetches: `events=6`, `bytes=900`,
+  elapsed p50/p90/p95/max `75ms` / `221ms` / `221ms` / `221ms`.
+- Pre-lookup waits: `6`, hits `0`, misses `0`, timeouts `6`,
+  budget `50=6`.
+- Pre-lookup elapsed p50/p90/p95/max:
+  `51ms` / `52ms` / `52ms` / `52ms`.
+- Post-lookup waits: `6`, hits `5`, timeouts `1`,
+  budget `100=6`, timeout budget `100=1`.
+- Post-lookup hit elapsed p50/p90/p95/max:
+  `19ms` / `51ms` / `51ms` / `51ms`.
+- One run had a child range tail: `block_range_batch_fetch=221ms`,
+  `bitswap_fetch_cancelled=154ms`, and request elapsed `307ms`.
+
+Interpretation:
+
+- The current `50ms` pre-lookup grace consistently expires before this seeded
+  child range path finishes. Most requests still succeed during post-lookup,
+  but this run caught one tail where the shortcut did not win inside the
+  post-lookup budget.
+- This supports measuring the distribution before any future retune. It does
+  not by itself justify lengthening the grace: earlier `100ms` range head-start
+  and multi-want range hooks had weak or unstable repeat evidence.
+- Future work should use this summary to separate "pre-lookup always too short"
+  from "Bitswap child fetch itself is tailing", then retune only with repeated
+  p95 evidence across seeded and public page/range workloads.
+
+Final validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo test -p freedom-ipfs-retrieval
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting passed.
+- Full mobile web harness suite passed: `37 passed`.
+- Full retrieval suite passed: `72 passed`, `1 ignored`.
+- Workspace check passed.
+- Workspace clippy passed with `-D warnings`.
+- Diff whitespace check passed.
+
+Decision:
+Keep. This is diagnostics-only: no provider policy change, no public gateway
+fallback, no cache contract change, and no block verification change.
