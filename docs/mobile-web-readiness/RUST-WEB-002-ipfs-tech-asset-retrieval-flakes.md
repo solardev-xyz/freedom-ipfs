@@ -8012,3 +8012,45 @@ Decision: reject and revert. The temporary change preserved reliability, but
 the same-window baseline was better on root p50/p95, asset p50/p95, RSS, FD, and
 dial pressure. The initial apparent asset-tail win was network-window noise, not
 evidence to keep the filtering behavior.
+
+## 2026-05-05 Current Daicowtf Sparse-Provider Refresh
+
+Command:
+
+```sh
+timeout 420s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/daicowtf-current-refresh-trace.jsonl \
+  --comparison-output /tmp/daicowtf-current-refresh.json
+```
+
+Result:
+
+- Rust and Kubo both failed `3/3`.
+- Root TTFB p50/p95: Rust `10934/27084ms`, Kubo `30003/30003ms`.
+- Max RSS/FD: Rust `44672KiB`/`17`, Kubo `153280KiB`/`193`.
+- Rust delegated provider lookup summary: `events=7`, `successes=7`,
+  `failures=0`, `providers=3`, `max_elapsed_ms=161`.
+- DHT fallback failed on all three low-diversity attempts:
+  `provider_lookup: dht: the request timed out=3`.
+- Bitswap delivery from the one delegated peer succeeded for three tiny blocks
+  quickly: source peer
+  `12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP`, total `244ms`,
+  max `95ms`, transports `tcp=2`, `quic=1`.
+- The failing child CID was
+  `bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u`; the only
+  useful provider opened streams but did not return the requested block.
+- Incoming stream reads timed out three times at about `6001ms`.
+
+Conclusion:
+This remains a public-network sparse/stale-provider case, not a Rust-only
+regression. Kubo failed every run and used substantially more resources. Keep
+`daicowtf-page-assets` as an opt-in provider-quality target. The likely future
+work is better provider diversity/fallback for sparse roots, not gateway or
+UnixFS serving changes.
