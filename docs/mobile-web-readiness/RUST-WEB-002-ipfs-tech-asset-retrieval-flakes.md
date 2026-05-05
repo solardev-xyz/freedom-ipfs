@@ -5918,3 +5918,37 @@ gateway/UnixFS work, with progress phases:
 ```text
 streaming=7, completed=1, queued=1, started=1
 ```
+
+Follow-up live IPNS/DNSLink replay:
+
+```sh
+rm -f /tmp/freedom-ipfs-offline-replay-ipfs-tech.db \
+  /tmp/freedom-ipfs-offline-replay-ipfs-tech.db-* \
+  /tmp/ipfs-tech-offline-replay*.json \
+  /tmp/ipfs-tech-offline-replay*.jsonl
+cargo run -p mobile-web-harness -- --case ipfs-tech-page-assets \
+  --repeat 1 --asset-concurrency 6 --run-timeout-secs 120 \
+  --gateway-db /tmp/freedom-ipfs-offline-replay-ipfs-tech.db \
+  --offline-replay \
+  --trace-output /tmp/ipfs-tech-offline-replay-trace.jsonl \
+  --output /tmp/ipfs-tech-offline-replay.json
+```
+
+Result: online passed `1/1`, offline failed `0/1`, `missing_urls=1`. The
+missing URL was the root `/ipns/ipfs.tech/`, with status `404`. The online trace
+resolved `ipfs.tech` to
+`/ipfs/bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq`; the
+offline trace then failed at `name_resolve` with
+`dnslink record not found for ipfs.tech` before any block lookup. Evidence:
+
+- `/tmp/ipfs-tech-offline-replay.json`
+- `/tmp/ipfs-tech-offline-replay-trace-online.jsonl` (`931` lines)
+- `/tmp/ipfs-tech-offline-replay-trace-offline.jsonl` (`4` lines)
+
+Conclusion: after warming, immutable `/ipfs` replay works for the tested range
+case, but an `/ipns`/DNSLink URL does not currently replay offline after a
+process restart because name resolution state is not persisted or rewritten to
+the resolved `/ipfs` target. This gives three concrete follow-up options:
+persist bounded successful name resolutions, let the host app replay the
+resolved `/ipfs` URL offline, or improve the offline `/ipns` error page with the
+missing-name cause.
