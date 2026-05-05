@@ -167,10 +167,10 @@ latencies, and the slowest member requests. Trace errors are grouped by phase
 and sanitized error string so provider-quality runs can show repeated
 DHT/Bitswap failure signatures without manual JSONL greps.
 HTTP-provider race summaries include race width, candidate counts, hedge counts,
-attempted provider counts, race result latency, and whether successful races
-were won by a candidate inside the initial race width. This is the preferred
-signal for deciding whether wider or selective HTTP-provider races are worth
-their mobile resource cost.
+attempted provider counts, winner rank buckets, race result latency, and whether
+successful races were won by a candidate inside the initial race width. This is
+the preferred signal for deciding whether wider or selective HTTP-provider
+races are worth their mobile resource cost.
 Bitswap session shortcut summaries include both started shortcut races and
 completed shortcut attempts, which makes hidden dropped background work visible
 when tuning recent-peer races. `bitswap_session_shortcut_post_lookup_wait`

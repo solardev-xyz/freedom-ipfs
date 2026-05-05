@@ -15706,8 +15706,8 @@ Implementation:
 - On failure, include provider count, race width, attempted provider count,
   failed provider count, hedge status, and elapsed time.
 - Extend the harness `http_provider_races` summary with result counts,
-  winner-inside-initial-width counts, late-winner counts, max winner rank, max
-  attempted providers, and max race-result elapsed time.
+  winner-inside-initial-width counts, late-winner counts, winner rank buckets,
+  max winner rank, max attempted providers, and max race-result elapsed time.
 - Map the new raw phase to `fetching_http_provider` in both the harness
   progress summary and the mobile progress snapshot so this remains a
   diagnostic detail, not a new app-facing loading state.
@@ -15759,7 +15759,8 @@ Live result:
   `21` single-provider races, `14` multi-provider races, `14` races above the
   race width, race width max `2`, provider count max `3`, `2` hedges,
   `35` race results, `35` successes, `0` failures, `35` winners inside the
-  initial race width, `0` late winners, max winner rank `2`, max attempted
+  initial race width, `0` late winners, `34` rank-1 winners, `1` rank-2
+  winner, `0` rank-3-or-later winners, max winner rank `2`, max attempted
   provider count `3`, max race-result elapsed `775ms`.
 - HTTP-provider fetch p50/p95/max: `166ms` / `671ms` / `775ms`.
 - Provider spread: `ipfs-bridge.sia.dev=21`, `dag.w3s.link=14`.

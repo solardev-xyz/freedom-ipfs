@@ -1547,7 +1547,7 @@ fn print_trace_http_provider_races(trace: &TraceSummary) {
         return;
     }
     println!(
-        "  http provider races: events={} providers={} single={} multi={} above_width={} race_width_max={} max_provider_count={} scored_events={} scored_providers={} max_scored={} hedges={} hedge_pending_max={} hedge_remaining_max={} results={} result_ok={} result_fail={} winner_initial={} winner_late={} winner_rank_max={} attempted_max={} result_elapsed_max={}ms",
+        "  http provider races: events={} providers={} single={} multi={} above_width={} race_width_max={} max_provider_count={} scored_events={} scored_providers={} max_scored={} hedges={} hedge_pending_max={} hedge_remaining_max={} results={} result_ok={} result_fail={} winner_initial={} winner_late={} winner_rank1={} winner_rank2={} winner_rank3_plus={} winner_rank_max={} attempted_max={} result_elapsed_max={}ms",
         race.events,
         race.provider_count_total,
         race.single_provider_events,
@@ -1566,6 +1566,9 @@ fn print_trace_http_provider_races(trace: &TraceSummary) {
         race.result_failures,
         race.winner_initial_width_events,
         race.winner_late_events,
+        race.winner_rank1_events,
+        race.winner_rank2_events,
+        race.winner_rank3_plus_events,
         race.max_winner_provider_rank,
         race.max_attempted_provider_count,
         race.max_result_elapsed_ms
@@ -4482,6 +4485,9 @@ struct TraceHttpProviderRaceAggregate {
     result_failures: usize,
     winner_initial_width_events: usize,
     winner_late_events: usize,
+    winner_rank1_events: usize,
+    winner_rank2_events: usize,
+    winner_rank3_plus_events: usize,
     max_winner_provider_rank: u128,
     max_attempted_provider_count: u128,
     max_result_elapsed_ms: u128,
@@ -4535,6 +4541,12 @@ impl TraceHttpProviderRaceAggregate {
                 self.result_successes += 1;
                 let winner_rank = trace_count_field(value, "winner_provider_rank");
                 self.max_winner_provider_rank = self.max_winner_provider_rank.max(winner_rank);
+                match winner_rank {
+                    1 => self.winner_rank1_events += 1,
+                    2 => self.winner_rank2_events += 1,
+                    rank if rank > 2 => self.winner_rank3_plus_events += 1,
+                    _ => {}
+                }
                 if value
                     .get("winner_within_initial_width")
                     .and_then(|within| within.as_bool())
@@ -9233,6 +9245,9 @@ mod tests {
         assert_eq!(summary.http_provider_races.result_failures, 1);
         assert_eq!(summary.http_provider_races.winner_initial_width_events, 1);
         assert_eq!(summary.http_provider_races.winner_late_events, 0);
+        assert_eq!(summary.http_provider_races.winner_rank1_events, 0);
+        assert_eq!(summary.http_provider_races.winner_rank2_events, 1);
+        assert_eq!(summary.http_provider_races.winner_rank3_plus_events, 0);
         assert_eq!(summary.http_provider_races.max_winner_provider_rank, 2);
         assert_eq!(summary.http_provider_races.max_attempted_provider_count, 4);
         assert_eq!(summary.http_provider_races.max_result_elapsed_ms, 300);
