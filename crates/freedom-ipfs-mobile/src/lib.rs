@@ -532,6 +532,12 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         "name_persistent_cache" => "resolving_name",
         "name_resolve" if fields.get("ok").map(String::as_str) == Some("false") => "failed",
         "name_resolve" => "name_resolved",
+        "provider_cache"
+            if fields.get("cache_hit").map(String::as_str) == Some("true")
+                && fields.get("provider_count").map(String::as_str) == Some("0") =>
+        {
+            "failed"
+        }
         "provider_cache" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
             "providers_found"
         }
@@ -2112,6 +2118,18 @@ mod tests {
                 "active",
             ),
             "provider_lookup"
+        );
+        assert_eq!(
+            progress_phase(
+                "provider_cache",
+                &progress_fields([
+                    ("phase", "provider_cache"),
+                    ("cache_hit", "true"),
+                    ("provider_count", "0")
+                ]),
+                "active",
+            ),
+            "failed"
         );
         assert_eq!(
             progress_phase(

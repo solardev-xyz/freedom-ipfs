@@ -5653,6 +5653,7 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
             _ => "name_resolved",
         },
         "provider_cache" => match value.get("cache_hit").and_then(|hit| hit.as_bool()) {
+            Some(true) if value.get("provider_count").and_then(json_u128) == Some(0) => "failed",
             Some(true) => "providers_found",
             _ => "provider_lookup",
         },
@@ -6794,6 +6795,7 @@ mod tests {
                 "{\"phase\":\"name_persistent_cache\",\"name\":\"site.test\",\"cache_hit\":true,\"resolved_target\":\"/ipfs/root\"}\n",
                 "{\"phase\":\"name_resolve\",\"name\":\"site.test\",\"ok\":true,\"resolved_target\":\"/ipfs/root\"}\n",
                 "{\"phase\":\"provider_cache\",\"cid\":\"cid-a\",\"cache_hit\":false}\n",
+                "{\"phase\":\"provider_cache\",\"cid\":\"cid-z\",\"cache_hit\":true,\"provider_count\":0}\n",
                 "{\"phase\":\"provider_lookup\",\"cid\":\"cid-a\",\"provider_count\":3}\n",
                 "{\"phase\":\"delegated_provider_lookup\",\"cid\":\"cid-a\",\"endpoint\":\"https://delegated-ipfs.dev/routing/v1\",\"provider_count\":3,\"elapsed_ms\":8}\n",
                 "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid-a\",\"provider_count\":1,\"fallback\":\"light_dht\"}\n",
@@ -6874,7 +6876,7 @@ mod tests {
         assert_eq!(summary.gateway_direct_body.max_body_len, 4096);
         assert_eq!(trace_value_count(&summary.progress_phases, "retrying"), 4);
         assert_eq!(trace_value_count(&summary.progress_phases, "completed"), 1);
-        assert_eq!(trace_value_count(&summary.progress_phases, "failed"), 3);
+        assert_eq!(trace_value_count(&summary.progress_phases, "failed"), 4);
         assert_eq!(
             summary.provider_retries.skipped_empty_provider_set_events,
             1

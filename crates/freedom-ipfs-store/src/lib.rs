@@ -219,9 +219,6 @@ impl SqliteBlockStore {
         providers: &[CachedProviderRecord],
         ttl: Duration,
     ) -> Result<()> {
-        if providers.is_empty() {
-            return Ok(());
-        }
         let expires_at = now_secs().saturating_add(ttl.as_secs());
         let providers_json = serde_json::to_string(providers)?;
         self.conn.lock().execute(
@@ -860,6 +857,22 @@ mod tests {
                 }],
                 Duration::ZERO,
             )
+            .unwrap();
+        assert_eq!(store.get_provider_records(&cid).unwrap(), None);
+    }
+
+    #[test]
+    fn caches_empty_provider_records_until_ttl_expires() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let cid = cid_from_data(CODEC_RAW, b"empty provider cache key");
+
+        store
+            .put_provider_records(&cid, &[], Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(store.get_provider_records(&cid).unwrap(), Some(Vec::new()));
+
+        store
+            .put_provider_records(&cid, &[], Duration::ZERO)
             .unwrap();
         assert_eq!(store.get_provider_records(&cid).unwrap(), None);
     }

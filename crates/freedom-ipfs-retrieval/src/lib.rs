@@ -39,6 +39,7 @@ use tokio::time::timeout;
 use url::Url;
 
 const PROVIDER_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const PROVIDER_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const BAD_HTTP_PROVIDER_TTL: Duration = Duration::from_secs(10 * 60);
 const BAD_BITSWAP_PROVIDER_TTL: Duration = Duration::from_secs(30);
 const HTTP_PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -624,11 +625,7 @@ impl HttpRetriever {
             .into_iter()
             .map(|record| Provider::from_parts(record.id, record.addrs))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        if providers.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(providers))
-        }
+        Ok(Some(providers))
     }
 
     fn cache_providers(&self, cid: &Cid, providers: &[Provider]) -> Result<()> {
@@ -639,8 +636,12 @@ impl HttpRetriever {
                 addrs: provider.addrs.clone(),
             })
             .collect::<Vec<_>>();
-        self.store
-            .put_provider_records(cid, &records, PROVIDER_CACHE_TTL)?;
+        let ttl = if records.is_empty() {
+            PROVIDER_NEGATIVE_CACHE_TTL
+        } else {
+            PROVIDER_CACHE_TTL
+        };
+        self.store.put_provider_records(cid, &records, ttl)?;
         Ok(())
     }
 
@@ -4432,6 +4433,43 @@ mod bitswap_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn empty_provider_lookups_are_cached_briefly() {
+        let cid = freedom_ipfs_core::cid_from_data(
+            freedom_ipfs_core::CODEC_RAW,
+            b"negative provider cache",
+        );
+        let requests = Arc::new(AtomicU64::new(0));
+        let (endpoint, routing_task) =
+            spawn_counting_delegated_response(r#"{"Providers":[]}"#.to_string(), requests.clone())
+                .await;
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new(endpoint),
+            store,
+        );
+
+        let first = retriever
+            .fetch_block_uncached_with_source(&cid)
+            .await
+            .unwrap_err();
+        let second = retriever
+            .fetch_block_uncached_with_source(&cid)
+            .await
+            .unwrap_err();
+
+        assert!(
+            is_no_provider_error(&first),
+            "unexpected first error: {first:?}"
+        );
+        assert!(
+            is_no_provider_error(&second),
+            "unexpected second error: {second:?}"
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        routing_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn shared_bitswap_client_handles_repeated_block_fetches() {
         let first = b"first shared bitswap block";
         let second = b"second shared bitswap block";
@@ -6121,6 +6159,34 @@ mod bitswap_tests {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
+                let mut request = vec![0u8; 4096];
+                if stream.read(&mut request).await.is_err() {
+                    continue;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (endpoint, task)
+    }
+
+    async fn spawn_counting_delegated_response(
+        body: String,
+        requests: Arc<AtomicU64>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let endpoint = format!("http://{addr}/routing/v1");
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                requests.fetch_add(1, Ordering::Relaxed);
                 let mut request = vec![0u8; 4096];
                 if stream.read(&mut request).await.is_err() {
                     continue;

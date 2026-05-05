@@ -9055,3 +9055,98 @@ Deterministic validation:
 - `cargo check --workspace --all-targets`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `git diff --check`
+
+## 2026-05-05 Keep: Short Negative Provider Cache
+
+Hypothesis:
+After the empty-provider refresh skip, repeated requests for the same sparse
+child CID still paid repeated delegated/DHT lookup cost because empty provider
+sets were not cached. This showed up in `daicowtf-page-assets`: the failing child
+CID could repeat a `3000ms` DHT lookup on immediate retries even though the
+previous lookup had just found no providers.
+
+Implementation:
+
+- Allow the provider cache to store an empty provider list.
+- Cache empty provider lookups for `30s`, while keeping non-empty provider
+  records at the existing `5min` TTL.
+- Treat `provider_cache cache_hit=true provider_count=0` as a failed/no-provider
+  progress phase in mobile and harness summaries.
+- Keep this scoped to provider discovery only: it does not serve content,
+  bypass verification, add public gateway fallback, or cache failed block bytes.
+
+Experiment commands:
+
+```sh
+cargo test -p freedom-ipfs-store caches_empty_provider_records_until_ttl_expires
+cargo test -p freedom-ipfs-retrieval empty_provider_lookups_are_cached_briefly
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+
+timeout 240s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/daicowtf-negative-provider-cache-r3-trace.jsonl \
+  --output /tmp/daicowtf-negative-provider-cache-r3.json
+
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --timeout-secs 90 \
+  --run-timeout-secs 90 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-negative-provider-cache-trace.jsonl \
+  --output /tmp/vitalik-negative-provider-cache.json
+
+timeout 240s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-negative-provider-cache-trace.jsonl \
+  --output /tmp/ipfs-tech-negative-provider-cache.json
+```
+
+Results:
+
+- Deterministic store/retrieval/mobile/harness focused tests passed. The
+  retrieval test proves the second same-CID empty provider miss does not call
+  delegated routing again.
+- `daicowtf-page-assets` still failed `0/3`, but the third immediate retry used
+  the cached empty provider result and failed in `3ms` instead of repeating
+  another `3000ms` DHT lookup. Root p50/p95/max was `3028/4000/4000ms`, RSS max
+  `47872KiB`, FD max `17`. DHT provider lookup events fell to `3` across the
+  three runs; the third request had `provider_cache=1` and no provider/DHT
+  lookup.
+- `vitalik-root-html-range` passed `1/1` with root TTFB `2033ms`, RSS
+  `38656KiB`, FD count `20`, no DHT provider lookups, and delegated lookup max
+  `57ms`.
+- `ipfs-tech-page-assets` passed `1/1`; root TTFB was `2580ms`, asset
+  p50/p95/max was `182/2043/2214ms`, RSS was `51740KiB`, and FD count was `44`.
+  This was a slow network window with many successful Bitswap fetches; there
+  were no DHT provider lookups and no failed requests.
+
+Decision: keep. A short negative provider cache is a resource and latency win
+for immediate retries/page reloads against sparse CIDs. The `30s` TTL limits the
+risk that newly appearing provider records remain hidden for too long, while
+removing repeated DHT work within the same user-visible failure window.
+
+Deterministic validation:
+
+- `cargo fmt --all --check`
+- `cargo test -p freedom-ipfs-store`
+- `cargo test -p freedom-ipfs-retrieval`
+- `cargo test -p freedom-ipfs-mobile`
+- `cargo test -p mobile-web-harness`
+- `cargo check --workspace --all-targets`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `git diff --check`
