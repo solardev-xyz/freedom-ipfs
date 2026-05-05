@@ -27,6 +27,9 @@ use tracing::Instrument;
 
 pub const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 const GATEWAY_STREAM_CHUNK_SIZE: u64 = 64 * 1024;
+const X_FREEDOM_REQUEST_ID: &str = "x-freedom-request-id";
+const X_FREEDOM_PARENT_REQUEST_ID: &str = "x-freedom-parent-request-id";
+const X_FREEDOM_TOP_LEVEL_PATH: &str = "x-freedom-top-level-path";
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -222,10 +225,16 @@ async fn ipfs_get(
     let process_id = std::process::id();
     let request_path = format!("/ipfs/{path}");
     let range = header_value_for_trace(headers.get(RANGE));
+    let progress_request_id = header_u64_for_trace(&headers, X_FREEDOM_REQUEST_ID);
+    let parent_request_id = header_u64_for_trace(&headers, X_FREEDOM_PARENT_REQUEST_ID);
+    let top_level_path = header_value_for_trace(headers.get(X_FREEDOM_TOP_LEVEL_PATH));
     let span = tracing::info_span!(
         "gateway_request",
         process_id,
         request_id,
+        progress_request_id = progress_request_id.unwrap_or_default(),
+        parent_request_id = parent_request_id.unwrap_or_default(),
+        top_level_path = %top_level_path,
         namespace = "ipfs",
         path = %request_path,
         range = %range
@@ -291,10 +300,16 @@ async fn ipns_get(
     let process_id = std::process::id();
     let request_path = format!("/ipns/{path}");
     let range = header_value_for_trace(headers.get(RANGE));
+    let progress_request_id = header_u64_for_trace(&headers, X_FREEDOM_REQUEST_ID);
+    let parent_request_id = header_u64_for_trace(&headers, X_FREEDOM_PARENT_REQUEST_ID);
+    let top_level_path = header_value_for_trace(headers.get(X_FREEDOM_TOP_LEVEL_PATH));
     let span = tracing::info_span!(
         "gateway_request",
         process_id,
         request_id,
+        progress_request_id = progress_request_id.unwrap_or_default(),
+        parent_request_id = parent_request_id.unwrap_or_default(),
+        top_level_path = %top_level_path,
         namespace = "ipns",
         path = %request_path,
         range = %range
@@ -357,6 +372,13 @@ fn header_value_for_trace(value: Option<&HeaderValue>) -> String {
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string()
+}
+
+fn header_u64_for_trace(headers: &HeaderMap, name: &'static str) -> Option<u64> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 async fn serve_ipfs_path(

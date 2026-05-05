@@ -5754,6 +5754,9 @@ Implementation:
   `cancelled` events.
 - Bound recent event history to `512` events and keep an active-target map for
   currently loading requests.
+- Carry optional gateway correlation headers into progress events:
+  `X-Freedom-Request-ID`, `X-Freedom-Parent-Request-ID`, and
+  `X-Freedom-Top-Level-Path`.
 - Expose:
   - `freedom_ipfs_node_progress_snapshot_json(node)`
   - `freedom_ipfs_node_clear_progress(node)`
@@ -5770,6 +5773,7 @@ Validation:
 cargo fmt --all --check
 cargo test -p freedom-ipfs-mobile progress_snapshot_records_gateway_request_phases
 cargo test -p freedom-ipfs-mobile
+cargo test -p freedom-ipfs-gateway --lib
 cargo test -p freedom-ipfs-retrieval --lib bitswap_fetch_caches_verified_extra_blocks
 cargo test -p freedom-ipfs-retrieval --lib
 cargo test -p freedom-ipfs-gateway
@@ -5784,6 +5788,5 @@ public gateway fallback, or mobile resource caps.
 Known follow-up:
 
 - Extend the live harness to collect progress snapshots during page loads.
-- Add request-header correlation (`X-Freedom-Request-ID` /
-  `X-Freedom-Top-Level-Path`) if Swift needs stronger top-level navigation
-  grouping than the default gateway request IDs.
+- Add richer page-load grouping semantics on top of the current request-header
+  correlation if Swift needs more than numeric parent/top-level IDs.

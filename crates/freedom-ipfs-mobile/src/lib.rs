@@ -109,6 +109,9 @@ pub struct FreedomIpfsDiagnostics {
 #[derive(Clone, Default)]
 struct ProgressSpanFields {
     request_id: Option<u64>,
+    progress_request_id: Option<u64>,
+    parent_request_id: Option<u64>,
+    top_level_path: Option<String>,
     namespace: Option<String>,
     path: Option<String>,
 }
@@ -129,8 +132,11 @@ struct ProgressInner {
 struct ProgressEvent {
     event_id: u64,
     target_id: u64,
+    request_id: Option<u64>,
+    parent_id: Option<u64>,
     kind: String,
     path: Option<String>,
+    top_level_path: Option<String>,
     namespace: Option<String>,
     phase: String,
     raw_phase: String,
@@ -149,8 +155,11 @@ struct ProgressEvent {
 #[derive(Clone, Serialize)]
 struct ProgressTarget {
     id: u64,
+    request_id: Option<u64>,
+    parent_id: Option<u64>,
     kind: String,
     path: Option<String>,
+    top_level_path: Option<String>,
     namespace: Option<String>,
     phase: String,
     status: String,
@@ -175,7 +184,17 @@ impl ProgressRecorder {
         let kind = progress_kind(&fields, &raw_phase, &span);
         let target_id = progress_target_id(&fields, &span);
         let path = fields.get("path").cloned().or(span.path);
+        let top_level_path = fields
+            .get("top_level_path")
+            .filter(|path| !path.is_empty())
+            .cloned()
+            .or(span.top_level_path);
         let namespace = fields.get("namespace").cloned().or(span.namespace);
+        let request_id = fields.get_u64("request_id").or(span.request_id);
+        let parent_id = fields
+            .get_u64("parent_request_id")
+            .filter(|id| *id != 0)
+            .or(span.parent_request_id);
         let status = progress_status(&raw_phase, &fields);
         let phase = progress_phase(&raw_phase, &fields, &status);
         let elapsed_ms = fields.get_u64("elapsed_ms");
@@ -198,8 +217,11 @@ impl ProgressRecorder {
         let event = ProgressEvent {
             event_id: inner.next_event_id,
             target_id,
+            request_id,
+            parent_id,
             kind: kind.clone(),
             path: path.clone(),
+            top_level_path: top_level_path.clone(),
             namespace: namespace.clone(),
             phase: phase.clone(),
             raw_phase: raw_phase.clone(),
@@ -231,8 +253,11 @@ impl ProgressRecorder {
                 target_key,
                 ProgressTarget {
                     id: target_id,
+                    request_id,
+                    parent_id,
                     kind,
                     path,
+                    top_level_path,
                     namespace,
                     phase,
                     status,
@@ -282,6 +307,12 @@ where
         attrs.record(&mut fields);
         let span_fields = ProgressSpanFields {
             request_id: fields.get_u64("request_id"),
+            progress_request_id: fields.get_u64("progress_request_id").filter(|id| *id != 0),
+            parent_request_id: fields.get_u64("parent_request_id").filter(|id| *id != 0),
+            top_level_path: fields
+                .get("top_level_path")
+                .filter(|path| !path.is_empty())
+                .cloned(),
             namespace: fields.get("namespace").cloned(),
             path: fields.get("path").cloned(),
         };
@@ -378,6 +409,8 @@ fn progress_kind(fields: &ProgressFields, raw_phase: &str, span: &ProgressSpanFi
 fn progress_target_id(fields: &ProgressFields, span: &ProgressSpanFields) -> u64 {
     fields
         .get_u64("preload_id")
+        .or_else(|| fields.get_u64("progress_request_id"))
+        .or(span.progress_request_id)
         .or_else(|| fields.get_u64("request_id"))
         .or(span.request_id)
         .or_else(|| fields.get_u64("task_id"))
@@ -1743,7 +1776,20 @@ mod tests {
             assert!(freedom_ipfs_node_start_gateway(node, addr.as_ptr()));
 
             let path = format!("/ipfs/{cid}");
-            assert_gateway_path(node, &path, data);
+            let top_level_path = format!("{path}?top=1");
+            let response = gateway_response_with_headers(
+                node,
+                &path,
+                &[
+                    ("X-Freedom-Request-ID", "4242"),
+                    ("X-Freedom-Parent-Request-ID", "7"),
+                    ("X-Freedom-Top-Level-Path", &top_level_path),
+                ],
+            );
+            assert!(
+                response.as_bytes().ends_with(data),
+                "response did not end with expected body: {response}"
+            );
 
             let snapshot = progress_snapshot_json(node);
             let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
@@ -1751,7 +1797,10 @@ mod tests {
             assert!(
                 events.iter().any(|event| event["path"] == path
                     && event["phase"] == "started"
-                    && event["kind"] == "gateway_request"),
+                    && event["kind"] == "gateway_request"
+                    && event["target_id"] == 4242
+                    && event["parent_id"] == 7
+                    && event["top_level_path"] == top_level_path),
                 "{snapshot}"
             );
             assert!(
@@ -2091,13 +2140,26 @@ mod tests {
     }
 
     unsafe fn gateway_response(node: *mut FreedomIpfsNode, path: &str) -> String {
+        gateway_response_with_headers(node, path, &[])
+    }
+
+    unsafe fn gateway_response_with_headers(
+        node: *mut FreedomIpfsNode,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> String {
         let url = gateway_url_string(node);
         assert!(url.starts_with("http://127.0.0.1:"));
 
         let addr = url.strip_prefix("http://").unwrap();
         let mut stream = std::net::TcpStream::connect(addr).unwrap();
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let extra_headers = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\n{extra_headers}Connection: close\r\n\r\n"
+        );
         stream.write_all(request.as_bytes()).unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();

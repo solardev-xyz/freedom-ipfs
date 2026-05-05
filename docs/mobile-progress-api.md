@@ -33,8 +33,11 @@ The returned string is owned by Rust and must be released with
     {
       "event_id": 18,
       "target_id": 1,
+      "request_id": 12,
+      "parent_id": null,
       "kind": "gateway_request",
       "path": "/ipfs/bafy...",
+      "top_level_path": "/ipfs/bafy...",
       "namespace": "ipfs",
       "phase": "fetching_bitswap",
       "raw_phase": "bitswap_fetch",
@@ -56,6 +59,15 @@ The returned string is owned by Rust and must be released with
 `events` is capped to the most recent 512 events. `active` contains currently
 active targets only; completed, failed, and cancelled targets remain visible in
 recent `events`.
+
+For gateway requests, Swift may pass optional correlation headers:
+
+- `X-Freedom-Request-ID`: unsigned integer used as `target_id`
+- `X-Freedom-Parent-Request-ID`: unsigned integer exposed as `parent_id`
+- `X-Freedom-Top-Level-Path`: copied into `top_level_path`
+
+When these headers are absent, the gateway's local request counter is used as
+the target id.
 
 ## Current Event Sources
 
@@ -101,4 +113,3 @@ The app should treat `phase` as the UI-facing state and keep `raw_phase`,
 - `retrying`: "Retrying slow provider"
 - `completed`: loaded
 - `failed`: failed
-
