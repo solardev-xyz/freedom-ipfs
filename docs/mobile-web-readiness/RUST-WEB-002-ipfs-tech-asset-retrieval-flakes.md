@@ -5125,3 +5125,70 @@ Decision: reject and revert. The run did not exercise the intended mixed-trusted
 burst; instead it regressed cold root retrieval badly. A reset cooldown is not a
 safe next step without a narrower trigger and stronger evidence that it only
 acts after a successful warm/session peer exists.
+
+## 2026-05-05 Rejected: Suppress Connection-Timeout Peers
+
+Hypothesis:
+
+- Bitswap read-timeout peers are temporarily suppressed, but
+  connection-ready-timeout peers are only counted for retry decisions.
+- Suppressing narrow connection-timeout peer sets with the same short bad-peer
+  TTL might reduce repeated dials to slow or unreachable peers without pruning
+  broad failures.
+
+Prototype:
+
+- Rename the timeout marking helper to cover failed peer sets.
+- Keep existing read-timeout suppression behavior.
+- Add `bitswap_peer_connection_timeout` and
+  `bitswap_peer_connection_timeout_suppressed` phases.
+- Mark narrow connection-timeout peers bad for the existing
+  `BAD_BITSWAP_PROVIDER_TTL`.
+- Preserve the broad-failure guard so mass connection timeout sets are not
+  suppressed.
+
+Validation before live rejection:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib bitswap_tests::single_bitswap_connection_timeout_peer_is_temporarily_suppressed
+cargo test -p freedom-ipfs-retrieval --lib bitswap_tests::single_bitswap_timeout_peer_is_temporarily_suppressed
+cargo test -p freedom-ipfs-retrieval --lib bitswap_tests::broad_bitswap_timeouts_are_not_mass_suppressed
+cargo build -p freedom-ipfs-gateway
+git diff --check
+```
+
+Prototype live run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-connection-timeout-suppression-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-connection-timeout-suppression-r3.json
+```
+
+Result: reject. Rust failed `0/3`; Kubo passed `3/3`. Rust root p50/p95 was
+`30516/30583ms` versus Kubo `1946/1980ms`; Rust did not reach successful asset
+fetches (`asset_ttfb=n/a`). Rust max RSS/FD was `37760KiB`/`21` versus Kubo
+`152664KiB`/`111`, again mostly because Rust failed early.
+
+Trace summary:
+
+- `bitswap timeout recovery: request_timeout_details=6 mixed_trusted=0
+  request_timeout_events=6 reset_true=6 reset_false=0 client_resets=6
+  retry_starts=3 same_provider_retries=2 refreshed_provider_retries=1
+  retry_successes=0 retry_failures=3`
+- `bitswap session request_timeouts_with_trusted=0`.
+- Trace errors were dominated by request-level timeouts and connection errors;
+  the prototype did not meaningfully exercise the new per-peer suppression path.
+
+Decision: reject and revert. The live failure shape was cold root request
+timeouts, not repeated per-peer connection-ready failures. Suppressing
+connection-timeout peers may still be useful later, but this run gives no
+evidence that it helps the current `ipfs.tech` failure mode.
