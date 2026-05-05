@@ -6420,3 +6420,38 @@ guardrail. The remaining `vitalik` gap is the initial mixed-trusted request
 timeout itself; future experiments should try to avoid waiting the full 4s when
 the trusted/session candidate is stale and untrusted candidates are already
 delivering nearby blocks.
+
+Rejected follow-up: `3500ms` mixed-trusted timeout under cap-3.
+
+```sh
+# Temporarily set BITSWAP_TRUSTED_MIXED_REQUEST_TIMEOUT to 3500ms.
+cargo build -p freedom-ipfs-gateway
+
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/vitalik-direct3-timeout3500-rust-vs-kubo-trace.jsonl \
+  --output /tmp/vitalik-direct3-timeout3500-rust-vs-kubo.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `6410/6685ms`, Kubo `1658/2161ms`.
+- Max RSS/FD: Rust `39296KiB`/`27`, Kubo `134176KiB`/`75`.
+- Trace: `request_timeout_details=3`, all `mixed_trusted`, all
+  `timeout_ms=3500`.
+- Retry recovery regressed versus the kept 4s cap-3 sample:
+  `retry_success_elapsed=p50=1320ms p95=1529ms max=1529ms`.
+- Target modes expanded to `want_block=12`, `want_have=19`, `max_want_block=4`,
+  `max_want_have=7`.
+
+Decision: reject and restore `4s`. The lower timeout fires earlier, but in this
+network window it caused a slower retry path and worse total TTFB than the kept
+4s cap-3 run. The remaining `vitalik` gap is not solved by shaving another
+500ms from the mixed-trusted request cap.
