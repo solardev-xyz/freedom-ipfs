@@ -3856,6 +3856,52 @@ mod bitswap_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn multi_want_stream_fetches_multiple_blocks_from_local_peer() {
+        let first_data = b"first local multi-want block";
+        let second_data = b"second local multi-want block";
+        let first = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, first_data);
+        let second = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, second_data);
+        let (peer_id, addr, peer_swarm_task, peer_stream_task) =
+            spawn_multi_want_bitswap_peer(vec![
+                (first, first_data.to_vec()),
+                (second, second_data.to_vec()),
+            ])
+            .await;
+
+        let mut swarm = build_bitswap_swarm().await.unwrap();
+        let mut control = swarm.behaviour().stream.new_control();
+        swarm
+            .dial(addr.with_p2p(peer_id).unwrap_or_else(|addr| addr))
+            .unwrap();
+        let swarm_task = tokio::spawn(async move {
+            loop {
+                let _ = swarm.select_next_some().await;
+            }
+        });
+
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            control.open_stream(peer_id, StreamProtocol::new("/ipfs/bitswap/1.2.0")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let result =
+            request_bitswap_blocks_on_stream(&mut stream, &[first, second], "/ipfs/bitswap/1.2.0")
+                .await
+                .unwrap();
+
+        assert_eq!(result.requested_blocks.get(&first).unwrap(), first_data);
+        assert_eq!(result.requested_blocks.get(&second).unwrap(), second_data);
+        tokio::time::timeout(Duration::from_secs(5), peer_stream_task)
+            .await
+            .unwrap()
+            .unwrap();
+        swarm_task.abort();
+        peer_swarm_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn fetches_block_from_local_bitswap_peer() {
         let data = b"local bitswap block";
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
@@ -5084,6 +5130,101 @@ mod bitswap_tests {
             let entry = cancel.wantlist.unwrap().entries.remove(0);
             assert_eq!(entry.block, cid.to_bytes());
             assert!(entry.cancel);
+        });
+
+        (peer_id, addr, swarm_task, stream_task)
+    }
+
+    async fn spawn_multi_want_bitswap_peer(
+        blocks: Vec<(Cid, Vec<u8>)>,
+    ) -> (
+        PeerId,
+        Multiaddr,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut swarm = SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                (tls::Config::new, noise::Config::new),
+                yamux::Config::default,
+            )
+            .unwrap()
+            .with_behaviour(|_| libp2p_stream::Behaviour::new())
+            .unwrap()
+            .build();
+        let peer_id = *swarm.local_peer_id();
+        let mut control = swarm.behaviour().new_control();
+        let mut incoming = control
+            .accept(StreamProtocol::new("/ipfs/bitswap/1.2.0"))
+            .unwrap();
+        swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let addr = loop {
+            if let libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } =
+                swarm.select_next_some().await
+            {
+                break address;
+            }
+        };
+
+        let swarm_task = tokio::spawn(async move {
+            loop {
+                let _ = swarm.select_next_some().await;
+            }
+        });
+        let stream_task = tokio::spawn(async move {
+            let block_map = blocks.into_iter().collect::<HashMap<_, _>>();
+            let (_peer, mut stream) = incoming.next().await.unwrap();
+            let want_bytes = read_length_prefixed(&mut stream, 1024).await.unwrap();
+            let want = BitswapMessage::decode(want_bytes.as_slice()).unwrap();
+            let entries = want.wantlist.unwrap().entries;
+            assert_eq!(entries.len(), block_map.len());
+            assert!(entries.iter().all(|entry| !entry.cancel));
+
+            let mut payload = Vec::new();
+            let mut requested = Vec::new();
+            for entry in entries {
+                let mut cid_bytes = entry.block.as_slice();
+                let cid = Cid::read_bytes(&mut cid_bytes).unwrap();
+                let data = block_map.get(&cid).expect("requested known block").clone();
+                requested.push(cid);
+                payload.push(BlockPayload {
+                    prefix: bitswap_payload_prefix(&cid),
+                    data,
+                    tokens: Vec::new(),
+                });
+            }
+            let response = BitswapMessage {
+                payload,
+                ..BitswapMessage::default()
+            };
+            write_length_prefixed(&mut stream, &response.encode_to_vec())
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+
+            let cancel_bytes = tokio::time::timeout(
+                Duration::from_secs(5),
+                read_length_prefixed(&mut stream, 1024),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let cancel = BitswapMessage::decode(cancel_bytes.as_slice()).unwrap();
+            let cancel_entries = cancel.wantlist.unwrap().entries;
+            assert_eq!(cancel_entries.len(), requested.len());
+            assert!(cancel_entries.iter().all(|entry| entry.cancel));
+            let cancelled = cancel_entries
+                .into_iter()
+                .map(|entry| {
+                    let mut cid_bytes = entry.block.as_slice();
+                    Cid::read_bytes(&mut cid_bytes).unwrap()
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(cancelled, requested.into_iter().collect::<BTreeSet<_>>());
         });
 
         (peer_id, addr, swarm_task, stream_task)

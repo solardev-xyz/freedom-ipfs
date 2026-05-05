@@ -4125,3 +4125,22 @@ events=105 total=27 max=3 incoming=27 outgoing=0 unknown=0`;
 max_oldest_pending_ms=1748`. This keeps pointing at inbound Bitswap delivery
 and verified extra blocks as the practical optimization surface, rather than
 completed outgoing stream reads.
+
+Priority-1 multi-want building block:
+
+- Add `multi_want_stream_fetches_multiple_blocks_from_local_peer`, which opens
+  a real local libp2p Bitswap stream, sends one WANT_BLOCK message containing
+  two CIDs, receives both verified payload blocks, and confirms the client sends
+  one cancel message covering both CIDs.
+- This does not change live page behavior yet. It establishes deterministic
+  loopback coverage for the existing multi-want stream machinery before wiring
+  any UnixFS or page-session batching into retrieval.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib multi_want_stream_fetches_multiple_blocks_from_local_peer
+cargo test -p freedom-ipfs-retrieval --lib
+git diff --check
+```
