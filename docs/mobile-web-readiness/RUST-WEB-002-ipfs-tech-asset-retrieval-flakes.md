@@ -14206,3 +14206,68 @@ need to preserve early HTTP-provider availability, for example by returning a
 partial provider set only when it contains both enough Bitswap diversity and at
 least one usable HTTP provider, or by racing Bitswap startup with continued
 delegated stream consumption instead of dropping the stream tail.
+
+## 2026-05-05 Reject: Return Streamed Delegated Results On Mixed Bitswap/HTTP Availability
+
+Hypothesis:
+The Bitswap-only early return was too aggressive because it dropped late HTTP
+providers. A narrower version might be safe if it only returned early after the
+streamed delegated response contained both:
+
+- at least `MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY` non-HTTP provider records
+- at least one HTTP provider URL
+
+Experiment:
+
+- Restore the existing HTTP-provider target of four providers.
+- Add a second early return condition for mixed availability:
+  Bitswap diversity plus at least one HTTP provider.
+- Add a focused test with two fast Bitswap provider records, one fast HTTP
+  provider record, and a delayed HTTP-provider tail.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing streamed
+```
+
+Result:
+
+- Focused streamed routing tests passed: `3 passed; 0 failed`.
+
+Live comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-streamed-mixed-target-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-streamed-mixed-target-r3.json
+```
+
+Live result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Root TTFB p50/p95: Rust `1505ms` / `2062ms`, Kubo `1809ms` / `2598ms`.
+- Asset TTFB p50/p95: Rust `272ms` / `1092ms`, Kubo `207ms` / `562ms`.
+- Rust max RSS/FD: `51584KiB` / `30`.
+- Delegated provider lookup max was still `5218ms`.
+- HTTP provider fetch p50/p95/max: `162ms` / `670ms` / `1187ms`.
+- Bitswap work increased: `112` fetching-bitswap progress events,
+  `29` Bitswap peer-attempt starts, and `14` shortcut starts.
+
+Decision:
+Reject and revert. This was reliable, but it did not fix the delegated-routing
+tail and it increased Bitswap work while asset p95 regressed versus the kept
+HTTP hedge sample (`584ms` -> `1092ms`). The trace shows the worst delegated
+event still waited for first HTTP provider availability at `5218ms`, so this
+condition does not address the problematic slow-provider-order case.
