@@ -8469,3 +8469,98 @@ Live result:
 
 Decision: keep. This is diagnostics-only and makes page-level tail analysis
 possible from normal JSON reports instead of one-off trace scripts.
+
+## 2026-05-05 Observe: Progress-Grouped Rust-vs-Kubo Refresh
+
+Motivation:
+After adding page-level progress groups, rerun the main live comparison cases
+to see whether the next optimization target is cold retrieval, warm-cache
+latency, or sparse-provider reliability. These runs are evidence only; no
+gateway or retrieval behavior changed.
+
+Commands:
+
+```sh
+timeout 480s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/ipfs-tech-progress-groups-rust-vs-kubo-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-progress-groups-rust-vs-kubo.json
+
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --timeout-secs 90 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/vitalik-progress-groups-rust-vs-kubo-trace.jsonl \
+  --comparison-output /tmp/vitalik-progress-groups-rust-vs-kubo.json
+
+timeout 360s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/daicowtf-progress-groups-rust-vs-kubo-trace.jsonl \
+  --comparison-output /tmp/daicowtf-progress-groups-rust-vs-kubo.json
+```
+
+`ipfs-tech-page-assets`:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `20/581ms`, Kubo `2/2890ms`.
+- Asset TTFB p50/p95: Rust `17/206ms`, Kubo `4/1365ms`.
+- Max RSS/FD: Rust `50576KiB`/`33`, Kubo `233528KiB`/`178`.
+- Rust grouped request elapsed:
+  - cold group `root_progress_request_id=1`: `33` requests, `32` children,
+    `failed=0`, p50/p90/p95/max `123/223/405/563ms`.
+  - warm group `34`: p50/p90/p95/max `4/15/16/16ms`.
+  - warm group `67`: p50/p90/p95/max `4/11/12/12ms`.
+- Rust trace: delegated provider lookup max `116ms`, gateway request elapsed
+  p50/p90/p95/max `7/150/204/563ms`, direct-body max `15ms`, Bitswap
+  session shortcut hits `32/32`.
+
+`vitalik-root-html-range`:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `7/1349ms`, Kubo `4/1930ms`.
+- Max RSS/FD: Rust `38400KiB`/`22`, Kubo `123980KiB`/`50`.
+- Rust grouped request elapsed:
+  - cold group `1`: one request, max `1346ms`.
+  - warm groups `2` and `3`: one request each, max `5ms` and `4ms`.
+- Rust trace: delegated provider lookup max `48ms`; the cold Bitswap source
+  peer delivered two blocks with max fetch `629ms`; warm range responses used
+  the direct-body path with max `3ms`.
+
+`daicowtf-page-assets`:
+
+- Rust and Kubo both failed `0/3`.
+- Root TTFB p50/p95: Rust `10902/20638ms`, Kubo `30002/30003ms`.
+- Max RSS/FD: Rust `53120KiB`/`17`, Kubo `149160KiB`/`127`.
+- Rust statuses were `504`, `502`, `504`; Kubo timed out with `504` in all
+  three runs.
+- Rust grouped request elapsed showed one failed root request per run:
+  `20636ms` (`502`), `10899ms` (`504`), and `10029ms` (`504`).
+- Rust trace showed delegated routing returning only `1` provider total across
+  `5` delegated lookup events, DHT provider lookup timing out `3` times,
+  Bitswap shortcut misses `3/3`, incoming stream read timeouts `2`, and one
+  provider refresh after failure.
+
+Conclusion:
+
+- Current Rust is already materially better than Kubo on cold p95 and resource
+  use for `ipfs.tech` and `vitalik` in this same-window sample.
+- Kubo still wins the warm-cache p50 by a few milliseconds (`2-4ms` versus
+  Rust `7-20ms`), so the next speed work should focus on warm gateway/local
+  response overhead only if that margin matters more than reliability work.
+- `daicowtf` remains a sparse/stale-provider reliability case. Because Kubo
+  also failed, this is not a parity blocker, but it is the best current target
+  for provider-diversity and DHT fallback experiments. Any fix should preserve
+  the low RSS/FD profile and avoid public gateway fallback.
