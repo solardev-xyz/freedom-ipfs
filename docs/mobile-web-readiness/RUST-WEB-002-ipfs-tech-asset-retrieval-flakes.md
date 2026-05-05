@@ -7930,3 +7930,85 @@ Result:
 Decision: keep. This is diagnostics-only and gives future provider/address
 policy experiments a clearer signal for whether connection failures are
 address-family-specific before changing any dial filtering behavior.
+
+## 2026-05-05 Reject: Skip DNS IP Expansion For Unsupported Bitswap Addrs
+
+Hypothesis:
+The latest `ipfs-tech-page-assets` refresh showed the slowest asset spending
+about `2032ms` in `bitswap_peer_expand` while expanding `561` provider
+multiaddrs into `576` candidates. Most expanded addresses were later rejected
+because they contained relay, WebRTC, WebTransport, or certhash components.
+Skipping DNS IP expansion for those always-rejected multiaddrs might reduce
+asset tails without changing the supported Bitswap candidate set.
+
+Temporary implementation:
+
+- After DNSAddr TXT expansion, detect multiaddrs with relay/WebRTC/
+  WebTransport/certhash features.
+- Push those records through unchanged instead of resolving their DNS names to
+  IP addresses.
+- Keep websocket DNS multiaddrs unchanged as before.
+
+Focused validation passed:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval dns_ip_expansion --lib
+cargo test -p freedom-ipfs-retrieval cached_dns_expansion_reuses_dnsaddr_and_ip_results --lib
+git diff --check
+```
+
+Experiment:
+
+```sh
+timeout 360s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/ipfs-tech-skip-unsupported-dns-expansion-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-skip-unsupported-dns-expansion.json
+```
+
+Experiment result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `865/2217ms`, Kubo `1645/5061ms`.
+- Asset TTFB p50/p95: Rust `313/899ms`, Kubo `188/996ms`.
+- Max RSS/FD: Rust `53968KiB`/`49`, Kubo `290060KiB`/`502`.
+- Delegated lookup max was `667ms`.
+- Bitswap dial rejections: `58`, all connection-limit.
+- Bitswap connection errors: `14`, address families `ip4=9`, `ip6=5`.
+
+Same-window baseline recheck after stashing the temporary change:
+
+```sh
+timeout 360s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/ipfs-tech-unsupported-dns-baseline-recheck-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-unsupported-dns-baseline-recheck.json
+```
+
+Baseline result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `911/946ms`, Kubo `2440/2529ms`.
+- Asset TTFB p50/p95: Rust `141/641ms`, Kubo `94/2350ms`.
+- Max RSS/FD: Rust `51492KiB`/`47`, Kubo `278948KiB`/`324`.
+- Delegated lookup max was `187ms`.
+- Bitswap dial rejections: `5`, all connection-limit.
+- Bitswap connection errors: `12`, address families `ip4=12`.
+
+Decision: reject and revert. The temporary change preserved reliability, but
+the same-window baseline was better on root p50/p95, asset p50/p95, RSS, FD, and
+dial pressure. The initial apparent asset-tail win was network-window noise, not
+evidence to keep the filtering behavior.
