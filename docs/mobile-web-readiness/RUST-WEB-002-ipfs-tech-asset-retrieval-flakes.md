@@ -18617,3 +18617,58 @@ Keep. This gives future iterations a cheap first-pass signal for whether a
 candidate optimization is moving latency between sources or actually reducing
 the block-fetch tail. It should be used alongside provider-race, Bitswap, cache,
 RSS, and FD summaries before keeping any adaptive HTTP/Bitswap policy.
+
+## 2026-05-05 Baseline: Current Rust vs Kubo With Source-Latency Summary
+
+Question:
+After the HTTP-provider scoring work and the new block-fetch source latency
+summary, where is the current Rust gateway still behind Kubo on the focused
+`ipfs.tech` page workload?
+
+Command:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-current-kubo-comparison-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-current-kubo-comparison-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1309ms` / `1371ms`; Kubo `2320ms` /
+  `3092ms`; Rust ratio `0.56x` / `0.44x`.
+- Asset TTFB p50/p95: Rust `251ms` / `929ms`; Kubo `146ms` / `1271ms`;
+  Rust ratio `1.72x` / `0.73x`.
+- Max RSS/FD: Rust `46764KiB` / `28`; Kubo `249520KiB` / `179`.
+- Rust block sources: `http_provider=120`.
+- Rust block-fetch source latency:
+  `http_provider: count=120 total=32551ms elapsed=p50=211ms p90=558ms p95=691ms max=999ms`.
+- Delegated lookup p50/p95/max: `22ms` / `50ms` / `97ms`.
+- HTTP-provider fetch p50/p95/max: `161ms` / `644ms` / `923ms`.
+- Single-provider HTTP winners: `63`, all `https://ipfs-bridge.sia.dev/`,
+  p50/p95/max `292ms` / `693ms` / `948ms`.
+- Multi-provider HTTP winner p50/p95/max: `91ms` / `191ms` / `217ms`.
+- Provider detail:
+  `https://ipfs-bridge.sia.dev/` p50/p95/max `168ms` / `673ms` / `923ms`;
+  `https://dag.w3s.link/` p50/p95/max `43ms` / `90ms` / `94ms`;
+  `https://calib2.ezpdpz.net/` p50/p95/max `30ms` / `88ms` / `88ms`.
+
+Conclusion:
+This window says Rust is already meaningfully ahead of Kubo for root TTFB and
+asset p95 while using far less RSS and far fewer file descriptors. Kubo still
+wins asset p50, and the Rust tail is now clearly an HTTP-provider source tail,
+not Bitswap or delegated lookup. The next promising target remains narrow
+single-provider HTTP mitigation, especially when the only HTTP provider is
+`ipfs-bridge.sia.dev`, but previous static host suppression and broad Bitswap
+substitution were rejected on resource and latency grounds.
