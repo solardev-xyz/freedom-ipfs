@@ -1491,15 +1491,25 @@ fn print_trace_http_provider_fetches(trace: &TraceSummary) {
         return;
     }
     println!(
-        "  http provider fetches: events={} successes={} failures={} bytes={} elapsed={} providers={} error_classes={}",
+        "  http provider fetches: events={} successes={} failures={} bytes={} response_bytes={} elapsed={} providers={} error_classes={}",
         http.events,
         http.successes,
         http.failures,
         http.bytes,
+        http.response_bytes,
         http.elapsed_ms,
         format_trace_counts(&http.providers),
         format_trace_counts(&http.error_classes)
     );
+    if http.has_response_milestones() {
+        println!(
+            "    response milestones: header_max={}ms first_chunk_seen={} first_chunk_max={}ms body_max={}ms",
+            http.max_response_headers_elapsed_ms,
+            http.first_chunk_events,
+            http.max_response_first_chunk_elapsed_ms,
+            http.max_response_body_elapsed_ms
+        );
+    }
 }
 
 fn print_trace_provider_retries(trace: &TraceSummary) {
@@ -4380,9 +4390,24 @@ struct TraceHttpProviderFetchAggregate {
     successes: usize,
     failures: usize,
     bytes: u128,
+    response_bytes: u128,
+    first_chunk_events: usize,
+    max_response_headers_elapsed_ms: u128,
+    max_response_first_chunk_elapsed_ms: u128,
+    max_response_body_elapsed_ms: u128,
     elapsed_ms: LatencySummary,
     providers: Vec<TraceValueCount>,
     error_classes: Vec<TraceValueCount>,
+}
+
+impl TraceHttpProviderFetchAggregate {
+    fn has_response_milestones(&self) -> bool {
+        self.response_bytes > 0
+            || self.first_chunk_events > 0
+            || self.max_response_headers_elapsed_ms > 0
+            || self.max_response_first_chunk_elapsed_ms > 0
+            || self.max_response_body_elapsed_ms > 0
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -5189,6 +5214,11 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut http_provider_fetch_successes = 0usize;
     let mut http_provider_fetch_failures = 0usize;
     let mut http_provider_fetch_bytes = 0u128;
+    let mut http_provider_fetch_response_bytes = 0u128;
+    let mut http_provider_fetch_first_chunk_events = 0usize;
+    let mut http_provider_fetch_max_response_headers_elapsed_ms = 0u128;
+    let mut http_provider_fetch_max_response_first_chunk_elapsed_ms = 0u128;
+    let mut http_provider_fetch_max_response_body_elapsed_ms = 0u128;
     let mut http_provider_fetch_elapsed_values = Vec::<u128>::new();
     let mut http_provider_fetch_providers = BTreeMap::<String, usize>::new();
     let mut http_provider_fetch_error_classes = BTreeMap::<String, usize>::new();
@@ -5321,6 +5351,38 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 None => {}
             }
             http_provider_fetch_bytes += value.get("bytes").and_then(json_u128).unwrap_or_default();
+            http_provider_fetch_response_bytes += value
+                .get("response_bytes")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            if value
+                .get("response_first_chunk_seen")
+                .and_then(|seen| seen.as_bool())
+                == Some(true)
+            {
+                http_provider_fetch_first_chunk_events += 1;
+            }
+            http_provider_fetch_max_response_headers_elapsed_ms =
+                http_provider_fetch_max_response_headers_elapsed_ms.max(
+                    value
+                        .get("response_headers_elapsed_ms")
+                        .and_then(json_u128)
+                        .unwrap_or_default(),
+                );
+            http_provider_fetch_max_response_first_chunk_elapsed_ms =
+                http_provider_fetch_max_response_first_chunk_elapsed_ms.max(
+                    value
+                        .get("response_first_chunk_elapsed_ms")
+                        .and_then(json_u128)
+                        .unwrap_or_default(),
+                );
+            http_provider_fetch_max_response_body_elapsed_ms =
+                http_provider_fetch_max_response_body_elapsed_ms.max(
+                    value
+                        .get("response_body_elapsed_ms")
+                        .and_then(json_u128)
+                        .unwrap_or_default(),
+                );
             if let Some(elapsed_ms) = elapsed_ms {
                 http_provider_fetch_elapsed_values.push(elapsed_ms);
             }
@@ -6138,6 +6200,12 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             successes: http_provider_fetch_successes,
             failures: http_provider_fetch_failures,
             bytes: http_provider_fetch_bytes,
+            response_bytes: http_provider_fetch_response_bytes,
+            first_chunk_events: http_provider_fetch_first_chunk_events,
+            max_response_headers_elapsed_ms: http_provider_fetch_max_response_headers_elapsed_ms,
+            max_response_first_chunk_elapsed_ms:
+                http_provider_fetch_max_response_first_chunk_elapsed_ms,
+            max_response_body_elapsed_ms: http_provider_fetch_max_response_body_elapsed_ms,
             elapsed_ms: LatencySummary::from_values(http_provider_fetch_elapsed_values),
             providers: sorted_trace_counts(http_provider_fetch_providers),
             error_classes: sorted_trace_counts(http_provider_fetch_error_classes),
@@ -8752,7 +8820,7 @@ mod tests {
             &path,
             concat!(
                 "{\"phase\":\"http_provider_race\",\"cid\":\"cid-a\",\"provider_count\":2,\"race_width\":2}\n",
-                "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-a\",\"provider\":\"https://provider-a.example\",\"ok\":true,\"bytes\":128,\"elapsed_ms\":25}\n",
+                "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-a\",\"provider\":\"https://provider-a.example\",\"ok\":true,\"bytes\":128,\"response_bytes\":128,\"response_headers_elapsed_ms\":7,\"response_first_chunk_seen\":true,\"response_first_chunk_elapsed_ms\":9,\"response_body_elapsed_ms\":20,\"elapsed_ms\":25}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-b\",\"provider\":\"https://provider-b.example\",\"ok\":false,\"error\":\"core: cid hash mismatch for cid-b\",\"elapsed_ms\":40}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-c\",\"provider\":\"https://provider-b.example\",\"ok\":false,\"error\":\"request timed out\",\"elapsed_ms\":60}\n",
             ),
@@ -8766,6 +8834,24 @@ mod tests {
         assert_eq!(summary.http_provider_fetches.successes, 1);
         assert_eq!(summary.http_provider_fetches.failures, 2);
         assert_eq!(summary.http_provider_fetches.bytes, 128);
+        assert_eq!(summary.http_provider_fetches.response_bytes, 128);
+        assert_eq!(summary.http_provider_fetches.first_chunk_events, 1);
+        assert_eq!(
+            summary
+                .http_provider_fetches
+                .max_response_headers_elapsed_ms,
+            7
+        );
+        assert_eq!(
+            summary
+                .http_provider_fetches
+                .max_response_first_chunk_elapsed_ms,
+            9
+        );
+        assert_eq!(
+            summary.http_provider_fetches.max_response_body_elapsed_ms,
+            20
+        );
         assert_eq!(summary.http_provider_fetches.elapsed_ms.count, 3);
         assert_eq!(summary.http_provider_fetches.elapsed_ms.p50_ms, Some(40));
         assert_eq!(

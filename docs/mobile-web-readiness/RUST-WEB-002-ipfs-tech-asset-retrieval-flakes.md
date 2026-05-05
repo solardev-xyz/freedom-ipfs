@@ -13850,3 +13850,83 @@ Live result:
 Decision:
 Keep. This is harness/diagnostic-only and makes the previous routing trace
 fields usable during long comparison runs without changing node behavior.
+
+## 2026-05-05 Keep: Trace HTTP Provider Response Milestones
+
+Problem:
+HTTP-provider fetch tails still appear in `ipfs.tech` page runs, but the
+existing `http_provider_fetch` event only reported total elapsed time, provider,
+and bytes. That made it unclear whether a slow fetch was waiting for response
+headers, first body bytes, body transfer, verification, or storage.
+
+Implementation:
+
+- Keep HTTP provider selection, fanout, verification, and caching behavior
+  unchanged.
+- Extend the HTTP provider body reader to return compact body stats.
+- Add these fields to successful `http_provider_fetch` trace events:
+  - `response_bytes`
+  - `response_headers_elapsed_ms`
+  - `response_first_chunk_seen`
+  - `response_first_chunk_elapsed_ms`
+  - `response_body_elapsed_ms`
+- Extend the mobile web harness HTTP-provider summary with totals and max
+  header, first-chunk, and body milestone timings.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval limited_http_response_bytes_reports_body_stats
+cargo test -p mobile-web-harness trace_summary_counts_http_provider_fetches
+cargo test -p freedom-ipfs-retrieval
+cargo test -p mobile-web-harness
+```
+
+Result:
+
+- Formatting check passed.
+- Focused retrieval body-stats test passed.
+- Focused harness summary test passed.
+- Retrieval suite passed: `68 passed; 0 failed; 1 ignored`.
+- Harness suite passed: `32 passed; 0 failed`.
+
+Live smoke:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-provider-milestones-r1-trace.jsonl \
+  --output /tmp/ipfs-tech-http-provider-milestones-r1.json
+```
+
+Live result:
+
+- Rust passed `1/1`.
+- Root TTFB was `930ms`.
+- Asset TTFB p50/p95/max was `147ms` / `857ms` / `912ms`.
+- Rust max RSS/FD was `51980KiB` / `35`.
+- HTTP provider fetches: `11` events, `11` successes, p50/p95/max
+  `158ms` / `686ms` / `686ms`.
+- HTTP provider milestone summary: `response_bytes=309555`,
+  `first_chunk_events=11`, header max `642ms`, first-chunk max `650ms`, body
+  max `683ms`.
+- The two slowest HTTP-provider fetches were both from
+  `https://ipfs-bridge.sia.dev/`:
+  - `EgmQ2fGv.js`: total `686ms`, headers `642ms`, first chunk `650ms`, body
+    complete `683ms`
+  - `Duo5E1ke.js`: total `644ms`, headers `634ms`, first chunk `642ms`, body
+    complete `642ms`
+
+Decision:
+Keep. This is diagnostic-only and confirms that in this window the largest
+HTTP-provider tails were mostly header wait on `ipfs-bridge.sia.dev`, not body
+transfer or block-store time. Future HTTP-provider quality work should account
+for provider/header latency, not only bytes or block size.

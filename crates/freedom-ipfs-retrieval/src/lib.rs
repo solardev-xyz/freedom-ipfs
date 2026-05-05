@@ -744,13 +744,21 @@ impl HttpRetriever {
             })?;
         let started = Instant::now();
         match self.fetch_from_http_provider(&cid, &base).await {
-            Ok(block) => {
+            Ok((block, stats)) => {
                 tracing::info!(
                     phase = "http_provider_fetch",
                     cid = %cid,
                     provider = %base,
                     ok = true,
                     bytes = block.data().len(),
+                    response_bytes = stats.response_bytes,
+                    response_headers_elapsed_ms = stats.headers_elapsed.as_millis(),
+                    response_first_chunk_seen = stats.first_chunk_elapsed.is_some(),
+                    response_first_chunk_elapsed_ms = stats
+                        .first_chunk_elapsed
+                        .map(|elapsed| elapsed.as_millis())
+                        .unwrap_or_default(),
+                    response_body_elapsed_ms = stats.body_elapsed.as_millis(),
                     elapsed_ms = started.elapsed().as_millis()
                 );
                 Ok(block)
@@ -774,7 +782,12 @@ impl HttpRetriever {
         }
     }
 
-    async fn fetch_from_http_provider(&self, cid: &Cid, base: &Url) -> Result<Block> {
+    async fn fetch_from_http_provider(
+        &self,
+        cid: &Cid,
+        base: &Url,
+    ) -> Result<(Block, HttpProviderResponseStats)> {
+        let started = Instant::now();
         let url = base
             .join(&format!("/ipfs/{cid}?format=raw"))
             .map_err(RetrievalError::Url)?;
@@ -785,12 +798,27 @@ impl HttpRetriever {
             .send()
             .await?
             .error_for_status()?;
-        let bytes = limited_response_bytes(response, DEFAULT_MAX_BLOCK_SIZE).await?;
+        let headers_elapsed = started.elapsed();
+        let LimitedResponseBytes {
+            bytes,
+            stats: body_stats,
+        } = limited_response_bytes(response, DEFAULT_MAX_BLOCK_SIZE).await?;
+        let body_elapsed = started.elapsed();
         verify_block(cid, &bytes)?;
         let bytes = self
             .store_block_with_trace(*cid, bytes, "http_provider", true)
             .await?;
-        Ok(Block::unchecked(*cid, bytes))
+        Ok((
+            Block::unchecked(*cid, bytes),
+            HttpProviderResponseStats {
+                response_bytes: body_stats.bytes_read,
+                headers_elapsed,
+                first_chunk_elapsed: body_stats
+                    .first_chunk_elapsed
+                    .map(|elapsed| headers_elapsed + elapsed),
+                body_elapsed,
+            },
+        ))
     }
 
     async fn fetch_from_bitswap_providers(
@@ -1540,6 +1568,13 @@ struct SuccessfulBitswapPeer {
     seen_at: Instant,
     addrs: Vec<Multiaddr>,
     last_latency: Duration,
+}
+
+struct HttpProviderResponseStats {
+    response_bytes: usize,
+    headers_elapsed: Duration,
+    first_chunk_elapsed: Option<Duration>,
+    body_elapsed: Duration,
 }
 
 struct BitswapPeerTarget {
@@ -3360,11 +3395,29 @@ fn normalized_provider_set(providers: &[Provider]) -> BTreeSet<(Option<String>, 
         .collect()
 }
 
-async fn limited_response_bytes(response: reqwest::Response, max_size: usize) -> Result<Vec<u8>> {
+#[derive(Debug)]
+struct LimitedResponseBytes {
+    bytes: Vec<u8>,
+    stats: LimitedResponseByteStats,
+}
+
+#[derive(Debug, Default)]
+struct LimitedResponseByteStats {
+    bytes_read: usize,
+    first_chunk_elapsed: Option<Duration>,
+}
+
+async fn limited_response_bytes(
+    response: reqwest::Response,
+    max_size: usize,
+) -> Result<LimitedResponseBytes> {
+    let started = Instant::now();
     let mut stream = response.bytes_stream();
     let mut body = Vec::new();
+    let mut first_chunk_elapsed = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
+        first_chunk_elapsed.get_or_insert_with(|| started.elapsed());
         if body.len().saturating_add(chunk.len()) > max_size {
             return Err(RetrievalError::Core(CoreError::BlockTooLarge {
                 actual: body.len().saturating_add(chunk.len()),
@@ -3373,7 +3426,13 @@ async fn limited_response_bytes(response: reqwest::Response, max_size: usize) ->
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok(LimitedResponseBytes {
+        stats: LimitedResponseByteStats {
+            bytes_read: body.len(),
+            first_chunk_elapsed,
+        },
+        bytes: body,
+    })
 }
 
 fn accept_bitswap_streams(control: &mut StreamControl) -> Result<Vec<IncomingStreams>> {
@@ -5668,6 +5727,24 @@ mod bitswap_tests {
         assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
         slow_task.abort();
         fast_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn limited_http_response_bytes_reports_body_stats() {
+        let data = b"http response byte stats";
+        let (addr, server_task) = spawn_static_http_provider(data.to_vec()).await;
+        let response = reqwest::get(format!("http://{addr}/ipfs/test"))
+            .await
+            .unwrap();
+
+        let response = limited_response_bytes(response, DEFAULT_MAX_BLOCK_SIZE)
+            .await
+            .unwrap();
+
+        assert_eq!(response.bytes, data);
+        assert_eq!(response.stats.bytes_read, data.len());
+        assert!(response.stats.first_chunk_elapsed.is_some());
+        server_task.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
