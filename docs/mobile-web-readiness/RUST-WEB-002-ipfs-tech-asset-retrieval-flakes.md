@@ -14453,3 +14453,74 @@ Decision:
 Pass as guard coverage. The HTTP hedge did not introduce regressions in these
 two cases: daicowtf remains a successful Bitswap/WSS workload, while the
 Vitalik range case remains a fast verified HTTP-provider workload.
+
+## 2026-05-05 Reject: Repeated Range-Batch Recent-Peer Multi-Want Hook
+
+Hypothesis:
+`FetchingBlockProvider::get_block_ranges_async` already receives bounded
+adjacent raw child ranges from UnixFS. Since the shared Bitswap client now has
+multi-CID `fetch_many` support, a simple next step seemed to be trying those
+multi-range misses against recent successful Bitswap peers before falling back
+to the existing individual child fetches.
+
+Prototype:
+
+- Added `HttpRetriever::fetch_many_from_recent_bitswap_peers`.
+- Used it from `FetchingBlockProvider::get_block_ranges_async` when a range
+  batch had more than one uncached CID.
+- Stored verified requested blocks through the normal block store path before
+  serving range bytes.
+- Added a focused local-peer test,
+  `range_batch_uses_recent_bitswap_multi_want_peer`, proving the two requested
+  raw ranges were sent as one Bitswap multi-want stream.
+
+Focused validation while the prototype was present:
+
+```sh
+cargo test -p freedom-ipfs-retrieval range_batch_uses_recent_bitswap_multi_want_peer
+cargo test -p freedom-ipfs-retrieval
+```
+
+Focused result:
+
+- `range_batch_uses_recent_bitswap_multi_want_peer` passed.
+- Full retrieval tests passed: `70 passed; 1 ignored`.
+
+Live check:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-bitswap-range-batch-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-bitswap-range-batch-r3.json
+```
+
+Live result:
+
+- Rust and Kubo passed `3/3`.
+- Root TTFB p50/p95: Rust `1349ms` / `1855ms`, Kubo `2522ms` / `2724ms`.
+- Asset TTFB p50/p95: Rust `271ms` / `1312ms`, Kubo `89ms` / `210ms`.
+- Rust max RSS/FD: `52284KiB` / `35`.
+- Delegated provider lookup max was `6768ms`, still the dominant tail.
+- Harness batch summary showed `multi_cid_commands=0`, `max_cids=1`; the new
+  hook did not engage on this live page.
+
+Decision:
+Reject and revert. This repeated a production hook shape that was already
+rejected earlier in this document after the seeded
+`bitswap-seeded-multiblock-boundary-range` evidence showed duplicate work and
+worse p95. Today's `ipfs.tech` run added no evidence in favor because the hook
+did not fire at all, while the prior seeded evidence already showed an unstable
+latency tradeoff when it does fire. Do not reintroduce this range-batch
+multi-want hook without first solving duplicate cache writes and proving a
+request shape where the multi-CID batch consistently wins before the existing
+single-CID child fetch path.
