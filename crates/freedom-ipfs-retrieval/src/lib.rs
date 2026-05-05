@@ -1506,22 +1506,42 @@ async fn run_shared_bitswap_swarm(
                     command_queued_ms
                 );
 
+                let mut started_dial_peers = BTreeSet::new();
                 for (peer_id, addr) in dial_addrs {
                     let transport = bitswap_transport_label(&addr);
                     let dial_addr = addr.with_p2p(peer_id).unwrap_or_else(|addr| addr);
-                    if let Err(err) = swarm.dial(dial_addr) {
-                        let error_detail = format_error_detail(&err);
-                        let connection_limit = is_connection_limit_error(&error_detail);
-                        record_dial_error(&dial_errors, peer_id, error_detail.clone()).await;
-                        tracing::info!(
-                            phase = "bitswap_dial_rejected",
-                            peer = %peer_id,
-                            transport,
-                            connection_limit,
-                            error = %err,
-                            error_debug = ?err
-                        );
+                    match swarm.dial(dial_addr) {
+                        Ok(()) => {
+                            started_dial_peers.insert(peer_id);
+                        }
+                        Err(err) => {
+                            let error_detail = format_error_detail(&err);
+                            let connection_limit = is_connection_limit_error(&error_detail);
+                            record_dial_error(&dial_errors, peer_id, error_detail.clone()).await;
+                            tracing::info!(
+                                phase = "bitswap_dial_rejected",
+                                peer = %peer_id,
+                                transport,
+                                connection_limit,
+                                error = %err,
+                                error_debug = ?err
+                            );
+                        }
                     }
+                }
+                let failed_dial_waiter_count = drop_failed_bitswap_dial_waiters(
+                    &scheduled_dial_peers,
+                    &started_dial_peers,
+                    &mut connection_waiters,
+                    &mut connection_wait_started,
+                );
+                if failed_dial_waiter_count > 0 {
+                    tracing::info!(
+                        phase = "bitswap_dial_waiters_dropped",
+                        cid = %command.cid,
+                        peer_count = scheduled_dial_peers.len().saturating_sub(started_dial_peers.len()),
+                        waiter_count = failed_dial_waiter_count
+                    );
                 }
 
                 let control = control.clone();
@@ -1761,6 +1781,20 @@ fn prune_connection_waiters(
         !peer_waiters.is_empty()
     });
     started.retain(|peer, _| waiters.contains_key(peer));
+}
+
+fn drop_failed_bitswap_dial_waiters(
+    scheduled_peers: &BTreeSet<PeerId>,
+    started_peers: &BTreeSet<PeerId>,
+    waiters: &mut HashMap<PeerId, Vec<oneshot::Sender<()>>>,
+    started: &mut HashMap<PeerId, Instant>,
+) -> usize {
+    let mut dropped = 0usize;
+    for peer in scheduled_peers.difference(started_peers) {
+        dropped += waiters.remove(peer).map_or(0, |waiters| waiters.len());
+        started.remove(peer);
+    }
+    dropped
 }
 
 fn should_start_bitswap_dial(
@@ -4859,6 +4893,40 @@ mod bitswap_tests {
             &connected_peers,
             &connection_waiters
         ));
+    }
+
+    #[test]
+    fn drops_waiters_for_dials_that_never_started() {
+        let failed = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let started =
+            parse_peer_id("12D3KooWAtxJkDLacJdK7yZkk2iPp8iMdSVh1bDHzmJ3t8oKUkqA").unwrap();
+        let (failed_ready, mut failed_wait) = oneshot::channel();
+        let (started_ready, _started_wait) = oneshot::channel();
+        let mut scheduled_peers = BTreeSet::new();
+        scheduled_peers.insert(failed);
+        scheduled_peers.insert(started);
+        let mut started_peers = BTreeSet::new();
+        started_peers.insert(started);
+        let mut waiters = HashMap::new();
+        waiters.insert(failed, vec![failed_ready]);
+        waiters.insert(started, vec![started_ready]);
+        let mut wait_started = HashMap::new();
+        wait_started.insert(failed, Instant::now());
+        wait_started.insert(started, Instant::now());
+
+        let dropped = drop_failed_bitswap_dial_waiters(
+            &scheduled_peers,
+            &started_peers,
+            &mut waiters,
+            &mut wait_started,
+        );
+
+        assert_eq!(dropped, 1);
+        assert!(!waiters.contains_key(&failed));
+        assert!(!wait_started.contains_key(&failed));
+        assert!(waiters.contains_key(&started));
+        assert!(wait_started.contains_key(&started));
+        assert!(failed_wait.try_recv().is_err());
     }
 
     #[test]

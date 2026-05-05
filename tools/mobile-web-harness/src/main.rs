@@ -5058,6 +5058,7 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         | "bitswap_client_reset"
         | "bitswap_connection_error"
         | "bitswap_dial_rejected"
+        | "bitswap_dial_waiters_dropped"
         | "bitswap_incoming_stream_read"
         | "bitswap_peer_timeout"
         | "bitswap_peer_timeout_suppressed"
@@ -5878,6 +5879,7 @@ mod tests {
                 "{\"phase\":\"gateway_conditional\",\"path\":\"/ipns/site/\",\"outcome\":\"not_modified\"}\n",
                 "{\"phase\":\"bitswap_request_timeout\",\"cid\":\"cid-a\",\"peer_count\":2}\n",
                 "{\"phase\":\"bitswap_connection_error\",\"peer\":\"peer-b\",\"error\":\"timeout\"}\n",
+                "{\"phase\":\"bitswap_dial_waiters_dropped\",\"cid\":\"cid-a\",\"waiter_count\":2}\n",
                 "{\"phase\":\"bitswap_incoming_stream_read\",\"peer\":\"peer-c\",\"ok\":false,\"timed_out\":true}\n",
                 "{\"phase\":\"gateway_limiter\",\"acquired\":false}\n",
                 "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipns/site/\",\"status\":200}\n",
@@ -5927,7 +5929,7 @@ mod tests {
         assert_eq!(summary.gateway_direct_body.events, 1);
         assert_eq!(summary.gateway_direct_body.bytes, 4096);
         assert_eq!(summary.gateway_direct_body.max_body_len, 4096);
-        assert_eq!(trace_value_count(&summary.progress_phases, "retrying"), 3);
+        assert_eq!(trace_value_count(&summary.progress_phases, "retrying"), 4);
         assert_eq!(trace_value_count(&summary.progress_phases, "completed"), 1);
         assert_eq!(trace_value_count(&summary.progress_phases, "failed"), 2);
     }

@@ -153,6 +153,9 @@ time in both single-engine and Rust-vs-Kubo comparison output.
 Rust-vs-Kubo trace output also prints Bitswap source peer, source transport,
 delivery, and per-peer fetch summaries so provider-quality experiments can see
 which peers actually supplied blocks.
+Rejected Bitswap dials now drop their connection waiters when no dial for that
+peer actually started, preventing later requests from treating a locally
+rejected peer as still pending.
 Single-chunk gateway responses emit `gateway_direct_body` traces, and the
 comparison summary reports direct-body event count, total bytes, maximum body
 length, and maximum elapsed time so small-response fast paths are visible.

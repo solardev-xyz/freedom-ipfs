@@ -7475,3 +7475,84 @@ delivery, but early cold requests continue to spend limited dial slots on weak
 or stale candidates before that signal is strong enough. A better next
 experiment should bias against recently failed connection classes earlier, not
 just reorder successful peers after the fact.
+
+## 2026-05-05 Keep: Drop Waiters For Dials That Never Started
+
+Motivation:
+The parked dial-cap experiments showed local connection-limit rejections, and
+the trace often kept many peers in a pending state. In `run_shared_bitswap_swarm`
+the command path created connection waiters before calling `swarm.dial`. If
+`swarm.dial` rejected every address for a scheduled peer synchronously, for
+example because the local connection limit was already full, those waiters could
+remain even though no dial was actually pending. Future commands then treated
+that peer as pending and current attempts could wait on a connection that would
+never be established.
+
+Implementation:
+
+- Track which scheduled Bitswap peers actually had at least one `swarm.dial`
+  call accepted.
+- After the dial loop, drop waiters and wait-start timestamps for scheduled
+  peers where no dial started.
+- Emit `bitswap_dial_waiters_dropped` with peer and waiter counts.
+- Map the new trace phase to mobile/harness progress phase `retrying`.
+- Keep existing connection caps unchanged.
+
+Validation before live run:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval drops_waiters_for_dials_that_never_started
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+cargo build -p freedom-ipfs-gateway
+```
+
+Experiment:
+
+```sh
+timeout 360s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/ipfs-tech-drop-failed-dial-waiters-cold-trace.jsonl \
+  --output /tmp/ipfs-tech-drop-failed-dial-waiters-cold.json
+```
+
+Experiment result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `909/1167ms`, Kubo `2472/5094ms`.
+- Asset TTFB p50/p95: Rust `139/374ms`, Kubo `151/368ms`.
+- Max RSS/FD: Rust `49956KiB`/`42`, Kubo `303240KiB`/`541`.
+- Bitswap dial plans: `112` events, `212` candidates, `48` new addrs,
+  `62` suppressed addrs, `2` pending peers, `153` connected peers.
+- Bitswap dial rejections: none in the summary.
+- Bitswap peer attempts dropped from the previous baseline's `459` starts to
+  `198` starts.
+- Oldest pending incoming wait dropped from the previous baseline's `777ms` to
+  `223ms`.
+
+Same-window baseline:
+Use the immediately preceding reverted run:
+`/tmp/ipfs-tech-session-score-revert-samewindow-cold.json` and
+`/tmp/ipfs-tech-session-score-revert-samewindow-cold-trace.jsonl`.
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1168/1270ms`, Kubo `2223/3382ms`.
+- Asset TTFB p50/p95: Rust `206/1102ms`, Kubo `152/521ms`.
+- Max RSS/FD: Rust `51512KiB`/`51`, Kubo `273036KiB`/`261`.
+- Bitswap dial plans: `133` events, `532` candidates, `128` new addrs,
+  `214` suppressed addrs, `31` pending peers, `312` connected peers.
+- Bitswap dial rejections: `51`, all connection-limit, transports
+  `tcp=37`, `quic=14`.
+
+Decision: keep. The change is narrow, fixes a concrete stale-waiter condition,
+keeps mobile connection caps unchanged, and the same-window evidence improved
+root p50/p95, asset p50/p95, FD max, dial-plan pressure, and pending wait
+latency. The trace had no local dial rejections in this sample, and Kubo still
+used much higher memory and FD counts.

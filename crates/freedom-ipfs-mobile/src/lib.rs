@@ -513,6 +513,7 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         | "bitswap_client_reset"
         | "bitswap_connection_error"
         | "bitswap_dial_rejected"
+        | "bitswap_dial_waiters_dropped"
         | "bitswap_incoming_stream_read"
         | "bitswap_peer_timeout"
         | "bitswap_peer_timeout_suppressed"
@@ -2042,6 +2043,17 @@ mod tests {
             progress_phase(
                 "bitswap_connection_error",
                 &progress_fields([("phase", "bitswap_connection_error"), ("error", "timeout")]),
+                "active",
+            ),
+            "retrying"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_dial_waiters_dropped",
+                &progress_fields([
+                    ("phase", "bitswap_dial_waiters_dropped"),
+                    ("waiter_count", "2")
+                ]),
                 "active",
             ),
             "retrying"
