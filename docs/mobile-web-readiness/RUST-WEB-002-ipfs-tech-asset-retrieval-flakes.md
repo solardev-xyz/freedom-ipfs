@@ -13777,3 +13777,76 @@ Keep. This is diagnostic-only and does not add network work, provider fanout,
 fallback gateways, or trust changes. The next time delegated lookup tails spike,
 these fields should show whether to optimize endpoint/header latency, stream
 body latency, or the HTTP-provider early-return threshold.
+
+## 2026-05-05 Keep: Summarize Delegated Response Milestones In Harness
+
+Problem:
+The delegated response milestone fields were emitted in raw trace events, but
+the mobile web harness summary still only surfaced delegated lookup event count,
+provider count, and max elapsed time. That made the new diagnostics easy to
+miss in long Rust-vs-Kubo runs and JSON comparison reports.
+
+Implementation:
+
+- Extend `TraceDelegatedProviderLookupAggregate` and per-endpoint aggregates
+  with:
+  - total `http_providers`
+  - total `response_bytes`
+  - total `response_lines`
+  - counts for first chunk, first HTTP provider, and target-met events
+  - max response header, first chunk, first HTTP provider, and target-met
+    elapsed times
+- Print a compact `response milestones` line under delegated provider lookup
+  summaries.
+- Include the same fields in JSON reports under
+  `trace_summary.delegated_provider_lookup` and
+  `trace_summary.delegated_provider_lookup_by_endpoint`.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+cargo test -p mobile-web-harness
+```
+
+Result:
+
+- Formatting check passed after rustfmt.
+- Focused trace summary test passed.
+- Full harness suite passed: `32 passed; 0 failed`.
+
+Live smoke:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-delegated-summary-milestones-r1-trace.jsonl \
+  --output /tmp/ipfs-tech-delegated-summary-milestones-r1.json
+```
+
+Live result:
+
+- Rust passed `1/1`.
+- Root TTFB was `1249ms`.
+- Asset TTFB p50/p95/max was `186ms` / `667ms` / `895ms`.
+- Rust max RSS/FD was `53400KiB` / `29`.
+- Delegated provider lookups: `22` events, `22` successes, `323` providers,
+  `46` HTTP providers, `466669` response bytes, `323` response lines, max
+  elapsed `82ms`.
+- Response milestones summary: header max `75ms`, first chunk seen `22`,
+  first chunk max `75ms`, first HTTP provider seen `19`, first HTTP max
+  `75ms`, target-met `9`, target-met max `44ms`.
+- The JSON report contains the same values under
+  `/tmp/ipfs-tech-delegated-summary-milestones-r1.json`.
+
+Decision:
+Keep. This is harness/diagnostic-only and makes the previous routing trace
+fields usable during long comparison runs without changing node behavior.
