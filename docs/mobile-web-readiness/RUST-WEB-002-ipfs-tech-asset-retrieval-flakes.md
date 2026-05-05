@@ -15596,3 +15596,93 @@ mobile resource usage. The first live summary already gives a useful next-step
 signal: on this `ipfs.tech` run, `11/27` HTTP-provider races had more
 candidates than the current race width, while `16/27` had only one provider
 where ordering/scoring cannot help.
+
+## 2026-05-05 Reject: Increase HTTP Provider Race Width to 3
+
+Question:
+The race-shape summary showed that `11/27` HTTP-provider races in a live
+`ipfs.tech` smoke had more candidates than the current race width of `2`.
+Maybe starting three HTTP-provider attempts immediately would let the gateway
+use a faster later candidate and reduce Bitswap fallback on page assets.
+
+Prototype:
+
+- Temporarily changed `HTTP_PROVIDER_RACE_WIDTH` from `2` to `3`.
+- Kept the global `MAX_CONCURRENT_HTTP_PROVIDER_FETCHES` cap unchanged at `4`.
+- Kept the existing `250ms` hedge delay unchanged.
+
+Validation while the prototype was present:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval http_provider
+```
+
+Result:
+
+- Formatting passed.
+- Focused retrieval HTTP-provider tests passed: `5 passed`.
+
+Live run:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-race-width3-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-http-race-width3-r3.json
+```
+
+Live result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `986ms` / `1561ms` / `1561ms`.
+- Asset TTFB p50/p95/max: `264ms` / `1011ms` / `5569ms`.
+- Run total p50/p95/max: `2766ms` / `8023ms` / `8023ms`.
+- Max RSS/FD: `50872KiB` / `31`.
+- Delegated lookup max: `5467ms`.
+- HTTP provider distribution: `zero=1`, `single=62`, `multi=42`,
+  `single_target_miss=62`, `single_max=969ms`,
+  `single_first_http_max=968ms`.
+- HTTP-provider races: `104` events, `188` total providers,
+  `62` single-provider races, `42` multi-provider races, `0` races above the
+  race width, race width max `3`, provider count max `3`, `0` scored events,
+  `0` hedges.
+- HTTP-provider fetches: `104` events, `104` successes, p50/p95/max
+  `161ms` / `625ms` / `889ms`.
+- Provider spread: `ipfs-bridge.sia.dev=62`, `dag.w3s.link=40`,
+  `a-fil-http.aur.lu=1`, `calib2.ezpdpz.net=1`.
+- Block sources: `http_provider=119`, `bitswap=1`.
+
+Same-window committed-width comparison:
+
+- Artifact paths:
+  `/tmp/ipfs-tech-first-http-grace250-rerun-r3-trace.jsonl` and
+  `/tmp/ipfs-tech-first-http-grace250-rerun-r3.json`.
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `595ms` / `1328ms` / `1328ms`.
+- Asset TTFB p50/p95/max: `204ms` / `594ms` / `851ms`.
+- Run total p50/p95/max: `2831ms` / `2920ms` / `2920ms`.
+- Max RSS/FD: `51424KiB` / `35`.
+- Delegated lookup max: `149ms`.
+- HTTP provider distribution: `zero=5`, `single=50`, `multi=36`,
+  `single_target_miss=50`, `single_first_http_max=147ms`.
+- HTTP-provider fetch p50/p95/max: `168ms` / `387ms` / `771ms`.
+- Block sources: `http_provider=78`, `bitswap=42`.
+
+Decision:
+Reject and revert. Width `3` nearly eliminated Bitswap work on this run and
+still stayed within the global HTTP-provider fetch cap, but it increased HTTP
+provider fetch volume and worsened the visible page-load tail: asset p95
+`1011ms` versus `594ms`, asset max `5569ms` versus `851ms`, and run p95
+`8023ms` versus `2920ms` in the same-window committed-width comparison. The
+large delegated lookup tail means this single run is noisy, but the evidence
+does not support spending more mobile resources by default. Revisit only with a
+selective policy, for example provider-specific race admission or a live signal
+that the first two candidates are likely slow.
