@@ -82,6 +82,7 @@
       "expect_content_type_prefix": "image/",
       "expect_content_range_prefix": "bytes 0-4095/",
       "expect_content_length": 4096,
+      "expect_accept_ranges": "bytes",
       "min_bytes": 4096,
       "max_ttfb_ms": 45000
     },
@@ -95,6 +96,7 @@
       "expect_content_type_prefix": "image/",
       "expect_content_range_prefix": "bytes 65536-69631/",
       "expect_content_length": 4096,
+      "expect_accept_ranges": "bytes",
       "min_bytes": 4096,
       "max_ttfb_ms": 45000
     },
@@ -108,6 +110,7 @@
       "expect_content_type_prefix": "image/",
       "expect_content_range_prefix": "bytes ",
       "expect_content_length": 4096,
+      "expect_accept_ranges": "bytes",
       "min_bytes": 4096,
       "max_ttfb_ms": 45000
     },
@@ -120,6 +123,7 @@
       "expect_status": 200,
       "expect_content_type_prefix": "image/",
       "expect_content_length": 184141,
+      "expect_accept_ranges": "bytes",
       "expect_body_bytes": 0,
       "max_ttfb_ms": 45000
     },

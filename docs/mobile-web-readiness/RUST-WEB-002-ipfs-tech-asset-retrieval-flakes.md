@@ -20284,3 +20284,75 @@ Decision:
 Keep. This is harness/reporting coverage only and confirms the existing gateway
 media range and HEAD behavior surfaces the headers WebKit needs. It preserves
 read-only retrieval, verified block handling, and mobile resource constraints.
+
+## 2026-05-05 Keep: Assert Accept-Ranges For Media Range And HEAD Cases
+
+Question:
+The gateway already emits `Accept-Ranges: bytes` for file and range responses,
+but the live harness did not record or assert that header. Since WebKit media
+loads rely on range support, can the corpus catch regressions in this header?
+
+Implementation:
+
+- Capture response `Accept-Ranges` in `mobile-web-harness` fetch results and
+  serialized root/asset reports.
+- Add optional corpus field `expect_accept_ranges`.
+- Assert `Accept-Ranges: bytes` for the first, middle, suffix, and HEAD
+  `ipfs.tech` developers hero image cases.
+
+Focused validation:
+
+```sh
+cargo fmt --all
+cargo test -p mobile-web-harness
+cargo check -p mobile-web-harness --all-targets
+```
+
+Focused result:
+
+- Formatting was applied.
+- Full mobile web harness suite passed: `39 passed`.
+- Harness check passed.
+
+Live Rust validation:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-developers-hero-range \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-hero-accept-ranges-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-hero-accept-ranges-r3.json
+```
+
+Live Rust result:
+
+- Passed: `3/3`.
+- Run total p50/p95/max: `847/1125/1125ms`.
+- Gateway max RSS/FD: `33080KiB` / `15`.
+- First range passed with `206`, `Content-Range:
+  bytes 0-4095/184141`, `Content-Length: 4096`,
+  `Accept-Ranges: bytes`, body bytes `4096`, TTFB p50/p95/max
+  `835/1112/1112ms`.
+- Middle range passed with `206`, `Content-Range:
+  bytes 65536-69631/184141`, `Content-Length: 4096`,
+  `Accept-Ranges: bytes`, body bytes `4096`, TTFB p50/p95/max `4/4/4ms`.
+- Suffix range passed with `206`, `Content-Range:
+  bytes 180045-184140/184141`, `Content-Length: 4096`,
+  `Accept-Ranges: bytes`, body bytes `4096`, TTFB p50/p95/max `3/3/3ms`.
+- HEAD passed with `200`, no `Content-Range`, `Content-Length: 184141`,
+  `Accept-Ranges: bytes`, body bytes `0`, TTFB p50/p95/max `3/3/3ms`.
+- Block sources: `http_provider=9`.
+
+Decision:
+Keep. This is harness/reporting coverage only and confirms the existing gateway
+media range and HEAD responses advertise range support in the way browser media
+clients expect.
