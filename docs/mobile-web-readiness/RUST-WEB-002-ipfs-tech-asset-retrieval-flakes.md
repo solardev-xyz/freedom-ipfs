@@ -5064,3 +5064,64 @@ queued retries for up to `4176ms`, did not restore reliability, and left the
 asset tail far behind Kubo. A useful fix likely needs smarter peer/provider
 choice or reset coordination, not a blunt semaphore around all same-provider
 timeout retries.
+
+## 2026-05-05 Rejected: Shared Client Reset Cooldown
+
+Hypothesis:
+
+- Reset contention is real, but skipping all mixed-timeout resets was too broad.
+- A short shared-client reset cooldown might preserve the first reset in a
+  timeout burst while preventing immediate reset thrash from follow-on timeout
+  handlers.
+
+Prototype:
+
+- Add a `1s` request-timeout reset cooldown to `HttpRetriever`.
+- Keep the first reset in a burst.
+- Suppress resets inside the cooldown window and emit `reset_suppressed`,
+  `reset_cooldown_ms`, and `since_last_reset_ms` on `bitswap_request_timeout`.
+- Extend the harness timeout-recovery summary with `reset_suppressed`.
+
+Validation before live rejection:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo test -p freedom-ipfs-retrieval --lib shortens_request_timeout_for_mixed_trusted_bitswap_candidates
+cargo build -p freedom-ipfs-gateway
+git diff --check
+```
+
+Prototype live run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-request-timeout-reset-cooldown-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-request-timeout-reset-cooldown-r3.json
+```
+
+Result: reject. Rust failed `0/3`; Kubo passed `3/3`. Rust root p50/p95 was
+`30851/30998ms` versus Kubo `1579/2032ms`, and Rust did not successfully reach
+the asset phase in this run (`asset_ttfb=n/a`). Rust max RSS/FD stayed low at
+`37888KiB`/`19` versus Kubo `175028KiB`/`102`, but this was because the page
+loads failed early.
+
+Trace summary:
+
+- `bitswap timeout recovery: request_timeout_details=6 mixed_trusted=0
+  request_timeout_events=6 reset_true=6 reset_false=0 reset_suppressed=0
+  client_resets=6 retry_starts=3 same_provider_retries=2
+  refreshed_provider_retries=1 retry_successes=0 retry_failures=3`
+- `bitswap session request_timeouts_with_trusted=0`.
+
+Decision: reject and revert. The run did not exercise the intended mixed-trusted
+burst; instead it regressed cold root retrieval badly. A reset cooldown is not a
+safe next step without a narrower trigger and stronger evidence that it only
+acts after a successful warm/session peer exists.
