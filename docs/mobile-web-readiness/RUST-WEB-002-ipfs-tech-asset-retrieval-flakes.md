@@ -19345,3 +19345,55 @@ Rust reaches single-digit-millisecond warm page/subresource responses while
 using far less RSS and fewer file descriptors. Future warm-path work should
 focus on preserving this behavior under longer sessions and larger cached
 working sets rather than chasing a 2ms local benchmark delta.
+
+## 2026-05-05 Soak: Warm Same-Daemon `ipfs.tech` 30 Runs
+
+Question:
+Does a repeated warm same-daemon `ipfs.tech` page workload show obvious RSS/FD
+growth or warm latency drift?
+
+Command:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --warmup-runs 1 \
+  --repeat 30 \
+  --asset-concurrency 6 \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-warm-same-daemon-soak-r30-trace.jsonl \
+  --output /tmp/ipfs-tech-warm-same-daemon-soak-r30.json
+```
+
+Result:
+
+- Rust passed `30/30`.
+- Run total p50/p90/p95/max: `20ms` / `30ms` / `50ms` / `61ms`.
+- Root TTFB p50/p90/p95/max: `1ms` / `3ms` / `4ms` / `5ms`.
+- Asset TTFB p50/p90/p95/max: `2ms` / `4ms` / `4ms` / `10ms`.
+- Max RSS/FD: `52384KiB` / `35`.
+- RSS stayed in a narrow `52128KiB` to `52384KiB` band across measured runs.
+- FD count stayed between `33` and `35`.
+- Per-run totals after warmup were mostly `19ms` to `22ms`, with the first few
+  measured runs settling from `50ms`, `45ms`, and `30ms`, and one late `61ms`
+  outlier.
+- Block sources during the traced warmup/measured window:
+  `http_provider=36`, `bitswap=4`.
+- Delegated provider lookup p50/p90/p95/max:
+  `22ms` / `43ms` / `55ms` / `80ms`.
+- Delegated self-hedges: `0`.
+- HTTP-provider fetch p50/p90/p95/max:
+  `161ms` / `621ms` / `722ms` / `897ms`.
+- HTTP-provider self-hedges: `8`, all during cold/warm-fill block fetches, not
+  during the already-hot page responses.
+
+Decision:
+Keep as a resource soak baseline. There is no obvious RSS or FD growth over 30
+warm page loads, and the hot measured path remains stable at roughly 20ms total
+per page run. Longer soaks should use this as the short-run reference and
+should separate cold/warm-fill trace events from hot measured responses when
+looking at slow HTTP-provider fetches.
