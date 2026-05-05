@@ -1434,11 +1434,12 @@ fn print_trace_connection_errors(trace: &TraceSummary) {
         return;
     }
     println!(
-        "  bitswap connection errors: events={} with_peer={} without_peer={} classes={} peers={}",
+        "  bitswap connection errors: events={} with_peer={} without_peer={} classes={} addr_families={} peers={}",
         errors.events,
         errors.with_peer,
         errors.without_peer,
         format_trace_counts(&errors.classes),
+        format_trace_counts(&trace.bitswap_connection_error_addr_families),
         format_trace_counts(&errors.peers)
     );
 }
@@ -3647,6 +3648,7 @@ struct TraceSummary {
     bitswap_provider_quality: TraceBitswapProviderQualityAggregate,
     bitswap_connection_transports: Vec<TraceValueCount>,
     bitswap_connection_errors: TraceBitswapConnectionErrorAggregate,
+    bitswap_connection_error_addr_families: Vec<TraceValueCount>,
     bitswap_connection_backoff: TraceBitswapConnectionBackoffAggregate,
     bitswap_dial_rejections: TraceBitswapDialRejectedAggregate,
     bitswap_dial_rejected_transports: Vec<TraceValueCount>,
@@ -4212,6 +4214,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_connection_error_without_peer = 0usize;
     let mut bitswap_connection_error_classes = BTreeMap::<String, usize>::new();
     let mut bitswap_connection_error_peers = BTreeMap::<String, usize>::new();
+    let mut bitswap_connection_error_addr_families = BTreeMap::<String, usize>::new();
     let mut bitswap_connection_backoffs = 0usize;
     let mut bitswap_connection_backoff_skips = 0usize;
     let mut bitswap_connection_backoff_classes = BTreeMap::<String, usize>::new();
@@ -4817,6 +4820,14 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             *bitswap_connection_error_classes
                 .entry(class.to_string())
                 .or_default() += 1;
+            let addr_family = value
+                .get("error")
+                .and_then(|error| error.as_str())
+                .map(bitswap_connection_error_addr_family)
+                .unwrap_or("unknown");
+            *bitswap_connection_error_addr_families
+                .entry(addr_family.to_string())
+                .or_default() += 1;
         }
         if phase == "bitswap_connection_error_backoff" {
             bitswap_connection_backoffs += 1;
@@ -4990,6 +5001,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             classes: sorted_trace_counts(bitswap_connection_error_classes),
             peers: sorted_trace_counts(bitswap_connection_error_peers),
         },
+        bitswap_connection_error_addr_families: sorted_trace_counts(
+            bitswap_connection_error_addr_families,
+        ),
         bitswap_connection_backoff: TraceBitswapConnectionBackoffAggregate {
             backoffs: bitswap_connection_backoffs,
             skipped: bitswap_connection_backoff_skips,
@@ -5244,6 +5258,17 @@ fn bitswap_connection_error_class(error: &str) -> &'static str {
         "timeout"
     } else {
         "other"
+    }
+}
+
+fn bitswap_connection_error_addr_family(error: &str) -> &'static str {
+    let has_ip4 = error.contains("/ip4/");
+    let has_ip6 = error.contains("/ip6/");
+    match (has_ip4, has_ip6) {
+        (true, true) => "mixed",
+        (true, false) => "ip4",
+        (false, true) => "ip6",
+        (false, false) => "unknown",
     }
 }
 
@@ -5689,8 +5714,8 @@ mod tests {
                 "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":2,\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":true,\"source_peer\":\"peer1\",\"bitswap_delivery\":\"outgoing\",\"source_peer_trusted\":true,\"extra_blocks\":1}\n",
                 "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":3,\"cid\":\"cid9\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":false,\"timeout\":true}\n",
                 "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer1\",\"remote_addr\":\"/ip4/127.0.0.1/tcp/4001\",\"transport\":\"tcp\"}\n",
-                "{\"phase\":\"bitswap_connection_error\",\"peer\":\"peer3\",\"error\":\"Failed to negotiate transport protocol(s): Protocol negotiation failed.\"}\n",
-                "{\"phase\":\"bitswap_connection_error\",\"peer\":\"\",\"error\":\"Failed to negotiate transport protocol(s): Connection refused (os error 111)\"}\n",
+                "{\"phase\":\"bitswap_connection_error\",\"peer\":\"peer3\",\"error\":\"Failed to negotiate transport protocol(s): [(/ip6/2001:db8::1/tcp/4001/p2p/peer3: Protocol negotiation failed.)]\"}\n",
+                "{\"phase\":\"bitswap_connection_error\",\"peer\":\"\",\"error\":\"Failed to negotiate transport protocol(s): [(/ip4/127.0.0.1/tcp/4001: Connection refused (os error 111))]\"}\n",
                 "{\"phase\":\"bitswap_connection_error_backoff\",\"peer\":\"peer3\",\"error_class\":\"protocol_negotiation_failed\",\"count\":2,\"ttl_ms\":30000}\n",
                 "{\"phase\":\"bitswap_connection_error_peer_skipped\",\"cid\":\"cid-skip\",\"peer\":\"peer3\",\"remaining_ms\":25000}\n",
                 "{\"phase\":\"bitswap_dial_rejected\",\"peer\":\"peer2\",\"transport\":\"quic\",\"connection_limit\":true,\"error\":\"Dial error\"}\n",
@@ -5938,6 +5963,14 @@ mod tests {
         );
         assert_eq!(summary.bitswap_connection_errors.peers[0].value, "peer3");
         assert_eq!(summary.bitswap_connection_errors.peers[0].count, 1);
+        assert_eq!(
+            summary.bitswap_connection_error_addr_families[0].value,
+            "ip4"
+        );
+        assert_eq!(
+            summary.bitswap_connection_error_addr_families[1].value,
+            "ip6"
+        );
         assert_eq!(summary.bitswap_connection_backoff.backoffs, 1);
         assert_eq!(summary.bitswap_connection_backoff.skipped, 1);
         assert_eq!(

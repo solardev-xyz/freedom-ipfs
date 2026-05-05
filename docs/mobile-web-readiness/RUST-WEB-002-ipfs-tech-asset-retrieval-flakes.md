@@ -7855,3 +7855,78 @@ Result:
 Decision: keep. This is diagnostics-only and makes future endpoint sweeps
 readable from the normal harness output instead of requiring manual JSONL
 inspection.
+
+## 2026-05-05 Keep: Bitswap Connection Error Address Families
+
+Motivation:
+The current `ipfs-tech-page-assets` refresh passed but still showed dial
+pressure and several `No route to host` connection errors. The harness grouped
+connection errors by class and peer, but did not say whether failures were tied
+to IPv4, IPv6, mixed, or unknown multiaddrs.
+
+Implementation:
+
+- Classify `bitswap_connection_error` error strings by embedded multiaddr
+  family: `ip4`, `ip6`, `mixed`, or `unknown`.
+- Add `bitswap_connection_error_addr_families` to trace summaries.
+- Print the family breakdown alongside connection error class and peer counts.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+cargo test -p mobile-web-harness
+git diff --check
+```
+
+Context refresh before adding the diagnostic:
+
+```sh
+timeout 360s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/ipfs-tech-current-refresh-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-current-refresh.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `689/2427ms`, Kubo `3789/3931ms`.
+- Asset TTFB p50/p95: Rust `200/1789ms`, Kubo `224/546ms`.
+- Max RSS/FD: Rust `52484KiB`/`44`, Kubo `300896KiB`/`368`.
+- Delegated lookup max was only `91ms`, so this window was not routing-bound.
+- Trace still had `48` connection-limit dial rejections and connection errors
+  including repeated IPv6 `No route to host` failures.
+
+Live smoke after adding the diagnostic:
+
+```sh
+timeout 180s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/vitalik-connection-error-family-smoke-trace.jsonl \
+  --comparison-output /tmp/vitalik-connection-error-family-smoke.json
+```
+
+Result:
+
+- Rust and Kubo both passed `1/1`.
+- Root TTFB: Rust `1680ms`, Kubo `2901ms`.
+- The report printed `bitswap connection errors: events=2 ... classes=
+  connection_refused=2 addr_families=ip4=2 ...`.
+
+Decision: keep. This is diagnostics-only and gives future provider/address
+policy experiments a clearer signal for whether connection failures are
+address-family-specific before changing any dial filtering behavior.

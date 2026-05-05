@@ -145,7 +145,9 @@ Bitswap connections are also counted by transport as
 `bitswap_connection_transports`, so provider experiments can see whether actual
 connections are using TCP, QUIC, WS, or WSS. Immediate dial rejections are
 counted by transport as `bitswap_dial_rejected_transports`, which helps spot
-connection-limit pressure by transport. UnixFS metadata-cache traces are also
+connection-limit pressure by transport. Connection errors are additionally
+grouped by failed multiaddr family as IPv4, IPv6, mixed, or unknown when the
+error string contains a multiaddr. UnixFS metadata-cache traces are also
 aggregated so reports show decoded DAG-PB cache events, path-resolution cache
 hits/misses, file-size cache hits/misses, inserts, evictions, skip counts,
 maximum lengths, and capacity without manual JSONL greps.
