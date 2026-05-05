@@ -1250,6 +1250,8 @@ impl SharedBitswapClient {
         let peer_count = peers.len();
         let trusted_peer_count = peers.iter().filter(|peer| peer.skip_want_have).count();
         let request_timeout = bitswap_request_timeout(peer_count, trusted_peer_count);
+        let (want_block_target_count, want_have_target_count) =
+            bitswap_request_target_mode_counts(&peers);
         let target_summary =
             tracing::enabled!(tracing::Level::INFO).then(|| format_bitswap_peers(&peers));
         let (respond, response) = oneshot::channel();
@@ -1275,6 +1277,8 @@ impl SharedBitswapClient {
                     cid = %cid,
                     peer_count,
                     trusted_peer_count,
+                    want_block_target_count,
+                    want_have_target_count,
                     timeout_ms = request_timeout.as_millis(),
                     elapsed_ms = wait_started.elapsed().as_millis(),
                     targets = %target_summary.as_deref().unwrap_or("")
@@ -1283,6 +1287,25 @@ impl SharedBitswapClient {
             }
         }
     }
+}
+
+fn bitswap_request_target_mode_counts(peers: &[BitswapPeer]) -> (usize, usize) {
+    let has_multiple_peers = peers.len() > 1;
+    let mut direct_untrusted_want_block_count = 0usize;
+    let mut want_block_count = 0usize;
+    let mut want_have_count = 0usize;
+    for peer in peers {
+        if bitswap_prefer_want_have(
+            has_multiple_peers,
+            peer.skip_want_have,
+            &mut direct_untrusted_want_block_count,
+        ) {
+            want_have_count += 1;
+        } else {
+            want_block_count += 1;
+        }
+    }
+    (want_block_count, want_have_count)
 }
 
 fn bitswap_request_timeout(peer_count: usize, trusted_peer_count: usize) -> Duration {
@@ -3584,6 +3607,8 @@ mod bitswap_tests {
     fn formats_bitswap_peer_timeout_summary() {
         let first = parse_peer_id("12D3KooWLSFr3c4K1dxWavx5XFsUjeSXap3VPMuEbe28zeL5B1v3").unwrap();
         let second = parse_peer_id("12D3KooWGU3fJrHaWtRSWyrrzCpdgFX5bxbS69hqL1MSdKMGez12").unwrap();
+        let third = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let fourth = parse_peer_id("12D3KooWGtYkBAaqJMJEmywMxaCiNP7LCEFUAFiLEBASe232c2VH").unwrap();
         let peers = vec![
             BitswapPeer {
                 id: first,
@@ -3601,14 +3626,25 @@ mod bitswap_tests {
                 addrs: Vec::new(),
                 skip_want_have: false,
             },
+            BitswapPeer {
+                id: third,
+                addrs: Vec::new(),
+                skip_want_have: false,
+            },
+            BitswapPeer {
+                id: fourth,
+                addrs: Vec::new(),
+                skip_want_have: false,
+            },
         ];
 
         assert_eq!(
             format_bitswap_peers(&peers),
             format!(
-                "{first}:want-block@[/ip4/127.0.0.1/tcp/1001,/ip4/127.0.0.1/tcp/1002,+3 more]; {second}:want-block@[]"
+                "{first}:want-block@[/ip4/127.0.0.1/tcp/1001,/ip4/127.0.0.1/tcp/1002,+3 more]; {second}:want-block@[]; {third}:want-block@[]; {fourth}:want-have@[]"
             )
         );
+        assert_eq!(bitswap_request_target_mode_counts(&peers), (3, 1));
     }
 
     #[tokio::test(flavor = "multi_thread")]

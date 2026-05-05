@@ -5320,3 +5320,75 @@ Decision: keep. This does not change retrieval behavior, but it makes live
 comparison output capture whether a run is dominated by scheduled outgoing
 attempts, completed peer-attempt failures, or incoming-session wins before the
 outgoing attempts finish.
+
+## 2026-05-05 Keep: Count Timeout Target Modes
+
+Goal:
+
+- Make cold and mixed Bitswap request timeout summaries show how many selected
+  peers received full want-block requests versus want-have probes.
+- Avoid relying on the long `targets` string in
+  `bitswap_request_timeout_detail` to understand whether a timeout batch was
+  mostly probes or full block requests.
+
+Implementation:
+
+- Add `want_block_target_count` and `want_have_target_count` to
+  `bitswap_request_timeout_detail`.
+- Aggregate total and max want-block/want-have timeout targets in the mobile web
+  harness.
+- Print a separate `bitswap timeout target modes` line only when the new fields
+  are present.
+
+Validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval --lib formats_bitswap_peer_timeout_summary
+cargo test -p mobile-web-harness trace_summary_counts_bitswap_timeout_recovery
+cargo test -p freedom-ipfs-retrieval --lib
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo build -p freedom-ipfs-gateway
+```
+
+Live validation:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-timeout-target-modes-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-timeout-target-modes-r3.json
+```
+
+Result: Rust passed `1/3`; Kubo passed `3/3`. Rust root TTFB p50/p95 was
+`28207/30500ms` versus Kubo `1596/3199ms`. Rust asset TTFB p50/p95 was
+`139/5495ms` versus Kubo `114/250ms`. Rust max RSS/FD was `52652KiB`/`67`
+versus Kubo `202480KiB`/`141`.
+
+Trace summary:
+
+- `bitswap timeout recovery: request_timeout_details=5 cold=3
+  mixed_trusted=2 trusted_only=0 timeout_ms=15000=3, 4000=2 max_peers=16
+  request_timeout_events=5 reset_true=4 reset_false=1 client_resets=4
+  retry_starts=4 same_provider_retries=3 refreshed_provider_retries=1
+  retry_successes=2 trusted_retry_successes=2 untrusted_retry_successes=0
+  retry_failures=2 retry_unresolved=0`
+- `bitswap timeout target modes: want_block=12 want_have=32
+  max_want_block=3 max_want_have=13`
+- `bitswap peer attempts: starts=219 outgoing_completed=26 successes=0
+  failures=26 connection_timeouts=24 read_timeouts=2 other_failures=0
+  prefer_want_have=18`
+- `bitswap dial rejections: events=34 connection_limit=34 other=0
+  transports=tcp=29, quic=4, ws=1`
+
+Decision: keep. The failure shape is more specific now: selected timeout
+batches are mostly want-have probes, but the completed outgoing attempts are
+overwhelmingly connection timeouts. The next behavior experiment should focus
+on cold provider/peer quality and connection-slot pressure, not on raising
+request timeout budgets.

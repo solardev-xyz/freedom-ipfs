@@ -1051,6 +1051,17 @@ fn print_trace_timeout_recovery(trace: &TraceSummary) {
         recovery.retry_unresolved,
         recovery.retry_success_elapsed_ms
     );
+    if recovery.request_timeout_want_block_targets > 0
+        || recovery.request_timeout_want_have_targets > 0
+    {
+        println!(
+            "  bitswap timeout target modes: want_block={} want_have={} max_want_block={} max_want_have={}",
+            recovery.request_timeout_want_block_targets,
+            recovery.request_timeout_want_have_targets,
+            recovery.max_request_timeout_want_block_targets,
+            recovery.max_request_timeout_want_have_targets
+        );
+    }
 }
 
 fn print_trace_bitswap_peer_attempts(trace: &TraceSummary) {
@@ -3083,6 +3094,10 @@ struct TraceBitswapTimeoutRecoveryAggregate {
     trusted_only_request_timeouts: usize,
     request_timeout_budgets: Vec<TraceValueCount>,
     max_request_timeout_peer_count: u128,
+    request_timeout_want_block_targets: u128,
+    request_timeout_want_have_targets: u128,
+    max_request_timeout_want_block_targets: u128,
+    max_request_timeout_want_have_targets: u128,
     request_timeout_events: usize,
     request_timeout_reset_true: usize,
     request_timeout_reset_false: usize,
@@ -3118,6 +3133,10 @@ struct TraceBitswapTimeoutRecoveryBuilder {
     trusted_only_request_timeouts: usize,
     request_timeout_budgets: BTreeMap<String, usize>,
     max_request_timeout_peer_count: u128,
+    request_timeout_want_block_targets: u128,
+    request_timeout_want_have_targets: u128,
+    max_request_timeout_want_block_targets: u128,
+    max_request_timeout_want_have_targets: u128,
     request_timeout_events: usize,
     request_timeout_reset_true: usize,
     request_timeout_reset_false: usize,
@@ -3144,6 +3163,10 @@ impl TraceBitswapTimeoutRecoveryBuilder {
             trusted_only_request_timeouts: self.trusted_only_request_timeouts,
             request_timeout_budgets: sorted_trace_counts(self.request_timeout_budgets),
             max_request_timeout_peer_count: self.max_request_timeout_peer_count,
+            request_timeout_want_block_targets: self.request_timeout_want_block_targets,
+            request_timeout_want_have_targets: self.request_timeout_want_have_targets,
+            max_request_timeout_want_block_targets: self.max_request_timeout_want_block_targets,
+            max_request_timeout_want_have_targets: self.max_request_timeout_want_have_targets,
             request_timeout_events: self.request_timeout_events,
             request_timeout_reset_true: self.request_timeout_reset_true,
             request_timeout_reset_false: self.request_timeout_reset_false,
@@ -3526,6 +3549,24 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             bitswap_timeout_recovery.max_request_timeout_peer_count = bitswap_timeout_recovery
                 .max_request_timeout_peer_count
                 .max(peer_count);
+            let want_block_targets = value
+                .get("want_block_target_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            let want_have_targets = value
+                .get("want_have_target_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            bitswap_timeout_recovery.request_timeout_want_block_targets += want_block_targets;
+            bitswap_timeout_recovery.request_timeout_want_have_targets += want_have_targets;
+            bitswap_timeout_recovery.max_request_timeout_want_block_targets =
+                bitswap_timeout_recovery
+                    .max_request_timeout_want_block_targets
+                    .max(want_block_targets);
+            bitswap_timeout_recovery.max_request_timeout_want_have_targets =
+                bitswap_timeout_recovery
+                    .max_request_timeout_want_have_targets
+                    .max(want_have_targets);
             if let Some(timeout_ms) = value.get("timeout_ms").and_then(json_u128) {
                 *bitswap_timeout_recovery
                     .request_timeout_budgets
@@ -4819,13 +4860,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "{\"phase\":\"bitswap_request_timeout_detail\",\"elapsed_ms\":4000,\"cid\":\"cid-a\",\"peer_count\":10,\"trusted_peer_count\":2,\"timeout_ms\":4000}\n",
+                "{\"phase\":\"bitswap_request_timeout_detail\",\"elapsed_ms\":4000,\"cid\":\"cid-a\",\"peer_count\":10,\"trusted_peer_count\":2,\"want_block_target_count\":4,\"want_have_target_count\":6,\"timeout_ms\":4000}\n",
                 "{\"phase\":\"bitswap_client_reset\"}\n",
                 "{\"phase\":\"bitswap_request_timeout\",\"elapsed_ms\":4001,\"cid\":\"cid-a\",\"peer_count\":10,\"trusted_peer_count\":2,\"timeout_ms\":4000,\"reset_client\":true}\n",
                 "{\"phase\":\"retry_provider_count\",\"cid\":\"cid-a\",\"same_provider_set\":true,\"same_bitswap_peer_set\":true,\"request_timeout\":true}\n",
                 "{\"phase\":\"provider_retry_after_request_timeout\",\"cid\":\"cid-a\",\"provider_count\":8,\"request_timeout\":true}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":75,\"cid\":\"cid-a\",\"ok\":true,\"trusted_peer_count\":2,\"source_peer_trusted\":false,\"source_peer\":\"peer-a\",\"source_transport\":\"tcp\",\"bitswap_delivery\":\"incoming\",\"extra_blocks\":0,\"bytes\":123}\n",
-                "{\"phase\":\"bitswap_request_timeout_detail\",\"elapsed_ms\":15000,\"cid\":\"cid-b\",\"peer_count\":1,\"trusted_peer_count\":0,\"timeout_ms\":15000}\n",
+                "{\"phase\":\"bitswap_request_timeout_detail\",\"elapsed_ms\":15000,\"cid\":\"cid-b\",\"peer_count\":1,\"trusted_peer_count\":0,\"want_block_target_count\":1,\"want_have_target_count\":0,\"timeout_ms\":15000}\n",
                 "{\"phase\":\"bitswap_request_timeout\",\"elapsed_ms\":15001,\"cid\":\"cid-b\",\"peer_count\":1,\"trusted_peer_count\":0,\"timeout_ms\":15000,\"reset_client\":false}\n",
                 "{\"phase\":\"retry_provider_count\",\"cid\":\"cid-b\",\"same_provider_set\":false,\"same_bitswap_peer_set\":false,\"request_timeout\":true}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":15000,\"cid\":\"cid-b\",\"ok\":false,\"trusted_peer_count\":0,\"error\":\"bitswap request timed out\"}\n",
@@ -4857,6 +4898,30 @@ mod tests {
                 .bitswap_timeout_recovery
                 .max_request_timeout_peer_count,
             10
+        );
+        assert_eq!(
+            summary
+                .bitswap_timeout_recovery
+                .request_timeout_want_block_targets,
+            5
+        );
+        assert_eq!(
+            summary
+                .bitswap_timeout_recovery
+                .request_timeout_want_have_targets,
+            6
+        );
+        assert_eq!(
+            summary
+                .bitswap_timeout_recovery
+                .max_request_timeout_want_block_targets,
+            4
+        );
+        assert_eq!(
+            summary
+                .bitswap_timeout_recovery
+                .max_request_timeout_want_have_targets,
+            6
         );
         let timeout_budgets = summary
             .bitswap_timeout_recovery
