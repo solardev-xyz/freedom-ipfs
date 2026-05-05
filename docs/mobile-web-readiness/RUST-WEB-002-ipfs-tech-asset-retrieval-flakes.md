@@ -4098,3 +4098,30 @@ cargo test -p freedom-ipfs-retrieval --lib fetches_block_from_local_bitswap_peer
 cargo test -p freedom-ipfs-retrieval --lib
 git diff --check
 ```
+
+Current same-window Kubo comparison with the extra-block summary:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-extra-blocks-current-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-extra-blocks-current-r3.json
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root TTFB p50/p95 was
+`935/3654ms` versus Kubo `4585/5191ms`; Rust asset p50/p95 was `158/891ms`
+versus Kubo `214/683ms`. Rust stayed much lighter at max RSS/FD
+`50664KiB`/`49` versus Kubo `323272KiB`/`537`.
+
+Trace summary: `bitswap deliveries: incoming=105`; `bitswap extra blocks:
+events=105 total=27 max=3 incoming=27 outgoing=0 unknown=0`;
+`bitswap_session_shortcut_hits=85`; `peer_attempt_starts=341`;
+`outgoing_completed=0`; inbound `blocks=141 bytes=2622475
+max_oldest_pending_ms=1748`. This keeps pointing at inbound Bitswap delivery
+and verified extra blocks as the practical optimization surface, rather than
+completed outgoing stream reads.
