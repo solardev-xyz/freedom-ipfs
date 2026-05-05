@@ -19397,3 +19397,49 @@ warm page loads, and the hot measured path remains stable at roughly 20ms total
 per page run. Longer soaks should use this as the short-run reference and
 should separate cold/warm-fill trace events from hot measured responses when
 looking at slow HTTP-provider fetches.
+
+## 2026-05-05 Baseline: Resolved-IPFS Offline Replay After Self-Hedges
+
+Question:
+After one online `ipfs.tech` page load, can the warmed Rust cache replay the
+page offline when the observed IPNS target is rewritten to its resolved
+`/ipfs/...` path?
+
+Command:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --offline-replay \
+  --offline-replay-resolved-ipfs \
+  --case ipfs-tech-page-assets \
+  --asset-concurrency 6 \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-resolved-offline-post-self-hedges-trace.jsonl \
+  --output /tmp/ipfs-tech-resolved-offline-post-self-hedges.json
+```
+
+Result:
+
+- Offline replay DB:
+  `/tmp/freedom-ipfs-offline-replay.db-1563279-1778023401850`.
+- Resolved path rewrite:
+  `/ipns/ipfs.tech/` ->
+  `/ipfs/bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq/`.
+- Online pass: `1/1`.
+- Offline pass: `1/1`.
+- Missing URLs: `0`.
+- Offline statuses: `200=27`, `206=6`.
+- Offline progress phases: `streaming=232`, `completed=33`, `queued=33`,
+  `started=33`.
+- Offline storage bytes reported by the harness: `4096B`.
+
+Decision:
+Keep as current cache-completeness evidence. A single online load is sufficient
+for resolved-IPFS offline replay of the current `ipfs.tech` root plus same-site
+asset set. Product-level offline IPNS behavior still depends on how the app
+wants to handle name freshness and IPNS record caching, but the block/resource
+cache has the page data needed for this resolved replay.
