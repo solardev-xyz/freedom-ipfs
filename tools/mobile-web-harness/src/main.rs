@@ -5662,9 +5662,10 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         "provider_diversity_low" => "provider_diversity_low",
         "light_dht_provider_lookup" | "dht_provider_lookup" => "dht_fallback_started",
         "provider_fetch_start" => "providers_found",
-        "delegated_provider_lookup" | "bitswap_dnsaddr_expand" | "bitswap_dns_multiaddr_expand" => {
-            "provider_lookup"
-        }
+        "delegated_provider_lookup"
+        | "bitswap_dns_prefetch"
+        | "bitswap_dnsaddr_expand"
+        | "bitswap_dns_multiaddr_expand" => "provider_lookup",
         "http_provider_fetch" => "fetching_http_provider",
         "bitswap_fetch"
         | "bitswap_connection_established"
@@ -5900,6 +5901,8 @@ fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
         "cache_hit",
         "process_id",
         "request_id",
+        "dnsaddr_host_count",
+        "dns_ip_host_count",
         "peer",
         "prefer_want_have",
         "want_have_timeout_ms",
@@ -6799,6 +6802,7 @@ mod tests {
                 "{\"phase\":\"provider_lookup\",\"cid\":\"cid-a\",\"provider_count\":3}\n",
                 "{\"phase\":\"delegated_provider_lookup\",\"cid\":\"cid-a\",\"endpoint\":\"https://delegated-ipfs.dev/routing/v1\",\"provider_count\":3,\"elapsed_ms\":8}\n",
                 "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid-a\",\"provider_count\":1,\"fallback\":\"light_dht\"}\n",
+                "{\"phase\":\"bitswap_dns_prefetch\",\"dnsaddr_host_count\":1,\"dns_ip_host_count\":2,\"elapsed_ms\":5}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"peer.test\",\"record_count\":2}\n",
                 "{\"phase\":\"block_store_get\",\"cid\":\"cid-a\",\"cache_hit\":false}\n",
                 "{\"phase\":\"block_store_get\",\"cid\":\"cid-b\",\"cache_hit\":true}\n",
@@ -6834,7 +6838,7 @@ mod tests {
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "provider_lookup"),
-            3
+            4
         );
         assert_eq!(summary.delegated_provider_lookup.events, 1);
         assert_eq!(summary.delegated_provider_lookup.successes, 1);

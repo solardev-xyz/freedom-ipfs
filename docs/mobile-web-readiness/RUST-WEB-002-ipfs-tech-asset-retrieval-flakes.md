@@ -9150,3 +9150,88 @@ Deterministic validation:
 - `cargo check --workspace --all-targets`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `git diff --check`
+
+## 2026-05-05 Keep: Concurrent Bitswap DNS Prefetch
+
+Hypothesis:
+`bitswap_peer_expand` was still a visible latency tail on public network reads
+because provider address DNS work happened serially during the per-provider
+quality pass. In the live traces before this experiment,
+`vitalik-root-html-range` spent `832ms` in its first peer expansion and
+`ipfs-tech-page-assets` hit a `1253ms` max peer expansion. Resolving unique
+`/dnsaddr` and `/dns*` multiaddr hosts concurrently before the existing quality
+pass should cap that tail without changing which peers are eligible.
+
+Implementation:
+
+- Prefetch unique provider `/dnsaddr` TXT hosts before the Bitswap candidate
+  quality loop.
+- Prefetch unique DNS multiaddr host IPs from the original provider addrs plus
+  resolved dnsaddr records.
+- Keep the same Cloudflare DoH resolver and the same expansion/filtering logic
+  used by the old path.
+- Bound prefetch fanout with `BITSWAP_DNS_PREFETCH_CONCURRENCY = 8`.
+- Feed prefetched results through the existing `expand_provider_multiaddrs`
+  cache path, while logging first-use expansion events as non-cached so trace
+  summaries still read naturally.
+- Add `bitswap_dns_prefetch` as a provider-lookup progress phase in the mobile
+  progress snapshot and mobile web harness trace summary.
+
+Experiment commands:
+
+```sh
+cargo test -p freedom-ipfs-retrieval cached_dns_expansion_reuses_dnsaddr_and_ip_results
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --timeout-secs 90 \
+  --run-timeout-secs 90 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-dns-prefetch-trace.jsonl \
+  --output /tmp/vitalik-dns-prefetch.json
+
+timeout 240s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-dns-prefetch-trace.jsonl \
+  --output /tmp/ipfs-tech-dns-prefetch.json
+```
+
+Results:
+
+- Focused retrieval/mobile/harness tests passed.
+- `vitalik-root-html-range` passed `1/1`; root TTFB was `474ms`, RSS was
+  `37376KiB`, FD count was `18`, delegated provider lookup max was `124ms`, and
+  there were no DHT provider lookups. `bitswap_peer_expand` ran once at `172ms`;
+  the new `bitswap_dns_prefetch` event took `142ms`.
+- `ipfs-tech-page-assets` passed `1/1`; root TTFB was `2318ms`, asset
+  p50/p95/max was `122/919/941ms`, RSS was `51940KiB`, and FD count was `41`.
+  There were no DHT provider lookups. `bitswap_peer_expand` ran `7` times with
+  max `128ms`; `bitswap_dns_prefetch` ran `4` times with max `100ms`.
+
+Decision: keep. This is a behavior-preserving latency reduction for provider
+address expansion. The work is read-only, bounded, uses the existing verified
+retrieval path after candidate selection, does not add public gateway fallback,
+and does not serve or cache unverified bytes. The live results are not perfectly
+A/B comparable because the public network varied, but they show the intended
+effect: DNS expansion is moved into a bounded concurrent phase and
+`bitswap_peer_expand` no longer dominates the observed page-load tail.
+
+Deterministic validation:
+
+- `cargo fmt --all --check`
+- `cargo test -p freedom-ipfs-retrieval`
+- `cargo test -p freedom-ipfs-mobile`
+- `cargo test -p mobile-web-harness`
+- `cargo check --workspace --all-targets`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `git diff --check`

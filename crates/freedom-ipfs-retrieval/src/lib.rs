@@ -80,6 +80,7 @@ const MAX_PENDING_INCOMING_BITSWAP_READS: usize = 32;
 // back to conservative WANT_HAVE probes for the rest. This lowers page-asset
 // tails without requesting every block from every provider candidate.
 const MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS: usize = 3;
+const BITSWAP_DNS_PREFETCH_CONCURRENCY: usize = 8;
 const MAX_BITSWAP_FAILURE_DETAILS: usize = 8;
 const MAX_RECORDED_DIAL_ERRORS_PER_PEER: usize = 6;
 const MAX_INFLIGHT_BLOCK_FETCHES: usize = 256;
@@ -2212,6 +2213,21 @@ struct BitswapProviderAddrQuality {
     addr_with_certhash_count: usize,
 }
 
+#[derive(Clone)]
+struct CachedDnsaddrRecords {
+    records: Vec<String>,
+    log_as_cached: bool,
+}
+
+#[derive(Clone)]
+struct CachedDnsIpRecords {
+    addrs: Vec<IpAddr>,
+    log_as_cached: bool,
+}
+
+type DnsaddrCache = HashMap<String, CachedDnsaddrRecords>;
+type DnsIpCache = HashMap<String, CachedDnsIpRecords>;
+
 impl BitswapProviderAddrQuality {
     fn rejected_addr_count(&self) -> usize {
         self.unsupported_relay_addr_count
@@ -2252,8 +2268,9 @@ async fn bitswap_peers(providers: &[Provider]) -> Vec<BitswapPeer> {
 async fn bitswap_peers_with_quality(providers: &[Provider]) -> BitswapProviderCandidates {
     let mut peers = Vec::new();
     let mut quality = BitswapProviderAddrQuality::default();
-    let mut dnsaddr_cache = HashMap::<String, Vec<String>>::new();
-    let mut dns_ip_cache = HashMap::<String, Vec<IpAddr>>::new();
+    let mut dnsaddr_cache = DnsaddrCache::new();
+    let mut dns_ip_cache = DnsIpCache::new();
+    prefetch_bitswap_dns_expansions(providers, &mut dnsaddr_cache, &mut dns_ip_cache).await;
 
     for provider in providers {
         let provider_peer = provider.id.as_deref().and_then(parse_peer_id);
@@ -2415,10 +2432,137 @@ fn bitswap_transport_label(addr: &Multiaddr) -> &'static str {
     }
 }
 
+async fn prefetch_bitswap_dns_expansions(
+    providers: &[Provider],
+    dnsaddr_cache: &mut DnsaddrCache,
+    dns_ip_cache: &mut DnsIpCache,
+) {
+    let started = Instant::now();
+    let dnsaddr_hosts = providers
+        .iter()
+        .flat_map(|provider| provider.addrs.iter())
+        .filter_map(|addr| dnsaddr_host(addr).map(str::to_string))
+        .filter(|host| !dnsaddr_cache.contains_key(host))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let dnsaddr_host_count = dnsaddr_hosts.len();
+    for (host, records) in resolve_dnsaddr_hosts(dnsaddr_hosts).await {
+        dnsaddr_cache.insert(
+            host,
+            CachedDnsaddrRecords {
+                records,
+                log_as_cached: false,
+            },
+        );
+    }
+
+    let dns_names = providers
+        .iter()
+        .flat_map(|provider| provider.addrs.iter())
+        .flat_map(|addr| {
+            if let Some(host) = dnsaddr_host(addr) {
+                dnsaddr_cache
+                    .get(host)
+                    .map(|entry| entry.records.clone())
+                    .unwrap_or_default()
+            } else {
+                vec![addr.clone()]
+            }
+        })
+        .filter(|addr| !websocket_multiaddr(addr))
+        .filter_map(|addr| dns_multiaddr_name(&addr))
+        .filter(|host| !dns_ip_cache.contains_key(host))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let dns_ip_host_count = dns_names.len();
+    for (host, addrs) in resolve_dns_ip_hosts(dns_names).await {
+        dns_ip_cache.insert(
+            host,
+            CachedDnsIpRecords {
+                addrs,
+                log_as_cached: false,
+            },
+        );
+    }
+
+    if dnsaddr_host_count > 0 || dns_ip_host_count > 0 {
+        tracing::info!(
+            phase = "bitswap_dns_prefetch",
+            dnsaddr_host_count,
+            dns_ip_host_count,
+            elapsed_ms = started.elapsed().as_millis()
+        );
+    }
+}
+
+async fn resolve_dnsaddr_hosts(hosts: Vec<String>) -> Vec<(String, Vec<String>)> {
+    let resolver = Arc::new(CloudflareDohResolver::default());
+    let mut pending = FuturesUnordered::<BoxFuture<'static, (String, Vec<String>)>>::new();
+    let mut hosts = hosts.into_iter();
+    for _ in 0..BITSWAP_DNS_PREFETCH_CONCURRENCY {
+        let Some(host) = hosts.next() else {
+            break;
+        };
+        pending.push(resolve_dnsaddr_host(resolver.clone(), host).boxed());
+    }
+
+    let mut resolved = Vec::new();
+    while let Some(result) = pending.next().await {
+        resolved.push(result);
+        if let Some(host) = hosts.next() {
+            pending.push(resolve_dnsaddr_host(resolver.clone(), host).boxed());
+        }
+    }
+    resolved
+}
+
+async fn resolve_dnsaddr_host(
+    resolver: Arc<CloudflareDohResolver>,
+    host: String,
+) -> (String, Vec<String>) {
+    let lookup = format!("_dnsaddr.{host}");
+    let records = match resolver.txt_lookup(&lookup).await {
+        Ok(records) => dnsaddr_records(records),
+        Err(_) => Vec::new(),
+    };
+    (host, records)
+}
+
+async fn resolve_dns_ip_hosts(hosts: Vec<String>) -> Vec<(String, Vec<IpAddr>)> {
+    let resolver = Arc::new(CloudflareDohResolver::default());
+    let mut pending = FuturesUnordered::<BoxFuture<'static, (String, Vec<IpAddr>)>>::new();
+    let mut hosts = hosts.into_iter();
+    for _ in 0..BITSWAP_DNS_PREFETCH_CONCURRENCY {
+        let Some(host) = hosts.next() else {
+            break;
+        };
+        pending.push(resolve_dns_ip_host(resolver.clone(), host).boxed());
+    }
+
+    let mut resolved = Vec::new();
+    while let Some(result) = pending.next().await {
+        resolved.push(result);
+        if let Some(host) = hosts.next() {
+            pending.push(resolve_dns_ip_host(resolver.clone(), host).boxed());
+        }
+    }
+    resolved
+}
+
+async fn resolve_dns_ip_host(
+    resolver: Arc<CloudflareDohResolver>,
+    host: String,
+) -> (String, Vec<IpAddr>) {
+    let addrs = resolver.ip_lookup(&host).await.unwrap_or_default();
+    (host, addrs)
+}
+
 async fn expand_provider_multiaddrs(
     addrs: &[String],
-    dnsaddr_cache: &mut HashMap<String, Vec<String>>,
-    dns_ip_cache: &mut HashMap<String, Vec<IpAddr>>,
+    dnsaddr_cache: &mut DnsaddrCache,
+    dns_ip_cache: &mut DnsIpCache,
 ) -> Vec<String> {
     let resolver = CloudflareDohResolver::default();
     let mut expanded_dnsaddr = Vec::new();
@@ -2428,15 +2572,16 @@ async fn expand_provider_multiaddrs(
             expanded_dnsaddr.push(addr.clone());
             continue;
         };
-        if let Some(records) = dnsaddr_cache.get(host) {
+        if let Some(entry) = dnsaddr_cache.get_mut(host) {
             tracing::info!(
                 phase = "bitswap_dnsaddr_expand",
                 host,
-                cached = true,
-                ok = true,
-                record_count = records.len()
+                cached = entry.log_as_cached,
+                ok = !entry.records.is_empty(),
+                record_count = entry.records.len()
             );
-            expanded_dnsaddr.extend(records.iter().cloned());
+            entry.log_as_cached = true;
+            expanded_dnsaddr.extend(entry.records.iter().cloned());
             continue;
         }
         let lookup = format!("_dnsaddr.{host}");
@@ -2451,7 +2596,13 @@ async fn expand_provider_multiaddrs(
             ok = !records.is_empty(),
             record_count = records.len()
         );
-        dnsaddr_cache.insert(host.to_string(), records.clone());
+        dnsaddr_cache.insert(
+            host.to_string(),
+            CachedDnsaddrRecords {
+                records: records.clone(),
+                log_as_cached: true,
+            },
+        );
         expanded_dnsaddr.extend(records);
     }
 
@@ -2465,14 +2616,15 @@ async fn expand_provider_multiaddrs(
             expanded.push(addr);
             continue;
         };
-        let addrs = if let Some(addrs) = dns_ip_cache.get(&dns_name) {
+        let addrs = if let Some(entry) = dns_ip_cache.get_mut(&dns_name) {
             tracing::info!(
                 phase = "bitswap_dns_multiaddr_expand",
                 host = %dns_name,
-                cached = true,
-                ip_count = addrs.len()
+                cached = entry.log_as_cached,
+                ip_count = entry.addrs.len()
             );
-            addrs.clone()
+            entry.log_as_cached = true;
+            entry.addrs.clone()
         } else {
             match resolver.ip_lookup(&dns_name).await {
                 Ok(addrs) => {
@@ -2482,11 +2634,23 @@ async fn expand_provider_multiaddrs(
                         cached = false,
                         ip_count = addrs.len()
                     );
-                    dns_ip_cache.insert(dns_name.clone(), addrs.clone());
+                    dns_ip_cache.insert(
+                        dns_name.clone(),
+                        CachedDnsIpRecords {
+                            addrs: addrs.clone(),
+                            log_as_cached: true,
+                        },
+                    );
                     addrs
                 }
                 Err(_) => {
-                    dns_ip_cache.insert(dns_name.clone(), Vec::new());
+                    dns_ip_cache.insert(
+                        dns_name.clone(),
+                        CachedDnsIpRecords {
+                            addrs: Vec::new(),
+                            log_as_cached: true,
+                        },
+                    );
                     expanded.push(addr);
                     continue;
                 }
@@ -3719,14 +3883,20 @@ mod bitswap_tests {
     async fn cached_dns_expansion_reuses_dnsaddr_and_ip_results() {
         let mut dnsaddr_cache = HashMap::from([(
             "bootstrap.example".to_string(),
-            vec![
-                "/dns4/example.com/tcp/4001".to_string(),
-                "/dns4/ws.example/tcp/443/wss".to_string(),
-            ],
+            CachedDnsaddrRecords {
+                records: vec![
+                    "/dns4/example.com/tcp/4001".to_string(),
+                    "/dns4/ws.example/tcp/443/wss".to_string(),
+                ],
+                log_as_cached: true,
+            },
         )]);
         let mut dns_ip_cache = HashMap::from([(
             "example.com".to_string(),
-            vec!["203.0.113.10".parse().unwrap()],
+            CachedDnsIpRecords {
+                addrs: vec!["203.0.113.10".parse().unwrap()],
+                log_as_cached: true,
+            },
         )]);
 
         let expanded = expand_provider_multiaddrs(
