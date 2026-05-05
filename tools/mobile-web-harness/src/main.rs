@@ -1022,8 +1022,23 @@ fn print_offline_replay_summary(report: &OfflineReplayReport) {
             println!("    - {failure}");
         }
     }
-    if let Some(trace) = &report.offline.trace_summary {
-        print_trace_progress_phases(trace);
+    if !report.summary.offline_request_statuses.is_empty() {
+        println!(
+            "  offline statuses: {}",
+            format_trace_counts(&report.summary.offline_request_statuses)
+        );
+    }
+    if !report.summary.offline_trace_errors.is_empty() {
+        println!(
+            "  offline trace errors: {}",
+            format_trace_counts(&report.summary.offline_trace_errors)
+        );
+    }
+    if !report.summary.offline_progress_phases.is_empty() {
+        println!(
+            "  offline progress phases: {}",
+            format_trace_counts(&report.summary.offline_progress_phases)
+        );
     }
 }
 
@@ -2612,6 +2627,9 @@ struct OfflineReplaySummary {
     missing_url_count: usize,
     missing_urls: Vec<OfflineReplayMissingUrl>,
     offline_storage_bytes: Option<u64>,
+    offline_request_statuses: Vec<TraceValueCount>,
+    offline_trace_errors: Vec<TraceValueCount>,
+    offline_progress_phases: Vec<TraceValueCount>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2652,10 +2670,24 @@ impl OfflineReplaySummary {
             }
         }
         let offline_storage_bytes = report.summary.gateway_storage_bytes.max;
+        let (offline_request_statuses, offline_trace_errors, offline_progress_phases) = report
+            .trace_summary
+            .as_ref()
+            .map(|trace| {
+                (
+                    trace.request_statuses.clone(),
+                    trace.trace_errors.clone(),
+                    trace.progress_phases.clone(),
+                )
+            })
+            .unwrap_or_default();
         Self {
             missing_url_count: missing_urls.len(),
             missing_urls,
             offline_storage_bytes,
+            offline_request_statuses,
+            offline_trace_errors,
+            offline_progress_phases,
         }
     }
 }
@@ -3115,7 +3147,7 @@ struct TraceSlowEvent {
     details: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct TraceValueCount {
     value: String,
     count: usize,
@@ -5686,6 +5718,9 @@ mod tests {
             "http://127.0.0.1:8080/ipfs/root/app.js"
         );
         assert_eq!(summary.missing_urls[1].kind, "script");
+        assert!(summary.offline_request_statuses.is_empty());
+        assert!(summary.offline_trace_errors.is_empty());
+        assert!(summary.offline_progress_phases.is_empty());
     }
 
     fn trace_value_count(counts: &[TraceValueCount], value: &str) -> usize {

@@ -5879,6 +5879,9 @@ Implementation:
   - `summary.missing_url_count`
   - `summary.missing_urls[]` with root/asset kind, case id, URL, and failures
   - `summary.offline_storage_bytes`
+  - `summary.offline_request_statuses`
+  - `summary.offline_trace_errors`
+  - `summary.offline_progress_phases`
 - If `--trace-output /tmp/replay.jsonl` is passed, online/offline traces are
   split into `/tmp/replay-online.jsonl` and `/tmp/replay-offline.jsonl`.
 
