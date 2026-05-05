@@ -4768,3 +4768,67 @@ some 5s waits, but it appears to re-open those peers for more immediate redial
 attempts under page fan-out, increasing connection-limit churn and worsening the
 asset tail. A future version needs fair scheduling/backoff for rejected peers,
 not immediate waiter removal by itself.
+
+## 2026-05-05 Rejected: Keep Shared Client After Mixed Timeout
+
+Hypothesis:
+
+- Slow `ipfs.tech` root loads are often the large `/index.html` raw block
+  hitting the `4s` mixed trusted/provider Bitswap request timeout, then
+  succeeding on retry.
+- The current timeout path resets the shared Bitswap client. For the short
+  mixed-timeout case, keeping the shared client alive might let the retry reuse
+  established connections and reduce redial churn.
+
+Prototype:
+
+- Keep resetting the shared Bitswap client after cold or trusted-only request
+  timeouts.
+- Skip the reset only when `trusted_peer_count > 0` and the candidate set also
+  includes untrusted provider peers, which is exactly the
+  `BITSWAP_TRUSTED_MIXED_REQUEST_TIMEOUT` path.
+- Add `reset_client` to the `bitswap_request_timeout` trace event during the
+  prototype.
+
+Validation that passed before rejection:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib keeps_bitswap_client_after_mixed_trusted_request_timeout
+cargo build -p freedom-ipfs-gateway
+git diff --check
+```
+
+Baseline immediately before this prototype is the same run used above:
+`/tmp/ipfs-tech-dial-rejection-summary-r3.json` and
+`/tmp/ipfs-tech-dial-rejection-summary-r3-trace.jsonl`. Rust and Kubo both
+passed `3/3`; Rust root p50/p95 was `6677/7210ms`, asset p50/p95 was
+`149/1480ms`, max RSS/FD was `50908KiB`/`57`, and dial rejections were
+`events=9 connection_limit=9`.
+
+Prototype run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-skip-mixed-timeout-reset-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-skip-mixed-timeout-reset-r3.json
+```
+
+Prototype result: reject. Rust passed only `2/3` while Kubo passed `3/3`.
+Rust root p50/p95 improved to `2452/2580ms`, but reliability regressed and
+asset p95 remained poor at `1065ms` versus Kubo `161ms`. Connection-limit churn
+also worsened substantially: `bitswap dial rejections: events=72
+connection_limit=72 other=0`. The trace still showed
+`request_timeouts_with_trusted=2`.
+
+Decision: reject and revert. Resetting the shared client after the mixed
+request timeout is still important for reliability. Keeping it alive can improve
+root latency in a good window, but it worsens connection-limit pressure and can
+turn a passing page session into a failure.
