@@ -9904,6 +9904,31 @@ Broader result:
   improved from `612ms` to `435ms`; root p95 was effectively unchanged
   (`1547ms` to `1542ms`).
 
+Additional range check:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/vitalik-cid-direct-range-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/vitalik-cid-direct-range-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root/range TTFB p50/p95: Rust `3/1362ms`, Kubo `3/1966ms`.
+- Rust RSS/FD: `38784KiB`/`20`; Kubo RSS/FD: `121744KiB`/`61`.
+- Rust warm repeat requests were `1ms` each, and direct-body max elapsed was
+  `1ms`.
+
 Decision: keep. This is a small local UnixFS/gateway optimization with direct
 test coverage for the intended cache behavior. It removes redundant path-cache
 work from body reads and improves the real range sample and full `ipfs.tech`
