@@ -15439,3 +15439,81 @@ p95 by allowing a longer single-provider wait. A same-window `250ms` rerun also
 matched or beat `350ms` on `ipfs.tech` asset p95, root p95, delegated lookup
 max, and run p95, so there is no evidence-based reason to move away from the
 current value.
+
+## 2026-05-05 Reject: In-Memory HTTP Provider Success Ordering
+
+Question:
+Recent traces repeatedly showed provider-specific latency spread in verified
+HTTP-provider fetches. For example, `dag.w3s.link` often returned faster than
+`ipfs-bridge.sia.dev`, while both remained valid trustless providers. Test
+whether a small in-memory success history can improve race ordering without
+adding public gateway fallback or probing providers that routing did not return
+for the requested CID.
+
+Prototype:
+
+- Add a process-local `successful_http_providers` map to `HttpRetriever`.
+- Record a provider URL only after a successful, CID-verified HTTP-provider
+  block fetch.
+- Keep the history bounded to `16` providers and expire entries after `10min`.
+- Before an HTTP-provider race, sort only the current CID's routing-returned
+  provider URLs by known success latency and recency.
+- Do not add any provider that was not returned for the current CID.
+- Add `scored_provider_count` to the `http_provider_race` trace event.
+- Add focused tests for latency ordering and bounded history.
+
+Focused validation while the prototype was present:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval successful_http_provider
+cargo test -p freedom-ipfs-retrieval http_provider
+```
+
+Focused result:
+
+- Formatting passed.
+- New successful HTTP-provider ordering and cap tests passed.
+- Existing HTTP-provider verification tests passed: `7 passed`.
+
+Live experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-provider-score-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-http-provider-score-r3.json
+```
+
+Live result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `935ms` / `1767ms` / `1767ms`.
+- Asset TTFB p50/p95/max: `294ms` / `1262ms` / `5530ms`.
+- Run total p50/p95/max: `2799ms` / `8534ms` / `8534ms`.
+- Max RSS/FD: `51788KiB` / `31`.
+- Delegated provider lookup max: `5430ms`.
+- HTTP provider distribution: `zero=3`, `single=52`, `multi=38`,
+  `single_target_miss=52`, `single_first_http_max=1401ms`.
+- HTTP-provider fetch p50/p95/max: `178ms` / `687ms` / `1068ms`.
+- Block sources: `http_provider=102`, `bitswap=18`.
+- `http_provider_race` score usage in the raw trace:
+  `scored_provider_count=0` for `6` races, `1` for `79` races, and `2` for
+  `2` races.
+
+Decision:
+Reject and revert. The focused mechanism worked, but the live result did not
+show a page-load win and added state without a clear payoff. Most scored races
+had only one current HTTP provider, where ordering cannot change behavior; only
+two races had two scored providers. The run also hit a large delegated lookup
+tail and worsened asset/run p95 versus the current `250ms` baseline. The idea
+may be worth revisiting only after the harness summarizes score counts and race
+width impact directly, or if routing regularly returns three or more HTTP
+providers where the fastest candidate is outside the first two race slots.
