@@ -15239,3 +15239,203 @@ delegated lookup max from `2198ms` to `602ms`, cut `ipfs.tech` asset p95 from
 meaningful RSS/FD growth. Root p95 moved from `1539ms` to `1706ms`, so keep an
 eye on root HTML variance in future runs, but the aggregate page-load and asset
 tail improvement is strong enough to retain the optimization.
+
+## 2026-05-05 Reject: Retune First HTTP Provider Grace to 150ms or 350ms
+
+Question:
+After keeping the `250ms` first-HTTP-provider grace, test whether a shorter or
+longer grace window improves the speed/resource tradeoff. A shorter `150ms`
+window might reduce sparse-stream waits further; a longer `350ms` window might
+collect more late HTTP providers and improve candidate quality.
+
+Prototype:
+
+- Temporarily changed `STREAMING_DELEGATED_FIRST_HTTP_PROVIDER_GRACE` from
+  `250ms` to `150ms`.
+- Then temporarily changed it from `150ms` to `350ms`.
+- Restored the committed `250ms` value after measurement.
+- No behavior besides the constant changed.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing streamed_delegated_response_returns_after_first_http_provider_grace
+```
+
+Result:
+
+- Formatting passed.
+- The deterministic streaming response test passed at `150ms`, `350ms`, and
+  after restoring `250ms`.
+
+`150ms` live experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-first-http-grace150-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-first-http-grace150-r3.json
+```
+
+`150ms` result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1106ms` / `1127ms` / `1127ms`.
+- Asset TTFB p50/p95/max: `292ms` / `5140ms` / `5683ms`.
+- Run total p50/p95/max: `3098ms` / `7988ms` / `7988ms`.
+- Max RSS/FD: `50768KiB` / `35`.
+- Delegated provider lookup max: `5511ms`.
+- HTTP provider distribution: `zero=4`, `single=58`, `multi=40`,
+  `single_target_miss=58`, `single_first_http_max=5509ms`.
+- HTTP-provider fetch p50/p95/max: `161ms` / `629ms` / `688ms`.
+- Block sources: `http_provider=105`, `bitswap=12`, `cache=3`.
+
+`350ms` live experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-first-http-grace350-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-first-http-grace350-r3.json
+```
+
+`350ms` `ipfs.tech` result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1450ms` / `1601ms` / `1601ms`.
+- Asset TTFB p50/p95/max: `213ms` / `603ms` / `1139ms`.
+- Run total p50/p95/max: `2812ms` / `3434ms` / `3434ms`.
+- Max RSS/FD: `52504KiB` / `35`.
+- Delegated provider lookup max: `163ms`.
+- HTTP provider distribution: `zero=6`, `single=52`, `multi=37`,
+  `single_target_miss=52`, `single_first_http_max=156ms`.
+- HTTP-provider fetch p50/p95/max: `160ms` / `648ms` / `889ms`.
+- Block sources: `http_provider=88`, `bitswap=31`, `cache=1`.
+
+Additional `350ms` live smoke:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-first-http-grace350-r3-trace.jsonl \
+  --output /tmp/daicowtf-first-http-grace350-r3.json
+```
+
+`350ms` `daicowtf-page-assets` result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1337ms` / `1759ms` / `1759ms`.
+- Run total p50/p95/max: `1350ms` / `1776ms` / `1776ms`.
+- Max RSS/FD: `42300KiB` / `17`.
+- Delegated provider lookup max: `47ms`.
+- HTTP provider distribution: `zero=3`, `single=6`, `multi=0`.
+- Block sources: `http_provider=6`, `bitswap=3`.
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-first-http-grace350-r3-trace.jsonl \
+  --output /tmp/vitalik-first-http-grace350-r3.json
+```
+
+`350ms` `vitalik-root-html-range` result:
+
+- Rust passed `3/3`.
+- Root/range TTFB p50/p95/max: `502ms` / `505ms` / `505ms`.
+- Run total p50/p95/max: `503ms` / `506ms` / `506ms`.
+- Max RSS/FD: `31104KiB` / `14`.
+- Delegated provider lookup max: `408ms`.
+- HTTP provider distribution: `zero=0`, `single=3`, `multi=3`.
+- Block sources: `http_provider=6`.
+
+Current-window `250ms` rerun:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-first-http-grace250-rerun-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-first-http-grace250-rerun-r3.json
+```
+
+`250ms` `ipfs.tech` rerun result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `595ms` / `1328ms` / `1328ms`.
+- Asset TTFB p50/p95/max: `204ms` / `594ms` / `851ms`.
+- Run total p50/p95/max: `2831ms` / `2920ms` / `2920ms`.
+- Max RSS/FD: `51424KiB` / `35`.
+- Delegated provider lookup max: `149ms`.
+- HTTP provider distribution: `zero=5`, `single=50`, `multi=36`,
+  `single_target_miss=50`, `single_first_http_max=147ms`.
+- HTTP-provider fetch p50/p95/max: `168ms` / `387ms` / `771ms`.
+- Block sources: `http_provider=78`, `bitswap=42`.
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-first-http-grace250-rerun-r3-trace.jsonl \
+  --output /tmp/vitalik-first-http-grace250-rerun-r3.json
+```
+
+`250ms` `vitalik-root-html-range` rerun result:
+
+- Rust passed `3/3`.
+- Root/range TTFB p50/p95/max: `141ms` / `149ms` / `149ms`.
+- Run total p50/p95/max: `141ms` / `149ms` / `149ms`.
+- Max RSS/FD: `31360KiB` / `13`.
+- Delegated provider lookup max: `56ms`.
+- HTTP provider distribution: `zero=0`, `single=3`, `multi=3`.
+- Block sources: `http_provider=6`.
+
+Decision:
+Reject both retunes and keep `250ms`. The `150ms` run had unacceptable
+`ipfs.tech` asset and page-load tails. The `350ms` run looked good on
+`ipfs.tech` and `daicowtf`, but it regressed the small range-shaped
+`vitalik-root-html-range` case from roughly `149ms` p95 at `250ms` to `505ms`
+p95 by allowing a longer single-provider wait. A same-window `250ms` rerun also
+matched or beat `350ms` on `ipfs.tech` asset p95, root p95, delegated lookup
+max, and run p95, so there is no evidence-based reason to move away from the
+current value.
