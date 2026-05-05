@@ -11111,3 +11111,80 @@ Keep. This turns the CAR-seeded fixture from a one-off deep-range smoke into a
 small deterministic stream/range harness that future prefetch, multi-want,
 streaming, and body-progress diagnostics experiments can run without
 public-network noise.
+
+## 2026-05-05 Diagnostics: Trace Streamed Gateway Body Completion
+
+Hypothesis:
+For large full responses and large ranges, `request_done` is too early to
+explain browser-perceived latency because it records response construction, not
+body production. A low-volume completion event for streamed gateway bodies
+would let the harness and mobile progress API tell whether the gateway spent
+time producing the response body, without per-chunk trace spam.
+
+Change:
+
+- Add a `gateway_stream_done` trace event for streamed full responses and
+  streamed ranges.
+- Emit it after the final chunk is successfully read from UnixFS, before that
+  chunk is yielded to Hyper.
+- Include `range_start`, `range_end`, `body_len`, `chunks`, and `elapsed_ms`.
+- Carry the request tracing span into the response-body stream so the event is
+  correlated with `request_id`, `progress_request_id`, `top_level_path`, and
+  gateway path.
+- Map `gateway_stream_done` to mobile/harness progress phase `completed`.
+- Expose `body_len` as mobile progress `bytes_loaded` for the completion event.
+
+Implementation note:
+An earlier version emitted from the stream terminal `None` state. The
+deterministic harness showed that this is unreliable with `Content-Length`
+responses because Hyper can finish once it has sent the declared byte count
+without polling an extra EOF frame. Emitting after the final successful chunk is
+the reliable low-volume signal. This event measures body production by the
+gateway, not guaranteed client socket delivery after the last byte leaves the
+process.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+cargo test -p freedom-ipfs-mobile progress_snapshot_records_stream_body_bytes
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+cargo test -p freedom-ipfs-gateway
+
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --routing-mode offline \
+  --gateway-import-car /tmp/xtask-mobile-web-stream-suite.car \
+  --corpus /tmp/xtask-mobile-web-stream-suite-corpus.json \
+  --case multiblock-unixfs-full \
+  --repeat 1 \
+  --trace-output /tmp/xtask-mobile-web-stream-done-rust-trace.jsonl \
+  --output /tmp/xtask-mobile-web-stream-done-rust.json
+```
+
+Result:
+
+- focused mobile progress test passed
+- focused mobile streamed-byte snapshot test passed
+- focused harness progress summary test passed
+- all gateway tests passed
+- deterministic full-response fixture passed `1/1`
+- root TTFB/total: `5ms` / `50ms`
+- RSS/FD: `21652KiB` / `12`
+- trace contained one `gateway_stream_done` event:
+  - `body_len=600000`
+  - `range_start=0`
+  - `range_end=599999`
+  - `chunks=10`
+  - `elapsed_ms=2`
+  - correlated span fields included `request_id=1`,
+    `progress_request_id=1`, and the `/ipfs/...` top-level path
+- progress phases included `completed=2`: one for `request_done`, one for
+  `gateway_stream_done`
+
+Decision:
+Keep. The event closes the diagnostic gap identified by the stream/range
+fixture: future harness runs can now see both gateway response construction and
+streamed body production timing, while the mobile progress layer receives a
+bounded completion signal for large streamed responses.

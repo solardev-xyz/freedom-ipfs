@@ -1126,6 +1126,13 @@ struct FileResponseTarget {
     len: u64,
 }
 
+#[derive(Clone, Copy)]
+struct GatewayStreamState {
+    offset: u64,
+    chunks: u64,
+    started: Instant,
+}
+
 fn streaming_response(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
@@ -1166,31 +1173,65 @@ fn streaming_response(
     }
 
     let provider = Arc::new(ScopedBlockProvider::new(provider));
-    let stream = stream::unfold(Some(0u64), move |offset| {
-        let provider = provider.clone();
-        let unixfs = unixfs.clone();
-        async move {
-            let offset = offset?;
-            if offset >= len {
-                return None;
+    let span = tracing::Span::current();
+    let stream = stream::unfold(
+        Some(GatewayStreamState {
+            offset: 0,
+            chunks: 0,
+            started: Instant::now(),
+        }),
+        move |state| {
+            let provider = provider.clone();
+            let unixfs = unixfs.clone();
+            let path = path.clone();
+            let span = span.clone();
+            async move {
+                let state = state?;
+                let offset = state.offset;
+                if offset >= len {
+                    return None;
+                }
+                let last = len - 1;
+                let end = offset
+                    .saturating_add(GATEWAY_STREAM_CHUNK_SIZE - 1)
+                    .min(last);
+                let chunks = state.chunks.saturating_add(1);
+                let next = if end == last {
+                    None
+                } else {
+                    Some(GatewayStreamState {
+                        offset: end.saturating_add(1),
+                        chunks,
+                        started: state.started,
+                    })
+                };
+                let chunk = unixfs
+                    .read_file_cid_range(
+                        provider.as_ref() as &dyn BlockProvider,
+                        &file_cid,
+                        offset,
+                        end,
+                    )
+                    .map(Bytes::from)
+                    .map_err(|err| io::Error::other(err.to_string()));
+                if chunk.is_ok() && end == last {
+                    tracing::info!(
+                        phase = "gateway_stream_done",
+                        cid = %root_cid,
+                        file_cid = %file_cid,
+                        unixfs_path = %path,
+                        range_start = 0u64,
+                        range_end = last,
+                        body_len = len,
+                        chunks,
+                        elapsed_ms = state.started.elapsed().as_millis()
+                    );
+                }
+                Some((chunk, next))
             }
-            let last = len - 1;
-            let end = offset
-                .saturating_add(GATEWAY_STREAM_CHUNK_SIZE - 1)
-                .min(last);
-            let next = if end == last { None } else { Some(end + 1) };
-            let chunk = unixfs
-                .read_file_cid_range(
-                    provider.as_ref() as &dyn BlockProvider,
-                    &file_cid,
-                    offset,
-                    end,
-                )
-                .map(Bytes::from)
-                .map_err(|err| io::Error::other(err.to_string()));
-            Some((chunk, next))
-        }
-    });
+            .instrument(span)
+        },
+    );
 
     let mut response = Body::from_stream(stream).into_response();
     insert_full_file_headers(&mut response, len, headers)?;
@@ -1344,31 +1385,64 @@ fn ranged_response(
     }
 
     let provider = Arc::new(ScopedBlockProvider::new(provider));
-    let stream = stream::unfold(Some(start), move |offset| {
-        let provider = provider.clone();
-        let unixfs = unixfs.clone();
-        async move {
-            let offset = offset?;
-            let chunk_end = offset
-                .saturating_add(GATEWAY_STREAM_CHUNK_SIZE - 1)
-                .min(end);
-            let next = if chunk_end == end {
-                None
-            } else {
-                Some(chunk_end + 1)
-            };
-            let chunk = unixfs
-                .read_file_cid_range(
-                    provider.as_ref() as &dyn BlockProvider,
-                    &file_cid,
-                    offset,
-                    chunk_end,
-                )
-                .map(Bytes::from)
-                .map_err(|err| io::Error::other(err.to_string()));
-            Some((chunk, next))
-        }
-    });
+    let span = tracing::Span::current();
+    let stream = stream::unfold(
+        Some(GatewayStreamState {
+            offset: start,
+            chunks: 0,
+            started: Instant::now(),
+        }),
+        move |state| {
+            let provider = provider.clone();
+            let unixfs = unixfs.clone();
+            let path = path.clone();
+            let span = span.clone();
+            async move {
+                let state = state?;
+                let offset = state.offset;
+                if offset > end {
+                    return None;
+                }
+                let chunk_end = offset
+                    .saturating_add(GATEWAY_STREAM_CHUNK_SIZE - 1)
+                    .min(end);
+                let chunks = state.chunks.saturating_add(1);
+                let next = if chunk_end == end {
+                    None
+                } else {
+                    Some(GatewayStreamState {
+                        offset: chunk_end.saturating_add(1),
+                        chunks,
+                        started: state.started,
+                    })
+                };
+                let chunk = unixfs
+                    .read_file_cid_range(
+                        provider.as_ref() as &dyn BlockProvider,
+                        &file_cid,
+                        offset,
+                        chunk_end,
+                    )
+                    .map(Bytes::from)
+                    .map_err(|err| io::Error::other(err.to_string()));
+                if chunk.is_ok() && chunk_end == end {
+                    tracing::info!(
+                        phase = "gateway_stream_done",
+                        cid = %root_cid,
+                        file_cid = %file_cid,
+                        unixfs_path = %path,
+                        range_start = start,
+                        range_end = end,
+                        body_len = range_len,
+                        chunks,
+                        elapsed_ms = state.started.elapsed().as_millis()
+                    );
+                }
+                Some((chunk, next))
+            }
+            .instrument(span)
+        },
+    );
 
     let mut response = Body::from_stream(stream).into_response();
     *response.status_mut() = StatusCode::PARTIAL_CONTENT;

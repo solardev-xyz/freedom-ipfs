@@ -255,7 +255,9 @@ impl ProgressRecorder {
             source: target_source.clone(),
             transport: target_transport.clone(),
             delivery: target_delivery.clone(),
-            bytes_loaded: fields.get_u64("bytes"),
+            bytes_loaded: fields
+                .get_u64("bytes")
+                .or_else(|| fields.get_u64("body_len")),
             providers_found: fields
                 .get_u64("provider_count")
                 .or_else(|| fields.get_u64("retry_provider_count")),
@@ -458,6 +460,7 @@ fn progress_target_id(fields: &ProgressFields, span: &ProgressSpanFields) -> u64
 
 fn progress_status(raw_phase: &str, fields: &ProgressFields) -> String {
     match raw_phase {
+        "gateway_stream_done" => "completed",
         "request_done" => match fields.get_u64("status") {
             Some(status) if status < 400 => "completed",
             Some(_) => "failed",
@@ -503,6 +506,7 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         "request_start" | "preload_start" => "started",
         "request_done" if status == "completed" => "completed",
         "request_done" => "failed",
+        "gateway_stream_done" => "completed",
         "preload_done" if status == "completed" => "completed",
         "preload_done" => "failed",
         "preload_cancelled" => "cancelled",
@@ -2073,6 +2077,46 @@ mod tests {
     }
 
     #[test]
+    fn progress_snapshot_records_stream_body_bytes() {
+        let recorder = ProgressRecorder::default();
+        let span = ProgressSpanFields {
+            request_id: Some(1),
+            progress_request_id: Some(4242),
+            path: Some("/ipfs/root".into()),
+            ..ProgressSpanFields::default()
+        };
+
+        recorder.record_event(
+            span.clone(),
+            progress_fields([("phase", "request_start")]),
+            "test",
+        );
+        recorder.record_event(
+            span,
+            progress_fields([
+                ("phase", "gateway_stream_done"),
+                ("body_len", "600000"),
+                ("chunks", "10"),
+            ]),
+            "test",
+        );
+
+        let snapshot = recorder.snapshot_json();
+        let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(value["active_count"].as_u64().unwrap(), 0);
+        let events = value["events"].as_array().unwrap();
+        let completed = events
+            .iter()
+            .find(|event| event["raw_phase"] == "gateway_stream_done")
+            .unwrap();
+        assert_eq!(completed["target_id"].as_u64().unwrap(), 4242);
+        assert_eq!(completed["path"], "/ipfs/root");
+        assert_eq!(completed["phase"], "completed");
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["bytes_loaded"].as_u64().unwrap(), 600000);
+    }
+
+    #[test]
     fn progress_phase_maps_trace_events_to_ui_states() {
         assert_eq!(
             progress_source(
@@ -2211,6 +2255,18 @@ mod tests {
                 "active",
             ),
             "streaming"
+        );
+        assert_eq!(
+            progress_phase(
+                "gateway_stream_done",
+                &progress_fields([
+                    ("phase", "gateway_stream_done"),
+                    ("body_len", "600000"),
+                    ("chunks", "3")
+                ]),
+                "completed",
+            ),
+            "completed"
         );
         assert_eq!(
             progress_phase(

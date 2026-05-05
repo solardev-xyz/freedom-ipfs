@@ -5707,6 +5707,7 @@ fn sorted_trace_delegated_provider_endpoints(
 fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'a str {
     match raw_phase {
         "request_start" | "preload_start" => "started",
+        "gateway_stream_done" => "completed",
         "request_done" => match value.get("status").and_then(json_u128) {
             Some(status) if status >= 400 => "failed",
             _ => "completed",
@@ -6961,6 +6962,7 @@ mod tests {
                 "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer-a\",\"transport\":\"tcp\"}\n",
                 "{\"phase\":\"unixfs_resource\",\"path\":\"/ipns/site/\",\"ok\":true}\n",
                 "{\"phase\":\"gateway_direct_body\",\"path\":\"/ipns/site/asset.css\",\"body_len\":4096}\n",
+                "{\"phase\":\"gateway_stream_done\",\"path\":\"/ipns/site/\",\"body_len\":600000,\"chunks\":3}\n",
                 "{\"phase\":\"gateway_conditional\",\"path\":\"/ipns/site/\",\"outcome\":\"not_modified\"}\n",
                 "{\"phase\":\"bitswap_request_timeout\",\"cid\":\"cid-a\",\"peer_count\":2}\n",
                 "{\"phase\":\"bitswap_connection_error\",\"peer\":\"peer-b\",\"error\":\"timeout\"}\n",
@@ -7029,7 +7031,7 @@ mod tests {
         assert_eq!(summary.gateway_direct_body.bytes, 4096);
         assert_eq!(summary.gateway_direct_body.max_body_len, 4096);
         assert_eq!(trace_value_count(&summary.progress_phases, "retrying"), 4);
-        assert_eq!(trace_value_count(&summary.progress_phases, "completed"), 1);
+        assert_eq!(trace_value_count(&summary.progress_phases, "completed"), 2);
         assert_eq!(trace_value_count(&summary.progress_phases, "failed"), 4);
         assert_eq!(
             summary.provider_retries.skipped_empty_provider_set_events,
