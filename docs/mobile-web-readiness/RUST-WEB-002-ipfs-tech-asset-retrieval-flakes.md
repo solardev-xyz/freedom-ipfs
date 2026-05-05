@@ -11135,6 +11135,10 @@ Change:
 - Expose `body_len` as mobile progress `bytes_loaded` for the completion event.
 - Add a harness summary line for streamed bodies with event count, bytes,
   maximum body length, maximum chunk count, and maximum elapsed time.
+- Keep completed harness request summaries available for later span-correlated
+  stream-body events. In practice `gateway_stream_done` can arrive after
+  `request_done`, because `request_done` records response construction while the
+  body stream finishes afterward.
 
 Implementation note:
 An earlier version emitted from the stream terminal `None` state. The
@@ -11172,8 +11176,8 @@ Result:
 - focused harness progress summary test passed
 - all gateway tests passed
 - deterministic full-response fixture passed `1/1`
-- root TTFB/total: `3ms` / `6ms`
-- RSS/FD: `21904KiB` / `12`
+- root TTFB/total: `4ms` / `7ms`
+- RSS/FD: `22164KiB` / `12`
 - trace contained one `gateway_stream_done` event:
   - `body_len=600000`
   - `range_start=0`
@@ -11186,6 +11190,9 @@ Result:
   `gateway_stream_done`
 - harness streamed-body summary reported one event with `600000` bytes and
   `10` chunks
+- slow request and progress request group summaries now include
+  `gateway_stream_done=1` even though the event appears after `request_done` in
+  the JSONL trace
 
 Decision:
 Keep. The event closes the diagnostic gap identified by the stream/range

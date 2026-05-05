@@ -4653,7 +4653,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut pending_request_timeout_retries = BTreeMap::<String, usize>::new();
     let mut slow_cids = BTreeMap::<String, TraceCidBuilder>::new();
     let mut active_requests = BTreeMap::<TraceRequestKey, TraceRequestBuilder>::new();
-    let mut slow_requests = Vec::<TraceRequestAggregate>::new();
+    let mut completed_requests = BTreeMap::<TraceRequestKey, TraceRequestBuilder>::new();
 
     for line in text.lines() {
         line_count += 1;
@@ -4680,12 +4680,18 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         if let Some(key) = request_key.as_ref() {
             if let Some(request) = active_requests.get_mut(key) {
                 request.record_event(phase, &value, elapsed_ms);
+            } else if let Some(request) = completed_requests.get_mut(key) {
+                request.record_event(phase, &value, elapsed_ms);
+            } else if phase == "request_done" {
+                let mut request = TraceRequestBuilder::new(key.clone());
+                request.record_event(phase, &value, elapsed_ms);
+                completed_requests.insert(key.clone(), request);
             }
         }
         if phase == "request_done" {
             if let Some(key) = request_key {
                 if let Some(request) = active_requests.remove(&key) {
-                    slow_requests.push(request.into_aggregate());
+                    completed_requests.insert(key, request);
                 }
             }
         }
@@ -5420,6 +5426,10 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             .then_with(|| left.phase.cmp(&right.phase))
     });
     slow_events.truncate(MAX_TRACE_SLOW_EVENTS);
+    let mut slow_requests = completed_requests
+        .into_values()
+        .map(TraceRequestBuilder::into_aggregate)
+        .collect::<Vec<_>>();
     slow_requests.extend(
         active_requests
             .into_values()
@@ -6920,6 +6930,7 @@ mod tests {
             concat!(
                 "{\"phase\":\"request_start\",\"request_id\":1,\"path\":\"/ipns/site/\",\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipns/site/\",\"status\":200,\"elapsed_ms\":20,\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"gateway_stream_done\",\"elapsed_ms\":21,\"body_len\":1234,\"chunks\":1,\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"request_start\",\"request_id\":2,\"path\":\"/ipns/site/app.js\",\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":2,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"provider_lookup\",\"elapsed_ms\":60,\"cid\":\"cid-js\",\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":2,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"request_done\",\"request_id\":2,\"path\":\"/ipns/site/app.js\",\"status\":504,\"elapsed_ms\":70,\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":2,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
@@ -6962,6 +6973,10 @@ mod tests {
             .phases
             .iter()
             .any(|phase| phase.value == "provider_lookup" && phase.count == 1));
+        assert!(group
+            .phases
+            .iter()
+            .any(|phase| phase.value == "gateway_stream_done" && phase.count == 1));
 
         let other = &summary.progress_request_groups[1];
         assert_eq!(other.top_level_path, "/ipns/other/");
