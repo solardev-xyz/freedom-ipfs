@@ -4631,3 +4631,62 @@ that the new aggregate is needed.
 Decision: keep. This is diagnostics-only and avoids a premature retry-policy
 change while making same-provider/same-Bitswap timeout loops visible in future
 comparison reports.
+
+## 2026-05-05 Bitswap Dial Rejection Cause Summary
+
+Motivation:
+
+- A repeat `ipfs.tech` comparison with the provider-retry aggregate showed no
+  provider-retry loops, but it still produced many `bitswap_dial_rejected`
+  trace errors under page asset fan-out.
+- A previous blunt global pending-dial cap was already rejected because it
+  removed dial rejections but starved concurrent page loads. The next step
+  should be better measurement, not another broad cap.
+
+Implementation:
+
+- Add `bitswap_dial_rejections` to the harness trace summary with:
+  `events`, `connection_limit`, and `other`.
+- Preserve the existing rejected transport breakdown.
+- Print one concise comparison summary line:
+  `bitswap dial rejections: events=... connection_limit=... other=... transports=...`
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+git diff --check
+```
+
+Result: all passed.
+
+Live validation:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-dial-rejection-summary-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-dial-rejection-summary-r3.json
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root p50/p95 was `6677/7210ms`
+versus Kubo `2119/4548ms`; Rust asset p50/p95 was `149/1480ms` versus Kubo
+`213/553ms`. Rust remained much lighter at max RSS/FD `50908KiB`/`57` versus
+Kubo `280840KiB`/`715`.
+
+Trace summary: `provider_retries refresh_timeout=2`, `request_timeout_counts=2`,
+`same_bitswap_request_timeouts=1`, `request_timeouts_with_trusted=2`,
+incoming `matches=108`, `delivered_waiters=108`, `dropped_waiters=0`, and
+`bitswap dial rejections: events=9 connection_limit=9 other=0 transports=tcp=7,
+quic=1, ws=1`.
+
+Decision: keep. This is diagnostics-only and gives future dial-pressure
+experiments a direct signal for connection-limit churn without replaying the
+previously rejected blunt global cap.

@@ -774,12 +774,7 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.bitswap_connection_transports)
             );
         }
-        if !trace.bitswap_dial_rejected_transports.is_empty() {
-            println!(
-                "  bitswap rejected dial transports: {}",
-                format_trace_counts(&trace.bitswap_dial_rejected_transports)
-            );
-        }
+        print_trace_dial_rejections(trace);
         if trace.bitswap_dns_expansion.events > 0 {
             let dns = &trace.bitswap_dns_expansion;
             println!(
@@ -1004,6 +999,13 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
             incoming.max_dropped_waiters
         );
     }
+    if !trace.bitswap_connection_transports.is_empty() {
+        println!(
+            "  bitswap connection transports: {}",
+            format_trace_counts(&trace.bitswap_connection_transports)
+        );
+    }
+    print_trace_dial_rejections(trace);
     if !trace.trace_errors.is_empty() {
         println!(
             "  trace errors: {}",
@@ -1029,6 +1031,22 @@ fn print_trace_provider_retries(trace: &TraceSummary) {
         retries.request_timeout_retries,
         retries.timeout_retries,
         retries.connection_timeout_retries
+    );
+}
+
+fn print_trace_dial_rejections(trace: &TraceSummary) {
+    if trace.bitswap_dial_rejections.events == 0
+        && trace.bitswap_dial_rejected_transports.is_empty()
+    {
+        return;
+    }
+    let rejected = &trace.bitswap_dial_rejections;
+    println!(
+        "  bitswap dial rejections: events={} connection_limit={} other={} transports={}",
+        rejected.events,
+        rejected.connection_limit,
+        rejected.other,
+        format_trace_counts(&trace.bitswap_dial_rejected_transports)
     );
 }
 
@@ -2795,6 +2813,7 @@ struct TraceSummary {
     bitswap_addr_mix: Vec<TraceValueCount>,
     bitswap_provider_quality: TraceBitswapProviderQualityAggregate,
     bitswap_connection_transports: Vec<TraceValueCount>,
+    bitswap_dial_rejections: TraceBitswapDialRejectedAggregate,
     bitswap_dial_rejected_transports: Vec<TraceValueCount>,
     bitswap_dns_expansion: TraceBitswapDnsExpansionAggregate,
     slow_cids: Vec<TraceCidAggregate>,
@@ -2934,6 +2953,13 @@ impl TraceBitswapProviderQualityAggregate {
         self.addr_with_webrtc_count += trace_count_field(value, "addr_with_webrtc_count");
         self.addr_with_certhash_count += trace_count_field(value, "addr_with_certhash_count");
     }
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceBitswapDialRejectedAggregate {
+    events: usize,
+    connection_limit: usize,
+    other: usize,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -3152,6 +3178,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_addr_mix = BTreeMap::<String, usize>::new();
     let mut bitswap_provider_quality = TraceBitswapProviderQualityAggregate::default();
     let mut bitswap_connection_transports = BTreeMap::<String, usize>::new();
+    let mut bitswap_dial_rejections = TraceBitswapDialRejectedAggregate::default();
     let mut bitswap_dial_rejected_transports = BTreeMap::<String, usize>::new();
     let mut bitswap_dns_expansion = TraceBitswapDnsExpansionAggregate::default();
     let mut bitswap_session = TraceBitswapSessionAggregate::default();
@@ -3505,6 +3532,16 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             }
         }
         if phase == "bitswap_dial_rejected" {
+            bitswap_dial_rejections.events += 1;
+            if value
+                .get("connection_limit")
+                .and_then(|limit| limit.as_bool())
+                == Some(true)
+            {
+                bitswap_dial_rejections.connection_limit += 1;
+            } else {
+                bitswap_dial_rejections.other += 1;
+            }
             if let Some(transport) = json_detail_string(value.get("transport")) {
                 *bitswap_dial_rejected_transports
                     .entry(transport)
@@ -3633,6 +3670,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_addr_mix: sorted_trace_counts(bitswap_addr_mix),
         bitswap_provider_quality,
         bitswap_connection_transports: sorted_trace_counts(bitswap_connection_transports),
+        bitswap_dial_rejections,
         bitswap_dial_rejected_transports: sorted_trace_counts(bitswap_dial_rejected_transports),
         bitswap_dns_expansion,
         slow_cids: sorted_trace_cids(slow_cids),
@@ -4453,6 +4491,8 @@ mod tests {
                 "{\"phase\":\"retry_provider_count\",\"cid\":\"cid-a\",\"same_provider_set\":true,\"same_bitswap_peer_set\":true,\"request_timeout\":true}\n",
                 "{\"phase\":\"provider_retry_after_request_timeout\",\"cid\":\"cid-a\",\"provider_count\":3,\"request_timeout\":true}\n",
                 "{\"phase\":\"bitswap_dial_plan\",\"cid\":\"cid-a\",\"peer_count\":4,\"candidate_peer_count\":5,\"new_dial_peer_count\":2,\"new_dial_addr_count\":3,\"suppressed_dial_peer_count\":1,\"suppressed_dial_addr_count\":4,\"pending_dial_peer_count\":2,\"connected_peer_count\":1,\"command_queued_ms\":7}\n",
+                "{\"phase\":\"bitswap_dial_rejected\",\"peer\":\"peer-a\",\"transport\":\"tcp\",\"connection_limit\":true}\n",
+                "{\"phase\":\"bitswap_dial_rejected\",\"peer\":\"peer-b\",\"transport\":\"ws\",\"connection_limit\":false}\n",
                 "{\"phase\":\"bitswap_incoming_block\",\"cid\":\"cid-a\",\"peer\":\"peer-d\",\"source_transport\":\"tcp\",\"block_count\":2,\"bytes\":256,\"pending_waiter_count\":3,\"delivered_waiter_count\":2,\"dropped_waiter_count\":1,\"oldest_pending_ms\":75,\"newest_pending_ms\":25}\n",
             ),
         )
@@ -4494,6 +4534,13 @@ mod tests {
         assert_eq!(summary.bitswap_dial_plans.pending_dial_peers, 2);
         assert_eq!(summary.bitswap_dial_plans.connected_peers, 1);
         assert_eq!(summary.bitswap_dial_plans.max_command_queued_ms, 7);
+        assert_eq!(summary.bitswap_dial_rejections.events, 2);
+        assert_eq!(summary.bitswap_dial_rejections.connection_limit, 1);
+        assert_eq!(summary.bitswap_dial_rejections.other, 1);
+        assert_eq!(summary.bitswap_dial_rejected_transports[0].value, "tcp");
+        assert_eq!(summary.bitswap_dial_rejected_transports[0].count, 1);
+        assert_eq!(summary.bitswap_dial_rejected_transports[1].value, "ws");
+        assert_eq!(summary.bitswap_dial_rejected_transports[1].count, 1);
         assert_eq!(summary.bitswap_incoming_blocks.matches, 1);
         assert_eq!(summary.bitswap_incoming_blocks.blocks, 2);
         assert_eq!(summary.bitswap_incoming_blocks.bytes, 256);
