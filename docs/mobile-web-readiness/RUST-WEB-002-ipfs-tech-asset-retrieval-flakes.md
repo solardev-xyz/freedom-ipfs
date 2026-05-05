@@ -16203,6 +16203,36 @@ Results:
   `1300ms` / `1552ms` / `1552ms`, max RSS/FD `42436KiB` / `17`, block sources
   `http_provider=6`, `bitswap=3`. The late-peer wait did not fire.
 
+Kubo comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --output /tmp/ipfs-tech-rust-vs-kubo-late-session-peer-r3.json
+```
+
+Result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Root TTFB: Rust p50/p95 `1572ms` / `1695ms`; Kubo p50/p95 `2987ms` /
+  `4770ms`; Rust/Kubo ratios `0.53x` p50 and `0.36x` p95.
+- Asset TTFB: Rust p50/p95 `295ms` / `848ms`; Kubo p50/p95 `186ms` /
+  `415ms`; Rust/Kubo ratios `1.59x` p50 and `2.04x` p95.
+- Resources: Rust max RSS/FD `53376KiB` / `31`; Kubo max RSS/FD
+  `262100KiB` / `355`.
+- Interpretation: Rust is currently faster on root startup and much lighter on
+  mobile resources for this case, but Kubo still has better asset TTFB. The next
+  optimization target should remain asset/session behavior, not root routing.
+
 Final validation:
 
 ```sh
