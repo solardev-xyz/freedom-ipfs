@@ -1103,14 +1103,27 @@ impl FetchingBlockProvider {
 
 impl BlockProvider for FetchingBlockProvider {
     fn get_block(&self, cid: &Cid) -> CoreResult<Option<Block>> {
+        let cache_started = Instant::now();
         if let Some(block) = self
             .store
             .get(cid)
             .map_err(|err| CoreError::Storage(err.to_string()))?
         {
+            tracing::info!(
+                phase = "block_store_get",
+                cid = %cid,
+                cache_hit = true,
+                elapsed_ms = cache_started.elapsed().as_millis()
+            );
             self.stats.record(RetrievalSource::Cache);
             return Ok(Some(block));
         }
+        tracing::info!(
+            phase = "block_store_get",
+            cid = %cid,
+            cache_hit = false,
+            elapsed_ms = cache_started.elapsed().as_millis()
+        );
 
         let fetched = match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| {

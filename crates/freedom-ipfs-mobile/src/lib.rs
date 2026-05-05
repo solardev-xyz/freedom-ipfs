@@ -9,18 +9,27 @@ use freedom_ipfs_routing::{
     ProviderRoutingClient, RoutingStatsHandle, DEFAULT_DELEGATED_ROUTER,
 };
 use freedom_ipfs_store::SqliteBlockStore;
+use serde::Serialize;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::ffi::{c_char, CStr, CString};
+use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Id, Subscriber};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::{Layer, Registry};
 
 const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const LOW_MEMORY_CACHE_BYTES: u64 = 32 * 1024 * 1024;
@@ -30,6 +39,10 @@ const ROUTING_MODE_DELEGATED: u32 = 1;
 const ROUTING_MODE_LIGHT_DHT: u32 = 2;
 const ROUTING_MODE_OFFLINE: u32 = 3;
 const PRELOAD_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_PROGRESS_EVENTS: usize = 512;
+
+static PROGRESS_RECORDER: OnceLock<Arc<ProgressRecorder>> = OnceLock::new();
+static PROGRESS_TRACING_INIT: Once = Once::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LifecycleState {
@@ -93,6 +106,362 @@ pub struct FreedomIpfsDiagnostics {
     pub lifecycle_background: u64,
 }
 
+#[derive(Clone, Default)]
+struct ProgressSpanFields {
+    request_id: Option<u64>,
+    namespace: Option<String>,
+    path: Option<String>,
+}
+
+#[derive(Default)]
+struct ProgressRecorder {
+    inner: Mutex<ProgressInner>,
+}
+
+#[derive(Default)]
+struct ProgressInner {
+    next_event_id: u64,
+    events: VecDeque<ProgressEvent>,
+    active_targets: HashMap<String, ProgressTarget>,
+}
+
+#[derive(Clone, Serialize)]
+struct ProgressEvent {
+    event_id: u64,
+    target_id: u64,
+    kind: String,
+    path: Option<String>,
+    namespace: Option<String>,
+    phase: String,
+    raw_phase: String,
+    status: String,
+    source: Option<String>,
+    transport: Option<String>,
+    bytes_loaded: Option<u64>,
+    providers_found: Option<u64>,
+    candidate_peers: Option<u64>,
+    elapsed_ms: Option<u64>,
+    last_error_code: Option<String>,
+    last_error_message: Option<String>,
+    timestamp_ms: u64,
+}
+
+#[derive(Clone, Serialize)]
+struct ProgressTarget {
+    id: u64,
+    kind: String,
+    path: Option<String>,
+    namespace: Option<String>,
+    phase: String,
+    status: String,
+    elapsed_ms: Option<u64>,
+    last_error_code: Option<String>,
+    last_error_message: Option<String>,
+    last_event_id: u64,
+    updated_ms: u64,
+}
+
+#[derive(Serialize)]
+struct ProgressSnapshot {
+    active: Vec<ProgressTarget>,
+    events: Vec<ProgressEvent>,
+}
+
+impl ProgressRecorder {
+    fn record_event(&self, span: ProgressSpanFields, fields: ProgressFields, _metadata_name: &str) {
+        let Some(raw_phase) = fields.get("phase").cloned() else {
+            return;
+        };
+        let kind = progress_kind(&fields, &raw_phase, &span);
+        let target_id = progress_target_id(&fields, &span);
+        let path = fields.get("path").cloned().or(span.path);
+        let namespace = fields.get("namespace").cloned().or(span.namespace);
+        let status = progress_status(&raw_phase, &fields);
+        let phase = progress_phase(&raw_phase, &fields, &status);
+        let elapsed_ms = fields.get_u64("elapsed_ms");
+        let timestamp_ms = now_ms();
+        let source = fields
+            .get("source")
+            .cloned()
+            .or_else(|| fields.get("bitswap_delivery").cloned());
+        let transport = fields
+            .get("source_transport")
+            .cloned()
+            .or_else(|| fields.get("transport").cloned());
+        let last_error_message = fields.get("error").cloned();
+        let last_error_code = progress_error_code(&raw_phase, &fields, &status);
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return,
+        };
+        inner.next_event_id = inner.next_event_id.saturating_add(1);
+        let event = ProgressEvent {
+            event_id: inner.next_event_id,
+            target_id,
+            kind: kind.clone(),
+            path: path.clone(),
+            namespace: namespace.clone(),
+            phase: phase.clone(),
+            raw_phase: raw_phase.clone(),
+            status: status.clone(),
+            source,
+            transport,
+            bytes_loaded: fields.get_u64("bytes"),
+            providers_found: fields
+                .get_u64("provider_count")
+                .or_else(|| fields.get_u64("retry_provider_count")),
+            candidate_peers: fields
+                .get_u64("peer_count")
+                .or_else(|| fields.get_u64("candidate_peer_count")),
+            elapsed_ms,
+            last_error_code: last_error_code.clone(),
+            last_error_message: last_error_message.clone(),
+            timestamp_ms,
+        };
+        inner.events.push_back(event.clone());
+        while inner.events.len() > MAX_PROGRESS_EVENTS {
+            inner.events.pop_front();
+        }
+
+        let target_key = format!("{kind}:{target_id}");
+        if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+            inner.active_targets.remove(&target_key);
+        } else if target_id != 0 {
+            inner.active_targets.insert(
+                target_key,
+                ProgressTarget {
+                    id: target_id,
+                    kind,
+                    path,
+                    namespace,
+                    phase,
+                    status,
+                    elapsed_ms,
+                    last_error_code,
+                    last_error_message,
+                    last_event_id: event.event_id,
+                    updated_ms: timestamp_ms,
+                },
+            );
+        }
+    }
+
+    fn snapshot_json(&self) -> String {
+        let snapshot = match self.inner.lock() {
+            Ok(inner) => ProgressSnapshot {
+                active: inner.active_targets.values().cloned().collect(),
+                events: inner.events.iter().cloned().collect(),
+            },
+            Err(_) => ProgressSnapshot {
+                active: Vec::new(),
+                events: Vec::new(),
+            },
+        };
+        serde_json::to_string(&snapshot).unwrap_or_else(|_| "{\"active\":[],\"events\":[]}".into())
+    }
+
+    fn clear(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.events.clear();
+            inner.active_targets.clear();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ProgressLayer {
+    recorder: Arc<ProgressRecorder>,
+}
+
+impl<S> Layer<S> for ProgressLayer
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        let mut fields = ProgressFields::default();
+        attrs.record(&mut fields);
+        let span_fields = ProgressSpanFields {
+            request_id: fields.get_u64("request_id"),
+            namespace: fields.get("namespace").cloned(),
+            path: fields.get("path").cloned(),
+        };
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(span_fields);
+        }
+    }
+
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let mut fields = ProgressFields::default();
+        event.record(&mut fields);
+        let span = ctx
+            .lookup_current()
+            .and_then(|span| span.extensions().get::<ProgressSpanFields>().cloned())
+            .unwrap_or_default();
+        self.recorder
+            .record_event(span, fields, event.metadata().name());
+    }
+}
+
+#[derive(Default)]
+struct ProgressFields {
+    values: HashMap<String, String>,
+}
+
+impl ProgressFields {
+    fn get(&self, key: &str) -> Option<&String> {
+        self.values.get(key)
+    }
+
+    fn get_u64(&self, key: &str) -> Option<u64> {
+        self.get(key).and_then(|value| value.parse::<u64>().ok())
+    }
+}
+
+impl Visit for ProgressFields {
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.values
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.values
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.values
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.values
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.values
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+}
+
+fn progress_recorder() -> Arc<ProgressRecorder> {
+    PROGRESS_RECORDER
+        .get_or_init(|| Arc::new(ProgressRecorder::default()))
+        .clone()
+}
+
+fn ensure_progress_tracing() {
+    let recorder = progress_recorder();
+    PROGRESS_TRACING_INIT.call_once(|| {
+        let layer = ProgressLayer { recorder };
+        let subscriber = Registry::default().with(layer);
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+}
+
+fn progress_kind(fields: &ProgressFields, raw_phase: &str, span: &ProgressSpanFields) -> String {
+    if fields.get("preload_id").is_some() || raw_phase.starts_with("preload_") {
+        "preload".into()
+    } else if span.request_id.is_some() || fields.get("request_id").is_some() {
+        "gateway_request".into()
+    } else if raw_phase.contains("provider") || raw_phase.contains("routing") {
+        "provider_lookup".into()
+    } else if raw_phase.contains("name") || raw_phase.contains("ipns") {
+        "name_resolution".into()
+    } else if fields.get("cid").is_some() {
+        "block_fetch".into()
+    } else {
+        "event".into()
+    }
+}
+
+fn progress_target_id(fields: &ProgressFields, span: &ProgressSpanFields) -> u64 {
+    fields
+        .get_u64("preload_id")
+        .or_else(|| fields.get_u64("request_id"))
+        .or(span.request_id)
+        .or_else(|| fields.get_u64("task_id"))
+        .unwrap_or(0)
+}
+
+fn progress_status(raw_phase: &str, fields: &ProgressFields) -> String {
+    match raw_phase {
+        "request_done" => match fields.get_u64("status") {
+            Some(status) if status < 400 => "completed",
+            Some(_) => "failed",
+            None => "completed",
+        },
+        "preload_done" => match fields.get("ok").map(String::as_str) {
+            Some("true") => "completed",
+            Some("false") => "failed",
+            _ => "completed",
+        },
+        "preload_cancelled" => "cancelled",
+        "gateway_limiter" if fields.get("acquired").map(String::as_str) == Some("false") => {
+            "failed"
+        }
+        _ if fields.get("ok").map(String::as_str) == Some("false") => "active",
+        _ => "active",
+    }
+    .into()
+}
+
+fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> String {
+    match raw_phase {
+        "request_start" | "preload_start" => "started",
+        "request_done" if status == "completed" => "completed",
+        "request_done" => "failed",
+        "preload_done" if status == "completed" => "completed",
+        "preload_done" => "failed",
+        "preload_cancelled" => "cancelled",
+        "block_store_get" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
+            "cache_hit"
+        }
+        "block_store_get" => "checking_cache",
+        "provider_lookup" if fields.get("error").is_some() => "failed",
+        "provider_lookup" => "providers_found",
+        "provider_diversity_low" => "provider_diversity_low",
+        "light_dht_provider_lookup" | "dht_provider_lookup" => "dht_fallback_started",
+        "http_provider_fetch" => "fetching_http_provider",
+        "bitswap_fetch" | "bitswap_session_shortcut" | "bitswap_peer_attempt_start" => {
+            "fetching_bitswap"
+        }
+        "bitswap_request_timeout"
+        | "provider_retry_after_timeout"
+        | "provider_retry_after_request_timeout"
+        | "provider_refresh_after_timeout"
+        | "provider_refresh_after_failure" => "retrying",
+        "gateway_limiter" if fields.get("acquired").map(String::as_str) == Some("false") => {
+            "failed"
+        }
+        "gateway_limiter" => "queued",
+        _ => raw_phase,
+    }
+    .into()
+}
+
+fn progress_error_code(raw_phase: &str, fields: &ProgressFields, status: &str) -> Option<String> {
+    if raw_phase == "request_done" && status == "failed" {
+        return fields.get("status").map(|status| format!("http_{status}"));
+    }
+    if raw_phase == "gateway_limiter" && fields.get("acquired").map(String::as_str) == Some("false")
+    {
+        return Some("gateway_busy".into());
+    }
+    if fields.get("error").is_some() {
+        Some(raw_phase.to_string())
+    } else {
+        None
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
+}
+
 #[no_mangle]
 pub extern "C" fn freedom_ipfs_version() -> *mut c_char {
     CString::new(env!("CARGO_PKG_VERSION"))
@@ -153,6 +522,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_new_with_data_dir(
 }
 
 fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
+    ensure_progress_tracing();
     let runtime = match Runtime::new() {
         Ok(runtime) => runtime,
         Err(_) => return ptr::null_mut(),
@@ -168,6 +538,37 @@ fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
         next_preload_id: AtomicU64::new(1),
         preload_tasks: Mutex::new(HashMap::new()),
     }))
+}
+
+/// # Safety
+///
+/// `ptr` must be a valid node pointer. The returned string is UTF-8 JSON and
+/// must be released with `freedom_ipfs_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_node_progress_snapshot_json(
+    ptr: *mut FreedomIpfsNode,
+) -> *mut c_char {
+    if ptr.is_null() {
+        return CString::new("{\"active\":[],\"events\":[]}")
+            .expect("static JSON has no nul")
+            .into_raw();
+    }
+    ensure_progress_tracing();
+    CString::new(progress_recorder().snapshot_json())
+        .unwrap_or_else(|_| CString::new("{\"active\":[],\"events\":[]}").unwrap())
+        .into_raw()
+}
+
+/// # Safety
+///
+/// `ptr` must be a valid node pointer.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_node_clear_progress(ptr: *mut FreedomIpfsNode) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
+    progress_recorder().clear();
+    true
 }
 
 /// # Safety
@@ -870,17 +1271,46 @@ pub unsafe extern "C" fn freedom_ipfs_node_preload_path(
 
     let id = node.next_preload_id.fetch_add(1, Ordering::Relaxed);
     let url = format!("http://{addr}{path}");
+    tracing::info!(phase = "preload_start", preload_id = id, path = %path);
+    let preload_path = path.clone();
     let task = node.runtime.spawn(async move {
         let Ok(client) = reqwest::Client::builder().timeout(PRELOAD_TIMEOUT).build() else {
+            tracing::info!(
+                phase = "preload_done",
+                preload_id = id,
+                path = %preload_path,
+                ok = false,
+                error = "client_build_failed"
+            );
             return;
         };
         let Ok(response) = client.get(url).send().await else {
+            tracing::info!(
+                phase = "preload_done",
+                preload_id = id,
+                path = %preload_path,
+                ok = false,
+                error = "request_failed"
+            );
             return;
         };
         let Ok(mut response) = response.error_for_status() else {
+            tracing::info!(
+                phase = "preload_done",
+                preload_id = id,
+                path = %preload_path,
+                ok = false,
+                error = "http_status"
+            );
             return;
         };
         while matches!(response.chunk().await, Ok(Some(_))) {}
+        tracing::info!(
+            phase = "preload_done",
+            preload_id = id,
+            path = %preload_path,
+            ok = true
+        );
     });
 
     let Ok(mut tasks) = node.preload_tasks.lock() else {
@@ -912,6 +1342,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_cancel_preload(
         return false;
     };
     task.abort();
+    tracing::info!(phase = "preload_cancelled", preload_id = task_id);
     true
 }
 
@@ -1299,6 +1730,49 @@ mod tests {
     }
 
     #[test]
+    fn progress_snapshot_records_gateway_request_phases() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+            assert!(freedom_ipfs_node_clear_progress(node));
+
+            let data = b"progress fixture";
+            let cid = cid_from_data(CODEC_RAW, data);
+            (*node).store.put_block(&cid, data).unwrap();
+            let addr = CString::new("127.0.0.1:0").unwrap();
+            assert!(freedom_ipfs_node_start_gateway(node, addr.as_ptr()));
+
+            let path = format!("/ipfs/{cid}");
+            assert_gateway_path(node, &path, data);
+
+            let snapshot = progress_snapshot_json(node);
+            let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+            let events = value["events"].as_array().unwrap();
+            assert!(
+                events.iter().any(|event| event["path"] == path
+                    && event["phase"] == "started"
+                    && event["kind"] == "gateway_request"),
+                "{snapshot}"
+            );
+            assert!(
+                events.iter().any(|event| event["path"] == path
+                    && event["phase"] == "completed"
+                    && event["status"] == "completed"),
+                "{snapshot}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["path"] == path && event["raw_phase"] == "unixfs_resource"),
+                "{snapshot}"
+            );
+
+            assert!(freedom_ipfs_node_stop_gateway(node));
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
     fn restarts_online_gateway_for_routing_mode_changes() {
         unsafe {
             let node = freedom_ipfs_node_new_in_memory();
@@ -1636,5 +2110,13 @@ mod tests {
         let url = CStr::from_ptr(url_ptr).to_str().unwrap().to_string();
         freedom_ipfs_string_free(url_ptr);
         url
+    }
+
+    unsafe fn progress_snapshot_json(node: *mut FreedomIpfsNode) -> String {
+        let snapshot_ptr = freedom_ipfs_node_progress_snapshot_json(node);
+        assert!(!snapshot_ptr.is_null());
+        let snapshot = CStr::from_ptr(snapshot_ptr).to_str().unwrap().to_string();
+        freedom_ipfs_string_free(snapshot_ptr);
+        snapshot
     }
 }

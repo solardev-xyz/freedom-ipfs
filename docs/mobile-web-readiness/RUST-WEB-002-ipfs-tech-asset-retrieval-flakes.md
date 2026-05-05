@@ -5734,3 +5734,56 @@ passed `9/9`, and two samples exercised the new path. The asset p95 can still
 lose to Kubo in some passing runs, but the backoff is bounded, in-memory,
 resource-neutral, and prevents repeatedly scheduling peers that have just
 proven unusable at the connection layer.
+
+## 2026-05-05 Mobile Progress Snapshot API
+
+Goal:
+
+- Start the parallel mobile progress/event API track without changing retrieval
+  behavior or adding callback ABI complexity.
+- Let Swift poll a bounded per-request JSON snapshot while real local-gateway
+  requests load through `WKURLSchemeHandler`.
+
+Implementation:
+
+- Add a mobile progress recorder backed by a `tracing_subscriber` layer in
+  `freedom-ipfs-mobile`.
+- Reuse existing structured phases emitted by the gateway, UnixFS, retrieval,
+  provider lookup, Bitswap, routing, and name-system paths.
+- Record explicit mobile preload `started`, `completed`, `failed`, and
+  `cancelled` events.
+- Bound recent event history to `512` events and keep an active-target map for
+  currently loading requests.
+- Expose:
+  - `freedom_ipfs_node_progress_snapshot_json(node)`
+  - `freedom_ipfs_node_clear_progress(node)`
+  - Swift `FreedomIpfsReader.progressSnapshotJSON`
+  - Swift `FreedomIpfsReader.clearProgress()`
+- Add `docs/mobile-progress-api.md` with JSON shape and suggested Swift UI
+  mapping.
+- Update `FetchingBlockProvider` to emit `block_store_get` for direct store
+  hits/misses, so cache activity is visible to the same progress recorder.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-mobile progress_snapshot_records_gateway_request_phases
+cargo test -p freedom-ipfs-mobile
+cargo test -p freedom-ipfs-retrieval --lib bitswap_fetch_caches_verified_extra_blocks
+cargo test -p freedom-ipfs-retrieval --lib
+cargo test -p freedom-ipfs-gateway
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Result: validation passed. This is an API/diagnostics change; it does not
+change provider selection, Bitswap fanout, timeout budgets, block verification,
+public gateway fallback, or mobile resource caps.
+
+Known follow-up:
+
+- Extend the live harness to collect progress snapshots during page loads.
+- Add request-header correlation (`X-Freedom-Request-ID` /
+  `X-Freedom-Top-Level-Path`) if Swift needs stronger top-level navigation
+  grouping than the default gateway request IDs.
