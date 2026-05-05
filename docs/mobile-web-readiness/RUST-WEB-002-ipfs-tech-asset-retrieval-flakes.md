@@ -11725,3 +11725,102 @@ the rejected multi-want prefetch: bounded fanout, no public fallback, no
 unverified caching, no new provider source, no synchronous prefetch timeout, and
 mobile resource usage remains low. Future work should use the seeded harness to
 continue driving this gap toward Kubo's `~56ms` p50.
+
+## 2026-05-05 Reject: Split-Response Reader and Session Range Multi-Want Hook
+
+Hypothesis:
+One reason the earlier multi-want prefetch failed could be that the outgoing
+multi-want stream reader stopped after the first non-empty Bitswap response.
+That only works if a peer sends every requested block in one frame. Kubo may
+split requested blocks across multiple responses, so the stream reader should
+continue until it has all requested CIDs, sees terminal `DONT_HAVE` coverage, or
+hits a small response-frame cap.
+
+Reader prototype:
+
+- Add `MAX_BITSWAP_RESPONSE_FRAMES = 16`.
+- For outgoing Bitswap block wants, read response frames until all requested
+  CIDs are collected instead of stopping at the first non-empty frame.
+- Add focused coverage:
+
+```sh
+cargo test -p freedom-ipfs-retrieval multi_want_stream_collects_blocks_split_across_responses
+cargo test -p freedom-ipfs-retrieval shared_bitswap_client_fetch_many_requests_multiple_blocks_from_one_peer
+```
+
+Rejected production hook:
+
+- Prototype: after the reader fix, `FetchingBlockProvider::get_block_ranges`
+  tried to fetch the uncached raw child range CIDs through one recent-session
+  Bitswap `fetch_many` command with a `150ms` cap, then fell back to the
+  existing parallel single-CID path.
+- This used no public gateway fallback and did not bypass verification, but it
+  still put a new timeout on the user-visible range path.
+
+Validation:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 1 \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-range-multiwant-boundary-rust-trace.jsonl \
+  --comparison-output /tmp/harness-range-multiwant-boundary-rust-vs-kubo.json
+```
+
+Result:
+
+- focused split-response stream reader test passed
+- existing shared-client multi-want local-peer test still passed
+- seeded harness with the range multi-want hook passed Rust and Kubo, but Rust
+  regressed:
+  - Rust root TTFB `329ms`; Kubo `58ms`
+  - Rust max RSS/FD `39192KiB` / `12`; Kubo `86220KiB` / `39`
+- Trace showed the prototype did create a multi-CID command:
+  `commands=4 multi_cid_commands=1 total_cids=5 max_cids=2`
+- The session range batch timed out/cancelled at `151ms`:
+  `bitswap_session_range_batch ok=false`, `bitswap_fetch_cancelled=151ms`
+- The existing fallback then fetched the two child blocks successfully through
+  normal session shortcuts, so the new hook only added latency.
+- After reverting only the range multi-want hook and keeping the split-response
+  reader, the same one-run seeded check still regressed:
+  - command:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 1 \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-range-split-reader-boundary-rust-trace.jsonl \
+  --comparison-output /tmp/harness-range-split-reader-boundary-rust-vs-kubo.json
+```
+
+  - Rust root TTFB `335ms`; Kubo `52ms`
+  - Rust max RSS/FD `39576KiB` / `13`; Kubo `86500KiB` / `37`
+  - Trace showed no multi-CID commands, but one child request still spent
+    `180ms` in a cancelled Bitswap fetch and only completed after provider
+    lookup fallback.
+
+Decision:
+Reject and revert both code changes. The split-response reader looked correct in
+isolation, but live seeded evidence showed it changes the behavior of competing
+single-CID outgoing requests: a losing outgoing stream can stay alive waiting for
+its exact CID instead of failing/cancelling quickly while the incoming Bitswap
+path delivers another block. Future multi-want work should first prove Kubo
+responds through our outgoing multi-want path without adding a blocking fallback
+penalty, or should race without materially increasing mobile network/resource
+usage.
