@@ -9707,3 +9707,45 @@ tail and resource pressure worsened, and there was no trace evidence that the
 second endpoint materially contributed. Keep multi-endpoint routing available as
 a CLI/mobile override for further provider-quality sweeps rather than changing
 the default.
+
+## 2026-05-05 Baseline: `ipfs.tech` Offline Replay Passes After One Online Load
+
+Purpose:
+Check cache completeness for the product question: after loading a page online,
+what can a cache-only gateway replay? This uses the existing harness offline
+replay mode and rewrites the observed `/ipns/ipfs.tech/` resolution to the
+immutable `/ipfs/...` target before the offline pass, so the result measures
+block cache completeness rather than online IPNS availability.
+
+Command:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --offline-replay \
+  --offline-replay-resolved-ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-offline-replay-trace.jsonl \
+  --output /tmp/ipfs-tech-offline-replay.json
+```
+
+Result:
+
+- Online pass: `1/1`.
+- Offline pass: `1/1`.
+- The harness rewrote `/ipns/ipfs.tech/` to
+  `/ipfs/bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq/`.
+- Offline replay reported `missing_urls=0`.
+- Offline statuses: `200=27`, `206=6`.
+- Offline progress phases: `streaming=230`, `completed=33`, `queued=33`,
+  `started=33`.
+
+Decision: keep as baseline evidence. For this page, the current online load
+caches enough verified blocks for root plus discovered JS/CSS/image range assets
+to replay offline through the cache-only gateway when the mutable name is
+rewritten to the observed immutable root.
