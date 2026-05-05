@@ -852,6 +852,8 @@ fn print_summary(report: &RunReport) {
             );
         }
         print_trace_unixfs_metadata_cache(trace);
+        print_trace_gateway_direct_body(trace);
+        print_trace_gateway_stream_body(trace);
         print_trace_bitswap_sources(trace);
         if trace.bitswap_extra_blocks.events > 0 {
             let extra = &trace.bitswap_extra_blocks;
@@ -1153,6 +1155,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_progress_request_groups(trace);
     print_trace_timeout_recovery(trace);
     print_trace_gateway_direct_body(trace);
+    print_trace_gateway_stream_body(trace);
     print_trace_bitswap_peer_attempts(trace);
     print_trace_bitswap_dial_plans(trace);
     print_trace_bitswap_sources(trace);
@@ -1381,6 +1384,17 @@ fn print_trace_gateway_direct_body(trace: &TraceSummary) {
     println!(
         "  gateway direct bodies: events={} bytes={} max_body_len={} max_elapsed_ms={}",
         direct.events, direct.bytes, direct.max_body_len, direct.max_elapsed_ms
+    );
+}
+
+fn print_trace_gateway_stream_body(trace: &TraceSummary) {
+    let stream = &trace.gateway_stream_body;
+    if stream.events == 0 {
+        return;
+    }
+    println!(
+        "  gateway streamed bodies: events={} bytes={} max_body_len={} max_chunks={} max_elapsed_ms={}",
+        stream.events, stream.bytes, stream.max_body_len, stream.max_chunks, stream.max_elapsed_ms
     );
 }
 
@@ -3869,6 +3883,7 @@ struct TraceSummary {
     gateway_limiter_denials: usize,
     gateway_request_elapsed_ms: LatencySummary,
     gateway_direct_body: TraceGatewayDirectBodyAggregate,
+    gateway_stream_body: TraceGatewayStreamBodyAggregate,
     unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
     bitswap_source_peers: Vec<TraceValueCount>,
     bitswap_source_transports: Vec<TraceValueCount>,
@@ -4097,6 +4112,15 @@ struct TraceGatewayDirectBodyAggregate {
     events: usize,
     bytes: u128,
     max_body_len: u128,
+    max_elapsed_ms: u128,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceGatewayStreamBodyAggregate {
+    events: usize,
+    bytes: u128,
+    max_body_len: u128,
+    max_chunks: u128,
     max_elapsed_ms: u128,
 }
 
@@ -4592,6 +4616,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut gateway_limiter_denials = 0usize;
     let mut gateway_request_elapsed_values = Vec::<u128>::new();
     let mut gateway_direct_body = TraceGatewayDirectBodyAggregate::default();
+    let mut gateway_stream_body = TraceGatewayStreamBodyAggregate::default();
     let mut unixfs_metadata_cache = TraceUnixfsMetadataCacheAggregate::default();
     let mut bitswap_source_peers = BTreeMap::<String, usize>::new();
     let mut bitswap_source_transports = BTreeMap::<String, usize>::new();
@@ -4790,6 +4815,20 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             gateway_direct_body.bytes += body_len;
             gateway_direct_body.max_body_len = gateway_direct_body.max_body_len.max(body_len);
             gateway_direct_body.max_elapsed_ms = gateway_direct_body
+                .max_elapsed_ms
+                .max(elapsed_ms.unwrap_or_default());
+        }
+        if phase == "gateway_stream_done" {
+            gateway_stream_body.events += 1;
+            let body_len = value
+                .get("body_len")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            let chunks = value.get("chunks").and_then(json_u128).unwrap_or_default();
+            gateway_stream_body.bytes += body_len;
+            gateway_stream_body.max_body_len = gateway_stream_body.max_body_len.max(body_len);
+            gateway_stream_body.max_chunks = gateway_stream_body.max_chunks.max(chunks);
+            gateway_stream_body.max_elapsed_ms = gateway_stream_body
                 .max_elapsed_ms
                 .max(elapsed_ms.unwrap_or_default());
         }
@@ -5415,6 +5454,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         gateway_limiter_denials,
         gateway_request_elapsed_ms: LatencySummary::from_values(gateway_request_elapsed_values),
         gateway_direct_body,
+        gateway_stream_body,
         unixfs_metadata_cache,
         bitswap_source_peers: sorted_trace_counts(bitswap_source_peers),
         bitswap_source_transports: sorted_trace_counts(bitswap_source_transports),
@@ -7030,6 +7070,10 @@ mod tests {
         assert_eq!(summary.gateway_direct_body.events, 1);
         assert_eq!(summary.gateway_direct_body.bytes, 4096);
         assert_eq!(summary.gateway_direct_body.max_body_len, 4096);
+        assert_eq!(summary.gateway_stream_body.events, 1);
+        assert_eq!(summary.gateway_stream_body.bytes, 600000);
+        assert_eq!(summary.gateway_stream_body.max_body_len, 600000);
+        assert_eq!(summary.gateway_stream_body.max_chunks, 3);
         assert_eq!(trace_value_count(&summary.progress_phases, "retrying"), 4);
         assert_eq!(trace_value_count(&summary.progress_phases, "completed"), 2);
         assert_eq!(trace_value_count(&summary.progress_phases, "failed"), 4);

@@ -11133,6 +11133,8 @@ Change:
   gateway path.
 - Map `gateway_stream_done` to mobile/harness progress phase `completed`.
 - Expose `body_len` as mobile progress `bytes_loaded` for the completion event.
+- Add a harness summary line for streamed bodies with event count, bytes,
+  maximum body length, maximum chunk count, and maximum elapsed time.
 
 Implementation note:
 An earlier version emitted from the stream terminal `None` state. The
@@ -11170,18 +11172,20 @@ Result:
 - focused harness progress summary test passed
 - all gateway tests passed
 - deterministic full-response fixture passed `1/1`
-- root TTFB/total: `5ms` / `50ms`
-- RSS/FD: `21652KiB` / `12`
+- root TTFB/total: `3ms` / `6ms`
+- RSS/FD: `21904KiB` / `12`
 - trace contained one `gateway_stream_done` event:
   - `body_len=600000`
   - `range_start=0`
   - `range_end=599999`
   - `chunks=10`
-  - `elapsed_ms=2`
+  - `elapsed_ms=0`
   - correlated span fields included `request_id=1`,
     `progress_request_id=1`, and the `/ipfs/...` top-level path
 - progress phases included `completed=2`: one for `request_done`, one for
   `gateway_stream_done`
+- harness streamed-body summary reported one event with `600000` bytes and
+  `10` chunks
 
 Decision:
 Keep. The event closes the diagnostic gap identified by the stream/range
