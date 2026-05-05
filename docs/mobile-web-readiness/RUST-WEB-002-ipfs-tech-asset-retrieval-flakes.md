@@ -4032,3 +4032,49 @@ Decision: reject. The `4s` stream cap reduced attempt pressure further but
 introduced a severe request-level root TTFB tail, including a full `15s`
 Bitswap request timeout. Keep `6s` as the current balance point unless a later
 change makes earlier stream cutoff safe.
+
+## 2026-05-05 Summarize Bitswap Extra Blocks
+
+Hypothesis:
+Priority-1 multi-want and prefetch experiments need a cheap way to see whether
+Bitswap responses are returning verified blocks beyond the CID that unblocked
+the request. Retrieval already traces `extra_blocks`, but the live harness did
+not summarize it, making the signal easy to miss during longer runs.
+
+Implementation:
+
+- Add `trace_summary.bitswap_extra_blocks` to `mobile-web-harness` JSON output.
+- Print `events`, `total`, `max`, and delivery split
+  `incoming`/`outgoing`/`unknown` in the console trace summary.
+- Include `extra_blocks` in slow-event details.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo check -p mobile-web-harness --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+git diff --check
+```
+
+Live smoke:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/vitalik-extra-blocks-trace.jsonl \
+  --output /tmp/vitalik-extra-blocks.json
+```
+
+Result: passed `1/1`, root TTFB `696ms`, RSS/FD `37760KiB`/`21`. The trace
+summary reported `bitswap deliveries: incoming=2` and
+`bitswap extra blocks: events=2 total=0 max=0 incoming=0 outgoing=0 unknown=0`.
+
+Decision: keep. This is diagnostics-only, but it gives future multi-want,
+locality prefetch, and extra-block caching experiments a first-class harness
+metric instead of requiring ad hoc trace parsing.
