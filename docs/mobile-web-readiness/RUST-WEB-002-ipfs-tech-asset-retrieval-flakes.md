@@ -12291,6 +12291,36 @@ Result:
 - full mobile web harness tests passed: `30 passed; 0 failed`
 - harness clippy passed with `-D warnings`
 
+Live sanity check:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 1 \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-seed-setup-metadata-r1-trace.jsonl \
+  --comparison-output /tmp/harness-seed-setup-metadata-r1.json
+```
+
+Live result:
+
+- Rust and Kubo passed `bitswap-seeded-multiblock-boundary-range`.
+- JSON artifact labels:
+  - Rust `bitswap_seed_connection_setup`:
+    `delegated_router_provider_lookup`
+  - Kubo `bitswap_seed_connection_setup`: `swarm_connect_before_request`
+- Rust root TTFB `180ms`; Kubo root TTFB `52ms`.
+- Rust max RSS/FD `39188KiB` / `13`; Kubo max RSS/FD `85864KiB` / `35`.
+- Rust trace summary reported one Bitswap connection establishment:
+  `established_ms` p50/max `50ms`, `wait_elapsed_ms` p50/max `51ms`.
+
 Decision:
 Keep. This is diagnostics-only and does not change retrieval behavior. It makes
 seeded comparison artifacts explicit that Kubo's seeded root TTFB excludes the
