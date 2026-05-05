@@ -5235,3 +5235,32 @@ whether request timeouts are cold (`trusted_peer_count=0`), mixed
 trusted/provider, or trusted-only, and which timeout budget fired (`4000ms` vs
 `15000ms`). That prevents the warm-session and cold-root failure modes from
 being conflated.
+
+Post-keep live validation:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-timeout-classifier-current-r1-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-timeout-classifier-current-r1.json
+```
+
+Result: Rust failed `0/1`; Kubo passed `1/1`. Rust root TTFB was `30663ms`
+versus Kubo `2390ms`; Rust did not reach successful asset fetches. The new
+summary classified the failure as cold-root, not mixed-session:
+
+- `bitswap timeout recovery: request_timeout_details=2 cold=2 mixed_trusted=0
+  trusted_only=0 timeout_ms=15000=2 max_peers=8 request_timeout_events=2
+  reset_true=2 reset_false=0 client_resets=2 retry_starts=1
+  same_provider_retries=0 refreshed_provider_retries=1 retry_successes=0
+  retry_failures=1`
+
+This confirms the next behavior track should address cold provider/peer quality
+or cold Bitswap request timeout recovery, separately from the warm mixed-trusted
+asset/session path.
