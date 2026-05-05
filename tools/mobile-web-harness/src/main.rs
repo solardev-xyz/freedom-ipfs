@@ -4,6 +4,7 @@ use reqwest::header::{CACHE_CONTROL, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,6 +64,9 @@ struct Args {
     /// SQLite cache DB path for spawned gateways; useful for fresh-process warm-store runs.
     #[arg(long)]
     gateway_db: Option<PathBuf>,
+    /// CAR file to import into each spawned gateway before running the corpus.
+    #[arg(long)]
+    gateway_import_car: Option<PathBuf>,
     /// Kubo ipfs binary to spawn when --engine kubo is selected.
     #[arg(long, env = "KUBO_BIN", default_value = DEFAULT_KUBO_BIN)]
     kubo_bin: PathBuf,
@@ -298,6 +302,9 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
     if args.gateway_url.is_some() && args.gateway_db.is_some() {
         bail!("--gateway-db can only be used when the harness spawns the gateway");
     }
+    if args.gateway_url.is_some() && args.gateway_import_car.is_some() {
+        bail!("--gateway-import-car can only be used when the harness spawns the gateway");
+    }
     if args.gateway_url.is_some() && args.build_gateway {
         bail!("--build-gateway can only be used when the harness spawns the Rust gateway");
     }
@@ -312,6 +319,14 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
     }
     if args.engine == HarnessEngine::Kubo && args.trace_output.is_some() {
         bail!("--trace-output is only supported for --engine rust");
+    }
+    if let Some(import_car) = &args.gateway_import_car {
+        if !import_car.is_file() {
+            bail!(
+                "--gateway-import-car must point to a readable CAR file: {}",
+                import_car.display()
+            );
+        }
     }
     if args.build_gateway {
         build_default_rust_gateway().await?;
@@ -475,6 +490,10 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
         engine: args.engine,
         gateway_db: args
             .gateway_db
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        gateway_import_car: args
+            .gateway_import_car
             .as_ref()
             .map(|path| path.display().to_string()),
         kubo_repo: args
@@ -710,6 +729,9 @@ fn print_summary(report: &RunReport) {
     );
     if let Some(gateway_db) = &report.gateway_db {
         println!("gateway_db: {gateway_db}");
+    }
+    if let Some(gateway_import_car) = &report.gateway_import_car {
+        println!("gateway_import_car: {gateway_import_car}");
     }
     if let Some(kubo_repo) = &report.kubo_repo {
         println!("kubo_repo: {kubo_repo}");
@@ -2754,6 +2776,9 @@ impl SpawnedGateway {
         if let Some(gateway_db) = &args.gateway_db {
             command.arg("--db").arg(gateway_db);
         }
+        if let Some(import_car) = &args.gateway_import_car {
+            command.arg("--import-car").arg(import_car);
+        }
         let mut child = command.spawn().with_context(|| {
             format!(
                 "spawn {}; build it first with `cargo build -p freedom-ipfs-gateway`",
@@ -2805,6 +2830,17 @@ impl SpawnedGateway {
         let api_port = reserve_loopback_port().context("reserve Kubo API port")?;
         let gateway_port = reserve_loopback_port().context("reserve Kubo gateway port")?;
         prepare_kubo_repo(kubo, &repo, api_port, gateway_port)?;
+        if let Some(import_car) = &args.gateway_import_car {
+            kubo_ok_os(
+                kubo,
+                &repo,
+                [
+                    OsStr::new("dag"),
+                    OsStr::new("import"),
+                    import_car.as_os_str(),
+                ],
+            )?;
+        }
 
         let mut command = Command::new(kubo);
         command
@@ -3141,6 +3177,14 @@ fn prepare_kubo_repo(
 }
 
 fn kubo_ok<const N: usize>(kubo: &PathBuf, repo: &PathBuf, args: [&str; N]) -> Result<()> {
+    kubo_ok_os(kubo, repo, args)
+}
+
+fn kubo_ok_os<I, S>(kubo: &PathBuf, repo: &PathBuf, args: I) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let output = std::process::Command::new(kubo)
         .env("IPFS_PATH", repo)
         .env("IPFS_TELEMETRY", "off")
@@ -3244,6 +3288,7 @@ struct RunReport {
     run_timeout_secs: Option<u64>,
     engine: HarnessEngine,
     gateway_db: Option<String>,
+    gateway_import_car: Option<String>,
     kubo_repo: Option<String>,
     trace_output: Option<String>,
     trace_summary: Option<TraceSummary>,
@@ -6287,6 +6332,69 @@ mod tests {
     }
 
     #[test]
+    fn args_accept_gateway_import_car() {
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--gateway-import-car",
+            "/tmp/mobile-fixture.car",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.gateway_import_car.as_deref(),
+            Some(Path::new("/tmp/mobile-fixture.car"))
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_import_car_requires_spawned_gateway() {
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--gateway-url",
+            "http://127.0.0.1:50017",
+            "--gateway-import-car",
+            "/tmp/mobile-fixture.car",
+        ])
+        .unwrap();
+        let corpus = Corpus {
+            entries: Vec::new(),
+        };
+
+        let err = run_harness(&args, &corpus).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--gateway-import-car can only be used when the harness spawns the gateway"));
+    }
+
+    #[tokio::test]
+    async fn gateway_import_car_requires_readable_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "missing-mobile-fixture-{}-{}.car",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_arg = path.display().to_string();
+        let args = Args::try_parse_from([
+            "mobile-web-harness".to_string(),
+            "--gateway-import-car".to_string(),
+            path_arg,
+        ])
+        .unwrap();
+        let corpus = Corpus {
+            entries: Vec::new(),
+        };
+
+        let err = run_harness(&args, &corpus).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--gateway-import-car must point to a readable CAR file"));
+    }
+
+    #[test]
     fn request_correlation_headers_include_parent_and_top_level_path() {
         let root = RequestCorrelation::root("/ipns/site/".to_string());
         let child = root.child();
@@ -7561,6 +7669,7 @@ mod tests {
             run_timeout_secs: None,
             engine: HarnessEngine::Rust,
             gateway_db: Some("/tmp/replay.db".to_string()),
+            gateway_import_car: None,
             kubo_repo: None,
             trace_output: None,
             trace_summary: None,

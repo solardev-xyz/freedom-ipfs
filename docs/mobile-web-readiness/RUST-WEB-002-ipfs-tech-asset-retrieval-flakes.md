@@ -10813,3 +10813,112 @@ multi-block UnixFS file CIDs before it should be carried in production. A good
 next step is to add a deterministic harness fixture or stable public media file
 where the requested file CID is a DAG-PB file with multiple raw children, then
 retest bounded prefetch or true Bitswap multi-want against that case.
+
+## 2026-05-05 Harness: CAR-Seeded Mobile-Web Runs
+
+Problem:
+The linked-child prefetch experiment above could not be evaluated because the
+live corpus did not actually request a multi-link DAG-PB UnixFS file. Depending
+on public providers to find one would make the next optimization loop noisy and
+hard to compare against Kubo.
+
+Change:
+
+- Added `mobile-web-harness --gateway-import-car /path/to/fixture.car`.
+- Rust spawned gateways receive `--import-car` before the corpus starts.
+- Kubo spawned repos receive `ipfs dag import /path/to/fixture.car` before the
+  daemon starts.
+- JSON/console reports record the imported CAR path.
+- The option is rejected with `--gateway-url`, because the harness cannot seed
+  an already-running external gateway.
+
+Intended use:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --routing-mode offline \
+  --gateway-import-car /tmp/multiblock-unixfs.car \
+  --corpus /tmp/multiblock-unixfs-corpus.json \
+  --case multiblock-unixfs-range \
+  --repeat 5 \
+  --trace-output /tmp/multiblock-unixfs-rust-trace.jsonl \
+  --output /tmp/multiblock-unixfs-rust.json
+
+cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --gateway-import-car /tmp/multiblock-unixfs.car \
+  --corpus /tmp/multiblock-unixfs-corpus.json \
+  --case multiblock-unixfs-range \
+  --repeat 5 \
+  --comparison-output /tmp/multiblock-unixfs-rust-vs-kubo.json
+```
+
+Validation:
+
+```sh
+cargo test -p mobile-web-harness
+cargo test -p freedom-ipfs-gateway explicit_offline_routing_runs_cache_only_gateway
+cargo fmt --all --check
+cargo check -p mobile-web-harness --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+git diff --check
+```
+
+Result: all passed.
+
+Temporary multi-block fixture generated with Kubo:
+
+- root CID:
+  `bafybeia4mzkpepxsp6sbltl6yk6aost4xe5ut47annbokwikepvtegngwq`
+- CAR: `/tmp/mobile-web-multiblock-unixfs.car`
+- corpus: `/tmp/mobile-web-multiblock-unixfs-corpus.json`
+
+Rust offline import smoke:
+
+```sh
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --routing-mode offline \
+  --gateway-import-car /tmp/mobile-web-multiblock-unixfs.car \
+  --corpus /tmp/mobile-web-multiblock-unixfs-corpus.json \
+  --case multiblock-unixfs-range \
+  --repeat 1 \
+  --trace-output /tmp/mobile-web-multiblock-unixfs-rust-trace.jsonl \
+  --output /tmp/mobile-web-multiblock-unixfs-rust.json
+```
+
+Result:
+
+- gateway imported `3` CAR blocks
+- passed `1/1`
+- root/range TTFB `2ms`, total `2ms`
+- RSS/FD `20828KiB` / `12`
+
+Rust-vs-Kubo import smoke:
+
+```sh
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --routing-mode offline \
+  --gateway-import-car /tmp/mobile-web-multiblock-unixfs.car \
+  --corpus /tmp/mobile-web-multiblock-unixfs-corpus.json \
+  --case multiblock-unixfs-range \
+  --repeat 1 \
+  --comparison-output /tmp/mobile-web-multiblock-unixfs-rust-vs-kubo.json
+```
+
+Result:
+
+- Rust and Kubo both passed `1/1`
+- root/range TTFB: Rust `2ms`, Kubo `5ms`
+- RSS/FD: Rust `20444KiB` / `10`, Kubo `93800KiB` / `36`
+
+Decision:
+Keep this as measurement infrastructure. It does not change gateway retrieval
+behavior, but it gives future prefetch/multi-want work a deterministic
+black-box workload before touching production code again.

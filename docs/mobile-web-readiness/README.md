@@ -114,6 +114,14 @@ replay after a process restart while the name record is still valid, without
 performing DNS, delegated routing, DHT, Bitswap, or HTTP-provider network work
 during the offline pass.
 
+For deterministic cache-seeded runs, pass `--gateway-import-car /path/to/site.car`.
+The harness imports the CAR into each spawned Rust gateway before the corpus
+starts, or into each spawned Kubo repo with `ipfs dag import` before starting
+the daemon. This is useful for offline UnixFS fixtures, range fixtures, and
+Rust-vs-Kubo byte/latency checks that should not depend on public provider
+availability. The option is rejected with `--gateway-url` because the harness
+cannot seed an already-running external gateway.
+
 For gateway phase tracing, pass `--trace-output /tmp/run.jsonl`. When the
 harness spawns the Rust gateway it forwards this path to the gateway, parses the
 JSONL events, and adds raw phase and mobile-style progress phase summaries to
