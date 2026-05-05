@@ -9554,3 +9554,107 @@ Decision: keep. This is a narrow session-ranking change that directly targets
 the observed slow-peer reuse, improves the primary `ipfs.tech` asset tail
 without more concurrency or larger resource use, and does not change serving,
 caching, verification, or fallback semantics.
+
+## 2026-05-05 Keep: Shorten Bitswap Session Post-Lookup Grace To 100ms
+
+Hypothesis:
+After provider lookup finishes, the retrieval path waits briefly for an already
+running recent-peer session shortcut before using the provider set. With
+latency-ranked session peers, the old `200ms` post-lookup grace still appeared
+in several slow cold `ipfs.tech` asset requests. Reducing that grace should cut
+tail latency while still giving fast recent peers a chance to win.
+
+Rejected sub-experiment:
+
+- `50ms` was too aggressive. `cargo test -p freedom-ipfs-retrieval` failed
+  `recent_bitswap_peer_can_win_after_fast_provider_lookup`, proving the window
+  was too short for the deterministic local fast-session case.
+
+Implementation:
+
+- Change `BITSWAP_SESSION_POST_LOOKUP_GRACE` from `200ms` to `100ms`.
+- Keep `BITSWAP_SESSION_SHORTCUT_TIMEOUT`, successful-peer TTL, peer caps,
+  bad-peer suppression, provider lookup behavior, block verification, and
+  timeout caps unchanged.
+
+Baseline:
+
+The latency-ranked-peer run immediately before this change:
+
+- `/tmp/ipfs-tech-latency-ranked-peers-rust-vs-kubo-r3.json`
+- `/tmp/ipfs-tech-latency-ranked-peers-rust-vs-kubo-r3-trace.jsonl`
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `19/2226ms`, Kubo `3/1315ms`.
+- Asset TTFB p50/p95: Rust `17/719ms`, Kubo `5/131ms`.
+- Rust RSS/FD: `51116KiB`/`47`.
+- Bitswap peer attempts: `209`; dial-plan peer targets: `209`.
+
+Experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-post-lookup-100ms-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-post-lookup-100ms-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `18/1547ms`, Kubo `3/4922ms`.
+- Asset TTFB p50/p95: Rust `14/612ms`, Kubo `2/449ms`.
+- Rust RSS/FD: `50984KiB`/`48`.
+- Bitswap peer attempts fell from `209` to `155`; dial-plan peer targets fell
+  from `209` to `155`; incoming max oldest pending wait fell from `905ms` to
+  `837ms`.
+
+Additional live check:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/vitalik-post-lookup-100ms-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/vitalik-post-lookup-100ms-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root/range TTFB p50/p95: Rust `7/1360ms`, Kubo `4/2033ms`.
+- Rust RSS/FD: `38272KiB`/`20`; Kubo RSS/FD: `110092KiB`/`48`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval
+cargo test -p freedom-ipfs-gateway
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result: all passed.
+
+Decision: keep. `100ms` retains the deterministic fast-session behavior while
+cutting the cold asset tail and reducing Bitswap attempt pressure in the primary
+comparison case.
