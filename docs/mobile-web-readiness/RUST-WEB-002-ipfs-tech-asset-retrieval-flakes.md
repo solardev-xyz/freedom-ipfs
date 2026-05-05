@@ -13608,3 +13608,94 @@ polling might eventually catch a peer, but it would add timer wakeups and
 complexity without evidence that the session peer exists in time. The next
 work should focus on reducing delegated-provider lookup tails directly or on
 improving HTTP-provider candidate quality once provider records arrive.
+
+## 2026-05-05 Reject: Rank HTTP Providers By Recent Success Latency
+
+Hypothesis:
+In the late-session lookup run, successful HTTP-provider fetches showed a strong
+provider split: `https://dag.w3s.link/` was much faster than
+`https://ipfs-bridge.sia.dev/` (`53ms` p50 and `109ms` p95 for `dag.w3s.link`
+versus `203ms` p50 and `879ms` p95 for `ipfs-bridge.sia.dev`). A small
+in-memory score table for recently successful HTTP providers might promote
+known-fast providers into the first two-candidate race window when delegated
+routing listed them later.
+
+Prototype:
+
+- Track successful HTTP provider base URLs in memory for `10m`.
+- Store last successful latency and observation time.
+- Before starting the bounded HTTP-provider race, sort candidates so recently
+  successful providers come first, ordered by lower last latency.
+- Drop the success entry on provider failure.
+- Emit `http_provider_rank` with candidate count, known success count, fastest
+  provider, and fastest latency.
+
+Focused validation while the temporary patch was applied:
+
+```sh
+cargo fmt --all
+cargo test -p freedom-ipfs-retrieval ranks_successful_http_provider_candidates_by_latency
+cargo test -p freedom-ipfs-retrieval races_http_provider_candidates_and_returns_first_verified_block
+cargo test -p freedom-ipfs-retrieval
+```
+
+Result:
+
+- The new deterministic test passed: a known-fast third HTTP provider was
+  promoted ahead of two unknown hanging providers and returned the verified
+  block within `500ms`.
+- Existing HTTP-provider race test passed.
+- Full retrieval suite passed: `68 passed; 0 failed; 1 ignored`.
+
+Live experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-provider-rank-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-http-provider-rank-r3.json
+```
+
+Live result:
+
+- Rust and Kubo both passed `3/3`.
+- Rust root TTFB p50/p95 was `1444ms` / `1631ms`; Kubo was `2689ms` /
+  `2721ms`.
+- Rust asset TTFB p50/p95/max was `282ms` / `1239ms` / `4198ms`; Kubo was
+  `104ms` / `225ms` / `255ms`.
+- Rust max RSS/FD was `52088KiB` / `32`; Kubo max RSS/FD was `217952KiB` /
+  `126`.
+- Delegated provider lookup max was `3767ms`.
+- HTTP provider fetches: `65` events, `65` successes, p50/p95/max `174ms` /
+  `864ms` / `1187ms`.
+- HTTP-provider winners were still skewed toward `ipfs-bridge.sia.dev`:
+  `42` wins for `ipfs-bridge.sia.dev`, `23` wins for `dag.w3s.link`.
+- Bitswap peer attempts increased to `94` starts.
+
+Trace interpretation:
+
+- `http_provider_rank` fired `20` times.
+- Every rank event promoted `https://dag.w3s.link/` as the fastest known
+  provider.
+- Despite that, live asset p50/p95 worsened versus the preceding accepted
+  streaming-delegated baseline window (`252ms` / `1053ms` -> `282ms` /
+  `1239ms`), and HTTP-provider fetch p95 worsened (`755ms` -> `864ms`).
+- The behavior may increase contention on the same globally fast provider, and
+  it does not address the remaining delegated lookup tails that occur before
+  HTTP-provider candidates are available.
+
+Decision:
+Reject and revert the code. The deterministic ranker worked, but the real
+window did not produce a latency win and showed worse asset and HTTP-provider
+tails. Keep the trace output as evidence that simple last-success ranking is
+not enough; a future attempt would need richer provider quality signals,
+concurrency-aware scoring, or per-CID/provider availability data.
