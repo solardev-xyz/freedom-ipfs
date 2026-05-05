@@ -16859,3 +16859,69 @@ Keep. This is harness-only diagnostics and preserves the read-only,
 verified-block retrieval model. The next optimization agent can now compare
 delegated-routing p95/max against HTTP-provider p95/max without spelunking raw
 JSONL.
+
+## 2026-05-05 Baseline: Current Delegated-Latency Build vs Kubo
+
+Goal:
+After adding delegated-routing and HTTP-provider latency summaries, collect a
+fresh same-window Kubo comparison without changing runtime behavior. This gives
+future experiments a current baseline with richer trace summaries.
+
+Command:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-delegated-latency-summary-compare-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-delegated-latency-summary-compare-r3.json
+```
+
+Result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Root TTFB: Rust p50/p95 `871ms` / `951ms`; Kubo p50/p95
+  `2067ms` / `3780ms`; Rust/Kubo ratios `0.42x` p50 and `0.25x` p95.
+- Asset TTFB: Rust p50/p95 `272ms` / `706ms`; Kubo p50/p95
+  `228ms` / `1175ms`; Rust/Kubo ratios `1.19x` p50 and `0.60x` p95.
+- Resources: Rust max RSS/FD `54092KiB` / `37`; Kubo max RSS/FD
+  `271368KiB` / `285`; Rust/Kubo ratios `0.20x` RSS and `0.13x` FDs.
+- Rust delegated lookup events: `102`, all successful, max `97ms`.
+- Delegated lookup elapsed p50/p90/p95/max:
+  `24ms` / `50ms` / `71ms` / `97ms`.
+- First HTTP provider p50/p90/p95/max:
+  `21ms` / `49ms` / `69ms` / `97ms`.
+- HTTP-provider distribution: `zero=6`, `single=55`, `multi=41`,
+  `single_target_miss=55`.
+- HTTP-provider races: `75` results, all successful, `0` late winners;
+  `42` single-provider races and `33` multi-provider races.
+- HTTP-provider fetch p50/p95/max: `163ms` / `500ms` / `664ms`.
+- Provider spread: `ipfs-bridge.sia.dev=42`, `dag.w3s.link=33`.
+- Block sources: `http_provider=69`, `bitswap=49`, `cache=2`.
+- Bitswap session summary: `shortcut_post_lookup_waits=38`,
+  `post_lookup_hits=21`, `post_lookup_timeouts=17`.
+
+Interpretation:
+
+- In this window, delegated routing was not the bottleneck. First-HTTP p95 was
+  only `69ms`.
+- Rust is already materially faster than Kubo for root p50/p95 and asset p95
+  while using far fewer resources.
+- Kubo still wins asset p50. The slowest Rust sample in this run was a
+  Bitswap-served asset (`BfUTpfA9.js`) at `1036ms`, not an HTTP-provider or
+  delegated-routing tail.
+- The next behavior experiment should be gated by trace shape: work on
+  delegated routing only when repeated traces show high delegated p95; otherwise
+  investigate page/session Bitswap shortcut timing, single-provider HTTP
+  winners, or asset-p50 paths.
+
+Decision:
+Baseline only. No code change.
