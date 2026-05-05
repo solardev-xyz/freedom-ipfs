@@ -11289,6 +11289,20 @@ cargo fmt --all
 cargo test -p freedom-ipfs-retrieval shared_bitswap_client_fetch_many
 cargo test -p freedom-ipfs-retrieval
 cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+
+timeout 360s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-shared-batch-sanity-trace.jsonl \
+  --comparison-output /tmp/vitalik-shared-batch-sanity.json
 ```
 
 Result:
@@ -11298,8 +11312,18 @@ Result:
 - full retrieval test suite passed:
   `65 passed; 0 failed; 1 ignored`
 - retrieval clippy passed with `-D warnings`
-- no live harness comparison was run because this commit intentionally does not
-  change gateway/UnixFS page retrieval scheduling yet
+- live same-window `vitalik-root-html-range` sanity check passed for both Rust
+  and Kubo:
+  - Rust root TTFB: `1443ms`
+  - Kubo root TTFB: `3003ms`
+  - Rust max RSS/FD: `38528KiB` / `21`
+  - Kubo max RSS/FD: `120724KiB` / `86`
+  - Rust Bitswap fetches: `2`, both delivered by incoming streams
+  - trace showed `cids`/`cid_count` fields on the normal single-CID path while
+    preserving single-request behavior
+- live artifacts:
+  `/tmp/vitalik-shared-batch-sanity-trace.jsonl` and
+  `/tmp/vitalik-shared-batch-sanity.json`
 
 Decision:
 Keep as a Priority-1 building block. This does not claim a page-load speed win
