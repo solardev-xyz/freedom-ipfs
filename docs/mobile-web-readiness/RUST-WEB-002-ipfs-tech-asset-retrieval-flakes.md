@@ -9235,3 +9235,67 @@ Deterministic validation:
 - `cargo check --workspace --all-targets`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `git diff --check`
+
+## 2026-05-05 Reject: Direct Untrusted WANT_BLOCK Cap 4
+
+Hypothesis:
+The latest same-window `ipfs-tech-page-assets` run after DNS prefetch showed the
+slow cold root/index child block arriving from an untrusted provider that was
+behind the `WANT_HAVE` boundary. Increasing
+`MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS` from `3` to `4` might move that
+provider into the direct `WANT_BLOCK` set and reduce the cold raw-block tail.
+
+Prototype:
+
+- Temporarily set `MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS = 4`.
+- Update the deterministic Bitswap mode-boundary tests so four untrusted peers
+  receive direct `WANT_BLOCK` and the next peer still exercises `WANT_HAVE`.
+- Keep existing peer, dial, timeout, verification, and cache semantics
+  unchanged.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval multi_peer_bitswap_directs_first_untrusted_then_uses_want_have
+cargo test -p freedom-ipfs-retrieval want_have_probe_falls_back_to_want_block_quickly
+cargo test -p freedom-ipfs-retrieval formats_bitswap_peer_timeout_summary
+cargo test -p freedom-ipfs-retrieval
+```
+
+Live comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-direct4-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-direct4-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `20/2737ms`, Kubo `3/3058ms`.
+- Asset TTFB p50/p95: Rust `13/767ms`, Kubo `3/209ms`.
+- Gateway request elapsed p50/p90/p95/max: `6/198/1011/2718ms`.
+- Bitswap peer attempts increased to `155` starts, compared with `127` in the
+  preceding cap-3 DNS-prefetch comparison.
+- Direct `WANT_HAVE` probes disappeared (`prefer_want_have=0`) and verified
+  extra-block reuse collapsed to `2` total extra blocks, compared with `54` in
+  the preceding cap-3 run.
+- RSS/FD remained mobile-friendly at `51356KiB`/`44`, but this did not offset
+  the asset and gateway elapsed tail regression.
+
+Decision: reject and revert. Cap 4 made the page workload more aggressive but
+less useful: more peer attempts, fewer extra blocks, worse asset p95, and worse
+gateway elapsed p95/max. Keep the cap at `3`; future direct-fanout experiments
+should be conditional on stronger peer quality evidence instead of simply
+raising the global direct untrusted budget.
