@@ -912,6 +912,7 @@ fn print_summary(report: &RunReport) {
         print_trace_unixfs_metadata_cache(trace);
         print_trace_gateway_direct_body(trace);
         print_trace_gateway_stream_body(trace);
+        print_trace_http_provider_fetches(trace);
         print_trace_bitswap_sources(trace);
         print_trace_bitswap_batches(trace);
         print_trace_bitswap_incoming_batches(trace);
@@ -1225,6 +1226,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_timeout_recovery(trace);
     print_trace_gateway_direct_body(trace);
     print_trace_gateway_stream_body(trace);
+    print_trace_http_provider_fetches(trace);
     print_trace_bitswap_peer_attempts(trace);
     print_trace_bitswap_dial_plans(trace);
     print_trace_bitswap_sources(trace);
@@ -1461,6 +1463,23 @@ fn print_trace_gateway_stream_body(trace: &TraceSummary) {
     println!(
         "  gateway streamed bodies: events={} bytes={} max_body_len={} max_chunks={} max_elapsed_ms={}",
         stream.events, stream.bytes, stream.max_body_len, stream.max_chunks, stream.max_elapsed_ms
+    );
+}
+
+fn print_trace_http_provider_fetches(trace: &TraceSummary) {
+    let http = &trace.http_provider_fetches;
+    if http.events == 0 {
+        return;
+    }
+    println!(
+        "  http provider fetches: events={} successes={} failures={} bytes={} elapsed={} providers={} error_classes={}",
+        http.events,
+        http.successes,
+        http.failures,
+        http.bytes,
+        http.elapsed_ms,
+        format_trace_counts(&http.providers),
+        format_trace_counts(&http.error_classes)
     );
 }
 
@@ -4268,6 +4287,7 @@ struct TraceSummary {
     gateway_request_elapsed_ms: LatencySummary,
     gateway_direct_body: TraceGatewayDirectBodyAggregate,
     gateway_stream_body: TraceGatewayStreamBodyAggregate,
+    http_provider_fetches: TraceHttpProviderFetchAggregate,
     unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
     bitswap_source_peers: Vec<TraceValueCount>,
     bitswap_source_transports: Vec<TraceValueCount>,
@@ -4333,6 +4353,17 @@ struct TraceBlockStoreAggregate {
     put_failures: usize,
     put_total_ms: u128,
     put_max_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
+struct TraceHttpProviderFetchAggregate {
+    events: usize,
+    successes: usize,
+    failures: usize,
+    bytes: u128,
+    elapsed_ms: LatencySummary,
+    providers: Vec<TraceValueCount>,
+    error_classes: Vec<TraceValueCount>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -5047,6 +5078,13 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut gateway_request_elapsed_values = Vec::<u128>::new();
     let mut gateway_direct_body = TraceGatewayDirectBodyAggregate::default();
     let mut gateway_stream_body = TraceGatewayStreamBodyAggregate::default();
+    let mut http_provider_fetch_events = 0usize;
+    let mut http_provider_fetch_successes = 0usize;
+    let mut http_provider_fetch_failures = 0usize;
+    let mut http_provider_fetch_bytes = 0u128;
+    let mut http_provider_fetch_elapsed_values = Vec::<u128>::new();
+    let mut http_provider_fetch_providers = BTreeMap::<String, usize>::new();
+    let mut http_provider_fetch_error_classes = BTreeMap::<String, usize>::new();
     let mut unixfs_metadata_cache = TraceUnixfsMetadataCacheAggregate::default();
     let mut bitswap_source_peers = BTreeMap::<String, usize>::new();
     let mut bitswap_source_transports = BTreeMap::<String, usize>::new();
@@ -5166,6 +5204,26 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             if let Some(elapsed_ms) = elapsed_ms {
                 block_store.put_total_ms += elapsed_ms;
                 block_store.put_max_ms = block_store.put_max_ms.max(elapsed_ms);
+            }
+        }
+        if phase == "http_provider_fetch" {
+            http_provider_fetch_events += 1;
+            match value.get("ok").and_then(|ok| ok.as_bool()) {
+                Some(true) => http_provider_fetch_successes += 1,
+                Some(false) => http_provider_fetch_failures += 1,
+                None => {}
+            }
+            http_provider_fetch_bytes += value.get("bytes").and_then(json_u128).unwrap_or_default();
+            if let Some(elapsed_ms) = elapsed_ms {
+                http_provider_fetch_elapsed_values.push(elapsed_ms);
+            }
+            if let Some(provider) = json_detail_string(value.get("provider")) {
+                *http_provider_fetch_providers.entry(provider).or_default() += 1;
+            }
+            if let Some(error) = json_detail_string(value.get("error")) {
+                *http_provider_fetch_error_classes
+                    .entry(http_provider_error_class(&error).to_string())
+                    .or_default() += 1;
             }
         }
         if phase == "delegated_provider_lookup" {
@@ -5968,6 +6026,15 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         gateway_request_elapsed_ms: LatencySummary::from_values(gateway_request_elapsed_values),
         gateway_direct_body,
         gateway_stream_body,
+        http_provider_fetches: TraceHttpProviderFetchAggregate {
+            events: http_provider_fetch_events,
+            successes: http_provider_fetch_successes,
+            failures: http_provider_fetch_failures,
+            bytes: http_provider_fetch_bytes,
+            elapsed_ms: LatencySummary::from_values(http_provider_fetch_elapsed_values),
+            providers: sorted_trace_counts(http_provider_fetch_providers),
+            error_classes: sorted_trace_counts(http_provider_fetch_error_classes),
+        },
         unixfs_metadata_cache,
         bitswap_source_peers: sorted_trace_counts(bitswap_source_peers),
         bitswap_source_transports: sorted_trace_counts(bitswap_source_transports),
@@ -6442,6 +6509,24 @@ fn trace_error_key(phase: &str, value: &serde_json::Value) -> Option<String> {
         return Some(format!("{phase}: ok=false"));
     }
     None
+}
+
+fn http_provider_error_class(error: &str) -> &'static str {
+    if error.contains("cid hash mismatch") {
+        "cid_hash_mismatch"
+    } else if error.contains("timed out") || error.contains("Timeout has been reached") {
+        "timeout"
+    } else if error.contains("429") {
+        "http_429"
+    } else if error.contains("404") {
+        "http_404"
+    } else if error.contains("500") || error.contains("502") || error.contains("503") {
+        "http_5xx"
+    } else if error.contains("redirect") {
+        "redirect"
+    } else {
+        "other"
+    }
 }
 
 fn bitswap_connection_error_class(error: &str) -> &'static str {
@@ -8488,6 +8573,60 @@ mod tests {
         assert_eq!(summary.block_store.put_total_ms, 20);
         assert_eq!(summary.block_store.put_max_ms, 17);
         assert_eq!(trace_value_count(&summary.progress_phases, "streaming"), 2);
+    }
+
+    #[test]
+    fn trace_summary_counts_http_provider_fetches() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-http-provider-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-a\",\"provider\":\"https://provider-a.example\",\"ok\":true,\"bytes\":128,\"elapsed_ms\":25}\n",
+                "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-b\",\"provider\":\"https://provider-b.example\",\"ok\":false,\"error\":\"core: cid hash mismatch for cid-b\",\"elapsed_ms\":40}\n",
+                "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-c\",\"provider\":\"https://provider-b.example\",\"ok\":false,\"error\":\"request timed out\",\"elapsed_ms\":60}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(summary.http_provider_fetches.events, 3);
+        assert_eq!(summary.http_provider_fetches.successes, 1);
+        assert_eq!(summary.http_provider_fetches.failures, 2);
+        assert_eq!(summary.http_provider_fetches.bytes, 128);
+        assert_eq!(summary.http_provider_fetches.elapsed_ms.count, 3);
+        assert_eq!(summary.http_provider_fetches.elapsed_ms.p50_ms, Some(40));
+        assert_eq!(
+            trace_value_count(
+                &summary.http_provider_fetches.providers,
+                "https://provider-b.example"
+            ),
+            2
+        );
+        assert_eq!(
+            trace_value_count(
+                &summary.http_provider_fetches.error_classes,
+                "cid_hash_mismatch"
+            ),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.http_provider_fetches.error_classes, "timeout"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "fetching_http_provider"),
+            3
+        );
     }
 
     #[test]

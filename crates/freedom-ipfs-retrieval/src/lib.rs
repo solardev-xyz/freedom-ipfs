@@ -651,6 +651,7 @@ impl HttpRetriever {
                             cid = %cid,
                             provider = %base,
                             ok = true,
+                            bytes = block.data().len(),
                             elapsed_ms = started.elapsed().as_millis()
                         );
                         return Ok((block, RetrievalSource::HttpProvider));

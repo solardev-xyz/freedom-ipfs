@@ -12613,3 +12613,81 @@ Live public result:
 - The p95 tail came from delegated provider lookup / HTTP provider variability,
   not local store writes. The trace had two HTTP-provider hash-mismatch errors
   for the child block, but the request still passed through verified fallback.
+
+## 2026-05-05 Keep: Summarize HTTP Provider Fetch Quality
+
+Hypothesis:
+Live `vitalik-root-html-range` checks show tails from delegated provider lookup
+and verified HTTP-provider fallback, including CID hash mismatches. The harness
+previously exposed HTTP-provider attempts only as raw slow events and generic
+trace errors, which makes provider-quality experiments harder to compare.
+
+Change:
+
+- Add `bytes` to successful `http_provider_fetch` trace events.
+- Add `http_provider_fetches` to the mobile web harness trace summary.
+- Track HTTP-provider event count, successes, failures, returned bytes, elapsed
+  latency summary, provider URL counts, and coarse error classes.
+- Print a concise `http provider fetches:` line in both normal and comparison
+  trace summaries.
+- Classify common errors including `cid_hash_mismatch`, timeout, HTTP 404/429,
+  HTTP 5xx, redirect, and other.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_http_provider_fetches
+cargo test -p mobile-web-harness trace_summary
+cargo test -p freedom-ipfs-retrieval http_provider
+cargo test -p freedom-ipfs-retrieval
+cargo test -p mobile-web-harness
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Result:
+
+- focused HTTP-provider harness summary test passed
+- focused harness trace-summary tests passed: `8 passed; 0 failed`
+- focused retrieval HTTP-provider tests passed: `3 passed; 0 failed`
+- full retrieval suite passed: `66 passed; 0 failed; 1 ignored`
+- full mobile web harness suite passed: `32 passed; 0 failed`
+- retrieval and harness clippy passed with `-D warnings`
+
+Live sanity check:
+
+```sh
+timeout 480s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-http-provider-summary-r1-trace.jsonl \
+  --comparison-output /tmp/vitalik-http-provider-summary-r1.json
+```
+
+Live result:
+
+- Rust and Kubo passed `vitalik-root-html-range`.
+- Rust root TTFB `1209ms`; Kubo root TTFB `3121ms`.
+- Rust max RSS/FD `30848KiB` / `15`; Kubo max RSS/FD `118888KiB` / `71`.
+- New summary line:
+  `http provider fetches: events=3 successes=2 failures=1 bytes=38773
+  elapsed=p50=60ms p90=994ms p95=994ms max=994ms
+  providers=https://trustless.filebase.io/=2,
+  https://indexer.storacha.network/=1 error_classes=cid_hash_mismatch=1`
+- The slow child fetch was a `994ms` CID hash mismatch from an HTTP provider,
+  followed by verified fallback. This gives the next provider-quality experiment
+  a precise counter and source-provider signal.
+
+Decision:
+Keep. This is diagnostics-only and does not alter provider selection, public
+fallback behavior, block verification, or caching. It makes HTTP-provider
+quality visible enough to safely test provider suppression/racing changes later.
