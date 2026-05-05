@@ -685,6 +685,14 @@ async fn run_case(
             failures.push(format!("body did not contain {expected:?}"));
         }
     }
+    if let Some(expected) = entry.expect_body_bytes {
+        if response.body.len() != expected {
+            failures.push(format!(
+                "body {} bytes, expected exactly {expected}",
+                response.body.len()
+            ));
+        }
+    }
     if let Some(min_bytes) = entry.min_bytes {
         if response.body.len() < min_bytes {
             failures.push(format!(
@@ -3992,6 +4000,7 @@ struct CorpusEntry {
     expect_content_type_prefix: Option<String>,
     expect_content_range_prefix: Option<String>,
     expect_body_contains: Option<String>,
+    expect_body_bytes: Option<usize>,
     min_bytes: Option<usize>,
     max_ttfb_ms: Option<u64>,
 }
@@ -10195,6 +10204,7 @@ mod tests {
                     expect_content_type_prefix: None,
                     expect_content_range_prefix: None,
                     expect_body_contains: None,
+                    expect_body_bytes: None,
                     min_bytes: None,
                     max_ttfb_ms: None,
                 },
@@ -10210,6 +10220,7 @@ mod tests {
                     expect_content_type_prefix: None,
                     expect_content_range_prefix: None,
                     expect_body_contains: None,
+                    expect_body_bytes: Some(0),
                     min_bytes: None,
                     max_ttfb_ms: None,
                 },
@@ -10246,6 +10257,7 @@ mod tests {
             expect_content_type_prefix: None,
             expect_content_range_prefix: None,
             expect_body_contains: None,
+            expect_body_bytes: None,
             min_bytes: None,
             max_ttfb_ms: None,
         };
@@ -10261,6 +10273,7 @@ mod tests {
             expect_content_type_prefix: None,
             expect_content_range_prefix: None,
             expect_body_contains: None,
+            expect_body_bytes: None,
             min_bytes: None,
             max_ttfb_ms: None,
         };
@@ -11146,6 +11159,7 @@ mod tests {
             expect_content_type_prefix: None,
             expect_content_range_prefix: None,
             expect_body_contains: None,
+            expect_body_bytes: None,
             min_bytes: None,
             max_ttfb_ms: None,
         }

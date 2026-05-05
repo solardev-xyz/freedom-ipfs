@@ -340,7 +340,10 @@ status, MIME type, byte count, and timing.
   resulting `/ipfs/<cid>/` path directly so ENS bugs stay separate from IPFS
   retrieval bugs.
 - Range-heavy media fixtures: request first, middle, and suffix byte ranges from
-  known audio/video CIDs and verify `206`, `Content-Range`, and bounded memory.
+  known media CIDs and verify `206`, `Content-Range`, and bounded memory. The
+  harness now has opt-in first/middle/suffix/HEAD coverage for the
+  `ipfs.tech` developers hero image; stable audio/video CIDs are still useful
+  future additions.
 - Cold/warm timing pairs: run each case twice against the same gateway and record
   cache-hit speedups, provider lookup counts, and outlier latencies.
 - Failure classification: distinguish name resolution failures, provider

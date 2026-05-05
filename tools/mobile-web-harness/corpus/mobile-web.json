@@ -85,6 +85,41 @@
       "max_ttfb_ms": 45000
     },
     {
+      "id": "ipfs-tech-developers-hero-middle-range",
+      "description": "Opt-in DNSLink-backed image middle range from the ipfs.tech page bundle. Exercises non-prefix media byte ranges without fetching the full image.",
+      "path": "/ipns/ipfs.tech/_nuxt/developers-hero.BRuJDQyf.jpg",
+      "default_enabled": false,
+      "range": "bytes=65536-69631",
+      "expect_status": 206,
+      "expect_content_type_prefix": "image/",
+      "expect_content_range_prefix": "bytes 65536-69631/",
+      "min_bytes": 4096,
+      "max_ttfb_ms": 45000
+    },
+    {
+      "id": "ipfs-tech-developers-hero-suffix-range",
+      "description": "Opt-in DNSLink-backed image suffix range from the ipfs.tech page bundle. Exercises browser media-style tail reads without fetching the full image.",
+      "path": "/ipns/ipfs.tech/_nuxt/developers-hero.BRuJDQyf.jpg",
+      "default_enabled": false,
+      "range": "bytes=-4096",
+      "expect_status": 206,
+      "expect_content_type_prefix": "image/",
+      "expect_content_range_prefix": "bytes ",
+      "min_bytes": 4096,
+      "max_ttfb_ms": 45000
+    },
+    {
+      "id": "ipfs-tech-developers-hero-head",
+      "description": "Opt-in DNSLink-backed image HEAD request from the ipfs.tech page bundle. Exercises media metadata checks without a response body.",
+      "path": "/ipns/ipfs.tech/_nuxt/developers-hero.BRuJDQyf.jpg",
+      "default_enabled": false,
+      "method": "HEAD",
+      "expect_status": 200,
+      "expect_content_type_prefix": "image/",
+      "expect_body_bytes": 0,
+      "max_ttfb_ms": 45000
+    },
+    {
       "id": "wikipedia-on-ipfs-root",
       "description": "Small independent DNSLink root outside ipfs.tech. Keeps a non-IPFS-project IPNS/DNSLink target in the mobile-web harness.",
       "path": "/ipns/en.wikipedia-on-ipfs.org",

@@ -20109,3 +20109,102 @@ Keep. Without this event, Swift could see a stale active preload target after a
 normal lifecycle stop even though the task had been aborted. The change does not
 alter the FFI ABI or Swift wrapper surface; it only makes existing progress
 snapshots reflect lifecycle-driven cancellation accurately.
+
+## 2026-05-05 Keep: Add Opt-In Media Range And HEAD Corpus Cases
+
+Question:
+The roadmap calls out range-heavy media workloads, but the live mobile corpus
+only had a first-prefix image range for the `ipfs.tech` developers hero asset.
+Can the harness cover middle range, suffix range, and HEAD shapes without
+expanding the default live corpus cost?
+
+Implementation:
+
+- Add opt-in corpus cases for the DNSLink-backed
+  `/ipns/ipfs.tech/_nuxt/developers-hero.BRuJDQyf.jpg` asset:
+  - `ipfs-tech-developers-hero-middle-range`: `bytes=65536-69631`
+  - `ipfs-tech-developers-hero-suffix-range`: `bytes=-4096`
+  - `ipfs-tech-developers-hero-head`: `HEAD`
+- Keep the existing first-prefix image range case enabled by default.
+- Add an optional `expect_body_bytes` corpus assertion so HEAD cases can verify
+  the gateway returns no response body.
+- Document that stable audio/video CIDs remain a useful future corpus addition.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+```
+
+Focused result:
+
+- Formatting passed.
+- Full mobile web harness suite passed: `39 passed`.
+
+Live Rust validation:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-hero-media-range-head-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-hero-media-range-head-r3.json
+```
+
+Live Rust result:
+
+- Passed: `3/3`.
+- Run total p50/p95/max: `1665/1884/1884ms`.
+- Gateway max RSS/FD: `39692KiB` / `19`.
+- Middle range passed `3/3` with `206` and `Content-Range:
+  bytes 65536-69631/184141`; TTFB p50/p95/max `1658/1880/1880ms`.
+- Suffix range passed `3/3` with `206` and `Content-Range:
+  bytes 180045-184140/184141`; TTFB p50/p95/max `3/4/4ms`.
+- HEAD passed `3/3` with `200`, `0` response bytes, and TTFB p50/p95/max
+  `3/3/3ms`.
+- Block sources: `http_provider=6`, `bitswap=3`.
+- UnixFS metadata cache within each fresh process: path hits/misses `6/3`,
+  file-size hits/misses `6/3`.
+
+Same-window Kubo comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-hero-media-range-head-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-hero-media-range-head-kubo-r3.json
+```
+
+Same-window Kubo result:
+
+- Rust and Kubo both passed `3/3`.
+- Middle range TTFB p50/p95: Rust `788/839ms`, Kubo `3103/3335ms`.
+- Suffix range TTFB p50/p95: Rust `3/3ms`, Kubo `4/16ms`.
+- HEAD TTFB p50/p95: Rust `3/3ms`, Kubo `2/4ms`.
+- Resource max RSS/FD: Rust `32944KiB` / `15`, Kubo `265148KiB` / `174`.
+
+Decision:
+Keep. This is harness coverage and corpus validation only; it does not change
+gateway retrieval behavior. The opt-in cases exercise media-style range and
+metadata shapes that WebKit can issue while preserving default harness cost and
+mobile resource constraints.
