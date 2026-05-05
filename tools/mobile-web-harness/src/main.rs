@@ -1,6 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
-use reqwest::header::{CACHE_CONTROL, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH, RANGE};
+use reqwest::header::{
+    CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH, RANGE,
+};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -679,6 +681,14 @@ async fn run_case(
             ));
         }
     }
+    if let Some(expected) = entry.expect_content_length {
+        if response.content_length != Some(expected) {
+            failures.push(format!(
+                "content-length {:?}, expected {expected}",
+                response.content_length
+            ));
+        }
+    }
     if let Some(expected) = &entry.expect_body_contains {
         let text = String::from_utf8_lossy(&response.body);
         if !text.contains(expected) {
@@ -756,6 +766,7 @@ async fn run_case(
         status: Some(response.status),
         content_type: response.content_type,
         content_range: response.content_range,
+        content_length: response.content_length,
         etag: response.etag,
         cache_control: response.cache_control,
         body_bytes: response.body.len(),
@@ -2116,13 +2127,17 @@ fn display_option_seed_setup(value: Option<BitswapSeedConnectionSetup>) -> &'sta
 fn print_case_result(result: &CaseResult) {
     let mark = if result.passed { "PASS" } else { "FAIL" };
     println!(
-        "{mark} {:32} status={} type={} bytes={} ttfb={}ms total={}ms etag={} cache_control={}",
+        "{mark} {:32} status={} type={} content_length={} bytes={} ttfb={}ms total={}ms etag={} cache_control={}",
         result.id,
         result
             .status
             .map(|status| status.to_string())
             .unwrap_or_else(|| "-".to_string()),
         result.content_type.as_deref().unwrap_or("-"),
+        result
+            .content_length
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
         result.body_bytes,
         result.ttfb_ms,
         result.total_ms,
@@ -2274,6 +2289,11 @@ async fn fetch_response(
         .get(CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    let content_length = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
     let etag = response
         .headers()
         .get(ETAG)
@@ -2295,6 +2315,7 @@ async fn fetch_response(
         status,
         content_type,
         content_range,
+        content_length,
         etag,
         cache_control,
         body,
@@ -2558,6 +2579,7 @@ async fn fetch_asset(
         status: None,
         content_type: None,
         content_range: None,
+        content_length: None,
         etag: None,
         cache_control: None,
         body_bytes: 0,
@@ -2583,6 +2605,7 @@ async fn fetch_asset(
     result.status = Some(response.status);
     result.content_type = response.content_type.clone();
     result.content_range = response.content_range.clone();
+    result.content_length = response.content_length;
     result.etag = response.etag.clone();
     result.cache_control = response.cache_control.clone();
     result.body_bytes = response.body.len();
@@ -3999,6 +4022,7 @@ struct CorpusEntry {
     expect_status: Option<u16>,
     expect_content_type_prefix: Option<String>,
     expect_content_range_prefix: Option<String>,
+    expect_content_length: Option<u64>,
     expect_body_contains: Option<String>,
     expect_body_bytes: Option<usize>,
     min_bytes: Option<usize>,
@@ -8362,6 +8386,7 @@ struct CaseResult {
     status: Option<u16>,
     content_type: Option<String>,
     content_range: Option<String>,
+    content_length: Option<u64>,
     etag: Option<String>,
     cache_control: Option<String>,
     body_bytes: usize,
@@ -8385,6 +8410,7 @@ impl CaseResult {
             status: None,
             content_type: None,
             content_range: None,
+            content_length: None,
             etag: None,
             cache_control: None,
             body_bytes: 0,
@@ -8404,6 +8430,7 @@ struct FetchResponse {
     status: u16,
     content_type: Option<String>,
     content_range: Option<String>,
+    content_length: Option<u64>,
     etag: Option<String>,
     cache_control: Option<String>,
     body: Vec<u8>,
@@ -8471,6 +8498,7 @@ struct AssetResult {
     status: Option<u16>,
     content_type: Option<String>,
     content_range: Option<String>,
+    content_length: Option<u64>,
     etag: Option<String>,
     cache_control: Option<String>,
     body_bytes: usize,
@@ -10119,6 +10147,7 @@ mod tests {
             status: Some(200),
             content_type: Some("text/javascript".to_string()),
             content_range: None,
+            content_length: Some(128),
             etag: Some("\"asset\"".to_string()),
             cache_control: Some("public, max-age=31536000, immutable".to_string()),
             body_bytes: 128,
@@ -10164,6 +10193,7 @@ mod tests {
             status: 200,
             content_type: Some("text/plain".to_string()),
             content_range: None,
+            content_length: Some(5),
             etag: None,
             cache_control: Some("public, max-age=31536000, immutable".to_string()),
             body: b"hello".to_vec(),
@@ -10203,6 +10233,7 @@ mod tests {
                     expect_status: Some(200),
                     expect_content_type_prefix: None,
                     expect_content_range_prefix: None,
+                    expect_content_length: None,
                     expect_body_contains: None,
                     expect_body_bytes: None,
                     min_bytes: None,
@@ -10219,6 +10250,7 @@ mod tests {
                     expect_status: Some(200),
                     expect_content_type_prefix: None,
                     expect_content_range_prefix: None,
+                    expect_content_length: None,
                     expect_body_contains: None,
                     expect_body_bytes: Some(0),
                     min_bytes: None,
@@ -10256,6 +10288,7 @@ mod tests {
             expect_status: Some(200),
             expect_content_type_prefix: None,
             expect_content_range_prefix: None,
+            expect_content_length: None,
             expect_body_contains: None,
             expect_body_bytes: None,
             min_bytes: None,
@@ -10272,6 +10305,7 @@ mod tests {
             expect_status: Some(200),
             expect_content_type_prefix: None,
             expect_content_range_prefix: None,
+            expect_content_length: None,
             expect_body_contains: None,
             expect_body_bytes: None,
             min_bytes: None,
@@ -10318,6 +10352,7 @@ mod tests {
                 status: Some(504),
                 content_type: Some("text/html".to_string()),
                 content_range: None,
+                content_length: None,
                 etag: None,
                 cache_control: None,
                 body_bytes: 0,
@@ -10335,6 +10370,7 @@ mod tests {
                 status: Some(200),
                 content_type: Some("image/png".to_string()),
                 content_range: None,
+                content_length: Some(128),
                 etag: None,
                 cache_control: None,
                 body_bytes: 128,
@@ -11131,6 +11167,7 @@ mod tests {
                 status: Some(200),
                 content_type: Some("text/plain".to_string()),
                 content_range: None,
+                content_length: Some(5),
                 etag: None,
                 cache_control: None,
                 body_bytes: 5,
@@ -11158,6 +11195,7 @@ mod tests {
             expect_status: None,
             expect_content_type_prefix: None,
             expect_content_range_prefix: None,
+            expect_content_length: None,
             expect_body_contains: None,
             expect_body_bytes: None,
             min_bytes: None,

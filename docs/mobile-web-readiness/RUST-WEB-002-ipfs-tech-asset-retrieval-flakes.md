@@ -20208,3 +20208,79 @@ Keep. This is harness coverage and corpus validation only; it does not change
 gateway retrieval behavior. The opt-in cases exercise media-style range and
 metadata shapes that WebKit can issue while preserving default harness cost and
 mobile resource constraints.
+
+## 2026-05-05 Keep: Assert Content-Length For Media Range And HEAD Cases
+
+Question:
+The media range corpus validates status, MIME type, `Content-Range`, and body
+length, but browser media and metadata paths also depend on stable
+`Content-Length`. Can the harness record and assert `Content-Length` without
+changing gateway behavior?
+
+Implementation:
+
+- Capture response `Content-Length` in `mobile-web-harness` fetch results and
+  serialized root/asset reports.
+- Add optional corpus field `expect_content_length`.
+- Assert `Content-Length: 4096` for the first, middle, and suffix
+  `ipfs.tech` developers hero image range cases.
+- Assert `Content-Length: 184141` and zero response body for the opt-in HEAD
+  case.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo check -p mobile-web-harness --all-targets
+```
+
+Focused result:
+
+- Formatting passed.
+- Full mobile web harness suite passed: `39 passed`.
+- Harness check passed.
+
+Live Rust validation:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-developers-hero-range \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-hero-content-length-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-hero-content-length-r3.json
+```
+
+Live Rust result:
+
+- Passed: `3/3`.
+- Run total p50/p95/max: `1091/1136/1136ms`.
+- Gateway max RSS/FD: `33056KiB` / `16`.
+- First range passed with `206`, `Content-Range:
+  bytes 0-4095/184141`, `Content-Length: 4096`, body bytes `4096`, TTFB
+  p50/p95/max `1079/1124/1124ms`.
+- Middle range passed with `206`, `Content-Range:
+  bytes 65536-69631/184141`, `Content-Length: 4096`, body bytes `4096`, TTFB
+  p50/p95/max `4/4/4ms`.
+- Suffix range passed with `206`, `Content-Range:
+  bytes 180045-184140/184141`, `Content-Length: 4096`, body bytes `4096`,
+  TTFB p50/p95/max `3/3/3ms`.
+- HEAD passed with `200`, no `Content-Range`, `Content-Length: 184141`, body
+  bytes `0`, TTFB p50/p95/max `3/3/3ms`.
+- Block sources: `http_provider=9`.
+- UnixFS metadata cache within each fresh process: path hits/misses `9/3`,
+  file-size hits/misses `9/3`.
+
+Decision:
+Keep. This is harness/reporting coverage only and confirms the existing gateway
+media range and HEAD behavior surfaces the headers WebKit needs. It preserves
+read-only retrieval, verified block handling, and mobile resource constraints.
