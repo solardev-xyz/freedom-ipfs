@@ -1571,12 +1571,16 @@ fn print_trace_http_provider_fetches(trace: &TraceSummary) {
     }
     for provider in http.provider_milestones.iter().take(4) {
         println!(
-            "    provider {}: events={} successes={} failures={} bytes={} elapsed_max={}ms header_max={}ms first_chunk_max={}ms body_max={}ms",
+            "    provider {}: events={} successes={} failures={} bytes={} elapsed={} headers={} first_chunks={} bodies={} elapsed_max={}ms header_max={}ms first_chunk_max={}ms body_max={}ms",
             provider.provider,
             provider.events,
             provider.successes,
             provider.failures,
             provider.bytes,
+            provider.elapsed_ms,
+            provider.response_headers_elapsed_ms,
+            provider.response_first_chunk_elapsed_ms,
+            provider.response_body_elapsed_ms,
             provider.max_ms,
             provider.max_response_headers_elapsed_ms,
             provider.max_response_first_chunk_elapsed_ms,
@@ -4713,6 +4717,10 @@ struct TraceHttpProviderMilestoneAggregate {
     bytes: u128,
     response_bytes: u128,
     first_chunk_events: usize,
+    elapsed_ms: LatencySummary,
+    response_headers_elapsed_ms: LatencySummary,
+    response_first_chunk_elapsed_ms: LatencySummary,
+    response_body_elapsed_ms: LatencySummary,
     total_ms: u128,
     max_ms: u128,
     max_response_headers_elapsed_ms: u128,
@@ -4728,6 +4736,10 @@ struct TraceHttpProviderMilestoneBuilder {
     bytes: u128,
     response_bytes: u128,
     first_chunk_events: usize,
+    elapsed_values: Vec<u128>,
+    response_headers_elapsed_values: Vec<u128>,
+    response_first_chunk_elapsed_values: Vec<u128>,
+    response_body_elapsed_values: Vec<u128>,
     total_ms: u128,
     max_ms: u128,
     max_response_headers_elapsed_ms: u128,
@@ -4758,6 +4770,23 @@ impl TraceHttpProviderMilestoneBuilder {
         if let Some(elapsed_ms) = elapsed_ms {
             self.total_ms += elapsed_ms;
             self.max_ms = self.max_ms.max(elapsed_ms);
+            self.elapsed_values.push(elapsed_ms);
+        }
+        if let Some(headers_elapsed_ms) =
+            value.get("response_headers_elapsed_ms").and_then(json_u128)
+        {
+            self.response_headers_elapsed_values
+                .push(headers_elapsed_ms);
+        }
+        if let Some(first_chunk_elapsed_ms) = value
+            .get("response_first_chunk_elapsed_ms")
+            .and_then(json_u128)
+        {
+            self.response_first_chunk_elapsed_values
+                .push(first_chunk_elapsed_ms);
+        }
+        if let Some(body_elapsed_ms) = value.get("response_body_elapsed_ms").and_then(json_u128) {
+            self.response_body_elapsed_values.push(body_elapsed_ms);
         }
         self.max_response_headers_elapsed_ms = self.max_response_headers_elapsed_ms.max(
             value
@@ -6925,19 +6954,32 @@ fn sorted_trace_http_provider_milestones(
 ) -> Vec<TraceHttpProviderMilestoneAggregate> {
     let mut values = counts
         .into_iter()
-        .map(|(provider, builder)| TraceHttpProviderMilestoneAggregate {
-            provider,
-            events: builder.events,
-            successes: builder.successes,
-            failures: builder.failures,
-            bytes: builder.bytes,
-            response_bytes: builder.response_bytes,
-            first_chunk_events: builder.first_chunk_events,
-            total_ms: builder.total_ms,
-            max_ms: builder.max_ms,
-            max_response_headers_elapsed_ms: builder.max_response_headers_elapsed_ms,
-            max_response_first_chunk_elapsed_ms: builder.max_response_first_chunk_elapsed_ms,
-            max_response_body_elapsed_ms: builder.max_response_body_elapsed_ms,
+        .map(|(provider, builder)| {
+            let elapsed_ms = LatencySummary::from_values(builder.elapsed_values);
+            let response_headers_elapsed_ms =
+                LatencySummary::from_values(builder.response_headers_elapsed_values);
+            let response_first_chunk_elapsed_ms =
+                LatencySummary::from_values(builder.response_first_chunk_elapsed_values);
+            let response_body_elapsed_ms =
+                LatencySummary::from_values(builder.response_body_elapsed_values);
+            TraceHttpProviderMilestoneAggregate {
+                provider,
+                events: builder.events,
+                successes: builder.successes,
+                failures: builder.failures,
+                bytes: builder.bytes,
+                response_bytes: builder.response_bytes,
+                first_chunk_events: builder.first_chunk_events,
+                elapsed_ms,
+                response_headers_elapsed_ms,
+                response_first_chunk_elapsed_ms,
+                response_body_elapsed_ms,
+                total_ms: builder.total_ms,
+                max_ms: builder.max_ms,
+                max_response_headers_elapsed_ms: builder.max_response_headers_elapsed_ms,
+                max_response_first_chunk_elapsed_ms: builder.max_response_first_chunk_elapsed_ms,
+                max_response_body_elapsed_ms: builder.max_response_body_elapsed_ms,
+            }
         })
         .collect::<Vec<_>>();
     values.sort_by(|left, right| {
@@ -9583,6 +9625,18 @@ mod tests {
             60
         );
         assert_eq!(
+            summary.http_provider_fetches.provider_milestones[0]
+                .elapsed_ms
+                .p50_ms,
+            Some(40)
+        );
+        assert_eq!(
+            summary.http_provider_fetches.provider_milestones[0]
+                .response_headers_elapsed_ms
+                .p50_ms,
+            Some(40)
+        );
+        assert_eq!(
             summary.http_provider_fetches.provider_milestones[1].provider,
             "https://provider-a.example"
         );
@@ -9593,6 +9647,18 @@ mod tests {
         assert_eq!(
             summary.http_provider_fetches.provider_milestones[1].first_chunk_events,
             1
+        );
+        assert_eq!(
+            summary.http_provider_fetches.provider_milestones[1]
+                .response_first_chunk_elapsed_ms
+                .p50_ms,
+            Some(9)
+        );
+        assert_eq!(
+            summary.http_provider_fetches.provider_milestones[1]
+                .response_body_elapsed_ms
+                .p50_ms,
+            Some(20)
         );
         assert_eq!(
             trace_value_count(

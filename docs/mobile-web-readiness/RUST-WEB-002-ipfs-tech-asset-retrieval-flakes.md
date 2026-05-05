@@ -16628,3 +16628,110 @@ path enough to justify a behavior change. The maximum possible timeout saving
 from `225ms` is only `25ms`, while losing a late session hit would be more
 expensive. Keep the current `250ms` selective grace until repeated outcome
 traces show a clearer cutoff with margin.
+
+## 2026-05-05 Keep: Summarize HTTP Provider Latencies By Provider
+
+Question:
+The harness already counted HTTP-provider milestones by provider, but the
+provider rows only exposed total counts and maxes. Recent live runs have mixed
+two different tail shapes: slow verified HTTP-provider responses, and slow
+delegated routing before the first HTTP provider is available. Add per-provider
+latency summaries so future experiments can tell whether a tail belongs to a
+specific HTTP provider or to the routing path before provider fetch starts.
+
+Implementation:
+
+- Keep gateway, retrieval, provider selection, verification, and caching
+  behavior unchanged.
+- Extend `TraceHttpProviderMilestoneAggregate` with `LatencySummary` fields for:
+  - total HTTP-provider fetch elapsed time
+  - response-header elapsed time
+  - first response chunk elapsed time
+  - response-body elapsed time
+- Print those summaries in the provider milestone rows while preserving the
+  existing max fields.
+- Add focused harness assertions for provider-level p50 header, first-chunk,
+  body, and total elapsed values.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_http_provider_fetches
+```
+
+Focused result:
+
+- Formatting passed.
+- The HTTP-provider trace summary regression test passed.
+
+Live smoke:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-provider-latency-summary-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-http-provider-latency-summary-r3.json
+```
+
+Live result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `872ms` / `882ms` / `882ms`.
+- Asset TTFB p50/p95/max: `231ms` / `1109ms` / `6055ms`.
+- Run total p50/p95/max: `2737ms` / `8118ms` / `8118ms`.
+- Max RSS/FD: `47196KiB` / `27`.
+- Block sources: `http_provider=120`.
+- Delegated lookup max: `5876ms`; first HTTP-provider max: `5875ms`;
+  target-met max: `5298ms`.
+- HTTP-provider fetch p50/p95/max: `162ms` / `424ms` / `920ms`.
+- Provider `https://ipfs-bridge.sia.dev/`: `63` events, elapsed
+  p50/p90/p95/max `172ms` / `378ms` / `502ms` / `920ms`, headers
+  p50/p90/p95/max `162ms` / `192ms` / `308ms` / `661ms`, bodies
+  p50/p90/p95/max `170ms` / `370ms` / `484ms` / `913ms`.
+- Provider `https://dag.w3s.link/`: `42` events, elapsed p50/p90/p95/max
+  `57ms` / `96ms` / `107ms` / `162ms`, headers p50/p90/p95/max
+  `54ms` / `94ms` / `104ms` / `156ms`, bodies p50/p90/p95/max
+  `55ms` / `95ms` / `105ms` / `159ms`.
+
+Interpretation:
+
+- The provider-level summaries show `dag.w3s.link` was materially faster than
+  `ipfs-bridge.sia.dev` in this window.
+- The worst asset tail in the same run was not explained by HTTP-provider body
+  latency. It came from delegated routing / first-HTTP-provider delay:
+  `/ipns/ipfs.tech/_nuxt/AKg0Znx-.js` had a `6052ms` asset TTFB and
+  `5876ms` delegated provider lookup.
+- This supports keeping the diagnostic and points future behavior work toward
+  delegated routing first-byte / first-HTTP-provider tails. It does not by
+  itself justify changing HTTP-provider ranking or fanout policy.
+
+Final validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting passed.
+- Full mobile web harness suite passed: `35 passed`.
+- Workspace check passed.
+- Workspace clippy passed with `-D warnings`.
+- Diff whitespace check passed.
+
+Decision:
+Keep. This is diagnostics-only and preserves read-only, verified-block
+behavior. It gives the next long-running optimization agent a provider-level
+latency lens for live Kubo comparisons and future routing/provider experiments.
