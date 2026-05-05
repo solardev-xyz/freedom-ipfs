@@ -19662,3 +19662,166 @@ Keep as the current cold `ipfs.tech` Rust-vs-Kubo baseline. The next speed
 experiments should avoid increasing fanout blindly and instead target the
 single-provider HTTP path, provider diversity before large cold blocks, and
 warm/local asset p50 overhead while preserving verified-block semantics.
+
+## 2026-05-05 Keep: Lower Single HTTP Self-Hedge To 250ms
+
+Question:
+The current-head Kubo comparison showed that delegated lookups were fast, while
+single-provider HTTP fetches from `https://ipfs-bridge.sia.dev/` still dominated
+the Rust asset p50 gap. Can the same-provider self-hedge fire at `250ms`,
+matching the existing multi-provider HTTP hedge, without adding too much mobile
+resource pressure?
+
+Implementation:
+
+- Change `SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER` from `350ms` to `250ms`.
+- Keep the existing kill switch:
+  `FREEDOM_IPFS_DISABLE_SINGLE_HTTP_SELF_HEDGE=1`.
+- Keep the same bounded HTTP provider fetch limiter:
+  `MAX_CONCURRENT_HTTP_PROVIDER_FETCHES=4`.
+- The duplicate request is still only used when there is exactly one HTTP
+  provider candidate.
+- The first verified block still wins; no public gateway fallback is added.
+
+Baseline command at the prior `350ms` threshold:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-single-http-self-hedge350-current-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-single-http-self-hedge350-current-r3.json
+```
+
+Baseline result:
+
+- Passed: `3/3`.
+- Run total p50/p95/max: `2410/3302/3302ms`.
+- Root TTFB p50/p95/max: `983/1590/1590ms`.
+- Asset TTFB p50/p90/p95/max: `232/474/528/1056ms`.
+- Gateway max RSS/FD: `48088KiB` / `26`.
+- Block sources: `http_provider=120`.
+- HTTP-provider self-hedges: `9`.
+- Single-provider HTTP winner p50/p90/p95/max:
+  `245/490/539/914ms`.
+- HTTP-provider fetch p50/p90/p95/max: `160/245/450/639ms`.
+
+First `250ms` experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-single-http-self-hedge250-experiment-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-single-http-self-hedge250-experiment-r3.json
+```
+
+First experiment result:
+
+- Passed: `3/3`.
+- Run total p50/p95/max: `2265/2751/2751ms`.
+- Root TTFB p50/p95/max: `721/963/963ms`.
+- Asset TTFB p50/p90/p95/max: `192/452/520/1038ms`.
+- Gateway max RSS/FD: `52872KiB` / `33`.
+- Block sources: `http_provider=92`, `bitswap=28`.
+- HTTP-provider self-hedges: `10`.
+- Single-provider HTTP winner p50/p90/p95/max:
+  `194/272/393/443ms`.
+- HTTP-provider fetch p50/p90/p95/max: `159/201/231/393ms`.
+
+Second `250ms` experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-single-http-self-hedge250-experiment-rerun-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-single-http-self-hedge250-experiment-rerun-r3.json
+```
+
+Second experiment result:
+
+- Passed: `3/3`.
+- Run total p50/p95/max: `1878/2112/2112ms`.
+- Root TTFB p50/p95/max: `711/884/884ms`.
+- Asset TTFB p50/p90/p95/max: `154/465/513/803ms`.
+- Gateway max RSS/FD: `53940KiB` / `35`.
+- Block sources: `http_provider=73`, `bitswap=47`.
+- HTTP-provider self-hedges: `15`.
+- Single-provider HTTP winner p50/p90/p95/max:
+  `235/454/536/552ms`.
+- HTTP-provider fetch p50/p90/p95/max: `161/218/388/535ms`.
+
+Guardrails:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-single-http-self-hedge250-guardrail-r3-trace.jsonl \
+  --output /tmp/daicowtf-single-http-self-hedge250-guardrail-r3.json
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-root-html-range-single-http-self-hedge250-guardrail-r3-trace.jsonl \
+  --output /tmp/vitalik-root-html-range-single-http-self-hedge250-guardrail-r3.json
+```
+
+Guardrail results:
+
+- `daicowtf-page-assets`: passed `3/3`; root TTFB p50/p95/max
+  `269/369/369ms`; max RSS/FD `33356KiB` / `14`; HTTP self-hedges `0`.
+- `vitalik-root-html-range`: passed `3/3`; root/range TTFB p50/p95/max
+  `251/251/251ms`; max RSS/FD `32128KiB` / `14`; HTTP self-hedges `0`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval self_hedges_slow_single_http_provider
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Result:
+All validation commands passed.
+
+Decision:
+Keep. The lower threshold produced two positive `ipfs.tech` samples, improved
+root and asset p50, kept asset p95 roughly flat or better, and stayed bounded by
+the existing HTTP fetch limiter. It did shift more blocks to the existing
+Bitswap race in the two live samples, raising max FD/RSS modestly, but still
+well below the current Kubo baseline and idle on the already-fast DAICO/Vitalik
+guardrails. Revert or retune if future long soaks show duplicate HTTP pressure
+or Bitswap connection growth during mobile-length sessions.
