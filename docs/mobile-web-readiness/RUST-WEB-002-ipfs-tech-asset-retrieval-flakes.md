@@ -8961,3 +8961,97 @@ Deterministic validation:
 - `cargo clippy -p freedom-ipfs-retrieval -p freedom-ipfs-mobile -p mobile-web-harness --all-targets -- -D warnings`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `git diff --check`
+
+## 2026-05-05 Keep: Shorter Direct Read Cap For Single Untrusted Bitswap Provider
+
+Hypothesis:
+The same-window `daicowtf` Rust/Kubo run showed a remaining first-request tail:
+when delegated routing returned exactly one untrusted public Bitswap provider for
+the root CID, that provider opened a stream but never returned the block, costing
+one full `6000ms` Bitswap stream read timeout before temporary peer suppression
+made later attempts fail quickly. This is a mobile-visible cold-load tail and is
+low-value to wait out when there is only one untrusted candidate.
+
+Implementation:
+
+- Keep the existing `6000ms` stream read timeout for trusted/session peers and
+  multi-peer provider races.
+- Use a `3000ms` stream read timeout only when the outgoing Bitswap request has
+  exactly one candidate and that candidate is not trusted from recent successful
+  session history.
+- Add `stream_read_timeout_ms` to Bitswap attempt/request-timeout traces and the
+  harness slow-event details so the chosen cap is visible in live traces.
+- Extend the deterministic provider-refresh test so a silent single untrusted
+  peer must refresh to a new provider before the old default stream timeout.
+
+Experiment commands:
+
+```sh
+cargo test -p freedom-ipfs-retrieval \
+  provider_refresh_after_bitswap_timeout_uses_new_peer -- --nocapture
+
+timeout 240s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/daicowtf-single-untrusted-read3-r3-trace.jsonl \
+  --output /tmp/daicowtf-single-untrusted-read3-r3.json
+
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --timeout-secs 90 \
+  --run-timeout-secs 90 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-single-untrusted-read3-trace.jsonl \
+  --output /tmp/vitalik-single-untrusted-read3.json
+
+timeout 240s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-single-untrusted-read3-trace.jsonl \
+  --output /tmp/ipfs-tech-single-untrusted-read3.json
+```
+
+Results:
+
+- Deterministic local test passed in `3.26s`, proving a silent single untrusted
+  provider can be marked bad and refreshed to a new provider before the old
+  default `6000ms` stream-read cap.
+- `daicowtf-page-assets` still failed `0/3` with root p50/p95/max
+  `3033/3892/3892ms`, RSS max `48640KiB`, and FD max `22`. This live window did
+  not exercise the new direct-read cap: the root block arrived from the single
+  public provider in `61ms`, and failures remained the child CID's empty
+  delegated/DHT provider path.
+- `vitalik-root-html-range` passed `1/1` with root TTFB `659ms`, RSS
+  `38144KiB`, FD count `18`, no DHT provider lookups, and delegated lookup max
+  `48ms`.
+- `ipfs-tech-page-assets` passed `1/1`; root TTFB was `533ms`, asset
+  p50/p95/max was `122/226/399ms`, RSS was `49604KiB`, and FD count was `30`.
+
+Decision: keep. This is narrower than reducing the global Bitswap stream read
+timeout: it applies only to one untrusted candidate, the case that cannot benefit
+from peer diversity and produced the observed `6000ms` stale-provider tail.
+Trusted/session peers and multi-provider races keep the existing cap. The known
+risk is a rare single public provider that would return a block between `3000ms`
+and `6000ms`; the mobile tradeoff favors a faster retry/failure over waiting
+for a lone untrusted public peer that has already stalled.
+
+Deterministic validation:
+
+- `cargo fmt --all --check`
+- `cargo test -p freedom-ipfs-retrieval`
+- `cargo test -p mobile-web-harness`
+- `cargo check --workspace --all-targets`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `git diff --check`

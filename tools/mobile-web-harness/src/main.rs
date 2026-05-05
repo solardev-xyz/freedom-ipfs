@@ -5902,6 +5902,7 @@ fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
         "peer",
         "prefer_want_have",
         "want_have_timeout_ms",
+        "stream_read_timeout_ms",
         "candidate_peer_count",
         "new_dial_peer_count",
         "new_dial_addr_count",

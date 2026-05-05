@@ -49,6 +49,7 @@ const BITSWAP_CONNECTION_READY_TIMEOUT: Duration = Duration::from_secs(5);
 // directly on the gateway TTFB path before we request the block.
 const BITSWAP_WANT_HAVE_TIMEOUT: Duration = Duration::from_millis(750);
 const BITSWAP_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(6);
+const BITSWAP_SINGLE_UNTRUSTED_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(3);
 const BITSWAP_INCOMING_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(6);
 const BITSWAP_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const BITSWAP_SUCCESSFUL_PEER_TTL: Duration = Duration::from_secs(10 * 60);
@@ -1319,6 +1320,7 @@ impl SharedBitswapClient {
         let peer_count = peers.len();
         let trusted_peer_count = peers.iter().filter(|peer| peer.skip_want_have).count();
         let request_timeout = bitswap_request_timeout(peer_count, trusted_peer_count);
+        let stream_read_timeout = bitswap_stream_read_timeout(peer_count, trusted_peer_count);
         let (want_block_target_count, want_have_target_count) =
             bitswap_request_target_mode_counts(&peers);
         let target_summary =
@@ -1349,6 +1351,7 @@ impl SharedBitswapClient {
                     want_block_target_count,
                     want_have_target_count,
                     timeout_ms = request_timeout.as_millis(),
+                    stream_read_timeout_ms = stream_read_timeout.as_millis(),
                     elapsed_ms = wait_started.elapsed().as_millis(),
                     targets = %target_summary.as_deref().unwrap_or("")
                 );
@@ -1383,6 +1386,20 @@ fn bitswap_request_timeout(peer_count: usize, trusted_peer_count: usize) -> Dura
     } else {
         BITSWAP_REQUEST_TIMEOUT
     }
+}
+
+fn bitswap_stream_read_timeout(peer_count: usize, trusted_peer_count: usize) -> Duration {
+    if peer_count == 1 && trusted_peer_count == 0 {
+        BITSWAP_SINGLE_UNTRUSTED_STREAM_READ_TIMEOUT
+    } else {
+        BITSWAP_STREAM_READ_TIMEOUT
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BitswapRequestTimeouts {
+    want_have: Duration,
+    stream_read: Duration,
 }
 
 async fn read_incoming_bitswap_stream(
@@ -2830,6 +2847,14 @@ async fn fetch_bitswap_over_outgoing_streams(
 ) -> Result<BitswapFetchResult> {
     let mut attempts = FuturesUnordered::new();
     let has_multiple_peers = peers.len() > 1;
+    let stream_read_timeout = bitswap_stream_read_timeout(
+        peers.len(),
+        peers.iter().filter(|peer| peer.skip_want_have).count(),
+    );
+    let request_timeouts = BitswapRequestTimeouts {
+        want_have: BITSWAP_WANT_HAVE_TIMEOUT,
+        stream_read: stream_read_timeout,
+    };
     let target_summary = format_bitswap_targets(&peers);
     let mut direct_untrusted_want_block_count = 0usize;
     for peer in peers {
@@ -2843,7 +2868,7 @@ async fn fetch_bitswap_over_outgoing_streams(
             peer,
             cid,
             prefer_want_have,
-            BITSWAP_WANT_HAVE_TIMEOUT,
+            request_timeouts,
             dial_errors.clone(),
             peer_transports.clone(),
         ));
@@ -2908,7 +2933,7 @@ async fn request_bitswap_block_after_connection(
     peer: BitswapPeerTarget,
     cid: Cid,
     prefer_want_have: bool,
-    want_have_timeout: Duration,
+    request_timeouts: BitswapRequestTimeouts,
     dial_errors: DialErrorLog,
     peer_transports: PeerTransportLog,
 ) -> std::result::Result<BitswapFetchResult, BitswapPeerFailure> {
@@ -2925,7 +2950,8 @@ async fn request_bitswap_block_after_connection(
         cid = %cid,
         peer = %peer_id,
         prefer_want_have,
-        want_have_timeout_ms = want_have_timeout.as_millis()
+        want_have_timeout_ms = request_timeouts.want_have.as_millis(),
+        stream_read_timeout_ms = request_timeouts.stream_read.as_millis()
     );
 
     if let Some(connection_ready) = connection_ready {
@@ -2939,7 +2965,8 @@ async fn request_bitswap_block_after_connection(
                     ok = false,
                     failure_kind = "connection_waiter_dropped",
                     prefer_want_have,
-                    want_have_timeout_ms = want_have_timeout.as_millis(),
+                    want_have_timeout_ms = request_timeouts.want_have.as_millis(),
+                    stream_read_timeout_ms = request_timeouts.stream_read.as_millis(),
                     elapsed_ms = attempt_started.elapsed().as_millis()
                 );
                 return Err(BitswapPeerFailure {
@@ -2960,7 +2987,8 @@ async fn request_bitswap_block_after_connection(
                     ok = false,
                     failure_kind = "connection_timeout",
                     prefer_want_have,
-                    want_have_timeout_ms = want_have_timeout.as_millis(),
+                    want_have_timeout_ms = request_timeouts.want_have.as_millis(),
+                    stream_read_timeout_ms = request_timeouts.stream_read.as_millis(),
                     elapsed_ms = attempt_started.elapsed().as_millis()
                 );
                 return Err(BitswapPeerFailure {
@@ -2983,7 +3011,7 @@ async fn request_bitswap_block_after_connection(
         addrs,
         cid,
         prefer_want_have,
-        want_have_timeout,
+        request_timeouts,
         peer_transports,
     )
     .await;
@@ -2995,7 +3023,8 @@ async fn request_bitswap_block_after_connection(
                 peer = %peer_id,
                 ok = true,
                 prefer_want_have,
-                want_have_timeout_ms = want_have_timeout.as_millis(),
+                want_have_timeout_ms = request_timeouts.want_have.as_millis(),
+                stream_read_timeout_ms = request_timeouts.stream_read.as_millis(),
                 source_transport = result.source_transport.unwrap_or("unknown"),
                 bytes = result.requested_block.len(),
                 extra_blocks = result.extra_blocks.len(),
@@ -3010,7 +3039,8 @@ async fn request_bitswap_block_after_connection(
                 ok = false,
                 failure_kind = bitswap_peer_failure_kind_label(err.kind),
                 prefer_want_have,
-                want_have_timeout_ms = want_have_timeout.as_millis(),
+                want_have_timeout_ms = request_timeouts.want_have.as_millis(),
+                stream_read_timeout_ms = request_timeouts.stream_read.as_millis(),
                 error = %err.detail,
                 elapsed_ms = attempt_started.elapsed().as_millis()
             );
@@ -3033,7 +3063,7 @@ async fn request_bitswap_block(
     addrs: Vec<Multiaddr>,
     cid: Cid,
     prefer_want_have: bool,
-    want_have_timeout: Duration,
+    request_timeouts: BitswapRequestTimeouts,
     peer_transports: PeerTransportLog,
 ) -> std::result::Result<BitswapFetchResult, BitswapPeerFailure> {
     let mut failures = Vec::new();
@@ -3067,7 +3097,7 @@ async fn request_bitswap_block(
                 &mut stream,
                 &cid,
                 &protocol_name,
-                want_have_timeout,
+                request_timeouts,
             )
             .await
             {
@@ -3092,7 +3122,14 @@ async fn request_bitswap_block(
             }
         }
 
-        match request_bitswap_block_on_stream(&mut stream, &cid, &protocol_name).await {
+        match request_bitswap_block_on_stream(
+            &mut stream,
+            &cid,
+            &protocol_name,
+            request_timeouts.stream_read,
+        )
+        .await
+        {
             Ok(mut result) => {
                 result.source_peer = Some(peer_id);
                 result.source_transport = current_peer_transport(&peer_transports, peer_id).await;
@@ -3134,7 +3171,7 @@ async fn request_bitswap_block_after_want_have<T>(
     stream: &mut T,
     cid: &Cid,
     protocol_name: &str,
-    want_have_timeout: Duration,
+    request_timeouts: BitswapRequestTimeouts,
 ) -> std::result::Result<BitswapFetchResult, WantHaveFailure>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -3146,7 +3183,7 @@ where
             )),
         ));
     }
-    let response = match timeout(want_have_timeout, read_bitswap_response(stream)).await {
+    let response = match timeout(request_timeouts.want_have, read_bitswap_response(stream)).await {
         Ok(Ok(response)) => response,
         Ok(Err(err)) => {
             return Err(WantHaveFailure::TryOtherProtocols(
@@ -3156,9 +3193,14 @@ where
             ))
         }
         Err(_) => {
-            return request_bitswap_block_on_stream(stream, cid, protocol_name)
-                .await
-                .map_err(WantHaveFailure::TryOtherProtocols);
+            return request_bitswap_block_on_stream(
+                stream,
+                cid,
+                protocol_name,
+                request_timeouts.stream_read,
+            )
+            .await
+            .map_err(WantHaveFailure::TryOtherProtocols);
         }
     };
     let has_dont_have = response.has_presence(cid, BLOCK_PRESENCE_DONT_HAVE);
@@ -3173,11 +3215,16 @@ where
         ));
     }
     if !has_have {
-        return request_bitswap_block_on_stream(stream, cid, protocol_name)
-            .await
-            .map_err(WantHaveFailure::TryOtherProtocols);
+        return request_bitswap_block_on_stream(
+            stream,
+            cid,
+            protocol_name,
+            request_timeouts.stream_read,
+        )
+        .await
+        .map_err(WantHaveFailure::TryOtherProtocols);
     }
-    request_bitswap_block_on_stream(stream, cid, protocol_name)
+    request_bitswap_block_on_stream(stream, cid, protocol_name, request_timeouts.stream_read)
         .await
         .map_err(WantHaveFailure::TryOtherProtocols)
 }
@@ -3186,11 +3233,14 @@ async fn request_bitswap_block_on_stream<T>(
     stream: &mut T,
     cid: &Cid,
     protocol_name: &str,
+    stream_read_timeout: Duration,
 ) -> std::result::Result<BitswapFetchResult, BitswapProtocolFailure>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut results = request_bitswap_blocks_on_stream(stream, &[*cid], protocol_name).await?;
+    let mut results =
+        request_bitswap_blocks_on_stream(stream, &[*cid], protocol_name, stream_read_timeout)
+            .await?;
     let Some(requested_block) = results.requested_blocks.remove(cid) else {
         return Err(BitswapProtocolFailure::other(format!(
             "{protocol_name}: no valid block returned"
@@ -3209,6 +3259,7 @@ async fn request_bitswap_blocks_on_stream<T>(
     stream: &mut T,
     cids: &[Cid],
     protocol_name: &str,
+    stream_read_timeout: Duration,
 ) -> std::result::Result<BitswapFetchResults, BitswapProtocolFailure>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -3218,7 +3269,7 @@ where
             "{protocol_name}: write failed: {err}"
         )));
     }
-    let blocks = match timeout(BITSWAP_STREAM_READ_TIMEOUT, read_bitswap_blocks(stream)).await {
+    let blocks = match timeout(stream_read_timeout, read_bitswap_blocks(stream)).await {
         Ok(Ok(blocks)) => blocks,
         Ok(Err(err)) => {
             return Err(BitswapProtocolFailure::other(format!(
@@ -4187,10 +4238,14 @@ mod bitswap_tests {
         };
         let mut stream = ScriptedBitswapStream::new(length_prefixed_bytes(&response));
 
-        let result =
-            request_bitswap_blocks_on_stream(&mut stream, &[first, second], "/ipfs/bitswap/1.2.0")
-                .await
-                .unwrap();
+        let result = request_bitswap_blocks_on_stream(
+            &mut stream,
+            &[first, second],
+            "/ipfs/bitswap/1.2.0",
+            BITSWAP_STREAM_READ_TIMEOUT,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.requested_blocks.get(&first).unwrap(), first_data);
         assert_eq!(result.requested_blocks.get(&second).unwrap(), second_data);
@@ -4253,10 +4308,14 @@ mod bitswap_tests {
         .await
         .unwrap()
         .unwrap();
-        let result =
-            request_bitswap_blocks_on_stream(&mut stream, &[first, second], "/ipfs/bitswap/1.2.0")
-                .await
-                .unwrap();
+        let result = request_bitswap_blocks_on_stream(
+            &mut stream,
+            &[first, second],
+            "/ipfs/bitswap/1.2.0",
+            BITSWAP_STREAM_READ_TIMEOUT,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.requested_blocks.get(&first).unwrap(), first_data);
         assert_eq!(result.requested_blocks.get(&second).unwrap(), second_data);
@@ -4941,6 +5000,18 @@ mod bitswap_tests {
         );
         assert_eq!(bitswap_request_timeout(10, 0), BITSWAP_REQUEST_TIMEOUT);
         assert_eq!(bitswap_request_timeout(1, 1), BITSWAP_REQUEST_TIMEOUT);
+        assert_eq!(
+            bitswap_stream_read_timeout(1, 0),
+            BITSWAP_SINGLE_UNTRUSTED_STREAM_READ_TIMEOUT
+        );
+        assert_eq!(
+            bitswap_stream_read_timeout(2, 0),
+            BITSWAP_STREAM_READ_TIMEOUT
+        );
+        assert_eq!(
+            bitswap_stream_read_timeout(1, 1),
+            BITSWAP_STREAM_READ_TIMEOUT
+        );
     }
 
     #[test]
@@ -5285,6 +5356,7 @@ mod bitswap_tests {
             store.clone(),
         );
 
+        let started = Instant::now();
         let (block, source) = tokio::time::timeout(
             Duration::from_secs(20),
             retriever.fetch_block_with_source(&cid),
@@ -5295,6 +5367,10 @@ mod bitswap_tests {
 
         assert_eq!(source, RetrievalSource::Bitswap);
         assert_eq!(block.data(), data);
+        assert!(
+            started.elapsed() < BITSWAP_STREAM_READ_TIMEOUT,
+            "single untrusted stale provider should refresh before the default stream read timeout"
+        );
         assert!(store.is_bad_provider(&silent_peer_id.to_string()).unwrap());
         assert_eq!(store.get(&cid).unwrap().unwrap().data(), data);
 
