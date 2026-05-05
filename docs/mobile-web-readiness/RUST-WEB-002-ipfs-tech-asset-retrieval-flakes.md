@@ -19516,3 +19516,72 @@ Keep. This is diagnostics-only, but it matters for mobile resource accounting:
 SQLite WAL mode can put most recently written cache bytes in the `-wal` file,
 so measuring only the main DB substantially understated storage after offline
 warmup.
+
+## 2026-05-05 Guardrail: Conditional Revalidation After Self-Hedges
+
+Question:
+After the HTTP-provider and delegated-router self-hedges, does browser-style
+conditional revalidation still stay cheap and correct for an `ipfs.tech` page
+load?
+
+Command:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --conditional-revalidate \
+  --asset-concurrency 6 \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-conditional-post-self-hedges-trace.jsonl \
+  --output /tmp/ipfs-tech-conditional-post-self-hedges.json
+```
+
+Result:
+
+- Passed: `1/1`.
+- Run total: `2754ms`.
+- Root TTFB/total: `918/919ms`.
+- Asset TTFB p50/p90/p95/max: `281/538/1049/1122ms`.
+- Asset total p50/p90/p95/max: `281/538/1049/1123ms`.
+- Root revalidation: `1/1`, failed `0`, status `304`, TTFB
+  p50/p90/p95/max `3/3/3/3ms`.
+- Asset revalidation: `26/26`, failed `0`, all `304`, TTFB
+  p50/p90/p95/max `2/3/3/3ms`.
+- Gateway RSS/FD: `52636KiB` / `32`.
+
+Trace summary:
+
+- Trace path:
+  `/tmp/ipfs-tech-conditional-post-self-hedges-trace.jsonl`.
+- JSON output:
+  `/tmp/ipfs-tech-conditional-post-self-hedges.json`.
+- Trace events/phases: `1274` events, `31` phases.
+- Gateway statuses: `200=27`, `304=27`, `206=6`.
+- Block sources during the cold fill: `http_provider=27`, `bitswap=13`.
+- Delegated provider lookups: `31`, successes `31`, providers `447`,
+  HTTP providers `53`.
+- Delegated self-hedges: `1`, max self-hedge timeout `750ms`.
+- HTTP-provider races: `22`; HTTP-provider self-hedges: `2`, max result
+  elapsed `470ms`.
+- HTTP-provider fetch p50/p90/p95/max: `162/327/355/469ms`.
+
+Notes:
+
+- The single delegated self-hedge fired for
+  `/ipns/ipfs.tech/_nuxt/Grid.CfsFuo-l.css` and returned providers
+  successfully in `757ms`.
+- The slowest cold asset was `/ipns/ipfs.tech/_nuxt/B1ETkkRH.js` at
+  `1122ms` TTFB; trace events point at a late Bitswap peer wait rather than
+  conditional revalidation.
+- The subsequent conditional requests were served as fast local `304`
+  responses and did not hit the network-heavy provider paths again.
+
+Decision:
+Keep as a browser-cache semantics guardrail. The self-hedge changes do not
+break conditional request behavior, and the harness now gives a compact signal
+that a mobile WebKit integration can revalidate cached page resources without
+paying another cold retrieval cost.
