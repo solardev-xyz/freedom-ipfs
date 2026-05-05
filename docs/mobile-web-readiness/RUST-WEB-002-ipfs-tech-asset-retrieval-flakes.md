@@ -4316,3 +4316,88 @@ the new fast path, but the deterministic test proves the race exists and the
 live run shows the added local lookup has negligible overhead. The new harness
 counter will show whether future page sessions convert extra-block arrivals
 into recheck cache hits.
+
+Rejected experiment: late session-shortcut cache fill:
+
+Hypothesis:
+
+- The `/tmp/ipfs-tech-cache-recheck-r2-trace.jsonl` run showed a recent-peer
+  shortcut delivering the root/index child after the `200ms` post-lookup wait
+  had already timed out, and the following provider fanout then hit the `4s`
+  mixed trusted request timeout.
+- Keeping only those timed-out shortcut futures alive in the background, bounded
+  by the existing `2s` shortcut timeout, might cache verified late successes for
+  nearby requests without increasing foreground wait time.
+
+Prototype:
+
+- Move the timed-out post-lookup shortcut future into a background task.
+- Let `fetch_from_recent_bitswap_peers` continue to verify and store successful
+  late results.
+- Trace `bitswap_session_shortcut_late_cache`.
+- Add a deterministic delayed-peer test proving a foreground miss can still
+  populate the store from a late shortcut result.
+- Add harness counters for late-cache events/hits/misses.
+
+Validation that passed before rejection:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib late_session_shortcut_result_is_cached_after_post_lookup_timeout
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+cargo test -p mobile-web-harness
+cargo test -p freedom-ipfs-retrieval --lib
+cargo build -p freedom-ipfs-gateway
+git diff --check
+```
+
+Same-window baseline from detached `7c08cc1`:
+
+```sh
+git worktree add /tmp/freedom-ipfs-before-late-cache 7c08cc1
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 2 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-before-late-cache-r2-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-before-late-cache-r2.json
+```
+
+Baseline result: Rust and Kubo both passed `2/2`. Rust root p50/p95 was
+`922/1496ms` versus Kubo `1838/2403ms`; Rust asset p50/p95 was `490/5098ms`
+versus Kubo `63/116ms`. Trace totals included `bitswap_fetches=48`,
+`request_timeouts_with_trusted=8`, `session_shortcut_hits=30`,
+`bitswap extra blocks: events=70 total=34 max=4`, `peer_attempt_starts=524`,
+and inbound `blocks=116 bytes=2091038 max_oldest_pending_ms=1664`.
+
+Prototype run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 2 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-late-cache-r2-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-late-cache-r2.json
+```
+
+Prototype result: reject. Rust passed only `1/2` while Kubo passed `2/2`.
+Rust root p50/p95 was `1448/1695ms` versus Kubo `3870/3980ms`, but Rust asset
+p50/p95 regressed to `232/8523ms` versus Kubo `295/737ms`. The trace showed
+`bitswap_session_shortcut_late_cache=34` with `29` hits, but mixed trusted
+request timeouts worsened to `13`, and one page run failed.
+
+Decision: reject and revert the prototype. The late-cache idea can recover
+verified blocks, but keeping those timed-out session futures alive increased
+contention enough to worsen the request-timeout tail. A future version would
+need tighter gating, such as one late cache fill per page/root or only when no
+provider fanout is already in flight for the CID.
