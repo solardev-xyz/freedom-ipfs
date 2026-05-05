@@ -6305,6 +6305,7 @@ mod tests {
                 "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid2\",\"provider_count\":1,\"bitswap_provider_count\":1,\"min_bitswap_provider_count\":2,\"fallback\":\"light_dht\"}\n",
                 "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid2\",\"provider_count\":3,\"dht_provider_count\":2,\"bitswap_provider_count\":2,\"fallback\":\"light_dht\"}\n",
                 "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid2\",\"bitswap_provider_count\":1,\"fallback\":\"light_dht\",\"ok\":false,\"timeout_ms\":750}\n",
+                "{\"phase\":\"dht_provider_lookup\",\"elapsed_ms\":7,\"cid\":\"cid2\",\"ok\":false,\"error\":\"low diversity DHT fallback timed out\",\"fallback\":\"light_dht\",\"cancelled\":true,\"max_providers\":4,\"timeout_ms\":750,\"query_timeout_ms\":10000}\n",
                 "{\"phase\":\"dht_provider_lookup\",\"elapsed_ms\":6,\"cid\":\"cid2\",\"ok\":false,\"error\":\"dht: timed out\",\"max_providers\":4,\"timeout_ms\":750}\n",
                 "{\"phase\":\"dht_provider_lookup\",\"elapsed_ms\":20,\"cid\":\"cid3\",\"ok\":true,\"provider_count\":2,\"max_providers\":4,\"timeout_ms\":750}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":12,\"cid\":\"cid6\",\"ok\":false,\"trusted_peer_count\":1}\n",
@@ -6342,8 +6343,8 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 39);
-        assert_eq!(summary.event_count, 38);
+        assert_eq!(summary.line_count, 40);
+        assert_eq!(summary.event_count, 39);
         assert_eq!(summary.slow_events.len(), 16);
         assert_eq!(
             summary.slow_events[0].phase,
@@ -6417,9 +6418,9 @@ mod tests {
             "light_dht"
         );
         assert_eq!(summary.provider_diversity_low.fallbacks[0].count, 3);
-        assert_eq!(summary.dht_provider_lookup.events, 2);
+        assert_eq!(summary.dht_provider_lookup.events, 3);
         assert_eq!(summary.dht_provider_lookup.successes, 1);
-        assert_eq!(summary.dht_provider_lookup.failures, 1);
+        assert_eq!(summary.dht_provider_lookup.failures, 2);
         assert_eq!(summary.dht_provider_lookup.providers, 2);
         assert_eq!(summary.dht_provider_lookup.max_providers, 4);
         assert_eq!(summary.dht_provider_lookup.max_timeout_ms, 750);
@@ -6487,7 +6488,7 @@ mod tests {
             .iter()
             .map(|error| error.value.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(trace_errors.len(), 9);
+        assert_eq!(trace_errors.len(), 10);
         assert!(trace_errors.iter().any(|error| {
             error.starts_with("bitswap_connection_error: Failed to negotiate transport protocol")
         }));
@@ -6498,6 +6499,7 @@ mod tests {
         assert!(trace_errors.contains(&"provider_lookup: dht: timeout"));
         assert!(trace_errors.contains(&"provider_diversity_low: ok=false"));
         assert!(trace_errors.contains(&"dht_provider_lookup: dht: timed out"));
+        assert!(trace_errors.contains(&"dht_provider_lookup: low diversity DHT fallback timed out"));
         assert_eq!(summary.bitswap_addr_mix[0].value, "tcp");
         assert_eq!(summary.bitswap_addr_mix[0].count, 4);
         assert_eq!(summary.bitswap_addr_mix[1].value, "ip4");

@@ -8661,3 +8661,64 @@ Live result:
 Decision: keep. This is diagnostics-only and does not change provider
 selection, DHT timeout policy, retrieval behavior, cache semantics, or public
 gateway policy.
+
+## 2026-05-05 Keep: Trace Cancelled Low-Diversity DHT Fallbacks
+
+Motivation:
+The new `dht_provider_lookup` summary captures full light-DHT provider queries,
+but low-diversity fallback queries can be cancelled by the short `750ms`
+fallback cap before `LightDhtClient::providers` returns. That means the
+low-diversity summary could report a fallback timeout while the DHT summary did
+not count the attempted lookup. Sparse-provider experiments need those counts
+to line up.
+
+Implementation:
+
+- When the low-diversity light-DHT fallback hits its outer timeout, emit a
+  `dht_provider_lookup` event with `ok=false`, `cancelled=true`,
+  `fallback=light_dht`, the fallback timeout cap, the configured full DHT query
+  timeout, provider cap, elapsed time, and a sanitized error string.
+- Keep successful and normally failed full DHT lookups unchanged.
+- Extend the harness trace-summary fixture so cancelled fallback lookup events
+  count as DHT lookup failures and appear in trace errors.
+- Add a deterministic routing test that proves low delegated diversity returns
+  the delegated provider after the short DHT fallback cap instead of waiting for
+  the full DHT query timeout.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+cargo test -p freedom-ipfs-routing observed_light_dht_records_provider_lookup_stats
+cargo test -p freedom-ipfs-routing auto_routing_bounds_low_diversity_dht_fallback_timeout
+FREEDOM_IPFS_LIVE_DHT_CID=bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u \
+  timeout 90s cargo test -p freedom-ipfs-routing --lib \
+  live_light_dht_finds_public_providers -- --ignored --nocapture
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/daicowtf-dht-cancelled-lookup-trace.jsonl \
+  --output /tmp/daicowtf-dht-cancelled-lookup.json
+```
+
+Validation results:
+
+- Focused deterministic tests passed.
+- The standalone public DHT probe for failing child CID
+  `bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u` found `0`
+  providers after about `12.45s`; the ignored smoke test failed its non-empty
+  assertion, which is useful evidence for this CID rather than a kept gate.
+- The live `daicowtf-page-assets` smoke failed as expected with root `504` in
+  `10165ms`, RSS `43008KiB`, and FD count `16`.
+- That live window did not exercise the short low-diversity cancellation path:
+  delegated routing returned `2` providers across two lookups, then the failing
+  child CID fell through to a full DHT lookup that timed out after `10010ms`.
+  The DHT summary was therefore `events=1 successes=0 failures=1 providers=0`.
+
+Decision: keep. This is diagnostics-only and makes future low-diversity
+fallback traces internally consistent without changing provider selection,
+fallback timing, retrieval behavior, cache semantics, or public gateway policy.

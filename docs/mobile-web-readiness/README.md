@@ -177,7 +177,9 @@ Light-DHT provider lookups also emit and summarize `dht_provider_lookup` events
 with success/failure counts, providers found, configured provider cap, timeout
 cap, and maximum elapsed time. Use this with the low-diversity summary to tell
 whether sparse-provider runs actually found more peers or only burned timeout
-budget.
+budget. Low-diversity fallback attempts that hit the short outer fallback cap
+also emit a cancelled `dht_provider_lookup` failure, so the DHT summary counts
+all attempted fallback lookups, not only full `LightDhtClient` queries.
 Rust-vs-Kubo trace output also prints Bitswap source peer, source transport,
 delivery, and per-peer fetch summaries so provider-quality experiments can see
 which peers actually supplied blocks.

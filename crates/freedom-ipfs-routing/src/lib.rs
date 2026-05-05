@@ -446,6 +446,7 @@ impl AutoRoutingClient {
                 if let Some(stats) = stats {
                     stats.record_dht_lookup();
                 }
+                let dht_started = Instant::now();
                 match tokio::time::timeout(
                     LOW_DIVERSITY_DHT_FALLBACK_TIMEOUT,
                     self.dht.providers(cid),
@@ -487,6 +488,18 @@ impl AutoRoutingClient {
                         if let Some(stats) = stats {
                             stats.record_dht_error();
                         }
+                        tracing::info!(
+                            phase = "dht_provider_lookup",
+                            cid = %cid,
+                            ok = false,
+                            error = "low diversity DHT fallback timed out",
+                            fallback = "light_dht",
+                            cancelled = true,
+                            max_providers = self.dht.max_providers,
+                            timeout_ms = LOW_DIVERSITY_DHT_FALLBACK_TIMEOUT.as_millis(),
+                            query_timeout_ms = self.dht.query_timeout.as_millis(),
+                            elapsed_ms = dht_started.elapsed().as_millis()
+                        );
                         tracing::info!(
                             phase = "provider_diversity_low",
                             cid = %cid,
@@ -1377,6 +1390,52 @@ mod tests {
         );
         delegated_task.abort();
         dht_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_routing_bounds_low_diversity_dht_fallback_timeout() {
+        let cid = "bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u"
+            .parse::<Cid>()
+            .unwrap();
+        let (endpoint, delegated_task) = spawn_delegated_response(
+            r#"{"Providers":[{"ID":"peer-a","Addrs":["/ip4/127.0.0.1/tcp/4101"]}]}"#,
+        )
+        .await;
+        let dht = LightDhtClient::new(vec![
+            "/ip4/203.0.113.1/tcp/4001/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
+                .to_string(),
+        ])
+        .with_query_timeout(Duration::from_secs(5))
+        .with_max_providers(1);
+        let stats = RoutingStatsHandle::default();
+        let client = ProviderRoutingClient::from(AutoRoutingClient::new(
+            DelegatedRoutingClient::new(endpoint),
+            dht,
+        ))
+        .with_stats(stats.clone());
+
+        let started = std::time::Instant::now();
+        let providers = client.providers(&cid).await.unwrap();
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id.as_deref(), Some("peer-a"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "low-diversity DHT fallback should use the short fallback cap"
+        );
+        assert_eq!(
+            stats.snapshot(),
+            RoutingStats {
+                delegated_provider_lookups: 1,
+                delegated_provider_results: 1,
+                delegated_provider_errors: 0,
+                dht_provider_lookups: 1,
+                dht_provider_results: 0,
+                dht_provider_errors: 1,
+            }
+        );
+        delegated_task.abort();
+        let _ = delegated_task.await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
