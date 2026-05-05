@@ -7693,3 +7693,108 @@ baseline from the previous same-day run. This argues against replacing
 delegated routing for `vitalik-root-html-range`. The more promising direction
 is a bounded slow-delegated fallback/race that preserves fast delegated wins
 instead of forcing every lookup through light DHT.
+
+## 2026-05-05 Keep: Harness Delegated-Router Sweep Knob
+
+Motivation:
+The provider-quality lab needs to vary delegated router endpoints in spawned
+Rust gateway runs without manually starting gateways. The gateway already
+supports `--delegated-router`, including comma-separated endpoint lists, but the
+mobile web harness did not forward that option.
+
+Implementation:
+
+- Add `mobile-web-harness --delegated-router`.
+- Forward the value to spawned Rust gateways as `freedom-ipfs-gateway
+  --delegated-router`.
+- Document that the value can be a single endpoint or comma-separated endpoint
+  list.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness args_accept_delegated_router_endpoint_list
+cargo test -p mobile-web-harness
+cargo build -p freedom-ipfs-gateway -p mobile-web-harness
+git diff --check
+```
+
+Endpoint experiment, `cid.contact` only:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --delegated-router https://cid.contact/routing/v1 \
+  --asset-concurrency 6 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/vitalik-cid-contact-routing-trace.jsonl \
+  --comparison-output /tmp/vitalik-cid-contact-routing.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `12132/23056ms`, Kubo `1806/3075ms`.
+- Max RSS/FD: Rust `50176KiB`/`21`, Kubo `127208KiB`/`95`.
+- Delegated provider lookup summary: `events=7`, `successes=0`,
+  `failures=7`, `providers=0`, `max_elapsed_ms=213`.
+- Trace errors were `404 Not Found` responses from `cid.contact` for both the
+  root CID and range block CID, causing auto routing to fall through to DHT.
+
+Endpoint experiment, default plus `cid.contact` raced:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --delegated-router https://delegated-ipfs.dev/routing/v1,https://cid.contact/routing/v1 \
+  --asset-concurrency 6 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/vitalik-raced-delegated-routing-trace.jsonl \
+  --comparison-output /tmp/vitalik-raced-delegated-routing.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1861/5571ms`, Kubo `2846/3262ms`.
+- Max RSS/FD: Rust `38528KiB`/`22`, Kubo `172964KiB`/`116`.
+- Delegated provider lookup summary: `events=12`, `successes=6`,
+  `failures=6`, `providers=132`, `max_elapsed_ms=3937`.
+- The extra endpoint contributed only fast `404` failures in this sample.
+
+Same-window default rerun:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/vitalik-default-delegated-rerun-trace.jsonl \
+  --comparison-output /tmp/vitalik-default-delegated-rerun.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1816/1838ms`, Kubo `2963/3011ms`.
+- Max RSS/FD: Rust `38400KiB`/`21`, Kubo `145192KiB`/`106`.
+- Delegated provider lookup summary: `events=6`, `successes=6`,
+  `failures=0`, `providers=129`, `max_elapsed_ms=74`.
+
+Decision: keep the harness knob; reject adding `cid.contact` to the default
+endpoint set from this evidence. For this case and network window, the current
+default delegated router was both faster and cleaner than `cid.contact` alone
+or a raced default-plus-`cid.contact` configuration.

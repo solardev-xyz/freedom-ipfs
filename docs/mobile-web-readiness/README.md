@@ -48,9 +48,11 @@ The repeat report includes measured pass/fail counts, pass rate, root and asset
 TTFB/total-time p50/p90/p95/max summaries, failed asset kinds, and failed URLs
 grouped by status/error. Use `--warmup-runs` to separate warm-cache behavior, or
 `--fresh-gateway-per-run` when measuring repeated cold gateways. Spawning uses
-the same routing, DHT, request-concurrency, and asset-concurrency knobs as the
-single-run harness, with an 8-request gateway default and a 6-asset crawl
-default to model bounded browser pressure.
+the same routing, delegated-router, DHT, request-concurrency, and
+asset-concurrency knobs as the single-run harness, with an 8-request gateway
+default and a 6-asset crawl default to model bounded browser pressure.
+Use `--delegated-router` to pass a single endpoint or comma-separated endpoint
+list through to spawned Rust gateways during provider-quality experiments.
 
 For noisy live experiments, `--run-timeout-secs N` adds a wall-clock cap around
 one full corpus run. If the cap fires, the harness records matching cases as

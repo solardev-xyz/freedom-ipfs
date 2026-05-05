@@ -102,6 +102,9 @@ struct Args {
     /// Gateway routing mode when spawning a gateway.
     #[arg(long, default_value = "auto")]
     routing_mode: String,
+    /// Delegated routing endpoint list for spawned Rust gateways.
+    #[arg(long)]
+    delegated_router: Option<String>,
     /// DHT query timeout when spawning a gateway.
     #[arg(long, default_value_t = 10)]
     dht_query_timeout_secs: u64,
@@ -2542,6 +2545,9 @@ impl SpawnedGateway {
         }
         if let Some(trace_filter) = &args.trace_filter {
             command.arg("--trace-filter").arg(trace_filter);
+        }
+        if let Some(delegated_router) = &args.delegated_router {
+            command.arg("--delegated-router").arg(delegated_router);
         }
         if let Some(gateway_db) = &args.gateway_db {
             command.arg("--db").arg(gateway_db);
@@ -5559,6 +5565,21 @@ impl ParsedTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn args_accept_delegated_router_endpoint_list() {
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--delegated-router",
+            "https://delegated-ipfs.dev/routing/v1,https://cid.contact/routing/v1",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.delegated_router.as_deref(),
+            Some("https://delegated-ipfs.dev/routing/v1,https://cid.contact/routing/v1")
+        );
+    }
 
     #[test]
     fn parses_linux_proc_stat_parent_pid() {
