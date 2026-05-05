@@ -16551,3 +16551,80 @@ fanout, caching, or verification behavior. It closes the measurement gap for
 the next single-HTTP-provider grace retune: future runs can now tell whether a
 post-lookup wait actually produced a verified session Bitswap block, timed out,
 or merely added delay before the HTTP-provider path.
+
+## 2026-05-05 Reject: Retune Single HTTP Post-Lookup Grace To 200ms Or 225ms
+
+Question:
+With post-lookup wait outcomes visible, test whether the selective single
+HTTP-provider session grace can be reduced from `250ms`. In the exploratory raw
+trace above, `29/30` single-HTTP `250ms` hits completed by `200ms`, and all
+completed by `223ms`, so smaller values could shave timeout cost while
+preserving most session wins.
+
+Prototype:
+
+- Temporarily changed `BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE` from
+  `250ms` to `200ms`.
+- After the deterministic guard failed, temporarily changed it to `225ms`.
+- Restored the committed `250ms` value after measurement.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval single_http_provider_waits_longer_for_recent_bitswap_peer
+cargo test -p freedom-ipfs-retrieval multi_http_provider_keeps_short_recent_peer_wait
+```
+
+Focused result:
+
+- `200ms` failed the deterministic single-HTTP-provider guard. The delayed
+  recent Bitswap peer did not reliably beat the hanging single HTTP-provider
+  path.
+- `225ms` passed both focused guards.
+
+Live `225ms` experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-single-http-postlookup225-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-single-http-postlookup225-r3.json
+```
+
+Result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `609ms` / `1621ms` / `1621ms`.
+- Asset TTFB p50/p95/max: `229ms` / `892ms` / `4426ms`.
+- Run total p50/p95/max: `2174ms` / `6492ms` / `6492ms`.
+- Max RSS/FD: `51908KiB` / `30`.
+- Block sources: `http_provider=119`, `bitswap=1`.
+- Post-lookup waits did not fire in this live window:
+  `shortcut_post_lookup_waits=0`.
+- The run had one unrelated cold Bitswap asset tail:
+  `bitswap_fetch=4319ms` for `/ipns/ipfs.tech/_nuxt/8Bs0wEmG.js`.
+
+Comparison context:
+
+- The immediately preceding `250ms` diagnostic live run passed `3/3`, with
+  root TTFB p50/p95 `1314ms` / `1351ms`, asset TTFB p50/p95/max
+  `269ms` / `906ms` / `1262ms`, run p50/p95 `3333ms` / `3682ms`, and
+  `shortcut_post_lookup_waits=5`.
+- The `225ms` run had a slightly better asset p95, but worse root p95 and a
+  much worse max/run p95 due to a tail unrelated to the post-lookup grace.
+
+Decision:
+Reject and restore `250ms`. The `200ms` candidate is too tight for the
+deterministic guard, and the `225ms` live sample did not exercise the target
+path enough to justify a behavior change. The maximum possible timeout saving
+from `225ms` is only `25ms`, while losing a late session hit would be more
+expensive. Keep the current `250ms` selective grace until repeated outcome
+traces show a clearer cutoff with margin.
