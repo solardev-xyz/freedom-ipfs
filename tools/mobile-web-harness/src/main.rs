@@ -720,12 +720,15 @@ fn print_summary(report: &RunReport) {
         if trace.bitswap_incoming_blocks.matches > 0 {
             let incoming = &trace.bitswap_incoming_blocks;
             println!(
-                "  bitswap incoming blocks: matches={} blocks={} bytes={} max_oldest_pending_ms={} max_pending_waiters={}",
+                "  bitswap incoming blocks: matches={} blocks={} bytes={} delivered_waiters={} dropped_waiters={} max_oldest_pending_ms={} max_pending_waiters={} max_dropped_waiters={}",
                 incoming.matches,
                 incoming.blocks,
                 incoming.bytes,
+                incoming.delivered_waiters,
+                incoming.dropped_waiters,
                 incoming.max_oldest_pending_ms,
-                incoming.max_pending_waiters
+                incoming.max_pending_waiters,
+                incoming.max_dropped_waiters
             );
         }
         if !trace.trace_errors.is_empty() {
@@ -2875,8 +2878,11 @@ struct TraceBitswapIncomingBlockAggregate {
     matches: usize,
     blocks: u128,
     bytes: u128,
+    delivered_waiters: u128,
+    dropped_waiters: u128,
     max_oldest_pending_ms: u128,
     max_pending_waiters: u128,
+    max_dropped_waiters: u128,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -3262,6 +3268,16 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 .unwrap_or_default();
             bitswap_incoming_blocks.bytes +=
                 value.get("bytes").and_then(json_u128).unwrap_or_default();
+            let delivered_waiters = value
+                .get("delivered_waiter_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            let dropped_waiters = value
+                .get("dropped_waiter_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            bitswap_incoming_blocks.delivered_waiters += delivered_waiters;
+            bitswap_incoming_blocks.dropped_waiters += dropped_waiters;
             bitswap_incoming_blocks.max_oldest_pending_ms =
                 bitswap_incoming_blocks.max_oldest_pending_ms.max(
                     value
@@ -3276,6 +3292,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                         .and_then(json_u128)
                         .unwrap_or_default(),
                 );
+            bitswap_incoming_blocks.max_dropped_waiters = bitswap_incoming_blocks
+                .max_dropped_waiters
+                .max(dropped_waiters);
         }
         if successful_bitswap_fetch {
             if let Some(peer) = value.get("source_peer").and_then(|peer| peer.as_str()) {
@@ -4265,7 +4284,7 @@ mod tests {
                 "{\"phase\":\"bitswap_peer_attempt_start\",\"cid\":\"cid-a\",\"peer\":\"peer-c\",\"prefer_want_have\":true}\n",
                 "{\"phase\":\"bitswap_peer_attempt\",\"elapsed_ms\":10000,\"cid\":\"cid-a\",\"peer\":\"peer-c\",\"ok\":false,\"prefer_want_have\":true,\"failure_kind\":\"read_timeout\",\"error\":\"read timed out\"}\n",
                 "{\"phase\":\"bitswap_dial_plan\",\"cid\":\"cid-a\",\"peer_count\":4,\"candidate_peer_count\":5,\"new_dial_peer_count\":2,\"new_dial_addr_count\":3,\"suppressed_dial_peer_count\":1,\"suppressed_dial_addr_count\":4,\"pending_dial_peer_count\":2,\"connected_peer_count\":1,\"command_queued_ms\":7}\n",
-                "{\"phase\":\"bitswap_incoming_block\",\"cid\":\"cid-a\",\"peer\":\"peer-d\",\"source_transport\":\"tcp\",\"block_count\":2,\"bytes\":256,\"pending_waiter_count\":3,\"oldest_pending_ms\":75,\"newest_pending_ms\":25}\n",
+                "{\"phase\":\"bitswap_incoming_block\",\"cid\":\"cid-a\",\"peer\":\"peer-d\",\"source_transport\":\"tcp\",\"block_count\":2,\"bytes\":256,\"pending_waiter_count\":3,\"delivered_waiter_count\":2,\"dropped_waiter_count\":1,\"oldest_pending_ms\":75,\"newest_pending_ms\":25}\n",
             ),
         )
         .unwrap();
@@ -4294,8 +4313,11 @@ mod tests {
         assert_eq!(summary.bitswap_incoming_blocks.matches, 1);
         assert_eq!(summary.bitswap_incoming_blocks.blocks, 2);
         assert_eq!(summary.bitswap_incoming_blocks.bytes, 256);
+        assert_eq!(summary.bitswap_incoming_blocks.delivered_waiters, 2);
+        assert_eq!(summary.bitswap_incoming_blocks.dropped_waiters, 1);
         assert_eq!(summary.bitswap_incoming_blocks.max_pending_waiters, 3);
         assert_eq!(summary.bitswap_incoming_blocks.max_oldest_pending_ms, 75);
+        assert_eq!(summary.bitswap_incoming_blocks.max_dropped_waiters, 1);
         assert_eq!(
             summary.slow_events[0].details.get("peer"),
             Some(&"peer-c".to_string())

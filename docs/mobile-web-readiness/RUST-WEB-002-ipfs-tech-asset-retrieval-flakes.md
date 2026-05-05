@@ -4401,3 +4401,73 @@ verified blocks, but keeping those timed-out session futures alive increased
 contention enough to worsen the request-timeout tail. A future version would
 need tighter gating, such as one late cache fill per page/root or only when no
 provider fanout is already in flight for the CID.
+
+## 2026-05-05 Incoming Bitswap Waiter Delivery Diagnostics
+
+Hypothesis:
+
+- Recent live traces showed inbound Bitswap blocks arriving while session
+  shortcut/provider races were active, but the trace did not say whether the
+  delivered block reached a still-live receiver or was dropped because the
+  waiting request had already moved on.
+- Counting delivered versus dropped waiters for each inbound block can guide a
+  future bounded mitigation without changing current scheduling behavior.
+
+Implementation:
+
+- Extend `bitswap_incoming_block` tracing with:
+  - `delivered_waiter_count`
+  - `dropped_waiter_count`
+- Keep the existing pending-waiter age fields:
+  - `pending_waiter_count`
+  - `oldest_pending_ms`
+  - `newest_pending_ms`
+- Extend the mobile web harness trace summary with incoming-block totals:
+  `delivered_waiters`, `dropped_waiters`, and `max_dropped_waiters`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+git diff --check
+cargo test -p mobile-web-harness
+cargo test -p freedom-ipfs-retrieval --lib
+cargo build -p freedom-ipfs-gateway
+```
+
+Result: all passed.
+
+Live check:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-incoming-waiter-delivery-r1-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-incoming-waiter-delivery-r1.json
+```
+
+Result: Rust and Kubo both passed `1/1`. Rust root TTFB was `1676ms` versus
+Kubo `2831ms`. Rust asset p50/p95 was `739/1876ms` versus Kubo `108/245ms`.
+Rust stayed lighter at max RSS/FD `53320KiB`/`47` versus Kubo
+`220104KiB`/`152`.
+
+Trace summary from
+`/tmp/ipfs-tech-incoming-waiter-delivery-r1.json`: `bitswap_fetches=23`,
+`with_trusted_peers=22`, `trusted_successes=15`, `untrusted_successes=8`,
+`request_timeouts_with_trusted=0`, `session_shortcut_starts=34`,
+`session_shortcut_hits=12`, and `block_store rechecks=23` with no recheck hits.
+Incoming block summary: `matches=39`, `blocks=41`, `bytes=1247574`,
+`delivered_waiters=39`, `dropped_waiters=4`, `max_oldest_pending_ms=1281`,
+`max_pending_waiters=2`, and `max_dropped_waiters=1`.
+
+Decision: keep. This is diagnostics-only and records a useful signal for the
+next cancellation/cache-fill experiment. The one-run live check confirms that
+dropped receivers happen in normal `ipfs.tech` page loading, but the count is
+small enough that it does not justify reintroducing the rejected late-cache
+prototype without tighter gating.

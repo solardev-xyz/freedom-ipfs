@@ -1482,6 +1482,19 @@ async fn run_shared_bitswap_swarm(
                                 if pending_waiter_count == 0 {
                                     newest_pending_ms = 0;
                                 }
+                                let mut delivered_waiter_count = 0usize;
+                                let mut dropped_waiter_count = 0usize;
+                                if let Some(senders) = pending_incoming.get_mut(&cid) {
+                                    senders.retain(|pending| {
+                                        if pending.sender.send(result.clone()).is_ok() {
+                                            delivered_waiter_count += 1;
+                                            true
+                                        } else {
+                                            dropped_waiter_count += 1;
+                                            false
+                                        }
+                                    });
+                                }
                                 tracing::info!(
                                     phase = "bitswap_incoming_block",
                                     cid = %cid,
@@ -1490,14 +1503,11 @@ async fn run_shared_bitswap_swarm(
                                     block_count = blocks.len(),
                                     bytes = result.requested_block.len(),
                                     pending_waiter_count,
+                                    delivered_waiter_count,
+                                    dropped_waiter_count,
                                     oldest_pending_ms,
                                     newest_pending_ms
                                 );
-                                if let Some(senders) = pending_incoming.get_mut(&cid) {
-                                    senders.retain(|pending| {
-                                        pending.sender.send(result.clone()).is_ok()
-                                    });
-                                }
                                 let _ = write_bitswap_cancel(&mut stream, &cid).await;
                             }
                         }
