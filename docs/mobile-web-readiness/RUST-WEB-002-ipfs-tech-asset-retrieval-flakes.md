@@ -14271,3 +14271,119 @@ tail and it increased Bitswap work while asset p95 regressed versus the kept
 HTTP hedge sample (`584ms` -> `1092ms`). The trace shows the worst delegated
 event still waited for first HTTP provider availability at `5218ms`, so this
 condition does not address the problematic slow-provider-order case.
+
+## 2026-05-05 Observe: Delegated Router Endpoint Sweep
+
+Goal:
+Start the provider-quality lab by comparing `delegated-ipfs.dev` and
+`cid.contact` endpoint behavior in the same live window before considering any
+default endpoint changes.
+
+Default delegated endpoint:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-router-default-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-router-default-r3.json
+```
+
+Result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1061ms` / `1146ms` / `1146ms`.
+- Asset TTFB p50/p95/max: `257ms` / `939ms` / `1198ms`.
+- Max RSS/FD: `51284KiB` / `36`.
+- Delegated lookup events: `90` successes, `0` failures, `1285` providers,
+  `200` HTTP providers, max `848ms`.
+- HTTP-provider fetch p50/p95/max: `162ms` / `525ms` / `875ms`.
+
+`cid.contact` alone:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --delegated-router https://cid.contact/routing/v1 \
+  --trace-output /tmp/ipfs-tech-router-cid-contact-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-router-cid-contact-r3.json
+```
+
+Result:
+
+- Rust failed `0/3`.
+- All three root requests returned `502`.
+- Delegated lookup events: `0` successes, `3` failures, `0` providers.
+- Trace errors were HTTP `404 Not Found` for
+  `https://cid.contact/routing/v1/providers/bafybeier...`.
+- DHT fallback returned `0` providers for the root CID in these runs.
+
+Manual endpoint check:
+
+```sh
+curl -sS -H 'Accept: application/x-ndjson, application/json' \
+  -D /tmp/cid-contact-routing-v1.headers \
+  https://cid.contact/routing/v1/providers/bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq \
+  -o /tmp/cid-contact-routing-v1.body
+```
+
+Result:
+
+- GET returned `HTTP/2 404` with an empty body.
+- `HEAD` on the same route returned `405` with `allow: GET`, so this endpoint
+  shape is advertised but not useful for this CID/window.
+
+Default plus `cid.contact`:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --delegated-router https://delegated-ipfs.dev/routing/v1,https://cid.contact/routing/v1 \
+  --trace-output /tmp/ipfs-tech-router-delegated-plus-cid-contact-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-router-delegated-plus-cid-contact-r3.json
+```
+
+Result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `768ms` / `831ms` / `831ms`.
+- Asset TTFB p50/p95/max: `232ms` / `550ms` / `789ms`.
+- Max RSS/FD: `56084KiB` / `34`.
+- Combined delegated lookup events: `98` successes, `3` failures, `1423`
+  providers, `215` HTTP providers, max `102ms`.
+- Per-endpoint summary:
+  - `https://delegated-ipfs.dev/routing/v1`: `98` successes, `0` failures,
+    `1423` providers, `215` HTTP providers, max `102ms`.
+  - `https://cid.contact/routing/v1`: `0` successes, `3` failures, max `42ms`.
+- HTTP-provider fetch p50/p95/max: `159ms` / `346ms` / `545ms`.
+
+Decision:
+Do not change defaults. The dual-endpoint run looked faster than the default
+sample, but `cid.contact` contributed only three fast `404` errors and no
+provider records. The apparent improvement is not causally attributable to
+`cid.contact`; it is more likely normal live-network variance in
+`delegated-ipfs.dev` and HTTP provider response timing. Treat
+`https://cid.contact/routing/v1` as rejected for this delegated-provider API
+shape until a working provider endpoint is confirmed. Future provider-quality
+sweeps should test other IPNI/delegated endpoints or a corrected `cid.contact`
+API before adding any default endpoint fanout.
