@@ -15517,3 +15517,82 @@ tail and worsened asset/run p95 versus the current `250ms` baseline. The idea
 may be worth revisiting only after the harness summarizes score counts and race
 width impact directly, or if routing regularly returns three or more HTTP
 providers where the fastest candidate is outside the first two race slots.
+
+## 2026-05-05 Keep: Summarize HTTP Provider Race Shape
+
+Question:
+The rejected HTTP-provider scoring prototype exposed a harness gap: raw traces
+could show whether scoring fired, but the standard summary did not explain how
+many HTTP-provider races had one provider, multiple providers, providers beyond
+the race width, hedges, or optional scoring fields. Without that summary, future
+HTTP-provider ordering experiments require raw JSONL spelunking.
+
+Implementation:
+
+- Add a `http_provider_races` trace summary aggregate.
+- Count `http_provider_race` events, total provider candidates, max provider
+  count, max race width, single-provider races, multi-provider races, and races
+  where `provider_count > race_width`.
+- Count optional `scored_provider_count` fields when future experiments emit
+  them.
+- Count `http_provider_hedge` events and their max pending/remaining provider
+  counts.
+- Print a compact `http provider races:` summary before HTTP-provider fetch
+  details.
+- Extend the focused HTTP-provider trace summary test.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_http_provider_fetches
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Result:
+
+- Formatting passed.
+- Focused HTTP-provider summary test passed.
+- Full `mobile-web-harness` tests passed: `33 passed`.
+- Workspace check passed.
+- Package and workspace clippy passed with `-D warnings`.
+
+Live smoke:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-race-summary-r1-trace.jsonl \
+  --output /tmp/ipfs-tech-http-race-summary-r1.json
+```
+
+Live result:
+
+- Rust passed `1/1`.
+- Root TTFB/total: `1441ms` / `1443ms`.
+- Asset TTFB p50/p95/max: `320ms` / `913ms` / `1382ms`.
+- Run total: `4147ms`.
+- Max RSS/FD: `50908KiB` / `30`.
+- HTTP-provider races: `27` events, `49` total providers, `16` single-provider
+  races, `11` multi-provider races, `11` races above the race width, race width
+  max `2`, provider count max `3`, `0` scored events, `0` hedges.
+- HTTP-provider fetch p50/p95/max: `161ms` / `683ms` / `1156ms`.
+- Provider spread: `ipfs-bridge.sia.dev` max `1156ms`,
+  `dag.w3s.link` max `76ms`.
+
+Decision:
+Keep. This is harness-only diagnostics and does not change node behavior or
+mobile resource usage. The first live summary already gives a useful next-step
+signal: on this `ipfs.tech` run, `11/27` HTTP-provider races had more
+candidates than the current race width, while `16/27` had only one provider
+where ordering/scoring cannot help.

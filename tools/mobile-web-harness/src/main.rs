@@ -912,6 +912,7 @@ fn print_summary(report: &RunReport) {
         print_trace_unixfs_metadata_cache(trace);
         print_trace_gateway_direct_body(trace);
         print_trace_gateway_stream_body(trace);
+        print_trace_http_provider_races(trace);
         print_trace_http_provider_fetches(trace);
         print_trace_bitswap_sources(trace);
         print_trace_bitswap_batches(trace);
@@ -1226,6 +1227,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_timeout_recovery(trace);
     print_trace_gateway_direct_body(trace);
     print_trace_gateway_stream_body(trace);
+    print_trace_http_provider_races(trace);
     print_trace_http_provider_fetches(trace);
     print_trace_bitswap_peer_attempts(trace);
     print_trace_bitswap_dial_plans(trace);
@@ -1537,6 +1539,29 @@ fn print_trace_http_provider_fetches(trace: &TraceSummary) {
             provider.max_response_body_elapsed_ms
         );
     }
+}
+
+fn print_trace_http_provider_races(trace: &TraceSummary) {
+    let race = &trace.http_provider_races;
+    if !race.has_events() {
+        return;
+    }
+    println!(
+        "  http provider races: events={} providers={} single={} multi={} above_width={} race_width_max={} max_provider_count={} scored_events={} scored_providers={} max_scored={} hedges={} hedge_pending_max={} hedge_remaining_max={}",
+        race.events,
+        race.provider_count_total,
+        race.single_provider_events,
+        race.multi_provider_events,
+        race.above_race_width_events,
+        race.max_race_width,
+        race.max_provider_count,
+        race.scored_events,
+        race.scored_provider_count_total,
+        race.max_scored_provider_count,
+        race.hedges,
+        race.max_hedge_pending_count,
+        race.max_hedge_remaining_provider_count
+    );
 }
 
 fn print_trace_provider_retries(trace: &TraceSummary) {
@@ -4343,6 +4368,7 @@ struct TraceSummary {
     gateway_request_elapsed_ms: LatencySummary,
     gateway_direct_body: TraceGatewayDirectBodyAggregate,
     gateway_stream_body: TraceGatewayStreamBodyAggregate,
+    http_provider_races: TraceHttpProviderRaceAggregate,
     http_provider_fetches: TraceHttpProviderFetchAggregate,
     unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
     bitswap_source_peers: Vec<TraceValueCount>,
@@ -4426,6 +4452,63 @@ struct TraceHttpProviderFetchAggregate {
     providers: Vec<TraceValueCount>,
     provider_milestones: Vec<TraceHttpProviderMilestoneAggregate>,
     error_classes: Vec<TraceValueCount>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceHttpProviderRaceAggregate {
+    events: usize,
+    provider_count_total: u128,
+    max_provider_count: u128,
+    max_race_width: u128,
+    single_provider_events: usize,
+    multi_provider_events: usize,
+    above_race_width_events: usize,
+    scored_events: usize,
+    scored_provider_count_total: u128,
+    max_scored_provider_count: u128,
+    hedges: usize,
+    max_hedge_pending_count: u128,
+    max_hedge_remaining_provider_count: u128,
+}
+
+impl TraceHttpProviderRaceAggregate {
+    fn record_race(&mut self, value: &serde_json::Value) {
+        self.events += 1;
+        let provider_count = trace_count_field(value, "provider_count");
+        let race_width = trace_count_field(value, "race_width");
+        let scored_provider_count = trace_count_field(value, "scored_provider_count");
+        self.provider_count_total += provider_count;
+        self.max_provider_count = self.max_provider_count.max(provider_count);
+        self.max_race_width = self.max_race_width.max(race_width);
+        if provider_count == 1 {
+            self.single_provider_events += 1;
+        } else if provider_count > 1 {
+            self.multi_provider_events += 1;
+        }
+        if race_width > 0 && provider_count > race_width {
+            self.above_race_width_events += 1;
+        }
+        if scored_provider_count > 0 {
+            self.scored_events += 1;
+            self.scored_provider_count_total += scored_provider_count;
+            self.max_scored_provider_count =
+                self.max_scored_provider_count.max(scored_provider_count);
+        }
+    }
+
+    fn record_hedge(&mut self, value: &serde_json::Value) {
+        self.hedges += 1;
+        self.max_hedge_pending_count = self
+            .max_hedge_pending_count
+            .max(trace_count_field(value, "pending_count"));
+        self.max_hedge_remaining_provider_count = self
+            .max_hedge_remaining_provider_count
+            .max(trace_count_field(value, "remaining_provider_count"));
+    }
+
+    fn has_events(&self) -> bool {
+        self.events > 0 || self.hedges > 0
+    }
 }
 
 impl TraceHttpProviderFetchAggregate {
@@ -5351,6 +5434,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut gateway_request_elapsed_values = Vec::<u128>::new();
     let mut gateway_direct_body = TraceGatewayDirectBodyAggregate::default();
     let mut gateway_stream_body = TraceGatewayStreamBodyAggregate::default();
+    let mut http_provider_races = TraceHttpProviderRaceAggregate::default();
     let mut http_provider_fetch_events = 0usize;
     let mut http_provider_fetch_successes = 0usize;
     let mut http_provider_fetch_failures = 0usize;
@@ -5543,6 +5627,12 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                     .entry(http_provider_error_class(&error).to_string())
                     .or_default() += 1;
             }
+        }
+        if phase == "http_provider_race" {
+            http_provider_races.record_race(&value);
+        }
+        if phase == "http_provider_hedge" {
+            http_provider_races.record_hedge(&value);
         }
         if phase == "delegated_provider_lookup" {
             delegated_provider_lookup.record(&value, elapsed_ms);
@@ -6344,6 +6434,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         gateway_request_elapsed_ms: LatencySummary::from_values(gateway_request_elapsed_values),
         gateway_direct_body,
         gateway_stream_body,
+        http_provider_races,
         http_provider_fetches: TraceHttpProviderFetchAggregate {
             events: http_provider_fetch_events,
             successes: http_provider_fetch_successes,
@@ -9057,6 +9148,8 @@ mod tests {
             &path,
             concat!(
                 "{\"phase\":\"http_provider_race\",\"cid\":\"cid-a\",\"provider_count\":2,\"race_width\":2}\n",
+                "{\"phase\":\"http_provider_race\",\"cid\":\"cid-b\",\"provider_count\":4,\"race_width\":2,\"scored_provider_count\":2}\n",
+                "{\"phase\":\"http_provider_hedge\",\"cid\":\"cid-b\",\"provider\":\"https://provider-c.example\",\"timeout_ms\":250,\"pending_count\":2,\"remaining_provider_count\":1}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-a\",\"provider\":\"https://provider-a.example\",\"ok\":true,\"bytes\":128,\"response_bytes\":128,\"response_headers_elapsed_ms\":7,\"response_first_chunk_seen\":true,\"response_first_chunk_elapsed_ms\":9,\"response_body_elapsed_ms\":20,\"elapsed_ms\":25}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-b\",\"provider\":\"https://provider-b.example\",\"ok\":false,\"error\":\"core: cid hash mismatch for cid-b\",\"response_headers_elapsed_ms\":40,\"elapsed_ms\":40}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-c\",\"provider\":\"https://provider-b.example\",\"ok\":false,\"error\":\"request timed out\",\"response_headers_elapsed_ms\":60,\"elapsed_ms\":60}\n",
@@ -9067,6 +9160,24 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
+        assert_eq!(summary.http_provider_races.events, 2);
+        assert_eq!(summary.http_provider_races.provider_count_total, 6);
+        assert_eq!(summary.http_provider_races.max_provider_count, 4);
+        assert_eq!(summary.http_provider_races.max_race_width, 2);
+        assert_eq!(summary.http_provider_races.single_provider_events, 0);
+        assert_eq!(summary.http_provider_races.multi_provider_events, 2);
+        assert_eq!(summary.http_provider_races.above_race_width_events, 1);
+        assert_eq!(summary.http_provider_races.scored_events, 1);
+        assert_eq!(summary.http_provider_races.scored_provider_count_total, 2);
+        assert_eq!(summary.http_provider_races.max_scored_provider_count, 2);
+        assert_eq!(summary.http_provider_races.hedges, 1);
+        assert_eq!(summary.http_provider_races.max_hedge_pending_count, 2);
+        assert_eq!(
+            summary
+                .http_provider_races
+                .max_hedge_remaining_provider_count,
+            1
+        );
         assert_eq!(summary.http_provider_fetches.events, 3);
         assert_eq!(summary.http_provider_fetches.successes, 1);
         assert_eq!(summary.http_provider_fetches.failures, 2);
@@ -9140,7 +9251,7 @@ mod tests {
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_http_provider"),
-            4
+            6
         );
     }
 
