@@ -6550,3 +6550,109 @@ Live smoke result:
 Decision: keep. This is harness-only and does not change gateway or retrieval
 behavior. It turns the current `vitalik` failure shape into a first-class metric
 for future behavior experiments.
+
+## 2026-05-05 Keep: Offload Incoming Bitswap Stream Reads
+
+Hypothesis:
+The new no-dial-plan metric showed the `vitalik` child CID
+`bafkreibny3ionuayaittbxl2tn5dgfae7sbu45ymd35vhdm3634lmakxqi` timing out
+after `provider_fetch_start` and `bitswap_peer_expand`, but before any
+`bitswap_dial_plan`. Inspecting `run_shared_bitswap_swarm` showed that the
+shared Bitswap loop awaited `read_bitswap_blocks(&mut stream)` directly inside
+the incoming-stream branch. A slow inbound Bitswap read could therefore occupy
+the main shared swarm future and delay queued provider commands until their
+caller-side request timeout fired.
+
+Implementation:
+
+- Move incoming Bitswap stream reads into a bounded `FuturesUnordered` so the
+  shared swarm loop can continue processing commands, dial plans, swarm events,
+  and other incoming streams while a peer's inbound stream is still reading.
+- Cap pending incoming reads at `32` to keep mobile resource use bounded. When
+  the cap is hit, the stream is dropped and a `bitswap_incoming_stream_read`
+  trace event records `dropped=true`.
+- Apply a `6s` timeout to each incoming stream read. Timed-out reads emit
+  `bitswap_incoming_stream_read` with `timed_out=true`.
+- Preserve the previous delivery behavior after a read completes: match received
+  blocks to active pending requests, send a Bitswap cancel for matched CIDs, and
+  send an empty Bitswap message when no active request matches.
+- Add a deterministic unit test covering the bounded-read timeout helper.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval bitswap
+cargo test -p freedom-ipfs-retrieval
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+cargo build -p freedom-ipfs-gateway
+```
+
+Live comparison, exact current code:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/vitalik-bounded-async-incoming-read-rust-vs-kubo-trace.jsonl \
+  --output /tmp/vitalik-bounded-async-incoming-read-rust-vs-kubo.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1551/1605ms`, Kubo `1875/1932ms`.
+- Max RSS/FD: Rust `38912KiB`/`29`, Kubo `123888KiB`/`79`.
+- Trace: `request_timeouts_with_trusted=0`; the previous mixed-trusted
+  no-dial-plan timeout shape disappeared in this sample.
+- Incoming Bitswap delivery stayed prompt: `max_oldest_pending_ms=690`.
+- Peer attempts stayed much lower than the noisier rejected command-bias run:
+  `54`.
+- Evidence:
+  - `/tmp/vitalik-bounded-async-incoming-read-rust-vs-kubo.json`
+  - `/tmp/vitalik-bounded-async-incoming-read-rust-vs-kubo-trace.jsonl`
+
+Page workload guardrail, exact current code:
+
+```sh
+timeout 360s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/ipfs-tech-bounded-async-incoming-read-rust-vs-kubo-trace.jsonl \
+  --output /tmp/ipfs-tech-bounded-async-incoming-read-rust-vs-kubo.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1048/2159ms`, Kubo `2283/2567ms`.
+- Asset TTFB p50/p95: Rust `187/1119ms`, Kubo `95/491ms`.
+- Max RSS/FD: Rust `53300KiB`/`50`, Kubo `190032KiB`/`112`.
+- Trace: `request_timeouts_with_trusted=0`.
+- Dial pressure increased versus the previous cap-3 `ipfs.tech` guardrail:
+  `bitswap peer attempts=495`, `dial rejections=105`.
+- Evidence:
+  - `/tmp/ipfs-tech-bounded-async-incoming-read-rust-vs-kubo.json`
+  - `/tmp/ipfs-tech-bounded-async-incoming-read-rust-vs-kubo-trace.jsonl`
+
+Decision: keep. This directly targets a scheduler blockage exposed by the
+no-dial-plan metric, removes the repeatable `vitalik` mixed-trusted timeout
+shape in the measured window, and makes Rust beat Kubo on both `vitalik` root
+HTML and `ipfs.tech` root TTFB while staying much lighter on RSS and file
+descriptors. The tradeoff is higher `ipfs.tech` Bitswap dial pressure and a
+remaining asset-tail gap versus Kubo; future work should focus on fair
+scheduling and peer/dial pressure after incoming-read offload, not on reverting
+this change.

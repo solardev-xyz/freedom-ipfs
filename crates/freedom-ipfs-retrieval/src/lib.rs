@@ -14,7 +14,7 @@ use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::Boxed;
 use libp2p::core::upgrade;
 use libp2p::multiaddr::Protocol;
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::swarm::{NetworkBehaviour, Stream as Libp2pStream, SwarmEvent};
 use libp2p::StreamProtocol;
 use libp2p::{
     connection_limits, identify, noise, ping, tcp, tls, websocket, yamux, Multiaddr, PeerId,
@@ -49,6 +49,7 @@ const BITSWAP_CONNECTION_READY_TIMEOUT: Duration = Duration::from_secs(5);
 // directly on the gateway TTFB path before we request the block.
 const BITSWAP_WANT_HAVE_TIMEOUT: Duration = Duration::from_millis(750);
 const BITSWAP_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(6);
+const BITSWAP_INCOMING_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(6);
 const BITSWAP_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const BITSWAP_SUCCESSFUL_PEER_TTL: Duration = Duration::from_secs(10 * 60);
 const BITSWAP_CONNECTION_ERROR_BACKOFF_TTL: Duration = Duration::from_secs(30);
@@ -72,6 +73,7 @@ const MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND: usize = 8;
 const MAX_BITSWAP_PEERS_PER_BLOCK: usize = 16;
 const MAX_BITSWAP_SESSION_PEERS: usize = 4;
 const MAX_BITSWAP_ADDRS_PER_PEER: usize = 2;
+const MAX_PENDING_INCOMING_BITSWAP_READS: usize = 32;
 // Race a small number of untrusted providers with WANT_BLOCK before falling
 // back to conservative WANT_HAVE probes for the rest. This lowers page-asset
 // tails without requesting every block from every provider candidate.
@@ -1242,6 +1244,14 @@ struct PendingIncomingBitswapResult {
     sender: mpsc::UnboundedSender<BitswapFetchResult>,
 }
 
+struct IncomingBitswapRead {
+    peer: PeerId,
+    stream: Libp2pStream,
+    result: io::Result<Vec<ReceivedBitswapBlock>>,
+    elapsed_ms: u128,
+    timed_out: bool,
+}
+
 type DialErrorLog = Arc<tokio::sync::Mutex<HashMap<PeerId, Vec<String>>>>;
 type PeerTransportLog = Arc<tokio::sync::Mutex<HashMap<PeerId, PeerTransportState>>>;
 
@@ -1338,6 +1348,42 @@ fn bitswap_request_timeout(peer_count: usize, trusted_peer_count: usize) -> Dura
     }
 }
 
+async fn read_incoming_bitswap_stream(
+    peer: PeerId,
+    mut stream: Libp2pStream,
+) -> IncomingBitswapRead {
+    let (result, elapsed_ms, timed_out) =
+        read_incoming_bitswap_blocks(&mut stream, BITSWAP_INCOMING_STREAM_READ_TIMEOUT).await;
+    IncomingBitswapRead {
+        peer,
+        stream,
+        result,
+        elapsed_ms,
+        timed_out,
+    }
+}
+
+async fn read_incoming_bitswap_blocks<T>(
+    stream: &mut T,
+    read_timeout: Duration,
+) -> (io::Result<Vec<ReceivedBitswapBlock>>, u128, bool)
+where
+    T: AsyncRead + Unpin,
+{
+    let started = Instant::now();
+    match timeout(read_timeout, read_bitswap_blocks(stream)).await {
+        Ok(result) => (result, started.elapsed().as_millis(), false),
+        Err(_) => (
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "incoming bitswap stream read timed out",
+            )),
+            started.elapsed().as_millis(),
+            true,
+        ),
+    }
+}
+
 async fn run_shared_bitswap_swarm(
     mut swarm: libp2p::Swarm<BitswapBehaviour>,
     control: StreamControl,
@@ -1346,6 +1392,7 @@ async fn run_shared_bitswap_swarm(
 ) {
     let mut incoming = select_all(incoming);
     let mut fetches = FuturesUnordered::<BoxFuture<'static, Cid>>::new();
+    let mut incoming_reads = FuturesUnordered::<BoxFuture<'static, IncomingBitswapRead>>::new();
     let mut pending_incoming = HashMap::<Cid, Vec<PendingIncomingBitswapResult>>::new();
     let mut pending_counts = HashMap::<Cid, usize>::new();
     let mut connected_peers = HashMap::<PeerId, usize>::new();
@@ -1518,17 +1565,30 @@ async fn run_shared_bitswap_swarm(
                 }
             }
             maybe_stream = incoming.next() => {
-                let Some((peer, mut stream)) = maybe_stream else {
+                let Some((peer, stream)) = maybe_stream else {
                     continue;
                 };
-                match read_bitswap_blocks(&mut stream).await {
+                if incoming_reads.len() >= MAX_PENDING_INCOMING_BITSWAP_READS {
+                    tracing::info!(
+                        phase = "bitswap_incoming_stream_read",
+                        peer = %peer,
+                        ok = false,
+                        dropped = true,
+                        pending_reads = incoming_reads.len()
+                    );
+                    continue;
+                }
+                incoming_reads.push(read_incoming_bitswap_stream(peer, stream).boxed());
+            }
+            Some(mut incoming_read) = incoming_reads.next(), if !incoming_reads.is_empty() => {
+                match incoming_read.result {
                     Ok(blocks) => {
                         let mut matched = false;
                         let source_transport =
-                            current_peer_transport(&peer_transports, peer).await;
+                            current_peer_transport(&peer_transports, incoming_read.peer).await;
                         for cid in pending_incoming.keys().copied().collect::<Vec<_>>() {
                             if let Some(mut result) = collect_bitswap_result(&cid, blocks.clone()) {
-                                result.source_peer = Some(peer);
+                                result.source_peer = Some(incoming_read.peer);
                                 result.source_transport = source_transport;
                                 result.delivery = "incoming";
                                 matched = true;
@@ -1562,7 +1622,7 @@ async fn run_shared_bitswap_swarm(
                                 tracing::info!(
                                     phase = "bitswap_incoming_block",
                                     cid = %cid,
-                                    peer = %peer,
+                                    peer = %incoming_read.peer,
                                     source_transport = source_transport.unwrap_or("unknown"),
                                     block_count = blocks.len(),
                                     bytes = result.requested_block.len(),
@@ -1572,15 +1632,26 @@ async fn run_shared_bitswap_swarm(
                                     oldest_pending_ms,
                                     newest_pending_ms
                                 );
-                                let _ = write_bitswap_cancel(&mut stream, &cid).await;
+                                let _ = write_bitswap_cancel(&mut incoming_read.stream, &cid).await;
                             }
                         }
                         if !matched {
-                            let _ = write_empty_bitswap_message(&mut stream).await;
+                            let _ = write_empty_bitswap_message(&mut incoming_read.stream).await;
                         }
                     }
                     Err(err) => {
-                        tracing::debug!(error = %err, "incoming bitswap stream read failed");
+                        if incoming_read.timed_out {
+                            tracing::info!(
+                                phase = "bitswap_incoming_stream_read",
+                                peer = %incoming_read.peer,
+                                ok = false,
+                                timed_out = true,
+                                timeout_ms = BITSWAP_INCOMING_STREAM_READ_TIMEOUT.as_millis(),
+                                elapsed_ms = incoming_read.elapsed_ms
+                            );
+                        } else {
+                            tracing::debug!(error = %err, "incoming bitswap stream read failed");
+                        }
                     }
                 }
             }
@@ -3799,6 +3870,20 @@ mod bitswap_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn incoming_bitswap_stream_reads_are_bounded() {
+        let mut stream = PendingReadStream;
+        let (result, elapsed_ms, timed_out) =
+            read_incoming_bitswap_blocks(&mut stream, Duration::from_millis(10)).await;
+
+        assert!(timed_out);
+        let Err(err) = result else {
+            panic!("pending incoming stream unexpectedly returned blocks");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(elapsed_ms < 1000);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn dropped_bitswap_fetch_cancels_open_peer_stream() {
         let data = b"dropped bitswap fetch block";
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
@@ -5259,6 +5344,18 @@ mod bitswap_tests {
     struct ScriptedBitswapStream {
         read: std::io::Cursor<Vec<u8>>,
         written: Vec<u8>,
+    }
+
+    struct PendingReadStream;
+
+    impl AsyncRead for PendingReadStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut [u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Pending
+        }
     }
 
     impl ScriptedBitswapStream {
