@@ -891,6 +891,7 @@ fn print_summary(report: &RunReport) {
         print_trace_gateway_stream_body(trace);
         print_trace_bitswap_sources(trace);
         print_trace_bitswap_batches(trace);
+        print_trace_bitswap_incoming_batches(trace);
         if trace.bitswap_extra_blocks.events > 0 {
             let extra = &trace.bitswap_extra_blocks;
             println!(
@@ -1196,6 +1197,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_bitswap_dial_plans(trace);
     print_trace_bitswap_sources(trace);
     print_trace_bitswap_batches(trace);
+    print_trace_bitswap_incoming_batches(trace);
     print_trace_bitswap_peer_fetches(trace);
     if trace.bitswap_session.has_events() {
         let session = &trace.bitswap_session;
@@ -1567,6 +1569,22 @@ fn print_trace_bitswap_batches(trace: &TraceSummary) {
         batches.max_requested_blocks,
         batches.cancelled,
         batches.failures
+    );
+}
+
+fn print_trace_bitswap_incoming_batches(trace: &TraceSummary) {
+    let batches = &trace.bitswap_incoming_batches;
+    if batches.events == 0 {
+        return;
+    }
+    println!(
+        "  bitswap incoming batches: events={} total_cids={} max_cids={} requested_blocks={} extra_blocks={} max_elapsed_ms={}",
+        batches.events,
+        batches.total_cids,
+        batches.max_cids,
+        batches.requested_blocks,
+        batches.extra_blocks,
+        batches.max_elapsed_ms
     );
 }
 
@@ -4174,6 +4192,7 @@ struct TraceSummary {
     bitswap_deliveries: Vec<TraceValueCount>,
     bitswap_batches: TraceBitswapBatchAggregate,
     bitswap_extra_blocks: TraceBitswapExtraBlockAggregate,
+    bitswap_incoming_batches: TraceBitswapIncomingBatchAggregate,
     bitswap_peer_fetches: Vec<TracePeerAggregate>,
     bitswap_session: TraceBitswapSessionAggregate,
     bitswap_peer_attempts: TraceBitswapPeerAttemptAggregate,
@@ -4592,6 +4611,16 @@ struct TraceBitswapIncomingBlockAggregate {
 }
 
 #[derive(Debug, Default, Serialize)]
+struct TraceBitswapIncomingBatchAggregate {
+    events: usize,
+    total_cids: u128,
+    max_cids: u128,
+    requested_blocks: u128,
+    extra_blocks: u128,
+    max_elapsed_ms: u128,
+}
+
+#[derive(Debug, Default, Serialize)]
 struct TraceBitswapIncomingReadAggregate {
     events: usize,
     failures: usize,
@@ -4929,6 +4958,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_deliveries = BTreeMap::<String, usize>::new();
     let mut bitswap_batches = TraceBitswapBatchAggregate::default();
     let mut bitswap_extra_blocks = TraceBitswapExtraBlockAggregate::default();
+    let mut bitswap_incoming_batches = TraceBitswapIncomingBatchAggregate::default();
     let mut bitswap_peer_fetches = BTreeMap::<String, TracePeerBuilder>::new();
     let mut trace_errors = BTreeMap::<String, usize>::new();
     let mut bitswap_addr_mix = BTreeMap::<String, usize>::new();
@@ -5451,6 +5481,29 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         if phase == "bitswap_batch_failed" {
             bitswap_batches.failures += 1;
         }
+        if phase == "bitswap_incoming_batch" {
+            let cid_count = value
+                .get("cid_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            bitswap_incoming_batches.events += 1;
+            bitswap_incoming_batches.total_cids += cid_count;
+            bitswap_incoming_batches.max_cids = bitswap_incoming_batches.max_cids.max(cid_count);
+            bitswap_incoming_batches.requested_blocks += value
+                .get("requested_blocks")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            bitswap_incoming_batches.extra_blocks += value
+                .get("extra_blocks")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            bitswap_incoming_batches.max_elapsed_ms = bitswap_incoming_batches.max_elapsed_ms.max(
+                value
+                    .get("elapsed_ms")
+                    .and_then(json_u128)
+                    .unwrap_or_default(),
+            );
+        }
         if phase == "provider_fetch_start" {
             if let Some(cid) = json_detail_string(value.get("cid")) {
                 provider_fetch_dial_plan_seen.insert(cid, false);
@@ -5799,6 +5852,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_deliveries: sorted_trace_counts(bitswap_deliveries),
         bitswap_batches,
         bitswap_extra_blocks,
+        bitswap_incoming_batches,
         bitswap_peer_fetches: sorted_trace_peers(bitswap_peer_fetches),
         bitswap_session,
         bitswap_peer_attempts,
@@ -6140,6 +6194,7 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         "bitswap_fetch"
         | "bitswap_connection_established"
         | "bitswap_incoming_block"
+        | "bitswap_incoming_batch"
         | "bitswap_peer_attempt"
         | "bitswap_peer_attempt_start"
         | "bitswap_peer_expand"
@@ -7461,6 +7516,7 @@ mod tests {
                 "{\"phase\":\"block_store_get\",\"cid\":\"cid-b\",\"cache_hit\":true}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-a\",\"ok\":true}\n",
                 "{\"phase\":\"bitswap_peer_expand\",\"cid\":\"cid-a\",\"peer_count\":2}\n",
+                "{\"phase\":\"bitswap_incoming_batch\",\"cid\":\"cid-a\",\"cid_count\":2,\"requested_blocks\":2}\n",
                 "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer-a\",\"transport\":\"tcp\"}\n",
                 "{\"phase\":\"unixfs_resource\",\"path\":\"/ipns/site/\",\"ok\":true}\n",
                 "{\"phase\":\"gateway_direct_body\",\"path\":\"/ipns/site/asset.css\",\"body_len\":4096}\n",
@@ -7527,7 +7583,7 @@ mod tests {
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_bitswap"),
-            2
+            3
         );
         assert_eq!(trace_value_count(&summary.progress_phases, "streaming"), 3);
         assert_eq!(summary.gateway_direct_body.events, 1);
@@ -7618,6 +7674,7 @@ mod tests {
                 "{\"phase\":\"bitswap_dial_rejected\",\"peer\":\"peer-a\",\"transport\":\"tcp\",\"connection_limit\":true}\n",
                 "{\"phase\":\"bitswap_dial_rejected\",\"peer\":\"peer-b\",\"transport\":\"ws\",\"connection_limit\":false}\n",
                 "{\"phase\":\"bitswap_incoming_block\",\"cid\":\"cid-a\",\"peer\":\"peer-d\",\"source_transport\":\"tcp\",\"block_count\":2,\"bytes\":256,\"pending_waiter_count\":3,\"delivered_waiter_count\":2,\"dropped_waiter_count\":1,\"oldest_pending_ms\":75,\"newest_pending_ms\":25}\n",
+                "{\"phase\":\"bitswap_incoming_batch\",\"cid\":\"cid-a\",\"cids\":\"cid-a,cid-b\",\"cid_count\":2,\"requested_blocks\":2,\"extra_blocks\":1,\"elapsed_ms\":70}\n",
                 "{\"phase\":\"bitswap_incoming_stream_read\",\"peer\":\"peer-e\",\"ok\":false,\"dropped\":true,\"pending_reads\":32}\n",
                 "{\"phase\":\"bitswap_incoming_stream_read\",\"peer\":\"peer-f\",\"ok\":false,\"timed_out\":true,\"timeout_ms\":6000,\"elapsed_ms\":6001}\n",
                 "{\"phase\":\"provider_refresh_skipped_empty_provider_set\",\"cid\":\"cid-a\",\"error\":\"No Bitswap providers\",\"initial_error\":\"No Bitswap providers\"}\n",
@@ -7692,6 +7749,12 @@ mod tests {
         assert_eq!(summary.bitswap_incoming_blocks.max_pending_waiters, 3);
         assert_eq!(summary.bitswap_incoming_blocks.max_oldest_pending_ms, 75);
         assert_eq!(summary.bitswap_incoming_blocks.max_dropped_waiters, 1);
+        assert_eq!(summary.bitswap_incoming_batches.events, 1);
+        assert_eq!(summary.bitswap_incoming_batches.total_cids, 2);
+        assert_eq!(summary.bitswap_incoming_batches.max_cids, 2);
+        assert_eq!(summary.bitswap_incoming_batches.requested_blocks, 2);
+        assert_eq!(summary.bitswap_incoming_batches.extra_blocks, 1);
+        assert_eq!(summary.bitswap_incoming_batches.max_elapsed_ms, 70);
         assert_eq!(summary.bitswap_incoming_reads.events, 2);
         assert_eq!(summary.bitswap_incoming_reads.failures, 2);
         assert_eq!(summary.bitswap_incoming_reads.dropped, 1);

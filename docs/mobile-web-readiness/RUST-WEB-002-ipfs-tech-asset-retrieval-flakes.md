@@ -12184,3 +12184,42 @@ wire it into `get_block_ranges_async` in this shape. A future attempt should
 first remove duplicate large-block cache writes without weakening the
 post-fetch cache contract, or find a request shape that wins before the current
 individual child fetches complete.
+
+## 2026-05-05 Keep: Summarize Incoming Bitswap Batches
+
+Hypothesis:
+After keeping `bitswap_incoming_batch`, future multi-want experiments need an
+obvious harness/mobile signal for whether an incoming batch completed, how many
+CIDs it covered, and whether the UI should still report Bitswap activity. The
+raw trace event was visible only through slow-event output and generic phase
+counts.
+
+Change:
+
+- Add `bitswap_incoming_batches` to the mobile web harness trace summary JSON.
+- Print a concise `bitswap incoming batches:` line in normal and Kubo comparison
+  trace summaries.
+- Track event count, total/max CID count, requested/extra block totals, and max
+  elapsed time.
+- Map `bitswap_incoming_batch` to the mobile/harness progress phase
+  `fetching_bitswap`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_bitswap_peer_attempts
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+```
+
+Result:
+
+- focused harness incoming-batch summary test passed
+- focused harness progress-phase summary test passed
+- focused mobile progress mapping test passed
+
+Decision:
+Keep. This is diagnostics-only and does not change gateway/retrieval behavior.
+It makes the kept multi-CID incoming support measurable in future live and
+seeded Kubo comparisons.

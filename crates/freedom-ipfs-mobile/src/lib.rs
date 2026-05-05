@@ -633,6 +633,7 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         "bitswap_fetch"
         | "bitswap_connection_established"
         | "bitswap_incoming_block"
+        | "bitswap_incoming_batch"
         | "bitswap_peer_attempt"
         | "bitswap_peer_attempt_start"
         | "bitswap_peer_expand"
@@ -2370,6 +2371,14 @@ mod tests {
             progress_phase(
                 "bitswap_connection_established",
                 &progress_fields([("phase", "bitswap_connection_established")]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_incoming_batch",
+                &progress_fields([("phase", "bitswap_incoming_batch")]),
                 "active",
             ),
             "fetching_bitswap"
