@@ -19443,3 +19443,76 @@ for resolved-IPFS offline replay of the current `ipfs.tech` root plus same-site
 asset set. Product-level offline IPNS behavior still depends on how the app
 wants to handle name freshness and IPNS record caching, but the block/resource
 cache has the page data needed for this resolved replay.
+
+## 2026-05-05 Keep: Count SQLite WAL/SHM Storage In Harness
+
+Question:
+The offline replay above reported only `4096B` of storage even though the page
+cache clearly contained much more data. Is the harness undercounting SQLite
+storage by measuring only the main DB file and not `-wal` / `-shm` sidecars?
+
+Finding:
+
+The offline replay DB path had sidecars:
+
+```text
+/tmp/freedom-ipfs-offline-replay.db-1563279-1778023401850      4.0K
+/tmp/freedom-ipfs-offline-replay.db-1563279-1778023401850-shm   32K
+/tmp/freedom-ipfs-offline-replay.db-1563279-1778023401850-wal  2.3M
+```
+
+Implementation:
+
+- Change the harness storage-size helper so a file path counts:
+  - the main file
+  - `<path>-wal`
+  - `<path>-shm`
+- Keep directory storage measurement recursive, so Kubo repo sizing still works.
+- Add a focused unit test covering sidecar accounting.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness storage_size_counts_sqlite_sidecars
+cargo test -p mobile-web-harness offline_replay_summary_collects_failed_roots_and_assets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Focused result:
+
+- Formatting passed.
+- Sidecar storage-size test passed.
+- Offline replay summary test passed.
+- Harness clippy passed with `-D warnings`.
+
+Post-fix offline replay:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --offline-replay \
+  --offline-replay-resolved-ipfs \
+  --case ipfs-tech-page-assets \
+  --asset-concurrency 6 \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-resolved-offline-storage-sidecars-trace.jsonl \
+  --output /tmp/ipfs-tech-resolved-offline-storage-sidecars.json
+```
+
+Post-fix result:
+
+- Online pass: `1/1`.
+- Offline pass: `1/1`.
+- Missing URLs: `0`.
+- Offline statuses: `200=27`, `206=6`.
+- Offline storage bytes: `2574816B`.
+
+Decision:
+Keep. This is diagnostics-only, but it matters for mobile resource accounting:
+SQLite WAL mode can put most recently written cache bytes in the `-wal` file,
+so measuring only the main DB substantially understated storage after offline
+warmup.

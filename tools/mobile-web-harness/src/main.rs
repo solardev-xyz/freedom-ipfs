@@ -3631,7 +3631,7 @@ impl SpawnedGateway {
     fn storage_bytes(&self) -> Option<u64> {
         self.storage_path
             .as_ref()
-            .and_then(|path| path_size_bytes(path).ok())
+            .and_then(|path| storage_path_size_bytes(path).ok())
     }
 
     fn storage_path(&self) -> Option<String> {
@@ -3937,10 +3937,23 @@ async fn wait_for_kubo_api(child: &mut Child, api_port: u16) -> Result<()> {
     }
 }
 
-fn path_size_bytes(path: &PathBuf) -> std::io::Result<u64> {
+fn storage_path_size_bytes(path: &Path) -> std::io::Result<u64> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.is_file() {
-        return Ok(metadata.len());
+        let mut total = metadata.len();
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            match std::fs::symlink_metadata(PathBuf::from(sidecar)) {
+                Ok(sidecar_metadata) if sidecar_metadata.is_file() => {
+                    total = total.saturating_add(sidecar_metadata.len());
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+        return Ok(total);
     }
     if !metadata.is_dir() {
         return Ok(0);
@@ -3949,7 +3962,7 @@ fn path_size_bytes(path: &PathBuf) -> std::io::Result<u64> {
     let mut total = 0u64;
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
-        total = total.saturating_add(path_size_bytes(&entry.path())?);
+        total = total.saturating_add(storage_path_size_bytes(&entry.path())?);
     }
     Ok(total)
 }
@@ -9980,6 +9993,23 @@ mod tests {
         assert_eq!(summary.bitswap_seed_connect_ms.max_ms, Some(42));
         assert_eq!(summary.cases.len(), 1);
         assert_eq!(summary.cases[0].root_ttfb_ms.count, 2);
+    }
+
+    #[test]
+    fn storage_size_counts_sqlite_sidecars() {
+        let path = unique_temp_path("mobile-web-storage-size-test.db");
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let shm = PathBuf::from(format!("{}-shm", path.display()));
+        std::fs::write(&path, vec![0u8; 11]).unwrap();
+        std::fs::write(&wal, vec![0u8; 17]).unwrap();
+        std::fs::write(&shm, vec![0u8; 23]).unwrap();
+
+        let size = storage_path_size_bytes(&path).unwrap();
+
+        assert_eq!(size, 51);
+        for file in [&path, &wal, &shm] {
+            let _ = std::fs::remove_file(file);
+        }
     }
 
     #[test]
