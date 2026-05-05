@@ -4144,3 +4144,108 @@ cargo test -p freedom-ipfs-retrieval --lib multi_want_stream_fetches_multiple_bl
 cargo test -p freedom-ipfs-retrieval --lib
 git diff --check
 ```
+
+Rejected shared-client `fetch_many` refactor:
+
+- Attempted to refactor the shared Bitswap client around an internal
+  `fetch_many` path while keeping the existing single-CID `fetch` API as a
+  wrapper.
+- Added a deterministic local test proving the shared client could fetch two
+  CIDs through one local peer request.
+- Focused retrieval tests, full retrieval lib tests, gateway tests, `cargo
+  check`, `cargo clippy`, and a `vitalik-root-html-range` live smoke all passed.
+- Rejected anyway because same-window `ipfs.tech` evidence showed either failed
+  root loads or much worse asset latency than the current `f81d1f7` baseline.
+
+Validation that passed before rejection:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib shared_bitswap_client_fetches_multiple_blocks_in_one_request
+cargo test -p freedom-ipfs-retrieval --lib fetches_block_from_local_bitswap_peer
+cargo test -p freedom-ipfs-retrieval --lib dropped_bitswap_fetch_cancels_open_peer_stream
+cargo test -p freedom-ipfs-retrieval --lib want_have_probe_falls_back_to_want_block_quickly
+cargo test -p freedom-ipfs-retrieval --lib shared_bitswap_client_handles_repeated_block_fetches
+cargo test -p freedom-ipfs-retrieval --lib
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo build -p freedom-ipfs-gateway
+cargo test -p freedom-ipfs-gateway
+```
+
+Passing smoke from the rejected branch:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/vitalik-fetch-many-smoke-trace.jsonl \
+  --output /tmp/vitalik-fetch-many-smoke.json
+```
+
+Result: passed `1/1`, root TTFB `1488ms`, RSS/FD `38784KiB`/`28`. Trace
+summary showed `bitswap_fetch=2`, `bitswap deliveries: incoming=2`, and no
+request timeout. This proved the branch could still handle a narrow live
+gateway case, but it was insufficient because the broader `ipfs.tech` comparison
+regressed.
+
+Rejected live comparison:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-fetch-many-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-fetch-many-r3.json
+```
+
+Result: Rust failed `0/3` while Kubo passed `3/3`. The Rust root requests
+timed out with 504s, and the trace showed Bitswap request timeouts.
+
+Recheck:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 2 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-fetch-many-r2-recheck-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-fetch-many-r2-recheck.json
+```
+
+Result: Rust and Kubo both passed `2/2`, but Rust asset p95 was `4842ms` with
+max `9897ms`, versus Kubo asset p95 `562ms`. The trace showed 11 Bitswap
+request timeouts and trusted provider failures.
+
+Baseline from `f81d1f7` in `/tmp/freedom-ipfs-pre-fetch-many`:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 2 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-pre-fetch-many-f81d-r2-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-pre-fetch-many-f81d-r2.json
+```
+
+Result: Rust and Kubo both passed `2/2`. Rust root p50/p95 was `806/930ms`,
+asset p50/p95 was `129/269ms`, and max asset latency was `1026ms`; there was no
+matching request-timeout cluster.
+
+Decision: keep the stream-level multi-want test as a building block, but reject
+the shared-client production `fetch_many` refactor for now. The next attempt
+should not alter the current single-CID shared-client scheduling path until it
+can preserve same-window `ipfs.tech` root reliability and asset p95.
