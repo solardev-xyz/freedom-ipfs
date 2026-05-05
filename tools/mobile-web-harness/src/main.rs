@@ -4189,8 +4189,11 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         "provider_diversity_low" => "provider_diversity_low",
         "light_dht_provider_lookup" | "dht_provider_lookup" => "dht_fallback_started",
         "provider_fetch_start" => "providers_found",
+        "bitswap_dnsaddr_expand" | "bitswap_dns_multiaddr_expand" => "provider_lookup",
         "http_provider_fetch" => "fetching_http_provider",
         "bitswap_fetch"
+        | "bitswap_connection_established"
+        | "bitswap_incoming_block"
         | "bitswap_peer_attempt"
         | "bitswap_peer_attempt_start"
         | "bitswap_peer_expand"
@@ -4204,6 +4207,13 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         | "provider_retry_after_connection_timeout"
         | "bitswap_connection_error_backoff"
         | "bitswap_connection_error_peer_skipped"
+        | "bad_peer_skipped"
+        | "bitswap_client_reset"
+        | "bitswap_connection_error"
+        | "bitswap_dial_rejected"
+        | "bitswap_peer_timeout"
+        | "bitswap_peer_timeout_suppressed"
+        | "bitswap_provider_candidates_empty"
         | "bitswap_request_timeout"
         | "provider_retry_after_timeout"
         | "provider_retry_after_request_timeout"
@@ -4972,12 +4982,15 @@ mod tests {
                 "{\"phase\":\"provider_cache\",\"cid\":\"cid-a\",\"cache_hit\":false}\n",
                 "{\"phase\":\"provider_lookup\",\"cid\":\"cid-a\",\"provider_count\":3}\n",
                 "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid-a\",\"provider_count\":1,\"fallback\":\"light_dht\"}\n",
+                "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"peer.test\",\"record_count\":2}\n",
                 "{\"phase\":\"block_store_get\",\"cid\":\"cid-a\",\"cache_hit\":false}\n",
                 "{\"phase\":\"block_store_get\",\"cid\":\"cid-b\",\"cache_hit\":true}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-a\",\"ok\":true}\n",
                 "{\"phase\":\"bitswap_peer_expand\",\"cid\":\"cid-a\",\"peer_count\":2}\n",
+                "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer-a\",\"transport\":\"tcp\"}\n",
                 "{\"phase\":\"unixfs_resource\",\"path\":\"/ipns/site/\",\"ok\":true}\n",
                 "{\"phase\":\"bitswap_request_timeout\",\"cid\":\"cid-a\",\"peer_count\":2}\n",
+                "{\"phase\":\"bitswap_connection_error\",\"peer\":\"peer-b\",\"error\":\"timeout\"}\n",
                 "{\"phase\":\"gateway_limiter\",\"acquired\":false}\n",
                 "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipns/site/\",\"status\":200}\n",
                 "{\"phase\":\"request_done\",\"request_id\":2,\"path\":\"/ipns/missing/\",\"status\":503}\n",
@@ -4999,7 +5012,7 @@ mod tests {
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "provider_lookup"),
-            1
+            2
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "providers_found"),
@@ -5020,10 +5033,10 @@ mod tests {
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_bitswap"),
-            1
+            2
         );
         assert_eq!(trace_value_count(&summary.progress_phases, "streaming"), 1);
-        assert_eq!(trace_value_count(&summary.progress_phases, "retrying"), 1);
+        assert_eq!(trace_value_count(&summary.progress_phases, "retrying"), 2);
         assert_eq!(trace_value_count(&summary.progress_phases, "completed"), 1);
         assert_eq!(trace_value_count(&summary.progress_phases, "failed"), 2);
     }

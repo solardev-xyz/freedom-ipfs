@@ -5821,8 +5821,8 @@ Implementation:
   node.
 - Tighten the mobile progress mapper for name cache/resolution, provider cache,
   Bitswap peer expansion/dial plans, retry/backoff events, block-source totals,
-  and UnixFS/MIME response work so Swift sees stable UI phases instead of raw
-  trace names for common page-load events.
+  Bitswap DNS/address/connection events, and UnixFS/MIME response work so Swift
+  sees stable UI phases instead of raw trace names for common page-load events.
 - Update `docs/mobile-progress-api.md`, `docs/mobile-web-readiness/README.md`,
   and the top-level README with the new harness summary and stable phase list.
 
@@ -5839,7 +5839,18 @@ cargo test -p freedom-ipfs-retrieval --lib
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 git diff --check
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- --case vitalik-root-html-range --repeat 1 \
+  --fresh-gateway-per-run --asset-concurrency 6 \
+  --trace-output /tmp/vitalik-progress-summary-trace-2.jsonl \
+  --output /tmp/vitalik-progress-summary-2.json
 ```
 
-Result: validation passed. No live public-network harness run was performed for
-this small diagnostics increment.
+Result: validation passed. The live `vitalik-root-html-range` smoke passed
+`1/1`; after folding common Bitswap DNS/address/connection events into stable
+progress states, the console printed:
+
+```text
+progress phases: fetching_bitswap=20, provider_lookup=13, streaming=9,
+checking_cache=5, cache_hit=3, providers_found=2, completed=1, queued=1
+```

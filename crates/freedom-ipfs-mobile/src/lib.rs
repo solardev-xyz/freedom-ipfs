@@ -487,8 +487,11 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         "provider_diversity_low" => "provider_diversity_low",
         "light_dht_provider_lookup" | "dht_provider_lookup" => "dht_fallback_started",
         "provider_fetch_start" => "providers_found",
+        "bitswap_dnsaddr_expand" | "bitswap_dns_multiaddr_expand" => "provider_lookup",
         "http_provider_fetch" => "fetching_http_provider",
         "bitswap_fetch"
+        | "bitswap_connection_established"
+        | "bitswap_incoming_block"
         | "bitswap_peer_attempt"
         | "bitswap_peer_attempt_start"
         | "bitswap_peer_expand"
@@ -502,6 +505,13 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         | "provider_retry_after_connection_timeout"
         | "bitswap_connection_error_backoff"
         | "bitswap_connection_error_peer_skipped" => "retrying",
+        "bad_peer_skipped"
+        | "bitswap_client_reset"
+        | "bitswap_connection_error"
+        | "bitswap_dial_rejected"
+        | "bitswap_peer_timeout"
+        | "bitswap_peer_timeout_suppressed"
+        | "bitswap_provider_candidates_empty" => "retrying",
         "bitswap_request_timeout"
         | "provider_retry_after_timeout"
         | "provider_retry_after_request_timeout"
@@ -1904,8 +1914,24 @@ mod tests {
         );
         assert_eq!(
             progress_phase(
+                "bitswap_dnsaddr_expand",
+                &progress_fields([("phase", "bitswap_dnsaddr_expand"), ("record_count", "2")]),
+                "active",
+            ),
+            "provider_lookup"
+        );
+        assert_eq!(
+            progress_phase(
                 "bitswap_peer_expand",
                 &progress_fields([("phase", "bitswap_peer_expand"), ("peer_count", "3")]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_connection_established",
+                &progress_fields([("phase", "bitswap_connection_established")]),
                 "active",
             ),
             "fetching_bitswap"
@@ -1925,6 +1951,14 @@ mod tests {
                 "active",
             ),
             "fetching_http_provider"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_connection_error",
+                &progress_fields([("phase", "bitswap_connection_error"), ("error", "timeout")]),
+                "active",
+            ),
+            "retrying"
         );
         assert_eq!(
             progress_phase(
