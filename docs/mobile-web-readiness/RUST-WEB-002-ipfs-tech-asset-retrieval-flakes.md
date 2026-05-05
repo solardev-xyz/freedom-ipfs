@@ -18918,3 +18918,74 @@ provider suppression. It uses the existing verified raw-block path and the
 existing global HTTP-provider concurrency cap, and it directly improved the
 single-provider `ipfs-bridge.sia.dev` tail in the same-window A/B run. Continue
 watching self-hedge counts, HTTP-provider bytes, and FD/RSS in future runs.
+
+## 2026-05-05 Baseline: Self-Hedge Rust vs Kubo Refresh
+
+Question:
+After adding the narrow single-provider HTTP self-hedge, where does the current
+Rust gateway stand against Kubo on the focused `ipfs.tech` page workload?
+
+Command:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-self-hedge-kubo-comparison-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-self-hedge-kubo-comparison-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1024ms` / `1852ms`; Kubo `1800ms` /
+  `1811ms`; Rust ratio `0.57x` / `1.02x`.
+- Asset TTFB p50/p95: Rust `217ms` / `964ms`; Kubo `118ms` / `1919ms`;
+  Rust ratio `1.84x` / `0.50x`.
+- Max RSS/FD: Rust `53656KiB` / `39`; Kubo `291564KiB` / `385`.
+- Rust block-fetch sources:
+  - `http_provider`: count `50`, total `21502ms`, p50/p90/p95/max
+    `235ms` / `713ms` / `948ms` / `5284ms`.
+  - `bitswap`: count `67`, total `12148ms`, p50/p90/p95/max
+    `132ms` / `276ms` / `353ms` / `1362ms`.
+  - `cache`: count `1`, total `187ms`.
+- Delegated provider lookup: events `97`, successes `97`, failures `0`,
+  p50/p90/p95/max `25ms` / `53ms` / `278ms` / `5212ms`.
+- HTTP-provider races: events `45`, single `20`, multi `25`, successes `45`,
+  self-hedges `7`, result max `765ms`.
+- HTTP-provider fetches: p50/p90/p95/max `103ms` / `619ms` / `642ms` /
+  `765ms`.
+- Single-provider HTTP winners: `20`, all `https://ipfs-bridge.sia.dev/`,
+  p50/p90/p95/max `248ms` / `660ms` / `681ms` / `765ms`.
+- Provider detail:
+  `https://ipfs-bridge.sia.dev/` p50/p90/p95/max
+  `189ms` / `642ms` / `671ms` / `765ms`;
+  `https://dag.w3s.link/` p50/p90/p95/max
+  `49ms` / `103ms` / `114ms` / `190ms`.
+- Slowest Rust request:
+  `/ipns/ipfs.tech/_nuxt/community-hero.Cp0BCcC7.jpg` range request,
+  `5287ms` total. Its slow block was
+  `bafkreiam77queskklq2cjhaoywvlxvasghy4ydr77gmzagjioporv6xsy4`, with
+  `delegated_provider_lookup` taking `5212ms` before an HTTP-provider fetch
+  completed quickly enough to keep the HTTP-provider race result max at
+  `765ms`.
+
+Conclusion:
+The self-hedge path remains resource-friendly and visible: Rust still uses much
+less RSS/FD than Kubo, wins asset p95 by roughly half, and keeps
+single-provider `ipfs-bridge.sia.dev` fetch p95 under `700ms` in this window.
+The current root p95 miss against Kubo is not caused by the self-hedged HTTP
+fetch path; it is dominated by one delegated-router response that took `5.2s`
+to return headers/first chunk/first HTTP provider for a sparse hero-image
+block. The next promising target is therefore a narrow delegated-routing tail
+mitigation, such as bounded endpoint hedging or earlier fallback when
+`delegated-ipfs.dev` stalls before the first useful provider, while preserving
+the no-public-gateway-fallback and mobile resource constraints.
