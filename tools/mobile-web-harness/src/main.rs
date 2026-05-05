@@ -775,24 +775,7 @@ fn print_summary(report: &RunReport) {
             );
         }
         print_trace_unixfs_metadata_cache(trace);
-        if !trace.bitswap_source_peers.is_empty() {
-            println!(
-                "  bitswap source peers: {}",
-                format_trace_counts(&trace.bitswap_source_peers)
-            );
-        }
-        if !trace.bitswap_source_transports.is_empty() {
-            println!(
-                "  bitswap source transports: {}",
-                format_trace_counts(&trace.bitswap_source_transports)
-            );
-        }
-        if !trace.bitswap_deliveries.is_empty() {
-            println!(
-                "  bitswap deliveries: {}",
-                format_trace_counts(&trace.bitswap_deliveries)
-            );
-        }
+        print_trace_bitswap_sources(trace);
         if trace.bitswap_extra_blocks.events > 0 {
             let extra = &trace.bitswap_extra_blocks;
             println!(
@@ -805,16 +788,7 @@ fn print_summary(report: &RunReport) {
                 extra.unknown
             );
         }
-        if !trace.bitswap_peer_fetches.is_empty() {
-            println!("  bitswap peer fetches:");
-            for peer in trace.bitswap_peer_fetches.iter().take(8) {
-                let transports = format_trace_counts(&peer.transports);
-                println!(
-                    "    {}: count={} total={}ms max={}ms bytes={} transports={}",
-                    peer.peer, peer.count, peer.total_ms, peer.max_ms, peer.bytes, transports
-                );
-            }
-        }
+        print_trace_bitswap_peer_fetches(trace);
         if trace.bitswap_session.has_events() {
             let session = &trace.bitswap_session;
             println!(
@@ -1141,6 +1115,8 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_gateway_direct_body(trace);
     print_trace_bitswap_peer_attempts(trace);
     print_trace_bitswap_dial_plans(trace);
+    print_trace_bitswap_sources(trace);
+    print_trace_bitswap_peer_fetches(trace);
     if trace.bitswap_session.has_events() {
         let session = &trace.bitswap_session;
         println!(
@@ -1332,6 +1308,41 @@ fn format_trace_bitswap_peer_attempts(
         attempts.other_failures,
         attempts.prefer_want_have
     ))
+}
+
+fn print_trace_bitswap_sources(trace: &TraceSummary) {
+    if !trace.bitswap_source_peers.is_empty() {
+        println!(
+            "  bitswap source peers: {}",
+            format_trace_counts(&trace.bitswap_source_peers)
+        );
+    }
+    if !trace.bitswap_source_transports.is_empty() {
+        println!(
+            "  bitswap source transports: {}",
+            format_trace_counts(&trace.bitswap_source_transports)
+        );
+    }
+    if !trace.bitswap_deliveries.is_empty() {
+        println!(
+            "  bitswap deliveries: {}",
+            format_trace_counts(&trace.bitswap_deliveries)
+        );
+    }
+}
+
+fn print_trace_bitswap_peer_fetches(trace: &TraceSummary) {
+    if trace.bitswap_peer_fetches.is_empty() {
+        return;
+    }
+    println!("  bitswap peer fetches:");
+    for peer in trace.bitswap_peer_fetches.iter().take(8) {
+        let transports = format_trace_counts(&peer.transports);
+        println!(
+            "    {}: count={} total={}ms max={}ms bytes={} transports={}",
+            peer.peer, peer.count, peer.total_ms, peer.max_ms, peer.bytes, transports
+        );
+    }
 }
 
 fn print_trace_bitswap_dial_plans(trace: &TraceSummary) {
