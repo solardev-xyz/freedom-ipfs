@@ -762,6 +762,7 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.bitswap_connection_transports)
             );
         }
+        print_trace_connection_errors(trace);
         print_trace_dial_rejections(trace);
         if trace.bitswap_dns_expansion.events > 0 {
             let dns = &trace.bitswap_dns_expansion;
@@ -995,6 +996,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
             format_trace_counts(&trace.bitswap_connection_transports)
         );
     }
+    print_trace_connection_errors(trace);
     print_trace_dial_rejections(trace);
     if !trace.trace_errors.is_empty() {
         println!(
@@ -1102,6 +1104,21 @@ fn print_trace_dial_rejections(trace: &TraceSummary) {
         rejected.connection_limit,
         rejected.other,
         format_trace_counts(&trace.bitswap_dial_rejected_transports)
+    );
+}
+
+fn print_trace_connection_errors(trace: &TraceSummary) {
+    let errors = &trace.bitswap_connection_errors;
+    if errors.events == 0 {
+        return;
+    }
+    println!(
+        "  bitswap connection errors: events={} with_peer={} without_peer={} classes={} peers={}",
+        errors.events,
+        errors.with_peer,
+        errors.without_peer,
+        format_trace_counts(&errors.classes),
+        format_trace_counts(&errors.peers)
     );
 }
 
@@ -2869,6 +2886,7 @@ struct TraceSummary {
     bitswap_addr_mix: Vec<TraceValueCount>,
     bitswap_provider_quality: TraceBitswapProviderQualityAggregate,
     bitswap_connection_transports: Vec<TraceValueCount>,
+    bitswap_connection_errors: TraceBitswapConnectionErrorAggregate,
     bitswap_dial_rejections: TraceBitswapDialRejectedAggregate,
     bitswap_dial_rejected_transports: Vec<TraceValueCount>,
     bitswap_dns_expansion: TraceBitswapDnsExpansionAggregate,
@@ -3016,6 +3034,15 @@ struct TraceBitswapDialRejectedAggregate {
     events: usize,
     connection_limit: usize,
     other: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct TraceBitswapConnectionErrorAggregate {
+    events: usize,
+    with_peer: usize,
+    without_peer: usize,
+    classes: Vec<TraceValueCount>,
+    peers: Vec<TraceValueCount>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -3334,6 +3361,11 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_addr_mix = BTreeMap::<String, usize>::new();
     let mut bitswap_provider_quality = TraceBitswapProviderQualityAggregate::default();
     let mut bitswap_connection_transports = BTreeMap::<String, usize>::new();
+    let mut bitswap_connection_error_events = 0usize;
+    let mut bitswap_connection_error_with_peer = 0usize;
+    let mut bitswap_connection_error_without_peer = 0usize;
+    let mut bitswap_connection_error_classes = BTreeMap::<String, usize>::new();
+    let mut bitswap_connection_error_peers = BTreeMap::<String, usize>::new();
     let mut bitswap_dial_rejections = TraceBitswapDialRejectedAggregate::default();
     let mut bitswap_dial_rejected_transports = BTreeMap::<String, usize>::new();
     let mut bitswap_dns_expansion = TraceBitswapDnsExpansionAggregate::default();
@@ -3791,6 +3823,24 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 *bitswap_connection_transports.entry(transport).or_default() += 1;
             }
         }
+        if phase == "bitswap_connection_error" {
+            bitswap_connection_error_events += 1;
+            match json_detail_string(value.get("peer")).filter(|peer| !peer.is_empty()) {
+                Some(peer) => {
+                    bitswap_connection_error_with_peer += 1;
+                    *bitswap_connection_error_peers.entry(peer).or_default() += 1;
+                }
+                None => bitswap_connection_error_without_peer += 1,
+            }
+            let class = value
+                .get("error")
+                .and_then(|error| error.as_str())
+                .map(bitswap_connection_error_class)
+                .unwrap_or("other");
+            *bitswap_connection_error_classes
+                .entry(class.to_string())
+                .or_default() += 1;
+        }
         if phase == "bitswap_dial_rejected" {
             bitswap_dial_rejections.events += 1;
             if value
@@ -3932,6 +3982,13 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_addr_mix: sorted_trace_counts(bitswap_addr_mix),
         bitswap_provider_quality,
         bitswap_connection_transports: sorted_trace_counts(bitswap_connection_transports),
+        bitswap_connection_errors: TraceBitswapConnectionErrorAggregate {
+            events: bitswap_connection_error_events,
+            with_peer: bitswap_connection_error_with_peer,
+            without_peer: bitswap_connection_error_without_peer,
+            classes: sorted_trace_counts(bitswap_connection_error_classes),
+            peers: sorted_trace_counts(bitswap_connection_error_peers),
+        },
         bitswap_dial_rejections,
         bitswap_dial_rejected_transports: sorted_trace_counts(bitswap_dial_rejected_transports),
         bitswap_dns_expansion,
@@ -4034,6 +4091,22 @@ fn trace_error_key(phase: &str, value: &serde_json::Value) -> Option<String> {
         return Some(format!("{phase}: ok=false"));
     }
     None
+}
+
+fn bitswap_connection_error_class(error: &str) -> &'static str {
+    if error.contains("Protocol negotiation failed") {
+        "protocol_negotiation_failed"
+    } else if error.contains("Connection refused") {
+        "connection_refused"
+    } else if error.contains("Connection reset by peer") {
+        "connection_reset"
+    } else if error.contains("No route to host") {
+        "no_route_to_host"
+    } else if error.contains("Timeout has been reached") {
+        "timeout"
+    } else {
+        "other"
+    }
 }
 
 fn trace_event_path(value: &serde_json::Value) -> Option<String> {
@@ -4440,6 +4513,8 @@ mod tests {
                 "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":2,\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":true,\"source_peer\":\"peer1\",\"bitswap_delivery\":\"outgoing\",\"source_peer_trusted\":true,\"extra_blocks\":1}\n",
                 "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":3,\"cid\":\"cid9\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":false,\"timeout\":true}\n",
                 "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer1\",\"remote_addr\":\"/ip4/127.0.0.1/tcp/4001\",\"transport\":\"tcp\"}\n",
+                "{\"phase\":\"bitswap_connection_error\",\"peer\":\"peer3\",\"error\":\"Failed to negotiate transport protocol(s): Protocol negotiation failed.\"}\n",
+                "{\"phase\":\"bitswap_connection_error\",\"peer\":\"\",\"error\":\"Failed to negotiate transport protocol(s): Connection refused (os error 111)\"}\n",
                 "{\"phase\":\"bitswap_dial_rejected\",\"peer\":\"peer2\",\"transport\":\"quic\",\"connection_limit\":true,\"error\":\"Dial error\"}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bootstrap.example\",\"cached\":false,\"ok\":true,\"record_count\":2}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bootstrap.example\",\"cached\":true,\"ok\":true,\"record_count\":2}\n",
@@ -4464,8 +4539,8 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 30);
-        assert_eq!(summary.event_count, 29);
+        assert_eq!(summary.line_count, 32);
+        assert_eq!(summary.event_count, 31);
         assert_eq!(summary.slow_events.len(), 15);
         assert_eq!(
             summary.slow_events[0].phase,
@@ -4571,7 +4646,10 @@ mod tests {
             .iter()
             .map(|error| error.value.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(trace_errors.len(), 5);
+        assert_eq!(trace_errors.len(), 7);
+        assert!(trace_errors.iter().any(|error| {
+            error.starts_with("bitswap_connection_error: Failed to negotiate transport protocol")
+        }));
         assert!(trace_errors.contains(&"bitswap_dial_rejected: Dial error"));
         assert!(trace_errors.contains(&"bitswap_dnsaddr_expand: ok=false"));
         assert!(trace_errors.contains(&"bitswap_fetch: ok=false"));
@@ -4658,6 +4736,19 @@ mod tests {
         assert_eq!(summary.bitswap_connection_transports.len(), 1);
         assert_eq!(summary.bitswap_connection_transports[0].value, "tcp");
         assert_eq!(summary.bitswap_connection_transports[0].count, 1);
+        assert_eq!(summary.bitswap_connection_errors.events, 2);
+        assert_eq!(summary.bitswap_connection_errors.with_peer, 1);
+        assert_eq!(summary.bitswap_connection_errors.without_peer, 1);
+        assert_eq!(
+            summary.bitswap_connection_errors.classes[0].value,
+            "connection_refused"
+        );
+        assert_eq!(
+            summary.bitswap_connection_errors.classes[1].value,
+            "protocol_negotiation_failed"
+        );
+        assert_eq!(summary.bitswap_connection_errors.peers[0].value, "peer3");
+        assert_eq!(summary.bitswap_connection_errors.peers[0].count, 1);
         assert_eq!(summary.bitswap_dial_rejected_transports.len(), 1);
         assert_eq!(summary.bitswap_dial_rejected_transports[0].value, "quic");
         assert_eq!(summary.bitswap_dial_rejected_transports[0].count, 1);

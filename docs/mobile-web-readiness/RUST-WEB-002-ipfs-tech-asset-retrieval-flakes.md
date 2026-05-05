@@ -5554,3 +5554,65 @@ protocol negotiation failures need to be tracked from swarm dial/connection
 events or addressed with peer selection/backpressure, not by suppressing
 completed outgoing Bitswap attempts that rarely materialize for this failure
 shape.
+
+## 2026-05-05 Keep: Summarize Bitswap Connection Errors
+
+Goal:
+
+- Move repeated `bitswap_connection_error` details out of the long
+  `trace_errors` string and into a compact aggregate by failure class and peer.
+- Make the next peer-selection/backpressure experiment measurable without
+  manually grepping trace JSONL.
+
+Implementation:
+
+- Add `bitswap connection errors` to normal and Rust/Kubo comparison trace
+  summaries.
+- Count total events, with-peer versus without-peer events, top peers, and
+  classes:
+  - `protocol_negotiation_failed`
+  - `connection_refused`
+  - `connection_reset`
+  - `no_route_to_host`
+  - `timeout`
+  - `other`
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+cargo test -p mobile-web-harness
+git diff --check
+```
+
+Live validation:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-connection-error-summary-r1-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-connection-error-summary-r1.json
+```
+
+Result: Rust failed `0/1`; Kubo passed `1/1`. Rust root TTFB was `6409ms`
+versus Kubo `3115ms`; Rust asset TTFB p95 was `8343ms` versus Kubo `241ms`.
+
+The new summary line exposed the connection failure shape directly:
+
+- `bitswap connection errors: events=20 with_peer=20 without_peer=0
+  classes=protocol_negotiation_failed=6, timeout=5, connection_refused=3,
+  connection_reset=3, no_route_to_host=2, other=1`
+- Top peer:
+  `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT=6`
+
+Decision: keep. This is diagnostics-only, but it identifies repeated
+connection-level failures by peer and class. The next behavior work should use
+this signal for bounded peer backoff or smarter candidate selection, instead of
+trying to infer repeated bad peers from request timeouts alone.
