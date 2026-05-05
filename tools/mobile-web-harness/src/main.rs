@@ -1529,7 +1529,18 @@ async fn maybe_revalidate_response(
     {
         return None;
     }
-    let etag = response.etag.as_deref()?;
+    let Some(etag) = response.etag.as_deref() else {
+        return Some(RevalidationResult {
+            status: None,
+            etag: None,
+            cache_control: response.cache_control.clone(),
+            body_bytes: 0,
+            ttfb_ms: 0,
+            total_ms: 0,
+            passed: false,
+            failures: vec!["response omitted ETag".to_string()],
+        });
+    };
     Some(fetch_revalidation(client, url, etag).await)
 }
 
@@ -6075,6 +6086,36 @@ mod tests {
             .failure_groups
             .iter()
             .any(|group| group.key.contains("conditional revalidation")));
+    }
+
+    #[tokio::test]
+    async fn conditional_revalidation_requires_etag_for_eligible_gets() {
+        let client = reqwest::Client::new();
+        let response = FetchResponse {
+            status: 200,
+            content_type: Some("text/plain".to_string()),
+            content_range: None,
+            etag: None,
+            cache_control: Some("public, max-age=31536000, immutable".to_string()),
+            body: b"hello".to_vec(),
+            ttfb_ms: 1,
+            total_ms: 1,
+        };
+
+        let revalidation = maybe_revalidate_response(
+            &client,
+            "http://127.0.0.1:9/ipfs/root",
+            "GET",
+            None,
+            &response,
+            true,
+        )
+        .await
+        .expect("eligible GET should produce a revalidation result");
+
+        assert!(!revalidation.passed);
+        assert_eq!(revalidation.status, None);
+        assert_eq!(revalidation.failures, vec!["response omitted ETag"]);
     }
 
     #[test]

@@ -6152,15 +6152,15 @@ Implementation:
 
 - Add `--conditional-revalidate` to `mobile-web-harness`.
 - Capture `ETag` and `Cache-Control` on root and crawl asset responses.
-- For each successful non-range `GET` with an `ETag`, issue a second `GET` with
-  `If-None-Match`.
+- For each successful non-range `GET`, require an `ETag` and issue a second
+  `GET` with `If-None-Match`.
 - Record each revalidation as JSON on the root/asset result:
   `status`, `etag`, `cache_control`, `body_bytes`, `ttfb_ms`, `total_ms`,
   `passed`, and `failures`.
 - Aggregate root and asset revalidation attempts, passes, failures, and TTFB
   summaries per case.
-- Treat an attempted revalidation that does not return an empty `304` as a
-  harness failure. Range requests are skipped.
+- Treat a missing `ETag` or attempted revalidation that does not return an empty
+  `304` as a harness failure. Range requests are skipped.
 
 Validation:
 
@@ -6176,22 +6176,22 @@ timeout 300s cargo run -p mobile-web-harness -- \
   --asset-concurrency 6 \
   --conditional-revalidate \
   --run-timeout-secs 240 \
-  --trace-output /tmp/ipfs-tech-conditional-revalidate-trace.jsonl \
-  --output /tmp/ipfs-tech-conditional-revalidate.json
+  --trace-output /tmp/ipfs-tech-conditional-revalidate-strict-trace.jsonl \
+  --output /tmp/ipfs-tech-conditional-revalidate-strict.json
 ```
 
 Live result:
 
 - `ipfs-tech-page-assets` passed `1/1`.
-- Root TTFB was `756ms`; total run was `2981ms`.
-- Root revalidation passed `1/1`, `304`, empty body, TTFB `19ms`.
-- Asset revalidation passed `26/26`, all `304`, empty bodies, TTFB p50 `5ms`,
-  p90 `12ms`, p95 `21ms`, max `23ms`.
+- Root TTFB was `943ms`; total run was `2684ms`.
+- Root revalidation passed `1/1`, `304`, empty body, TTFB `21ms`.
+- Asset revalidation passed `26/26`, all `304`, empty bodies, TTFB p50 `3ms`,
+  p90 `5ms`, p95 `12ms`, max `32ms`.
 - Trace showed gateway response statuses `200=27`, `304=27`, `206=6`.
 - Trace contained `27` `gateway_conditional` events.
 - Evidence paths:
-  - `/tmp/ipfs-tech-conditional-revalidate.json`
-  - `/tmp/ipfs-tech-conditional-revalidate-trace.jsonl`
+  - `/tmp/ipfs-tech-conditional-revalidate-strict.json`
+  - `/tmp/ipfs-tech-conditional-revalidate-strict-trace.jsonl`
 
 Conclusion: keep the harness mode. It gives future warm-path and browser-cache
 experiments a direct regression signal without changing normal harness behavior.
