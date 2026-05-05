@@ -7247,3 +7247,84 @@ already verified single-chunk responses, and resource use stayed low. Cold
 network runs remain governed by provider discovery and Bitswap peer quality, so
 the next higher-leverage work should return to provider/session behavior rather
 than expanding this direct-body path.
+
+## 2026-05-05 Parked: Raising Pending Bitswap Dial Cap
+
+Hypothesis:
+The cold direct-body run still showed many connection-limit dial rejections:
+`116` rejected dials, mostly TCP, with only `14` established Bitswap
+connections. Since established connections stayed below the configured cap,
+raising only `BITSWAP_MAX_PENDING_OUTGOING_CONNECTIONS` from `16` to `24`
+might reduce cold asset tails without increasing the steady established
+connection bound.
+
+Change tested:
+
+```rust
+const BITSWAP_MAX_PENDING_OUTGOING_CONNECTIONS: u32 = 24;
+const BITSWAP_MAX_ESTABLISHED_CONNECTIONS: u32 = 16;
+```
+
+Validation before live run:
+
+```sh
+cargo test -p freedom-ipfs-retrieval
+cargo build -p freedom-ipfs-gateway
+```
+
+Experiment:
+
+```sh
+timeout 360s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/ipfs-tech-pending24-cold-rust-vs-kubo-trace.jsonl \
+  --output /tmp/ipfs-tech-pending24-cold-rust-vs-kubo.json
+```
+
+Experiment result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1769/2873ms`, Kubo `1655/2696ms`.
+- Asset TTFB p50/p95: Rust `182/730ms`, Kubo `140/841ms`.
+- Max RSS/FD: Rust `50508KiB`/`51`, Kubo `164792KiB`/`76`.
+- Bitswap connection-limit dial rejections disappeared from the summary.
+- Established Bitswap TCP connections rose to `30`.
+
+Same-window baseline after reverting the cap to `16`:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+timeout 360s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/ipfs-tech-pending16-samewindow-cold-rust-vs-kubo-trace.jsonl \
+  --output /tmp/ipfs-tech-pending16-samewindow-cold-rust-vs-kubo.json
+```
+
+Same-window baseline result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `901/2258ms`, Kubo `2375/2445ms`.
+- Asset TTFB p50/p95: Rust `139/641ms`, Kubo `83/203ms`.
+- Max RSS/FD: Rust `50092KiB`/`48`, Kubo `187488KiB`/`117`.
+- Bitswap dial rejections: `14`, all connection-limit, transports
+  `tcp=12`, `quic=2`.
+- Established Bitswap TCP connections: `23`.
+
+Decision: do not keep. Raising the pending dial cap proved that the rejections
+are tunable, but it did not improve the same-window Rust latency sample and it
+increased FD usage slightly. The better next experiment is more selective:
+preserve the mobile connection caps while improving which peers get the limited
+pending dial slots, especially by using provider/session quality signals rather
+than simply allowing more simultaneous dials.
