@@ -6298,3 +6298,125 @@ Decision:
 Follow-up: the next behavior experiment should target `vitalik-root-html-range`
 or `ipfs.tech` asset p50, not DAICO, unless the goal is specifically
 sparse-provider failure handling.
+
+## 2026-05-05 Direct Untrusted WANT_BLOCK Cap Recheck
+
+Hypothesis: the `vitalik-root-html-range` tail is dominated by a mixed-trusted
+Bitswap request timeout, followed by a retry that succeeds only after another
+provider response arrives. Letting one more untrusted provider receive an
+optimistic direct `WANT_BLOCK` before falling back to `WANT_HAVE` may reduce the
+post-timeout recovery delay without materially increasing mobile resource use.
+
+Experiment:
+
+- Increase `MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS` from `2` to `3`.
+- Keep the existing bounded peer caps and request timeout behavior unchanged.
+- Rebuild `freedom-ipfs-gateway` before each live run because the harness starts
+  `target/debug/freedom-ipfs-gateway`.
+
+The first cap-3 run at `/tmp/vitalik-direct3-rust-vs-kubo.*` was discarded
+because it used a stale gateway binary. The first rebuilt run was consistent
+with the second run below:
+
+- Evidence: `/tmp/vitalik-direct3-rebuilt-rust-vs-kubo.json`,
+  `/tmp/vitalik-direct3-rebuilt-rust-vs-kubo-trace.jsonl`.
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `5681/5819ms`, Kubo `1642/2141ms`.
+- Retry success elapsed p50/max: Rust `133/133ms`.
+
+Second cap-3 Rust/Kubo sample:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/vitalik-direct3-rebuilt-r2-trace.jsonl \
+  --output /tmp/vitalik-direct3-rebuilt-r2.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `5707/6033ms`, Kubo `1702/2055ms`.
+- Max RSS/FD: Rust `38912KiB`/`28`, Kubo `191032KiB`/`110`.
+- Trace: `request_timeout_details=3`, all `mixed_trusted`, all `timeout_ms=4000`.
+- Retry recovery: `retry_successes=3`, all `untrusted_retry_successes=3`,
+  `retry_success_elapsed=p50=133ms p95=137ms max=137ms`.
+- Target modes: `want_block=12`, `want_have=15`, `max_want_block=4`,
+  `max_want_have=5`.
+
+Temporary cap-2 recheck in the same network window:
+
+```sh
+# Temporarily restore only MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS=2.
+cargo build -p freedom-ipfs-gateway
+
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/vitalik-direct2-recheck-trace.jsonl \
+  --output /tmp/vitalik-direct2-recheck.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `6394/6597ms`, Kubo `1689/1949ms`.
+- Max RSS/FD: Rust `39168KiB`/`28`, Kubo `180252KiB`/`105`.
+- Trace: `request_timeout_details=3`, all `mixed_trusted`, all `timeout_ms=4000`.
+- Retry recovery: `retry_successes=3`, all `trusted_retry_successes=3`,
+  `retry_success_elapsed=p50=880ms p95=1042ms max=1042ms`.
+- Target modes: `want_block=9`, `want_have=18`, `max_want_block=3`,
+  `max_want_have=6`.
+
+The cap-3 change does not eliminate the initial 4s mixed-trusted timeout, so it
+is not the final `vitalik` fix. It does make the bounded retry recover much
+faster in this repeatable failure shape, with no observed RSS/FD increase.
+
+Page workload guardrail:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+
+timeout 360s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/ipfs-tech-direct3-rust-vs-kubo-trace.jsonl \
+  --output /tmp/ipfs-tech-direct3-rust-vs-kubo.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `2852/3428ms`, Kubo `3789/11305ms`.
+- Asset TTFB p50/p95: Rust `137/1065ms`, Kubo `190/1250ms`.
+- Max RSS/FD: Rust `50716KiB`/`49`, Kubo `298840KiB`/`564`.
+- Trace: `request_timeouts_with_trusted=0`, `trusted_successes=8`,
+  `untrusted_successes=8`, `shortcut_hits=89`.
+- Connection churn stayed bounded: `bitswap connection backoff: backoffs=1
+  skipped=1`; dial rejections were present but did not break the run.
+
+Decision: keep the cap-3 experiment. It is a small, bounded increase in
+optimistic direct Bitswap fanout, improves the observed `vitalik` timeout
+recovery path, and does not regress the current `ipfs.tech` page-assets
+guardrail. The remaining `vitalik` gap is the initial mixed-trusted request
+timeout itself; future experiments should try to avoid waiting the full 4s when
+the trusted/session candidate is stale and untrusted candidates are already
+delivering nearby blocks.

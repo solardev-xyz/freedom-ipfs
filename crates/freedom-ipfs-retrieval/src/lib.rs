@@ -75,7 +75,7 @@ const MAX_BITSWAP_ADDRS_PER_PEER: usize = 2;
 // Race a small number of untrusted providers with WANT_BLOCK before falling
 // back to conservative WANT_HAVE probes for the rest. This lowers page-asset
 // tails without requesting every block from every provider candidate.
-const MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS: usize = 2;
+const MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS: usize = 3;
 const MAX_BITSWAP_FAILURE_DETAILS: usize = 8;
 const MAX_RECORDED_DIAL_ERRORS_PER_PEER: usize = 6;
 const MAX_INFLIGHT_BLOCK_FETCHES: usize = 256;
@@ -3731,6 +3731,7 @@ mod bitswap_tests {
         let second = parse_peer_id("12D3KooWGU3fJrHaWtRSWyrrzCpdgFX5bxbS69hqL1MSdKMGez12").unwrap();
         let third = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
         let fourth = parse_peer_id("12D3KooWGtYkBAaqJMJEmywMxaCiNP7LCEFUAFiLEBASe232c2VH").unwrap();
+        let fifth = parse_peer_id("12D3KooWCL2pXbQVaVnJntNZFNvz58PdY9gXo2R6NJajnDyhzxc4").unwrap();
         let peers = vec![
             BitswapPeer {
                 id: first,
@@ -3758,15 +3759,20 @@ mod bitswap_tests {
                 addrs: Vec::new(),
                 skip_want_have: false,
             },
+            BitswapPeer {
+                id: fifth,
+                addrs: Vec::new(),
+                skip_want_have: false,
+            },
         ];
 
         assert_eq!(
             format_bitswap_peers(&peers),
             format!(
-                "{first}:want-block@[/ip4/127.0.0.1/tcp/1001,/ip4/127.0.0.1/tcp/1002,+3 more]; {second}:want-block@[]; {third}:want-block@[]; {fourth}:want-have@[]"
+                "{first}:want-block@[/ip4/127.0.0.1/tcp/1001,/ip4/127.0.0.1/tcp/1002,+3 more]; {second}:want-block@[]; {third}:want-block@[]; {fourth}:want-block@[]; {fifth}:want-have@[]"
             )
         );
-        assert_eq!(bitswap_request_target_mode_counts(&peers), (3, 1));
+        assert_eq!(bitswap_request_target_mode_counts(&peers), (4, 1));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4356,6 +4362,8 @@ mod bitswap_tests {
             spawn_closing_bitswap_peer_expect_want_block(cid).await;
         let (second_peer_id, second_addr, second_swarm, second_stream) =
             spawn_closing_bitswap_peer_expect_want_block(cid).await;
+        let (third_peer_id, third_addr, third_swarm, third_stream) =
+            spawn_closing_bitswap_peer_expect_want_block(cid).await;
         let (present_peer_id, present_addr, present_swarm, present_stream) =
             spawn_want_have_bitswap_peer_with_presence_delay(
                 cid,
@@ -4382,6 +4390,11 @@ mod bitswap_tests {
             )
             .unwrap(),
             Provider::from_parts(
+                Some(third_peer_id.to_string()),
+                vec![third_addr.to_string()],
+            )
+            .unwrap(),
+            Provider::from_parts(
                 Some(present_peer_id.to_string()),
                 vec![present_addr.to_string()],
             )
@@ -4403,12 +4416,17 @@ mod bitswap_tests {
             .await
             .unwrap()
             .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), third_stream)
+            .await
+            .unwrap()
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(5), present_stream)
             .await
             .unwrap()
             .unwrap();
         first_swarm.abort();
         second_swarm.abort();
+        third_swarm.abort();
         present_swarm.abort();
     }
 
@@ -4419,6 +4437,8 @@ mod bitswap_tests {
         let (first_peer_id, first_addr, first_swarm, first_stream) =
             spawn_closing_bitswap_peer_expect_want_block(cid).await;
         let (second_peer_id, second_addr, second_swarm, second_stream) =
+            spawn_closing_bitswap_peer_expect_want_block(cid).await;
+        let (third_peer_id, third_addr, third_swarm, third_stream) =
             spawn_closing_bitswap_peer_expect_want_block(cid).await;
         let (missing_peer_id, missing_addr, missing_swarm, missing_stream) =
             spawn_want_have_bitswap_peer(cid, data.to_vec(), false).await;
@@ -4439,6 +4459,11 @@ mod bitswap_tests {
             Provider::from_parts(
                 Some(second_peer_id.to_string()),
                 vec![second_addr.to_string()],
+            )
+            .unwrap(),
+            Provider::from_parts(
+                Some(third_peer_id.to_string()),
+                vec![third_addr.to_string()],
             )
             .unwrap(),
             Provider::from_parts(
@@ -4473,6 +4498,10 @@ mod bitswap_tests {
             .await
             .unwrap()
             .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), third_stream)
+            .await
+            .unwrap()
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(5), missing_stream)
             .await
             .unwrap()
@@ -4483,6 +4512,7 @@ mod bitswap_tests {
             .unwrap();
         first_swarm.abort();
         second_swarm.abort();
+        third_swarm.abort();
         missing_swarm.abort();
         present_swarm.abort();
     }
