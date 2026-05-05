@@ -15,6 +15,7 @@ use thiserror::Error;
 
 const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_HOT_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_NAME_CACHE_RECORDS: i64 = 128;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -102,6 +103,14 @@ impl SqliteBlockStore {
                 providers_json TEXT NOT NULL,
                 expires_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS name_cache (
+                name TEXT PRIMARY KEY NOT NULL,
+                resolved_target TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS name_cache_updated_at
+                ON name_cache(updated_at);
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
@@ -253,6 +262,50 @@ impl SqliteBlockStore {
         Ok(Some(serde_json::from_str(&providers_json)?))
     }
 
+    pub fn put_name_record(&self, name: &str, resolved_target: &str, ttl: Duration) -> Result<()> {
+        if ttl.is_zero() {
+            return Ok(());
+        }
+        let now = now_secs();
+        let expires_at = now.saturating_add(ttl.as_secs());
+        self.conn.lock().execute(
+            r#"
+            INSERT INTO name_cache(name, resolved_target, expires_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(name) DO UPDATE SET
+                resolved_target = excluded.resolved_target,
+                expires_at = excluded.expires_at,
+                updated_at = excluded.updated_at
+            "#,
+            params![name, resolved_target, expires_at as i64, now as i64],
+        )?;
+        self.prune_name_cache()?;
+        Ok(())
+    }
+
+    pub fn get_name_record(&self, name: &str) -> Result<Option<String>> {
+        let row = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT resolved_target, expires_at FROM name_cache WHERE name = ?1",
+                params![name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+
+        let Some((resolved_target, expires_at)) = row else {
+            return Ok(None);
+        };
+        if expires_at <= now_secs() as i64 {
+            self.conn
+                .lock()
+                .execute("DELETE FROM name_cache WHERE name = ?1", params![name])?;
+            return Ok(None);
+        }
+        Ok(Some(resolved_target))
+    }
+
     pub fn mark_bad_provider(&self, peer_or_url: &str, reason: &str, ttl: Duration) -> Result<()> {
         let expires_at = now_secs().saturating_add(ttl.as_secs());
         self.conn.lock().execute(
@@ -315,6 +368,7 @@ impl SqliteBlockStore {
         self.conn.lock().execute("DELETE FROM blocks", [])?;
         self.conn.lock().execute("DELETE FROM provider_cache", [])?;
         self.conn.lock().execute("DELETE FROM bad_providers", [])?;
+        self.conn.lock().execute("DELETE FROM name_cache", [])?;
         self.hot.lock().clear();
         Ok(())
     }
@@ -322,6 +376,7 @@ impl SqliteBlockStore {
     pub fn clear_provider_metadata(&self) -> Result<()> {
         self.conn.lock().execute("DELETE FROM provider_cache", [])?;
         self.conn.lock().execute("DELETE FROM bad_providers", [])?;
+        self.conn.lock().execute("DELETE FROM name_cache", [])?;
         Ok(())
     }
 
@@ -339,6 +394,27 @@ impl SqliteBlockStore {
 
     fn evict_if_needed(&self) -> Result<()> {
         self.evict_until(self.max_bytes)
+    }
+
+    fn prune_name_cache(&self) -> Result<()> {
+        let now = now_secs() as i64;
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM name_cache WHERE expires_at <= ?1",
+            params![now],
+        )?;
+        conn.execute(
+            r#"
+            DELETE FROM name_cache
+            WHERE name IN (
+                SELECT name FROM name_cache
+                ORDER BY updated_at DESC, name DESC
+                LIMIT -1 OFFSET ?1
+            )
+            "#,
+            params![MAX_NAME_CACHE_RECORDS],
+        )?;
+        Ok(())
     }
 
     fn evict_until(&self, max_bytes: u64) -> Result<()> {
@@ -600,11 +676,20 @@ mod tests {
         let data = b"hot cache clear";
         let cid = cid_from_data(CODEC_RAW, data);
         store.put_block(&cid, data).unwrap();
+        store
+            .put_name_record(
+                "example.test",
+                "/ipfs/bafkqaddwgevxmmraojswg33smq",
+                Duration::from_secs(60),
+            )
+            .unwrap();
         assert_eq!(store.get(&cid).unwrap().unwrap().data(), data);
+        assert!(store.get_name_record("example.test").unwrap().is_some());
 
         store.clear().unwrap();
 
         assert!(store.get(&cid).unwrap().is_none());
+        assert!(store.get_name_record("example.test").unwrap().is_none());
     }
 
     #[test]
@@ -681,6 +766,60 @@ mod tests {
         store.trim_blocks_to(0).unwrap();
 
         assert_eq!(store.block_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn caches_name_records_with_ttl() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+
+        store
+            .put_name_record(
+                "example.test",
+                "/ipfs/bafkqaddwgevxmmraojswg33smq",
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.get_name_record("example.test").unwrap().as_deref(),
+            Some("/ipfs/bafkqaddwgevxmmraojswg33smq")
+        );
+        assert!(store.get_name_record("missing.test").unwrap().is_none());
+    }
+
+    #[test]
+    fn skips_zero_ttl_name_records() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+
+        store
+            .put_name_record("example.test", "/ipfs/bafyroot", Duration::ZERO)
+            .unwrap();
+
+        assert!(store.get_name_record("example.test").unwrap().is_none());
+    }
+
+    #[test]
+    fn bounds_name_cache_records() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+
+        for index in 0..(MAX_NAME_CACHE_RECORDS + 2) {
+            store
+                .put_name_record(
+                    &format!("name-{index:03}.test"),
+                    "/ipfs/bafyroot",
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+        }
+
+        let count = store
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM name_cache", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(count, MAX_NAME_CACHE_RECORDS);
     }
 
     #[test]

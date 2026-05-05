@@ -6019,3 +6019,78 @@ Conclusion: the current warmed `ipfs.tech` page-assets cache is complete enough
 to replay via immutable `/ipfs` paths after a restart. The remaining offline
 failure for the original `/ipns/ipfs.tech/` URL is specifically the lack of
 offline name-resolution state or host-side rewrite policy.
+
+## 2026-05-05 Persistent Name Cache For Offline IPNS Replay
+
+Hypothesis: if successful DNSLink/IPNS resolutions are persisted with bounded
+TTL, a warmed `/ipns/...` page can replay offline after a process restart
+without rewriting the URL to `/ipfs/...`.
+
+Implementation:
+
+- Add a bounded `name_cache` table to the SQLite store:
+  - `name`
+  - `resolved_target`
+  - `expires_at`
+  - `updated_at`
+- Store at most 128 name records and prune expired records on insert/read.
+- Add `PersistentNameResolver` in the gateway crate. Online gateways wrap the
+  normal resolver with it, so successful `/ipfs/...` or `/ipns/...` resolutions
+  are persisted with `min(upstream_ttl, 1h)`.
+- Offline CLI and mobile gateways use `PersistentNameResolver::cache_only`, so
+  they can resolve still-valid names from SQLite but do not perform network
+  name resolution.
+- Map `name_persistent_cache` trace events to mobile/harness progress phase
+  `name_resolved` on cache hit and `resolving_name` on miss.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-store
+cargo test -p freedom-ipfs-gateway
+cargo test -p freedom-ipfs-mobile
+cargo test -p mobile-web-harness
+cargo build -p freedom-ipfs-gateway
+rm -f /tmp/freedom-ipfs-offline-replay-ipfs-tech-persistent-name.db \
+  /tmp/freedom-ipfs-offline-replay-ipfs-tech-persistent-name.db-* \
+  /tmp/ipfs-tech-offline-replay-persistent-name*.json \
+  /tmp/ipfs-tech-offline-replay-persistent-name*.jsonl
+cargo run -p mobile-web-harness -- --case ipfs-tech-page-assets \
+  --repeat 1 --asset-concurrency 6 --run-timeout-secs 120 \
+  --gateway-db /tmp/freedom-ipfs-offline-replay-ipfs-tech-persistent-name.db \
+  --offline-replay \
+  --trace-output /tmp/ipfs-tech-offline-replay-persistent-name-trace.jsonl \
+  --output /tmp/ipfs-tech-offline-replay-persistent-name.json
+```
+
+Result: validation passed. The original `/ipns/ipfs.tech/` offline replay now
+passed without the resolved-IPFS rewrite: online `1/1`, offline `1/1`,
+`missing_urls=0`. Offline statuses were `200=27, 206=6`; offline progress
+phases were `streaming=199, name_resolved=66, completed=33, queued=33,
+started=33`; offline trace errors were empty. The offline trace showed
+`name_persistent_cache` hits for `ipfs.tech` and zero provider/Bitswap/HTTP
+provider fetch phases:
+
+```text
+provider_lookup=0
+bitswap_fetch=0
+http_provider_fetch=0
+provider_cache=0
+block_fetch_total=0
+```
+
+Evidence:
+
+- `/tmp/ipfs-tech-offline-replay-persistent-name.json`
+- `/tmp/ipfs-tech-offline-replay-persistent-name-trace-online.jsonl` (`907`
+  lines)
+- `/tmp/ipfs-tech-offline-replay-persistent-name-trace-offline.jsonl` (`364`
+  lines)
+- `/tmp/freedom-ipfs-offline-replay-ipfs-tech-persistent-name.db`
+
+Conclusion: immediate offline replay for warmed DNSLink/IPNS pages now works
+for the original URL while the resolved name record is TTL-valid. This keeps the
+node read-only and cache-only offline; the remaining product decision is how
+strictly the app should treat expired mutable-name records versus offering a
+host-side "last resolved immutable path" replay affordance.

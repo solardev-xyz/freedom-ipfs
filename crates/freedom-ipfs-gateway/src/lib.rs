@@ -8,7 +8,7 @@ use axum::Router;
 use bytes::Bytes;
 use cid::Cid;
 use freedom_ipfs_core::{parse_cid, BlockProvider};
-use freedom_ipfs_namesys::{NameResolver, NamesysError};
+use freedom_ipfs_namesys::{NameResolver, NamesysError, ResolvedName};
 use freedom_ipfs_store::SqliteBlockStore;
 use freedom_ipfs_unixfs::{
     DirectoryEntry, UnixfsError, UnixfsMetadataCacheStats, UnixfsResolver,
@@ -20,7 +20,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::Instrument;
@@ -31,6 +31,7 @@ const X_FREEDOM_REQUEST_ID: &str = "x-freedom-request-id";
 const X_FREEDOM_PARENT_REQUEST_ID: &str = "x-freedom-parent-request-id";
 const X_FREEDOM_TOP_LEVEL_PATH: &str = "x-freedom-top-level-path";
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+const DEFAULT_PERSISTENT_NAME_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
@@ -157,13 +158,94 @@ pub fn router_with_provider_and_name_resolver_config(
 }
 
 #[derive(Debug, Clone)]
-struct OfflineNameResolver;
+pub struct OfflineNameResolver;
 
 #[async_trait::async_trait]
 impl NameResolver for OfflineNameResolver {
     async fn resolve_name(&self, name: &str) -> freedom_ipfs_namesys::Result<String> {
         Err(NamesysError::NotFound(name.to_string()))
     }
+}
+
+#[derive(Clone)]
+pub struct PersistentNameResolver<R> {
+    inner: R,
+    store: SqliteBlockStore,
+    ttl: Duration,
+}
+
+impl<R> PersistentNameResolver<R> {
+    pub fn new(inner: R, store: SqliteBlockStore) -> Self {
+        Self::with_ttl(inner, store, DEFAULT_PERSISTENT_NAME_CACHE_TTL)
+    }
+
+    pub fn with_ttl(inner: R, store: SqliteBlockStore, ttl: Duration) -> Self {
+        Self { inner, store, ttl }
+    }
+}
+
+impl PersistentNameResolver<OfflineNameResolver> {
+    pub fn cache_only(store: SqliteBlockStore) -> Self {
+        Self::new(OfflineNameResolver, store)
+    }
+}
+
+#[async_trait::async_trait]
+impl<R> NameResolver for PersistentNameResolver<R>
+where
+    R: NameResolver,
+{
+    async fn resolve_name(&self, name: &str) -> freedom_ipfs_namesys::Result<String> {
+        self.resolve_name_with_ttl(name)
+            .await
+            .map(|resolved| resolved.value)
+    }
+
+    async fn resolve_name_with_ttl(
+        &self,
+        name: &str,
+    ) -> freedom_ipfs_namesys::Result<ResolvedName> {
+        match self.store.get_name_record(name) {
+            Ok(Some(value)) => {
+                tracing::info!(
+                    phase = "name_persistent_cache",
+                    name,
+                    cache_hit = true,
+                    resolved_target = %value
+                );
+                return Ok(ResolvedName::new(value));
+            }
+            Ok(None) => {
+                tracing::info!(phase = "name_persistent_cache", name, cache_hit = false);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    phase = "name_persistent_cache",
+                    name,
+                    cache_hit = false,
+                    error = %err
+                );
+            }
+        }
+
+        let resolved = self.inner.resolve_name_with_ttl(name).await?;
+        if is_cacheable_name_target(&resolved.value) {
+            let ttl = resolved.ttl.map_or(self.ttl, |ttl| ttl.min(self.ttl));
+            if let Err(err) = self.store.put_name_record(name, &resolved.value, ttl) {
+                tracing::warn!(
+                    phase = "name_persistent_cache_store",
+                    name,
+                    resolved_target = %resolved.value,
+                    error = %err
+                );
+            }
+        }
+        Ok(resolved)
+    }
+}
+
+fn is_cacheable_name_target(value: &str) -> bool {
+    value.starts_with("/ipfs/") || value.starts_with("/ipns/")
 }
 
 pub async fn serve(store: SqliteBlockStore, addr: SocketAddr) -> std::io::Result<SocketAddr> {
@@ -1727,6 +1809,57 @@ mod tests {
         });
 
         let url = format!("http://{addr}/ipns/k51fixture");
+        let response = reqwest::get(url).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(data));
+    }
+
+    #[tokio::test]
+    async fn persistent_name_resolver_stores_successful_resolution() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let resolver = PersistentNameResolver::new(
+            StaticNameResolver {
+                name: "example.com".to_string(),
+                target: "/ipfs/bafyroot".to_string(),
+            },
+            store.clone(),
+        );
+
+        assert_eq!(
+            resolver.resolve_name("example.com").await.unwrap(),
+            "/ipfs/bafyroot"
+        );
+        assert_eq!(
+            store.get_name_record("example.com").unwrap().as_deref(),
+            Some("/ipfs/bafyroot")
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_router_resolves_ipns_from_persistent_name_cache() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"<html>offline ipns</html>";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+        store
+            .put_name_record(
+                "example.com",
+                &format!("/ipfs/{cid}"),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router_with_provider_and_name_resolver(
+            Arc::new(store.clone()),
+            Arc::new(PersistentNameResolver::cache_only(store)),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/ipns/example.com");
         let response = reqwest::get(url).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(data));

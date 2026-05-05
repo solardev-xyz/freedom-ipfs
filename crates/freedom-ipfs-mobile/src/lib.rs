@@ -476,6 +476,10 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
             "name_resolved"
         }
         "name_cache" => "resolving_name",
+        "name_persistent_cache" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
+            "name_resolved"
+        }
+        "name_persistent_cache" => "resolving_name",
         "name_resolve" if fields.get("ok").map(String::as_str) == Some("false") => "failed",
         "name_resolve" => "name_resolved",
         "provider_cache" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
@@ -1169,8 +1173,11 @@ unsafe fn gateway_router_for_routing_mode(
             node.store.clone(),
             ProviderRoutingClient::Offline.with_stats(routing_stats.clone()),
         );
-        let router = freedom_ipfs_gateway::router_with_provider_config(
+        let name_resolver =
+            freedom_ipfs_gateway::PersistentNameResolver::cache_only(node.store.clone());
+        let router = freedom_ipfs_gateway::router_with_provider_and_name_resolver_config(
             Arc::new(provider.clone()),
+            Arc::new(name_resolver),
             gateway_config,
         );
         return Some(OnlineGatewayParts {
@@ -1201,9 +1208,12 @@ unsafe fn gateway_router_for_routing_mode(
     let routing_stats = RoutingStatsHandle::default();
     let routing = routing.with_stats(routing_stats.clone());
     let provider = FetchingBlockProvider::new(node.store.clone(), routing);
-    let name_resolver = CachedNameResolver::new(DefaultNameResolver::new(
-        CloudflareDohResolver::default(),
-        ipns_resolver(routing_mode, delegated_router_endpoints, dht),
+    let name_resolver = CachedNameResolver::new(freedom_ipfs_gateway::PersistentNameResolver::new(
+        DefaultNameResolver::new(
+            CloudflareDohResolver::default(),
+            ipns_resolver(routing_mode, delegated_router_endpoints, dht),
+        ),
+        node.store.clone(),
     ));
     let router = freedom_ipfs_gateway::router_with_provider_and_name_resolver_config(
         Arc::new(provider.clone()),
@@ -1689,6 +1699,47 @@ mod tests {
     }
 
     #[test]
+    fn offline_routing_mode_uses_persistent_name_cache() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let data = b"offline ipns cache";
+            let cid = cid_from_data(CODEC_RAW, data);
+            (*node).store.put_block(&cid, data).unwrap();
+            (*node)
+                .store
+                .put_name_record(
+                    "example.com",
+                    &format!("/ipfs/{cid}"),
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+
+            let addr = CString::new("127.0.0.1:0").unwrap();
+            assert!(freedom_ipfs_node_start_gateway_online_with_config_v2(
+                node,
+                addr.as_ptr(),
+                ptr::null(),
+                ROUTING_MODE_OFFLINE,
+                1,
+                0,
+                0,
+            ));
+
+            assert_gateway_health(node);
+            assert_gateway_path(node, "/ipns/example.com", data);
+            assert_eq!(
+                freedom_ipfs_node_routing_stats(node),
+                FreedomIpfsRoutingStats::default()
+            );
+
+            assert!(freedom_ipfs_node_stop_gateway(node));
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
     fn online_gateway_idles_without_network_work_before_requests() {
         unsafe {
             let node = freedom_ipfs_node_new_in_memory();
@@ -1900,6 +1951,14 @@ mod tests {
             progress_phase(
                 "name_resolve",
                 &progress_fields([("phase", "name_resolve"), ("ok", "true")]),
+                "active",
+            ),
+            "name_resolved"
+        );
+        assert_eq!(
+            progress_phase(
+                "name_persistent_cache",
+                &progress_fields([("phase", "name_persistent_cache"), ("cache_hit", "true")]),
                 "active",
             ),
             "name_resolved"

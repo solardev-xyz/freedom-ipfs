@@ -87,6 +87,12 @@ offline `/ipns/{name}/...` corpus paths to their resolved `/ipfs/...` targets,
 and the report records every rewrite in `resolved_ipfs_rewrites`. This mode is
 a diagnostics aid; it does not persist IPNS/DNSLink state or change gateway
 behavior.
+Online gateways persist successful TTL-valid DNSLink/IPNS resolutions into the
+same bounded SQLite cache, and offline gateways consult that cache before
+returning name-not-found. This means a recently warmed `/ipns/...` page can
+replay after a process restart while the name record is still valid, without
+performing DNS, delegated routing, DHT, Bitswap, or HTTP-provider network work
+during the offline pass.
 
 For gateway phase tracing, pass `--trace-output /tmp/run.jsonl`. When the
 harness spawns the Rust gateway it forwards this path to the gateway, parses the

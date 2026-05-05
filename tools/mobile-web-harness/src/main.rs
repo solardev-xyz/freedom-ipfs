@@ -4528,6 +4528,10 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
             Some(true) => "name_resolved",
             _ => "resolving_name",
         },
+        "name_persistent_cache" => match value.get("cache_hit").and_then(|hit| hit.as_bool()) {
+            Some(true) => "name_resolved",
+            _ => "resolving_name",
+        },
         "name_resolve" => match value.get("ok").and_then(|ok| ok.as_bool()) {
             Some(false) => "failed",
             _ => "name_resolved",
@@ -5330,6 +5334,7 @@ mod tests {
             concat!(
                 "{\"phase\":\"request_start\",\"request_id\":1,\"path\":\"/ipns/site/\"}\n",
                 "{\"phase\":\"name_cache\",\"name\":\"site.test\",\"cache_hit\":false}\n",
+                "{\"phase\":\"name_persistent_cache\",\"name\":\"site.test\",\"cache_hit\":true,\"resolved_target\":\"/ipfs/root\"}\n",
                 "{\"phase\":\"name_resolve\",\"name\":\"site.test\",\"ok\":true,\"resolved_target\":\"/ipfs/root\"}\n",
                 "{\"phase\":\"provider_cache\",\"cid\":\"cid-a\",\"cache_hit\":false}\n",
                 "{\"phase\":\"provider_lookup\",\"cid\":\"cid-a\",\"provider_count\":3}\n",
@@ -5360,7 +5365,7 @@ mod tests {
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "name_resolved"),
-            1
+            2
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "provider_lookup"),

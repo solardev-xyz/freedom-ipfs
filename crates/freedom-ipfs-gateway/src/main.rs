@@ -3,7 +3,7 @@ use axum::Router;
 use clap::{Parser, ValueEnum};
 use freedom_ipfs_core::parse_cid;
 use freedom_ipfs_gateway::{
-    router_with_provider_and_name_resolver_config, router_with_provider_config, GatewayConfig,
+    router_with_provider_and_name_resolver_config, GatewayConfig, PersistentNameResolver,
     DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
 };
 use freedom_ipfs_namesys::{
@@ -108,10 +108,13 @@ async fn main() -> Result<()> {
             RoutingMode::LightDht => ProviderRoutingClient::from(dht.clone()),
             RoutingMode::Offline => ProviderRoutingClient::Offline,
         };
-        let provider = FetchingBlockProvider::new(store, routing);
-        let name_resolver = CachedNameResolver::new(DefaultNameResolver::new(
-            CloudflareDohResolver::default(),
-            ipns_resolver(args.routing_mode, delegated_router_endpoints, dht),
+        let provider = FetchingBlockProvider::new(store.clone(), routing);
+        let name_resolver = CachedNameResolver::new(PersistentNameResolver::new(
+            DefaultNameResolver::new(
+                CloudflareDohResolver::default(),
+                ipns_resolver(args.routing_mode, delegated_router_endpoints, dht),
+            ),
+            store,
         ));
         router_with_provider_and_name_resolver_config(
             Arc::new(provider),
@@ -119,7 +122,11 @@ async fn main() -> Result<()> {
             gateway_config,
         )
     } else {
-        router_with_provider_config(Arc::new(store), gateway_config)
+        router_with_provider_and_name_resolver_config(
+            Arc::new(store.clone()),
+            Arc::new(PersistentNameResolver::cache_only(store)),
+            gateway_config,
+        )
     };
     serve_router(router, args.addr).await?;
     Ok(())
