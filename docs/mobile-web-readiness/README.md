@@ -154,8 +154,9 @@ suppressed peers/addrs, pending peers, connected peers, and max command queue
 time in both single-engine and Rust-vs-Kubo comparison output.
 Delegated provider lookups emit `delegated_provider_lookup` traces, and reports
 summarize delegated lookup count, success/failure count, total providers, and
-maximum elapsed time so slow routing tails are visible without manual JSONL
-inspection.
+maximum elapsed time. Reports also break those outcomes down by endpoint so
+slow routing tails and endpoint-specific failures are visible without manual
+JSONL inspection.
 Rust-vs-Kubo trace output also prints Bitswap source peer, source transport,
 delivery, and per-peer fetch summaries so provider-quality experiments can see
 which peers actually supplied blocks.

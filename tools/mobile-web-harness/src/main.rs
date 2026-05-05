@@ -1230,6 +1230,17 @@ fn print_trace_delegated_provider_lookup(trace: &TraceSummary) {
         delegated.providers,
         delegated.max_elapsed_ms
     );
+    for endpoint in trace.delegated_provider_lookup_by_endpoint.iter().take(4) {
+        println!(
+            "    {}: events={} successes={} failures={} providers={} max_elapsed_ms={}",
+            endpoint.endpoint,
+            endpoint.events,
+            endpoint.successes,
+            endpoint.failures,
+            endpoint.providers,
+            endpoint.max_elapsed_ms
+        );
+    }
 }
 
 fn print_trace_gateway_direct_body(trace: &TraceSummary) {
@@ -3615,6 +3626,7 @@ struct TraceSummary {
     block_store: TraceBlockStoreAggregate,
     provider_retries: TraceProviderRetryAggregate,
     delegated_provider_lookup: TraceDelegatedProviderLookupAggregate,
+    delegated_provider_lookup_by_endpoint: Vec<TraceDelegatedProviderEndpointAggregate>,
     request_statuses: Vec<TraceValueCount>,
     gateway_limiter_denials: usize,
     gateway_direct_body: TraceGatewayDirectBodyAggregate,
@@ -3701,6 +3713,32 @@ impl TraceProviderRetryAggregate {
 
 #[derive(Debug, Default, Serialize)]
 struct TraceDelegatedProviderLookupAggregate {
+    events: usize,
+    successes: usize,
+    failures: usize,
+    providers: u128,
+    max_elapsed_ms: u128,
+}
+
+impl TraceDelegatedProviderLookupAggregate {
+    fn record(&mut self, value: &serde_json::Value, elapsed_ms: Option<u128>) {
+        self.events += 1;
+        if value.get("ok").and_then(|ok| ok.as_bool()) == Some(false) {
+            self.failures += 1;
+        } else {
+            self.successes += 1;
+        }
+        self.providers += value
+            .get("provider_count")
+            .and_then(json_u128)
+            .unwrap_or_default();
+        self.max_elapsed_ms = self.max_elapsed_ms.max(elapsed_ms.unwrap_or_default());
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TraceDelegatedProviderEndpointAggregate {
+    endpoint: String,
     events: usize,
     successes: usize,
     failures: usize,
@@ -4154,6 +4192,8 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut block_store = TraceBlockStoreAggregate::default();
     let mut provider_retries = TraceProviderRetryAggregate::default();
     let mut delegated_provider_lookup = TraceDelegatedProviderLookupAggregate::default();
+    let mut delegated_provider_lookup_by_endpoint =
+        BTreeMap::<String, TraceDelegatedProviderLookupAggregate>::new();
     let mut request_statuses = BTreeMap::<String, usize>::new();
     let mut gateway_limiter_denials = 0usize;
     let mut gateway_direct_body = TraceGatewayDirectBodyAggregate::default();
@@ -4253,19 +4293,16 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             }
         }
         if phase == "delegated_provider_lookup" {
-            delegated_provider_lookup.events += 1;
-            if value.get("ok").and_then(|ok| ok.as_bool()) == Some(false) {
-                delegated_provider_lookup.failures += 1;
-            } else {
-                delegated_provider_lookup.successes += 1;
-            }
-            delegated_provider_lookup.providers += value
-                .get("provider_count")
-                .and_then(json_u128)
-                .unwrap_or_default();
-            delegated_provider_lookup.max_elapsed_ms = delegated_provider_lookup
-                .max_elapsed_ms
-                .max(elapsed_ms.unwrap_or_default());
+            delegated_provider_lookup.record(&value, elapsed_ms);
+            let endpoint = value
+                .get("endpoint")
+                .and_then(|endpoint| endpoint.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            delegated_provider_lookup_by_endpoint
+                .entry(endpoint)
+                .or_default()
+                .record(&value, elapsed_ms);
         }
         match phase {
             "provider_refresh_after_timeout" => {
@@ -4923,6 +4960,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         block_store,
         provider_retries,
         delegated_provider_lookup,
+        delegated_provider_lookup_by_endpoint: sorted_trace_delegated_provider_endpoints(
+            delegated_provider_lookup_by_endpoint,
+        ),
         request_statuses: sorted_trace_counts(request_statuses),
         gateway_limiter_denials,
         gateway_direct_body,
@@ -5037,6 +5077,34 @@ fn sorted_trace_counts(counts: BTreeMap<String, usize>) -> Vec<TraceValueCount> 
             .count
             .cmp(&left.count)
             .then_with(|| left.value.cmp(&right.value))
+    });
+    values.truncate(MAX_TRACE_SLOW_EVENTS);
+    values
+}
+
+fn sorted_trace_delegated_provider_endpoints(
+    endpoints: BTreeMap<String, TraceDelegatedProviderLookupAggregate>,
+) -> Vec<TraceDelegatedProviderEndpointAggregate> {
+    let mut values = endpoints
+        .into_iter()
+        .map(
+            |(endpoint, aggregate)| TraceDelegatedProviderEndpointAggregate {
+                endpoint,
+                events: aggregate.events,
+                successes: aggregate.successes,
+                failures: aggregate.failures,
+                providers: aggregate.providers,
+                max_elapsed_ms: aggregate.max_elapsed_ms,
+            },
+        )
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right
+            .events
+            .cmp(&left.events)
+            .then_with(|| right.failures.cmp(&left.failures))
+            .then_with(|| right.max_elapsed_ms.cmp(&left.max_elapsed_ms))
+            .then_with(|| left.endpoint.cmp(&right.endpoint))
     });
     values.truncate(MAX_TRACE_SLOW_EVENTS);
     values
@@ -5934,7 +6002,7 @@ mod tests {
                 "{\"phase\":\"name_resolve\",\"name\":\"site.test\",\"ok\":true,\"resolved_target\":\"/ipfs/root\"}\n",
                 "{\"phase\":\"provider_cache\",\"cid\":\"cid-a\",\"cache_hit\":false}\n",
                 "{\"phase\":\"provider_lookup\",\"cid\":\"cid-a\",\"provider_count\":3}\n",
-                "{\"phase\":\"delegated_provider_lookup\",\"cid\":\"cid-a\",\"provider_count\":3,\"elapsed_ms\":8}\n",
+                "{\"phase\":\"delegated_provider_lookup\",\"cid\":\"cid-a\",\"endpoint\":\"https://delegated-ipfs.dev/routing/v1\",\"provider_count\":3,\"elapsed_ms\":8}\n",
                 "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid-a\",\"provider_count\":1,\"fallback\":\"light_dht\"}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"peer.test\",\"record_count\":2}\n",
                 "{\"phase\":\"block_store_get\",\"cid\":\"cid-a\",\"cache_hit\":false}\n",
@@ -5976,6 +6044,15 @@ mod tests {
         assert_eq!(summary.delegated_provider_lookup.successes, 1);
         assert_eq!(summary.delegated_provider_lookup.providers, 3);
         assert_eq!(summary.delegated_provider_lookup.max_elapsed_ms, 8);
+        assert_eq!(summary.delegated_provider_lookup_by_endpoint.len(), 1);
+        assert_eq!(
+            summary.delegated_provider_lookup_by_endpoint[0].endpoint,
+            "https://delegated-ipfs.dev/routing/v1"
+        );
+        assert_eq!(
+            summary.delegated_provider_lookup_by_endpoint[0].successes,
+            1
+        );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "providers_found"),
             1

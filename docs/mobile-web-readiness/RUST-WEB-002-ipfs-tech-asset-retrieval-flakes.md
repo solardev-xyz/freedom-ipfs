@@ -7798,3 +7798,60 @@ Decision: keep the harness knob; reject adding `cid.contact` to the default
 endpoint set from this evidence. For this case and network window, the current
 default delegated router was both faster and cleaner than `cid.contact` alone
 or a raced default-plus-`cid.contact` configuration.
+
+## 2026-05-05 Keep: Delegated Provider Endpoint Summary
+
+Motivation:
+The delegated lookup trace records the endpoint for each completed router
+request, but the harness summary only reported the aggregate across all
+endpoints. Provider-quality sweeps need the report to show which endpoint
+returned providers, failed, or dominated lookup latency.
+
+Implementation:
+
+- Add `delegated_provider_lookup_by_endpoint` to trace summaries.
+- Print per-endpoint events, success/failure counts, provider totals, and max
+  elapsed time under the aggregate delegated provider lookup line.
+- Keep the existing aggregate fields unchanged for compatibility with previous
+  reports.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+cargo test -p mobile-web-harness
+git diff --check
+```
+
+Live smoke:
+
+```sh
+timeout 180s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --delegated-router https://delegated-ipfs.dev/routing/v1,https://cid.contact/routing/v1 \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/vitalik-raced-endpoint-summary-smoke-trace.jsonl \
+  --comparison-output /tmp/vitalik-raced-endpoint-summary-smoke.json
+```
+
+Result:
+
+- Rust and Kubo both passed `1/1`.
+- Root TTFB: Rust `1659ms`, Kubo `2864ms`.
+- Max RSS/FD: Rust `38144KiB`/`21`, Kubo `115456KiB`/`68`.
+- The report printed:
+  `delegated provider lookup: events=2 successes=2 failures=0 providers=43
+  max_elapsed_ms=43`.
+- The per-endpoint line showed
+  `https://delegated-ipfs.dev/routing/v1: events=2 successes=2 failures=0
+  providers=43 max_elapsed_ms=43`.
+
+Decision: keep. This is diagnostics-only and makes future endpoint sweeps
+readable from the normal harness output instead of requiring manual JSONL
+inspection.
