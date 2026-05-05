@@ -979,6 +979,14 @@ fn print_summary(report: &RunReport) {
                     session.session_shortcut_post_lookup_single_http_timeout_elapsed_ms
                 );
             }
+            if session.session_late_peer_waits > 0 {
+                println!(
+                    "    late-peer latency: elapsed={} hits={} misses={}",
+                    session.session_late_peer_elapsed_ms,
+                    session.session_late_peer_hit_elapsed_ms,
+                    session.session_late_peer_miss_elapsed_ms
+                );
+            }
         }
         print_trace_timeout_recovery(trace);
         print_trace_bitswap_peer_attempts(trace);
@@ -1315,6 +1323,14 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
                 session.session_shortcut_post_lookup_single_http_elapsed_ms,
                 session.session_shortcut_post_lookup_single_http_hit_elapsed_ms,
                 session.session_shortcut_post_lookup_single_http_timeout_elapsed_ms
+            );
+        }
+        if session.session_late_peer_waits > 0 {
+            println!(
+                "    late-peer latency: elapsed={} hits={} misses={}",
+                session.session_late_peer_elapsed_ms,
+                session.session_late_peer_hit_elapsed_ms,
+                session.session_late_peer_miss_elapsed_ms
             );
         }
     }
@@ -5389,6 +5405,9 @@ struct TraceBitswapSessionAggregate {
     session_late_peer_waits: usize,
     session_late_peer_hits: usize,
     session_late_peer_misses: usize,
+    session_late_peer_elapsed_ms: LatencySummary,
+    session_late_peer_hit_elapsed_ms: LatencySummary,
+    session_late_peer_miss_elapsed_ms: LatencySummary,
     session_late_peer_max_ms: u128,
     #[serde(skip)]
     session_shortcut_post_lookup_elapsed_values: Vec<u128>,
@@ -5402,6 +5421,12 @@ struct TraceBitswapSessionAggregate {
     session_shortcut_post_lookup_single_http_hit_elapsed_values: Vec<u128>,
     #[serde(skip)]
     session_shortcut_post_lookup_single_http_timeout_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    session_late_peer_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    session_late_peer_hit_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    session_late_peer_miss_elapsed_values: Vec<u128>,
 }
 
 impl TraceBitswapSessionAggregate {
@@ -5433,6 +5458,14 @@ impl TraceBitswapSessionAggregate {
             LatencySummary::from_values(std::mem::take(
                 &mut self.session_shortcut_post_lookup_single_http_timeout_elapsed_values,
             ));
+        self.session_late_peer_elapsed_ms =
+            LatencySummary::from_values(std::mem::take(&mut self.session_late_peer_elapsed_values));
+        self.session_late_peer_hit_elapsed_ms = LatencySummary::from_values(std::mem::take(
+            &mut self.session_late_peer_hit_elapsed_values,
+        ));
+        self.session_late_peer_miss_elapsed_ms = LatencySummary::from_values(std::mem::take(
+            &mut self.session_late_peer_miss_elapsed_values,
+        ));
     }
 }
 
@@ -6410,16 +6443,32 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         }
         if phase == "bitswap_session_late_peer_wait" {
             bitswap_session.session_late_peer_waits += 1;
-            bitswap_session.session_late_peer_max_ms =
-                bitswap_session.session_late_peer_max_ms.max(
-                    value
-                        .get("elapsed_ms")
-                        .and_then(json_u128)
-                        .unwrap_or_default(),
-                );
+            let late_peer_elapsed_ms = value.get("elapsed_ms").and_then(json_u128);
+            bitswap_session.session_late_peer_max_ms = bitswap_session
+                .session_late_peer_max_ms
+                .max(late_peer_elapsed_ms.unwrap_or_default());
+            if let Some(elapsed_ms) = late_peer_elapsed_ms {
+                bitswap_session
+                    .session_late_peer_elapsed_values
+                    .push(elapsed_ms);
+            }
             match value.get("outcome").and_then(|outcome| outcome.as_str()) {
-                Some("hit") => bitswap_session.session_late_peer_hits += 1,
-                Some("miss") => bitswap_session.session_late_peer_misses += 1,
+                Some("hit") => {
+                    bitswap_session.session_late_peer_hits += 1;
+                    if let Some(elapsed_ms) = late_peer_elapsed_ms {
+                        bitswap_session
+                            .session_late_peer_hit_elapsed_values
+                            .push(elapsed_ms);
+                    }
+                }
+                Some("miss") => {
+                    bitswap_session.session_late_peer_misses += 1;
+                    if let Some(elapsed_ms) = late_peer_elapsed_ms {
+                        bitswap_session
+                            .session_late_peer_miss_elapsed_values
+                            .push(elapsed_ms);
+                    }
+                }
                 _ => {}
             }
         }
@@ -9983,6 +10032,28 @@ mod tests {
         assert_eq!(summary.bitswap_session.session_late_peer_hits, 1);
         assert_eq!(summary.bitswap_session.session_late_peer_misses, 1);
         assert_eq!(summary.bitswap_session.session_late_peer_max_ms, 2000);
+        assert_eq!(
+            summary.bitswap_session.session_late_peer_elapsed_ms.p50_ms,
+            Some(283)
+        );
+        assert_eq!(
+            summary.bitswap_session.session_late_peer_elapsed_ms.p95_ms,
+            Some(2000)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_late_peer_hit_elapsed_ms
+                .p50_ms,
+            Some(283)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_late_peer_miss_elapsed_ms
+                .p50_ms,
+            Some(2000)
+        );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_bitswap"),
             2

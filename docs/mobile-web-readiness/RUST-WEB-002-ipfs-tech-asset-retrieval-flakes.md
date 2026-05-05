@@ -17037,3 +17037,99 @@ Result:
 Decision:
 Keep. This is harness-only diagnostics and preserves current session timing,
 provider policy, verification, and resource behavior.
+
+## 2026-05-05 Keep: Summarize Late Session Peer Wait Latencies
+
+Question:
+Late session peer waits are intentionally opportunistic: they only matter when
+a request starts with no recent Bitswap peer and another concurrent request
+discovers one while provider lookup is still pending. The harness counted
+late-peer waits, hits, misses, and max elapsed time, but did not expose p50/p95
+shape.
+
+Implementation:
+
+- Keep retrieval behavior unchanged.
+- Extend the Bitswap session summary with `LatencySummary` fields for:
+  - all late-peer waits
+  - late-peer hits
+  - late-peer misses
+- Keep raw sample vectors out of serialized summary output after finalization.
+- Print a `late-peer latency` line when late-peer waits are present.
+- Add focused harness assertions for the new summary fields.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_late_session_peer_waits
+```
+
+Focused result:
+
+- Formatting passed.
+- The late-session-peer trace summary test passed.
+
+Live smoke:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-late-peer-latency-summary-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-late-peer-latency-summary-r3.json
+```
+
+Live result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1151ms` / `1790ms` / `1790ms`.
+- Asset TTFB p50/p95/max: `241ms` / `1216ms` / `1866ms`.
+- Run total p50/p95/max: `3965ms` / `4629ms` / `4629ms`.
+- Max RSS/FD: `53772KiB` / `34`.
+- Block sources: `http_provider=66`, `bitswap=52`, `cache=1`.
+- Delegated lookup elapsed p50/p95/max: `22ms` / `55ms` / `70ms`.
+- HTTP-provider fetch p50/p95/max: `161ms` / `656ms` / `892ms`.
+- Bitswap session summary: `shortcut_post_lookup_waits=92`,
+  `post_lookup_hits=36`, `post_lookup_timeouts=56`.
+- Late-peer waits did not fire in this live window:
+  `late_peer_waits=0`, `late_peer_hits=0`, `late_peer_misses=0`.
+
+Interpretation:
+
+- This confirms the late-peer path is sparse and should not be tuned from one
+  arbitrary `ipfs.tech` run.
+- The summary is still useful for future regression windows where late-peer
+  waits do fire, especially because earlier kept evidence showed the path can
+  rescue a request after a peer appears during provider lookup.
+- Do not retune `BITSWAP_SESSION_LATE_PEER_WAIT` from this sample. Wait for
+  repeated traces with actual late-peer hits/misses and compare p95 against
+  provider lookup p95.
+
+Final validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting passed.
+- Full mobile web harness suite passed: `35 passed`.
+- Workspace check passed.
+- Workspace clippy passed with `-D warnings`.
+- Diff whitespace check passed.
+
+Decision:
+Keep. This is harness-only diagnostics and preserves current late-peer wait
+behavior.
