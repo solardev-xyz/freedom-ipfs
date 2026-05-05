@@ -609,6 +609,7 @@ fn print_summary(report: &RunReport) {
                 store.recheck_misses
             );
         }
+        print_trace_provider_retries(trace);
         if !trace.request_statuses.is_empty() || trace.gateway_limiter_denials > 0 {
             println!(
                 "  gateway responses: statuses={} limiter_denials={}",
@@ -964,6 +965,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
             store.recheck_misses
         );
     }
+    print_trace_provider_retries(trace);
     if trace.bitswap_session.has_events() {
         let session = &trace.bitswap_session;
         println!(
@@ -1008,6 +1010,26 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
             format_trace_counts(&trace.trace_errors)
         );
     }
+}
+
+fn print_trace_provider_retries(trace: &TraceSummary) {
+    if !trace.provider_retries.has_events() {
+        return;
+    }
+    let retries = &trace.provider_retries;
+    println!(
+        "  provider retries: refresh_timeout={} refresh_failure={} retry_counts={} same_providers={} same_bitswap_peers={} request_timeout_counts={} same_bitswap_request_timeouts={} retry_request_timeout={} retry_timeout={} retry_connection_timeout={}",
+        retries.refresh_after_timeout_events,
+        retries.refresh_after_failure_events,
+        retries.retry_count_events,
+        retries.same_provider_sets,
+        retries.same_bitswap_peer_sets,
+        retries.request_timeout_retry_counts,
+        retries.same_bitswap_request_timeout_retry_counts,
+        retries.request_timeout_retries,
+        retries.timeout_retries,
+        retries.connection_timeout_retries
+    );
 }
 
 fn display_option_ms(value: Option<u128>) -> String {
@@ -2756,6 +2778,7 @@ struct TraceSummary {
     slow_events: Vec<TraceSlowEvent>,
     block_sources: Vec<TraceValueCount>,
     block_store: TraceBlockStoreAggregate,
+    provider_retries: TraceProviderRetryAggregate,
     request_statuses: Vec<TraceValueCount>,
     gateway_limiter_denials: usize,
     unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
@@ -2807,6 +2830,31 @@ struct TraceBlockStoreAggregate {
     rechecks: usize,
     recheck_hits: usize,
     recheck_misses: usize,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceProviderRetryAggregate {
+    refresh_after_timeout_events: usize,
+    refresh_after_failure_events: usize,
+    retry_count_events: usize,
+    same_provider_sets: usize,
+    same_bitswap_peer_sets: usize,
+    request_timeout_retry_counts: usize,
+    same_bitswap_request_timeout_retry_counts: usize,
+    request_timeout_retries: usize,
+    timeout_retries: usize,
+    connection_timeout_retries: usize,
+}
+
+impl TraceProviderRetryAggregate {
+    fn has_events(&self) -> bool {
+        self.refresh_after_timeout_events > 0
+            || self.refresh_after_failure_events > 0
+            || self.retry_count_events > 0
+            || self.request_timeout_retries > 0
+            || self.timeout_retries > 0
+            || self.connection_timeout_retries > 0
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -3091,6 +3139,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut slow_events = Vec::<TraceSlowEvent>::new();
     let mut block_sources = BTreeMap::<String, usize>::new();
     let mut block_store = TraceBlockStoreAggregate::default();
+    let mut provider_retries = TraceProviderRetryAggregate::default();
     let mut request_statuses = BTreeMap::<String, usize>::new();
     let mut gateway_limiter_denials = 0usize;
     let mut unixfs_metadata_cache = TraceUnixfsMetadataCacheAggregate::default();
@@ -3168,6 +3217,51 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                     None => {}
                 }
             }
+        }
+        match phase {
+            "provider_refresh_after_timeout" => {
+                provider_retries.refresh_after_timeout_events += 1;
+            }
+            "provider_refresh_after_failure" => {
+                provider_retries.refresh_after_failure_events += 1;
+            }
+            "retry_provider_count" => {
+                provider_retries.retry_count_events += 1;
+                let same_provider_set = value
+                    .get("same_provider_set")
+                    .and_then(|same| same.as_bool())
+                    == Some(true);
+                let same_bitswap_peer_set = value
+                    .get("same_bitswap_peer_set")
+                    .and_then(|same| same.as_bool())
+                    == Some(true);
+                let request_timeout = value
+                    .get("request_timeout")
+                    .and_then(|timeout| timeout.as_bool())
+                    == Some(true);
+                if same_provider_set {
+                    provider_retries.same_provider_sets += 1;
+                }
+                if same_bitswap_peer_set {
+                    provider_retries.same_bitswap_peer_sets += 1;
+                }
+                if request_timeout {
+                    provider_retries.request_timeout_retry_counts += 1;
+                    if same_bitswap_peer_set {
+                        provider_retries.same_bitswap_request_timeout_retry_counts += 1;
+                    }
+                }
+            }
+            "provider_retry_after_request_timeout" => {
+                provider_retries.request_timeout_retries += 1;
+            }
+            "provider_retry_after_timeout" => {
+                provider_retries.timeout_retries += 1;
+            }
+            "provider_retry_after_connection_timeout" => {
+                provider_retries.connection_timeout_retries += 1;
+            }
+            _ => {}
         }
         if phase == "request_done" {
             if let Some(status) = json_detail_string(value.get("status")) {
@@ -3522,6 +3616,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         slow_events,
         block_sources: sorted_trace_counts(block_sources),
         block_store,
+        provider_retries,
         request_statuses: sorted_trace_counts(request_statuses),
         gateway_limiter_denials,
         unixfs_metadata_cache,
@@ -4354,6 +4449,9 @@ mod tests {
                 "{\"phase\":\"bitswap_peer_attempt\",\"elapsed_ms\":5000,\"cid\":\"cid-a\",\"peer\":\"peer-b\",\"ok\":false,\"prefer_want_have\":true,\"failure_kind\":\"connection_timeout\",\"error\":\"timed out\"}\n",
                 "{\"phase\":\"bitswap_peer_attempt_start\",\"cid\":\"cid-a\",\"peer\":\"peer-c\",\"prefer_want_have\":true}\n",
                 "{\"phase\":\"bitswap_peer_attempt\",\"elapsed_ms\":10000,\"cid\":\"cid-a\",\"peer\":\"peer-c\",\"ok\":false,\"prefer_want_have\":true,\"failure_kind\":\"read_timeout\",\"error\":\"read timed out\"}\n",
+                "{\"phase\":\"provider_refresh_after_timeout\",\"cid\":\"cid-a\",\"request_timeout\":true}\n",
+                "{\"phase\":\"retry_provider_count\",\"cid\":\"cid-a\",\"same_provider_set\":true,\"same_bitswap_peer_set\":true,\"request_timeout\":true}\n",
+                "{\"phase\":\"provider_retry_after_request_timeout\",\"cid\":\"cid-a\",\"provider_count\":3,\"request_timeout\":true}\n",
                 "{\"phase\":\"bitswap_dial_plan\",\"cid\":\"cid-a\",\"peer_count\":4,\"candidate_peer_count\":5,\"new_dial_peer_count\":2,\"new_dial_addr_count\":3,\"suppressed_dial_peer_count\":1,\"suppressed_dial_addr_count\":4,\"pending_dial_peer_count\":2,\"connected_peer_count\":1,\"command_queued_ms\":7}\n",
                 "{\"phase\":\"bitswap_incoming_block\",\"cid\":\"cid-a\",\"peer\":\"peer-d\",\"source_transport\":\"tcp\",\"block_count\":2,\"bytes\":256,\"pending_waiter_count\":3,\"delivered_waiter_count\":2,\"dropped_waiter_count\":1,\"oldest_pending_ms\":75,\"newest_pending_ms\":25}\n",
             ),
@@ -4371,6 +4469,21 @@ mod tests {
         assert_eq!(summary.bitswap_peer_attempts.read_timeouts, 1);
         assert_eq!(summary.bitswap_peer_attempts.other_failures, 0);
         assert_eq!(summary.bitswap_peer_attempts.prefer_want_have, 2);
+        assert_eq!(summary.provider_retries.refresh_after_timeout_events, 1);
+        assert_eq!(summary.provider_retries.refresh_after_failure_events, 0);
+        assert_eq!(summary.provider_retries.retry_count_events, 1);
+        assert_eq!(summary.provider_retries.same_provider_sets, 1);
+        assert_eq!(summary.provider_retries.same_bitswap_peer_sets, 1);
+        assert_eq!(summary.provider_retries.request_timeout_retry_counts, 1);
+        assert_eq!(
+            summary
+                .provider_retries
+                .same_bitswap_request_timeout_retry_counts,
+            1
+        );
+        assert_eq!(summary.provider_retries.request_timeout_retries, 1);
+        assert_eq!(summary.provider_retries.timeout_retries, 0);
+        assert_eq!(summary.provider_retries.connection_timeout_retries, 0);
         assert_eq!(summary.bitswap_dial_plans.events, 1);
         assert_eq!(summary.bitswap_dial_plans.peer_targets, 4);
         assert_eq!(summary.bitswap_dial_plans.candidate_peers, 5);

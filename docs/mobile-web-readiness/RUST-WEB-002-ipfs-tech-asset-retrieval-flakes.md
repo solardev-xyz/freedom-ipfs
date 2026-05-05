@@ -4547,3 +4547,87 @@ and `dropped_waiters=0`.
 
 Decision: keep. This is harness-only, does not change gateway behavior, and
 shortens the evidence loop for every future Rust/Kubo comparison.
+
+## 2026-05-05 Provider Retry Trace Summary
+
+Motivation:
+
+- The failed comparison in
+  `/tmp/ipfs-tech-comparison-trace-print-r1-trace.jsonl` showed the root
+  `ipfs.tech` request fetching the small DAG root quickly, then timing out
+  twice on `bafkreibnzgajg3gsyn5c4p5e2h7racpy6dy7tnhwe5l4v4vx5e32qmn4bi`.
+- Provider refresh returned the same provider set and the same Bitswap peer set:
+  `same_provider_set=true`, `same_bitswap_peer_set=true`,
+  `request_timeout=true`.
+- A tempting change would be to skip same-set request-timeout retries, but older
+  passing traces such as `/tmp/ipfs-tech-before-late-cache-r2-trace.jsonl`
+  contain same-set request-timeout retries during successful page loads. That
+  makes a behavior change too speculative without better measurement.
+
+Implementation:
+
+- Add `provider_retries` to the harness trace summary.
+- Count provider refreshes after timeout/failure.
+- Count `retry_provider_count` events, same-provider sets, same-Bitswap-peer
+  sets, request-timeout retry-count events, and same-Bitswap request-timeout
+  retry-count events.
+- Count actual retry phases:
+  `provider_retry_after_request_timeout`, `provider_retry_after_timeout`, and
+  `provider_retry_after_connection_timeout`.
+- Print a concise provider-retry line in normal and comparison trace summaries
+  only when events exist.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+git diff --check
+```
+
+Result: all passed.
+
+Live validation, passing small case:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/vitalik-provider-retry-summary-r1-trace.jsonl \
+  --comparison-output /tmp/vitalik-provider-retry-summary-r1.json
+```
+
+Result: Rust and Kubo both passed `1/1`. Rust root TTFB was `553ms` versus Kubo
+`2950ms`; Rust max RSS/FD was `37760KiB`/`21` versus Kubo `128512KiB`/`95`.
+No provider retry events occurred, so the console provider-retry line was
+correctly omitted. The JSON contains `provider_retries` with zero counts.
+
+Live validation, passing `ipfs.tech` case:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-provider-retry-summary-r1-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-provider-retry-summary-r1.json
+```
+
+Result: Rust and Kubo both passed `1/1`. Rust root TTFB was `526ms` versus Kubo
+`7417ms`; Rust asset p50/p95 was `128/195ms` versus Kubo `409/868ms`; Rust max
+RSS/FD was `48572KiB`/`27` versus Kubo `358192KiB`/`818`. This particular run
+had no provider retry events, while the earlier failed run remains the evidence
+that the new aggregate is needed.
+
+Decision: keep. This is diagnostics-only and avoids a premature retry-policy
+change while making same-provider/same-Bitswap timeout loops visible in future
+comparison reports.
