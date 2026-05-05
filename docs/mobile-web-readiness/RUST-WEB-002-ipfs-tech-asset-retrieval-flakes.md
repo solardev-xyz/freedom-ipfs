@@ -2974,3 +2974,50 @@ routing for ID-only provider records added bounded but real latency and resolved
 no useful provider addresses. The more important remaining signal is still the
 large unsupported direct-address mix: relay, WebTransport, and WebRTC records,
 not ID-only records.
+
+## 2026-05-05 Relay/WebTransport Feasibility Note
+
+Dependency check:
+
+```sh
+rg -n "libp2p|webtransport|webrtc|relay|p2p-circuit" \
+  Cargo.toml crates/*/Cargo.toml Cargo.lock
+
+cargo tree -p freedom-ipfs-retrieval -i libp2p --features ''
+```
+
+Current workspace libp2p features are:
+
+```text
+dns, ed25519, identify, kad, macros, noise, ping, quic, rsa, tcp, tls, tokio,
+websocket, yamux
+```
+
+Not enabled:
+
+```text
+relay
+webrtc-websys
+webtransport-websys
+```
+
+Local crate inspection for `libp2p v0.56.0` shows:
+
+- `relay` is available as a normal feature and exposes a relay client behaviour
+  through the libp2p swarm builder.
+- `webrtc-websys` and `webtransport-websys` are gated for `wasm32`/websys, so
+  they are not an obvious native Linux/mobile-reader transport toggle.
+
+Conclusion: relay support is the more realistic next transport experiment than
+native WebTransport/WebRTC in the current dependency set, but it is not a tiny
+address-parser change. A serious relay experiment needs at least:
+
+- enable libp2p `relay`
+- add relay client behaviour to the shared Bitswap swarm
+- stop rejecting selected `/p2p-circuit` provider addrs
+- preserve current connection/resource caps for mobile
+- add deterministic relay-loopback coverage
+- run same-window Kubo comparisons before keeping it
+
+Given the rejected ID-only peer-routing result, relay support should be treated
+as the next substantial experiment, not as a small follow-on to provider lookup.
