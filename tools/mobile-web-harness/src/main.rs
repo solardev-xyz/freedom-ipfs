@@ -767,6 +767,7 @@ fn print_summary(report: &RunReport) {
             );
         }
         print_trace_provider_retries(trace);
+        print_trace_delegated_provider_lookup(trace);
         if !trace.request_statuses.is_empty() || trace.gateway_limiter_denials > 0 {
             println!(
                 "  gateway responses: statuses={} limiter_denials={}",
@@ -1111,6 +1112,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_unixfs_metadata_cache(trace);
     print_trace_progress_phases(trace);
     print_trace_provider_retries(trace);
+    print_trace_delegated_provider_lookup(trace);
     print_trace_timeout_recovery(trace);
     print_trace_gateway_direct_body(trace);
     print_trace_bitswap_peer_attempts(trace);
@@ -1209,6 +1211,21 @@ fn print_trace_unixfs_metadata_cache(trace: &TraceSummary) {
         cache.file_size_evictions,
         cache.max_file_size_len,
         cache.max_capacity
+    );
+}
+
+fn print_trace_delegated_provider_lookup(trace: &TraceSummary) {
+    let delegated = &trace.delegated_provider_lookup;
+    if delegated.events == 0 {
+        return;
+    }
+    println!(
+        "  delegated provider lookup: events={} successes={} failures={} providers={} max_elapsed_ms={}",
+        delegated.events,
+        delegated.successes,
+        delegated.failures,
+        delegated.providers,
+        delegated.max_elapsed_ms
     );
 }
 
@@ -3591,6 +3608,7 @@ struct TraceSummary {
     block_sources: Vec<TraceValueCount>,
     block_store: TraceBlockStoreAggregate,
     provider_retries: TraceProviderRetryAggregate,
+    delegated_provider_lookup: TraceDelegatedProviderLookupAggregate,
     request_statuses: Vec<TraceValueCount>,
     gateway_limiter_denials: usize,
     gateway_direct_body: TraceGatewayDirectBodyAggregate,
@@ -3673,6 +3691,15 @@ impl TraceProviderRetryAggregate {
             || self.timeout_retries > 0
             || self.connection_timeout_retries > 0
     }
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceDelegatedProviderLookupAggregate {
+    events: usize,
+    successes: usize,
+    failures: usize,
+    providers: u128,
+    max_elapsed_ms: u128,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -4120,6 +4147,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut block_sources = BTreeMap::<String, usize>::new();
     let mut block_store = TraceBlockStoreAggregate::default();
     let mut provider_retries = TraceProviderRetryAggregate::default();
+    let mut delegated_provider_lookup = TraceDelegatedProviderLookupAggregate::default();
     let mut request_statuses = BTreeMap::<String, usize>::new();
     let mut gateway_limiter_denials = 0usize;
     let mut gateway_direct_body = TraceGatewayDirectBodyAggregate::default();
@@ -4217,6 +4245,21 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                     None => {}
                 }
             }
+        }
+        if phase == "delegated_provider_lookup" {
+            delegated_provider_lookup.events += 1;
+            if value.get("ok").and_then(|ok| ok.as_bool()) == Some(false) {
+                delegated_provider_lookup.failures += 1;
+            } else {
+                delegated_provider_lookup.successes += 1;
+            }
+            delegated_provider_lookup.providers += value
+                .get("provider_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            delegated_provider_lookup.max_elapsed_ms = delegated_provider_lookup
+                .max_elapsed_ms
+                .max(elapsed_ms.unwrap_or_default());
         }
         match phase {
             "provider_refresh_after_timeout" => {
@@ -4873,6 +4916,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         block_sources: sorted_trace_counts(block_sources),
         block_store,
         provider_retries,
+        delegated_provider_lookup,
         request_statuses: sorted_trace_counts(request_statuses),
         gateway_limiter_denials,
         gateway_direct_body,
@@ -5036,7 +5080,9 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         "provider_diversity_low" => "provider_diversity_low",
         "light_dht_provider_lookup" | "dht_provider_lookup" => "dht_fallback_started",
         "provider_fetch_start" => "providers_found",
-        "bitswap_dnsaddr_expand" | "bitswap_dns_multiaddr_expand" => "provider_lookup",
+        "delegated_provider_lookup" | "bitswap_dnsaddr_expand" | "bitswap_dns_multiaddr_expand" => {
+            "provider_lookup"
+        }
         "http_provider_fetch" => "fetching_http_provider",
         "bitswap_fetch"
         | "bitswap_connection_established"
@@ -5867,6 +5913,7 @@ mod tests {
                 "{\"phase\":\"name_resolve\",\"name\":\"site.test\",\"ok\":true,\"resolved_target\":\"/ipfs/root\"}\n",
                 "{\"phase\":\"provider_cache\",\"cid\":\"cid-a\",\"cache_hit\":false}\n",
                 "{\"phase\":\"provider_lookup\",\"cid\":\"cid-a\",\"provider_count\":3}\n",
+                "{\"phase\":\"delegated_provider_lookup\",\"cid\":\"cid-a\",\"provider_count\":3,\"elapsed_ms\":8}\n",
                 "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid-a\",\"provider_count\":1,\"fallback\":\"light_dht\"}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"peer.test\",\"record_count\":2}\n",
                 "{\"phase\":\"block_store_get\",\"cid\":\"cid-a\",\"cache_hit\":false}\n",
@@ -5902,8 +5949,12 @@ mod tests {
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "provider_lookup"),
-            2
+            3
         );
+        assert_eq!(summary.delegated_provider_lookup.events, 1);
+        assert_eq!(summary.delegated_provider_lookup.successes, 1);
+        assert_eq!(summary.delegated_provider_lookup.providers, 3);
+        assert_eq!(summary.delegated_provider_lookup.max_elapsed_ms, 8);
         assert_eq!(
             trace_value_count(&summary.progress_phases, "providers_found"),
             1

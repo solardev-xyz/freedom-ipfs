@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use url::Url;
 
@@ -355,17 +355,41 @@ impl DelegatedRoutingClient {
     }
 
     async fn providers_from_endpoint(&self, endpoint: &str, cid: &Cid) -> Result<Vec<Provider>> {
-        let lookup_cid = delegated_lookup_cid(cid);
-        let url = format!("{endpoint}/providers/{lookup_cid}");
-        let response = self
-            .client
-            .get(url)
-            .header("accept", "application/x-ndjson, application/json")
-            .send()
-            .await?
-            .error_for_status()?;
-        let body = limited_response_text(response, MAX_DELEGATED_ROUTING_RESPONSE_BYTES).await?;
-        Ok(limit_delegated_providers(parse_provider_response(&body)?))
+        let started = Instant::now();
+        let result = async {
+            let lookup_cid = delegated_lookup_cid(cid);
+            let url = format!("{endpoint}/providers/{lookup_cid}");
+            let response = self
+                .client
+                .get(url)
+                .header("accept", "application/x-ndjson, application/json")
+                .send()
+                .await?
+                .error_for_status()?;
+            let body =
+                limited_response_text(response, MAX_DELEGATED_ROUTING_RESPONSE_BYTES).await?;
+            Ok(limit_delegated_providers(parse_provider_response(&body)?))
+        }
+        .await;
+        match &result {
+            Ok(providers) => tracing::info!(
+                phase = "delegated_provider_lookup",
+                cid = %cid,
+                endpoint,
+                ok = true,
+                provider_count = providers.len(),
+                elapsed_ms = started.elapsed().as_millis()
+            ),
+            Err(err) => tracing::info!(
+                phase = "delegated_provider_lookup",
+                cid = %cid,
+                endpoint,
+                ok = false,
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis()
+            ),
+        }
+        result
     }
 }
 

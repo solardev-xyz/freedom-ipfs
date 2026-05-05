@@ -7581,3 +7581,64 @@ keeps mobile connection caps unchanged, and the same-window evidence improved
 root p50/p95, asset p50/p95, FD max, dial-plan pressure, and pending wait
 latency. The trace had no local dial rejections in this sample, and Kubo still
 used much higher memory and FD counts.
+
+## 2026-05-05 Keep: Trace Delegated Provider Lookup Latency
+
+Motivation:
+After dropping failed dial waiters, the range-heavy `vitalik-root-html-range`
+guard still had a Rust p95 root tail. Manual JSONL inspection showed the slow
+request spent about `4.8s` in `provider_lookup` before Bitswap fetched the block
+quickly. The trace did not say whether that was delegated routing, DHT fallback,
+response parsing, or retrieval work hidden under the higher-level provider
+lookup span.
+
+Implementation:
+
+- Emit `delegated_provider_lookup` from each delegated routing endpoint request.
+- Include CID, endpoint, success/failure, provider count, sanitized error, and
+  elapsed time.
+- Map the phase to mobile/harness progress phase `provider_lookup`.
+- Add harness summary counters for delegated lookup events, successes,
+  failures, total provider count, and max elapsed time.
+
+Validation before live run:
+
+```sh
+cargo fmt --all
+cargo test -p freedom-ipfs-routing delegated_routing_races_multiple_endpoints_until_success
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+cargo build -p freedom-ipfs-gateway
+```
+
+Experiment:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/vitalik-delegated-provider-lookup-trace.jsonl \
+  --output /tmp/vitalik-delegated-provider-lookup.json
+```
+
+Experiment result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1341/6325ms`, Kubo `1898/1952ms`.
+- Max RSS/FD: Rust `38784KiB`/`20`, Kubo `177664KiB`/`101`.
+- Delegated provider lookup summary: `events=6`, `successes=6`,
+  `failures=0`, `providers=136`, `max_elapsed_ms=4993`.
+- Bitswap dial plans: `8` events, `69` candidates, `25` new peers/addrs,
+  `37` suppressed peers, `96` suppressed addrs, `0` pending peers,
+  `7` connected peers.
+
+Decision: keep. This is diagnostics-only, but it identifies the current
+`vitalik` p95 tail as delegated routing latency rather than Bitswap, UnixFS, or
+range serving. The next routing experiment should test a bounded fallback or
+race for slow delegated provider lookups while preserving read-only behavior
+and mobile resource caps.

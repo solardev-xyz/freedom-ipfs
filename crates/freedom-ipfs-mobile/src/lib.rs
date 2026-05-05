@@ -491,7 +491,9 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         "provider_diversity_low" => "provider_diversity_low",
         "light_dht_provider_lookup" | "dht_provider_lookup" => "dht_fallback_started",
         "provider_fetch_start" => "providers_found",
-        "bitswap_dnsaddr_expand" | "bitswap_dns_multiaddr_expand" => "provider_lookup",
+        "delegated_provider_lookup" | "bitswap_dnsaddr_expand" | "bitswap_dns_multiaddr_expand" => {
+            "provider_lookup"
+        }
         "http_provider_fetch" => "fetching_http_provider",
         "bitswap_fetch"
         | "bitswap_connection_established"
@@ -1976,6 +1978,17 @@ mod tests {
             progress_phase(
                 "provider_cache",
                 &progress_fields([("phase", "provider_cache"), ("cache_hit", "false")]),
+                "active",
+            ),
+            "provider_lookup"
+        );
+        assert_eq!(
+            progress_phase(
+                "delegated_provider_lookup",
+                &progress_fields([
+                    ("phase", "delegated_provider_lookup"),
+                    ("provider_count", "8")
+                ]),
                 "active",
             ),
             "provider_lookup"
