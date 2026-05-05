@@ -1394,6 +1394,15 @@ struct BitswapFetchResult {
     delivery: &'static str,
 }
 
+#[derive(Clone, Debug)]
+struct BitswapFetchBatchResult {
+    requested_blocks: HashMap<Cid, Vec<u8>>,
+    extra_blocks: Vec<(Cid, Vec<u8>)>,
+    source_peer: Option<PeerId>,
+    source_transport: Option<&'static str>,
+    delivery: &'static str,
+}
+
 struct BitswapFetchResults {
     requested_blocks: HashMap<Cid, Vec<u8>>,
     extra_blocks: Vec<(Cid, Vec<u8>)>,
@@ -1405,15 +1414,15 @@ struct SharedBitswapClient {
 }
 
 struct BitswapCommand {
-    cid: Cid,
+    cids: Vec<Cid>,
     peers: Vec<BitswapPeer>,
     sent_at: Instant,
-    respond: oneshot::Sender<Result<BitswapFetchResult>>,
+    respond: oneshot::Sender<Result<BitswapFetchBatchResult>>,
 }
 
 struct PendingIncomingBitswapResult {
     sent_at: Instant,
-    sender: mpsc::UnboundedSender<BitswapFetchResult>,
+    sender: mpsc::UnboundedSender<BitswapFetchBatchResult>,
 }
 
 struct IncomingBitswapRead {
@@ -1451,6 +1460,29 @@ impl SharedBitswapClient {
     }
 
     async fn fetch(&self, cid: Cid, peers: Vec<BitswapPeer>) -> Result<Result<BitswapFetchResult>> {
+        let batch = self.fetch_many(vec![cid], peers).await?;
+        Ok(batch.map(|mut result| BitswapFetchResult {
+            requested_block: result
+                .requested_blocks
+                .remove(&cid)
+                .expect("single-CID Bitswap batch omitted requested block"),
+            extra_blocks: result.extra_blocks,
+            source_peer: result.source_peer,
+            source_transport: result.source_transport,
+            delivery: result.delivery,
+        }))
+    }
+
+    async fn fetch_many(
+        &self,
+        cids: Vec<Cid>,
+        peers: Vec<BitswapPeer>,
+    ) -> Result<Result<BitswapFetchBatchResult>> {
+        if cids.is_empty() {
+            return Err(RetrievalError::Bitswap(
+                "shared bitswap batch cannot be empty".into(),
+            ));
+        }
         let peer_count = peers.len();
         let trusted_peer_count = peers.iter().filter(|peer| peer.skip_want_have).count();
         let request_timeout = bitswap_request_timeout(peer_count, trusted_peer_count);
@@ -1459,10 +1491,12 @@ impl SharedBitswapClient {
             bitswap_request_target_mode_counts(&peers);
         let target_summary =
             tracing::enabled!(tracing::Level::INFO).then(|| format_bitswap_peers(&peers));
+        let cid_count = cids.len();
+        let cid_summary = tracing::enabled!(tracing::Level::INFO).then(|| format_cids(&cids));
         let (respond, response) = oneshot::channel();
         self.commands
             .send(BitswapCommand {
-                cid,
+                cids,
                 peers,
                 sent_at: Instant::now(),
                 respond,
@@ -1479,7 +1513,8 @@ impl SharedBitswapClient {
             Err(_) => {
                 tracing::info!(
                     phase = "bitswap_request_timeout_detail",
-                    cid = %cid,
+                    cids = %cid_summary.as_deref().unwrap_or(""),
+                    cid_count,
                     peer_count,
                     trusted_peer_count,
                     want_block_target_count,
@@ -1579,7 +1614,7 @@ async fn run_shared_bitswap_swarm(
     mut commands: mpsc::Receiver<BitswapCommand>,
 ) {
     let mut incoming = select_all(incoming);
-    let mut fetches = FuturesUnordered::<BoxFuture<'static, Cid>>::new();
+    let mut fetches = FuturesUnordered::<BoxFuture<'static, Vec<Cid>>>::new();
     let mut incoming_reads = FuturesUnordered::<BoxFuture<'static, IncomingBitswapRead>>::new();
     let mut pending_incoming = HashMap::<Cid, Vec<PendingIncomingBitswapResult>>::new();
     let mut pending_counts = HashMap::<Cid, usize>::new();
@@ -1599,14 +1634,24 @@ async fn run_shared_bitswap_swarm(
                 let command_queued_ms = command.sent_at.elapsed().as_millis();
                 prune_connection_waiters(&mut connection_waiters, &mut connection_wait_started);
                 prune_connection_error_backoff(&mut connection_error_backoff, Instant::now());
-                let (incoming_result, incoming_results) = mpsc::unbounded_channel();
-                pending_incoming.entry(command.cid).or_default().push(
-                    PendingIncomingBitswapResult {
-                        sent_at: command.sent_at,
-                        sender: incoming_result,
-                    },
-                );
-                *pending_counts.entry(command.cid).or_default() += 1;
+                let cids = command.cids;
+                let cid_count = cids.len();
+                let primary_cid = cids[0];
+                let cid_summary =
+                    tracing::enabled!(tracing::Level::INFO).then(|| format_cids(&cids));
+                let incoming_results = if cid_count == 1 {
+                    let (incoming_result, incoming_results) = mpsc::unbounded_channel();
+                    pending_incoming.entry(primary_cid).or_default().push(
+                        PendingIncomingBitswapResult {
+                            sent_at: command.sent_at,
+                            sender: incoming_result,
+                        },
+                    );
+                    *pending_counts.entry(primary_cid).or_default() += 1;
+                    Some(incoming_results)
+                } else {
+                    None
+                };
 
                 let mut peer_plans = Vec::new();
                 let mut dial_candidates = Vec::new();
@@ -1618,7 +1663,9 @@ async fn run_shared_bitswap_swarm(
                     ) {
                         tracing::info!(
                             phase = "bitswap_connection_error_peer_skipped",
-                            cid = %command.cid,
+                            cid = %primary_cid,
+                            cids = %cid_summary.as_deref().unwrap_or(""),
+                            cid_count,
                             peer = %peer.id,
                             remaining_ms
                         );
@@ -1681,7 +1728,9 @@ async fn run_shared_bitswap_swarm(
                 }
                 tracing::info!(
                     phase = "bitswap_dial_plan",
-                    cid = %command.cid,
+                    cid = %primary_cid,
+                    cids = %cid_summary.as_deref().unwrap_or(""),
+                    cid_count,
                     peer_count = peer_targets.len(),
                     candidate_peer_count,
                     candidate_dial_peer_count,
@@ -1726,24 +1775,26 @@ async fn run_shared_bitswap_swarm(
                 if failed_dial_waiter_count > 0 {
                     tracing::info!(
                         phase = "bitswap_dial_waiters_dropped",
-                        cid = %command.cid,
+                        cid = %primary_cid,
+                        cids = %cid_summary.as_deref().unwrap_or(""),
+                        cid_count,
                         peer_count = scheduled_dial_peers.len().saturating_sub(started_dial_peers.len()),
                         waiter_count = failed_dial_waiter_count
                     );
                 }
 
                 let control = control.clone();
-                let cid = command.cid;
+                let fetch_cids = cids.clone();
                 let mut respond = command.respond;
                 let dial_errors = dial_errors.clone();
                 let peer_transports = peer_transports.clone();
                 let fetch_started = Instant::now();
                 fetches.push(Box::pin(async move {
                     let result = tokio::select! {
-                        result = fetch_bitswap_with_incoming_streams(
+                        result = fetch_bitswap_batch_with_incoming_streams(
                             control,
                             peer_targets,
-                            cid,
+                            fetch_cids.clone(),
                             incoming_results,
                             dial_errors,
                             peer_transports,
@@ -1755,20 +1806,24 @@ async fn run_shared_bitswap_swarm(
                     } else {
                         tracing::info!(
                             phase = "bitswap_fetch_cancelled",
-                            cid = %cid,
+                            cid = %primary_cid,
+                            cids = %format_cids(&fetch_cids),
+                            cid_count = fetch_cids.len(),
                             command_queued_ms,
                             elapsed_ms = fetch_started.elapsed().as_millis()
                         );
                     }
-                    cid
+                    fetch_cids
                 }));
             }
-            Some(cid) = fetches.next(), if !fetches.is_empty() => {
-                if let Some(count) = pending_counts.get_mut(&cid) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        pending_counts.remove(&cid);
-                        pending_incoming.remove(&cid);
+            Some(cids) = fetches.next(), if !fetches.is_empty() => {
+                for cid in cids {
+                    if let Some(count) = pending_counts.get_mut(&cid) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            pending_counts.remove(&cid);
+                            pending_incoming.remove(&cid);
+                        }
                     }
                 }
             }
@@ -1799,6 +1854,14 @@ async fn run_shared_bitswap_swarm(
                                 result.source_peer = Some(incoming_read.peer);
                                 result.source_transport = source_transport;
                                 result.delivery = "incoming";
+                                let block_len = result.requested_block.len();
+                                let batch_result = BitswapFetchBatchResult {
+                                    requested_blocks: HashMap::from([(cid, result.requested_block)]),
+                                    extra_blocks: result.extra_blocks,
+                                    source_peer: result.source_peer,
+                                    source_transport: result.source_transport,
+                                    delivery: result.delivery,
+                                };
                                 matched = true;
                                 let mut pending_waiter_count = 0usize;
                                 let mut oldest_pending_ms = 0u128;
@@ -1818,7 +1881,7 @@ async fn run_shared_bitswap_swarm(
                                 let mut dropped_waiter_count = 0usize;
                                 if let Some(senders) = pending_incoming.get_mut(&cid) {
                                     senders.retain(|pending| {
-                                        if pending.sender.send(result.clone()).is_ok() {
+                                        if pending.sender.send(batch_result.clone()).is_ok() {
                                             delivered_waiter_count += 1;
                                             true
                                         } else {
@@ -1833,7 +1896,7 @@ async fn run_shared_bitswap_swarm(
                                     peer = %incoming_read.peer,
                                     source_transport = source_transport.unwrap_or("unknown"),
                                     block_count = blocks.len(),
-                                    bytes = result.requested_block.len(),
+                                    bytes = block_len,
                                     pending_waiter_count,
                                     delivered_waiter_count,
                                     dropped_waiter_count,
@@ -2147,6 +2210,14 @@ fn format_bitswap_peers(peers: &[BitswapPeer]) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+fn format_cids(cids: &[Cid]) -> String {
+    cids.iter()
+        .take(MAX_BITSWAP_FAILURE_DETAILS)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn format_bitswap_targets(peers: &[BitswapPeerTarget]) -> String {
@@ -3119,31 +3190,45 @@ fn accept_bitswap_streams(control: &mut StreamControl) -> Result<Vec<IncomingStr
         .collect()
 }
 
-async fn fetch_bitswap_with_incoming_streams(
+async fn fetch_bitswap_batch_with_incoming_streams(
     control: StreamControl,
     peers: Vec<BitswapPeerTarget>,
-    cid: Cid,
-    mut incoming_results: mpsc::UnboundedReceiver<BitswapFetchResult>,
+    cids: Vec<Cid>,
+    incoming_results: Option<mpsc::UnboundedReceiver<BitswapFetchBatchResult>>,
     dial_errors: DialErrorLog,
     peer_transports: PeerTransportLog,
-) -> Result<BitswapFetchResult> {
-    tokio::select! {
-        result = fetch_bitswap_over_outgoing_streams(control, peers, cid, dial_errors, peer_transports) => result,
-        incoming = incoming_results.recv() => incoming.ok_or_else(|| {
-            RetrievalError::Bitswap("incoming bitswap result channel closed".into())
-        }),
+) -> Result<BitswapFetchBatchResult> {
+    if let Some(mut incoming_results) = incoming_results {
+        tokio::select! {
+            result = fetch_bitswap_batch_over_outgoing_streams(control, peers, cids, dial_errors, peer_transports) => result,
+            incoming = incoming_results.recv() => incoming.ok_or_else(|| {
+                RetrievalError::Bitswap("incoming bitswap result channel closed".into())
+            }),
+        }
+    } else {
+        fetch_bitswap_batch_over_outgoing_streams(
+            control,
+            peers,
+            cids,
+            dial_errors,
+            peer_transports,
+        )
+        .await
     }
 }
 
-async fn fetch_bitswap_over_outgoing_streams(
+async fn fetch_bitswap_batch_over_outgoing_streams(
     control: StreamControl,
     peers: Vec<BitswapPeerTarget>,
-    cid: Cid,
+    cids: Vec<Cid>,
     dial_errors: DialErrorLog,
     peer_transports: PeerTransportLog,
-) -> Result<BitswapFetchResult> {
+) -> Result<BitswapFetchBatchResult> {
     let mut attempts = FuturesUnordered::new();
     let has_multiple_peers = peers.len() > 1;
+    let cid_count = cids.len();
+    let primary_cid = cids[0];
+    let cid_summary = tracing::enabled!(tracing::Level::INFO).then(|| format_cids(&cids));
     let stream_read_timeout = bitswap_stream_read_timeout(
         peers.len(),
         peers.iter().filter(|peer| peer.skip_want_have).count(),
@@ -3160,10 +3245,10 @@ async fn fetch_bitswap_over_outgoing_streams(
             peer.skip_want_have,
             &mut direct_untrusted_want_block_count,
         );
-        attempts.push(request_bitswap_block_after_connection(
+        attempts.push(request_bitswap_blocks_after_connection(
             control.clone(),
             peer,
-            cid,
+            cids.clone(),
             prefer_want_have,
             request_timeouts,
             dial_errors.clone(),
@@ -3189,8 +3274,10 @@ async fn fetch_bitswap_over_outgoing_streams(
             .collect::<Vec<_>>()
             .join("; ")
     };
-    let message =
-        format!("all bitswap stream requests failed for cid {cid}; targets={target_summary}; detail={detail}");
+    let message = format!(
+        "all bitswap stream requests failed for cids {}; targets={target_summary}; detail={detail}",
+        format_cids(&cids)
+    );
     let timeout_peers = failures
         .iter()
         .filter(|failure| failure.kind == BitswapPeerFailureKind::ReadTimeout)
@@ -3202,8 +3289,24 @@ async fn fetch_bitswap_over_outgoing_streams(
         .map(|failure| failure.id.to_string())
         .collect::<Vec<_>>();
     if timeout_peers.is_empty() && connection_timeout_peers.is_empty() {
+        tracing::info!(
+            phase = "bitswap_batch_failed",
+            cid = %primary_cid,
+            cids = %cid_summary.as_deref().unwrap_or(""),
+            cid_count,
+            failure_count = failures.len(),
+        );
         Err(RetrievalError::Bitswap(message))
     } else {
+        tracing::info!(
+            phase = "bitswap_batch_failed",
+            cid = %primary_cid,
+            cids = %cid_summary.as_deref().unwrap_or(""),
+            cid_count,
+            failure_count = failures.len(),
+            read_timeout_peer_count = timeout_peers.len(),
+            connection_timeout_peer_count = connection_timeout_peers.len(),
+        );
         Err(RetrievalError::BitswapPeerFailures {
             message,
             timeout_peers,
@@ -3225,15 +3328,15 @@ fn bitswap_prefer_want_have(
     has_multiple_peers && !skip_want_have && !direct_untrusted_want_block
 }
 
-async fn request_bitswap_block_after_connection(
+async fn request_bitswap_blocks_after_connection(
     control: StreamControl,
     peer: BitswapPeerTarget,
-    cid: Cid,
+    cids: Vec<Cid>,
     prefer_want_have: bool,
     request_timeouts: BitswapRequestTimeouts,
     dial_errors: DialErrorLog,
     peer_transports: PeerTransportLog,
-) -> std::result::Result<BitswapFetchResult, BitswapPeerFailure> {
+) -> std::result::Result<BitswapFetchBatchResult, BitswapPeerFailure> {
     let BitswapPeerTarget {
         id: peer_id,
         addrs,
@@ -3242,9 +3345,14 @@ async fn request_bitswap_block_after_connection(
     } = peer;
 
     let attempt_started = Instant::now();
+    let primary_cid = cids[0];
+    let cid_count = cids.len();
+    let cid_summary = tracing::enabled!(tracing::Level::INFO).then(|| format_cids(&cids));
     tracing::info!(
         phase = "bitswap_peer_attempt_start",
-        cid = %cid,
+        cid = %primary_cid,
+        cids = %cid_summary.as_deref().unwrap_or(""),
+        cid_count,
         peer = %peer_id,
         prefer_want_have,
         want_have_timeout_ms = request_timeouts.want_have.as_millis(),
@@ -3257,7 +3365,9 @@ async fn request_bitswap_block_after_connection(
             Ok(Err(_)) => {
                 tracing::info!(
                     phase = "bitswap_peer_attempt",
-                    cid = %cid,
+                    cid = %primary_cid,
+                    cids = %cid_summary.as_deref().unwrap_or(""),
+                    cid_count,
                     peer = %peer_id,
                     ok = false,
                     failure_kind = "connection_waiter_dropped",
@@ -3279,7 +3389,9 @@ async fn request_bitswap_block_after_connection(
                 let recent_dial_errors = recent_dial_errors(&dial_errors, peer_id).await;
                 tracing::info!(
                     phase = "bitswap_peer_attempt",
-                    cid = %cid,
+                    cid = %primary_cid,
+                    cids = %cid_summary.as_deref().unwrap_or(""),
+                    cid_count,
                     peer = %peer_id,
                     ok = false,
                     failure_kind = "connection_timeout",
@@ -3302,11 +3414,11 @@ async fn request_bitswap_block_after_connection(
             }
         }
     }
-    let result = request_bitswap_block(
+    let result = request_bitswap_blocks(
         control,
         peer_id,
         addrs,
-        cid,
+        cids,
         prefer_want_have,
         request_timeouts,
         peer_transports,
@@ -3314,16 +3426,24 @@ async fn request_bitswap_block_after_connection(
     .await;
     match &result {
         Ok(result) => {
+            let requested_bytes = result
+                .requested_blocks
+                .values()
+                .map(Vec::len)
+                .sum::<usize>();
             tracing::info!(
                 phase = "bitswap_peer_attempt",
-                cid = %cid,
+                cid = %primary_cid,
+                cids = %cid_summary.as_deref().unwrap_or(""),
+                cid_count,
                 peer = %peer_id,
                 ok = true,
                 prefer_want_have,
                 want_have_timeout_ms = request_timeouts.want_have.as_millis(),
                 stream_read_timeout_ms = request_timeouts.stream_read.as_millis(),
                 source_transport = result.source_transport.unwrap_or("unknown"),
-                bytes = result.requested_block.len(),
+                bytes = requested_bytes,
+                requested_blocks = result.requested_blocks.len(),
                 extra_blocks = result.extra_blocks.len(),
                 elapsed_ms = attempt_started.elapsed().as_millis()
             );
@@ -3331,7 +3451,9 @@ async fn request_bitswap_block_after_connection(
         Err(err) => {
             tracing::info!(
                 phase = "bitswap_peer_attempt",
-                cid = %cid,
+                cid = %primary_cid,
+                cids = %cid_summary.as_deref().unwrap_or(""),
+                cid_count,
                 peer = %peer_id,
                 ok = false,
                 failure_kind = bitswap_peer_failure_kind_label(err.kind),
@@ -3354,16 +3476,19 @@ fn bitswap_peer_failure_kind_label(kind: BitswapPeerFailureKind) -> &'static str
     }
 }
 
-async fn request_bitswap_block(
+async fn request_bitswap_blocks(
     mut control: StreamControl,
     peer_id: PeerId,
     addrs: Vec<Multiaddr>,
-    cid: Cid,
+    cids: Vec<Cid>,
     prefer_want_have: bool,
     request_timeouts: BitswapRequestTimeouts,
     peer_transports: PeerTransportLog,
-) -> std::result::Result<BitswapFetchResult, BitswapPeerFailure> {
+) -> std::result::Result<BitswapFetchBatchResult, BitswapPeerFailure> {
     let mut failures = Vec::new();
+    let primary_cid = cids[0];
+    let cid_count = cids.len();
+    let cid_summary = format_cids(&cids);
     for protocol in bitswap_protocols() {
         let protocol_name = protocol.to_string();
         let stream = timeout(
@@ -3389,20 +3514,23 @@ async fn request_bitswap_block(
             }
         };
 
-        if prefer_want_have && protocol_name == "/ipfs/bitswap/1.2.0" {
+        if cid_count == 1 && prefer_want_have && protocol_name == "/ipfs/bitswap/1.2.0" {
             match request_bitswap_block_after_want_have(
                 &mut stream,
-                &cid,
+                &primary_cid,
                 &protocol_name,
                 request_timeouts,
             )
             .await
             {
-                Ok(mut result) => {
-                    result.source_peer = Some(peer_id);
-                    result.source_transport =
-                        current_peer_transport(&peer_transports, peer_id).await;
-                    return Ok(result);
+                Ok(result) => {
+                    return Ok(BitswapFetchBatchResult {
+                        requested_blocks: HashMap::from([(primary_cid, result.requested_block)]),
+                        extra_blocks: result.extra_blocks,
+                        source_peer: Some(peer_id),
+                        source_transport: current_peer_transport(&peer_transports, peer_id).await,
+                        delivery: result.delivery,
+                    });
                 }
                 Err(WantHaveFailure::TryOtherProtocols(err)) => {
                     let read_timed_out = err.kind == BitswapPeerFailureKind::ReadTimeout;
@@ -3419,18 +3547,22 @@ async fn request_bitswap_block(
             }
         }
 
-        match request_bitswap_block_on_stream(
+        match request_bitswap_blocks_on_stream(
             &mut stream,
-            &cid,
+            &cids,
             &protocol_name,
             request_timeouts.stream_read,
         )
         .await
         {
-            Ok(mut result) => {
-                result.source_peer = Some(peer_id);
-                result.source_transport = current_peer_transport(&peer_transports, peer_id).await;
-                return Ok(result);
+            Ok(result) => {
+                return Ok(BitswapFetchBatchResult {
+                    requested_blocks: result.requested_blocks,
+                    extra_blocks: result.extra_blocks,
+                    source_peer: Some(peer_id),
+                    source_transport: current_peer_transport(&peer_transports, peer_id).await,
+                    delivery: "outgoing",
+                });
             }
             Err(err) => {
                 let read_timed_out = err.kind == BitswapPeerFailureKind::ReadTimeout;
@@ -3453,7 +3585,7 @@ async fn request_bitswap_block(
         id: peer_id,
         kind,
         detail: format!(
-            "{peer_id}: no supported Bitswap protocol returned cid {cid}; addrs={}; failures=({})",
+            "{peer_id}: no supported Bitswap protocol returned cids {cid_summary}; addrs={}; failures=({})",
             format_multiaddrs(&addrs),
             failures
                 .iter()
@@ -4628,6 +4760,55 @@ mod bitswap_tests {
             .unwrap();
         swarm_task.abort();
         peer_swarm_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shared_bitswap_client_fetch_many_requests_multiple_blocks_from_one_peer() {
+        let first_data = b"first shared client multi-want block";
+        let second_data = b"second shared client multi-want block";
+        let first = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, first_data);
+        let second = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, second_data);
+        let (peer_id, addr, peer_swarm_task, peer_stream_task) =
+            spawn_multi_want_bitswap_peer(vec![
+                (first, first_data.to_vec()),
+                (second, second_data.to_vec()),
+            ])
+            .await;
+        let client = SharedBitswapClient::spawn().await.unwrap();
+
+        let result = client
+            .fetch_many(
+                vec![first, second],
+                vec![BitswapPeer {
+                    id: peer_id,
+                    addrs: vec![addr],
+                    skip_want_have: true,
+                }],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.requested_blocks.get(&first).unwrap(), first_data);
+        assert_eq!(result.requested_blocks.get(&second).unwrap(), second_data);
+        assert_eq!(result.extra_blocks, Vec::<(Cid, Vec<u8>)>::new());
+        assert_eq!(result.source_peer, Some(peer_id));
+        assert_eq!(result.delivery, "outgoing");
+        tokio::time::timeout(Duration::from_secs(5), peer_stream_task)
+            .await
+            .unwrap()
+            .unwrap();
+        peer_swarm_task.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_bitswap_client_fetch_many_rejects_empty_batch() {
+        let client = SharedBitswapClient::spawn().await.unwrap();
+        let err = client.fetch_many(Vec::new(), Vec::new()).await.unwrap_err();
+
+        assert!(
+            matches!(err, RetrievalError::Bitswap(message) if message.contains("batch cannot be empty"))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

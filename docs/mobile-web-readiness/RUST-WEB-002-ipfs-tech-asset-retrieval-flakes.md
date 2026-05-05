@@ -11252,3 +11252,56 @@ Keep. The event closes the diagnostic gap identified by the stream/range
 fixture: future harness runs can now see both gateway response construction and
 streamed body production timing, while the mobile progress layer receives a
 bounded completion signal for large streamed responses.
+
+## 2026-05-05 Bitswap Multi-Want Shared Client Building Block
+
+Hypothesis:
+The stream-level multi-want helper already proves that one Bitswap stream can
+request and cancel multiple CIDs. The next safe step toward page/session
+batching is to carry that through the shared Bitswap client command path, while
+leaving gateway/UnixFS retrieval behavior unchanged until there is a bounded
+session window to feed it.
+
+Change:
+
+- Add an internal `SharedBitswapClient::fetch_many` path that accepts a bounded
+  CID vector and returns verified requested blocks plus verified extra blocks.
+- Keep `SharedBitswapClient::fetch` as the existing single-CID API by wrapping
+  the batch path and converting the one requested block back into the old result
+  shape.
+- Change the shared Bitswap command/result internals to carry batch results.
+- Preserve the existing incoming Bitswap stream fast path for single-CID
+  commands. Multi-CID commands currently use outgoing streams only; incoming
+  batch matching can be added when page/session batching is wired in.
+- For multi-CID requests, send direct WANT_BLOCK entries on one stream. The
+  existing single-CID WANT_HAVE behavior is preserved for normal provider races.
+- Extend trace fields with `cids`, `cid_count`, `requested_blocks`, and batch
+  failure diagnostics so future harness runs can distinguish one-CID fetches
+  from batch experiments.
+- Add deterministic local tests proving the shared client sends one multi-want
+  request to a loopback Bitswap peer and rejects empty batches.
+
+Validation:
+
+```sh
+cargo fmt --all
+
+cargo test -p freedom-ipfs-retrieval shared_bitswap_client_fetch_many
+cargo test -p freedom-ipfs-retrieval
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Result:
+
+- focused shared-client multi-want tests passed:
+  `2 passed; 0 failed`
+- full retrieval test suite passed:
+  `65 passed; 0 failed; 1 ignored`
+- retrieval clippy passed with `-D warnings`
+- no live harness comparison was run because this commit intentionally does not
+  change gateway/UnixFS page retrieval scheduling yet
+
+Decision:
+Keep as a Priority-1 building block. This does not claim a page-load speed win
+by itself; it removes one more internal blocker before testing a small
+content-root/session multi-want window.
