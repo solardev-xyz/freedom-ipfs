@@ -77,6 +77,11 @@ Rejected public-DHT smoke candidates:
 
 Retired public-corpus candidates:
 
+- 2026-05-05: `daicowtf-home`
+  (`bafybeidznfolm74c5cephzdycedx7hk76iawno45wemcvkflieotzo2lne`) failed
+  same-window Rust and Kubo checks with no reachable providers. Keep it as an
+  explicit provider-quality target, but exclude it from the default live corpus
+  until availability stabilizes again.
 - 2026-05-03: `/ipns/ipfs.tech`, `/ipns/dist.ipfs.tech`, and
   `/ipns/cid.ipfs.tech` previously passed, but mutable site roots became flaky
   with repeated `502 Bad Gateway` responses from unavailable public providers.

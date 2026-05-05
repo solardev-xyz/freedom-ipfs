@@ -6195,3 +6195,106 @@ Live result:
 
 Conclusion: keep the harness mode. It gives future warm-path and browser-cache
 experiments a direct regression signal without changing normal harness behavior.
+
+## 2026-05-05 Current Kubo Comparison And DAICO Corpus Refresh
+
+Hypothesis: after provider retry hardening and cache-validator work, the next
+retrieval experiment needs fresh Rust-vs-Kubo evidence. The default corpus also
+needs to avoid stale public targets that fail for both engines.
+
+Commands:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/ipfs-tech-current-rust-vs-kubo-trace.jsonl \
+  --output /tmp/ipfs-tech-current-rust-vs-kubo.json
+
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/vitalik-current-rust-vs-kubo-trace.jsonl \
+  --output /tmp/vitalik-current-rust-vs-kubo.json
+```
+
+Results:
+
+- `ipfs-tech-page-assets`: Rust `3/3`, Kubo `3/3`.
+  - Root TTFB p50/p95: Rust `1250/1684ms`, Kubo `1405/2726ms`.
+  - Asset TTFB p50/p95: Rust `196/1352ms`, Kubo `106/1339ms`.
+  - Max RSS/FD: Rust `52416KiB`/`51`, Kubo `184168KiB`/`112`.
+- `vitalik-root-html-range`: Rust `3/3`, Kubo `3/3`.
+  - Root TTFB p50/p95: Rust `6664/10458ms`, Kubo `1657/2055ms`.
+  - Max RSS/FD: Rust `38400KiB`/`29`, Kubo `188912KiB`/`120`.
+
+Interpretation:
+
+- Rust is now meaningfully faster than Kubo for the current `ipfs.tech` root
+  page-load sample and uses far less RSS/FDs.
+- Rust still loses badly to Kubo for the `vitalik` root range case. The trace
+  shows repeated request-timeout recovery with mixed trusted peers, making this
+  a better next session/provider experiment target than `ipfs.tech`.
+- Rust `ipfs.tech` asset p50 is still slower than Kubo, while p95 is roughly
+  parity. That points at per-asset warm/session scheduling overhead rather than
+  root discovery alone.
+
+DAICO corpus check:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/daicowtf-current-rust-vs-kubo-trace.jsonl \
+  --output /tmp/daicowtf-current-rust-vs-kubo.json
+```
+
+The old DAICO CID failed for both engines: Rust `0/3`, Kubo `0/3`. Kubo reported
+`found 3 provider(s), attempted 3, but none were reachable`; Rust traces showed
+low provider diversity, repeated single-peer Bitswap request timeouts, and no
+asset fetches.
+
+The corpus was then refreshed to the newer checked-in `daicowtf.eth` snapshot:
+
+```text
+/ipfs/bafybeidznfolm74c5cephzdycedx7hk76iawno45wemcvkflieotzo2lne/
+```
+
+Same-window result for the refreshed CID:
+
+- Rust `0/3`, Kubo `0/3`.
+- Root TTFB p50/p95: Rust `31603/31660ms`, Kubo `30005/30005ms`.
+- Rust trace: `provider_diversity_low=12`, `bitswap request timed out=6`,
+  no successful asset fetches.
+- Evidence:
+  - `/tmp/daicowtf-current-corpus-rust-vs-kubo.json`
+  - `/tmp/daicowtf-current-corpus-rust-vs-kubo-trace.jsonl`
+
+Decision:
+
+- Keep the DAICO corpus path refreshed to the current checked-in ENS snapshot,
+  but mark the DAICO mobile-web cases `"default_enabled": false` so default
+  harness runs do not fail on a public availability window that also breaks
+  Kubo.
+- Remove `daicowtf-home` from the default opt-in `live-corpus` fixture for now.
+- Keep DAICO available as an explicit sparse-provider target with
+  `--case daicowtf-page-assets`.
+
+Follow-up: the next behavior experiment should target `vitalik-root-html-range`
+or `ipfs.tech` asset p50, not DAICO, unless the goal is specifically
+sparse-provider failure handling.

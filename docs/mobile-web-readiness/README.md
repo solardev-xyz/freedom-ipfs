@@ -195,6 +195,9 @@ minimum body size, body snippets, TTFB, and total response time. The corpus now
 covers ENS-derived immutable HTML snapshots, DNSLink/IPNS page crawls, a
 DNSLink image byte-range case, and a small independent Wikipedia-on-IPFS
 DNSLink root.
+Cases with `"default_enabled": false` are skipped unless named with `--case`.
+Use that for valuable but currently flaky public-network targets so default
+smokes stay actionable while explicit provider-quality runs remain available.
 
 Entries can also enable a page crawl. A crawl fetches the root HTML, extracts
 same-origin browser subresources from HTML and CSS, resolves root-relative paths

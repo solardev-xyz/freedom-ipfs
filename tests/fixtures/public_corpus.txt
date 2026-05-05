@@ -2,7 +2,10 @@
 # Format: name path min_bytes optional_range_bytes
 # Last verified from this repository on 2026-05-03 with `make live-corpus`.
 vitalik-home /ipfs/bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u 1024 128
-daicowtf-home /ipfs/bafybeidznfolm74c5cephzdycedx7hk76iawno45wemcvkflieotzo2lne 1024 128
+# 2026-05-05: daicowtf-home currently returns no reachable providers for both
+# Rust and Kubo in same-window checks. Keep it out of the default live corpus
+# until public provider availability stabilizes.
+# daicowtf-home /ipfs/bafybeidznfolm74c5cephzdycedx7hk76iawno45wemcvkflieotzo2lne 1024 128
 
 # DNSLink-backed /ipns media paths. These are intentionally mutable and
 # exercise the node's DNSLink resolver, /ipns gateway path, delegated routing,

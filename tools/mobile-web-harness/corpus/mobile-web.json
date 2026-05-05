@@ -2,8 +2,9 @@
   "entries": [
     {
       "id": "daicowtf-root-html-range",
-      "description": "ENS-resolved daicowtf.eth root CID. Root UnixFS file must render as HTML, not octet-stream.",
-      "path": "/ipfs/QmWWbDw6kriAjRLyJNaeXjqqoyNn6kA18C42ubVzYKS4wS/",
+      "description": "ENS-resolved daicowtf.eth root CID. Sparse-provider target kept opt-in because public availability is currently flaky.",
+      "path": "/ipfs/bafybeidznfolm74c5cephzdycedx7hk76iawno45wemcvkflieotzo2lne/",
+      "default_enabled": false,
       "range": "bytes=0-256",
       "expect_status": 206,
       "expect_content_type_prefix": "text/html",
@@ -14,8 +15,9 @@
     },
     {
       "id": "daicowtf-page-assets",
-      "description": "Fetch daicowtf.eth root HTML and same-origin browser subresources using app-style ipfs:// path semantics.",
-      "path": "/ipfs/QmWWbDw6kriAjRLyJNaeXjqqoyNn6kA18C42ubVzYKS4wS/",
+      "description": "Fetch daicowtf.eth root HTML and same-origin browser subresources. Sparse-provider target kept opt-in because public availability is currently flaky.",
+      "path": "/ipfs/bafybeidznfolm74c5cephzdycedx7hk76iawno45wemcvkflieotzo2lne/",
+      "default_enabled": false,
       "expect_status": 200,
       "expect_content_type_prefix": "text/html",
       "expect_body_contains": "<!DOCTYPE html",

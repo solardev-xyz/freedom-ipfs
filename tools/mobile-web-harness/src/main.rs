@@ -465,7 +465,7 @@ async fn run_corpus_once(
         .context("build reqwest client")?;
     let mut results = Vec::new();
     for entry in &corpus.entries {
-        if !cases.is_empty() && !cases.iter().any(|case| case == &entry.id) {
+        if !entry_selected(entry, cases) {
             continue;
         }
         results.push(
@@ -493,7 +493,7 @@ fn run_timeout_failure_results(
 ) -> Result<Vec<CaseResult>> {
     let mut results = Vec::new();
     for entry in &corpus.entries {
-        if !cases.is_empty() && !cases.iter().any(|case| case == &entry.id) {
+        if !entry_selected(entry, cases) {
             continue;
         }
         let url = format!("{}{}", gateway_url.trim_end_matches('/'), entry.path);
@@ -507,6 +507,14 @@ fn run_timeout_failure_results(
         bail!("no corpus entries matched the requested case filters");
     }
     Ok(results)
+}
+
+fn entry_selected(entry: &CorpusEntry, cases: &[String]) -> bool {
+    if cases.is_empty() {
+        entry.default_enabled.unwrap_or(true)
+    } else {
+        cases.iter().any(|case| case == &entry.id)
+    }
 }
 
 async fn run_case(
@@ -2911,6 +2919,7 @@ struct CorpusEntry {
     id: String,
     description: Option<String>,
     path: String,
+    default_enabled: Option<bool>,
     method: Option<String>,
     range: Option<String>,
     crawl: Option<CrawlConfig>,
@@ -6126,6 +6135,7 @@ mod tests {
                     id: "first".to_string(),
                     description: Some("first case".to_string()),
                     path: "/ipfs/first".to_string(),
+                    default_enabled: None,
                     method: None,
                     range: None,
                     crawl: None,
@@ -6140,6 +6150,7 @@ mod tests {
                     id: "second".to_string(),
                     description: None,
                     path: "/ipfs/second".to_string(),
+                    default_enabled: None,
                     method: Some("HEAD".to_string()),
                     range: None,
                     crawl: None,
@@ -6167,6 +6178,45 @@ mod tests {
         assert_eq!(results[0].url, "http://127.0.0.1:8080/ipfs/second");
         assert!(!results[0].passed);
         assert_eq!(results[0].failures, vec!["run timed out after 7s"]);
+    }
+
+    #[test]
+    fn corpus_entries_can_be_explicit_only() {
+        let default_entry = CorpusEntry {
+            id: "default".to_string(),
+            description: None,
+            path: "/ipfs/default".to_string(),
+            default_enabled: None,
+            method: None,
+            range: None,
+            crawl: None,
+            expect_status: Some(200),
+            expect_content_type_prefix: None,
+            expect_content_range_prefix: None,
+            expect_body_contains: None,
+            min_bytes: None,
+            max_ttfb_ms: None,
+        };
+        let explicit_only = CorpusEntry {
+            id: "explicit".to_string(),
+            description: None,
+            path: "/ipfs/explicit".to_string(),
+            default_enabled: Some(false),
+            method: None,
+            range: None,
+            crawl: None,
+            expect_status: Some(200),
+            expect_content_type_prefix: None,
+            expect_content_range_prefix: None,
+            expect_body_contains: None,
+            min_bytes: None,
+            max_ttfb_ms: None,
+        };
+
+        assert!(entry_selected(&default_entry, &[]));
+        assert!(!entry_selected(&explicit_only, &[]));
+        assert!(entry_selected(&explicit_only, &["explicit".to_string()]));
+        assert!(!entry_selected(&default_entry, &["explicit".to_string()]));
     }
 
     #[test]
@@ -6402,6 +6452,7 @@ mod tests {
             id: id.to_string(),
             description: None,
             path: path.to_string(),
+            default_enabled: None,
             method: None,
             range: None,
             crawl: None,
