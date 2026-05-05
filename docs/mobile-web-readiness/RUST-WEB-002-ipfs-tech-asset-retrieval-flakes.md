@@ -13059,3 +13059,179 @@ exact shape. The successful live follow-ups did not exercise the retry, so this
 is a bounded robustness change rather than a measured live performance win. The
 cost is one extra delegated request and `100ms` only when delegated routing
 returns empty, before a much more expensive DHT lookup would already happen.
+
+## 2026-05-05 Keep: Shorten Low-Diversity DHT Fallback Cap To 250ms
+
+Hypothesis:
+The previous `daicowtf-page-assets` 10-run soak passed reliably, but its
+remaining tail included low-diversity light-DHT fallback attempts that all found
+zero extra providers and timed out under the existing `750ms` fallback cap.
+For sparse public-provider cases where delegated routing already returned a
+usable WSS provider, spending another `750ms` trying to diversify through DHT is
+often wasted latency. A shorter `250ms` cap should preserve the bounded fallback
+signal while reducing page-load tail when the DHT path is not producing
+additional providers.
+
+Change:
+
+- Lower `LOW_DIVERSITY_DHT_FALLBACK_TIMEOUT` from `750ms` to `250ms`.
+- Keep `LOW_DIVERSITY_DELEGATED_MERGE_TIMEOUT` at `750ms`; this only changes
+  the inner DHT provider lookup cap used after a non-empty low-diversity
+  delegated result.
+- Keep verification-before-store/serve semantics unchanged.
+- No public gateway fallback is added.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing auto_routing_bounds_low_diversity_dht_fallback_timeout
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+```
+
+Result: all focused checks passed. The routing test covers that the
+low-diversity DHT fallback is still bounded by the configured cap.
+
+Same-window `daicowtf` comparison against the previous `750ms` cap:
+
+Previous 750ms-cap artifact:
+
+- trace: `/tmp/daicowtf-empty-delegated-retry-r10-trace.jsonl`
+- output: `/tmp/daicowtf-empty-delegated-retry-r10.json`
+
+Previous 750ms-cap result:
+
+- Rust passed `10/10`.
+- Root TTFB p50/p90/p95/max was `1517ms` / `1579ms` / `1742ms` / `1742ms`.
+- Run total p50/p90/p95/max was `1535ms` / `1592ms` / `1758ms` / `1758ms`.
+- RSS p50/p90/p95/max was `43688KiB` / `44148KiB` / `44152KiB` / `44152KiB`.
+- FD p50/p90/p95/max was `18` / `20` / `20` / `20`.
+- Low-diversity DHT fallback events: `8`, all failures/timeouts, max timeout
+  `750ms`, max elapsed about `753ms`.
+
+250ms-cap run:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-dht-fallback-250ms-r10-trace.jsonl \
+  --output /tmp/daicowtf-dht-fallback-250ms-r10.json
+```
+
+250ms-cap result:
+
+- Rust passed `10/10`.
+- Root TTFB p50/p90/p95/max was `1124ms` / `1409ms` / `1427ms` / `1427ms`.
+- Run total p50/p90/p95/max was `1138ms` / `1422ms` / `1441ms` / `1441ms`.
+- RSS p50/p90/p95/max was `42788KiB` / `43120KiB` / `43240KiB` /
+  `43240KiB`.
+- FD p50/p90/p95/max was `19` / `20` / `20` / `20`.
+- Low-diversity DHT fallback events: `10`, all failures/timeouts, max timeout
+  `250ms`, max elapsed about `252ms`.
+- Provider-diversity-low trace events: `29`, failures `10`, total providers
+  `19`, max timeout `250ms`.
+
+Interpretation:
+
+- Reliability stayed at `10/10` for the target workload.
+- Compared with the immediate 750ms-cap soak, root TTFB improved by about
+  `393ms` at p50 and `315ms` at p95.
+- Run total improved by about `397ms` at p50 and `317ms` at p95.
+- RSS stayed in the same mobile-friendly band and was slightly lower in this
+  window; FD usage stayed capped around `20`.
+- The DHT fallback continued to find no extra providers, so this specific
+  public-network window supports treating the previous `750ms` spend as wasted
+  latency.
+
+Guardrail: `vitalik-root-html-range`
+
+First run:
+
+- artifacts: `/tmp/vitalik-dht-fallback-250ms-r3.json` and
+  `/tmp/vitalik-dht-fallback-250ms-r3-trace.jsonl`
+- Rust and Kubo passed `3/3`.
+- Rust root TTFB p50/p95 was `167ms` / `5993ms`; Kubo was `2689ms` /
+  `2824ms`.
+- Trace showed one high-diversity delegated provider lookup outlier at about
+  `5581ms`; there was no low-diversity DHT fallback involvement. Treat this as
+  delegated-router noise, not evidence against the 250ms cap.
+
+Rerun:
+
+```sh
+timeout 480s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-dht-fallback-250ms-rerun-r3-trace.jsonl \
+  --comparison-output /tmp/vitalik-dht-fallback-250ms-rerun-r3.json
+```
+
+Rerun result:
+
+- Rust and Kubo passed `3/3`.
+- Rust root TTFB p50/p95 was `148ms` / `152ms`; Kubo was `3432ms` /
+  `4073ms`.
+- Rust max RSS/FD was `31488KiB` / `15`; Kubo max RSS/FD was `176740KiB` /
+  `117`.
+- Delegated lookup max was `64ms`.
+- HTTP provider fetches: `6/6` success, p50/p95 `21ms` / `32ms`.
+- No low-diversity DHT fallback involvement.
+
+Guardrail: `ipfs-tech-page-assets`
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-dht-fallback-250ms-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-dht-fallback-250ms-r3.json
+```
+
+Guardrail result:
+
+- Rust and Kubo passed `3/3`.
+- Rust root TTFB p50/p95 was `1559ms` / `1573ms`; Kubo was `2547ms` /
+  `6429ms`.
+- Rust asset TTFB p50/p95 was `308ms` / `1418ms`; Kubo was `123ms` / `352ms`.
+- Rust max RSS/FD was `54740KiB` / `48`; Kubo max RSS/FD was `278224KiB` /
+  `277`.
+- The trace did not show low-diversity DHT fallback as the asset tail driver.
+  The slowest events were Bitswap/provider tails, connection errors, HTTP
+  provider fetches, and one public delegated-router lookup outlier around
+  `6196ms` in a high-provider-count path.
+- This remains a separate asset-tail problem: Rust passed reliably with much
+  lower resources and better root p95 than Kubo, but Kubo still had better asset
+  p95 in this window.
+
+Decision:
+Keep the `250ms` low-diversity DHT fallback cap. The strongest evidence is the
+same-window `daicowtf` r10 comparison: reliability stayed perfect, the DHT
+fallback continued to find no providers, and p50/p95 page latency improved by
+hundreds of milliseconds with no resource regression. The `vitalik` and
+`ipfs-tech` guardrails did not implicate the cap in their remaining tails. Keep
+watching sparse-provider workloads for cases where a slightly longer DHT
+fallback actually finds useful extra Bitswap peers, but the current measured
+tradeoff favors the shorter cap for mobile reads.
