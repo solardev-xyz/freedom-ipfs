@@ -3689,3 +3689,36 @@ peer selection, Bitswap request behavior, caching, or verification. It gives
 future session batching or first-byte hedge experiments a direct way to tell
 whether a slow asset was waiting on inbound Bitswap delivery, command queuing,
 provider lookup, or peer expansion.
+
+Rejected follow-up: increase post-lookup session wait from `200ms` to `400ms`.
+
+Hypothesis:
+The clean pending-age trace showed `session_shortcut_post_lookup_waits=6` and
+`max_oldest_pending_ms=898`. A longer post-lookup wait might allow more
+recent-peer session shortcuts to finish and reduce fallback provider fanout.
+
+Temporary experiment:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib recent_bitswap
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-postlookup400-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-postlookup400-r3.json
+```
+
+Result: reject. Rust and Kubo both passed `3/3`, but Rust regressed badly:
+root TTFB p50/p95 was `3124/3544ms` versus Kubo `2409/2480ms`, and asset TTFB
+p50/p95 was `179/2265ms` versus Kubo `303/711ms`. The trace showed
+`session_shortcut_starts=102`, `session_shortcut_post_lookup_waits=40`,
+`session_shortcut_hits=62`, `bitswap_fetches=43`, `peer_attempt_starts=697`,
+and inbound `max_oldest_pending_ms=1983`. Compared with the kept `200ms`
+baseline, the longer wait did not produce enough shortcut wins and held too
+many requests in the slow session path. Reverted to `200ms`.
