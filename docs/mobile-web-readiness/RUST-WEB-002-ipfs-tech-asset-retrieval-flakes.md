@@ -20017,3 +20017,65 @@ sub-second root p95, asset p50 close to warm human-perceived responsiveness,
 and bounded FD/RSS. The most visible remaining tail is no longer HTTP provider
 fetch result latency; it is UnixFS/root path work waiting on the slowest block
 fetches and occasional delegated lookup outliers under `1s`.
+
+## 2026-05-05 Reject: Lower Delegated Self-Hedge To 500ms
+
+Question:
+The 250ms HTTP self-hedge cold r10 sample had a rare delegated lookup outlier
+at `635ms`, below the current `750ms` delegated same-endpoint self-hedge. Would
+lowering `SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER` to `500ms` catch useful
+delegated-router tails without adding meaningful traffic?
+
+Temporary implementation:
+
+- Change `SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER` from `750ms` to `500ms`.
+- Keep the existing kill switch:
+  `FREEDOM_IPFS_DISABLE_SINGLE_DELEGATED_SELF_HEDGE=1`.
+- Keep the existing one-duplicate, same-endpoint behavior.
+
+Focused validation:
+
+```sh
+cargo test -p freedom-ipfs-routing delegated_routing_self_hedges_slow_single_endpoint
+```
+
+Focused result:
+Passed.
+
+Live experiment:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-delegated-self-hedge500-cold-r10-trace.jsonl \
+  --output /tmp/ipfs-tech-delegated-self-hedge500-cold-r10.json
+```
+
+Live result:
+
+- Passed: `10/10`.
+- Run total p50/p90/p95/max: `2043/2349/2367/2367ms`.
+- Root TTFB p50/p90/p95/max: `550/742/843/843ms`.
+- Asset TTFB p50/p90/p95/max: `214/458/539/940ms`.
+- Gateway max RSS/FD: `53484KiB` / `30`.
+- Delegated provider lookups: `325`, successes `325`, failures `0`.
+- Delegated self-hedges: `0`.
+- Delegated lookup p50/p90/p95/max: `22/47/52/94ms`.
+- HTTP-provider self-hedges: `42`.
+- Block sources: `http_provider=311`, `bitswap=88`, `cache=1`.
+
+Decision:
+Reject and revert. In this window the lower delegated threshold did not fire at
+all, so it gave no evidence of useful tail protection. The 500ms run was also
+slower than the preceding 750ms-threshold r10 sample, apparently from unrelated
+network/source variance, so there is no measured reason to change the delegated
+hedge threshold now. Keep `750ms` until a repeated live tail actually crosses
+the current guard or a deterministic production-like test shows a narrower
+threshold helps.
