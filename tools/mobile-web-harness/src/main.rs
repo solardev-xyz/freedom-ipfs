@@ -1754,6 +1754,17 @@ fn print_trace_http_provider_races(trace: &TraceSummary) {
             );
         }
     }
+    if race.winner_scored_events > 0 || race.max_winner_original_provider_rank > 0 {
+        println!(
+            "    provider scoring: winner_scored={} winner_score={} original_rank1={} original_rank2={} original_rank3_plus={} original_rank_max={}",
+            race.winner_scored_events,
+            race.winner_score_elapsed_ms,
+            race.winner_original_rank1_events,
+            race.winner_original_rank2_events,
+            race.winner_original_rank3_plus_events,
+            race.max_winner_original_provider_rank
+        );
+    }
     if race.multi_provider_success_elapsed_ms.count > 0 {
         println!(
             "    multi-provider winner elapsed={}",
@@ -4775,6 +4786,12 @@ struct TraceHttpProviderRaceAggregate {
     winner_rank2_events: usize,
     winner_rank3_plus_events: usize,
     max_winner_provider_rank: u128,
+    winner_original_rank1_events: usize,
+    winner_original_rank2_events: usize,
+    winner_original_rank3_plus_events: usize,
+    max_winner_original_provider_rank: u128,
+    winner_scored_events: usize,
+    winner_score_elapsed_ms: LatencySummary,
     max_attempted_provider_count: u128,
     max_result_elapsed_ms: u128,
     single_provider_result_successes: usize,
@@ -4786,6 +4803,8 @@ struct TraceHttpProviderRaceAggregate {
     single_provider_success_elapsed_values: Vec<u128>,
     #[serde(skip)]
     multi_provider_success_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    winner_score_elapsed_values: Vec<u128>,
     #[serde(skip)]
     single_provider_winner_builders: BTreeMap<String, TraceHttpProviderRaceWinnerProviderBuilder>,
 }
@@ -4849,12 +4868,35 @@ impl TraceHttpProviderRaceAggregate {
                     self.multi_provider_success_elapsed_values.push(elapsed_ms);
                 }
                 let winner_rank = trace_count_field(value, "winner_provider_rank");
+                let winner_original_rank =
+                    trace_count_field(value, "winner_original_provider_rank");
                 self.max_winner_provider_rank = self.max_winner_provider_rank.max(winner_rank);
+                self.max_winner_original_provider_rank = self
+                    .max_winner_original_provider_rank
+                    .max(winner_original_rank);
                 match winner_rank {
                     1 => self.winner_rank1_events += 1,
                     2 => self.winner_rank2_events += 1,
                     rank if rank > 2 => self.winner_rank3_plus_events += 1,
                     _ => {}
+                }
+                match winner_original_rank {
+                    1 => self.winner_original_rank1_events += 1,
+                    2 => self.winner_original_rank2_events += 1,
+                    rank if rank > 2 => self.winner_original_rank3_plus_events += 1,
+                    _ => {}
+                }
+                if value
+                    .get("winner_provider_scored")
+                    .and_then(|scored| scored.as_bool())
+                    == Some(true)
+                {
+                    self.winner_scored_events += 1;
+                    if let Some(score_ms) =
+                        value.get("winner_provider_score_ms").and_then(json_u128)
+                    {
+                        self.winner_score_elapsed_values.push(score_ms);
+                    }
                 }
                 if value
                     .get("winner_within_initial_width")
@@ -4883,6 +4925,8 @@ impl TraceHttpProviderRaceAggregate {
         self.multi_provider_success_elapsed_ms = LatencySummary::from_values(std::mem::take(
             &mut self.multi_provider_success_elapsed_values,
         ));
+        self.winner_score_elapsed_ms =
+            LatencySummary::from_values(std::mem::take(&mut self.winner_score_elapsed_values));
         self.single_provider_winners = sorted_trace_http_provider_race_winners(std::mem::take(
             &mut self.single_provider_winner_builders,
         ));
@@ -10202,9 +10246,9 @@ mod tests {
                 "{\"phase\":\"http_provider_race\",\"cid\":\"cid-single-ok\",\"provider_count\":1,\"race_width\":2}\n",
                 "{\"phase\":\"http_provider_race\",\"cid\":\"cid-single-fail\",\"provider_count\":1,\"race_width\":2}\n",
                 "{\"phase\":\"http_provider_hedge\",\"cid\":\"cid-b\",\"provider\":\"https://provider-c.example\",\"timeout_ms\":250,\"pending_count\":2,\"remaining_provider_count\":1}\n",
-                "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-a\",\"ok\":true,\"provider\":\"https://provider-a.example\",\"winner_provider_index\":1,\"winner_provider_rank\":2,\"winner_within_initial_width\":true,\"provider_count\":2,\"race_width\":2,\"attempted_provider_count\":2,\"failed_provider_count\":0,\"hedge_fired\":false,\"elapsed_ms\":25}\n",
+                "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-a\",\"ok\":true,\"provider\":\"https://provider-a.example\",\"winner_provider_index\":1,\"winner_provider_rank\":2,\"winner_original_provider_rank\":3,\"winner_within_initial_width\":true,\"winner_provider_scored\":true,\"winner_provider_score_ms\":42,\"provider_count\":2,\"race_width\":2,\"attempted_provider_count\":2,\"failed_provider_count\":0,\"hedge_fired\":false,\"elapsed_ms\":25}\n",
                 "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-b\",\"ok\":false,\"provider_count\":4,\"race_width\":2,\"attempted_provider_count\":4,\"failed_provider_count\":4,\"hedge_fired\":true,\"elapsed_ms\":300}\n",
-                "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-single-ok\",\"ok\":true,\"provider\":\"https://provider-single.example\",\"winner_provider_index\":0,\"winner_provider_rank\":1,\"winner_within_initial_width\":true,\"provider_count\":1,\"race_width\":2,\"attempted_provider_count\":1,\"failed_provider_count\":0,\"hedge_fired\":false,\"elapsed_ms\":450}\n",
+                "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-single-ok\",\"ok\":true,\"provider\":\"https://provider-single.example\",\"winner_provider_index\":0,\"winner_provider_rank\":1,\"winner_original_provider_rank\":1,\"winner_within_initial_width\":true,\"winner_provider_scored\":false,\"provider_count\":1,\"race_width\":2,\"attempted_provider_count\":1,\"failed_provider_count\":0,\"hedge_fired\":false,\"elapsed_ms\":450}\n",
                 "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-single-fail\",\"ok\":false,\"provider_count\":1,\"race_width\":2,\"attempted_provider_count\":1,\"failed_provider_count\":1,\"hedge_fired\":false,\"elapsed_ms\":900}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-a\",\"provider\":\"https://provider-a.example\",\"ok\":true,\"bytes\":128,\"response_bytes\":128,\"response_headers_elapsed_ms\":7,\"response_first_chunk_seen\":true,\"response_first_chunk_elapsed_ms\":9,\"response_body_elapsed_ms\":20,\"elapsed_ms\":25}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-b\",\"provider\":\"https://provider-b.example\",\"ok\":false,\"error\":\"core: cid hash mismatch for cid-b\",\"response_headers_elapsed_ms\":40,\"elapsed_ms\":40}\n",
@@ -10243,6 +10287,25 @@ mod tests {
         assert_eq!(summary.http_provider_races.winner_rank2_events, 1);
         assert_eq!(summary.http_provider_races.winner_rank3_plus_events, 0);
         assert_eq!(summary.http_provider_races.max_winner_provider_rank, 2);
+        assert_eq!(summary.http_provider_races.winner_original_rank1_events, 1);
+        assert_eq!(summary.http_provider_races.winner_original_rank2_events, 0);
+        assert_eq!(
+            summary
+                .http_provider_races
+                .winner_original_rank3_plus_events,
+            1
+        );
+        assert_eq!(
+            summary
+                .http_provider_races
+                .max_winner_original_provider_rank,
+            3
+        );
+        assert_eq!(summary.http_provider_races.winner_scored_events, 1);
+        assert_eq!(
+            summary.http_provider_races.winner_score_elapsed_ms.p50_ms,
+            Some(42)
+        );
         assert_eq!(summary.http_provider_races.max_attempted_provider_count, 4);
         assert_eq!(summary.http_provider_races.max_result_elapsed_ms, 900);
         assert_eq!(

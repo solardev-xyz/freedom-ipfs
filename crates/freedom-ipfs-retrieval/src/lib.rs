@@ -977,6 +977,7 @@ impl HttpRetriever {
                                 provider_count,
                                 race_width = HTTP_PROVIDER_RACE_WIDTH,
                                 scored_provider_count,
+                                winner_provider_scored = result.score_elapsed.is_some(),
                                 winner_provider_score_ms = result
                                     .score_elapsed
                                     .map(|elapsed| elapsed.as_millis())
@@ -1013,6 +1014,7 @@ impl HttpRetriever {
                             timeout_ms = HTTP_PROVIDER_HEDGE_AFTER.as_millis(),
                             provider_index = scheduled_index,
                             original_provider_rank = candidate.original_index + 1,
+                            provider_scored = candidate.score_elapsed.is_some(),
                             provider_score_ms = candidate
                                 .score_elapsed
                                 .map(|elapsed| elapsed.as_millis())

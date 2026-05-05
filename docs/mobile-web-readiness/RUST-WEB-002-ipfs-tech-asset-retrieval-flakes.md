@@ -18216,3 +18216,53 @@ verification, does not increase race width or fetch concurrency, and improved
 same-window `ipfs.tech` root and asset latency while preserving low RSS/FD in
 secondary live checks. Keep watching `scored_provider_count`, provider p95, and
 winner original rank in future provider-quality runs.
+
+## 2026-05-05 Keep: Summarize HTTP Provider Score Winners
+
+Question:
+The kept HTTP-provider origin scorer emits `winner_original_provider_rank` and
+score fields, but the harness only summarized how many race events had any
+scored providers. Future provider-quality runs need to know whether the
+selected winner was scored and whether scoring moved a provider from a later
+delegated rank into the scheduled race window.
+
+Implementation:
+
+- Add `winner_provider_scored` and `provider_scored` booleans to retrieval
+  race/hedge trace events.
+- Extend the harness HTTP-provider race aggregate with:
+  - scored winner count
+  - scored winner score latency summary
+  - winner original-rank buckets
+  - max winner original rank
+- Print a compact `provider scoring` line in trace summaries.
+- Update the existing HTTP-provider trace summary test with scored winner and
+  original-rank fixture data.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_http_provider_fetches
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo check -p mobile-web-harness --all-targets
+cargo test -p mobile-web-harness
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting passed.
+- Focused HTTP-provider trace summary test passed.
+- Retrieval crate all-target check passed.
+- Mobile web harness all-target check passed.
+- Full mobile web harness suite passed: `38 passed`.
+- Workspace clippy passed with warnings denied.
+- Diff whitespace check passed.
+
+Decision:
+Keep. This is diagnostics-only and does not change provider policy, fetch
+concurrency, fallback behavior, block verification, or caching. It makes the
+kept scorer measurable from normal harness output instead of requiring manual
+JSONL inspection.
