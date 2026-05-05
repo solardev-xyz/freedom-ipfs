@@ -29,6 +29,7 @@ const DEFAULT_DELEGATED_ROUTING_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DELEGATED_ROUTING_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_DELEGATED_ROUTING_PROVIDERS: usize = 64;
 const MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY: usize = 2;
+const LOW_DIVERSITY_DELEGATED_MERGE_TIMEOUT: Duration = Duration::from_millis(750);
 const LOW_DIVERSITY_DHT_FALLBACK_TIMEOUT: Duration = Duration::from_millis(750);
 const DHT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const DHT_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -297,12 +298,42 @@ impl DelegatedRoutingClient {
             .iter()
             .map(|endpoint| self.providers_from_endpoint(endpoint, cid))
             .collect::<FuturesUnordered<_>>();
+        let mut merged_providers = Vec::new();
+        let mut saw_provider_response = false;
         let mut saw_empty_response = false;
         let mut first_error = None;
+        let low_diversity_deadline = tokio::time::sleep(LOW_DIVERSITY_DELEGATED_MERGE_TIMEOUT);
+        tokio::pin!(low_diversity_deadline);
+        let mut waiting_for_low_diversity_merge = false;
 
-        while let Some(result) = queries.next().await {
+        loop {
+            let result = if waiting_for_low_diversity_merge {
+                tokio::select! {
+                    result = queries.next() => result,
+                    _ = &mut low_diversity_deadline => break,
+                }
+            } else {
+                queries.next().await
+            };
+            let Some(result) = result else {
+                break;
+            };
             match result {
-                Ok(providers) if !providers.is_empty() => return Ok(providers),
+                Ok(providers) if !providers.is_empty() => {
+                    saw_provider_response = true;
+                    merged_providers = merge_provider_lists(merged_providers, providers)?;
+                    if bitswap_provider_diversity(&merged_providers)
+                        >= MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY
+                    {
+                        return Ok(merged_providers);
+                    }
+                    if !waiting_for_low_diversity_merge {
+                        waiting_for_low_diversity_merge = true;
+                        low_diversity_deadline.as_mut().reset(
+                            tokio::time::Instant::now() + LOW_DIVERSITY_DELEGATED_MERGE_TIMEOUT,
+                        );
+                    }
+                }
                 Ok(_) => saw_empty_response = true,
                 Err(err) => {
                     if first_error.is_none() {
@@ -312,7 +343,9 @@ impl DelegatedRoutingClient {
             }
         }
 
-        if saw_empty_response {
+        if saw_provider_response {
+            Ok(merged_providers)
+        } else if saw_empty_response {
             Ok(Vec::new())
         } else {
             Err(first_error.unwrap_or_else(|| {
@@ -1130,6 +1163,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegated_routing_merges_low_diversity_endpoint_results() {
+        let cid = "bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u"
+            .parse::<Cid>()
+            .unwrap();
+        let (first_endpoint, first_task) = spawn_delegated_response(
+            r#"{"Providers":[{"ID":"peer-a","Addrs":["/ip4/127.0.0.1/tcp/4001"]}]}"#,
+        )
+        .await;
+        let (second_endpoint, second_task) = spawn_delegated_response(
+            r#"{"Providers":[{"ID":"peer-b","Addrs":["/ip4/127.0.0.2/tcp/4001"]}]}"#,
+        )
+        .await;
+
+        let providers = DelegatedRoutingClient::with_endpoints([first_endpoint, second_endpoint])
+            .providers(&cid)
+            .await
+            .unwrap();
+
+        assert_eq!(providers.len(), 2);
+        assert!(providers
+            .iter()
+            .any(|provider| provider.id.as_deref() == Some("peer-a")));
+        assert!(providers
+            .iter()
+            .any(|provider| provider.id.as_deref() == Some("peer-b")));
+        assert_eq!(bitswap_provider_diversity(&providers), 2);
+        for task in [first_task, second_task] {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_routing_returns_single_low_diversity_result_when_others_empty() {
+        let cid = "bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u"
+            .parse::<Cid>()
+            .unwrap();
+        let (first_endpoint, first_task) = spawn_delegated_response(
+            r#"{"Providers":[{"ID":"peer-a","Addrs":["/ip4/127.0.0.1/tcp/4001"]}]}"#,
+        )
+        .await;
+        let (empty_endpoint, empty_task) = spawn_delegated_response(r#"{"Providers":[]}"#).await;
+
+        let providers = DelegatedRoutingClient::with_endpoints([first_endpoint, empty_endpoint])
+            .providers(&cid)
+            .await
+            .unwrap();
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id.as_deref(), Some("peer-a"));
+        for task in [first_task, empty_task] {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_routing_low_diversity_merge_wait_is_bounded() {
+        let cid = "bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u"
+            .parse::<Cid>()
+            .unwrap();
+        let (first_endpoint, first_task) = spawn_delegated_response(
+            r#"{"Providers":[{"ID":"peer-a","Addrs":["/ip4/127.0.0.1/tcp/4001"]}]}"#,
+        )
+        .await;
+        let (slow_endpoint, slow_task) = spawn_delayed_delegated_response(
+            r#"{"Providers":[{"ID":"peer-b","Addrs":["/ip4/127.0.0.2/tcp/4001"]}]}"#,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let started = std::time::Instant::now();
+        let providers = DelegatedRoutingClient::with_endpoints([first_endpoint, slow_endpoint])
+            .providers(&cid)
+            .await
+            .unwrap();
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id.as_deref(), Some("peer-a"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "low-diversity delegated merge wait should stay bounded"
+        );
+        for task in [first_task, slow_task] {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    #[tokio::test]
     async fn observed_delegated_routing_records_provider_lookup_stats() {
         let cid = "bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u"
             .parse::<Cid>()
@@ -1293,6 +1416,30 @@ mod tests {
 
     async fn spawn_delegated_response(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
         spawn_delegated_response_owned(body.to_string()).await
+    }
+
+    async fn spawn_delayed_delegated_response(
+        body: &'static str,
+        delay: Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut request).await;
+            tokio::time::sleep(delay).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                .await
+                .unwrap();
+        });
+        (format!("http://{addr}/routing/v1"), task)
     }
 
     async fn spawn_delegated_response_owned(body: String) -> (String, tokio::task::JoinHandle<()>) {

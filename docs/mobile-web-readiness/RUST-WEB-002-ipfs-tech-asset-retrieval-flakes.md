@@ -6822,3 +6822,46 @@ git diff --check
 
 Decision: keep. This is diagnostics-only and makes future incoming-read cap or
 timeout regressions visible without hand-searching trace errors.
+
+## 2026-05-05 Keep: Merge Low-Diversity Delegated Router Results
+
+Motivation:
+The recurring `daicowtf` failure shape is a provider-diversity gap: delegated
+routing returns one Bitswap provider for the root, the root block succeeds, then
+the linked child CID has no routed providers and the root source peer stalls.
+The gateway already accepts comma-separated delegated routing endpoints, but
+`DelegatedRoutingClient` returned the first non-empty endpoint response. If a
+configured secondary endpoint had an additional provider, it would be ignored.
+
+Implementation:
+
+- For multiple delegated routing endpoints, continue racing requests in
+  parallel.
+- If an endpoint returns enough Bitswap provider diversity, return immediately.
+- If the first non-empty response is low-diversity, merge additional endpoint
+  responses for a bounded `750ms` window.
+- Deduplicate providers with the existing provider merge logic.
+- Return the low-diversity result if other endpoints are empty, errored, or too
+  slow.
+- Keep single-endpoint behavior unchanged.
+
+Validation:
+
+```sh
+cargo fmt --all
+cargo test -p freedom-ipfs-routing delegated_routing_merges_low_diversity_endpoint_results
+cargo test -p freedom-ipfs-routing delegated_routing_returns_single_low_diversity_result_when_others_empty
+cargo test -p freedom-ipfs-routing delegated_routing_low_diversity_merge_wait_is_bounded
+cargo test -p freedom-ipfs-routing delegated_routing_races_multiple_endpoints_until_success
+cargo test -p freedom-ipfs-routing
+cargo test -p freedom-ipfs-gateway
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Decision: keep. This does not invent a public gateway fallback and does not
+trust remote bytes; it only improves provider candidate discovery when the app
+or harness explicitly configures more than one delegated routing endpoint. The
+merge wait is bounded so a slow secondary router cannot add a 10s mobile latency
+tail.
