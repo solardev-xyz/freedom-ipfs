@@ -17952,3 +17952,86 @@ Reject and keep `100ms`. The `50ms` prototype did not preserve the accepted
 latency shape and caught a worse first-HTTP/delegated-routing tail. The next
 delegated grace retune should not go below `100ms` without repeated evidence
 that first-HTTP p95 and target-met p95 have moved lower in the same window.
+
+## 2026-05-05 Reject: Race Bitswap Against Single HTTP Provider
+
+Question:
+After keeping the delegated first-HTTP-provider grace at `100ms`, single
+HTTP-provider fetches still appeared to dominate some asset tails, especially
+when the only candidate was `ipfs-bridge.sia.dev`. Test whether racing Bitswap
+after a short delay only for exactly one usable HTTP provider can reduce those
+tails without hurting mobile resource usage.
+
+Prototype:
+
+- Added a temporary `200ms` Bitswap race only when
+  `fetch_from_providers_with_source` had exactly one usable HTTP provider.
+- Kept multi-provider HTTP candidate behavior unchanged.
+- Emitted temporary `single_http_bitswap_race` trace events.
+- Added a deterministic focused test covering a slow single HTTP provider and
+  a faster local Bitswap peer.
+- Restored the committed HTTP-first single-provider behavior after the live run
+  regressed.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval single_http_provider_races_bitswap_when_http_is_slow
+```
+
+Focused result:
+
+- Formatting passed.
+- The focused retrieval test passed.
+
+Live comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-single-http-bitswap-race-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-single-http-bitswap-race-r3.json
+```
+
+Live result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1041ms` / `2099ms`; Kubo `1472ms` /
+  `3021ms`; ratio `0.71x` / `0.69x`.
+- Asset TTFB p50/p95: Rust `227ms` / `836ms`; Kubo `119ms` / `1471ms`;
+  ratio `1.91x` / `0.57x`.
+- Max RSS/FD: Rust `53664KiB` / `41`; Kubo `259532KiB` / `165`.
+- Delegated provider lookups: `98`, p50/p95/max `20ms` / `60ms` / `159ms`.
+- HTTP provider fetches: `48`, p50/p95/max `129ms` / `370ms` / `693ms`.
+- HTTP provider host detail: `ipfs-bridge.sia.dev` p95 `646ms`;
+  `dag.w3s.link` p95 `119ms`.
+- Bitswap peer attempts jumped to `174`; Bitswap commands jumped to `93`.
+
+Comparison against kept `100ms`:
+
+- Rust root p95 worsened from `886ms` to `2099ms`.
+- Rust asset p95 worsened from `702ms` to `836ms`.
+- Max FD worsened from `30` to `41`.
+- Bitswap peer attempts worsened from `35` to `174`.
+- Bitswap commands worsened from `23` to `93`.
+- HTTP-provider fetch p95 improved from `626ms` to `370ms`, but that did not
+  translate into better end-to-end latency and came with substantially more
+  Bitswap pressure.
+
+Decision:
+Reject. The broad single-provider Bitswap race added too much peer/session
+work, increased FD pressure, and worsened the accepted absolute latency shape
+even though HTTP-provider fetch p95 improved. Future single-provider mitigation
+should avoid broad provider Bitswap racing. Prefer narrower approaches such as
+using only trusted/session peers, requiring adaptive evidence before racing, or
+improving single-provider HTTP host selection and suppression.
