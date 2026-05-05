@@ -145,11 +145,11 @@ impl SqliteBlockStore {
                 now as i64
             ],
         )?;
-        self.evict_if_needed()?;
-        if self.block_exists(&cid_bytes)? {
-            self.hot.lock().put_verified(cid_bytes, data.to_vec(), now);
-        } else {
+        let inserted_block_evicted = self.evict_if_needed_tracking(&cid_bytes)?;
+        if inserted_block_evicted {
             self.hot.lock().remove(&cid_bytes);
+        } else {
+            self.hot.lock().put_verified(cid_bytes, data.to_vec(), now);
         }
         Ok(())
     }
@@ -430,8 +430,8 @@ impl SqliteBlockStore {
         Ok(())
     }
 
-    fn evict_if_needed(&self) -> Result<()> {
-        self.evict_until(self.max_bytes)
+    fn evict_if_needed_tracking(&self, tracked_cid_bytes: &[u8]) -> Result<bool> {
+        self.evict_until_tracking(self.max_bytes, tracked_cid_bytes)
     }
 
     fn prune_name_cache(&self) -> Result<()> {
@@ -456,22 +456,30 @@ impl SqliteBlockStore {
     }
 
     fn evict_until(&self, max_bytes: u64) -> Result<()> {
+        self.evict_until_tracking(max_bytes, &[]).map(|_| ())
+    }
+
+    fn evict_until_tracking(&self, max_bytes: u64, tracked_cid_bytes: &[u8]) -> Result<bool> {
+        let mut tracked_block_evicted = false;
         loop {
             let total = self.total_bytes()?;
             if total <= max_bytes {
-                return Ok(());
+                return Ok(tracked_block_evicted);
             }
             let retained = self.retained.lock().clone();
             let cid_bytes = self.oldest_evictable_cid(&retained)?;
             let Some(cid_bytes) = cid_bytes else {
-                return Ok(());
+                return Ok(tracked_block_evicted);
             };
             let deleted = self
                 .conn
                 .lock()
                 .execute("DELETE FROM blocks WHERE cid = ?1", params![&cid_bytes])?;
             if deleted == 0 {
-                return Ok(());
+                return Ok(tracked_block_evicted);
+            }
+            if !tracked_cid_bytes.is_empty() && cid_bytes == tracked_cid_bytes {
+                tracked_block_evicted = true;
             }
             self.hot.lock().remove(&cid_bytes);
         }
@@ -509,20 +517,6 @@ impl SqliteBlockStore {
         if *count == 0 {
             retained.remove(cid_bytes);
         }
-    }
-
-    fn block_exists(&self, cid_bytes: &[u8]) -> Result<bool> {
-        let exists = self
-            .conn
-            .lock()
-            .query_row(
-                "SELECT 1 FROM blocks WHERE cid = ?1",
-                params![cid_bytes],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        Ok(exists)
     }
 }
 
@@ -703,6 +697,18 @@ mod tests {
         let cid = cid_from_data(CODEC_RAW, b"valid block");
 
         assert!(store.put_block(&cid, b"invalid block").is_err());
+        assert!(!store.hot.lock().entries.contains_key(&block_key(&cid)));
+    }
+
+    #[test]
+    fn evicted_put_does_not_populate_verified_hot_cache() {
+        let store = SqliteBlockStore::in_memory(1).unwrap();
+        let data = b"larger than cache budget";
+        let cid = cid_from_data(CODEC_RAW, data);
+
+        store.put_block(&cid, data).unwrap();
+
+        assert_eq!(store.block_count().unwrap(), 0);
         assert!(!store.hot.lock().entries.contains_key(&block_key(&cid)));
     }
 

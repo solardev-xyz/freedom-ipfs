@@ -17567,3 +17567,141 @@ Decision:
 Keep. This is benchmark reporting only, and it makes seeded Rust-vs-Kubo range
 experiments more honest without changing gateway, retrieval, verification,
 caching, provider policy, or mobile resource behavior.
+
+## 2026-05-05 Keep: Track Insert Eviction Instead Of Rechecking Stored Block
+
+Question:
+The seeded Bitswap range trace still showed synchronous block-store write time
+on the request path. `SqliteBlockStore::put_block` inserted a verified block,
+ran eviction, then issued an extra `SELECT 1` to check whether the block still
+existed before adding it to the verified hot cache. Can we preserve durable
+cache-before-return semantics while avoiding that redundant existence query?
+
+Implementation:
+
+- Keep the normal insert and eviction ordering unchanged.
+- Replace the post-eviction `block_exists` query with eviction tracking.
+- Return whether eviction deleted the just-inserted CID from
+  `evict_if_needed_tracking`.
+- Populate the verified hot cache only when the just-inserted block was not
+  evicted.
+- Remove the old private `block_exists` helper.
+- Add a focused store test proving a block inserted into an undersized cache is
+  not left in the verified hot cache after immediate eviction.
+
+This keeps the node read-only from the network perspective, still stores only
+verified bytes, and does not serve or hot-cache data that was immediately
+removed by the byte budget.
+
+Baseline:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-store-exists-baseline-r3-trace.jsonl \
+  --comparison-output /tmp/harness-store-exists-baseline-r3.json
+```
+
+Baseline result:
+
+- Rust and Kubo both passed `3/3`.
+- Raw root TTFB p50/p95: Rust `191ms` / `200ms`; Kubo `53ms` /
+  `53ms`; ratio `3.60x` / `3.77x`.
+- Setup-adjusted root TTFB: Rust `191ms` / `200ms`; Kubo `108ms` /
+  `112ms`; ratio `1.77x` / `1.79x`.
+- Max RSS/FD: Rust `39692KiB` / `13`; Kubo `89180KiB` / `36`.
+- Rust trace events: `166`.
+- Block store puts: `events=9`, `bytes=1573341`, total elapsed `85ms`,
+  max `21ms`.
+- Block range batch fetch elapsed p50/p95/max: `64ms` / `107ms` /
+  `107ms`.
+- Delegated provider lookups: `8`.
+- Session waits: pre-lookup `6`, hits `0`, timeouts `6`; post-lookup
+  `5`, hits `5`, hit elapsed p50/p95/max `31ms` / `50ms` / `50ms`.
+
+Patched validation:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-store-track-eviction-r3-trace.jsonl \
+  --comparison-output /tmp/harness-store-track-eviction-r3.json
+```
+
+Patched result:
+
+- Rust and Kubo both passed `3/3`.
+- Raw root TTFB p50/p95: Rust `153ms` / `173ms`; Kubo `57ms` /
+  `59ms`; ratio `2.68x` / `2.93x`.
+- Setup-adjusted root TTFB: Rust `153ms` / `173ms`; Kubo `111ms` /
+  `117ms`; ratio `1.38x` / `1.48x`.
+- Max RSS/FD: Rust `39600KiB` / `13`; Kubo `88916KiB` / `41`.
+- Rust trace events: `162`.
+- Block store puts: `events=9`, `bytes=1573341`, total elapsed `58ms`,
+  max `21ms`.
+- Block range batch fetch elapsed p50/p95/max: `54ms` / `81ms` /
+  `81ms`.
+- Delegated provider lookups: `6`.
+- Session waits: pre-lookup `6`, hits `2`, timeouts `4`; post-lookup
+  `3`, hits `3`, hit elapsed p50/p95/max `21ms` / `22ms` / `22ms`.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-store
+cargo check -p freedom-ipfs-store --all-targets
+cargo test -p freedom-ipfs-gateway
+cargo test -p freedom-ipfs-retrieval
+```
+
+Focused result:
+
+- Formatting passed.
+- Store tests passed: `26 passed`.
+- Store all-target check passed.
+- Gateway tests passed, including focused gateway suites and local soak/public
+  corpus coverage that is enabled by default.
+- Retrieval tests passed: `72 passed`, `1 ignored`.
+
+Final validation:
+
+```sh
+cargo fmt --all --check
+git diff --check
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Final result:
+
+- Formatting passed.
+- Diff whitespace check passed.
+- Workspace all-target compile check passed.
+- Workspace all-target clippy passed with warnings denied.
+
+Decision:
+Keep. The same-window seeded comparison improved Rust root TTFB, setup-adjusted
+Kubo ratio, block-store write time, range batch latency, and provider/session
+wait counts while keeping cache correctness explicitly covered by the new
+undersized-cache test.
