@@ -28,6 +28,7 @@ pub const DEFAULT_MAX_DHT_PROVIDERS: usize = 32;
 const DEFAULT_DELEGATED_ROUTING_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DELEGATED_ROUTING_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_DELEGATED_ROUTING_PROVIDERS: usize = 64;
+const STREAMING_DELEGATED_HTTP_PROVIDER_TARGET: usize = 4;
 const MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY: usize = 2;
 const LOW_DIVERSITY_DELEGATED_MERGE_TIMEOUT: Duration = Duration::from_millis(750);
 const LOW_DIVERSITY_DHT_FALLBACK_TIMEOUT: Duration = Duration::from_millis(250);
@@ -367,9 +368,7 @@ impl DelegatedRoutingClient {
                 .send()
                 .await?
                 .error_for_status()?;
-            let body =
-                limited_response_text(response, MAX_DELEGATED_ROUTING_RESPONSE_BYTES).await?;
-            Ok(limit_delegated_providers(parse_provider_response(&body)?))
+            limited_response_providers(response, MAX_DELEGATED_ROUTING_RESPONSE_BYTES).await
         }
         .await;
         match &result {
@@ -913,22 +912,100 @@ pub fn parse_provider_response(body: &str) -> Result<Vec<Provider>> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        if let Ok(provider) = serde_json::from_str::<ProviderRecord>(line) {
-            if provider.id.is_some() || provider.addrs.is_some() {
-                providers.push(provider.into_provider()?);
-                continue;
-            }
-        }
-        let response: ProvidersResponse = serde_json::from_str(line)
-            .map_err(|err| RoutingError::InvalidResponse(err.to_string()))?;
-        providers.extend(response.into_providers()?);
+        providers.extend(parse_provider_response_line(line)?);
     }
     Ok(providers)
+}
+
+fn parse_provider_response_line(line: &str) -> Result<Vec<Provider>> {
+    if let Ok(provider) = serde_json::from_str::<ProviderRecord>(line) {
+        if provider.id.is_some() || provider.addrs.is_some() {
+            return provider.into_provider().map(|provider| vec![provider]);
+        }
+    }
+    let response: ProvidersResponse =
+        serde_json::from_str(line).map_err(|err| RoutingError::InvalidResponse(err.to_string()))?;
+    response.into_providers()
 }
 
 fn limit_delegated_providers(mut providers: Vec<Provider>) -> Vec<Provider> {
     providers.truncate(MAX_DELEGATED_ROUTING_PROVIDERS);
     providers
+}
+
+async fn limited_response_providers(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<Provider>> {
+    let is_ndjson = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("application/x-ndjson"));
+
+    if !is_ndjson {
+        let body = limited_response_text(response, max_bytes).await?;
+        return Ok(limit_delegated_providers(parse_provider_response(&body)?));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buffered = Vec::new();
+    let mut bytes_read = 0usize;
+    let mut providers = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        bytes_read = bytes_read.saturating_add(chunk.len());
+        if bytes_read > max_bytes {
+            return Err(RoutingError::InvalidResponse(format!(
+                "delegated routing response exceeded {max_bytes} bytes"
+            )));
+        }
+        buffered.extend_from_slice(&chunk);
+
+        while let Some(newline_index) = buffered.iter().position(|byte| *byte == b'\n') {
+            let line = buffered.drain(..=newline_index).collect::<Vec<_>>();
+            append_provider_response_line(&line, &mut providers)?;
+            if should_return_streamed_providers(&providers) {
+                return Ok(limit_delegated_providers(providers));
+            }
+        }
+    }
+
+    append_provider_response_line(&buffered, &mut providers)?;
+    Ok(limit_delegated_providers(providers))
+}
+
+fn append_provider_response_line(line: &[u8], providers: &mut Vec<Provider>) -> Result<()> {
+    let line = trim_ascii_whitespace(line);
+    if line.is_empty() {
+        return Ok(());
+    }
+    let line =
+        std::str::from_utf8(line).map_err(|err| RoutingError::InvalidResponse(err.to_string()))?;
+    providers.extend(parse_provider_response_line(line)?);
+    Ok(())
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
+}
+
+fn should_return_streamed_providers(providers: &[Provider]) -> bool {
+    providers.len() >= MAX_DELEGATED_ROUTING_PROVIDERS
+        || providers
+            .iter()
+            .map(|provider| provider.http_urls.len())
+            .sum::<usize>()
+            >= STREAMING_DELEGATED_HTTP_PROVIDER_TARGET
 }
 
 async fn limited_response_text(response: reqwest::Response, max_bytes: usize) -> Result<String> {
@@ -1611,6 +1688,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegated_routing_returns_after_enough_streamed_http_providers() {
+        let cid = "bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u"
+            .parse::<Cid>()
+            .unwrap();
+        let fast_head = (0..STREAMING_DELEGATED_HTTP_PROVIDER_TARGET)
+            .map(|index| {
+                format!(
+                    r#"{{"ID":"peer-{index}","Addrs":["/dns4/provider-{index}.example/tcp/443/tls/http"]}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let slow_tail = r#"{"ID":"late-peer","Addrs":["/dns4/late.example/tcp/443/tls/http"]}"#;
+        let (endpoint, task) =
+            spawn_streaming_delegated_response(fast_head, slow_tail.into(), Duration::from_secs(2))
+                .await;
+
+        let providers = tokio::time::timeout(
+            Duration::from_millis(500),
+            DelegatedRoutingClient::new(endpoint).providers(&cid),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(providers.len(), STREAMING_DELEGATED_HTTP_PROVIDER_TARGET);
+        assert_eq!(
+            providers[0].http_urls[0].as_str(),
+            "https://provider-0.example/"
+        );
+        assert!(!providers
+            .iter()
+            .any(|provider| provider.id.as_deref() == Some("late-peer")));
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
     async fn rejects_oversized_delegated_response_body() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1626,7 +1742,7 @@ mod tests {
         let response = reqwest::get(format!("http://{addr}/routing/v1/providers/test"))
             .await
             .unwrap();
-        let err = limited_response_text(response, 4).await.unwrap_err();
+        let err = limited_response_providers(response, 4).await.unwrap_err();
 
         assert!(matches!(err, RoutingError::InvalidResponse(_)));
         task.await.unwrap();
@@ -1675,6 +1791,30 @@ mod tests {
             tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
                 .await
                 .unwrap();
+        });
+        (format!("http://{addr}/routing/v1"), task)
+    }
+
+    async fn spawn_streaming_delegated_response(
+        fast_head: String,
+        slow_tail: String,
+        tail_delay: Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut request).await;
+            let response_head = b"HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\nconnection: close\r\n\r\n";
+            tokio::io::AsyncWriteExt::write_all(&mut stream, response_head)
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut stream, fast_head.as_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(tail_delay).await;
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, slow_tail.as_bytes()).await;
         });
         (format!("http://{addr}/routing/v1"), task)
     }

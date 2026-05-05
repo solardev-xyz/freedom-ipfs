@@ -13235,3 +13235,199 @@ hundreds of milliseconds with no resource regression. The `vitalik` and
 watching sparse-provider workloads for cases where a slightly longer DHT
 fallback actually finds useful extra Bitswap peers, but the current measured
 tradeoff favors the shorter cap for mobile reads.
+
+## 2026-05-05 Keep: Stream Delegated NDJSON Provider Responses
+
+Hypothesis:
+`ipfs-tech-page-assets` still showed asset tails from high-provider delegated
+routing responses. The routing client requested `application/x-ndjson`, but it
+read the entire delegated response body before parsing any provider records.
+For some popular CIDs, the first HTTP-capable providers arrive quickly while
+the full provider list can take seconds to finish. Since retrieval already
+races a bounded number of verified HTTP provider candidates, the routing layer
+can return early once it has enough HTTP-capable provider records.
+
+Live probe before the change:
+
+```sh
+timeout 30s curl -fsS -w 'lines=%{size_download}B total=%{time_total}s start=%{time_starttransfer}s\n' \
+  -o /tmp/delegated-bafkreiam77queskklq2cjhaoywvlxvasghy4ydr77gmzagjioporv6xsy4.ndjson \
+  -H 'Accept: application/x-ndjson' \
+  'https://delegated-ipfs.dev/routing/v1/providers/bafkreiam77queskklq2cjhaoywvlxvasghy4ydr77gmzagjioporv6xsy4'
+
+/usr/bin/time -f 'first6q real=%e' bash -lc "timeout 30s curl -fsS \
+  -H 'Accept: application/x-ndjson' \
+  'https://delegated-ipfs.dev/routing/v1/providers/bafkreiam77queskklq2cjhaoywvlxvasghy4ydr77gmzagjioporv6xsy4' |
+  awk 'NR<=6{print} NR==6{exit}' >/tmp/delegated-first6q.txt"
+```
+
+Probe result:
+
+- Full response for the slow `community-hero` raw CID: `46` lines,
+  `77155B`, total `5.598990s`, first byte `0.234523s`.
+- The first six lines, which included multiple HTTP provider records, were
+  available in `0.14s`.
+- This means the old full-body parser could sit on the mobile request path for
+  seconds even though enough routing-provided HTTP candidates were already
+  available.
+
+Change:
+
+- Add a streaming parser for delegated responses with content type
+  `application/x-ndjson`.
+- Preserve the existing full-body parser for JSON-object responses and any
+  response that is not explicitly NDJSON.
+- Continue enforcing `MAX_DELEGATED_ROUTING_RESPONSE_BYTES`.
+- Return early from a streaming NDJSON response once either:
+  - `MAX_DELEGATED_ROUTING_PROVIDERS` records have been parsed, matching the
+    existing cap; or
+  - `4` HTTP-capable provider URLs have been parsed.
+- Keep sparse/non-HTTP responses on the full-read path. This avoids throwing
+  away late Bitswap candidates for cases such as `daicowtf`.
+- No public gateway fallback is added. All HTTP candidates still come from
+  delegated routing, and fetched blocks are still verified before store/serve.
+
+Deterministic validation:
+
+```sh
+cargo fmt --all
+cargo test -p freedom-ipfs-routing delegated_routing_returns_after_enough_streamed_http_providers
+cargo test -p freedom-ipfs-routing
+```
+
+Result:
+
+- The focused test passed. It serves four HTTP provider records immediately,
+  delays a fifth record by `2s`, and proves the client returns within `500ms`
+  without consuming the late record.
+- Full routing suite passed: `22 passed; 0 failed; 1 ignored`.
+
+Primary live comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-streaming-delegated-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-streaming-delegated-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Rust root TTFB p50/p95 was `1435ms` / `2028ms`; Kubo was `2888ms` /
+  `4313ms`.
+- Rust asset TTFB p50/p95/max was `292ms` / `1095ms` / `1972ms`; Kubo was
+  `122ms` / `295ms` / `306ms`.
+- Rust max RSS/FD was `52536KiB` / `38`; Kubo max RSS/FD was `244812KiB` /
+  `176`.
+- Delegated provider lookups: events `100`, successes `100`, failures `0`,
+  providers `1393`, max elapsed `1744ms`.
+- HTTP provider fetches: events `76`, successes `76`, failures `0`, p50/p95/max
+  `160ms` / `690ms` / `1175ms`.
+
+Comparison with the immediately previous 250ms-DHT-cap `ipfs.tech` run:
+
+- Previous artifact: `/tmp/ipfs-tech-dht-fallback-250ms-r3.json`,
+  `/tmp/ipfs-tech-dht-fallback-250ms-r3-trace.jsonl`.
+- Previous Rust passed `3/3`.
+- Previous Rust asset TTFB p50/p95/max was `308ms` / `1418ms` / `6976ms`.
+- Previous Rust delegated lookup max was `6196ms`.
+- Previous Rust max RSS/FD was `54740KiB` / `48`.
+- Streaming NDJSON improved asset p50/p95/max to `292ms` / `1095ms` /
+  `1972ms`, delegated lookup max to `1744ms`, and FD max to `38`.
+- Root p95 moved from `1573ms` to `2028ms` in this noisy same-day window, so do
+  not claim an across-the-board page win. The strongest signal is reducing
+  high-provider delegated lookup and asset max tails.
+
+Guardrail: `vitalik-root-html-range`
+
+```sh
+timeout 480s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-streaming-delegated-r3-trace.jsonl \
+  --comparison-output /tmp/vitalik-streaming-delegated-r3.json
+```
+
+Guardrail result:
+
+- Rust and Kubo both passed `3/3`.
+- Rust root TTFB p50/p95 was `160ms` / `659ms`; Kubo was `1751ms` / `2682ms`.
+- Rust max RSS/FD was `31360KiB` / `14`; Kubo max RSS/FD was `117564KiB` /
+  `62`.
+- Delegated provider lookup max was `319ms`.
+- HTTP provider fetches: `6/6` success, p50/p95/max `20ms` / `43ms` / `43ms`.
+
+Guardrail: `daicowtf-page-assets`
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-streaming-delegated-r3-trace.jsonl \
+  --comparison-output /tmp/daicowtf-streaming-delegated-r3.json
+```
+
+Guardrail result:
+
+- Rust and Kubo both passed `3/3`.
+- Rust root TTFB p50/p95 was `1342ms` / `1533ms`; Kubo was `2952ms` /
+  `3003ms`.
+- Rust max RSS/FD was `43460KiB` / `21`; Kubo max RSS/FD was `104008KiB` /
+  `63`.
+- Delegated provider lookup max was `52ms`.
+- DHT fallback still found `0` providers and timed out under the `250ms` cap in
+  three low-diversity attempts. This is unchanged sparse-provider behavior.
+
+Regression validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing
+cargo test -p freedom-ipfs-mobile -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Result:
+
+- routing suite passed: `22 passed; 0 failed; 1 ignored`
+- mobile suite passed: `26 passed; 0 failed`
+- mobile web harness suite passed: `32 passed; 0 failed`
+- workspace check passed
+- workspace clippy passed with `-D warnings`
+
+Decision:
+Keep. The change directly targets a measured delegated-router response-tail
+shape, preserves the read-only and verification model, and keeps sparse
+responses conservative. The `ipfs.tech` asset tail improved materially,
+especially max latency, while `vitalik` and `daicowtf` stayed reliable and
+resource-light. Rust asset p95 on `ipfs.tech` is still slower than Kubo in this
+window, so the next asset-tail work should look at HTTP-provider fetch latency,
+session shortcut/post-lookup behavior, and the remaining high-provider CIDs
+that have few HTTP candidates.
