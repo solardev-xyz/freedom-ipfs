@@ -976,12 +976,7 @@ fn print_summary(report: &RunReport) {
                 quality.addr_with_certhash_count
             );
         }
-        if !trace.bitswap_connection_transports.is_empty() {
-            println!(
-                "  bitswap connection transports: {}",
-                format_trace_counts(&trace.bitswap_connection_transports)
-            );
-        }
+        print_trace_connection_established(trace);
         print_trace_connection_errors(trace);
         print_trace_connection_backoff(trace);
         print_trace_dial_rejections(trace);
@@ -1238,12 +1233,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
         );
     }
     print_trace_bitswap_incoming_reads(trace);
-    if !trace.bitswap_connection_transports.is_empty() {
-        println!(
-            "  bitswap connection transports: {}",
-            format_trace_counts(&trace.bitswap_connection_transports)
-        );
-    }
+    print_trace_connection_established(trace);
     print_trace_connection_errors(trace);
     print_trace_connection_backoff(trace);
     print_trace_dial_rejections(trace);
@@ -1651,6 +1641,21 @@ fn print_trace_dial_rejections(trace: &TraceSummary) {
         rejected.connection_limit,
         rejected.other,
         format_trace_counts(&trace.bitswap_dial_rejected_transports)
+    );
+}
+
+fn print_trace_connection_established(trace: &TraceSummary) {
+    let established = &trace.bitswap_connection_established;
+    if established.events == 0 && trace.bitswap_connection_transports.is_empty() {
+        return;
+    }
+    println!(
+        "  bitswap connections: established={} established_ms={} wait_elapsed_ms={} failed_dials={} transports={}",
+        established.events,
+        established.established_ms,
+        established.wait_elapsed_ms,
+        established.failed_dial_count,
+        format_trace_counts(&trace.bitswap_connection_transports)
     );
 }
 
@@ -4203,6 +4208,7 @@ struct TraceSummary {
     trace_errors: Vec<TraceValueCount>,
     bitswap_addr_mix: Vec<TraceValueCount>,
     bitswap_provider_quality: TraceBitswapProviderQualityAggregate,
+    bitswap_connection_established: TraceBitswapConnectionEstablishedAggregate,
     bitswap_connection_transports: Vec<TraceValueCount>,
     bitswap_connection_errors: TraceBitswapConnectionErrorAggregate,
     bitswap_connection_error_addr_families: Vec<TraceValueCount>,
@@ -4515,6 +4521,14 @@ impl TraceBitswapProviderQualityAggregate {
         self.addr_with_webrtc_count += trace_count_field(value, "addr_with_webrtc_count");
         self.addr_with_certhash_count += trace_count_field(value, "addr_with_certhash_count");
     }
+}
+
+#[derive(Debug, Serialize)]
+struct TraceBitswapConnectionEstablishedAggregate {
+    events: usize,
+    established_ms: LatencySummary,
+    wait_elapsed_ms: LatencySummary,
+    failed_dial_count: u128,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -4963,6 +4977,10 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut trace_errors = BTreeMap::<String, usize>::new();
     let mut bitswap_addr_mix = BTreeMap::<String, usize>::new();
     let mut bitswap_provider_quality = TraceBitswapProviderQualityAggregate::default();
+    let mut bitswap_connection_established_events = 0usize;
+    let mut bitswap_connection_established_ms_values = Vec::<u128>::new();
+    let mut bitswap_connection_wait_elapsed_ms_values = Vec::<u128>::new();
+    let mut bitswap_connection_failed_dial_count = 0u128;
     let mut bitswap_connection_transports = BTreeMap::<String, usize>::new();
     let mut bitswap_connection_error_events = 0usize;
     let mut bitswap_connection_error_with_peer = 0usize;
@@ -5658,6 +5676,17 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             bitswap_provider_quality.accumulate(&value);
         }
         if phase == "bitswap_connection_established" {
+            bitswap_connection_established_events += 1;
+            if let Some(established_ms) = value.get("established_ms").and_then(json_u128) {
+                bitswap_connection_established_ms_values.push(established_ms);
+            }
+            if let Some(wait_elapsed_ms) = value.get("wait_elapsed_ms").and_then(json_u128) {
+                bitswap_connection_wait_elapsed_ms_values.push(wait_elapsed_ms);
+            }
+            bitswap_connection_failed_dial_count += value
+                .get("failed_dial_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
             if let Some(transport) = json_detail_string(value.get("transport")) {
                 *bitswap_connection_transports.entry(transport).or_default() += 1;
             }
@@ -5864,6 +5893,12 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         trace_errors: sorted_trace_counts(trace_errors),
         bitswap_addr_mix: sorted_trace_counts(bitswap_addr_mix),
         bitswap_provider_quality,
+        bitswap_connection_established: TraceBitswapConnectionEstablishedAggregate {
+            events: bitswap_connection_established_events,
+            established_ms: LatencySummary::from_values(bitswap_connection_established_ms_values),
+            wait_elapsed_ms: LatencySummary::from_values(bitswap_connection_wait_elapsed_ms_values),
+            failed_dial_count: bitswap_connection_failed_dial_count,
+        },
         bitswap_connection_transports: sorted_trace_counts(bitswap_connection_transports),
         bitswap_connection_errors: TraceBitswapConnectionErrorAggregate {
             events: bitswap_connection_error_events,
@@ -7034,7 +7069,7 @@ mod tests {
                 "{\"phase\":\"bitswap_session_shortcut_post_lookup_wait\",\"cid\":\"cid8\",\"timeout_ms\":100}\n",
                 "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":2,\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":true,\"source_peer\":\"peer1\",\"bitswap_delivery\":\"outgoing\",\"source_peer_trusted\":true,\"extra_blocks\":1}\n",
                 "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":3,\"cid\":\"cid9\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":false,\"timeout\":true}\n",
-                "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer1\",\"remote_addr\":\"/ip4/127.0.0.1/tcp/4001\",\"transport\":\"tcp\"}\n",
+                "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer1\",\"remote_addr\":\"/ip4/127.0.0.1/tcp/4001\",\"transport\":\"tcp\",\"established_ms\":\"44\",\"wait_elapsed_ms\":\"45\",\"failed_dial_count\":2}\n",
                 "{\"phase\":\"bitswap_connection_error\",\"peer\":\"peer3\",\"error\":\"Failed to negotiate transport protocol(s): [(/ip6/2001:db8::1/tcp/4001/p2p/peer3: Protocol negotiation failed.)]\"}\n",
                 "{\"phase\":\"bitswap_connection_error\",\"peer\":\"\",\"error\":\"Failed to negotiate transport protocol(s): [(/ip4/127.0.0.1/tcp/4001: Connection refused (os error 111))]\"}\n",
                 "{\"phase\":\"bitswap_connection_error_backoff\",\"peer\":\"peer3\",\"error_class\":\"protocol_negotiation_failed\",\"count\":2,\"ttl_ms\":30000}\n",
@@ -7302,6 +7337,19 @@ mod tests {
         assert_eq!(summary.bitswap_connection_transports.len(), 1);
         assert_eq!(summary.bitswap_connection_transports[0].value, "tcp");
         assert_eq!(summary.bitswap_connection_transports[0].count, 1);
+        assert_eq!(summary.bitswap_connection_established.events, 1);
+        assert_eq!(
+            summary.bitswap_connection_established.established_ms.p50_ms,
+            Some(44)
+        );
+        assert_eq!(
+            summary
+                .bitswap_connection_established
+                .wait_elapsed_ms
+                .p50_ms,
+            Some(45)
+        );
+        assert_eq!(summary.bitswap_connection_established.failed_dial_count, 2);
         assert_eq!(summary.bitswap_connection_errors.events, 2);
         assert_eq!(summary.bitswap_connection_errors.with_peer, 1);
         assert_eq!(summary.bitswap_connection_errors.without_peer, 1);

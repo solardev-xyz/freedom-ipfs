@@ -12223,3 +12223,37 @@ Decision:
 Keep. This is diagnostics-only and does not change gateway/retrieval behavior.
 It makes the kept multi-CID incoming support measurable in future live and
 seeded Kubo comparisons.
+
+## 2026-05-05 Keep: Summarize Bitswap Connection Latency
+
+Hypothesis:
+The seeded boundary-range traces show cold root latency is heavily influenced by
+Bitswap connection establishment, but the harness only summarized connection
+transports and errors. Future Rust-vs-Kubo comparisons need a direct connection
+latency line so dial/handshake cost is visible without scanning slow events.
+
+Change:
+
+- Add `bitswap_connection_established` to the harness trace summary JSON.
+- Summarize connection event count, `established_ms`, `wait_elapsed_ms`, and
+  failed dial count.
+- Print a concise `bitswap connections:` line that includes latency summaries
+  and transport counts.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+cargo test -p mobile-web-harness trace_summary_counts_bitswap_peer_attempts
+```
+
+Result:
+
+- focused slow-event trace summary test passed
+- focused Bitswap peer/connection summary test passed
+
+Decision:
+Keep. This is harness-only and does not change retrieval behavior. It gives the
+next Kubo-gap experiment an explicit dial/connection metric alongside request
+TTFB, provider lookup, and Bitswap batch summaries.
