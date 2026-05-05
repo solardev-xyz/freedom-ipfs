@@ -17359,3 +17359,132 @@ Result:
 Decision:
 Keep. This is diagnostics-only: no provider policy change, no public gateway
 fallback, no cache contract change, and no block verification change.
+
+## 2026-05-05 Reject: Replacement Multi-CID Range Shortcut
+
+Question:
+The seeded multiblock range workload still showed duplicate same-peer child
+Bitswap commands and occasional shortcut wait tails. A plausible optimization
+was to replace the existing parallel per-child shortcut path with a single
+multi-CID request to the recent session peer for adjacent uncached ranges. The
+hypothesis was that fewer commands, fewer child provider lookups, and fewer
+parallel same-peer streams would reduce range TTFB.
+
+Prototype:
+
+- Add a `100ms` recent-peer multi-CID range shortcut before the existing
+  per-child fallback path.
+- For multiple uncached ranges, send one `SharedBitswapClient::fetch_many`
+  command to recent Bitswap peers.
+- Store returned requested blocks through the normal verified
+  `store_block_with_trace(..., "bitswap", true)` path before serving.
+- Store non-requested extras as `bitswap_extra`.
+- Emit `bitswap_session_batch_shortcut_start` and
+  `bitswap_session_batch_shortcut` trace events.
+- Fall back to the existing individual `fetch_block_with_source` path on
+  timeout or error.
+
+Focused validation on the prototype:
+
+```sh
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo test -p freedom-ipfs-retrieval shared_bitswap_client_fetch_many_accepts_multi_cid_incoming_blocks
+cargo test -p freedom-ipfs-unixfs file_range_batches_adjacent_raw_child_ranges
+```
+
+Focused result:
+
+- Retrieval check passed.
+- Focused multi-CID Bitswap client test passed.
+- Focused UnixFS adjacent range batching test passed.
+
+Prototype live seeded comparison:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-range-replacement-batch-r3-trace.jsonl \
+  --comparison-output /tmp/harness-range-replacement-batch-r3.json
+```
+
+Prototype result:
+
+- Rust and Kubo both passed `3/3`.
+- Rust root TTFB p50/p95: `192ms` / `197ms`.
+- Kubo root TTFB p50/p95: `49ms` / `52ms`.
+- Max RSS/FD: Rust `40108KiB` / `13`; Kubo `89904KiB` / `40`.
+- Trace lines: `117`.
+- Delegated provider lookups: `3`.
+- Bitswap commands: `6`, multi-CID commands: `3`, total CIDs: `9`.
+- Bitswap incoming batches: `events=3`, `total_cids=6`,
+  `max_cids=2`, `requested_blocks=6`, `extra_blocks=0`,
+  `max_elapsed_ms=92`.
+- Block range batch fetches: `events=6`, `bytes=900`,
+  elapsed p50/p90/p95/max `72ms` / `93ms` / `93ms` / `93ms`.
+- No `bitswap_fetch_cancelled` events.
+
+Same-window baseline comparison:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-range-replacement-batch-ab-baseline-r3-trace.jsonl \
+  --comparison-output /tmp/harness-range-replacement-batch-ab-baseline-r3.json
+```
+
+Baseline result:
+
+- Rust and Kubo both passed `3/3`.
+- Rust root TTFB p50/p95: `154ms` / `171ms`.
+- Kubo root TTFB p50/p95: `51ms` / `52ms`.
+- Max RSS/FD: Rust `40088KiB` / `13`; Kubo `93808KiB` / `36`.
+- Trace lines: `164`.
+- Delegated provider lookups: `7`.
+- Bitswap commands: `9`, multi-CID commands: `0`, total CIDs: `9`.
+- Pre-lookup waits: `6`, hits `1`, timeouts `5`, budget `50=6`,
+  elapsed p50/p90/p95/max `51ms` / `51ms` / `51ms` / `51ms`.
+- Post-lookup waits: `4`, hits `4`, timeouts `0`,
+  hit elapsed p50/p90/p95/max `16ms` / `29ms` / `29ms` / `29ms`.
+- Block range batch fetches: `events=6`, `bytes=900`,
+  elapsed p50/p90/p95/max `59ms` / `85ms` / `85ms` / `85ms`.
+- No `bitswap_fetch_cancelled` events.
+
+Interpretation:
+
+- The prototype did reduce duplicate work: fewer trace lines, fewer delegated
+  lookups, and fewer Bitswap commands.
+- That reduction did not improve the user-facing metric in the same test
+  window. Rust root TTFB regressed from `154ms` / `171ms` p50/p95 to
+  `192ms` / `197ms`, and the block range batch fetch latency summary also
+  regressed from `59ms` / `85ms` p50/p95 to `72ms` / `93ms`.
+- The added batch wait shape is not justified for this latency-focused path.
+  It may still be interesting only if resource reduction becomes an explicit
+  product priority, or if a future variant can avoid adding a fixed batch
+  budget on already-fast baseline windows.
+
+Decision:
+Reject and keep the production code on the existing per-child shortcut path.
+The prototype was removed after the A/B run. Future work should not add a
+replacement multi-CID range shortcut unless repeated seeded and public workload
+evidence shows a real p50/p95 win without weakening verification, cache
+ordering, read-only behavior, or mobile resource limits.
