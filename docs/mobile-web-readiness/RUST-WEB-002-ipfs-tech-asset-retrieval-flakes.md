@@ -3096,3 +3096,57 @@ For this run, `45%` of expanded provider addresses contained `/p2p-circuit`
 (`1491/5602`). That strengthens the case that relay support deserves a
 dedicated experiment, while WebTransport/WebRTC remain non-trivial native
 transport work in the current dependency set.
+
+## 2026-05-05 Relay Builder Sequencing Caveat
+
+Follow-up inspection:
+
+The obvious libp2p builder shortcut for relay support is not safe to drop into
+the current Bitswap swarm construction.
+
+Current Bitswap transport construction in
+`crates/freedom-ipfs-retrieval/src/lib.rs` is:
+
+```text
+with_tcp(...)
+with_quic()
+with_other_transport(cloudflare_websocket_transport)
+with_behaviour(...)
+```
+
+That custom WebSocket transport is intentional: WSS providers need DNS names
+preserved for SNI, and it uses explicit Cloudflare DNS instead of the builder's
+system-DNS WebSocket shortcut.
+
+Local `libp2p v0.56.0` builder inspection found:
+
+- `OtherTransportPhase::with_relay_client(...)` calls
+  `without_any_other_transports().without_dns().without_websocket()...`
+- `QuicPhase::with_relay_client(...)` calls
+  `without_quic().without_any_other_transports().without_dns().without_websocket()...`
+- `WebsocketPhase::with_relay_client(...)` calls
+  `without_websocket()...`
+
+The inspected crate files were:
+
+- `/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libp2p-0.56.0/src/builder/phase/other_transport.rs`
+- `/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libp2p-0.56.0/src/builder/phase/quic.rs`
+- `/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libp2p-0.56.0/src/builder/phase/websocket.rs`
+
+Decision: reject a naive `.with_relay_client(...)` insertion. Depending on where
+it is inserted, it would silently discard the custom Cloudflare WSS transport,
+QUIC, or builder WebSocket transport. That would make the public-provider mix
+look different while testing relay and could regress the WSS reliability gap
+that was already closed.
+
+A real relay experiment should instead preserve the existing transport stack
+explicitly. Feasible next implementation paths are:
+
+- manually compose the transport stack before `Swarm::new`, preserving TCP,
+  QUIC, Cloudflare WSS, and relay
+- or refactor the builder sequence only after a compile-time check proves all
+  existing transports remain present
+
+Before keeping relay support, add deterministic coverage that exercises a relay
+address without losing a WSS-capable transport path, then run the same-window
+Kubo comparison harness.
