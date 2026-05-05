@@ -2730,6 +2730,121 @@ assets returned `504`, asset p95 rose to `4712ms`, and
 single-peer opportunities and let the full mixed-provider request path recreate
 the timeout tail.
 
+## 2026-05-05 Keep 200ms Post-Lookup Session Wait
+
+Hypothesis: the `100ms` post-lookup wait still drops too many useful session
+peer shortcuts. A slightly longer bounded wait may let known-good peers serve
+nearby page blocks while still falling back to provider fanout quickly.
+
+Current `100ms` one-run baseline after the relay experiment was reverted:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-current-post-relay-revert-r1-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-current-post-relay-revert-r1.json
+```
+
+Result: Rust/Kubo both passed `1/1`. Rust root TTFB was `2032ms` versus Kubo
+`1882ms`; Rust asset p50/p95 was `580/2011ms` versus Kubo `198/424ms`. The
+trace showed `provider_lookup=31`, `bitswap_fetch=31`, `dial_rejected=127`,
+`session_shortcut_starts=34`, and only `4` shortcut hits.
+
+Experiment: increase `BITSWAP_SESSION_POST_LOOKUP_GRACE` from `100ms` to
+`200ms`.
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib recent_bitswap
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-postlookup200-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-postlookup200-r3.json
+```
+
+Result at `200ms`: Rust/Kubo both passed `3/3`. Rust root p50/p95 was
+`1557/2320ms` versus Kubo `1426/3848ms`. Rust asset p50/p95 was `136/1369ms`
+versus Kubo `224/1734ms`. RSS/FD stayed low at Rust `51108KiB`/`46` versus
+Kubo `313148KiB`/`518`.
+
+Trace behavior changed in the intended direction:
+
+```text
+provider_lookup=31
+bitswap_fetch=31
+dial_rejected=46
+session_shortcut_starts=102
+session_shortcut_post_lookup_waits=28
+session_shortcut_hits=74
+request_timeouts_with_trusted=0
+```
+
+Nearby `100ms` recheck:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-postlookup100-recheck-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-postlookup100-recheck-r3.json
+```
+
+Result at `100ms`: Rust/Kubo both passed `3/3`. Rust root p50/p95 was
+`2472/3335ms` versus Kubo `2241/2500ms`. Rust asset p50/p95 was `188/1447ms`
+versus Kubo `178/1930ms`. The trace had more provider fanout:
+
+```text
+provider_lookup=56
+bitswap_fetch=56
+dial_rejected=217
+session_shortcut_starts=102
+session_shortcut_post_lookup_waits=52
+session_shortcut_hits=50
+request_timeouts_with_trusted=1
+```
+
+Regression check at `200ms`:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/postlookup200-regression-r3-trace.jsonl \
+  --comparison-output /tmp/postlookup200-regression-r3.json
+```
+
+`vitalik-root-html-range` passed `3/3` for both Rust and Kubo; Rust root p50/p95
+was `389/687ms` versus Kubo `1688/1857ms`. `daicowtf-page-assets` failed `0/3`
+for both Rust and Kubo with root timeouts, so this run is not a Rust-only
+regression signal.
+
+Decision: keep `200ms`. It increases the number of completed shortcut hits,
+cuts provider lookups and full Bitswap fanout, lowers dial pressure, and did
+not create a Rust-only failure in the regression cases. Keep watching root TTFB
+and range-heavy asset tails in future live windows.
+
 ## 2026-05-04 Provider Refresh Equivalence Follow-Up
 
 Hypothesis: a later `ipfs.tech` failure window was not caused by low provider

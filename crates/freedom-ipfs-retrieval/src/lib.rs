@@ -51,7 +51,7 @@ const BITSWAP_WANT_HAVE_TIMEOUT: Duration = Duration::from_millis(750);
 const BITSWAP_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const BITSWAP_SUCCESSFUL_PEER_TTL: Duration = Duration::from_secs(10 * 60);
 const BITSWAP_SESSION_SHORTCUT_GRACE: Duration = Duration::from_millis(0);
-const BITSWAP_SESSION_POST_LOOKUP_GRACE: Duration = Duration::from_millis(100);
+const BITSWAP_SESSION_POST_LOOKUP_GRACE: Duration = Duration::from_millis(200);
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
 // The per-peer read path has its own 10s timeout. This caps broader shared
 // swarm stalls so one stuck command cannot sit on a browser request for 45s.
