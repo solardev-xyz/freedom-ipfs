@@ -18266,3 +18266,122 @@ Keep. This is diagnostics-only and does not change provider policy, fetch
 concurrency, fallback behavior, block verification, or caching. It makes the
 kept scorer measurable from normal harness output instead of requiring manual
 JSONL inspection.
+
+## 2026-05-05 Reject: Add `cid.contact` To Default Delegated Routers
+
+Question:
+Priority 4 in the long-running roadmap calls out delegated router comparison.
+Recent `ipfs.tech` traces still occasionally show delegated lookup p95/max
+tails, so test whether using the existing multi-endpoint delegated-routing mode
+with both `delegated-ipfs.dev` and `cid.contact` improves page latency enough
+to justify adding a second default delegated router.
+
+Experiment:
+
+- No code change.
+- Run the spawned gateway with:
+  `--delegated-router https://delegated-ipfs.dev/routing/v1,https://cid.contact/routing/v1`.
+- Compare against an immediate default-router rerun in the same network window.
+- Keep the node read-only and keep block verification/caching unchanged.
+
+Context baseline with scoring-winner summary:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-score-winner-summary-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-http-score-winner-summary-r3.json
+```
+
+Context result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1465ms` / `1536ms`; Kubo `2516ms` /
+  `2556ms`.
+- Asset TTFB p50/p95: Rust `263ms` / `917ms`; Kubo `138ms` / `656ms`.
+- Rust max RSS/FD: `46848KiB` / `27`.
+- Delegated lookup p50/p95/max: `20ms` / `280ms` / `745ms`.
+- Provider scoring summary: `winner_scored=99`, original ranks
+  `rank1=102`, `rank2=3`, `rank3_plus=0`.
+
+Two-endpoint run:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --delegated-router https://delegated-ipfs.dev/routing/v1,https://cid.contact/routing/v1 \
+  --trace-output /tmp/ipfs-tech-router-delegated-plus-cidcontact-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-router-delegated-plus-cidcontact-r3.json
+```
+
+Two-endpoint result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `739ms` / `849ms` / `849ms`.
+- Asset TTFB p50/p95/max: `252ms` / `754ms` / `1288ms`.
+- Run total p50/p95/max: `2205ms` / `3230ms` / `3230ms`.
+- Max RSS/FD: `51840KiB` / `26`.
+- Delegated lookup p50/p95/max: `22ms` / `55ms` / `69ms`.
+- Endpoint summary only showed `https://delegated-ipfs.dev/routing/v1`;
+  `cid.contact` did not contribute before the multi-endpoint client returned.
+- HTTP-provider fetch p50/p95/max: `158ms` / `628ms` / `872ms`.
+
+Immediate default-router rerun:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-router-default-rerun-after-cidcontact-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-router-default-rerun-after-cidcontact-r3.json
+```
+
+Default rerun result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `718ms` / `820ms` / `820ms`.
+- Asset TTFB p50/p95/max: `233ms` / `547ms` / `1041ms`.
+- Run total p50/p95/max: `2248ms` / `2255ms` / `2255ms`.
+- Max RSS/FD: `46592KiB` / `27`.
+- Delegated lookup p50/p95/max: `21ms` / `50ms` / `54ms`.
+- HTTP-provider fetch p50/p95/max: `158ms` / `278ms` / `668ms`.
+
+Comparison:
+
+- The two-endpoint run did not show `cid.contact` contribution in the endpoint
+  summary.
+- The default rerun was slightly better on root p50/p95, asset p50/p95/max,
+  delegated lookup p95/max, HTTP-provider fetch p95/max, RSS, and run p95.
+- Both runs stayed reliable, and the endpoint addition did not cause an obvious
+  failure, but it also did not produce evidence that a second default endpoint
+  helps this workload.
+
+Decision:
+Reject adding `cid.contact` to the default delegated-router list for now. The
+existing multi-endpoint mode remains useful for manual experiments, but current
+same-window evidence does not justify extra default router traffic or a default
+configuration change. Revisit only with cases where `delegated-ipfs.dev` has
+actual failures/empty responses and the endpoint summary proves another router
+returns useful providers before the client deadline.
