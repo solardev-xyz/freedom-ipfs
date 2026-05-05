@@ -11179,6 +11179,17 @@ timeout 180s cargo run -p mobile-web-harness -- \
   --repeat 1 \
   --trace-output /tmp/xtask-mobile-web-stream-state-rust-trace.jsonl \
   --output /tmp/xtask-mobile-web-stream-state-rust.json
+
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --routing-mode offline \
+  --gateway-import-car /tmp/xtask-mobile-web-stream-suite.car \
+  --corpus /tmp/xtask-mobile-web-stream-suite-corpus.json \
+  --repeat 1 \
+  --trace-output /tmp/xtask-mobile-web-stream-state-rust-vs-kubo-trace.jsonl \
+  --comparison-output /tmp/xtask-mobile-web-stream-state-rust-vs-kubo.json
 ```
 
 Result:
@@ -11215,6 +11226,26 @@ Result:
   report `bytes_loaded=600000` and `bytes_total=600000`
 - active target snapshots now include `active_subrequests`, so Swift can see
   when a page-level request has active child resource requests
+- refreshed offline Rust-vs-Kubo comparison passed `1/1` for both engines on
+  all five deterministic stream/range fixture cases
+- comparison artifacts:
+  `/tmp/xtask-mobile-web-stream-state-rust-vs-kubo-trace.jsonl` and
+  `/tmp/xtask-mobile-web-stream-state-rust-vs-kubo.json`
+- Kubo version: `0.41.0`
+- Rust root TTFB vs Kubo:
+  - full stream: `5ms` vs `6ms`
+  - full range: `3ms` vs `2ms`
+  - prefix range: `1ms` vs `1ms`
+  - boundary range: `1ms` vs `2ms`
+  - suffix range: `1ms` vs `1ms`
+- resource comparison on the same offline fixture:
+  - Rust max RSS/FD: `21776KiB` / `11`
+  - Kubo max RSS/FD: `87268KiB` / `31`
+  - Kubo repo storage max: `631379B`
+- refreshed comparison trace summary preserved the expected body diagnostics:
+  `52` trace events, progress phases `streaming=37, completed=5, queued=5,
+  started=5`, direct bodies `4` / `1200` bytes, streamed bodies `1` /
+  `600000` bytes / `10` chunks
 
 Decision:
 Keep. The event closes the diagnostic gap identified by the stream/range
