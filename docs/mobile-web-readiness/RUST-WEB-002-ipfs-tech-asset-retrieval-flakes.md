@@ -6390,7 +6390,7 @@ Page workload guardrail:
 ```sh
 cargo build -p freedom-ipfs-gateway
 
-timeout 360s cargo run -p mobile-web-harness -- \
+timeout 180s cargo run -p mobile-web-harness -- \
   --compare-kubo \
   --kubo-bin target/tools/kubo/kubo/ipfs \
   --case ipfs-tech-page-assets \
@@ -6656,3 +6656,132 @@ descriptors. The tradeoff is higher `ipfs.tech` Bitswap dial pressure and a
 remaining asset-tail gap versus Kubo; future work should focus on fair
 scheduling and peer/dial pressure after incoming-read offload, not on reverting
 this change.
+
+## 2026-05-05 Keep: Lower Per-Command Bitswap Dial Cap To 5
+
+Hypothesis:
+After incoming-read offload removed the shared-swarm scheduler blockage,
+`ipfs.tech` still showed elevated Bitswap peer attempts, connection-limit dial
+rejections, and an asset p95 gap versus Kubo. The existing per-command dial cap
+of `8` was chosen before incoming reads were made non-blocking. With the swarm
+loop now processing commands promptly, a smaller per-command dial budget might
+preserve enough peer diversity while reducing connection-limit churn and page
+asset tail latency.
+
+Implementation:
+
+- Lower `MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND` from `8` to `5`.
+- Keep the global Bitswap connection limits unchanged.
+- Keep peer/provider candidate caps unchanged.
+- Update deterministic dial-cap coverage to assert that the interleaved planner
+  keeps the first ranked address for four peers plus the next best ranked
+  address, and suppresses the remaining eleven dial addresses.
+
+Rejected first try:
+
+- Cap `4` improved live `ipfs.tech` in one same-window run, but full retrieval
+  tests showed it was too narrow for the deterministic five-provider fallback
+  case `want_have_probe_falls_back_to_want_block_quickly`.
+- A one-peer budget reduction from cap `5` to cap `4` is not worth dropping that
+  fallback coverage.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval caps_bitswap_dial_addresses_per_command
+cargo test -p freedom-ipfs-retrieval want_have_probe_falls_back_to_want_block_quickly
+cargo test -p freedom-ipfs-retrieval
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+cargo build -p freedom-ipfs-gateway
+```
+
+`ipfs.tech` same-window comparison:
+
+```sh
+timeout 360s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/ipfs-tech-dial-cap5-rust-vs-kubo-trace.jsonl \
+  --output /tmp/ipfs-tech-dial-cap5-rust-vs-kubo.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `617/1368ms`, Kubo `2130/3694ms`.
+- Asset TTFB p50/p95: Rust `170/593ms`, Kubo `203/590ms`.
+- Max RSS/FD: Rust `50920KiB`/`46`, Kubo `268552KiB`/`464`.
+- Trace: `request_timeouts_with_trusted=0`, `shortcut_hits=86`,
+  `bitswap peer attempts=281`, `dial rejections=3` all connection-limit.
+- Incoming delivery stayed prompt: `max_oldest_pending_ms=524`.
+- Evidence:
+  - `/tmp/ipfs-tech-dial-cap5-rust-vs-kubo.json`
+  - `/tmp/ipfs-tech-dial-cap5-rust-vs-kubo-trace.jsonl`
+
+`vitalik` guardrail:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/vitalik-dial-cap5-rust-vs-kubo-trace.jsonl \
+  --output /tmp/vitalik-dial-cap5-rust-vs-kubo.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1490/1709ms`, Kubo `2013/2277ms`.
+- Max RSS/FD: Rust `38656KiB`/`23`, Kubo `191688KiB`/`95`.
+- Trace: `request_timeouts_with_trusted=0`; no timeout recovery cluster.
+- Evidence:
+  - `/tmp/vitalik-dial-cap5-rust-vs-kubo.json`
+  - `/tmp/vitalik-dial-cap5-rust-vs-kubo-trace.jsonl`
+
+`daicowtf` guardrail was inconclusive in this network window:
+
+```sh
+timeout 180s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case daicowtf-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/daicowtf-dial-cap5-rust-vs-kubo-r1-trace.jsonl \
+  --output /tmp/daicowtf-dial-cap5-rust-vs-kubo-r1.json
+```
+
+Result:
+
+- Rust and Kubo both failed `0/1`.
+- Root TTFB: Rust `22327ms`, Kubo `30002ms`.
+- The failure is not strong evidence against cap 5 because Kubo could not load
+  the same page roots in the same window.
+- Rust trace showed one-provider/provider-diversity failure shape:
+  `provider_diversity_low=2`, `retry_timeout=1`, `read_timeouts=1`.
+- Evidence:
+  - `/tmp/daicowtf-dial-cap5-rust-vs-kubo-r1.json`
+  - `/tmp/daicowtf-dial-cap5-rust-vs-kubo-r1-trace.jsonl`
+
+Decision: keep. Compared with the prior exact-code cap-8 `ipfs.tech` guardrail
+(`asset p95=1119ms`, `dial rejections=105`), cap 5 cut the asset tail and dial
+rejection count substantially while keeping `vitalik` healthy and beating Kubo
+in the measured windows. The remaining follow-up is to rerun `daicowtf` when
+Kubo can load it again, because the same-window failure was public-network or
+provider availability rather than a clear Rust regression.

@@ -69,7 +69,7 @@ const BITSWAP_MAX_ESTABLISHED_CONNECTIONS: u32 = 16;
 // Keep one command from filling every pending outgoing dial slot. Page loads
 // often request child blocks immediately after the root, so preserving headroom
 // lets follow-on blocks dial instead of waiting behind stale public providers.
-const MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND: usize = 8;
+const MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND: usize = 5;
 const MAX_BITSWAP_PEERS_PER_BLOCK: usize = 16;
 const MAX_BITSWAP_SESSION_PEERS: usize = 4;
 const MAX_BITSWAP_ADDRS_PER_PEER: usize = 2;
@@ -3780,7 +3780,7 @@ mod bitswap_tests {
             .collect::<Vec<_>>();
 
         assert_eq!(dials.len(), MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND);
-        assert_eq!(suppressed, 8);
+        assert_eq!(suppressed, 11);
         assert_eq!(
             addr_order,
             vec![
@@ -3789,9 +3789,6 @@ mod bitswap_tests {
                 "/ip4/127.0.0.3/tcp/1001",
                 "/ip4/127.0.0.4/tcp/1001",
                 "/ip4/127.0.0.1/tcp/1002",
-                "/ip4/127.0.0.2/tcp/1002",
-                "/ip4/127.0.0.3/tcp/1002",
-                "/ip4/127.0.0.4/tcp/1002",
             ]
         );
     }
