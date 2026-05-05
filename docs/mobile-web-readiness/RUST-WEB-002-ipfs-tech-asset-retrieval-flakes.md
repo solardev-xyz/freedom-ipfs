@@ -11905,3 +11905,125 @@ behavior for exactly the large media/range blocks we care about. A future cache
 write optimization should preserve the post-fetch cache contract, for example
 by making the store path cheaper or adding a bounded write-behind queue with an
 explicit flush/visibility contract.
+
+## 2026-05-05 Reject: Range-Batch 100ms Session Head Start
+
+Hypothesis:
+The global `75ms` Bitswap session pre-lookup grace is a good default for normal
+page assets, but batched raw UnixFS range child reads have a narrower shape:
+adjacent child CIDs are requested together after the parent has already reached a
+useful session peer. A scoped `100ms` pre-lookup grace only for
+`BlockProvider::get_block_ranges` with multiple children might let those child
+blocks arrive through the session shortcut before provider lookup/post-lookup
+fallback, reducing deterministic range TTFB without affecting normal requests.
+
+Prototype:
+
+- Added `BITSWAP_RANGE_BATCH_SESSION_PRE_LOOKUP_GRACE = 100ms`.
+- Threaded an optional pre-lookup grace through uncached block fetches.
+- Used the `100ms` grace only for multi-CID raw range batches; all other block
+  fetches kept the existing `75ms` policy.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-unixfs file_range_batches_adjacent_raw_child_ranges
+cargo test -p freedom-ipfs-retrieval recent_bitswap_peer_head_start_can_avoid_provider_lookup
+```
+
+All focused checks passed.
+
+Seeded one-run validation:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 1 \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-range-headstart100-boundary-rust-trace.jsonl \
+  --comparison-output /tmp/harness-range-headstart100-boundary-rust-vs-kubo.json
+```
+
+Result:
+
+- Rust and Kubo passed.
+- Rust root TTFB `132ms`; Kubo `54ms`.
+- Rust max RSS/FD `39508KiB` / `13`; Kubo `88824KiB` / `40`.
+- Rust gateway elapsed p50 `130ms`; gateway direct body max `60ms`.
+- Delegated lookup events `1` for the root only.
+- Range child shortcut hits `2/2`; no post-lookup waits.
+
+Seeded three-run fresh-gateway validation:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-range-headstart100-boundary-r3-rust-trace.jsonl \
+  --comparison-output /tmp/harness-range-headstart100-boundary-r3-rust-vs-kubo.json
+```
+
+Result:
+
+- Rust and Kubo passed `3/3`.
+- Rust root TTFB p50/p95 `190ms` / `193ms`.
+- Kubo root TTFB p50/p95 `52ms` / `52ms`.
+- Rust max RSS/FD `39588KiB` / `13`; Kubo `91404KiB` / `35`.
+- Delegated lookup events dropped to `3` total, compared with `5` in the
+  previous kept bounded range-batch repeat baseline.
+- Range child shortcut hits `6/6`; no post-lookup waits.
+- Compared with the kept bounded range-batch baseline
+  (`194ms` / `196ms` Rust p50/p95), this was only a tiny latency improvement.
+
+Live range validation:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/vitalik-range-headstart100-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/vitalik-range-headstart100-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo passed `3/3`.
+- Rust range/root TTFB p50/p95 `5ms` / `448ms`.
+- Kubo range/root TTFB p50/p95 `3ms` / `1962ms`.
+- Rust max RSS/FD `37376KiB` / `18`; Kubo `174744KiB` / `86`.
+- The prior kept `75ms` range check on the same live case was better for Rust
+  (`4ms` / `373ms` p50/p95), though live network variance is likely.
+- This case did not meaningfully exercise multi-child `get_block_ranges`; the
+  trace had `block_store_get_range=3` and no clear range-batch signal.
+
+Decision:
+Reject and revert. The seeded provider lookup reduction is real, but the
+latency win is too small to justify threading a second Bitswap pre-lookup grace
+through the retrieval path. Live range evidence was not better, and the only
+clear deterministic gain was `194ms` / `196ms` to `190ms` / `193ms` p50/p95.
+Keep the current global `75ms` pre-lookup policy unless a future experiment
+finds a larger, repeatable benefit without increasing mobile request latency.
