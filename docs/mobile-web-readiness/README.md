@@ -84,6 +84,9 @@ file responses use `Cache-Control: no-cache` so browsers revalidate mutable
 names. Matching non-range `If-None-Match` requests return `304 Not Modified`,
 while range responses keep `ETag`, `Cache-Control`, `Accept-Ranges`, and
 `Content-Range`.
+For range responses without a path extension, the gateway sniffs MIME only when
+the requested range starts at byte `0`; deep ranges use
+`application/octet-stream` rather than fetching unrelated prefix bytes.
 To exercise this browser path in live runs, pass `--conditional-revalidate`.
 For each successful non-range GET, the harness requires an `ETag`, immediately
 sends a second GET with `If-None-Match`, records the `304` result in the JSON

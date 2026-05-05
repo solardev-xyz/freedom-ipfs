@@ -573,6 +573,10 @@ async fn serve_ipfs_path_with_listing_path(
                 );
                 return not_modified_response(&etag, cache_policy);
             }
+            let parsed_range = request_headers
+                .range
+                .map(|range| parse_range_header(range, target.len))
+                .transpose()?;
             let mime_started = Instant::now();
             let mime = mime_for_served_file(
                 &unixfs,
@@ -581,6 +585,7 @@ async fn serve_ipfs_path_with_listing_path(
                 &target.file_cid,
                 &target.path,
                 target.len,
+                mime_sniff_end(target.len, parsed_range),
             )?;
             tracing::info!(
                 phase = "mime_total",
@@ -596,8 +601,8 @@ async fn serve_ipfs_path_with_listing_path(
                 cache_policy,
                 is_head: request_headers.is_head,
             };
-            if let Some(range) = request_headers.range {
-                ranged_response(provider, unixfs.clone(), target, range, headers)?
+            if let Some((start, end)) = parsed_range {
+                ranged_response(provider, unixfs.clone(), target, start, end, headers)?
             } else {
                 streaming_response(provider, unixfs.clone(), target, headers)?
             }
@@ -673,6 +678,7 @@ fn mime_for_served_file(
     file_cid: &Cid,
     path: &str,
     len: u64,
+    sniff_end: Option<u64>,
 ) -> Result<String, GatewayError> {
     let started = Instant::now();
     if let Some(mime) = mime_guess::from_path(path).first() {
@@ -685,8 +691,7 @@ fn mime_for_served_file(
         );
         return Ok(mime.to_string());
     }
-    if len > 0 {
-        let end = (len - 1).min(512);
+    if let Some(end) = sniff_end {
         let sniff_started = Instant::now();
         let prefix = unixfs
             .read_file_cid_range(provider, file_cid, 0, end)
@@ -714,10 +719,22 @@ fn mime_for_served_file(
         phase = "mime_detect",
         cid = %cid,
         unixfs_path = path,
-        source = "fallback",
+        source = if len > 0 { "fallback_no_sniff" } else { "fallback_empty" },
         elapsed_ms = started.elapsed().as_millis()
     );
     Ok("application/octet-stream".to_string())
+}
+
+fn mime_sniff_end(len: u64, parsed_range: Option<(u64, u64)>) -> Option<u64> {
+    if len == 0 {
+        return None;
+    }
+    let last_sniff_byte = (len - 1).min(512);
+    match parsed_range {
+        Some((0, end)) => Some(end.min(last_sniff_byte)),
+        Some(_) => None,
+        None => Some(last_sniff_byte),
+    }
 }
 
 fn looks_like_html(bytes: &[u8]) -> bool {
@@ -1282,7 +1299,8 @@ fn ranged_response(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
     target: FileResponseTarget,
-    range: &HeaderValue,
+    start: u64,
+    end: u64,
     headers: FileResponseHeaders<'_>,
 ) -> Result<Response, GatewayError> {
     let FileResponseTarget {
@@ -1291,15 +1309,6 @@ fn ranged_response(
         path,
         len: total_len,
     } = target;
-    let range = range
-        .to_str()
-        .map_err(|_| GatewayError::BadRequest("invalid Range header".into()))?;
-    let Some(spec) = range.strip_prefix("bytes=") else {
-        return Err(GatewayError::BadRequest(
-            "only bytes ranges are supported".into(),
-        ));
-    };
-    let (start, end) = parse_range_spec(spec, total_len)?;
     let range_len = end - start + 1;
     if !headers.is_head && range_len <= GATEWAY_STREAM_CHUNK_SIZE {
         let started = Instant::now();
@@ -1354,6 +1363,18 @@ fn ranged_response(
     *response.status_mut() = StatusCode::PARTIAL_CONTENT;
     insert_range_file_headers(&mut response, total_len, start, end, headers)?;
     Ok(response)
+}
+
+fn parse_range_header(range: &HeaderValue, total_len: u64) -> Result<(u64, u64), GatewayError> {
+    let range = range
+        .to_str()
+        .map_err(|_| GatewayError::BadRequest("invalid Range header".into()))?;
+    let Some(spec) = range.strip_prefix("bytes=") else {
+        return Err(GatewayError::BadRequest(
+            "only bytes ranges are supported".into(),
+        ));
+    };
+    parse_range_spec(spec, total_len)
 }
 
 fn insert_range_file_headers(
@@ -1890,6 +1911,62 @@ mod tests {
                 "{range}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn deep_byte_ranges_skip_mime_sniff_prefix_read() {
+        let first = b"<!DOCTYPE html><html><body>prefix block</body></html>";
+        let second = b"range payload";
+        let first_cid = cid_from_data(CODEC_RAW, first);
+        let second_cid = cid_from_data(CODEC_RAW, second);
+        let file_block = test_pb_file_with_links(
+            vec![test_link("", &first_cid), test_link("", &second_cid)],
+            (first.len() + second.len()) as u64,
+            vec![first.len() as u64, second.len() as u64],
+        );
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (file_cid, file_block),
+            (first_cid, first.to_vec()),
+            (second_cid, second.to_vec()),
+        ])));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router_with_provider(provider.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let start = first.len();
+        let end = start + second.len() - 1;
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/ipfs/{file_cid}"))
+            .header(RANGE, format!("bytes={start}-{end}"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            HeaderValue::from_static("application/octet-stream")
+        );
+        assert_eq!(
+            response.headers().get(CONTENT_RANGE).unwrap(),
+            HeaderValue::from_str(&format!(
+                "bytes {start}-{end}/{}",
+                first.len() + second.len()
+            ))
+            .unwrap()
+        );
+        assert_eq!(response.bytes().await.unwrap().as_ref(), second);
+        assert_eq!(
+            provider.call_count(&first_cid),
+            0,
+            "deep range should not fetch byte 0 only for MIME sniffing"
+        );
+        assert_eq!(provider.call_count(&second_cid), 1);
     }
 
     #[tokio::test]
@@ -2643,6 +2720,26 @@ mod tests {
                 .encode_to_vec(),
             ),
             links: Vec::new(),
+        }
+        .encode_to_vec()
+    }
+
+    fn test_pb_file_with_links(
+        links: Vec<TestPbLink>,
+        filesize: u64,
+        blocksizes: Vec<u64>,
+    ) -> Vec<u8> {
+        TestPbNode {
+            data: Some(
+                TestUnixfsData {
+                    r#type: Some(TestDataType::File as i32),
+                    data: Some(Vec::new()),
+                    filesize: Some(filesize),
+                    blocksizes,
+                }
+                .encode_to_vec(),
+            ),
+            links,
         }
         .encode_to_vec()
     }

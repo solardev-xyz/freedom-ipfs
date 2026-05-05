@@ -10937,3 +10937,81 @@ Decision:
 Keep this as measurement infrastructure. It does not change gateway retrieval
 behavior, but it gives future prefetch/multi-want work a deterministic
 black-box workload before touching production code again.
+
+## 2026-05-05 Optimize: Skip MIME Sniff Reads For Deep Ranges
+
+Hypothesis:
+For no-extension byte-range requests that start after byte `0`, MIME sniffing
+the first bytes can fetch an unrelated block before serving the requested
+range. This is especially wasteful for media seeking and multi-block UnixFS
+files on mobile.
+
+Change:
+
+- Parse the `Range` header before MIME detection.
+- Continue using path-extension MIME detection whenever available.
+- Continue sniffing full responses and ranges that start at byte `0`, using
+  only bytes inside the requested prefix range when possible.
+- For ranges that start after byte `0`, skip MIME sniffing and use
+  `application/octet-stream` with trace source `fallback_no_sniff`.
+
+Focused validation:
+
+```sh
+cargo test -p freedom-ipfs-gateway
+```
+
+Result: all gateway tests passed, including
+`deep_byte_ranges_skip_mime_sniff_prefix_read`, which proves a deep range over a
+two-link DAG-PB file does not fetch the first linked raw block just for MIME
+sniffing.
+
+Fixture validation:
+
+```sh
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --routing-mode offline \
+  --gateway-import-car /tmp/xtask-mobile-web-multiblock.car \
+  --corpus /tmp/xtask-mobile-web-multiblock-corpus.json \
+  --case multiblock-unixfs-range \
+  --repeat 1 \
+  --trace-output /tmp/xtask-mobile-web-multiblock-no-sniff-rust-trace.jsonl \
+  --output /tmp/xtask-mobile-web-multiblock-no-sniff-rust.json
+```
+
+Result:
+
+- passed `1/1`
+- trace lines dropped from `11` to `10`
+- `mime_sniff_read` disappeared from the trace
+- `mime_detect` recorded `source=fallback_no_sniff`
+- UnixFS metadata-cache hits dropped from `3` to `2`
+- root/range TTFB and total were `4ms` / `4ms`
+- RSS/FD `21524KiB` / `11`
+
+Kubo comparison:
+
+```sh
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --routing-mode offline \
+  --gateway-import-car /tmp/xtask-mobile-web-multiblock.car \
+  --corpus /tmp/xtask-mobile-web-multiblock-corpus.json \
+  --case multiblock-unixfs-range \
+  --repeat 1 \
+  --comparison-output /tmp/xtask-mobile-web-multiblock-no-sniff-rust-vs-kubo.json
+```
+
+Result:
+
+- Rust and Kubo both passed `1/1`
+- root/range TTFB: Rust `2ms`, Kubo `9ms`
+- RSS/FD: Rust `21008KiB` / `10`, Kubo `79696KiB` / `45`
+
+Decision:
+Keep. This is a bounded range-workload optimization: it avoids fetching data
+outside the requested byte range while preserving HTML sniffing for full
+responses and prefix ranges such as `bytes=0-127`.
