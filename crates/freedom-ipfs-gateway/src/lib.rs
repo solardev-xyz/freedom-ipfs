@@ -219,10 +219,12 @@ async fn ipfs_get(
     headers: HeaderMap,
 ) -> Response {
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let process_id = std::process::id();
     let request_path = format!("/ipfs/{path}");
     let range = header_value_for_trace(headers.get(RANGE));
     let span = tracing::info_span!(
         "gateway_request",
+        process_id,
         request_id,
         namespace = "ipfs",
         path = %request_path,
@@ -286,10 +288,12 @@ async fn ipns_get(
     headers: HeaderMap,
 ) -> Response {
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let process_id = std::process::id();
     let request_path = format!("/ipns/{path}");
     let range = header_value_for_trace(headers.get(RANGE));
     let span = tracing::info_span!(
         "gateway_request",
+        process_id,
         request_id,
         namespace = "ipns",
         path = %request_path,

@@ -734,12 +734,17 @@ fn print_summary(report: &RunReport) {
                 let phases = format_trace_counts(&request.phases);
                 let cids = format_trace_counts(&request.cids);
                 let status = request.status.as_deref().unwrap_or("unknown");
+                let request_id = if request.process_id.is_empty() {
+                    request.request_id.clone()
+                } else {
+                    format!("{}:{}", request.process_id, request.request_id)
+                };
                 println!(
                     "    {}: {}ms status={} request_id={} events={} max_event={}ms phases={} cids={}",
                     request.path,
                     request.elapsed_ms,
                     status,
-                    request.request_id,
+                    request_id,
                     request.event_count,
                     request.max_event_ms,
                     phases,
@@ -2759,6 +2764,7 @@ struct TraceCidAggregate {
 #[derive(Debug, Serialize)]
 struct TraceRequestAggregate {
     path: String,
+    process_id: String,
     request_id: String,
     status: Option<String>,
     elapsed_ms: u128,
@@ -2770,6 +2776,7 @@ struct TraceRequestAggregate {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TraceRequestKey {
+    process_id: String,
     request_id: String,
     path: String,
 }
@@ -2777,6 +2784,7 @@ struct TraceRequestKey {
 #[derive(Debug)]
 struct TraceRequestBuilder {
     path: String,
+    process_id: String,
     request_id: String,
     status: Option<String>,
     elapsed_ms: Option<u128>,
@@ -2790,6 +2798,7 @@ impl TraceRequestBuilder {
     fn new(key: TraceRequestKey) -> Self {
         Self {
             path: key.path,
+            process_id: key.process_id,
             request_id: key.request_id,
             status: None,
             elapsed_ms: None,
@@ -2818,6 +2827,7 @@ impl TraceRequestBuilder {
     fn into_aggregate(self) -> TraceRequestAggregate {
         TraceRequestAggregate {
             path: self.path,
+            process_id: self.process_id,
             request_id: self.request_id,
             status: self.status,
             elapsed_ms: self.elapsed_ms.unwrap_or(self.max_event_ms),
@@ -3267,8 +3277,15 @@ fn trace_request_key(value: &serde_json::Value) -> Option<TraceRequestKey> {
     let request_id = json_detail_string(value.get("request_id")).or_else(|| {
         json_detail_string(value.get("span").and_then(|span| span.get("request_id")))
     })?;
+    let process_id = json_detail_string(value.get("process_id"))
+        .or_else(|| json_detail_string(value.get("span").and_then(|span| span.get("process_id"))))
+        .unwrap_or_default();
     let path = trace_event_path(value)?;
-    Some(TraceRequestKey { request_id, path })
+    Some(TraceRequestKey {
+        process_id,
+        request_id,
+        path,
+    })
 }
 
 fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
@@ -3318,6 +3335,7 @@ fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
         "ip6_addr_count",
         "bytes",
         "cache_hit",
+        "process_id",
         "request_id",
         "command_queued_ms",
         "targets",
@@ -3336,6 +3354,13 @@ fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
             json_detail_string(value.get("span").and_then(|span| span.get("request_id")))
         {
             details.insert("request_id".to_string(), request_id);
+        }
+    }
+    if !details.contains_key("process_id") {
+        if let Some(process_id) =
+            json_detail_string(value.get("span").and_then(|span| span.get("process_id")))
+        {
+            details.insert("process_id".to_string(), process_id);
         }
     }
     details
@@ -3859,6 +3884,44 @@ mod tests {
         assert_eq!(summary.slow_requests[0].cids[0].value, "cid1");
         assert_eq!(summary.slow_requests[0].cids[0].count, 1);
         assert_eq!(summary.slow_requests[0].phases.len(), 3);
+    }
+
+    #[test]
+    fn trace_summary_keeps_restarted_gateway_request_ids_separate() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-restart-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"request_start\",\"request_id\":1,\"path\":\"/ipns/site/\",\"span\":{\"process_id\":101,\"request_id\":1,\"path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"unixfs_file_size\",\"elapsed_ms\":10,\"cid\":\"cid-a\",\"span\":{\"process_id\":101,\"request_id\":1,\"path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipns/site/\",\"status\":200,\"elapsed_ms\":11,\"span\":{\"process_id\":101,\"request_id\":1,\"path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"request_start\",\"request_id\":1,\"path\":\"/ipns/site/\",\"span\":{\"process_id\":202,\"request_id\":1,\"path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"unixfs_file_size\",\"elapsed_ms\":30,\"cid\":\"cid-b\",\"span\":{\"process_id\":202,\"request_id\":1,\"path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipns/site/\",\"status\":200,\"elapsed_ms\":31,\"span\":{\"process_id\":202,\"request_id\":1,\"path\":\"/ipns/site/\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(summary.slow_requests.len(), 2);
+        assert_eq!(summary.slow_requests[0].process_id, "202");
+        assert_eq!(summary.slow_requests[0].request_id, "1");
+        assert_eq!(summary.slow_requests[0].elapsed_ms, 31);
+        assert_eq!(summary.slow_requests[0].cids[0].value, "cid-b");
+        assert_eq!(summary.slow_requests[1].process_id, "101");
+        assert_eq!(summary.slow_requests[1].request_id, "1");
+        assert_eq!(summary.slow_requests[1].elapsed_ms, 11);
+        assert_eq!(summary.slow_requests[1].cids[0].value, "cid-a");
     }
 
     #[test]

@@ -3351,3 +3351,36 @@ provider cases, but it needs a more selective design:
 - budget relay dials separately from direct dials
 - suppress relays that return `NoReservation`
 - add a deterministic relay-loopback test before any future live run
+
+## 2026-05-05 Harness Request Correlation Fix
+
+Issue:
+`mobile-web-harness --fresh-gateway-per-run` appends trace events from multiple
+short-lived gateway processes into one JSONL file. The gateway request counter
+starts at `1` in each process, so harness `slow_requests` aggregation could
+merge unrelated requests that reused the same `(request_id, path)` across
+runs. That made multi-run trace summaries misleading while inspecting the
+post-lookup session wait and UnixFS range path.
+
+Implementation:
+
+- Gateway request spans now include `process_id` for both `/ipfs` and `/ipns`
+  requests.
+- Harness request aggregation keys on `(process_id, request_id, path)`, falling
+  back to the old key for older traces without `process_id`.
+- Slow request console output renders non-empty ids as `process_id:request_id`.
+- Added a deterministic harness regression test with two restarted gateway
+  traces that both use `request_id=1` and the same path.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_keeps_restarted_gateway_request_ids_separate
+cargo test -p mobile-web-harness
+cargo test -p freedom-ipfs-gateway request
+```
+
+Decision: keep. This is a diagnostics-only fix with no retrieval behavior
+change. Future multi-run live traces should no longer overstate per-request
+event counts or merge CIDs from different gateway processes.
