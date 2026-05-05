@@ -12027,3 +12027,57 @@ through the retrieval path. Live range evidence was not better, and the only
 clear deterministic gain was `194ms` / `196ms` to `190ms` / `193ms` p50/p95.
 Keep the current global `75ms` pre-lookup policy unless a future experiment
 finds a larger, repeatable benefit without increasing mobile request latency.
+
+## 2026-05-05 Keep: Multi-CID Incoming Bitswap Batch Matching
+
+Hypothesis:
+The rejected range multi-want experiment may have failed partly because
+`SharedBitswapClient::fetch_many` only listened for incoming Bitswap block
+delivery on single-CID commands. If a Kubo peer answers a multi-want by opening
+incoming Bitswap streams, the batch request can time out even though the blocks
+arrive through the same mechanism that already serves normal single-CID
+requests. Supporting incoming delivery for all requested CIDs is a safer
+building block than reintroducing another UnixFS prefetch hook.
+
+Change:
+
+- Register incoming Bitswap waiters for every CID in a shared-client command,
+  not only the primary CID.
+- Aggregate incoming one-block results until every requested CID in the
+  multi-CID command has been received.
+- Keep the outgoing stream request race unchanged.
+- Emit `bitswap_incoming_batch` only for multi-CID incoming completions, so
+  normal single-CID trace volume does not change.
+- Add a deterministic test peer that accepts a multi-want on an outgoing stream
+  but delivers each requested block back over incoming Bitswap streams. This
+  reproduces the response shape the earlier Kubo-backed experiment needed to
+  tolerate.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval shared_bitswap_client_fetch_many_accepts_multi_cid_incoming_blocks
+cargo test -p freedom-ipfs-retrieval shared_bitswap_client_fetch_many
+cargo test -p freedom-ipfs-retrieval multi_want_stream
+cargo test -p freedom-ipfs-retrieval
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- focused incoming multi-CID test passed
+- shared-client `fetch_many` tests passed: `3 passed`
+- stream-level multi-want tests passed: `2 passed`
+- full retrieval suite passed: `66 passed; 0 failed; 1 ignored`
+- retrieval clippy passed with `-D warnings`
+- formatting and diff whitespace checks passed
+
+Decision:
+Keep as a Priority-1 multi-want building block. This does not claim a live
+page-load speed win and does not change gateway/UnixFS retrieval behavior by
+itself. It makes the next range/session batching experiment better scoped:
+future work can test a non-blocking or raced multi-CID range request against the
+local Kubo seed while knowing that incoming Kubo-style block delivery can
+satisfy the batch instead of timing out.
