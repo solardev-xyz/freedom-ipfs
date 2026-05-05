@@ -12081,3 +12081,106 @@ itself. It makes the next range/session batching experiment better scoped:
 future work can test a non-blocking or raced multi-CID range request against the
 local Kubo seed while knowing that incoming Kubo-style block delivery can
 satisfy the batch instead of timing out.
+
+## 2026-05-05 Reject: Raced Multi-CID Range Shortcut
+
+Hypothesis:
+After keeping multi-CID incoming Bitswap batch matching, the range path could
+race a recent-peer multi-CID shortcut against the existing individual raw-child
+fetches. Unlike the earlier blocking prefetch hook, this should not delay the
+current path when the batch is slow; it should only win if the batch receives
+and stores all child blocks first.
+
+Prototype:
+
+- Added `HttpRetriever::fetch_many_from_recent_bitswap_peers`.
+- In `FetchingBlockProvider::get_block_ranges_async`, for multi-CID uncached
+  range batches:
+  - start the normal individual `fetch_block_with_source` child fetches
+  - also start a recent-session-peer `fetch_many` batch for the same child CIDs
+  - return the batch result only if it completed all requested blocks first
+  - otherwise let the existing individual path return as before
+- Preserved verification and durable cache insertion before serving batch
+  results.
+
+Focused validation while the prototype was present:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-unixfs file_range_batches_adjacent_raw_child_ranges
+cargo test -p freedom-ipfs-retrieval shared_bitswap_client_fetch_many_accepts_multi_cid_incoming_blocks
+```
+
+Focused checks passed.
+
+Seeded one-run validation:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 1 \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-range-raced-multi-incoming-r1-trace.jsonl \
+  --comparison-output /tmp/harness-range-raced-multi-incoming-r1.json
+```
+
+Result:
+
+- Rust and Kubo passed.
+- Rust root TTFB `181ms`; Kubo `54ms`.
+- Rust max RSS/FD `39712KiB` / `13`; Kubo `88072KiB` / `42`.
+- Trace exercised the new shape: `multi_cid_commands=1`,
+  `bitswap_incoming_batch=1`, incoming child blocks delivered to both the batch
+  waiter and the individual waiters.
+- The batch did not win the response path; individual child fetches still
+  produced `block_fetch_total` for both raw children.
+
+Seeded three-run fresh-gateway validation:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-range-raced-multi-incoming-r3-trace.jsonl \
+  --comparison-output /tmp/harness-range-raced-multi-incoming-r3.json
+```
+
+Result:
+
+- Rust and Kubo passed `3/3`.
+- Rust root TTFB p50/p95 `169ms` / `207ms`.
+- Kubo root TTFB p50/p95 `55ms` / `57ms`.
+- Rust max RSS/FD `40316KiB` / `13`; Kubo `90920KiB` / `45`.
+- Compared with the kept bounded range-batch baseline
+  (`194ms` / `196ms` Rust p50/p95), p50 improved but p95 regressed.
+- Trace showed `multi_cid_commands=3`, `bitswap_incoming_batch=3`, and
+  `delivered_waiters=15`, meaning every run added extra multi-CID work.
+- Only one request group clearly returned through `bitswap_session_batch_shortcut`.
+  Other runs either let the individual path win or paid enough durable store
+  cost after the batch completed that the response tail was worse.
+
+Decision:
+Reject and revert the production hook. The incoming batch mechanism works, but
+the raced range shortcut adds duplicate Bitswap and cache-write pressure for an
+unstable latency tradeoff: better p50, worse p95, and no movement toward Kubo's
+`~55ms` seeded p50. Keep the lower-level multi-CID incoming support, but do not
+wire it into `get_block_ranges_async` in this shape. A future attempt should
+first remove duplicate large-block cache writes without weakening the
+post-fetch cache contract, or find a request shape that wins before the current
+individual child fetches complete.
