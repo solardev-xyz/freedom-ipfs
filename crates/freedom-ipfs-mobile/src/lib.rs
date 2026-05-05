@@ -143,6 +143,7 @@ struct ProgressEvent {
     status: String,
     source: Option<String>,
     transport: Option<String>,
+    delivery: Option<String>,
     bytes_loaded: Option<u64>,
     providers_found: Option<u64>,
     candidate_peers: Option<u64>,
@@ -165,6 +166,9 @@ struct ProgressTarget {
     namespace: Option<String>,
     phase: String,
     status: String,
+    source: Option<String>,
+    transport: Option<String>,
+    delivery: Option<String>,
     elapsed_ms: Option<u64>,
     blocks_loaded: u64,
     retry_count: u64,
@@ -206,14 +210,12 @@ impl ProgressRecorder {
         let phase = progress_phase(&raw_phase, &fields, &status);
         let elapsed_ms = fields.get_u64("elapsed_ms");
         let timestamp_ms = now_ms();
-        let source = fields
-            .get("source")
-            .cloned()
-            .or_else(|| fields.get("bitswap_delivery").cloned());
+        let source = progress_source(&raw_phase, &fields);
         let transport = fields
             .get("source_transport")
             .cloned()
             .or_else(|| fields.get("transport").cloned());
+        let delivery = fields.get("bitswap_delivery").cloned();
         let last_error_message = fields.get("error").cloned();
         let last_error_code = progress_error_code(&raw_phase, &fields, &status);
         let mut inner = match self.inner.lock() {
@@ -222,11 +224,19 @@ impl ProgressRecorder {
         };
         inner.next_event_id = inner.next_event_id.saturating_add(1);
         let target_key = format!("{kind}:{target_id}");
-        let (previous_blocks_loaded, previous_retry_count) = inner
-            .active_targets
-            .get(&target_key)
+        let previous_target = inner.active_targets.get(&target_key);
+        let (previous_blocks_loaded, previous_retry_count) = previous_target
             .map(|target| (target.blocks_loaded, target.retry_count))
             .unwrap_or_default();
+        let target_source = source
+            .clone()
+            .or_else(|| previous_target.and_then(|target| target.source.clone()));
+        let target_transport = transport
+            .clone()
+            .or_else(|| previous_target.and_then(|target| target.transport.clone()));
+        let target_delivery = delivery
+            .clone()
+            .or_else(|| previous_target.and_then(|target| target.delivery.clone()));
         let blocks_loaded =
             previous_blocks_loaded.saturating_add(u64::from(raw_phase == "block_fetch_total"));
         let retry_count = previous_retry_count.saturating_add(u64::from(phase == "retrying"));
@@ -242,8 +252,9 @@ impl ProgressRecorder {
             phase: phase.clone(),
             raw_phase: raw_phase.clone(),
             status: status.clone(),
-            source,
-            transport,
+            source: target_source.clone(),
+            transport: target_transport.clone(),
+            delivery: target_delivery.clone(),
             bytes_loaded: fields.get_u64("bytes"),
             providers_found: fields
                 .get_u64("provider_count")
@@ -278,6 +289,9 @@ impl ProgressRecorder {
                     namespace,
                     phase,
                     status,
+                    source: target_source,
+                    transport: target_transport,
+                    delivery: target_delivery,
                     elapsed_ms,
                     blocks_loaded,
                     retry_count,
@@ -462,6 +476,26 @@ fn progress_status(raw_phase: &str, fields: &ProgressFields) -> String {
         _ => "active",
     }
     .into()
+}
+
+fn progress_source(raw_phase: &str, fields: &ProgressFields) -> Option<String> {
+    if let Some(source) = fields.get("source") {
+        return Some(source.clone());
+    }
+    match raw_phase {
+        "block_store_get" | "gateway_conditional"
+            if fields.get("cache_hit").map(String::as_str) == Some("true") =>
+        {
+            Some("cache".into())
+        }
+        "http_provider_fetch" => Some("http_provider".into()),
+        "delegated_provider_lookup" => Some("delegated_routing".into()),
+        "provider_diversity_low" | "light_dht_provider_lookup" | "dht_provider_lookup" => {
+            Some("dht".into())
+        }
+        phase if phase.starts_with("bitswap_") => Some("bitswap".into()),
+        _ => None,
+    }
 }
 
 fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> String {
@@ -2010,18 +2044,39 @@ mod tests {
         let snapshot = recorder.snapshot_json();
         let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
         assert_eq!(value["active_count"].as_u64().unwrap(), 0);
-        let completed = value["events"]
-            .as_array()
-            .unwrap()
+        let events = value["events"].as_array().unwrap();
+        let retrying = events
+            .iter()
+            .find(|event| event["phase"] == "retrying")
+            .unwrap();
+        assert_eq!(retrying["source"], "bitswap");
+        let completed = events
             .iter()
             .find(|event| event["phase"] == "completed")
             .unwrap();
+        assert_eq!(completed["source"], "bitswap");
         assert_eq!(completed["blocks_loaded"].as_u64().unwrap(), 1);
         assert_eq!(completed["retry_count"].as_u64().unwrap(), 1);
     }
 
     #[test]
     fn progress_phase_maps_trace_events_to_ui_states() {
+        assert_eq!(
+            progress_source(
+                "bitswap_fetch",
+                &progress_fields([("phase", "bitswap_fetch"), ("bitswap_delivery", "incoming")]),
+            )
+            .as_deref(),
+            Some("bitswap")
+        );
+        assert_eq!(
+            progress_source(
+                "delegated_provider_lookup",
+                &progress_fields([("phase", "delegated_provider_lookup")]),
+            )
+            .as_deref(),
+            Some("delegated_routing")
+        );
         assert_eq!(
             progress_phase(
                 "name_cache",

@@ -8068,6 +8068,10 @@ Implementation:
 - Add the same fields to active progress targets.
 - Accumulate `blocks_loaded` when a target sees `block_fetch_total`.
 - Accumulate `retry_count` when a target maps to the stable `retrying` phase.
+- Report stable high-level `source` values such as `cache`, `bitswap`,
+  `http_provider`, `delegated_routing`, and `dht`.
+- Preserve lower-level Bitswap direction as `delivery` so `source` can stay
+  UI-friendly while logs can still distinguish `incoming` and `outgoing`.
 - Preserve the final counter values on completed, failed, and cancelled events
   after the target is removed from `active`.
 - Update `docs/mobile-progress-api.md`.
@@ -8078,6 +8082,7 @@ Validation:
 cargo fmt --all --check
 cargo test -p freedom-ipfs-mobile progress_snapshot_records_gateway_request_phases
 cargo test -p freedom-ipfs-mobile progress_snapshot_accumulates_target_counters
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
 cargo test -p freedom-ipfs-mobile
 cargo check --workspace --all-targets
 git diff --check
