@@ -1185,6 +1185,11 @@ struct BitswapCommand {
     respond: oneshot::Sender<Result<BitswapFetchResult>>,
 }
 
+struct PendingIncomingBitswapResult {
+    sent_at: Instant,
+    sender: mpsc::UnboundedSender<BitswapFetchResult>,
+}
+
 type DialErrorLog = Arc<tokio::sync::Mutex<HashMap<PeerId, Vec<String>>>>;
 type PeerTransportLog = Arc<tokio::sync::Mutex<HashMap<PeerId, PeerTransportState>>>;
 
@@ -1259,8 +1264,7 @@ async fn run_shared_bitswap_swarm(
 ) {
     let mut incoming = select_all(incoming);
     let mut fetches = FuturesUnordered::<BoxFuture<'static, Cid>>::new();
-    let mut pending_incoming =
-        HashMap::<Cid, Vec<mpsc::UnboundedSender<BitswapFetchResult>>>::new();
+    let mut pending_incoming = HashMap::<Cid, Vec<PendingIncomingBitswapResult>>::new();
     let mut pending_counts = HashMap::<Cid, usize>::new();
     let mut connected_peers = HashMap::<PeerId, usize>::new();
     let mut connection_waiters = HashMap::<PeerId, Vec<oneshot::Sender<()>>>::new();
@@ -1277,7 +1281,12 @@ async fn run_shared_bitswap_swarm(
                 let command_queued_ms = command.sent_at.elapsed().as_millis();
                 prune_connection_waiters(&mut connection_waiters, &mut connection_wait_started);
                 let (incoming_result, incoming_results) = mpsc::unbounded_channel();
-                pending_incoming.entry(command.cid).or_default().push(incoming_result);
+                pending_incoming.entry(command.cid).or_default().push(
+                    PendingIncomingBitswapResult {
+                        sent_at: command.sent_at,
+                        sender: incoming_result,
+                    },
+                );
                 *pending_counts.entry(command.cid).or_default() += 1;
 
                 let mut peer_plans = Vec::new();
@@ -1410,16 +1419,35 @@ async fn run_shared_bitswap_swarm(
                                 result.source_peer = Some(peer);
                                 result.source_transport = source_transport;
                                 matched = true;
+                                let mut pending_waiter_count = 0usize;
+                                let mut oldest_pending_ms = 0u128;
+                                let mut newest_pending_ms = u128::MAX;
+                                if let Some(waiters) = pending_incoming.get(&cid) {
+                                    for waiter in waiters {
+                                        let pending_ms = waiter.sent_at.elapsed().as_millis();
+                                        pending_waiter_count += 1;
+                                        oldest_pending_ms = oldest_pending_ms.max(pending_ms);
+                                        newest_pending_ms = newest_pending_ms.min(pending_ms);
+                                    }
+                                }
+                                if pending_waiter_count == 0 {
+                                    newest_pending_ms = 0;
+                                }
                                 tracing::info!(
                                     phase = "bitswap_incoming_block",
                                     cid = %cid,
                                     peer = %peer,
                                     source_transport = source_transport.unwrap_or("unknown"),
                                     block_count = blocks.len(),
-                                    bytes = result.requested_block.len()
+                                    bytes = result.requested_block.len(),
+                                    pending_waiter_count,
+                                    oldest_pending_ms,
+                                    newest_pending_ms
                                 );
                                 if let Some(senders) = pending_incoming.get_mut(&cid) {
-                                    senders.retain(|sender| sender.send(result.clone()).is_ok());
+                                    senders.retain(|pending| {
+                                        pending.sender.send(result.clone()).is_ok()
+                                    });
                                 }
                                 let _ = write_bitswap_cancel(&mut stream, &cid).await;
                             }

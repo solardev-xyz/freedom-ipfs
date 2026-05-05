@@ -674,8 +674,12 @@ fn print_summary(report: &RunReport) {
         if trace.bitswap_incoming_blocks.matches > 0 {
             let incoming = &trace.bitswap_incoming_blocks;
             println!(
-                "  bitswap incoming blocks: matches={} blocks={} bytes={}",
-                incoming.matches, incoming.blocks, incoming.bytes
+                "  bitswap incoming blocks: matches={} blocks={} bytes={} max_oldest_pending_ms={} max_pending_waiters={}",
+                incoming.matches,
+                incoming.blocks,
+                incoming.bytes,
+                incoming.max_oldest_pending_ms,
+                incoming.max_pending_waiters
             );
         }
         if !trace.trace_errors.is_empty() {
@@ -2797,6 +2801,8 @@ struct TraceBitswapIncomingBlockAggregate {
     matches: usize,
     blocks: u128,
     bytes: u128,
+    max_oldest_pending_ms: u128,
+    max_pending_waiters: u128,
 }
 
 #[derive(Debug, Serialize)]
@@ -3102,6 +3108,20 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 .unwrap_or_default();
             bitswap_incoming_blocks.bytes +=
                 value.get("bytes").and_then(json_u128).unwrap_or_default();
+            bitswap_incoming_blocks.max_oldest_pending_ms =
+                bitswap_incoming_blocks.max_oldest_pending_ms.max(
+                    value
+                        .get("oldest_pending_ms")
+                        .and_then(json_u128)
+                        .unwrap_or_default(),
+                );
+            bitswap_incoming_blocks.max_pending_waiters =
+                bitswap_incoming_blocks.max_pending_waiters.max(
+                    value
+                        .get("pending_waiter_count")
+                        .and_then(json_u128)
+                        .unwrap_or_default(),
+                );
         }
         if successful_bitswap_fetch {
             if let Some(peer) = value.get("source_peer").and_then(|peer| peer.as_str()) {
@@ -3423,6 +3443,9 @@ fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
         "ip6_addr_count",
         "block_count",
         "bytes",
+        "pending_waiter_count",
+        "oldest_pending_ms",
+        "newest_pending_ms",
         "cache_hit",
         "process_id",
         "request_id",
@@ -4037,7 +4060,7 @@ mod tests {
                 "{\"phase\":\"bitswap_peer_attempt\",\"elapsed_ms\":5000,\"cid\":\"cid-a\",\"peer\":\"peer-b\",\"ok\":false,\"prefer_want_have\":true,\"failure_kind\":\"connection_timeout\",\"error\":\"timed out\"}\n",
                 "{\"phase\":\"bitswap_peer_attempt_start\",\"cid\":\"cid-a\",\"peer\":\"peer-c\",\"prefer_want_have\":true}\n",
                 "{\"phase\":\"bitswap_peer_attempt\",\"elapsed_ms\":10000,\"cid\":\"cid-a\",\"peer\":\"peer-c\",\"ok\":false,\"prefer_want_have\":true,\"failure_kind\":\"read_timeout\",\"error\":\"read timed out\"}\n",
-                "{\"phase\":\"bitswap_incoming_block\",\"cid\":\"cid-a\",\"peer\":\"peer-d\",\"source_transport\":\"tcp\",\"block_count\":2,\"bytes\":256}\n",
+                "{\"phase\":\"bitswap_incoming_block\",\"cid\":\"cid-a\",\"peer\":\"peer-d\",\"source_transport\":\"tcp\",\"block_count\":2,\"bytes\":256,\"pending_waiter_count\":3,\"oldest_pending_ms\":75,\"newest_pending_ms\":25}\n",
             ),
         )
         .unwrap();
@@ -4056,6 +4079,8 @@ mod tests {
         assert_eq!(summary.bitswap_incoming_blocks.matches, 1);
         assert_eq!(summary.bitswap_incoming_blocks.blocks, 2);
         assert_eq!(summary.bitswap_incoming_blocks.bytes, 256);
+        assert_eq!(summary.bitswap_incoming_blocks.max_pending_waiters, 3);
+        assert_eq!(summary.bitswap_incoming_blocks.max_oldest_pending_ms, 75);
         assert_eq!(
             summary.slow_events[0].details.get("peer"),
             Some(&"peer-c".to_string())

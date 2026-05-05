@@ -3624,3 +3624,68 @@ shared swarm while outgoing attempts are cancelled. Future peer scoring should
 first collect a cleaner signal, such as per-peer first-byte timing from the
 Bitswap swarm, byte-normalized throughput over multiple blocks, or bounded
 session-level batching outcomes.
+
+## 2026-05-05 Bitswap Incoming Pending-Age Trace
+
+Hypothesis:
+The per-peer attempt trace showed many successful blocks arrive through inbound
+Bitswap streams while outgoing attempts are cancelled before completion. The
+next behavior experiments need a cleaner timing signal around that inbound path,
+especially how long a CID was pending before the inbound block matched it.
+
+Implementation:
+
+- Store the enqueue time next to each pending inbound Bitswap result sender.
+- Add `pending_waiter_count`, `oldest_pending_ms`, and `newest_pending_ms` to
+  `bitswap_incoming_block` trace events.
+- Extend the harness trace summary with `max_oldest_pending_ms` and
+  `max_pending_waiters` for inbound Bitswap blocks.
+- Include the new fields in trace slow-event details for any future events that
+  carry elapsed timing.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_bitswap_peer_attempts
+cargo test -p freedom-ipfs-retrieval --lib bitswap_tests::fetches_block_from_local_bitswap_peer
+cargo build -p freedom-ipfs-gateway
+```
+
+Live trace-shape check:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-incoming-pending-age-clean-r1-trace.jsonl \
+  --output /tmp/ipfs-tech-incoming-pending-age-clean-r1.json
+```
+
+Result: passed `1/1`, root TTFB `911ms`, asset TTFB p50/p95 `186/1036ms`,
+RSS/FD `50048KiB`/`42`. The trace showed `bitswap incoming blocks:
+matches=37 blocks=87 bytes=969736 max_oldest_pending_ms=898
+max_pending_waiters=2`. Sample event:
+
+```json
+{
+  "phase": "bitswap_incoming_block",
+  "cid": "bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq",
+  "peer": "12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT",
+  "source_transport": "tcp",
+  "block_count": 1,
+  "bytes": 1362,
+  "pending_waiter_count": 1,
+  "oldest_pending_ms": "237",
+  "newest_pending_ms": "237"
+}
+```
+
+Decision: keep. This is diagnostics-only and does not alter provider lookup,
+peer selection, Bitswap request behavior, caching, or verification. It gives
+future session batching or first-byte hedge experiments a direct way to tell
+whether a slow asset was waiting on inbound Bitswap delivery, command queuing,
+provider lookup, or peer expansion.
