@@ -29,6 +29,7 @@ const DEFAULT_DELEGATED_ROUTING_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DELEGATED_ROUTING_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_DELEGATED_ROUTING_PROVIDERS: usize = 64;
 const STREAMING_DELEGATED_HTTP_PROVIDER_TARGET: usize = 3;
+const STREAMING_DELEGATED_FIRST_HTTP_PROVIDER_GRACE: Duration = Duration::from_millis(250);
 const MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY: usize = 2;
 const LOW_DIVERSITY_DELEGATED_MERGE_TIMEOUT: Duration = Duration::from_millis(750);
 const LOW_DIVERSITY_DHT_FALLBACK_TIMEOUT: Duration = Duration::from_millis(250);
@@ -1009,7 +1010,32 @@ async fn limited_response_providers(
     let mut providers = Vec::new();
     let mut first_chunk_elapsed = None;
     let mut first_http_provider_elapsed = None;
-    while let Some(chunk) = stream.next().await {
+    let mut first_http_provider_deadline = None;
+    loop {
+        let chunk = if let Some(deadline) = first_http_provider_deadline {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(chunk) => chunk,
+                Err(_) => {
+                    let providers = limit_delegated_providers(providers);
+                    return Ok(LimitedProviderResponse {
+                        stats: DelegatedResponseStats {
+                            bytes_read,
+                            line_count,
+                            first_chunk_elapsed,
+                            first_http_provider_elapsed,
+                            target_met_elapsed: None,
+                            http_provider_count: http_provider_url_count(&providers),
+                        },
+                        providers,
+                    });
+                }
+            }
+        } else {
+            stream.next().await
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         let chunk = chunk?;
         first_chunk_elapsed.get_or_insert_with(|| started.elapsed());
         bytes_read = bytes_read.saturating_add(chunk.len());
@@ -1026,6 +1052,9 @@ async fn limited_response_providers(
             line_count = line_count.saturating_add(1);
             if first_http_provider_elapsed.is_none() && http_provider_url_count(&providers) > 0 {
                 first_http_provider_elapsed = Some(started.elapsed());
+                first_http_provider_deadline = Some(
+                    tokio::time::Instant::now() + STREAMING_DELEGATED_FIRST_HTTP_PROVIDER_GRACE,
+                );
             }
             if should_return_streamed_providers(&providers) {
                 let providers = limit_delegated_providers(providers);
@@ -1862,6 +1891,41 @@ mod tests {
         assert!(response.stats.first_chunk_elapsed.is_some());
         assert!(response.stats.first_http_provider_elapsed.is_some());
         assert!(response.stats.target_met_elapsed.is_some());
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn streamed_delegated_response_returns_after_first_http_provider_grace() {
+        let fast_head = r#"{"ID":"peer-0","Addrs":["/dns4/provider-0.example/tcp/443/tls/http"]}"#
+            .to_string()
+            + "\n";
+        let slow_tail = r#"{"ID":"late-peer","Addrs":["/dns4/late.example/tcp/443/tls/http"]}"#;
+        let (endpoint, task) =
+            spawn_streaming_delegated_response(fast_head, slow_tail.into(), Duration::from_secs(2))
+                .await;
+        let response = reqwest::get(format!("{endpoint}/providers/test"))
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(800),
+            limited_response_providers(response, MAX_DELEGATED_ROUTING_RESPONSE_BYTES),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(response.providers.len(), 1);
+        assert_eq!(response.providers[0].id.as_deref(), Some("peer-0"));
+        assert_eq!(response.stats.http_provider_count, 1);
+        assert_eq!(response.stats.line_count, 1);
+        assert!(response.stats.first_http_provider_elapsed.is_some());
+        assert!(response.stats.target_met_elapsed.is_none());
+        assert!(!response
+            .providers
+            .iter()
+            .any(|provider| provider.id.as_deref() == Some("late-peer")));
         task.abort();
         let _ = task.await;
     }

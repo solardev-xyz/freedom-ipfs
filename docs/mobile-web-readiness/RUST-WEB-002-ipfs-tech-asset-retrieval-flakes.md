@@ -15049,3 +15049,193 @@ behavior or mobile resource use. The live run confirms the diagnostic value:
 HTTP-provider events missed the target response threshold. That gives future
 experiments a compact signal for sparse-provider tails without spelunking raw
 trace JSONL.
+
+## 2026-05-05 Keep: Bound Streamed Delegated Lookup After First HTTP Provider
+
+Question:
+The new delegated HTTP-provider distribution showed that many `ipfs.tech`
+lookups returned exactly one HTTP provider and never met the configured
+three-HTTP-provider streaming target. In the diagnostic baseline, those
+single-provider responses could keep the delegated lookup open until the
+response stream finished: max delegated lookup was `2198ms`, while the slowest
+single-provider first HTTP provider had appeared by `426ms`.
+
+Hypothesis:
+For mobile page loads, once a delegated NDJSON response has produced at least
+one trustless HTTP provider, waiting indefinitely for a sparse stream to finish
+is often worse than starting the verified block fetch. Keep the existing fast
+path that returns immediately after three HTTP providers, but if only one or two
+HTTP providers appear, return after a short grace window instead of waiting for
+the stream tail. Verification-before-store/serve remains unchanged because the
+retrieval layer still verifies every HTTP-provider block by CID.
+
+Implementation:
+
+- Add `STREAMING_DELEGATED_FIRST_HTTP_PROVIDER_GRACE = 250ms`.
+- In the NDJSON delegated response parser, start that grace deadline when the
+  first HTTP provider is parsed.
+- Continue to return immediately if the existing
+  `STREAMING_DELEGATED_HTTP_PROVIDER_TARGET = 3` target is met.
+- If the grace deadline expires first, return the parsed providers with
+  `target_met=false`.
+- Add a deterministic routing test where one HTTP provider arrives immediately
+  and a later HTTP provider stalls for two seconds; the parser must return
+  during the grace window and exclude the late tail.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing streamed_delegated_response_returns_after_first_http_provider_grace
+cargo test -p freedom-ipfs-routing streamed
+cargo test -p freedom-ipfs-routing
+cargo test -p freedom-ipfs-retrieval http_provider
+cargo test -p freedom-ipfs-gateway
+cargo test -p freedom-ipfs-mobile
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Result:
+
+- Formatting passed.
+- New deterministic first-HTTP-provider grace test passed.
+- Existing streamed delegated routing tests passed: `3 passed`.
+- Full `freedom-ipfs-routing` tests passed: `24 passed`, `1 ignored`.
+- Focused HTTP-provider retrieval tests passed: `5 passed`.
+- Full gateway tests passed.
+- Full mobile crate tests passed: `26 passed`.
+- Workspace check and clippy passed.
+
+Primary live experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-first-http-grace250-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-first-http-grace250-r3.json
+```
+
+Primary live result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1427ms` / `1706ms` / `1706ms`.
+- Asset TTFB p50/p95/max: `265ms` / `1199ms` / `1541ms`.
+- Run total p50/p95/max: `3811ms` / `3863ms` / `3863ms`.
+- Max RSS/FD: `52776KiB` / `36`.
+- Delegated provider lookup: `96` events, `96` successes, max `602ms`.
+- HTTP provider distribution: `zero=2`, `single=56`, `multi=38`,
+  `single_target_miss=56`, `single_max=602ms`,
+  `single_first_http_max=600ms`.
+- HTTP-provider fetch p50/p95/max: `163ms` / `697ms` / `1356ms`.
+- Block sources: `http_provider=100`, `bitswap=19`.
+
+Same-session diagnostic baseline before the code change:
+
+- Artifact: `/tmp/ipfs-tech-delegated-http-dist-r3.json`.
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1454ms` / `1539ms` / `1539ms`.
+- Asset TTFB p50/p95/max: `236ms` / `2504ms` / `3371ms`.
+- Run total p50/p95/max: `3507ms` / `5522ms` / `5522ms`.
+- Max RSS/FD: `52632KiB` / `38`.
+- Delegated provider lookup max: `2198ms`.
+- HTTP provider distribution: `zero=6`, `single=50`, `multi=35`,
+  `single_target_miss=50`, `single_max=2198ms`,
+  `single_first_http_max=426ms`.
+- HTTP-provider fetch p50/p95/max: `163ms` / `645ms` / `869ms`.
+- Block sources: `http_provider=87`, `bitswap=31`, `cache=2`.
+
+Additional live smoke:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-first-http-grace250-r3-trace.jsonl \
+  --output /tmp/daicowtf-first-http-grace250-r3.json
+```
+
+`daicowtf-page-assets` result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1789ms` / `2329ms` / `2329ms`.
+- Run total p50/p95/max: `1803ms` / `2345ms` / `2345ms`.
+- Max RSS/FD: `43124KiB` / `19`.
+- Delegated provider lookup max: `53ms`.
+- HTTP provider distribution: `zero=7`, `single=2`, `multi=0`.
+- Block sources: `bitswap=7`, `http_provider=2`.
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-first-http-grace250-r3-trace.jsonl \
+  --output /tmp/vitalik-first-http-grace250-r3.json
+```
+
+`vitalik-root-html-range` result:
+
+- Rust passed `3/3`.
+- Root/range TTFB p50/p95/max: `142ms` / `154ms` / `154ms`.
+- Run total p50/p95/max: `143ms` / `155ms` / `155ms`.
+- Max RSS/FD: `31488KiB` / `14`.
+- Delegated provider lookup max: `55ms`.
+- HTTP provider distribution: `zero=0`, `single=3`, `multi=3`.
+- Block sources: `http_provider=6`.
+
+Warm Rust-vs-Kubo comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --warmup-runs 1 \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-first-http-grace250-warm-compare-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-first-http-grace250-warm-compare-r3.json
+```
+
+Warm comparison result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Root TTFB p50/p95: Rust `2ms` / `4ms`, Kubo `1ms` / `15ms`.
+- Asset TTFB p50/p95: Rust `3ms` / `6ms`, Kubo `1ms` / `2ms`.
+- Resource max: Rust `46068KiB` / `26` FDs, Kubo `371620KiB` /
+  `711` FDs.
+- Rust delegated lookup max in the warm trace: `60ms`.
+
+Decision:
+Keep. The change is small, bounded, and directly addresses the single-provider
+tail revealed by the harness diagnostic. The main tradeoff is starting a
+verified HTTP-provider fetch with fewer candidates in sparse responses, but the
+primary live run shifted work toward HTTP providers, reduced Bitswap work, cut
+delegated lookup max from `2198ms` to `602ms`, cut `ipfs.tech` asset p95 from
+`2504ms` to `1199ms`, and reduced run p95 from `5522ms` to `3863ms` without
+meaningful RSS/FD growth. Root p95 moved from `1539ms` to `1706ms`, so keep an
+eye on root HTML variance in future runs, but the aggregate page-load and asset
+tail improvement is strong enough to retain the optimization.
