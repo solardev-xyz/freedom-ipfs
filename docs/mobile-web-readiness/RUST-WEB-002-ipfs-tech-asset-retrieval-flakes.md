@@ -4249,3 +4249,70 @@ Decision: keep the stream-level multi-want test as a building block, but reject
 the shared-client production `fetch_many` refactor for now. The next attempt
 should not alter the current single-CID shared-client scheduling path until it
 can preserve same-window `ipfs.tech` root reliability and asset p95.
+
+Experiment: cache recheck after provider lookup:
+
+Hypothesis:
+
+- During page-asset bursts, one request can miss the store, spend time in
+  provider lookup or session-peer racing, while another request receives and
+  verifies the same block as an extra Bitswap payload.
+- A cheap second store lookup after provider lookup, before any provider fetch,
+  can avoid an unnecessary network fetch in that window.
+
+Implementation:
+
+- Add a `block_store_get` recheck with `rechecked=true` immediately before
+  `fetch_from_providers_with_source`.
+- If the recheck hits, return `RetrievalSource::Cache`.
+- Extend the harness trace summary with block-store counters:
+  `events`, `hits`, `misses`, `rechecks`, `recheck_hits`, and
+  `recheck_misses`.
+- Add deterministic coverage with a gated delegated routing response: the fetch
+  misses the store, starts provider lookup, the test inserts the verified block
+  locally, then the provider response is released. The fetch must return from
+  cache instead of attempting empty providers.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib rechecks_cache_after_provider_lookup_before_network_fetch
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+cargo test -p mobile-web-harness
+cargo test -p freedom-ipfs-retrieval --lib
+cargo build -p freedom-ipfs-gateway
+git diff --check
+```
+
+Live regression check:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 2 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-cache-recheck-r2-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-cache-recheck-r2.json
+```
+
+Result: Rust and Kubo both passed `2/2`. Rust root p50/p95 was `722/5480ms`
+versus Kubo `3566/8109ms`; Rust asset p50/p95 was `120/1040ms` versus Kubo
+`292/745ms`. Rust stayed much lighter at max RSS/FD `51824KiB`/`60` versus Kubo
+`339272KiB`/`716`.
+
+Trace summary: `bitswap_fetches=16`, `session_shortcut_hits=55`,
+`request_timeouts_with_trusted=1`, `bitswap extra blocks: events=70 total=43
+max=4 incoming=43 outgoing=0 unknown=0`, inbound `blocks=125 bytes=2003094
+max_oldest_pending_ms=849`. Manual trace count before the harness summary
+counter landed showed `rechecked_total=15`, `recheck_hits=0`, and
+`recheck_misses=15`.
+
+Decision: keep. This is intentionally conservative: the live run did not hit
+the new fast path, but the deterministic test proves the race exists and the
+live run shows the added local lookup has negligible overhead. The new harness
+counter will show whether future page sessions convert extra-block arrivals
+into recheck cache hits.

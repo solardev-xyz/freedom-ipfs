@@ -401,6 +401,9 @@ impl HttpRetriever {
                 providers
             }
         };
+        if let Some(block) = self.recheck_block_store(cid)? {
+            return Ok((block, RetrievalSource::Cache));
+        }
         match self.fetch_from_providers_with_source(cid, &providers).await {
             Ok((block, source)) => Ok((block, source)),
             Err(err) if should_refresh_providers_after_failure(&err) => {
@@ -510,6 +513,32 @@ impl HttpRetriever {
                 }
             }
             Err(err) => Err(err),
+        }
+    }
+
+    fn recheck_block_store(&self, cid: &Cid) -> Result<Option<Block>> {
+        let cache_started = Instant::now();
+        match self.store.get(cid)? {
+            Some(block) => {
+                tracing::info!(
+                    phase = "block_store_get",
+                    cid = %cid,
+                    cache_hit = true,
+                    rechecked = true,
+                    elapsed_ms = cache_started.elapsed().as_millis()
+                );
+                Ok(Some(block))
+            }
+            None => {
+                tracing::info!(
+                    phase = "block_store_get",
+                    cid = %cid,
+                    cache_hit = false,
+                    rechecked = true,
+                    elapsed_ms = cache_started.elapsed().as_millis()
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -3973,6 +4002,39 @@ mod bitswap_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn rechecks_cache_after_provider_lookup_before_network_fetch() {
+        let data = b"late cached block";
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
+        let (endpoint, request_seen, release_response, routing_task) =
+            spawn_gated_delegated_response(r#"{"Providers":[]}"#.to_string()).await;
+
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new(endpoint),
+            store.clone(),
+        );
+        let fetch_cid = cid;
+        let fetch = tokio::spawn({
+            let retriever = retriever.clone();
+            async move { retriever.fetch_block_with_source(&fetch_cid).await }
+        });
+
+        request_seen.await.unwrap();
+        store.put_block(&cid, data).unwrap();
+        release_response.send(()).unwrap();
+
+        let (block, source) = tokio::time::timeout(Duration::from_secs(5), fetch)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(source, RetrievalSource::Cache);
+        assert_eq!(block.data(), data);
+        routing_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn shared_bitswap_client_handles_repeated_block_fetches() {
         let first = b"first shared bitswap block";
         let second = b"second shared bitswap block";
@@ -5453,6 +5515,35 @@ mod bitswap_tests {
             }
         });
         (endpoint, task)
+    }
+
+    async fn spawn_gated_delegated_response(
+        body: String,
+    ) -> (
+        String,
+        oneshot::Receiver<()>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let endpoint = format!("http://{addr}/routing/v1");
+        let (request_seen_tx, request_seen_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let _ = request_seen_tx.send(());
+            let _ = release_rx.await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        (endpoint, request_seen_rx, release_tx, task)
     }
 
     struct KuboDaemon {

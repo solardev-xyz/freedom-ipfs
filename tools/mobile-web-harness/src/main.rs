@@ -597,6 +597,18 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.block_sources)
             );
         }
+        if trace.block_store.events > 0 {
+            let store = &trace.block_store;
+            println!(
+                "  block store: events={} hits={} misses={} rechecks={} recheck_hits={} recheck_misses={}",
+                store.events,
+                store.hits,
+                store.misses,
+                store.rechecks,
+                store.recheck_hits,
+                store.recheck_misses
+            );
+        }
         if !trace.request_statuses.is_empty() || trace.gateway_limiter_denials > 0 {
             println!(
                 "  gateway responses: statuses={} limiter_denials={}",
@@ -2669,6 +2681,7 @@ struct TraceSummary {
     phases: Vec<TracePhaseAggregate>,
     slow_events: Vec<TraceSlowEvent>,
     block_sources: Vec<TraceValueCount>,
+    block_store: TraceBlockStoreAggregate,
     request_statuses: Vec<TraceValueCount>,
     gateway_limiter_denials: usize,
     unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
@@ -2710,6 +2723,16 @@ struct TraceSlowEvent {
 struct TraceValueCount {
     value: String,
     count: usize,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceBlockStoreAggregate {
+    events: usize,
+    hits: usize,
+    misses: usize,
+    rechecks: usize,
+    recheck_hits: usize,
+    recheck_misses: usize,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -2990,6 +3013,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut phases = BTreeMap::<String, Vec<u128>>::new();
     let mut slow_events = Vec::<TraceSlowEvent>::new();
     let mut block_sources = BTreeMap::<String, usize>::new();
+    let mut block_store = TraceBlockStoreAggregate::default();
     let mut request_statuses = BTreeMap::<String, usize>::new();
     let mut gateway_limiter_denials = 0usize;
     let mut unixfs_metadata_cache = TraceUnixfsMetadataCacheAggregate::default();
@@ -3045,6 +3069,27 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         if phase == "block_fetch_total" {
             if let Some(source) = value.get("source").and_then(|source| source.as_str()) {
                 *block_sources.entry(source.to_string()).or_default() += 1;
+            }
+        }
+        if phase == "block_store_get" {
+            block_store.events += 1;
+            let cache_hit = value.get("cache_hit").and_then(|hit| hit.as_bool());
+            match cache_hit {
+                Some(true) => block_store.hits += 1,
+                Some(false) => block_store.misses += 1,
+                None => {}
+            }
+            if value
+                .get("rechecked")
+                .and_then(|rechecked| rechecked.as_bool())
+                == Some(true)
+            {
+                block_store.rechecks += 1;
+                match cache_hit {
+                    Some(true) => block_store.recheck_hits += 1,
+                    Some(false) => block_store.recheck_misses += 1,
+                    None => {}
+                }
             }
         }
         if phase == "request_done" {
@@ -3386,6 +3431,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         phases,
         slow_events,
         block_sources: sorted_trace_counts(block_sources),
+        block_store,
         request_statuses: sorted_trace_counts(request_statuses),
         gateway_limiter_denials,
         unixfs_metadata_cache,
@@ -3916,6 +3962,9 @@ mod tests {
                 "{\"phase\":\"bitswap_dns_multiaddr_expand\",\"host\":\"peer.example\",\"cached\":false,\"ip_count\":2}\n",
                 "{\"phase\":\"bitswap_dns_multiaddr_expand\",\"host\":\"peer.example\",\"cached\":true,\"ip_count\":2}\n",
                 "{\"phase\":\"unixfs_metadata_cache\",\"elapsed_ms\":0,\"hits\":3,\"misses\":2,\"inserts\":2,\"evictions\":1,\"oversized_skips\":0,\"cache_len\":4,\"cache_capacity\":256}\n",
+                "{\"phase\":\"block_store_get\",\"elapsed_ms\":0,\"cid\":\"cid10\",\"cache_hit\":false}\n",
+                "{\"phase\":\"block_store_get\",\"elapsed_ms\":0,\"cid\":\"cid11\",\"cache_hit\":true,\"rechecked\":true}\n",
+                "{\"phase\":\"block_store_get\",\"elapsed_ms\":0,\"cid\":\"cid12\",\"cache_hit\":false,\"rechecked\":true}\n",
                 "not json\n",
                 "{\"phase\":\"request_start\",\"path\":\"/ipns/site/\"}\n",
                 "{\"phase\":\"gateway_limiter\",\"acquired\":false}\n",
@@ -3930,9 +3979,9 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 27);
-        assert_eq!(summary.event_count, 26);
-        assert_eq!(summary.slow_events.len(), 12);
+        assert_eq!(summary.line_count, 30);
+        assert_eq!(summary.event_count, 29);
+        assert_eq!(summary.slow_events.len(), 15);
         assert_eq!(
             summary.slow_events[0].phase,
             "bitswap_request_timeout_detail"
@@ -3969,11 +4018,17 @@ mod tests {
             summary.slow_events[2].details.get("source_peer_trusted"),
             Some(&"true".to_string())
         );
-        assert_eq!(summary.phases.len(), 9);
+        assert_eq!(summary.phases.len(), 10);
         assert_eq!(summary.block_sources.len(), 2);
         assert_eq!(summary.block_sources[0].value, "bitswap");
         assert_eq!(summary.block_sources[0].count, 1);
         assert_eq!(summary.block_sources[1].value, "cache");
+        assert_eq!(summary.block_store.events, 3);
+        assert_eq!(summary.block_store.hits, 1);
+        assert_eq!(summary.block_store.misses, 2);
+        assert_eq!(summary.block_store.rechecks, 2);
+        assert_eq!(summary.block_store.recheck_hits, 1);
+        assert_eq!(summary.block_store.recheck_misses, 1);
         assert_eq!(summary.request_statuses.len(), 2);
         assert_eq!(summary.request_statuses[0].value, "200");
         assert_eq!(summary.request_statuses[0].count, 2);
