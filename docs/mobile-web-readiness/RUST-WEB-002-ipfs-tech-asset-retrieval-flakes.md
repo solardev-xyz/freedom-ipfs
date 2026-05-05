@@ -14387,3 +14387,69 @@ provider records. The apparent improvement is not causally attributable to
 shape until a working provider endpoint is confirmed. Future provider-quality
 sweeps should test other IPNI/delegated endpoints or a corrected `cid.contact`
 API before adding any default endpoint fanout.
+
+## 2026-05-05 Observe: HTTP Hedge Guard Cases
+
+Goal:
+After keeping the bounded HTTP-provider hedge based on `ipfs.tech`, run the
+other recurring mobile smoke cases to make sure the change does not disturb
+Bitswap-only or small range workloads.
+
+Daicowtf page guard:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-http-hedge-guard-r3-trace.jsonl \
+  --output /tmp/daicowtf-http-hedge-guard-r3.json
+```
+
+Result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1055ms` / `1098ms` / `1098ms`.
+- Max RSS/FD: `43140KiB` / `19`.
+- Block sources were Bitswap-only: `bitswap=9`.
+- Delegated lookup events: `9` successes, `0` failures, `12` providers,
+  `0` HTTP providers, max `126ms`.
+- DHT fallback timed out in `3` low-diversity cases but did not block success.
+- Bitswap source transports included `tcp=3` and `wss=3`.
+
+Vitalik range guard:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-http-hedge-guard-r3-trace.jsonl \
+  --output /tmp/vitalik-http-hedge-guard-r3.json
+```
+
+Result:
+
+- Rust passed `3/3`.
+- Root/range TTFB p50/p95/max: `160ms` / `369ms` / `369ms`.
+- Max RSS/FD: `31872KiB` / `15`.
+- Block sources were HTTP-provider-only: `http_provider=6`.
+- Delegated lookup events: `6` successes, `0` failures, `157` providers,
+  `12` HTTP providers, max `279ms`.
+- HTTP-provider fetch p50/p95/max: `28ms` / `56ms` / `56ms` from
+  `https://trustless.filebase.io/`.
+
+Decision:
+Pass as guard coverage. The HTTP hedge did not introduce regressions in these
+two cases: daicowtf remains a successful Bitswap/WSS workload, while the
+Vitalik range case remains a fast verified HTTP-provider workload.
