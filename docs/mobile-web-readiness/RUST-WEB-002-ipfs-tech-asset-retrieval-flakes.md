@@ -9299,3 +9299,32 @@ less useful: more peer attempts, fewer extra blocks, worse asset p95, and worse
 gateway elapsed p95/max. Keep the cap at `3`; future direct-fanout experiments
 should be conditional on stronger peer quality evidence instead of simply
 raising the global direct untrusted budget.
+
+## 2026-05-05 Keep: Bitswap Source Request Mode Summary
+
+Motivation:
+The rejected cap-4 experiment required custom trace parsing to answer a basic
+question: when a successful Bitswap block arrives from `source_peer`, was that
+peer originally asked with direct `WANT_BLOCK` or with `WANT_HAVE` first? Future
+fanout/session experiments need that answer in the normal harness summary.
+
+Implementation:
+
+- Track `bitswap_peer_attempt_start` by `(cid, peer)` and remember whether the
+  attempt used `want_block` or `want_have`.
+- For successful `bitswap_fetch` and `bitswap_session_shortcut` events, map
+  `(cid, source_peer)` back to that request mode.
+- Add serialized `trace_summary.bitswap_source_request_modes`.
+- Print `bitswap source request modes: ...` in comparison trace summaries.
+- Use `unknown` when a source peer cannot be correlated to a prior attempt,
+  preserving robustness for partial traces or future trace shape changes.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+```
+
+Result: both passed. This is diagnostics-only; it does not change gateway,
+retrieval, network, verification, caching, or serving behavior.

@@ -1458,6 +1458,12 @@ fn print_trace_bitswap_sources(trace: &TraceSummary) {
             format_trace_counts(&trace.bitswap_source_transports)
         );
     }
+    if !trace.bitswap_source_request_modes.is_empty() {
+        println!(
+            "  bitswap source request modes: {}",
+            format_trace_counts(&trace.bitswap_source_request_modes)
+        );
+    }
     if !trace.bitswap_deliveries.is_empty() {
         println!(
             "  bitswap deliveries: {}",
@@ -3816,6 +3822,7 @@ struct TraceSummary {
     unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
     bitswap_source_peers: Vec<TraceValueCount>,
     bitswap_source_transports: Vec<TraceValueCount>,
+    bitswap_source_request_modes: Vec<TraceValueCount>,
     bitswap_deliveries: Vec<TraceValueCount>,
     bitswap_extra_blocks: TraceBitswapExtraBlockAggregate,
     bitswap_peer_fetches: Vec<TracePeerAggregate>,
@@ -4538,6 +4545,8 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut unixfs_metadata_cache = TraceUnixfsMetadataCacheAggregate::default();
     let mut bitswap_source_peers = BTreeMap::<String, usize>::new();
     let mut bitswap_source_transports = BTreeMap::<String, usize>::new();
+    let mut bitswap_source_request_modes = BTreeMap::<String, usize>::new();
+    let mut bitswap_attempt_modes = BTreeMap::<(String, String), String>::new();
     let mut bitswap_deliveries = BTreeMap::<String, usize>::new();
     let mut bitswap_extra_blocks = TraceBitswapExtraBlockAggregate::default();
     let mut bitswap_peer_fetches = BTreeMap::<String, TracePeerBuilder>::new();
@@ -4935,6 +4944,21 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         }
         if phase == "bitswap_peer_attempt_start" {
             bitswap_peer_attempts.starts += 1;
+            if let (Some(cid), Some(peer)) = (
+                json_detail_string(value.get("cid")),
+                json_detail_string(value.get("peer")),
+            ) {
+                let mode = if value
+                    .get("prefer_want_have")
+                    .and_then(|prefer| prefer.as_bool())
+                    == Some(true)
+                {
+                    "want_have"
+                } else {
+                    "want_block"
+                };
+                bitswap_attempt_modes.insert((cid, peer), mode.to_string());
+            }
         }
         if phase == "bitswap_peer_attempt" {
             bitswap_peer_attempts.outgoing_completed += 1;
@@ -5117,6 +5141,18 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             }
         }
         if successful_bitswap_delivery {
+            if let (Some(cid), Some(peer)) = (
+                json_detail_string(value.get("cid")),
+                json_detail_string(value.get("source_peer")),
+            ) {
+                let mode = bitswap_attempt_modes
+                    .get(&(cid, peer))
+                    .map(String::as_str)
+                    .unwrap_or("unknown");
+                *bitswap_source_request_modes
+                    .entry(mode.to_string())
+                    .or_default() += 1;
+            }
             if let Some(delivery) = json_detail_string(value.get("bitswap_delivery")) {
                 *bitswap_deliveries.entry(delivery).or_default() += 1;
             }
@@ -5332,6 +5368,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         unixfs_metadata_cache,
         bitswap_source_peers: sorted_trace_counts(bitswap_source_peers),
         bitswap_source_transports: sorted_trace_counts(bitswap_source_transports),
+        bitswap_source_request_modes: sorted_trace_counts(bitswap_source_request_modes),
         bitswap_deliveries: sorted_trace_counts(bitswap_deliveries),
         bitswap_extra_blocks,
         bitswap_peer_fetches: sorted_trace_peers(bitswap_peer_fetches),
@@ -6948,6 +6985,8 @@ mod tests {
                 "{\"phase\":\"bitswap_peer_attempt\",\"elapsed_ms\":5000,\"cid\":\"cid-a\",\"peer\":\"peer-b\",\"ok\":false,\"prefer_want_have\":true,\"failure_kind\":\"connection_timeout\",\"error\":\"timed out\"}\n",
                 "{\"phase\":\"bitswap_peer_attempt_start\",\"cid\":\"cid-a\",\"peer\":\"peer-c\",\"prefer_want_have\":true}\n",
                 "{\"phase\":\"bitswap_peer_attempt\",\"elapsed_ms\":10000,\"cid\":\"cid-a\",\"peer\":\"peer-c\",\"ok\":false,\"prefer_want_have\":true,\"failure_kind\":\"read_timeout\",\"error\":\"read timed out\"}\n",
+                "{\"phase\":\"bitswap_peer_attempt_start\",\"cid\":\"cid-b\",\"peer\":\"peer-d\",\"prefer_want_have\":true}\n",
+                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":40,\"cid\":\"cid-b\",\"peer_count\":2,\"trusted_peer_count\":0,\"ok\":true,\"source_peer\":\"peer-d\",\"source_transport\":\"tcp\",\"bitswap_delivery\":\"incoming\",\"source_peer_trusted\":false,\"extra_blocks\":0,\"bytes\":128}\n",
                 "{\"phase\":\"provider_refresh_after_timeout\",\"cid\":\"cid-a\",\"request_timeout\":true}\n",
                 "{\"phase\":\"retry_provider_count\",\"cid\":\"cid-a\",\"same_provider_set\":true,\"same_bitswap_peer_set\":true,\"request_timeout\":true}\n",
                 "{\"phase\":\"provider_retry_after_request_timeout\",\"cid\":\"cid-a\",\"provider_count\":3,\"request_timeout\":true}\n",
@@ -6965,7 +7004,7 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.bitswap_peer_attempts.starts, 3);
+        assert_eq!(summary.bitswap_peer_attempts.starts, 4);
         assert_eq!(summary.bitswap_peer_attempts.outgoing_completed, 3);
         assert_eq!(summary.bitswap_peer_attempts.successes, 1);
         assert_eq!(summary.bitswap_peer_attempts.failures, 2);
@@ -6973,6 +7012,8 @@ mod tests {
         assert_eq!(summary.bitswap_peer_attempts.read_timeouts, 1);
         assert_eq!(summary.bitswap_peer_attempts.other_failures, 0);
         assert_eq!(summary.bitswap_peer_attempts.prefer_want_have, 2);
+        assert_eq!(summary.bitswap_source_request_modes[0].value, "want_have");
+        assert_eq!(summary.bitswap_source_request_modes[0].count, 1);
         assert_eq!(summary.provider_retries.refresh_after_timeout_events, 1);
         assert_eq!(summary.provider_retries.refresh_after_failure_events, 0);
         assert_eq!(
