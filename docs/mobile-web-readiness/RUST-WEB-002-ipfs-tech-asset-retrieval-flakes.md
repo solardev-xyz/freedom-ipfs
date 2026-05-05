@@ -5854,3 +5854,67 @@ progress states, the console printed:
 progress phases: fetching_bitswap=20, provider_lookup=13, streaming=9,
 checking_cache=5, cache_hit=3, providers_found=2, completed=1, queued=1
 ```
+
+## 2026-05-05 Offline Replay Harness Mode
+
+Goal:
+
+- Start the cache-completeness track from the roadmap with a harness mode that
+  proves what a warmed page can replay when the node is restarted without
+  routing.
+- Keep this as a measurement tool only; do not change gateway/retrieval
+  behavior.
+
+Implementation:
+
+- Add `--offline-replay` to `mobile-web-harness`.
+- The mode runs the selected corpus once through an online Rust gateway backed
+  by a persistent SQLite DB, then restarts the same DB with
+  `--routing-mode offline` and replays the corpus.
+- If `--gateway-db` is omitted, the harness creates and reports a temporary DB
+  path under `/tmp`.
+- The JSON output is an `OfflineReplayReport` containing:
+  - `online: RunReport`
+  - `offline: RunReport`
+  - `summary.missing_url_count`
+  - `summary.missing_urls[]` with root/asset kind, case id, URL, and failures
+  - `summary.offline_storage_bytes`
+- If `--trace-output /tmp/replay.jsonl` is passed, online/offline traces are
+  split into `/tmp/replay-online.jsonl` and `/tmp/replay-offline.jsonl`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness offline_replay
+cargo test -p mobile-web-harness labeled_trace_output
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+rm -f /tmp/freedom-ipfs-offline-replay-vitalik.db \
+  /tmp/freedom-ipfs-offline-replay-vitalik.db-* \
+  /tmp/vitalik-offline-replay*.json \
+  /tmp/vitalik-offline-replay*.jsonl
+cargo run -p mobile-web-harness -- --case vitalik-root-html-range \
+  --repeat 1 --asset-concurrency 6 \
+  --gateway-db /tmp/freedom-ipfs-offline-replay-vitalik.db \
+  --offline-replay \
+  --trace-output /tmp/vitalik-offline-replay-trace.jsonl \
+  --output /tmp/vitalik-offline-replay.json
+```
+
+Result: validation passed. The live replay reported online `1/1`, offline
+`1/1`, `missing_urls=0`, and `offline_storage_bytes=4096`. Evidence files:
+
+- `/tmp/vitalik-offline-replay.json`
+- `/tmp/vitalik-offline-replay-trace-online.jsonl` (`55` lines)
+- `/tmp/vitalik-offline-replay-trace-offline.jsonl` (`10` lines)
+- `/tmp/freedom-ipfs-offline-replay-vitalik.db`
+
+The offline trace showed no Bitswap/provider activity and only cache-backed
+gateway/UnixFS work, with progress phases:
+
+```text
+streaming=7, completed=1, queued=1, started=1
+```

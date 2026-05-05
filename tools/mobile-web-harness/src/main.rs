@@ -4,7 +4,7 @@ use reqwest::header::{CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -63,6 +63,9 @@ struct Args {
     /// Run paired Rust and Kubo harness passes with the same corpus/options.
     #[arg(long)]
     compare_kubo: bool,
+    /// Run once online to warm a Rust gateway DB, then replay the same corpus with offline routing.
+    #[arg(long)]
+    offline_replay: bool,
     /// Optional paired Rust-vs-Kubo JSON comparison report output path.
     #[arg(long)]
     comparison_output: Option<PathBuf>,
@@ -118,6 +121,20 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let corpus = Corpus::read(&args.corpus)?;
 
+    if args.offline_replay {
+        let report = run_offline_replay(&args, &corpus).await?;
+        print_offline_replay_summary(&report);
+        if let Some(output) = args.output {
+            let json = serde_json::to_string_pretty(&report)?;
+            std::fs::write(&output, json).with_context(|| format!("write {}", output.display()))?;
+            eprintln!("wrote offline replay report to {}", output.display());
+        }
+        if report.online.summary.fail_count > 0 || report.offline.summary.fail_count > 0 {
+            bail!("mobile web offline replay found failures");
+        }
+        return Ok(());
+    }
+
     if args.compare_kubo {
         let report = run_comparison(&args, &corpus).await?;
         print_comparison_summary(&report);
@@ -171,6 +188,61 @@ async fn run_comparison(args: &Args, corpus: &Corpus) -> Result<ComparisonReport
         rust,
         kubo,
         cases,
+    })
+}
+
+async fn run_offline_replay(args: &Args, corpus: &Corpus) -> Result<OfflineReplayReport> {
+    if args.compare_kubo {
+        bail!("--offline-replay cannot be used with --compare-kubo");
+    }
+    if args.gateway_url.is_some() {
+        bail!("--offline-replay cannot be used with --gateway-url");
+    }
+    if args.engine != HarnessEngine::Rust {
+        bail!("--offline-replay is only supported for --engine rust");
+    }
+    if args.fresh_gateway_per_run {
+        bail!("--offline-replay cannot be used with --fresh-gateway-per-run");
+    }
+
+    let replay_db = args
+        .gateway_db
+        .clone()
+        .unwrap_or_else(|| unique_temp_path("freedom-ipfs-offline-replay.db"));
+    if let Some(parent) = replay_db
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create offline replay DB parent {}", parent.display()))?;
+    }
+
+    let mut online_args = args.clone();
+    online_args.gateway_db = Some(replay_db.clone());
+    online_args.routing_mode = args.routing_mode.clone();
+    online_args.trace_output = args
+        .trace_output
+        .as_ref()
+        .map(|path| labeled_trace_output(path, "online"));
+
+    let mut offline_args = args.clone();
+    offline_args.gateway_db = Some(replay_db.clone());
+    offline_args.routing_mode = "offline".to_string();
+    offline_args.trace_output = args
+        .trace_output
+        .as_ref()
+        .map(|path| labeled_trace_output(path, "offline"));
+
+    let online = run_harness(&online_args, corpus).await?;
+    let offline = run_harness(&offline_args, corpus).await?;
+    let summary = OfflineReplaySummary::from_report(&offline);
+
+    Ok(OfflineReplayReport {
+        generated_at_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        replay_db: replay_db.display().to_string(),
+        online,
+        offline,
+        summary,
     })
 }
 
@@ -926,6 +998,33 @@ fn print_comparison_summary(report: &ComparisonReport) {
     }
     print_comparison_trace_summary("rust", &report.rust);
     print_comparison_trace_summary("kubo", &report.kubo);
+}
+
+fn print_offline_replay_summary(report: &OfflineReplayReport) {
+    println!("offline replay db: {}", report.replay_db);
+    println!(
+        "online: passed={} failed={} pass_rate={:.1}%",
+        report.online.summary.pass_count,
+        report.online.summary.fail_count,
+        report.online.summary.pass_rate * 100.0
+    );
+    println!(
+        "offline: passed={} failed={} pass_rate={:.1}% missing_urls={} storage_bytes={}",
+        report.offline.summary.pass_count,
+        report.offline.summary.fail_count,
+        report.offline.summary.pass_rate * 100.0,
+        report.summary.missing_url_count,
+        display_option_u64_unit(report.summary.offline_storage_bytes, "B")
+    );
+    for missing in report.summary.missing_urls.iter().take(12) {
+        println!("  missing {}: {}", missing.kind, missing.url);
+        for failure in &missing.failures {
+            println!("    - {failure}");
+        }
+    }
+    if let Some(trace) = &report.offline.trace_summary {
+        print_trace_progress_phases(trace);
+    }
 }
 
 fn print_comparison_trace_summary(label: &str, report: &RunReport) {
@@ -2297,6 +2396,20 @@ fn unique_temp_path(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{}-{millis}", std::process::id()))
 }
 
+fn labeled_trace_output(path: &Path, label: &str) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("trace");
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    let file_name = match extension {
+        Some(extension) if !extension.is_empty() => format!("{stem}-{label}.{extension}"),
+        _ => format!("{stem}-{label}"),
+    };
+    parent.join(file_name)
+}
+
 fn reserve_loopback_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     Ok(listener.local_addr()?.port())
@@ -2483,6 +2596,68 @@ struct ComparisonReport {
     rust: RunReport,
     kubo: RunReport,
     cases: Vec<ComparisonCase>,
+}
+
+#[derive(Debug, Serialize)]
+struct OfflineReplayReport {
+    generated_at_unix_seconds: u64,
+    replay_db: String,
+    online: RunReport,
+    offline: RunReport,
+    summary: OfflineReplaySummary,
+}
+
+#[derive(Debug, Serialize)]
+struct OfflineReplaySummary {
+    missing_url_count: usize,
+    missing_urls: Vec<OfflineReplayMissingUrl>,
+    offline_storage_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct OfflineReplayMissingUrl {
+    kind: String,
+    case_id: String,
+    url: String,
+    failures: Vec<String>,
+}
+
+impl OfflineReplaySummary {
+    fn from_report(report: &RunReport) -> Self {
+        let mut missing_urls = Vec::new();
+        for run in report
+            .runs
+            .iter()
+            .filter(|run| run.phase == RunPhase::Measured)
+        {
+            for result in &run.results {
+                if !result.passed {
+                    missing_urls.push(OfflineReplayMissingUrl {
+                        kind: "root".to_string(),
+                        case_id: result.id.clone(),
+                        url: result.url.clone(),
+                        failures: result.failures.clone(),
+                    });
+                }
+                for asset in &result.assets {
+                    if !asset.passed {
+                        missing_urls.push(OfflineReplayMissingUrl {
+                            kind: asset.kind.to_string(),
+                            case_id: result.id.clone(),
+                            url: asset.url.clone(),
+                            failures: asset.failures.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        let offline_storage_bytes = report.summary.gateway_storage_bytes.max;
+        Self {
+            missing_url_count: missing_urls.len(),
+            missing_urls,
+            offline_storage_bytes,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -5424,6 +5599,93 @@ mod tests {
         assert_eq!(results[0].url, "http://127.0.0.1:8080/ipfs/second");
         assert!(!results[0].passed);
         assert_eq!(results[0].failures, vec!["run timed out after 7s"]);
+    }
+
+    #[test]
+    fn labeled_trace_output_adds_label_before_extension() {
+        assert_eq!(
+            labeled_trace_output(&PathBuf::from("/tmp/replay.jsonl"), "offline"),
+            PathBuf::from("/tmp/replay-offline.jsonl")
+        );
+        assert_eq!(
+            labeled_trace_output(&PathBuf::from("/tmp/replay"), "online"),
+            PathBuf::from("/tmp/replay-online")
+        );
+    }
+
+    #[test]
+    fn offline_replay_summary_collects_failed_roots_and_assets() {
+        let mut run = run_result(
+            RunPhase::Measured,
+            1,
+            100,
+            Some(40),
+            Some(48),
+            Some(0),
+            Some(2048),
+        );
+        run.passed = false;
+        run.results[0].passed = false;
+        run.results[0].failures = vec!["status 504, expected 200".to_string()];
+        run.results[0].assets = vec![
+            AssetResult {
+                kind: AssetKind::Script,
+                source: "app.js".to_string(),
+                url: "http://127.0.0.1:8080/ipfs/root/app.js".to_string(),
+                status: Some(504),
+                content_type: Some("text/html".to_string()),
+                content_range: None,
+                body_bytes: 0,
+                ttfb_ms: 10,
+                total_ms: 10,
+                body_preview: String::new(),
+                passed: false,
+                failures: vec!["status 504, expected 200".to_string()],
+            },
+            AssetResult {
+                kind: AssetKind::Image,
+                source: "logo.png".to_string(),
+                url: "http://127.0.0.1:8080/ipfs/root/logo.png".to_string(),
+                status: Some(200),
+                content_type: Some("image/png".to_string()),
+                content_range: None,
+                body_bytes: 128,
+                ttfb_ms: 5,
+                total_ms: 5,
+                body_preview: String::new(),
+                passed: true,
+                failures: Vec::new(),
+            },
+        ];
+        let runs = vec![run];
+        let report = RunReport {
+            gateway_url: None,
+            generated_at_unix_seconds: 0,
+            repeat: 1,
+            warmup_runs: 0,
+            fresh_gateway_per_run: false,
+            asset_concurrency: 1,
+            run_timeout_secs: None,
+            engine: HarnessEngine::Rust,
+            gateway_db: Some("/tmp/replay.db".to_string()),
+            kubo_repo: None,
+            trace_output: None,
+            trace_summary: None,
+            summary: RepeatSummary::from_runs(&runs),
+            runs,
+        };
+
+        let summary = OfflineReplaySummary::from_report(&report);
+
+        assert_eq!(summary.missing_url_count, 2);
+        assert_eq!(summary.offline_storage_bytes, Some(2048));
+        assert_eq!(summary.missing_urls[0].kind, "root");
+        assert_eq!(summary.missing_urls[0].case_id, "case");
+        assert_eq!(
+            summary.missing_urls[1].url,
+            "http://127.0.0.1:8080/ipfs/root/app.js"
+        );
+        assert_eq!(summary.missing_urls[1].kind, "script");
     }
 
     fn trace_value_count(counts: &[TraceValueCount], value: &str) -> usize {

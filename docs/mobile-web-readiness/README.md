@@ -71,6 +71,16 @@ manual per-run JSON parsing. Rust-vs-Kubo comparison output prints p50 and p95
 root/asset TTFB ratios plus max RSS, FD, and storage ratios for quick terminal
 triage.
 
+For cache-completeness checks, pass `--offline-replay`. The harness starts a
+Rust gateway online against a persistent SQLite DB, runs the selected corpus,
+stops that gateway, restarts the same DB with `--routing-mode offline`, and
+replays the same corpus. If `--gateway-db` is omitted, the harness creates a
+temporary DB path and reports it. The JSON report contains separate `online` and
+`offline` run reports plus an offline replay summary with missing root/asset
+URLs and offline cache storage bytes. If `--trace-output /tmp/replay.jsonl` is
+also set, the online and offline trace files are written as
+`/tmp/replay-online.jsonl` and `/tmp/replay-offline.jsonl`.
+
 For gateway phase tracing, pass `--trace-output /tmp/run.jsonl`. When the
 harness spawns the Rust gateway it forwards this path to the gateway, parses the
 JSONL events, and adds raw phase and mobile-style progress phase summaries to
