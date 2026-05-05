@@ -18035,3 +18035,184 @@ even though HTTP-provider fetch p95 improved. Future single-provider mitigation
 should avoid broad provider Bitswap racing. Prefer narrower approaches such as
 using only trusted/session peers, requiring adaptive evidence before racing, or
 improving single-provider HTTP host selection and suppression.
+
+## 2026-05-05 Keep: Score HTTP Provider Origins In Race Scheduling
+
+Question:
+`ipfs.tech` still showed asset p50/p95 sensitivity to HTTP-provider host
+choice. Prior traces consistently showed `dag.w3s.link` faster than
+`ipfs-bridge.sia.dev`, while the retrieval path still scheduled HTTP-provider
+candidates in delegated-routing order. Can a small in-memory provider score
+prefer previously fast verified HTTP providers inside the existing bounded race
+without adding fallback gateways, duplicate broad races, or resource pressure?
+
+Implementation:
+
+- Add a bounded in-memory HTTP-provider origin score map to `HttpRetriever`.
+- Score only verified successful HTTP-provider fetches.
+- Use a `10m` score TTL and cap the map at `64` origins.
+- Sort scored origins ahead of unscored origins for future
+  `fetch_from_http_provider_candidates` calls, preserving delegated order among
+  ties and unscored providers.
+- Keep `HTTP_PROVIDER_RACE_WIDTH=2`, `HTTP_PROVIDER_HEDGE_AFTER=250ms`, and
+  the global HTTP-provider fetch semaphore unchanged.
+- Emit `scored_provider_count`, `scoring_enabled`,
+  `winner_original_provider_rank`, and `winner_provider_score_ms` on
+  HTTP-provider race traces.
+- Add an A/B kill switch:
+  `FREEDOM_IPFS_DISABLE_HTTP_PROVIDER_SCORING=1`.
+- Add a deterministic retrieval test proving a previously fast provider is
+  moved into the initial race window before the hedge delay.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval prefers_scored_fast_http_provider_in_initial_race_width
+cargo check -p freedom-ipfs-retrieval --all-targets
+```
+
+Focused result:
+
+- Formatting passed.
+- Focused retrieval scorer test passed.
+- Retrieval crate all-target check passed.
+
+Same-window disabled baseline:
+
+```sh
+FREEDOM_IPFS_DISABLE_HTTP_PROVIDER_SCORING=1 timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-score-baseline-disabled-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-http-score-baseline-disabled-r3.json
+```
+
+Baseline result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1332ms` / `1406ms`; Kubo `2536ms` /
+  `3226ms`; ratio `0.53x` / `0.44x`.
+- Asset TTFB p50/p95: Rust `246ms` / `765ms`; Kubo `160ms` / `380ms`;
+  ratio `1.54x` / `2.01x`.
+- Max RSS/FD: Rust `52596KiB` / `31`; Kubo `383460KiB` / `791`.
+- HTTP-provider races: `92`, `scored_events=0`, `scored_providers=0`.
+- HTTP-provider fetch p50/p95/max: `163ms` / `644ms` / `911ms`.
+- Provider detail: `ipfs-bridge.sia.dev` p95 `679ms`;
+  `dag.w3s.link` p95 `130ms`.
+
+Same-window scored experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-score-enabled-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-http-score-enabled-r3.json
+```
+
+Experiment result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1190ms` / `1377ms`; Kubo `2031ms` /
+  `4602ms`; ratio `0.59x` / `0.30x`.
+- Asset TTFB p50/p95: Rust `234ms` / `568ms`; Kubo `139ms` / `468ms`;
+  ratio `1.68x` / `1.21x`.
+- Max RSS/FD: Rust `46572KiB` / `27`; Kubo `307028KiB` / `347`.
+- HTTP-provider races: `105`, `scored_events=99`, `scored_providers=99`,
+  `max_scored=1`.
+- HTTP-provider fetch p50/p95/max: `163ms` / `521ms` / `997ms`.
+- Provider detail: `ipfs-bridge.sia.dev` p95 `664ms`;
+  `dag.w3s.link` p95 `111ms`.
+
+Comparison against disabled baseline:
+
+- Rust root p50 improved from `1332ms` to `1190ms`; root p95 improved from
+  `1406ms` to `1377ms`.
+- Rust asset p50 improved from `246ms` to `234ms`; asset p95 improved from
+  `765ms` to `568ms`.
+- Rust RSS/FD improved from `52596KiB` / `31` to `46572KiB` / `27`.
+- HTTP-provider fetch p95 improved from `644ms` to `521ms`.
+- The scored run still stayed within the same bounded HTTP race width and had
+  no Bitswap pressure increase in this page window.
+
+Secondary live checks:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-http-score-enabled-r3-trace.jsonl \
+  --output /tmp/daicowtf-http-score-enabled-r3.json
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-http-score-enabled-r3-trace.jsonl \
+  --output /tmp/vitalik-http-score-enabled-r3.json
+```
+
+Secondary result:
+
+- `daicowtf-page-assets` passed `3/3`; root TTFB p50/p95/max
+  `296ms` / `322ms` / `322ms`, max RSS/FD `33016KiB` / `14`,
+  HTTP-provider fetch p50/p95/max `66ms` / `87ms` / `87ms`.
+- `vitalik-root-html-range` passed `3/3`; range TTFB p50/p95/max
+  `244ms` / `257ms` / `257ms`, max RSS/FD `31872KiB` / `13`,
+  HTTP-provider fetch p50/p95/max `21ms` / `62ms` / `62ms`.
+
+Final validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval
+cargo test -p freedom-ipfs-gateway
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Final result:
+
+- Formatting passed.
+- Full retrieval suite passed: `73 passed`, `1 ignored`.
+- Full gateway suite passed; all non-ignored unit/integration tests passed.
+- Workspace all-target compile check passed.
+- Workspace all-target clippy passed with warnings denied.
+- Diff whitespace check passed.
+
+Decision:
+Keep. This is a bounded in-memory scheduling hint for delegated HTTP providers
+only. It does not add public gateway fallback, does not change block
+verification, does not increase race width or fetch concurrency, and improved
+same-window `ipfs.tech` root and asset latency while preserving low RSS/FD in
+secondary live checks. Keep watching `scored_provider_count`, provider p95, and
+winner original rank in future provider-quality runs.

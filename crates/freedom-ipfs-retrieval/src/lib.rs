@@ -45,6 +45,9 @@ const BAD_BITSWAP_PROVIDER_TTL: Duration = Duration::from_secs(30);
 const HTTP_PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
 const HTTP_PROVIDER_RACE_WIDTH: usize = 2;
 const HTTP_PROVIDER_HEDGE_AFTER: Duration = Duration::from_millis(250);
+const HTTP_PROVIDER_SCORE_TTL: Duration = Duration::from_secs(10 * 60);
+const MAX_HTTP_PROVIDER_SCORE_ENTRIES: usize = 64;
+const DISABLE_HTTP_PROVIDER_SCORING_ENV: &str = "FREEDOM_IPFS_DISABLE_HTTP_PROVIDER_SCORING";
 const MAX_CONCURRENT_HTTP_PROVIDER_FETCHES: usize = 4;
 const BITSWAP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 // Start provider retry before a full dial timeout can dominate gateway TTFB.
@@ -175,6 +178,7 @@ pub struct HttpRetriever {
     bitswap: Arc<tokio::sync::Mutex<Option<SharedBitswapClient>>>,
     inflight: Arc<tokio::sync::Mutex<HashMap<Cid, SharedBlockFetch>>>,
     successful_bitswap_peers: Arc<tokio::sync::Mutex<HashMap<PeerId, SuccessfulBitswapPeer>>>,
+    http_provider_scores: Arc<tokio::sync::Mutex<HashMap<String, HttpProviderScore>>>,
     http_provider_fetch_limiter: Arc<tokio::sync::Semaphore>,
 }
 
@@ -190,6 +194,7 @@ impl HttpRetriever {
             bitswap: Arc::new(tokio::sync::Mutex::new(None)),
             inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             successful_bitswap_peers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            http_provider_scores: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             http_provider_fetch_limiter: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_HTTP_PROVIDER_FETCHES,
             )),
@@ -912,27 +917,35 @@ impl HttpRetriever {
         }
 
         let started = Instant::now();
-        let provider_count = bases.len();
+        let candidates = self.scored_http_provider_candidates(bases).await;
+        let provider_count = candidates.len();
+        let scored_provider_count = candidates
+            .iter()
+            .filter(|candidate| candidate.score_elapsed.is_some())
+            .count();
+        let scoring_enabled = http_provider_scoring_enabled();
         tracing::info!(
             phase = "http_provider_race",
             cid = %cid,
             provider_count,
-            race_width = HTTP_PROVIDER_RACE_WIDTH
+            race_width = HTTP_PROVIDER_RACE_WIDTH,
+            scored_provider_count,
+            scoring_enabled
         );
 
-        let mut next_bases = bases.into_iter().enumerate();
+        let mut next_bases = candidates.into_iter().enumerate();
         let mut pending = FuturesUnordered::new();
         let mut attempted_provider_count = 0usize;
         let mut failed_provider_count = 0usize;
         for _ in 0..HTTP_PROVIDER_RACE_WIDTH {
-            let Some((provider_index, base)) = next_bases.next() else {
+            let Some((scheduled_index, candidate)) = next_bases.next() else {
                 break;
             };
             attempted_provider_count += 1;
             pending.push(self.fetch_from_http_provider_candidate_with_index(
                 *cid,
-                provider_index,
-                base,
+                scheduled_index,
+                candidate,
             ));
         }
 
@@ -959,9 +972,15 @@ impl HttpRetriever {
                                 provider = %result.base,
                                 winner_provider_index = result.provider_index,
                                 winner_provider_rank = result.provider_index + 1,
+                                winner_original_provider_rank = result.original_provider_index + 1,
                                 winner_within_initial_width = (result.provider_index < HTTP_PROVIDER_RACE_WIDTH),
                                 provider_count,
                                 race_width = HTTP_PROVIDER_RACE_WIDTH,
+                                scored_provider_count,
+                                winner_provider_score_ms = result
+                                    .score_elapsed
+                                    .map(|elapsed| elapsed.as_millis())
+                                    .unwrap_or_default(),
                                 attempted_provider_count,
                                 failed_provider_count,
                                 hedge_fired,
@@ -971,12 +990,12 @@ impl HttpRetriever {
                         }
                         Err(_) => {
                             failed_provider_count += 1;
-                            if let Some((provider_index, base)) = next_bases.next() {
+                            if let Some((scheduled_index, candidate)) = next_bases.next() {
                                 attempted_provider_count += 1;
                                 pending.push(self.fetch_from_http_provider_candidate_with_index(
                                     *cid,
-                                    provider_index,
-                                    base,
+                                    scheduled_index,
+                                    candidate,
                                 ));
                             }
                         }
@@ -986,20 +1005,26 @@ impl HttpRetriever {
                     && !completion_seen_before_hedge
                     && next_bases.len() > 0 => {
                     hedge_fired = true;
-                    if let Some((provider_index, base)) = next_bases.next() {
+                    if let Some((scheduled_index, candidate)) = next_bases.next() {
                         tracing::info!(
                             phase = "http_provider_hedge",
                             cid = %cid,
-                            provider = %base,
+                            provider = %candidate.base,
                             timeout_ms = HTTP_PROVIDER_HEDGE_AFTER.as_millis(),
+                            provider_index = scheduled_index,
+                            original_provider_rank = candidate.original_index + 1,
+                            provider_score_ms = candidate
+                                .score_elapsed
+                                .map(|elapsed| elapsed.as_millis())
+                                .unwrap_or_default(),
                             pending_count = pending.len(),
                             remaining_provider_count = next_bases.len()
                         );
                         attempted_provider_count += 1;
                         pending.push(self.fetch_from_http_provider_candidate_with_index(
                             *cid,
-                            provider_index,
-                            base,
+                            scheduled_index,
+                            candidate,
                         ));
                     }
                 }
@@ -1024,13 +1049,16 @@ impl HttpRetriever {
         &self,
         cid: Cid,
         provider_index: usize,
-        base: Url,
+        candidate: ScoredHttpProviderBase,
     ) -> HttpProviderCandidateResult {
+        let base = candidate.base;
         let result = self
             .fetch_from_http_provider_candidate(cid, base.clone())
             .await;
         HttpProviderCandidateResult {
             provider_index,
+            original_provider_index: candidate.original_index,
+            score_elapsed: candidate.score_elapsed,
             base,
             result,
         }
@@ -1048,6 +1076,8 @@ impl HttpRetriever {
         let started = Instant::now();
         match self.fetch_from_http_provider(&cid, &base).await {
             Ok((block, stats)) => {
+                self.record_http_provider_success(&base, stats.body_elapsed)
+                    .await;
                 tracing::info!(
                     phase = "http_provider_fetch",
                     cid = %cid,
@@ -1083,6 +1113,81 @@ impl HttpRetriever {
                 Err(err)
             }
         }
+    }
+
+    async fn scored_http_provider_candidates(
+        &self,
+        bases: Vec<Url>,
+    ) -> Vec<ScoredHttpProviderBase> {
+        if !http_provider_scoring_enabled() {
+            return bases
+                .into_iter()
+                .enumerate()
+                .map(|(original_index, base)| ScoredHttpProviderBase {
+                    original_index,
+                    score_elapsed: None,
+                    base,
+                })
+                .collect();
+        }
+
+        let mut scores = self.http_provider_scores.lock().await;
+        let now = Instant::now();
+        scores.retain(|_, score| {
+            now.saturating_duration_since(score.last_seen) <= HTTP_PROVIDER_SCORE_TTL
+        });
+
+        let mut candidates = bases
+            .into_iter()
+            .enumerate()
+            .map(|(original_index, base)| {
+                let score_elapsed = http_provider_score_key(&base)
+                    .and_then(|key| scores.get(&key).map(|score| score.ewma_elapsed));
+                ScoredHttpProviderBase {
+                    original_index,
+                    score_elapsed,
+                    base,
+                }
+            })
+            .collect::<Vec<_>>();
+        drop(scores);
+
+        candidates.sort_by(|a, b| match (a.score_elapsed, b.score_elapsed) {
+            (Some(left), Some(right)) => left
+                .cmp(&right)
+                .then_with(|| a.original_index.cmp(&b.original_index)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.original_index.cmp(&b.original_index),
+        });
+        candidates
+    }
+
+    async fn record_http_provider_success(&self, base: &Url, elapsed: Duration) {
+        if !http_provider_scoring_enabled() {
+            return;
+        }
+        let Some(key) = http_provider_score_key(base) else {
+            return;
+        };
+        let mut scores = self.http_provider_scores.lock().await;
+        let now = Instant::now();
+        scores.retain(|_, score| {
+            now.saturating_duration_since(score.last_seen) <= HTTP_PROVIDER_SCORE_TTL
+        });
+        scores
+            .entry(key)
+            .and_modify(|score| {
+                score.ewma_elapsed = weighted_duration_average(score.ewma_elapsed, elapsed, 3, 1);
+                score.successes = score.successes.saturating_add(1);
+                score.last_seen = now;
+            })
+            .or_insert(HttpProviderScore {
+                ewma_elapsed: elapsed,
+                successes: 1,
+                last_seen: now,
+            });
+        prune_http_provider_scores(&mut scores, now);
     }
 
     async fn fetch_from_http_provider(
@@ -1922,6 +2027,12 @@ struct SuccessfulBitswapPeer {
     last_latency: Duration,
 }
 
+struct HttpProviderScore {
+    ewma_elapsed: Duration,
+    successes: u64,
+    last_seen: Instant,
+}
+
 struct HttpProviderResponseStats {
     response_bytes: usize,
     headers_elapsed: Duration,
@@ -1929,10 +2040,65 @@ struct HttpProviderResponseStats {
     body_elapsed: Duration,
 }
 
+struct ScoredHttpProviderBase {
+    original_index: usize,
+    score_elapsed: Option<Duration>,
+    base: Url,
+}
+
 struct HttpProviderCandidateResult {
     provider_index: usize,
+    original_provider_index: usize,
+    score_elapsed: Option<Duration>,
     base: Url,
     result: Result<Block>,
+}
+
+fn http_provider_score_key(base: &Url) -> Option<String> {
+    let host = base.host_str()?;
+    let mut key = format!("{}://{}", base.scheme(), host);
+    if let Some(port) = base.port_or_known_default() {
+        key.push(':');
+        key.push_str(&port.to_string());
+    }
+    Some(key)
+}
+
+fn http_provider_scoring_enabled() -> bool {
+    std::env::var_os(DISABLE_HTTP_PROVIDER_SCORING_ENV).is_none()
+}
+
+fn weighted_duration_average(
+    old: Duration,
+    new: Duration,
+    old_weight: u128,
+    new_weight: u128,
+) -> Duration {
+    let total_weight = old_weight.saturating_add(new_weight).max(1);
+    let nanos = old
+        .as_nanos()
+        .saturating_mul(old_weight)
+        .saturating_add(new.as_nanos().saturating_mul(new_weight))
+        / total_weight;
+    Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
+}
+
+fn prune_http_provider_scores(scores: &mut HashMap<String, HttpProviderScore>, now: Instant) {
+    if scores.len() <= MAX_HTTP_PROVIDER_SCORE_ENTRIES {
+        return;
+    }
+
+    let mut entries = scores
+        .iter()
+        .map(|(key, score)| (key.clone(), now.saturating_duration_since(score.last_seen)))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(_, age)| *age);
+    let retain_keys = entries
+        .into_iter()
+        .take(MAX_HTTP_PROVIDER_SCORE_ENTRIES)
+        .map(|(key, _)| key)
+        .collect::<BTreeSet<_>>();
+    scores.retain(|key, _| retain_keys.contains(key));
 }
 
 struct BitswapPeerTarget {
@@ -6130,6 +6296,71 @@ mod bitswap_tests {
         );
         assert_eq!(fast_requests.load(Ordering::Relaxed), 1);
         assert_eq!(slow_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
+        slow_a_task.abort();
+        slow_b_task.abort();
+        fast_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prefers_scored_fast_http_provider_in_initial_race_width() {
+        let expected = b"verified scored HTTP provider block";
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, expected);
+        let slow_requests = Arc::new(AtomicU64::new(0));
+        let fast_requests = Arc::new(AtomicU64::new(0));
+        let (slow_a_addr, slow_a_task) = spawn_hanging_http_provider(slow_requests.clone()).await;
+        let (slow_b_addr, slow_b_task) = spawn_hanging_http_provider(slow_requests.clone()).await;
+        let (fast_addr, fast_task) =
+            spawn_counting_http_provider(expected.to_vec(), Duration::ZERO, fast_requests.clone())
+                .await;
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let fast_only_provider = Provider::from_parts(
+            None,
+            vec![format!(
+                "/ip4/{}/tcp/{}/http",
+                fast_addr.ip(),
+                fast_addr.port()
+            )],
+        )
+        .unwrap_or_else(|_| panic!("failed to build fast HTTP provider"));
+
+        let (_block, source) = retriever
+            .fetch_from_providers_with_source(&cid, &[fast_only_provider])
+            .await
+            .unwrap();
+        assert_eq!(source, RetrievalSource::HttpProvider);
+
+        let mixed_provider = Provider::from_parts(
+            None,
+            vec![
+                format!("/ip4/{}/tcp/{}/http", slow_a_addr.ip(), slow_a_addr.port()),
+                format!("/ip4/{}/tcp/{}/http", slow_b_addr.ip(), slow_b_addr.port()),
+                format!("/ip4/{}/tcp/{}/http", fast_addr.ip(), fast_addr.port()),
+            ],
+        )
+        .unwrap_or_else(|_| panic!("failed to build mixed HTTP providers"));
+
+        let started = Instant::now();
+        let (block, source) = tokio::time::timeout(
+            Duration::from_secs(2),
+            retriever.fetch_from_providers_with_source(&cid, &[mixed_provider]),
+        )
+        .await
+        .expect("scored HTTP provider fetch timed out")
+        .unwrap();
+
+        assert_eq!(source, RetrievalSource::HttpProvider);
+        assert_eq!(block.data(), expected);
+        assert!(
+            started.elapsed() < HTTP_PROVIDER_HEDGE_AFTER,
+            "scored fast provider should be in the initial race window"
+        );
+        assert_eq!(fast_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(slow_requests.load(Ordering::Relaxed), 1);
         assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
         slow_a_task.abort();
         slow_b_task.abort();
