@@ -671,6 +671,22 @@ fn print_summary(report: &RunReport) {
                 attempts.prefer_want_have
             );
         }
+        if trace.bitswap_dial_plans.events > 0 {
+            let plans = &trace.bitswap_dial_plans;
+            println!(
+                "  bitswap dial plans: events={} peer_targets={} candidates={} new_peers={} new_addrs={} suppressed_peers={} suppressed_addrs={} pending_peers={} connected_peers={} max_queued_ms={}",
+                plans.events,
+                plans.peer_targets,
+                plans.candidate_peers,
+                plans.new_dial_peers,
+                plans.new_dial_addrs,
+                plans.suppressed_dial_peers,
+                plans.suppressed_dial_addrs,
+                plans.pending_dial_peers,
+                plans.connected_peers,
+                plans.max_command_queued_ms
+            );
+        }
         if trace.bitswap_incoming_blocks.matches > 0 {
             let incoming = &trace.bitswap_incoming_blocks;
             println!(
@@ -2643,6 +2659,7 @@ struct TraceSummary {
     bitswap_peer_fetches: Vec<TracePeerAggregate>,
     bitswap_session: TraceBitswapSessionAggregate,
     bitswap_peer_attempts: TraceBitswapPeerAttemptAggregate,
+    bitswap_dial_plans: TraceBitswapDialPlanAggregate,
     bitswap_incoming_blocks: TraceBitswapIncomingBlockAggregate,
     trace_errors: Vec<TraceValueCount>,
     bitswap_addr_mix: Vec<TraceValueCount>,
@@ -2797,6 +2814,20 @@ impl TraceBitswapPeerAttemptAggregate {
 }
 
 #[derive(Debug, Default, Serialize)]
+struct TraceBitswapDialPlanAggregate {
+    events: usize,
+    peer_targets: u128,
+    candidate_peers: u128,
+    new_dial_peers: u128,
+    new_dial_addrs: u128,
+    suppressed_dial_peers: u128,
+    suppressed_dial_addrs: u128,
+    pending_dial_peers: u128,
+    connected_peers: u128,
+    max_command_queued_ms: u128,
+}
+
+#[derive(Debug, Default, Serialize)]
 struct TraceBitswapIncomingBlockAggregate {
     matches: usize,
     blocks: u128,
@@ -2943,6 +2974,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_dns_expansion = TraceBitswapDnsExpansionAggregate::default();
     let mut bitswap_session = TraceBitswapSessionAggregate::default();
     let mut bitswap_peer_attempts = TraceBitswapPeerAttemptAggregate::default();
+    let mut bitswap_dial_plans = TraceBitswapDialPlanAggregate::default();
     let mut bitswap_incoming_blocks = TraceBitswapIncomingBlockAggregate::default();
     let mut slow_cids = BTreeMap::<String, TraceCidBuilder>::new();
     let mut active_requests = BTreeMap::<TraceRequestKey, TraceRequestBuilder>::new();
@@ -3099,6 +3131,48 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                     _ => bitswap_peer_attempts.other_failures += 1,
                 }
             }
+        }
+        if phase == "bitswap_dial_plan" {
+            bitswap_dial_plans.events += 1;
+            bitswap_dial_plans.peer_targets += value
+                .get("peer_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            bitswap_dial_plans.candidate_peers += value
+                .get("candidate_peer_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            bitswap_dial_plans.new_dial_peers += value
+                .get("new_dial_peer_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            bitswap_dial_plans.new_dial_addrs += value
+                .get("new_dial_addr_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            bitswap_dial_plans.suppressed_dial_peers += value
+                .get("suppressed_dial_peer_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            bitswap_dial_plans.suppressed_dial_addrs += value
+                .get("suppressed_dial_addr_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            bitswap_dial_plans.pending_dial_peers += value
+                .get("pending_dial_peer_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            bitswap_dial_plans.connected_peers += value
+                .get("connected_peer_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            bitswap_dial_plans.max_command_queued_ms =
+                bitswap_dial_plans.max_command_queued_ms.max(
+                    value
+                        .get("command_queued_ms")
+                        .and_then(json_u128)
+                        .unwrap_or_default(),
+                );
         }
         if phase == "bitswap_incoming_block" {
             bitswap_incoming_blocks.matches += 1;
@@ -3268,6 +3342,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_peer_fetches: sorted_trace_peers(bitswap_peer_fetches),
         bitswap_session,
         bitswap_peer_attempts,
+        bitswap_dial_plans,
         bitswap_incoming_blocks,
         trace_errors: sorted_trace_counts(trace_errors),
         bitswap_addr_mix: sorted_trace_counts(bitswap_addr_mix),
@@ -3452,6 +3527,13 @@ fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
         "peer",
         "prefer_want_have",
         "want_have_timeout_ms",
+        "candidate_peer_count",
+        "new_dial_peer_count",
+        "new_dial_addr_count",
+        "suppressed_dial_peer_count",
+        "suppressed_dial_addr_count",
+        "pending_dial_peer_count",
+        "connected_peer_count",
         "failure_kind",
         "command_queued_ms",
         "targets",
@@ -4060,6 +4142,7 @@ mod tests {
                 "{\"phase\":\"bitswap_peer_attempt\",\"elapsed_ms\":5000,\"cid\":\"cid-a\",\"peer\":\"peer-b\",\"ok\":false,\"prefer_want_have\":true,\"failure_kind\":\"connection_timeout\",\"error\":\"timed out\"}\n",
                 "{\"phase\":\"bitswap_peer_attempt_start\",\"cid\":\"cid-a\",\"peer\":\"peer-c\",\"prefer_want_have\":true}\n",
                 "{\"phase\":\"bitswap_peer_attempt\",\"elapsed_ms\":10000,\"cid\":\"cid-a\",\"peer\":\"peer-c\",\"ok\":false,\"prefer_want_have\":true,\"failure_kind\":\"read_timeout\",\"error\":\"read timed out\"}\n",
+                "{\"phase\":\"bitswap_dial_plan\",\"cid\":\"cid-a\",\"peer_count\":4,\"candidate_peer_count\":5,\"new_dial_peer_count\":2,\"new_dial_addr_count\":3,\"suppressed_dial_peer_count\":1,\"suppressed_dial_addr_count\":4,\"pending_dial_peer_count\":2,\"connected_peer_count\":1,\"command_queued_ms\":7}\n",
                 "{\"phase\":\"bitswap_incoming_block\",\"cid\":\"cid-a\",\"peer\":\"peer-d\",\"source_transport\":\"tcp\",\"block_count\":2,\"bytes\":256,\"pending_waiter_count\":3,\"oldest_pending_ms\":75,\"newest_pending_ms\":25}\n",
             ),
         )
@@ -4076,6 +4159,16 @@ mod tests {
         assert_eq!(summary.bitswap_peer_attempts.read_timeouts, 1);
         assert_eq!(summary.bitswap_peer_attempts.other_failures, 0);
         assert_eq!(summary.bitswap_peer_attempts.prefer_want_have, 2);
+        assert_eq!(summary.bitswap_dial_plans.events, 1);
+        assert_eq!(summary.bitswap_dial_plans.peer_targets, 4);
+        assert_eq!(summary.bitswap_dial_plans.candidate_peers, 5);
+        assert_eq!(summary.bitswap_dial_plans.new_dial_peers, 2);
+        assert_eq!(summary.bitswap_dial_plans.new_dial_addrs, 3);
+        assert_eq!(summary.bitswap_dial_plans.suppressed_dial_peers, 1);
+        assert_eq!(summary.bitswap_dial_plans.suppressed_dial_addrs, 4);
+        assert_eq!(summary.bitswap_dial_plans.pending_dial_peers, 2);
+        assert_eq!(summary.bitswap_dial_plans.connected_peers, 1);
+        assert_eq!(summary.bitswap_dial_plans.max_command_queued_ms, 7);
         assert_eq!(summary.bitswap_incoming_blocks.matches, 1);
         assert_eq!(summary.bitswap_incoming_blocks.blocks, 2);
         assert_eq!(summary.bitswap_incoming_blocks.bytes, 256);

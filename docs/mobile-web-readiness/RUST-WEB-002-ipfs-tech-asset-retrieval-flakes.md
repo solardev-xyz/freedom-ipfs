@@ -3722,3 +3722,29 @@ p50/p95 was `179/2265ms` versus Kubo `303/711ms`. The trace showed
 and inbound `max_oldest_pending_ms=1983`. Compared with the kept `200ms`
 baseline, the longer wait did not produce enough shortcut wins and held too
 many requests in the slow session path. Reverted to `200ms`.
+
+## 2026-05-05 Bitswap Dial Plan Harness Summary
+
+Follow-up diagnostic:
+Future batching and fanout experiments need dial-plan totals in the harness
+summary, not only raw JSONL. The retrieval layer already emits
+`bitswap_dial_plan`; the harness now aggregates:
+
+- plan event count
+- total peer targets and candidate peers
+- new dial peers and addresses
+- suppressed dial peers and addresses
+- pending and already-connected peers
+- max command queue delay
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_bitswap_peer_attempts
+```
+
+Decision: keep. This is harness-only and does not change gateway or retrieval
+behavior. It makes future session batching experiments easier to judge by
+showing whether a change actually lowers dial pressure or merely shifts latency
+elsewhere.
