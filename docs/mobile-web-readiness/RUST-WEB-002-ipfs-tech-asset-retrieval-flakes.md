@@ -11139,6 +11139,12 @@ Change:
   stream-body events. In practice `gateway_stream_done` can arrive after
   `request_done`, because `request_done` records response construction while the
   body stream finishes afterward.
+- Add `body_mode=stream|direct` to `request_done`. Mobile and harness progress
+  now keep successful streamed `request_done` events in `streaming` state until
+  `gateway_stream_done`; direct/error responses still complete or fail at
+  `request_done`.
+- Add `gateway_stream_failed` so a stream read error after headers have been
+  produced can still fail mobile progress instead of leaving the target active.
 
 Implementation note:
 An earlier version emitted from the stream terminal `None` state. The
@@ -11165,8 +11171,8 @@ timeout 180s cargo run -p mobile-web-harness -- \
   --corpus /tmp/xtask-mobile-web-stream-suite-corpus.json \
   --case multiblock-unixfs-full \
   --repeat 1 \
-  --trace-output /tmp/xtask-mobile-web-stream-done-rust-trace.jsonl \
-  --output /tmp/xtask-mobile-web-stream-done-rust.json
+  --trace-output /tmp/xtask-mobile-web-stream-state-rust-trace.jsonl \
+  --output /tmp/xtask-mobile-web-stream-state-rust.json
 ```
 
 Result:
@@ -11176,23 +11182,27 @@ Result:
 - focused harness progress summary test passed
 - all gateway tests passed
 - deterministic full-response fixture passed `1/1`
-- root TTFB/total: `4ms` / `7ms`
-- RSS/FD: `22164KiB` / `12`
+- root TTFB/total: `5ms` / `7ms`
+- RSS/FD: `22416KiB` / `12`
+- `request_done` included `body_mode=stream`
 - trace contained one `gateway_stream_done` event:
   - `body_len=600000`
   - `range_start=0`
   - `range_end=599999`
   - `chunks=10`
-  - `elapsed_ms=0`
+  - `elapsed_ms=1`
   - correlated span fields included `request_id=1`,
     `progress_request_id=1`, and the `/ipfs/...` top-level path
-- progress phases included `completed=2`: one for `request_done`, one for
-  `gateway_stream_done`
+- progress phases changed from `completed=2` to `streaming=8, completed=1`:
+  successful streamed `request_done` no longer marks the request completed
+  before the body stream finishes
 - harness streamed-body summary reported one event with `600000` bytes and
   `10` chunks
 - slow request and progress request group summaries now include
   `gateway_stream_done=1` even though the event appears after `request_done` in
   the JSONL trace
+- slow event details include `body_mode=stream` on `request_done` and
+  `body_len=600000`, `chunks=10` on `gateway_stream_done`
 
 Decision:
 Keep. The event closes the diagnostic gap identified by the stream/range

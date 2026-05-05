@@ -38,6 +38,21 @@ const CACHE_CONTROL_IPNS_FILE: &str = "no-cache";
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_PERSISTENT_NAME_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
+#[derive(Clone, Copy)]
+enum GatewayBodyMode {
+    Direct,
+    Stream,
+}
+
+impl GatewayBodyMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Stream => "stream",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     max_concurrent_requests: usize,
@@ -360,6 +375,7 @@ async fn ipfs_get(
                 phase = "request_done",
                 request_id,
                 status = response.status().as_u16(),
+                body_mode = gateway_body_mode(&response),
                 elapsed_ms = request_started.elapsed().as_millis()
             );
             return response;
@@ -390,6 +406,7 @@ async fn ipfs_get(
             phase = "request_done",
             request_id,
             status = response.status().as_u16(),
+            body_mode = gateway_body_mode(&response),
             elapsed_ms = request_started.elapsed().as_millis()
         );
         response
@@ -440,6 +457,7 @@ async fn ipns_get(
                 phase = "request_done",
                 request_id,
                 status = response.status().as_u16(),
+                body_mode = gateway_body_mode(&response),
                 elapsed_ms = request_started.elapsed().as_millis()
             );
             return response;
@@ -471,6 +489,7 @@ async fn ipns_get(
             phase = "request_done",
             request_id,
             status = response.status().as_u16(),
+            body_mode = gateway_body_mode(&response),
             elapsed_ms = request_started.elapsed().as_millis()
         );
         response
@@ -484,6 +503,19 @@ fn header_value_for_trace(value: Option<&HeaderValue>) -> String {
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string()
+}
+
+fn gateway_body_mode(response: &Response) -> &'static str {
+    response
+        .extensions()
+        .get::<GatewayBodyMode>()
+        .copied()
+        .unwrap_or(GatewayBodyMode::Direct)
+        .as_str()
+}
+
+fn set_gateway_body_mode(response: &mut Response, mode: GatewayBodyMode) {
+    response.extensions_mut().insert(mode);
 }
 
 fn header_u64_for_trace(headers: &HeaderMap, name: &'static str) -> Option<u64> {
@@ -1168,6 +1200,7 @@ fn streaming_response(
             bytes
         };
         let mut response = Body::from(body).into_response();
+        set_gateway_body_mode(&mut response, GatewayBodyMode::Direct);
         insert_full_file_headers(&mut response, len, headers)?;
         return Ok(response);
     }
@@ -1214,18 +1247,35 @@ fn streaming_response(
                     )
                     .map(Bytes::from)
                     .map_err(|err| io::Error::other(err.to_string()));
-                if chunk.is_ok() && end == last {
-                    tracing::info!(
-                        phase = "gateway_stream_done",
-                        cid = %root_cid,
-                        file_cid = %file_cid,
-                        unixfs_path = %path,
-                        range_start = 0u64,
-                        range_end = last,
-                        body_len = len,
-                        chunks,
-                        elapsed_ms = state.started.elapsed().as_millis()
-                    );
+                match &chunk {
+                    Ok(_) if end == last => {
+                        tracing::info!(
+                            phase = "gateway_stream_done",
+                            cid = %root_cid,
+                            file_cid = %file_cid,
+                            unixfs_path = %path,
+                            range_start = 0u64,
+                            range_end = last,
+                            body_len = len,
+                            chunks,
+                            elapsed_ms = state.started.elapsed().as_millis()
+                        );
+                    }
+                    Err(err) => {
+                        tracing::info!(
+                            phase = "gateway_stream_failed",
+                            cid = %root_cid,
+                            file_cid = %file_cid,
+                            unixfs_path = %path,
+                            range_start = offset,
+                            range_end = end,
+                            body_len = len,
+                            chunks = state.chunks,
+                            error = %err,
+                            elapsed_ms = state.started.elapsed().as_millis()
+                        );
+                    }
+                    _ => {}
                 }
                 Some((chunk, next))
             }
@@ -1234,6 +1284,14 @@ fn streaming_response(
     );
 
     let mut response = Body::from_stream(stream).into_response();
+    set_gateway_body_mode(
+        &mut response,
+        if headers.is_head {
+            GatewayBodyMode::Direct
+        } else {
+            GatewayBodyMode::Stream
+        },
+    );
     insert_full_file_headers(&mut response, len, headers)?;
     Ok(response)
 }
@@ -1379,6 +1437,7 @@ fn ranged_response(
             elapsed_ms = started.elapsed().as_millis()
         );
         let mut response = Body::from(body).into_response();
+        set_gateway_body_mode(&mut response, GatewayBodyMode::Direct);
         *response.status_mut() = StatusCode::PARTIAL_CONTENT;
         insert_range_file_headers(&mut response, total_len, start, end, headers)?;
         return Ok(response);
@@ -1425,18 +1484,35 @@ fn ranged_response(
                     )
                     .map(Bytes::from)
                     .map_err(|err| io::Error::other(err.to_string()));
-                if chunk.is_ok() && chunk_end == end {
-                    tracing::info!(
-                        phase = "gateway_stream_done",
-                        cid = %root_cid,
-                        file_cid = %file_cid,
-                        unixfs_path = %path,
-                        range_start = start,
-                        range_end = end,
-                        body_len = range_len,
-                        chunks,
-                        elapsed_ms = state.started.elapsed().as_millis()
-                    );
+                match &chunk {
+                    Ok(_) if chunk_end == end => {
+                        tracing::info!(
+                            phase = "gateway_stream_done",
+                            cid = %root_cid,
+                            file_cid = %file_cid,
+                            unixfs_path = %path,
+                            range_start = start,
+                            range_end = end,
+                            body_len = range_len,
+                            chunks,
+                            elapsed_ms = state.started.elapsed().as_millis()
+                        );
+                    }
+                    Err(err) => {
+                        tracing::info!(
+                            phase = "gateway_stream_failed",
+                            cid = %root_cid,
+                            file_cid = %file_cid,
+                            unixfs_path = %path,
+                            range_start = offset,
+                            range_end = chunk_end,
+                            body_len = range_len,
+                            chunks = state.chunks,
+                            error = %err,
+                            elapsed_ms = state.started.elapsed().as_millis()
+                        );
+                    }
+                    _ => {}
                 }
                 Some((chunk, next))
             }
@@ -1445,6 +1521,14 @@ fn ranged_response(
     );
 
     let mut response = Body::from_stream(stream).into_response();
+    set_gateway_body_mode(
+        &mut response,
+        if headers.is_head {
+            GatewayBodyMode::Direct
+        } else {
+            GatewayBodyMode::Stream
+        },
+    );
     *response.status_mut() = StatusCode::PARTIAL_CONTENT;
     insert_range_file_headers(&mut response, total_len, start, end, headers)?;
     Ok(response)

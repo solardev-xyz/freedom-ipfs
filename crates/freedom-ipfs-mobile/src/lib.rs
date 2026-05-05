@@ -461,7 +461,14 @@ fn progress_target_id(fields: &ProgressFields, span: &ProgressSpanFields) -> u64
 fn progress_status(raw_phase: &str, fields: &ProgressFields) -> String {
     match raw_phase {
         "gateway_stream_done" => "completed",
+        "gateway_stream_failed" => "failed",
         "request_done" => match fields.get_u64("status") {
+            Some(status)
+                if status < 400
+                    && fields.get("body_mode").map(String::as_str) == Some("stream") =>
+            {
+                "active"
+            }
             Some(status) if status < 400 => "completed",
             Some(_) => "failed",
             None => "completed",
@@ -504,9 +511,16 @@ fn progress_source(raw_phase: &str, fields: &ProgressFields) -> Option<String> {
 fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> String {
     match raw_phase {
         "request_start" | "preload_start" => "started",
+        "request_done"
+            if status == "active"
+                && fields.get("body_mode").map(String::as_str) == Some("stream") =>
+        {
+            "streaming"
+        }
         "request_done" if status == "completed" => "completed",
         "request_done" => "failed",
         "gateway_stream_done" => "completed",
+        "gateway_stream_failed" => "failed",
         "preload_done" if status == "completed" => "completed",
         "preload_done" => "failed",
         "preload_cancelled" => "cancelled",
@@ -615,6 +629,9 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
 fn progress_error_code(raw_phase: &str, fields: &ProgressFields, status: &str) -> Option<String> {
     if raw_phase == "request_done" && status == "failed" {
         return fields.get("status").map(|status| format!("http_{status}"));
+    }
+    if raw_phase == "gateway_stream_failed" {
+        return Some("gateway_stream_failed".into());
     }
     if raw_phase == "gateway_limiter" && fields.get("acquired").map(String::as_str) == Some("false")
     {
@@ -2092,6 +2109,15 @@ mod tests {
             "test",
         );
         recorder.record_event(
+            span.clone(),
+            progress_fields([
+                ("phase", "request_done"),
+                ("status", "200"),
+                ("body_mode", "stream"),
+            ]),
+            "test",
+        );
+        recorder.record_event(
             span,
             progress_fields([
                 ("phase", "gateway_stream_done"),
@@ -2105,6 +2131,12 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
         assert_eq!(value["active_count"].as_u64().unwrap(), 0);
         let events = value["events"].as_array().unwrap();
+        let response_ready = events
+            .iter()
+            .find(|event| event["raw_phase"] == "request_done")
+            .unwrap();
+        assert_eq!(response_ready["phase"], "streaming");
+        assert_eq!(response_ready["status"], "active");
         let completed = events
             .iter()
             .find(|event| event["raw_phase"] == "gateway_stream_done")
@@ -2258,6 +2290,18 @@ mod tests {
         );
         assert_eq!(
             progress_phase(
+                "request_done",
+                &progress_fields([
+                    ("phase", "request_done"),
+                    ("status", "200"),
+                    ("body_mode", "stream")
+                ]),
+                "active",
+            ),
+            "streaming"
+        );
+        assert_eq!(
+            progress_phase(
                 "gateway_stream_done",
                 &progress_fields([
                     ("phase", "gateway_stream_done"),
@@ -2267,6 +2311,17 @@ mod tests {
                 "completed",
             ),
             "completed"
+        );
+        assert_eq!(
+            progress_phase(
+                "gateway_stream_failed",
+                &progress_fields([
+                    ("phase", "gateway_stream_failed"),
+                    ("error", "missing block")
+                ]),
+                "failed",
+            ),
+            "failed"
         );
         assert_eq!(
             progress_phase(

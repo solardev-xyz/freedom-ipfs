@@ -5758,8 +5758,12 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
     match raw_phase {
         "request_start" | "preload_start" => "started",
         "gateway_stream_done" => "completed",
+        "gateway_stream_failed" => "failed",
         "request_done" => match value.get("status").and_then(json_u128) {
             Some(status) if status >= 400 => "failed",
+            Some(_) if value.get("body_mode").and_then(|mode| mode.as_str()) == Some("stream") => {
+                "streaming"
+            }
             _ => "completed",
         },
         "preload_done" => match value.get("ok").and_then(|ok| ok.as_bool()) {
@@ -6033,6 +6037,9 @@ fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
         "ip6_addr_count",
         "block_count",
         "bytes",
+        "body_len",
+        "body_mode",
+        "chunks",
         "pending_waiter_count",
         "oldest_pending_ms",
         "newest_pending_ms",
@@ -7018,6 +7025,7 @@ mod tests {
                 "{\"phase\":\"unixfs_resource\",\"path\":\"/ipns/site/\",\"ok\":true}\n",
                 "{\"phase\":\"gateway_direct_body\",\"path\":\"/ipns/site/asset.css\",\"body_len\":4096}\n",
                 "{\"phase\":\"gateway_stream_done\",\"path\":\"/ipns/site/\",\"body_len\":600000,\"chunks\":3}\n",
+                "{\"phase\":\"gateway_stream_failed\",\"path\":\"/ipns/site/video.mp4\",\"error\":\"missing block\"}\n",
                 "{\"phase\":\"gateway_conditional\",\"path\":\"/ipns/site/\",\"outcome\":\"not_modified\"}\n",
                 "{\"phase\":\"bitswap_request_timeout\",\"cid\":\"cid-a\",\"peer_count\":2}\n",
                 "{\"phase\":\"bitswap_connection_error\",\"peer\":\"peer-b\",\"error\":\"timeout\"}\n",
@@ -7025,7 +7033,7 @@ mod tests {
                 "{\"phase\":\"bitswap_incoming_stream_read\",\"peer\":\"peer-c\",\"ok\":false,\"timed_out\":true}\n",
                 "{\"phase\":\"provider_refresh_skipped_empty_provider_set\",\"cid\":\"cid-a\",\"error\":\"No Bitswap providers\",\"initial_error\":\"No Bitswap providers\"}\n",
                 "{\"phase\":\"gateway_limiter\",\"acquired\":false}\n",
-                "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipns/site/\",\"status\":200}\n",
+                "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipns/site/\",\"status\":200,\"body_mode\":\"stream\"}\n",
                 "{\"phase\":\"request_done\",\"request_id\":2,\"path\":\"/ipns/missing/\",\"status\":503}\n",
             ),
         )
@@ -7081,7 +7089,7 @@ mod tests {
             trace_value_count(&summary.progress_phases, "fetching_bitswap"),
             2
         );
-        assert_eq!(trace_value_count(&summary.progress_phases, "streaming"), 2);
+        assert_eq!(trace_value_count(&summary.progress_phases, "streaming"), 3);
         assert_eq!(summary.gateway_direct_body.events, 1);
         assert_eq!(summary.gateway_direct_body.bytes, 4096);
         assert_eq!(summary.gateway_direct_body.max_body_len, 4096);
@@ -7090,8 +7098,8 @@ mod tests {
         assert_eq!(summary.gateway_stream_body.max_body_len, 600000);
         assert_eq!(summary.gateway_stream_body.max_chunks, 3);
         assert_eq!(trace_value_count(&summary.progress_phases, "retrying"), 4);
-        assert_eq!(trace_value_count(&summary.progress_phases, "completed"), 2);
-        assert_eq!(trace_value_count(&summary.progress_phases, "failed"), 4);
+        assert_eq!(trace_value_count(&summary.progress_phases, "completed"), 1);
+        assert_eq!(trace_value_count(&summary.progress_phases, "failed"), 5);
         assert_eq!(
             summary.provider_retries.skipped_empty_provider_set_events,
             1
