@@ -12991,6 +12991,45 @@ Guardrail result:
   `0`, p50/p95 `21ms` / `47ms`.
 - The new retry did not fire because delegated routing returned providers.
 
+Longer `daicowtf` follow-up:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-empty-delegated-retry-r10-trace.jsonl \
+  --output /tmp/daicowtf-empty-delegated-retry-r10.json
+```
+
+Follow-up result:
+
+- Rust passed `10/10`.
+- Root TTFB p50/p90/p95/max was `1517ms` / `1579ms` / `1742ms` / `1742ms`.
+- Run total p50/p95/max was `1535ms` / `1758ms` / `1758ms`.
+- RSS p50/p95/max was `43688KiB` / `44152KiB` / `44152KiB`.
+- FD p50/p95/max was `18` / `20` / `20`.
+- Delegated provider lookups: events `29`, successes `29`, failures `0`,
+  providers `39`, max elapsed `166ms`.
+- DHT fallback was still attempted for low-diversity provider sets: events `8`,
+  all timed out under the existing `750ms` low-diversity cap.
+- Bitswap source peers were the root peer
+  `12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP` and Pinata WSS peer
+  `Qmdv6yNikmUWUWXufLJLRNkv6Y9sY5cmgeX5RVWA4WNMz4`.
+- `delegated_provider_empty_retry` still did not fire. Delegated routing had
+  providers during every measured run.
+- The remaining `daicowtf` tail in this window was not empty delegated routing:
+  the slowest phases were `mime_sniff_read` / `mime_detect` / `mime_total`
+  around `1174ms` p50 and up to `1344ms`, caused by fetching enough of the root
+  response to sniff extensionless HTML. The slow child CID
+  `bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u` still dominated
+  block-fetch cost, but it was available from the WSS provider in all runs.
+
 Regression validation:
 
 ```sh
