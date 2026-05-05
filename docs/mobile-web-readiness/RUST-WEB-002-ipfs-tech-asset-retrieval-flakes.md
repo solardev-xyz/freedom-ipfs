@@ -13520,3 +13520,91 @@ Reject and revert the code. Keep this note as a negative result. A future
 variant would need to address slow provider lookup while a recent session peer
 appears during that lookup, or improve HTTP-provider quality directly, rather
 than racing only after provider lookup has already completed.
+
+## 2026-05-05 Reject: Poll For Late Session Peers During Slow Provider Lookup
+
+Hypothesis:
+The rejected single-HTTP/session race showed one clear problem: recent session
+peers could only race after provider lookup had already finished, so a slow
+delegated provider lookup still sat directly on request TTFB. A small late poll
+during slow provider lookup might catch a recent Bitswap peer learned by another
+concurrent page request and let that peer win without waiting for the delegated
+router tail.
+
+Prototype:
+
+- In the cold `recent_peers.is_empty()` path, start provider lookup and wait
+  `150ms`.
+- If lookup is still pending, poll the recent successful Bitswap peer table
+  again.
+- If a peer appeared, race that recent-peer Bitswap shortcut against the still
+  pending provider lookup.
+- Keep the existing verified block path and no public gateway fallback.
+- Emit `bitswap_session_shortcut_late_lookup` with `peer_count` and `outcome`.
+
+Focused validation while the temporary patch was applied:
+
+```sh
+cargo fmt --all
+cargo test -p freedom-ipfs-retrieval late_recent_bitswap_peer_can_win_during_slow_provider_lookup
+cargo test -p freedom-ipfs-retrieval recent_bitswap_peer
+```
+
+Result:
+
+- The new deterministic test passed: a gated delegated lookup could be bypassed
+  after another task recorded a local Bitswap session peer.
+- Existing recent Bitswap peer tests passed.
+
+Live experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-late-session-lookup-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-late-session-lookup-r3.json
+```
+
+Live result:
+
+- Rust and Kubo both passed `3/3`.
+- Rust root TTFB p50/p95 was `1898ms` / `2393ms`; Kubo was `2724ms` /
+  `3071ms`.
+- Rust asset TTFB p50/p95/max was `252ms` / `1053ms` / `5558ms`; Kubo was
+  `113ms` / `252ms` / `287ms`.
+- Rust max RSS/FD was `52940KiB` / `32`; Kubo max RSS/FD was `243428KiB` /
+  `214`.
+- Gateway request elapsed p50/p90/p95/max was `252ms` / `949ms` / `1208ms` /
+  `5556ms`.
+- Delegated provider lookups: `96` events, `96` successes, max `5484ms`.
+- HTTP provider fetches: `86` events, `86` successes, p50/p95/max `162ms` /
+  `755ms` / `1347ms`.
+- Bitswap peer attempts: `34` starts, with low FD pressure.
+
+Trace interpretation:
+
+- `bitswap_session_shortcut_late_lookup` fired `10` times.
+- Every event had `peer_count=0` and `outcome=no_recent_peers`; the prototype
+  never actually started a late session shortcut in the live run.
+- The slowest request remained
+  `/ipns/ipfs.tech/_nuxt/community-hero.Cp0BCcC7.jpg`: request elapsed
+  `5556ms`, block total `5553ms`, delegated lookup `5484ms`.
+- This means the live bottleneck was still delegated provider lookup, but no
+  useful session peer was present at the `150ms` late poll point.
+
+Decision:
+Reject and revert the code. The deterministic mechanism worked, but live
+evidence did not show real hits in the target `ipfs.tech` workload. Repeated
+polling might eventually catch a peer, but it would add timer wakeups and
+complexity without evidence that the session peer exists in time. The next
+work should focus on reducing delegated-provider lookup tails directly or on
+improving HTTP-provider candidate quality once provider records arrive.
