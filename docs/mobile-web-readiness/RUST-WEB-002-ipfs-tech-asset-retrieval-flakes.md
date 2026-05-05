@@ -6455,3 +6455,46 @@ Decision: reject and restore `4s`. The lower timeout fires earlier, but in this
 network window it caused a slower retry path and worse total TTFB than the kept
 4s cap-3 run. The remaining `vitalik` gap is not solved by shaving another
 500ms from the mixed-trusted request cap.
+
+Rejected follow-up: biased shared Bitswap command select.
+
+Hypothesis: the kept cap-3 `vitalik` trace showed the first provider command
+timing out without a corresponding `bitswap_dial_plan`, suggesting that command
+processing inside the shared Bitswap swarm might be delayed behind swarm events.
+Prioritizing `commands.recv()` in the swarm `select!` might make provider
+commands enter dial planning before the 4s caller-side timeout expires.
+
+```sh
+# Temporarily add `biased;` to run_shared_bitswap_swarm's tokio::select! with
+# the command branch first.
+cargo build -p freedom-ipfs-gateway
+
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/vitalik-biased-command-select-rust-vs-kubo-trace.jsonl \
+  --output /tmp/vitalik-biased-command-select-rust-vs-kubo.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `6660/6678ms`, Kubo `1898/1972ms`.
+- Max RSS/FD: Rust `39296KiB`/`33`, Kubo `165764KiB`/`82`.
+- Trace still had `request_timeout_details=3`, all `mixed_trusted`, all
+  `timeout_ms=4000`.
+- Retry recovery regressed versus the kept cap-3 sample:
+  `retry_success_elapsed=p50=784ms p95=817ms max=817ms`.
+- Peer attempts increased to `62`, and target modes widened to `want_block=12`,
+  `want_have=21`, `max_want_block=4`, `max_want_have=7`.
+
+Decision: reject and restore fair `tokio::select!`. Prioritizing command intake
+did not remove the timeout shape and made the retry path noisier. The next useful
+step should improve diagnostics for request timeouts that lack a dial-plan event,
+or target peer scoring/selection for the stale trusted peer, not globally bias
+the swarm event loop.
