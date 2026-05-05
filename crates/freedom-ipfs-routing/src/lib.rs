@@ -368,16 +368,44 @@ impl DelegatedRoutingClient {
                 .send()
                 .await?
                 .error_for_status()?;
-            limited_response_providers(response, MAX_DELEGATED_ROUTING_RESPONSE_BYTES).await
+            let response_headers_elapsed_ms = started.elapsed().as_millis();
+            let response =
+                limited_response_providers(response, MAX_DELEGATED_ROUTING_RESPONSE_BYTES).await?;
+            Ok((response, response_headers_elapsed_ms))
         }
         .await;
         match &result {
-            Ok(providers) => tracing::info!(
+            Ok((response, response_headers_elapsed_ms)) => tracing::info!(
                 phase = "delegated_provider_lookup",
                 cid = %cid,
                 endpoint,
                 ok = true,
-                provider_count = providers.len(),
+                provider_count = response.providers.len(),
+                http_provider_count = response.stats.http_provider_count,
+                response_bytes = response.stats.bytes_read,
+                response_lines = response.stats.line_count,
+                response_headers_elapsed_ms,
+                response_first_chunk_seen = response.stats.first_chunk_elapsed.is_some(),
+                response_first_chunk_elapsed_ms = response
+                    .stats
+                    .first_chunk_elapsed
+                    .map(|elapsed| response_headers_elapsed_ms + elapsed.as_millis())
+                    .unwrap_or_default(),
+                response_first_http_provider_seen = response
+                    .stats
+                    .first_http_provider_elapsed
+                    .is_some(),
+                response_first_http_provider_elapsed_ms = response
+                    .stats
+                    .first_http_provider_elapsed
+                    .map(|elapsed| response_headers_elapsed_ms + elapsed.as_millis())
+                    .unwrap_or_default(),
+                response_target_met = response.stats.target_met_elapsed.is_some(),
+                response_target_met_elapsed_ms = response
+                    .stats
+                    .target_met_elapsed
+                    .map(|elapsed| response_headers_elapsed_ms + elapsed.as_millis())
+                    .unwrap_or_default(),
                 elapsed_ms = started.elapsed().as_millis()
             ),
             Err(err) => tracing::info!(
@@ -389,7 +417,7 @@ impl DelegatedRoutingClient {
                 elapsed_ms = started.elapsed().as_millis()
             ),
         }
-        result
+        result.map(|(response, _)| response.providers)
     }
 }
 
@@ -933,10 +961,27 @@ fn limit_delegated_providers(mut providers: Vec<Provider>) -> Vec<Provider> {
     providers
 }
 
+#[derive(Debug)]
+struct LimitedProviderResponse {
+    providers: Vec<Provider>,
+    stats: DelegatedResponseStats,
+}
+
+#[derive(Debug, Default)]
+struct DelegatedResponseStats {
+    bytes_read: usize,
+    line_count: usize,
+    first_chunk_elapsed: Option<Duration>,
+    first_http_provider_elapsed: Option<Duration>,
+    target_met_elapsed: Option<Duration>,
+    http_provider_count: usize,
+}
+
 async fn limited_response_providers(
     response: reqwest::Response,
     max_bytes: usize,
-) -> Result<Vec<Provider>> {
+) -> Result<LimitedProviderResponse> {
+    let started = Instant::now();
     let is_ndjson = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -945,15 +990,28 @@ async fn limited_response_providers(
 
     if !is_ndjson {
         let body = limited_response_text(response, max_bytes).await?;
-        return Ok(limit_delegated_providers(parse_provider_response(&body)?));
+        let providers = limit_delegated_providers(parse_provider_response(&body)?);
+        return Ok(LimitedProviderResponse {
+            stats: DelegatedResponseStats {
+                bytes_read: body.len(),
+                line_count: body.lines().filter(|line| !line.trim().is_empty()).count(),
+                http_provider_count: http_provider_url_count(&providers),
+                ..Default::default()
+            },
+            providers,
+        });
     }
 
     let mut stream = response.bytes_stream();
     let mut buffered = Vec::new();
     let mut bytes_read = 0usize;
+    let mut line_count = 0usize;
     let mut providers = Vec::new();
+    let mut first_chunk_elapsed = None;
+    let mut first_http_provider_elapsed = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
+        first_chunk_elapsed.get_or_insert_with(|| started.elapsed());
         bytes_read = bytes_read.saturating_add(chunk.len());
         if bytes_read > max_bytes {
             return Err(RoutingError::InvalidResponse(format!(
@@ -965,14 +1023,46 @@ async fn limited_response_providers(
         while let Some(newline_index) = buffered.iter().position(|byte| *byte == b'\n') {
             let line = buffered.drain(..=newline_index).collect::<Vec<_>>();
             append_provider_response_line(&line, &mut providers)?;
+            line_count = line_count.saturating_add(1);
+            if first_http_provider_elapsed.is_none() && http_provider_url_count(&providers) > 0 {
+                first_http_provider_elapsed = Some(started.elapsed());
+            }
             if should_return_streamed_providers(&providers) {
-                return Ok(limit_delegated_providers(providers));
+                let providers = limit_delegated_providers(providers);
+                return Ok(LimitedProviderResponse {
+                    stats: DelegatedResponseStats {
+                        bytes_read,
+                        line_count,
+                        first_chunk_elapsed,
+                        first_http_provider_elapsed,
+                        target_met_elapsed: Some(started.elapsed()),
+                        http_provider_count: http_provider_url_count(&providers),
+                    },
+                    providers,
+                });
             }
         }
     }
 
     append_provider_response_line(&buffered, &mut providers)?;
-    Ok(limit_delegated_providers(providers))
+    if !trim_ascii_whitespace(&buffered).is_empty() {
+        line_count = line_count.saturating_add(1);
+    }
+    if first_http_provider_elapsed.is_none() && http_provider_url_count(&providers) > 0 {
+        first_http_provider_elapsed = Some(started.elapsed());
+    }
+    let providers = limit_delegated_providers(providers);
+    Ok(LimitedProviderResponse {
+        stats: DelegatedResponseStats {
+            bytes_read,
+            line_count,
+            first_chunk_elapsed,
+            first_http_provider_elapsed,
+            target_met_elapsed: None,
+            http_provider_count: http_provider_url_count(&providers),
+        },
+        providers,
+    })
 }
 
 fn append_provider_response_line(line: &[u8], providers: &mut Vec<Provider>) -> Result<()> {
@@ -1001,11 +1091,14 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
 
 fn should_return_streamed_providers(providers: &[Provider]) -> bool {
     providers.len() >= MAX_DELEGATED_ROUTING_PROVIDERS
-        || providers
-            .iter()
-            .map(|provider| provider.http_urls.len())
-            .sum::<usize>()
-            >= STREAMING_DELEGATED_HTTP_PROVIDER_TARGET
+        || http_provider_url_count(providers) >= STREAMING_DELEGATED_HTTP_PROVIDER_TARGET
+}
+
+fn http_provider_url_count(providers: &[Provider]) -> usize {
+    providers
+        .iter()
+        .map(|provider| provider.http_urls.len())
+        .sum()
 }
 
 async fn limited_response_text(response: reqwest::Response, max_bytes: usize) -> Result<String> {
@@ -1722,6 +1815,53 @@ mod tests {
         assert!(!providers
             .iter()
             .any(|provider| provider.id.as_deref() == Some("late-peer")));
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn streamed_delegated_response_reports_response_stats() {
+        let fast_head = (0..STREAMING_DELEGATED_HTTP_PROVIDER_TARGET)
+            .map(|index| {
+                format!(
+                    r#"{{"ID":"peer-{index}","Addrs":["/dns4/provider-{index}.example/tcp/443/tls/http"]}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let slow_tail = r#"{"ID":"late-peer","Addrs":["/dns4/late.example/tcp/443/tls/http"]}"#;
+        let (endpoint, task) =
+            spawn_streaming_delegated_response(fast_head, slow_tail.into(), Duration::from_secs(2))
+                .await;
+        let response = reqwest::get(format!("{endpoint}/providers/test"))
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(500),
+            limited_response_providers(response, MAX_DELEGATED_ROUTING_RESPONSE_BYTES),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            response.providers.len(),
+            STREAMING_DELEGATED_HTTP_PROVIDER_TARGET
+        );
+        assert_eq!(
+            response.stats.http_provider_count,
+            STREAMING_DELEGATED_HTTP_PROVIDER_TARGET
+        );
+        assert_eq!(
+            response.stats.line_count,
+            STREAMING_DELEGATED_HTTP_PROVIDER_TARGET
+        );
+        assert!(response.stats.bytes_read > 0);
+        assert!(response.stats.first_chunk_elapsed.is_some());
+        assert!(response.stats.first_http_provider_elapsed.is_some());
+        assert!(response.stats.target_met_elapsed.is_some());
         task.abort();
         let _ = task.await;
     }

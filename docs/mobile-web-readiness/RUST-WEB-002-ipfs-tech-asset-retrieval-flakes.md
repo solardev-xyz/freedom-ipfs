@@ -13699,3 +13699,81 @@ window did not produce a latency win and showed worse asset and HTTP-provider
 tails. Keep the trace output as evidence that simple last-success ranking is
 not enough; a future attempt would need richer provider quality signals,
 concurrency-aware scoring, or per-CID/provider availability data.
+
+## 2026-05-05 Keep: Trace Delegated Response Milestones
+
+Problem:
+The remaining high `ipfs.tech` asset tails are often delegated provider lookup
+tails, but the existing `delegated_provider_lookup` event only reported total
+elapsed time and provider count. That made it unclear whether a slow lookup was
+waiting for response headers, first body bytes, the first HTTP-capable provider,
+or the streaming early-return target.
+
+Implementation:
+
+- Keep the existing delegated routing behavior unchanged.
+- Extend the internal delegated response parser to return compact response
+  stats alongside providers:
+  - `response_bytes`
+  - `response_lines`
+  - `http_provider_count`
+  - `response_headers_elapsed_ms`
+  - `response_first_chunk_seen`
+  - `response_first_chunk_elapsed_ms`
+  - `response_first_http_provider_seen`
+  - `response_first_http_provider_elapsed_ms`
+  - `response_target_met`
+  - `response_target_met_elapsed_ms`
+- Report those fields on the existing `delegated_provider_lookup` trace event,
+  not as extra per-line events.
+- Preserve `MAX_DELEGATED_ROUTING_RESPONSE_BYTES`, the NDJSON early return
+  policy, and all provider verification semantics.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing
+```
+
+Result:
+
+- Formatting check passed.
+- Routing suite passed: `23 passed; 0 failed; 1 ignored`.
+- New focused test `streamed_delegated_response_reports_response_stats` proves
+  streamed NDJSON stats are populated when the early HTTP-provider target is
+  reached before a delayed tail.
+
+Live smoke:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-delegated-response-stats-r1-trace.jsonl \
+  --output /tmp/ipfs-tech-delegated-response-stats-r1.json
+```
+
+Live result:
+
+- Rust passed `1/1`.
+- Root TTFB was `1351ms`.
+- Asset TTFB p50/p95/max was `238ms` / `881ms` / `1350ms`.
+- Rust max RSS/FD was `51332KiB` / `26`.
+- Delegated provider lookups: `25` events, `25` successes, max `215ms`.
+- The trace showed the new fields on real `delegated_provider_lookup` events,
+  for example root CID `bafybeier...` had `provider_count=17`,
+  `http_provider_count=1`, `response_bytes=24910`, `response_lines=17`,
+  and `response_headers_elapsed_ms=211`.
+
+Decision:
+Keep. This is diagnostic-only and does not add network work, provider fanout,
+fallback gateways, or trust changes. The next time delegated lookup tails spike,
+these fields should show whether to optimize endpoint/header latency, stream
+body latency, or the HTTP-provider early-return threshold.
