@@ -11329,3 +11329,42 @@ Decision:
 Keep as a Priority-1 building block. This does not claim a page-load speed win
 by itself; it removes one more internal blocker before testing a small
 content-root/session multi-want window.
+
+## 2026-05-05 Harness: Summarize Bitswap Batch Shape
+
+Problem:
+After adding the shared-client `fetch_many` path, future runs need an obvious
+summary signal that says whether a trace actually exercised multi-CID Bitswap
+commands. Otherwise a good or bad live result could be mistaken for a batching
+result even when every command was still single-CID.
+
+Change:
+
+- Add `bitswap_batches` to the mobile web harness trace summary JSON.
+- Summarize batch command count, multi-CID command count, total/max requested
+  CIDs per command, peer-attempt starts/successes, requested block count,
+  cancelled fetches, and batch failures.
+- Print a concise `bitswap batches:` line in normal and Rust-vs-Kubo comparison
+  trace summaries.
+- Preserve compatibility with older traces by treating `bitswap_dial_plan`
+  events without `cid_count` as single-CID commands.
+
+Validation:
+
+```sh
+cargo fmt --all
+cargo test -p mobile-web-harness trace_summary_counts_bitswap_peer_attempts
+cargo test -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Result:
+
+- focused harness batch/peer-attempt summary test passed
+- full mobile web harness tests passed: `24 passed; 0 failed`
+- mobile web harness clippy passed with `-D warnings`
+
+Decision:
+Keep. This is diagnostics-only, but it makes the next multi-want experiment
+measurable at a glance: a useful run should show `multi_cid_commands > 0` and
+`max_requested_blocks > 1`.

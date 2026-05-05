@@ -855,6 +855,7 @@ fn print_summary(report: &RunReport) {
         print_trace_gateway_direct_body(trace);
         print_trace_gateway_stream_body(trace);
         print_trace_bitswap_sources(trace);
+        print_trace_bitswap_batches(trace);
         if trace.bitswap_extra_blocks.events > 0 {
             let extra = &trace.bitswap_extra_blocks;
             println!(
@@ -1159,6 +1160,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_bitswap_peer_attempts(trace);
     print_trace_bitswap_dial_plans(trace);
     print_trace_bitswap_sources(trace);
+    print_trace_bitswap_batches(trace);
     print_trace_bitswap_peer_fetches(trace);
     if trace.bitswap_session.has_events() {
         let session = &trace.bitswap_session;
@@ -1511,6 +1513,26 @@ fn print_trace_bitswap_sources(trace: &TraceSummary) {
             format_trace_counts(&trace.bitswap_deliveries)
         );
     }
+}
+
+fn print_trace_bitswap_batches(trace: &TraceSummary) {
+    let batches = &trace.bitswap_batches;
+    if !batches.has_events() {
+        return;
+    }
+    println!(
+        "  bitswap batches: commands={} multi_cid_commands={} total_cids={} max_cids={} peer_attempt_starts={} peer_attempt_successes={} requested_blocks={} max_requested_blocks={} cancelled={} failures={}",
+        batches.commands,
+        batches.multi_cid_commands,
+        batches.total_cids,
+        batches.max_cids,
+        batches.peer_attempt_starts,
+        batches.peer_attempt_successes,
+        batches.requested_blocks,
+        batches.max_requested_blocks,
+        batches.cancelled,
+        batches.failures
+    );
 }
 
 fn print_trace_bitswap_peer_fetches(trace: &TraceSummary) {
@@ -3889,6 +3911,7 @@ struct TraceSummary {
     bitswap_source_transports: Vec<TraceValueCount>,
     bitswap_source_request_modes: Vec<TraceValueCount>,
     bitswap_deliveries: Vec<TraceValueCount>,
+    bitswap_batches: TraceBitswapBatchAggregate,
     bitswap_extra_blocks: TraceBitswapExtraBlockAggregate,
     bitswap_peer_fetches: Vec<TracePeerAggregate>,
     bitswap_session: TraceBitswapSessionAggregate,
@@ -4434,6 +4457,26 @@ struct TraceBitswapExtraBlockAggregate {
     unknown: u128,
 }
 
+#[derive(Debug, Default, Serialize)]
+struct TraceBitswapBatchAggregate {
+    commands: usize,
+    multi_cid_commands: usize,
+    total_cids: u128,
+    max_cids: u128,
+    peer_attempt_starts: usize,
+    peer_attempt_successes: usize,
+    requested_blocks: u128,
+    max_requested_blocks: u128,
+    cancelled: usize,
+    failures: usize,
+}
+
+impl TraceBitswapBatchAggregate {
+    fn has_events(&self) -> bool {
+        self.commands > 0 || self.peer_attempt_starts > 0 || self.cancelled > 0 || self.failures > 0
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct TraceCidAggregate {
     cid: String,
@@ -4623,6 +4666,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_source_request_modes = BTreeMap::<String, usize>::new();
     let mut bitswap_attempt_modes = BTreeMap::<(String, String), String>::new();
     let mut bitswap_deliveries = BTreeMap::<String, usize>::new();
+    let mut bitswap_batches = TraceBitswapBatchAggregate::default();
     let mut bitswap_extra_blocks = TraceBitswapExtraBlockAggregate::default();
     let mut bitswap_peer_fetches = BTreeMap::<String, TracePeerBuilder>::new();
     let mut trace_errors = BTreeMap::<String, usize>::new();
@@ -5039,6 +5083,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         }
         if phase == "bitswap_peer_attempt_start" {
             bitswap_peer_attempts.starts += 1;
+            bitswap_batches.peer_attempt_starts += 1;
             if let (Some(cid), Some(peer)) = (
                 json_detail_string(value.get("cid")),
                 json_detail_string(value.get("peer")),
@@ -5066,6 +5111,11 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             }
             if value.get("ok").and_then(|ok| ok.as_bool()) == Some(true) {
                 bitswap_peer_attempts.successes += 1;
+                bitswap_batches.peer_attempt_successes += 1;
+                let requested_blocks = trace_count_field(&value, "requested_blocks");
+                bitswap_batches.requested_blocks += requested_blocks;
+                bitswap_batches.max_requested_blocks =
+                    bitswap_batches.max_requested_blocks.max(requested_blocks);
             } else {
                 bitswap_peer_attempts.failures += 1;
                 match value
@@ -5082,6 +5132,16 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         if phase == "bitswap_dial_plan" {
             if let Some(cid) = json_detail_string(value.get("cid")) {
                 provider_fetch_dial_plan_seen.insert(cid, true);
+            }
+            let cid_count = match trace_count_field(&value, "cid_count") {
+                0 => 1,
+                count => count,
+            };
+            bitswap_batches.commands += 1;
+            bitswap_batches.total_cids += cid_count;
+            bitswap_batches.max_cids = bitswap_batches.max_cids.max(cid_count);
+            if cid_count > 1 {
+                bitswap_batches.multi_cid_commands += 1;
             }
             bitswap_dial_plans.events += 1;
             bitswap_dial_plans.peer_targets += value
@@ -5123,6 +5183,12 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                         .and_then(json_u128)
                         .unwrap_or_default(),
                 );
+        }
+        if phase == "bitswap_fetch_cancelled" {
+            bitswap_batches.cancelled += 1;
+        }
+        if phase == "bitswap_batch_failed" {
+            bitswap_batches.failures += 1;
         }
         if phase == "provider_fetch_start" {
             if let Some(cid) = json_detail_string(value.get("cid")) {
@@ -5470,6 +5536,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_source_transports: sorted_trace_counts(bitswap_source_transports),
         bitswap_source_request_modes: sorted_trace_counts(bitswap_source_request_modes),
         bitswap_deliveries: sorted_trace_counts(bitswap_deliveries),
+        bitswap_batches,
         bitswap_extra_blocks,
         bitswap_peer_fetches: sorted_trace_peers(bitswap_peer_fetches),
         bitswap_session,
@@ -7161,18 +7228,20 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "{\"phase\":\"bitswap_peer_attempt_start\",\"cid\":\"cid-a\",\"peer\":\"peer-a\",\"prefer_want_have\":false}\n",
-                "{\"phase\":\"bitswap_peer_attempt\",\"elapsed_ms\":25,\"cid\":\"cid-a\",\"peer\":\"peer-a\",\"ok\":true,\"prefer_want_have\":false,\"bytes\":42}\n",
+                "{\"phase\":\"bitswap_peer_attempt_start\",\"cid\":\"cid-a\",\"cids\":\"cid-a,cid-b,cid-c\",\"cid_count\":3,\"peer\":\"peer-a\",\"prefer_want_have\":false}\n",
+                "{\"phase\":\"bitswap_peer_attempt\",\"elapsed_ms\":25,\"cid\":\"cid-a\",\"cids\":\"cid-a,cid-b,cid-c\",\"cid_count\":3,\"peer\":\"peer-a\",\"ok\":true,\"prefer_want_have\":false,\"bytes\":42,\"requested_blocks\":3}\n",
                 "{\"phase\":\"bitswap_peer_attempt_start\",\"cid\":\"cid-a\",\"peer\":\"peer-b\",\"prefer_want_have\":true}\n",
                 "{\"phase\":\"bitswap_peer_attempt\",\"elapsed_ms\":5000,\"cid\":\"cid-a\",\"peer\":\"peer-b\",\"ok\":false,\"prefer_want_have\":true,\"failure_kind\":\"connection_timeout\",\"error\":\"timed out\"}\n",
                 "{\"phase\":\"bitswap_peer_attempt_start\",\"cid\":\"cid-a\",\"peer\":\"peer-c\",\"prefer_want_have\":true}\n",
                 "{\"phase\":\"bitswap_peer_attempt\",\"elapsed_ms\":10000,\"cid\":\"cid-a\",\"peer\":\"peer-c\",\"ok\":false,\"prefer_want_have\":true,\"failure_kind\":\"read_timeout\",\"error\":\"read timed out\"}\n",
                 "{\"phase\":\"bitswap_peer_attempt_start\",\"cid\":\"cid-b\",\"peer\":\"peer-d\",\"prefer_want_have\":true}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":40,\"cid\":\"cid-b\",\"peer_count\":2,\"trusted_peer_count\":0,\"ok\":true,\"source_peer\":\"peer-d\",\"source_transport\":\"tcp\",\"bitswap_delivery\":\"incoming\",\"source_peer_trusted\":false,\"extra_blocks\":0,\"bytes\":128}\n",
+                "{\"phase\":\"bitswap_fetch_cancelled\",\"cid\":\"cid-a\",\"cids\":\"cid-a,cid-b,cid-c\",\"cid_count\":3}\n",
+                "{\"phase\":\"bitswap_batch_failed\",\"cid\":\"cid-a\",\"cids\":\"cid-a,cid-b,cid-c\",\"cid_count\":3,\"failure_count\":2}\n",
                 "{\"phase\":\"provider_refresh_after_timeout\",\"cid\":\"cid-a\",\"request_timeout\":true}\n",
                 "{\"phase\":\"retry_provider_count\",\"cid\":\"cid-a\",\"same_provider_set\":true,\"same_bitswap_peer_set\":true,\"request_timeout\":true}\n",
                 "{\"phase\":\"provider_retry_after_request_timeout\",\"cid\":\"cid-a\",\"provider_count\":3,\"request_timeout\":true}\n",
-                "{\"phase\":\"bitswap_dial_plan\",\"cid\":\"cid-a\",\"peer_count\":4,\"candidate_peer_count\":5,\"new_dial_peer_count\":2,\"new_dial_addr_count\":3,\"suppressed_dial_peer_count\":1,\"suppressed_dial_addr_count\":4,\"pending_dial_peer_count\":2,\"connected_peer_count\":1,\"command_queued_ms\":7}\n",
+                "{\"phase\":\"bitswap_dial_plan\",\"cid\":\"cid-a\",\"cids\":\"cid-a,cid-b,cid-c\",\"cid_count\":3,\"peer_count\":4,\"candidate_peer_count\":5,\"new_dial_peer_count\":2,\"new_dial_addr_count\":3,\"suppressed_dial_peer_count\":1,\"suppressed_dial_addr_count\":4,\"pending_dial_peer_count\":2,\"connected_peer_count\":1,\"command_queued_ms\":7}\n",
                 "{\"phase\":\"bitswap_dial_rejected\",\"peer\":\"peer-a\",\"transport\":\"tcp\",\"connection_limit\":true}\n",
                 "{\"phase\":\"bitswap_dial_rejected\",\"peer\":\"peer-b\",\"transport\":\"ws\",\"connection_limit\":false}\n",
                 "{\"phase\":\"bitswap_incoming_block\",\"cid\":\"cid-a\",\"peer\":\"peer-d\",\"source_transport\":\"tcp\",\"block_count\":2,\"bytes\":256,\"pending_waiter_count\":3,\"delivered_waiter_count\":2,\"dropped_waiter_count\":1,\"oldest_pending_ms\":75,\"newest_pending_ms\":25}\n",
@@ -7194,6 +7263,16 @@ mod tests {
         assert_eq!(summary.bitswap_peer_attempts.read_timeouts, 1);
         assert_eq!(summary.bitswap_peer_attempts.other_failures, 0);
         assert_eq!(summary.bitswap_peer_attempts.prefer_want_have, 2);
+        assert_eq!(summary.bitswap_batches.commands, 1);
+        assert_eq!(summary.bitswap_batches.multi_cid_commands, 1);
+        assert_eq!(summary.bitswap_batches.total_cids, 3);
+        assert_eq!(summary.bitswap_batches.max_cids, 3);
+        assert_eq!(summary.bitswap_batches.peer_attempt_starts, 4);
+        assert_eq!(summary.bitswap_batches.peer_attempt_successes, 1);
+        assert_eq!(summary.bitswap_batches.requested_blocks, 3);
+        assert_eq!(summary.bitswap_batches.max_requested_blocks, 3);
+        assert_eq!(summary.bitswap_batches.cancelled, 1);
+        assert_eq!(summary.bitswap_batches.failures, 1);
         assert_eq!(summary.bitswap_source_request_modes[0].value, "want_have");
         assert_eq!(summary.bitswap_source_request_modes[0].count, 1);
         assert_eq!(summary.provider_retries.refresh_after_timeout_events, 1);
