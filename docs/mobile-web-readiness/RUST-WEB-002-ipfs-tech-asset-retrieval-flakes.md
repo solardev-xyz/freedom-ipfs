@@ -11368,3 +11368,98 @@ Decision:
 Keep. This is diagnostics-only, but it makes the next multi-want experiment
 measurable at a glance: a useful run should show `multi_cid_commands > 0` and
 `max_requested_blocks > 1`.
+
+## 2026-05-05 Reject: Session-Only UnixFS Link Batch Prefetch
+
+Hypothesis:
+After adding the shared-client `fetch_many` path, a narrower version of the
+earlier UnixFS prefetch hook might be safe enough to test: when UnixFS decodes a
+DAG-PB file with linked children, expose only the first small child-CID window
+and have `FetchingBlockProvider` ask recent successful Bitswap session peers for
+those children in one multi-want batch. This would avoid public gateway
+fallback, avoid new provider lookups, and preserve block verification before
+cache insertion.
+
+Prototype:
+
+- Added a default `BlockProvider::prefetch_blocks(&[Cid])` hook.
+- Had UnixFS call it before serial full-file child reads and before range reads
+  over sized intersecting child links.
+- Implemented `FetchingBlockProvider` as a best-effort, synchronous wrapper
+  around `HttpRetriever::prefetch_recent_bitswap_blocks`.
+- The retriever path used only recent Bitswap session peers and the internal
+  shared-client `fetch_many` batch path.
+- Added `unixfs_link_batch_prefetch` and `bitswap_batch_prefetch` traces and
+  mobile/harness progress mappings.
+
+Focused validation while the prototype was present:
+
+```sh
+cargo test -p freedom-ipfs-unixfs prefetches
+cargo test -p freedom-ipfs-retrieval fetching_block_provider_prefetches_recent_bitswap_children_as_batch
+cargo test -p freedom-ipfs-unixfs
+cargo test -p freedom-ipfs-retrieval
+cargo test -p freedom-ipfs-gateway
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+```
+
+Result:
+
+- focused UnixFS prefetch tests passed
+- focused `FetchingBlockProvider` batch-prefetch test passed against a local
+  multi-want Bitswap peer
+- full UnixFS, retrieval, and gateway test suites passed
+- focused mobile/harness phase-mapping tests passed
+
+Live checks:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-link-batch-prefetch-r3-trace.jsonl \
+  --comparison-output /tmp/vitalik-link-batch-prefetch-r3.json
+
+timeout 360s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-developers-hero-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-hero-link-batch-prefetch-r1-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-hero-link-batch-prefetch-r1.json
+```
+
+Live result:
+
+- `vitalik-root-html-range`: Rust and Kubo both passed `3/3`; Rust root TTFB
+  p50/p95 `545ms` / `6002ms`, Kubo `1873ms` / `2861ms`; Rust max RSS/FD
+  `37888KiB` / `18`, Kubo `163460KiB` / `137`.
+- `ipfs-tech-developers-hero-range`: Rust and Kubo both passed `1/1`; Rust root
+  TTFB `2654ms`, Kubo `2054ms`; Rust max RSS/FD `39916KiB` / `21`, Kubo
+  `110752KiB` / `44`.
+- Neither trace contained `unixfs_link_batch_prefetch` or
+  `bitswap_batch_prefetch`.
+- The harness batch summary reported `multi_cid_commands=0` and
+  `max_requested_blocks=0` in both live runs.
+
+Decision:
+Reject and revert the prototype. The focused tests prove the mechanism, but
+the current live corpus still does not exercise multi-link DAG-PB file children
+through the gateway. The next step should be a deterministic harness case that
+fetches a multi-block UnixFS file through a local Bitswap peer, not another
+production hook carried without live or harness evidence.
