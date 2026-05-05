@@ -431,17 +431,53 @@ impl HttpRetriever {
                                                         bitswap_session_post_lookup_grace(&providers);
                                                     let http_provider_count =
                                                         provider_http_url_count(&providers);
+                                                    let post_lookup_started = Instant::now();
                                                     match timeout(post_lookup_grace, &mut shortcut).await {
-                                                        Ok(shortcut_result) => {
-                                                            if let Some(block) = shortcut_result? {
+                                                        Ok(shortcut_result) => match shortcut_result {
+                                                            Ok(Some(block)) => {
+                                                                tracing::info!(
+                                                                    phase = "bitswap_session_shortcut_post_lookup_wait",
+                                                                    cid = %cid,
+                                                                    outcome = "hit",
+                                                                    timeout_ms = post_lookup_grace.as_millis(),
+                                                                    elapsed_ms = post_lookup_started.elapsed().as_millis(),
+                                                                    provider_count = providers.len(),
+                                                                    http_provider_count
+                                                                );
                                                                 return Ok((block, RetrievalSource::Bitswap));
                                                             }
-                                                        }
+                                                            Ok(None) => {
+                                                                tracing::info!(
+                                                                    phase = "bitswap_session_shortcut_post_lookup_wait",
+                                                                    cid = %cid,
+                                                                    outcome = "miss",
+                                                                    timeout_ms = post_lookup_grace.as_millis(),
+                                                                    elapsed_ms = post_lookup_started.elapsed().as_millis(),
+                                                                    provider_count = providers.len(),
+                                                                    http_provider_count
+                                                                );
+                                                            }
+                                                            Err(err) => {
+                                                                tracing::info!(
+                                                                    phase = "bitswap_session_shortcut_post_lookup_wait",
+                                                                    cid = %cid,
+                                                                    outcome = "error",
+                                                                    timeout_ms = post_lookup_grace.as_millis(),
+                                                                    elapsed_ms = post_lookup_started.elapsed().as_millis(),
+                                                                    provider_count = providers.len(),
+                                                                    http_provider_count,
+                                                                    error = %err
+                                                                );
+                                                                return Err(err);
+                                                            }
+                                                        },
                                                         Err(_) => {
                                                             tracing::info!(
                                                                 phase = "bitswap_session_shortcut_post_lookup_wait",
                                                                 cid = %cid,
+                                                                outcome = "timeout",
                                                                 timeout_ms = post_lookup_grace.as_millis(),
+                                                                elapsed_ms = post_lookup_started.elapsed().as_millis(),
                                                                 provider_count = providers.len(),
                                                                 http_provider_count
                                                             );
@@ -561,17 +597,53 @@ impl HttpRetriever {
                                                     bitswap_session_post_lookup_grace(&providers);
                                                 let http_provider_count =
                                                     provider_http_url_count(&providers);
+                                                let post_lookup_started = Instant::now();
                                                 match timeout(post_lookup_grace, &mut shortcut).await {
-                                                    Ok(shortcut_result) => {
-                                                        if let Some(block) = shortcut_result? {
+                                                    Ok(shortcut_result) => match shortcut_result {
+                                                        Ok(Some(block)) => {
+                                                            tracing::info!(
+                                                                phase = "bitswap_session_shortcut_post_lookup_wait",
+                                                                cid = %cid,
+                                                                outcome = "hit",
+                                                                timeout_ms = post_lookup_grace.as_millis(),
+                                                                elapsed_ms = post_lookup_started.elapsed().as_millis(),
+                                                                provider_count = providers.len(),
+                                                                http_provider_count
+                                                            );
                                                             return Ok((block, RetrievalSource::Bitswap));
                                                         }
-                                                    }
+                                                        Ok(None) => {
+                                                            tracing::info!(
+                                                                phase = "bitswap_session_shortcut_post_lookup_wait",
+                                                                cid = %cid,
+                                                                outcome = "miss",
+                                                                timeout_ms = post_lookup_grace.as_millis(),
+                                                                elapsed_ms = post_lookup_started.elapsed().as_millis(),
+                                                                provider_count = providers.len(),
+                                                                http_provider_count
+                                                            );
+                                                        }
+                                                        Err(err) => {
+                                                            tracing::info!(
+                                                                phase = "bitswap_session_shortcut_post_lookup_wait",
+                                                                cid = %cid,
+                                                                outcome = "error",
+                                                                timeout_ms = post_lookup_grace.as_millis(),
+                                                                elapsed_ms = post_lookup_started.elapsed().as_millis(),
+                                                                provider_count = providers.len(),
+                                                                http_provider_count,
+                                                                error = %err
+                                                            );
+                                                            return Err(err);
+                                                        }
+                                                    },
                                                     Err(_) => {
                                                         tracing::info!(
                                                             phase = "bitswap_session_shortcut_post_lookup_wait",
                                                             cid = %cid,
+                                                            outcome = "timeout",
                                                             timeout_ms = post_lookup_grace.as_millis(),
+                                                            elapsed_ms = post_lookup_started.elapsed().as_millis(),
                                                             provider_count = providers.len(),
                                                             http_provider_count
                                                         );

@@ -933,7 +933,7 @@ fn print_summary(report: &RunReport) {
         if trace.bitswap_session.has_events() {
             let session = &trace.bitswap_session;
             println!(
-                "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_starts={} shortcut_post_lookup_waits={} shortcut_attempts={} shortcut_hits={} shortcut_misses={} late_peer_waits={} late_peer_hits={} late_peer_misses={} late_peer_max={}ms",
+                "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_starts={} shortcut_post_lookup_waits={} post_lookup_hits={} post_lookup_misses={} post_lookup_timeouts={} post_lookup_errors={} post_lookup_max={}ms post_lookup_budgets={} post_lookup_timeout_budgets={} post_lookup_http_counts={} shortcut_attempts={} shortcut_hits={} shortcut_misses={} late_peer_waits={} late_peer_hits={} late_peer_misses={} late_peer_max={}ms",
                 session.fetches,
                 session.with_trusted_peers,
                 session.trusted_successes,
@@ -942,6 +942,24 @@ fn print_summary(report: &RunReport) {
                 session.request_timeouts_with_trusted,
                 session.session_shortcut_starts,
                 session.session_shortcut_post_lookup_waits,
+                session.session_shortcut_post_lookup_hits,
+                session.session_shortcut_post_lookup_misses,
+                session.session_shortcut_post_lookup_timeouts,
+                session.session_shortcut_post_lookup_errors,
+                session.session_shortcut_post_lookup_max_ms,
+                format_trace_counts(&sorted_trace_counts(
+                    session.session_shortcut_post_lookup_budgets.clone()
+                )),
+                format_trace_counts(&sorted_trace_counts(
+                    session
+                        .session_shortcut_post_lookup_timeout_budgets
+                        .clone()
+                )),
+                format_trace_counts(&sorted_trace_counts(
+                    session
+                        .session_shortcut_post_lookup_http_provider_counts
+                        .clone()
+                )),
                 session.session_shortcut_attempts,
                 session.session_shortcut_hits,
                 session.session_shortcut_misses,
@@ -1242,7 +1260,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     if trace.bitswap_session.has_events() {
         let session = &trace.bitswap_session;
         println!(
-            "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_starts={} shortcut_post_lookup_waits={} shortcut_attempts={} shortcut_hits={} shortcut_misses={} late_peer_waits={} late_peer_hits={} late_peer_misses={} late_peer_max={}ms",
+            "  bitswap session: fetches={} with_trusted={} trusted_successes={} untrusted_successes={} trusted_failures={} request_timeouts_with_trusted={} shortcut_starts={} shortcut_post_lookup_waits={} post_lookup_hits={} post_lookup_misses={} post_lookup_timeouts={} post_lookup_errors={} post_lookup_max={}ms post_lookup_budgets={} post_lookup_timeout_budgets={} post_lookup_http_counts={} shortcut_attempts={} shortcut_hits={} shortcut_misses={} late_peer_waits={} late_peer_hits={} late_peer_misses={} late_peer_max={}ms",
             session.fetches,
             session.with_trusted_peers,
             session.trusted_successes,
@@ -1251,6 +1269,24 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
             session.request_timeouts_with_trusted,
             session.session_shortcut_starts,
             session.session_shortcut_post_lookup_waits,
+            session.session_shortcut_post_lookup_hits,
+            session.session_shortcut_post_lookup_misses,
+            session.session_shortcut_post_lookup_timeouts,
+            session.session_shortcut_post_lookup_errors,
+            session.session_shortcut_post_lookup_max_ms,
+            format_trace_counts(&sorted_trace_counts(
+                session.session_shortcut_post_lookup_budgets.clone()
+            )),
+            format_trace_counts(&sorted_trace_counts(
+                session
+                    .session_shortcut_post_lookup_timeout_budgets
+                    .clone()
+            )),
+            format_trace_counts(&sorted_trace_counts(
+                session
+                    .session_shortcut_post_lookup_http_provider_counts
+                    .clone()
+            )),
             session.session_shortcut_attempts,
             session.session_shortcut_hits,
             session.session_shortcut_misses,
@@ -5183,6 +5219,14 @@ struct TraceBitswapSessionAggregate {
     request_timeouts_with_trusted: usize,
     session_shortcut_starts: usize,
     session_shortcut_post_lookup_waits: usize,
+    session_shortcut_post_lookup_hits: usize,
+    session_shortcut_post_lookup_misses: usize,
+    session_shortcut_post_lookup_timeouts: usize,
+    session_shortcut_post_lookup_errors: usize,
+    session_shortcut_post_lookup_max_ms: u128,
+    session_shortcut_post_lookup_budgets: BTreeMap<String, usize>,
+    session_shortcut_post_lookup_timeout_budgets: BTreeMap<String, usize>,
+    session_shortcut_post_lookup_http_provider_counts: BTreeMap<String, usize>,
     session_shortcut_attempts: usize,
     session_shortcut_hits: usize,
     session_shortcut_misses: usize,
@@ -6096,6 +6140,43 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         }
         if phase == "bitswap_session_shortcut_post_lookup_wait" {
             bitswap_session.session_shortcut_post_lookup_waits += 1;
+            bitswap_session.session_shortcut_post_lookup_max_ms =
+                bitswap_session.session_shortcut_post_lookup_max_ms.max(
+                    value
+                        .get("elapsed_ms")
+                        .and_then(json_u128)
+                        .unwrap_or_default(),
+                );
+            let outcome = value
+                .get("outcome")
+                .and_then(|outcome| outcome.as_str())
+                .unwrap_or("timeout");
+            match outcome {
+                "hit" => bitswap_session.session_shortcut_post_lookup_hits += 1,
+                "miss" => bitswap_session.session_shortcut_post_lookup_misses += 1,
+                "timeout" => bitswap_session.session_shortcut_post_lookup_timeouts += 1,
+                "error" => bitswap_session.session_shortcut_post_lookup_errors += 1,
+                _ => {}
+            }
+            if let Some(timeout_ms) = value.get("timeout_ms").and_then(json_u128) {
+                *bitswap_session
+                    .session_shortcut_post_lookup_budgets
+                    .entry(timeout_ms.to_string())
+                    .or_default() += 1;
+                if outcome == "timeout" {
+                    *bitswap_session
+                        .session_shortcut_post_lookup_timeout_budgets
+                        .entry(timeout_ms.to_string())
+                        .or_default() += 1;
+                }
+            }
+            if let Some(http_provider_count) = value.get("http_provider_count").and_then(json_u128)
+            {
+                *bitswap_session
+                    .session_shortcut_post_lookup_http_provider_counts
+                    .entry(http_provider_count.to_string())
+                    .or_default() += 1;
+            }
         }
         if phase == "bitswap_session_late_peer_wait" {
             bitswap_session.session_late_peer_waits += 1;
@@ -8115,6 +8196,30 @@ mod tests {
             summary.bitswap_session.session_shortcut_post_lookup_waits,
             1
         );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_timeouts,
+            1
+        );
+        assert_eq!(
+            summary.bitswap_session.session_shortcut_post_lookup_errors,
+            0
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_budgets
+                .get("100"),
+            Some(&1)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_timeout_budgets
+                .get("100"),
+            Some(&1)
+        );
         assert_eq!(summary.bitswap_session.session_shortcut_attempts, 2);
         assert_eq!(summary.bitswap_session.session_shortcut_hits, 1);
         assert_eq!(summary.bitswap_session.session_shortcut_misses, 1);
@@ -9543,6 +9648,102 @@ mod tests {
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_bitswap"),
             2
+        );
+    }
+
+    #[test]
+    fn trace_summary_counts_post_lookup_wait_outcomes() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-post-lookup-wait-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"bitswap_session_shortcut_post_lookup_wait\",\"cid\":\"cid-a\",\"outcome\":\"hit\",\"timeout_ms\":250,\"elapsed_ms\":81,\"provider_count\":12,\"http_provider_count\":1}\n",
+                "{\"phase\":\"bitswap_session_shortcut_post_lookup_wait\",\"cid\":\"cid-b\",\"outcome\":\"miss\",\"timeout_ms\":100,\"elapsed_ms\":24,\"provider_count\":4,\"http_provider_count\":3}\n",
+                "{\"phase\":\"bitswap_session_shortcut_post_lookup_wait\",\"cid\":\"cid-c\",\"outcome\":\"timeout\",\"timeout_ms\":250,\"elapsed_ms\":251,\"provider_count\":8,\"http_provider_count\":1}\n",
+                "{\"phase\":\"bitswap_session_shortcut_post_lookup_wait\",\"cid\":\"cid-d\",\"timeout_ms\":100,\"provider_count\":2,\"http_provider_count\":0}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            summary.bitswap_session.session_shortcut_post_lookup_waits,
+            4
+        );
+        assert_eq!(summary.bitswap_session.session_shortcut_post_lookup_hits, 1);
+        assert_eq!(
+            summary.bitswap_session.session_shortcut_post_lookup_misses,
+            1
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_timeouts,
+            2
+        );
+        assert_eq!(
+            summary.bitswap_session.session_shortcut_post_lookup_errors,
+            0
+        );
+        assert_eq!(
+            summary.bitswap_session.session_shortcut_post_lookup_max_ms,
+            251
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_budgets
+                .get("100"),
+            Some(&2)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_budgets
+                .get("250"),
+            Some(&2)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_timeout_budgets
+                .get("100"),
+            Some(&1)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_timeout_budgets
+                .get("250"),
+            Some(&1)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_http_provider_counts
+                .get("1"),
+            Some(&2)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_http_provider_counts
+                .get("3"),
+            Some(&1)
+        );
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "fetching_bitswap"),
+            4
         );
     }
 

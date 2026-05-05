@@ -16445,3 +16445,109 @@ asset gap materially, though Kubo still wins asset TTFB. The main risk is that
 a fast single HTTP provider might be delayed by up to `150ms` more than before
 when a recent session shortcut is active, but the secondary `vitalik` and
 `daicowtf` checks stayed inside prior resource/latency envelopes.
+
+## 2026-05-05 Keep: Trace Post-Lookup Session Wait Outcomes
+
+Question:
+After keeping the selective `250ms` post-lookup wait for single HTTP-provider
+results, the next tuning question is whether that grace is too short, too long,
+or only useful in a few request shapes. The existing trace only emitted
+`bitswap_session_shortcut_post_lookup_wait` when the wait timed out, which made
+successful waits invisible and forced tuning from block-source counts.
+
+Implementation:
+
+- Keep retrieval behavior unchanged.
+- Emit `bitswap_session_shortcut_post_lookup_wait` for every post-lookup wait
+  completion, not only timeouts.
+- Add `outcome=hit|miss|timeout|error`, `elapsed_ms`, `timeout_ms`,
+  `provider_count`, and `http_provider_count`.
+- Preserve backwards compatibility in the harness by treating old wait events
+  without `outcome` as timeouts.
+- Extend the harness Bitswap session summary with post-lookup hit, miss,
+  timeout, error, max elapsed, wait-budget, timeout-budget, and HTTP-provider
+  count buckets.
+- Add a focused harness regression test for the outcome counters.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_post_lookup_wait_outcomes
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+cargo test -p freedom-ipfs-retrieval single_http_provider_waits_longer_for_recent_bitswap_peer
+```
+
+Focused result:
+
+- Formatting passed.
+- New post-lookup outcome summary test passed.
+- Existing slow-event trace summary test passed.
+- Existing single HTTP-provider selective-wait retrieval test passed.
+
+Live smoke with corrected summary fields:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-postlookup-outcomes-v2-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-postlookup-outcomes-v2-r3.json
+```
+
+Live result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1314ms` / `1351ms` / `1351ms`.
+- Asset TTFB p50/p95/max: `269ms` / `906ms` / `1262ms`.
+- Run total p50/p95/max: `3333ms` / `3682ms` / `3682ms`.
+- Max RSS/FD: `53056KiB` / `31`.
+- Block sources: `http_provider=115`, `bitswap=4`, `cache=1`.
+- Delegated lookup max: `89ms`; HTTP-provider fetch p50/p95/max
+  `161ms` / `644ms` / `929ms`.
+- Bitswap session summary now showed:
+  - `shortcut_post_lookup_waits=5`
+  - `post_lookup_hits=1`
+  - `post_lookup_timeouts=4`
+  - `post_lookup_errors=0`
+  - `post_lookup_budgets=250=4, 100=1`
+  - `post_lookup_timeout_budgets=250=3, 100=1`
+  - `post_lookup_http_counts=1=4, 3=1`
+- An earlier exploratory raw trace from the same instrumentation, before the
+  summary label was corrected, showed a busier session window with `74`
+  post-lookup waits: `48` hits and `26` timeouts. In that raw trace,
+  single-HTTP-provider waits used the `250ms` budget `38` times, with `30`
+  hits and `8` timeouts.
+
+Final validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo test -p freedom-ipfs-retrieval
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting passed.
+- Full mobile web harness suite passed: `35 passed`.
+- Full retrieval suite passed: `72 passed`, `1 ignored`.
+- Workspace check passed.
+- Workspace clippy passed with `-D warnings`.
+- Diff whitespace check passed.
+
+Decision:
+Keep. This is diagnostics-only and does not change provider selection, Bitswap
+fanout, caching, or verification behavior. It closes the measurement gap for
+the next single-HTTP-provider grace retune: future runs can now tell whether a
+post-lookup wait actually produced a verified session Bitswap block, timed out,
+or merely added delay before the HTTP-provider path.
