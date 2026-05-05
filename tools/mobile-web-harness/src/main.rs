@@ -10,7 +10,8 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
@@ -67,6 +68,9 @@ struct Args {
     /// CAR file to import into each spawned gateway before running the corpus.
     #[arg(long)]
     gateway_import_car: Option<PathBuf>,
+    /// CAR file to import into a separate local Kubo seed provider. Spawned gateways retrieve it over Bitswap.
+    #[arg(long)]
+    bitswap_seed_car: Option<PathBuf>,
     /// Kubo ipfs binary to spawn when --engine kubo is selected.
     #[arg(long, env = "KUBO_BIN", default_value = DEFAULT_KUBO_BIN)]
     kubo_bin: PathBuf,
@@ -305,8 +309,14 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
     if args.gateway_url.is_some() && args.gateway_import_car.is_some() {
         bail!("--gateway-import-car can only be used when the harness spawns the gateway");
     }
+    if args.gateway_url.is_some() && args.bitswap_seed_car.is_some() {
+        bail!("--bitswap-seed-car can only be used when the harness spawns the gateway");
+    }
     if args.gateway_url.is_some() && args.build_gateway {
         bail!("--build-gateway can only be used when the harness spawns the Rust gateway");
+    }
+    if args.gateway_import_car.is_some() && args.bitswap_seed_car.is_some() {
+        bail!("--gateway-import-car cannot be combined with --bitswap-seed-car; the seed mode should exercise network retrieval");
     }
     if args.build_gateway && args.engine != HarnessEngine::Rust {
         bail!("--build-gateway only applies to --engine rust");
@@ -325,6 +335,14 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             bail!(
                 "--gateway-import-car must point to a readable CAR file: {}",
                 import_car.display()
+            );
+        }
+    }
+    if let Some(seed_car) = &args.bitswap_seed_car {
+        if !seed_car.is_file() {
+            bail!(
+                "--bitswap-seed-car must point to a readable CAR file: {}",
+                seed_car.display()
             );
         }
     }
@@ -360,12 +378,14 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
     let measured_runs = args.repeat.max(1);
     let total_runs = args.warmup_runs + measured_runs;
     let mut persistent_gateway = None;
+    let mut persistent_seed = None;
     let persistent_gateway_url = if args.fresh_gateway_per_run {
         None
     } else if let Some(url) = args.gateway_url.as_deref() {
         Some(normalize_gateway_url(url))
     } else {
-        let gateway = SpawnedGateway::start(args).await?;
+        persistent_seed = BitswapSeed::start_optional(args).await?;
+        let gateway = SpawnedGateway::start(args, persistent_seed.as_ref()).await?;
         let url = gateway.url.clone();
         persistent_gateway = Some(gateway);
         Some(url)
@@ -384,10 +404,12 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
         };
 
         let mut run_gateway = None;
+        let mut run_seed = None;
         let gateway_url = if let Some(url) = &persistent_gateway_url {
             url.clone()
         } else {
-            let gateway = SpawnedGateway::start(args).await?;
+            run_seed = BitswapSeed::start_optional(args).await?;
+            let gateway = SpawnedGateway::start(args, run_seed.as_ref()).await?;
             let url = gateway.url.clone();
             run_gateway = Some(gateway);
             url
@@ -466,10 +488,16 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
         if let Some(mut gateway) = run_gateway {
             gateway.stop().await;
         }
+        if let Some(mut seed) = run_seed {
+            seed.stop().await;
+        }
     }
 
     if let Some(mut gateway) = persistent_gateway {
         gateway.stop().await;
+    }
+    if let Some(mut seed) = persistent_seed {
+        seed.stop().await;
     }
 
     let summary = RepeatSummary::from_runs(&runs);
@@ -494,6 +522,10 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             .map(|path| path.display().to_string()),
         gateway_import_car: args
             .gateway_import_car
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        bitswap_seed_car: args
+            .bitswap_seed_car
             .as_ref()
             .map(|path| path.display().to_string()),
         kubo_repo: args
@@ -732,6 +764,9 @@ fn print_summary(report: &RunReport) {
     }
     if let Some(gateway_import_car) = &report.gateway_import_car {
         println!("gateway_import_car: {gateway_import_car}");
+    }
+    if let Some(bitswap_seed_car) = &report.bitswap_seed_car {
+        println!("bitswap_seed_car: {bitswap_seed_car}");
     }
     if let Some(kubo_repo) = &report.kubo_repo {
         println!("kubo_repo: {kubo_repo}");
@@ -2762,6 +2797,213 @@ fn normalize_gateway_url(url: &str) -> String {
 }
 
 #[derive(Debug)]
+struct BitswapSeed {
+    child: Child,
+    repo: PathBuf,
+    router_endpoint: String,
+    provider_addr: String,
+    stdout_task: Option<JoinHandle<()>>,
+    stderr_task: Option<JoinHandle<()>>,
+    router_task: Option<JoinHandle<()>>,
+}
+
+impl BitswapSeed {
+    async fn start_optional(args: &Args) -> Result<Option<Self>> {
+        match &args.bitswap_seed_car {
+            Some(car) => Self::start(&args.kubo_bin, car).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn start(kubo: &PathBuf, car: &Path) -> Result<Self> {
+        let repo = unique_temp_path("freedom-ipfs-bitswap-seed-repo");
+        std::fs::create_dir_all(&repo)
+            .with_context(|| format!("create Bitswap seed Kubo repo {}", repo.display()))?;
+
+        let api_port = reserve_loopback_port().context("reserve Bitswap seed Kubo API port")?;
+        let gateway_port =
+            reserve_loopback_port().context("reserve Bitswap seed Kubo gateway port")?;
+        prepare_kubo_repo(kubo, &repo, api_port, gateway_port)?;
+        kubo_ok_os(
+            kubo,
+            &repo,
+            [OsStr::new("dag"), OsStr::new("import"), car.as_os_str()],
+        )?;
+
+        let mut command = Command::new(kubo);
+        command
+            .kill_on_drop(true)
+            .env("IPFS_PATH", &repo)
+            .env("IPFS_TELEMETRY", "off")
+            .arg("daemon")
+            .arg("--migrate=true")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("spawn Bitswap seed Kubo daemon {}", kubo.display()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("Bitswap seed Kubo stdout was not piped"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("Bitswap seed Kubo stderr was not piped"))?;
+        let stdout_task = Some(log_child_lines("bitswap-seed", stdout));
+        let stderr_task = Some(log_child_lines("bitswap-seed", stderr));
+        wait_for_kubo_api(&mut child, api_port).await?;
+
+        let (peer_id, provider_addr) = kubo_seed_identity(api_port).await?;
+        let (router_endpoint, router_task) =
+            spawn_bitswap_seed_delegated_router(peer_id.clone(), provider_addr.clone()).await?;
+        eprintln!(
+            "bitswap seed provider {peer_id} listening at {provider_addr}; delegated router {router_endpoint}"
+        );
+
+        Ok(Self {
+            child,
+            repo,
+            router_endpoint,
+            provider_addr,
+            stdout_task,
+            stderr_task,
+            router_task: Some(router_task),
+        })
+    }
+
+    async fn stop(&mut self) {
+        if let Some(router_task) = self.router_task.take() {
+            router_task.abort();
+            let _ = router_task.await;
+        }
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+        if let Some(stdout_task) = self.stdout_task.take() {
+            stdout_task.abort();
+            let _ = stdout_task.await;
+        }
+        if let Some(stderr_task) = self.stderr_task.take() {
+            stderr_task.abort();
+            let _ = stderr_task.await;
+        }
+        let _ = std::fs::remove_dir_all(&self.repo);
+    }
+}
+
+async fn kubo_seed_identity(api_port: u16) -> Result<(String, String)> {
+    let url = format!("http://127.0.0.1:{api_port}/api/v0/id");
+    let value: serde_json::Value = reqwest::Client::new()
+        .post(url)
+        .send()
+        .await
+        .context("request Bitswap seed Kubo id")?
+        .error_for_status()
+        .context("Bitswap seed Kubo id status")?
+        .json()
+        .await
+        .context("decode Bitswap seed Kubo id")?;
+    let peer_id = value
+        .get("ID")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("Bitswap seed Kubo id response omitted ID"))?
+        .to_string();
+    let provider_addr = value
+        .get("Addresses")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|addrs| {
+            addrs
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .find(|addr| {
+                    addr.contains("/ip4/127.0.0.1/tcp/")
+                        && addr.ends_with(&format!("/p2p/{peer_id}"))
+                })
+        })
+        .ok_or_else(|| anyhow!("Bitswap seed Kubo id response omitted a loopback TCP address"))?
+        .to_string();
+    Ok((peer_id, provider_addr))
+}
+
+async fn spawn_bitswap_seed_delegated_router(
+    peer_id: String,
+    provider_addr: String,
+) -> Result<(String, JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("bind Bitswap seed delegated router")?;
+    let addr = listener
+        .local_addr()
+        .context("read delegated router addr")?;
+    let endpoint = format!("http://{addr}/routing/v1");
+    let body = Arc::new(
+        serde_json::json!({
+            "Providers": [
+                {
+                    "ID": peer_id,
+                    "Addrs": [provider_addr],
+                }
+            ]
+        })
+        .to_string(),
+    );
+    let task = tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    let body = Arc::clone(&body);
+                    tokio::spawn(async move {
+                        let _ = handle_bitswap_seed_router_connection(stream, body).await;
+                    });
+                }
+                Err(err) => {
+                    eprintln!("bitswap seed delegated router accept failed: {err}");
+                    break;
+                }
+            }
+        }
+    });
+    Ok((endpoint, task))
+}
+
+async fn handle_bitswap_seed_router_connection(
+    mut stream: TcpStream,
+    body: Arc<String>,
+) -> std::io::Result<()> {
+    let mut request = Vec::new();
+    let mut buf = [0u8; 1024];
+    while request.len() < 8192 {
+        let read = stream.read(&mut buf).await?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buf[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let request_line = request
+        .split(|byte| *byte == b'\n')
+        .next()
+        .and_then(|line| std::str::from_utf8(line).ok())
+        .unwrap_or_default()
+        .trim_end_matches('\r');
+    let ok = request_line.starts_with("GET /routing/v1/providers/");
+    let (status, response_body) = if ok {
+        ("200 OK", body.as_str())
+    } else {
+        ("404 Not Found", "")
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        response_body.len(),
+        response_body
+    );
+    stream.write_all(response.as_bytes()).await
+}
+
+#[derive(Debug)]
 struct SpawnedGateway {
     child: Child,
     url: String,
@@ -2772,24 +3014,29 @@ struct SpawnedGateway {
 }
 
 impl SpawnedGateway {
-    async fn start(args: &Args) -> Result<Self> {
+    async fn start(args: &Args, bitswap_seed: Option<&BitswapSeed>) -> Result<Self> {
         match args.engine {
-            HarnessEngine::Rust => Self::start_rust(args).await,
-            HarnessEngine::Kubo => Self::start_kubo(args).await,
+            HarnessEngine::Rust => Self::start_rust(args, bitswap_seed).await,
+            HarnessEngine::Kubo => Self::start_kubo(args, bitswap_seed).await,
         }
     }
 
-    async fn start_rust(args: &Args) -> Result<Self> {
+    async fn start_rust(args: &Args, bitswap_seed: Option<&BitswapSeed>) -> Result<Self> {
         let bin = args
             .gateway_bin
             .clone()
             .unwrap_or_else(|| PathBuf::from("target/debug/freedom-ipfs-gateway"));
+        let routing_mode = if bitswap_seed.is_some() {
+            "delegated"
+        } else {
+            &args.routing_mode
+        };
         let mut command = Command::new(&bin);
         command
             .kill_on_drop(true)
             .arg("--online")
             .arg("--routing-mode")
-            .arg(&args.routing_mode)
+            .arg(routing_mode)
             .arg("--max-concurrent-requests")
             .arg(args.max_concurrent_requests.to_string())
             .arg("--dht-query-timeout-secs")
@@ -2806,7 +3053,9 @@ impl SpawnedGateway {
         if let Some(trace_filter) = &args.trace_filter {
             command.arg("--trace-filter").arg(trace_filter);
         }
-        if let Some(delegated_router) = &args.delegated_router {
+        if let Some(seed) = bitswap_seed {
+            command.arg("--delegated-router").arg(&seed.router_endpoint);
+        } else if let Some(delegated_router) = &args.delegated_router {
             command.arg("--delegated-router").arg(delegated_router);
         }
         if let Some(gateway_db) = &args.gateway_db {
@@ -2854,7 +3103,7 @@ impl SpawnedGateway {
         }
     }
 
-    async fn start_kubo(args: &Args) -> Result<Self> {
+    async fn start_kubo(args: &Args, bitswap_seed: Option<&BitswapSeed>) -> Result<Self> {
         let kubo = &args.kubo_bin;
         let (repo, remove_storage_on_stop) = match &args.kubo_repo {
             Some(repo) => (repo.clone(), false),
@@ -2901,6 +3150,17 @@ impl SpawnedGateway {
         let stdout_task = Some(log_child_lines("kubo", stdout));
         let stderr_task = Some(log_child_lines("kubo", stderr));
         wait_for_kubo_api(&mut child, api_port).await?;
+        if let Some(seed) = bitswap_seed {
+            kubo_ok_os(
+                kubo,
+                &repo,
+                [
+                    OsStr::new("swarm"),
+                    OsStr::new("connect"),
+                    OsStr::new(seed.provider_addr.as_str()),
+                ],
+            )?;
+        }
         let url = format!("http://127.0.0.1:{gateway_port}");
         eprintln!("kubo gateway listening on {url}");
 
@@ -3325,6 +3585,7 @@ struct RunReport {
     engine: HarnessEngine,
     gateway_db: Option<String>,
     gateway_import_car: Option<String>,
+    bitswap_seed_car: Option<String>,
     kubo_repo: Option<String>,
     trace_output: Option<String>,
     trace_summary: Option<TraceSummary>,
@@ -6471,6 +6732,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn args_accept_bitswap_seed_car() {
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--bitswap-seed-car",
+            "/tmp/mobile-fixture.car",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.bitswap_seed_car.as_deref(),
+            Some(Path::new("/tmp/mobile-fixture.car"))
+        );
+    }
+
     #[tokio::test]
     async fn gateway_import_car_requires_spawned_gateway() {
         let args = Args::try_parse_from([
@@ -6517,6 +6793,103 @@ mod tests {
         assert!(err
             .to_string()
             .contains("--gateway-import-car must point to a readable CAR file"));
+    }
+
+    #[tokio::test]
+    async fn bitswap_seed_car_requires_spawned_gateway() {
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--gateway-url",
+            "http://127.0.0.1:50017",
+            "--bitswap-seed-car",
+            "/tmp/mobile-fixture.car",
+        ])
+        .unwrap();
+        let corpus = Corpus {
+            entries: Vec::new(),
+        };
+
+        let err = run_harness(&args, &corpus).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--bitswap-seed-car can only be used when the harness spawns the gateway"));
+    }
+
+    #[tokio::test]
+    async fn bitswap_seed_car_rejects_gateway_import_car() {
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--gateway-import-car",
+            "/tmp/mobile-fixture.car",
+            "--bitswap-seed-car",
+            "/tmp/mobile-fixture.car",
+        ])
+        .unwrap();
+        let corpus = Corpus {
+            entries: Vec::new(),
+        };
+
+        let err = run_harness(&args, &corpus).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--gateway-import-car cannot be combined with --bitswap-seed-car"));
+    }
+
+    #[tokio::test]
+    async fn bitswap_seed_car_requires_readable_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "missing-bitswap-seed-{}-{}.car",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_arg = path.display().to_string();
+        let args = Args::try_parse_from([
+            "mobile-web-harness".to_string(),
+            "--bitswap-seed-car".to_string(),
+            path_arg,
+        ])
+        .unwrap();
+        let corpus = Corpus {
+            entries: Vec::new(),
+        };
+
+        let err = run_harness(&args, &corpus).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--bitswap-seed-car must point to a readable CAR file"));
+    }
+
+    #[tokio::test]
+    async fn bitswap_seed_delegated_router_returns_provider_record() {
+        let (endpoint, task) = spawn_bitswap_seed_delegated_router(
+            "peer-id".to_string(),
+            "/ip4/127.0.0.1/tcp/4001/p2p/peer-id".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let body = reqwest::get(format!("{endpoint}/providers/bafytest"))
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(value["Providers"][0]["ID"], "peer-id");
+        assert_eq!(
+            value["Providers"][0]["Addrs"][0],
+            "/ip4/127.0.0.1/tcp/4001/p2p/peer-id"
+        );
+
+        task.abort();
+        let _ = task.await;
     }
 
     #[test]
@@ -7818,6 +8191,7 @@ mod tests {
             engine: HarnessEngine::Rust,
             gateway_db: Some("/tmp/replay.db".to_string()),
             gateway_import_car: None,
+            bitswap_seed_car: None,
             kubo_repo: None,
             trace_output: None,
             trace_summary: None,

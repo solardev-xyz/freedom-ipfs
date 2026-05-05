@@ -11463,3 +11463,81 @@ the current live corpus still does not exercise multi-link DAG-PB file children
 through the gateway. The next step should be a deterministic harness case that
 fetches a multi-block UnixFS file through a local Bitswap peer, not another
 production hook carried without live or harness evidence.
+
+## 2026-05-05 Keep: Local Bitswap Seed Harness Mode
+
+Hypothesis:
+Before carrying another UnixFS child-prefetch hook, the harness needs a
+deterministic case that exercises a multi-block DAG-PB UnixFS file through
+Bitswap rather than a cache-imported CAR. The existing stream fixture is useful
+for gateway/range parity, but importing the CAR into the gateway bypasses the
+retrieval path that a multi-want experiment needs to improve.
+
+Change:
+
+- Add `--bitswap-seed-car` to `mobile-web-harness`.
+- The option imports the CAR into a separate local Kubo seed daemon.
+- For Rust gateway runs, the harness starts a tiny loopback delegated-routing
+  endpoint that returns the Kubo seed's Bitswap peer ID and loopback TCP
+  multiaddr for provider lookups.
+- For Kubo gateway runs, the harness starts a separate Kubo client daemon and
+  `swarm connect`s it to the local seed before running requests.
+- The option is rejected with `--gateway-url` and with `--gateway-import-car`,
+  so seeded runs exercise network retrieval instead of testing an already
+  populated gateway cache.
+- `RunReport` records `bitswap_seed_car` for JSON artifacts.
+
+Validation:
+
+```sh
+cargo test -p mobile-web-harness bitswap_seed
+cargo test -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+cargo check --workspace --all-targets
+
+cargo run -p xtask -- generate-mobile-web-fixture \
+  --car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --bytes 600000 \
+  --range-start 262100 \
+  --range-len 300 \
+  --case-id bitswap-seeded-multiblock
+
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 1 \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-bitswap-seed-boundary-rust-trace.jsonl \
+  --comparison-output /tmp/harness-bitswap-seed-boundary-rust-vs-kubo.json
+```
+
+Result:
+
+- focused harness tests passed: `5 passed; 0 failed`
+- full harness tests passed: `29 passed; 0 failed`
+- mobile web harness clippy passed with `-D warnings`
+- workspace check passed
+- fixture root CID:
+  `bafybeig45rg3a5hszbyqnqanqjkgbkwrx7vjcv4uligjzw4jmhomgsshty`
+- Rust and Kubo both passed `bitswap-seeded-multiblock-boundary-range`.
+- Rust root TTFB `205ms`; Kubo root TTFB `53ms`.
+- Rust max RSS/FD `38108KiB` / `13`; Kubo max RSS/FD `88632KiB` / `35`.
+- Rust trace showed one local delegated provider lookup returning one provider.
+- Rust trace showed three Bitswap incoming blocks totaling `524447` bytes:
+  the DAG-PB root plus two raw UnixFS child blocks for the boundary range.
+- Harness batch summary showed the current baseline is still serial
+  single-CID Bitswap requests:
+  `commands=3 multi_cid_commands=0 total_cids=3 max_cids=1`.
+
+Decision:
+Keep. This gives future multi-want/prefetch work a deterministic harness target:
+before a production hook is kept, this seeded boundary-range run should show
+`multi_cid_commands > 0` or otherwise produce better latency/resource evidence
+against the same Kubo-backed seed setup.
