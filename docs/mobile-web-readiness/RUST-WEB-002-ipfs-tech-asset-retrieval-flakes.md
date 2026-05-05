@@ -8602,3 +8602,62 @@ git diff --check
 Decision: keep. This is diagnostics-only and makes the next sparse-provider
 experiment measurable without changing routing, Bitswap, gateway behavior,
 cache semantics, or public gateway policy.
+
+## 2026-05-05 Keep: DHT Provider Lookup Trace Summary
+
+Motivation:
+The low-diversity summary shows when fallback was attempted, but sparse-provider
+experiments also need a direct DHT signal: did light DHT find providers, how
+long did it run, and did it fail or time out? Previously that had to be inferred
+from generic retrieval-level `provider_lookup` errors.
+
+Implementation:
+
+- Emit `dht_provider_lookup` from `LightDhtClient::providers` with `ok`,
+  provider count, configured max providers, query timeout, elapsed time, and
+  sanitized error on failure.
+- Add `dht_provider_lookup` to serialized harness trace summaries.
+- Print DHT lookup count, successes/failures, total providers, max provider cap,
+  max timeout cap, and max elapsed time in single-engine and Rust-vs-Kubo
+  output.
+- Extend the trace-summary fixture with one failed and one successful
+  `dht_provider_lookup` event.
+
+Validation:
+
+```sh
+cargo fmt --all
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+cargo test -p freedom-ipfs-routing observed_light_dht_records_provider_lookup_stats
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy -p freedom-ipfs-routing -p mobile-web-harness --all-targets -- -D warnings
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/daicowtf-dht-provider-lookup-trace.jsonl \
+  --output /tmp/daicowtf-dht-provider-lookup.json
+git diff --check
+```
+
+Live result:
+
+- The `daicowtf-page-assets` smoke failed as expected with root `504` after
+  `27044ms`.
+- The new DHT summary was present:
+  `events=2 successes=1 failures=1 providers=0 max_providers=4
+  max_timeout_ms=10000 max_elapsed_ms=10010`.
+- The low-diversity summary showed `events=2 failures=1 providers_total=1`,
+  `dht_providers_total=0`, and `fallbacks=light_dht=2`.
+- The grouped request summary isolated the single failed root request, and the
+  slow-CID summary identified child CID
+  `bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u` as the
+  timeout source.
+
+Decision: keep. This is diagnostics-only and does not change provider
+selection, DHT timeout policy, retrieval behavior, cache semantics, or public
+gateway policy.

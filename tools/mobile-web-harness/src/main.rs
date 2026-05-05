@@ -819,6 +819,7 @@ fn print_summary(report: &RunReport) {
         }
         print_trace_provider_retries(trace);
         print_trace_delegated_provider_lookup(trace);
+        print_trace_dht_provider_lookup(trace);
         print_trace_provider_diversity_low(trace);
         if !trace.request_statuses.is_empty() || trace.gateway_limiter_denials > 0 {
             println!(
@@ -1169,6 +1170,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_progress_phases(trace);
     print_trace_provider_retries(trace);
     print_trace_delegated_provider_lookup(trace);
+    print_trace_dht_provider_lookup(trace);
     print_trace_provider_diversity_low(trace);
     if !trace.request_statuses.is_empty() || trace.gateway_limiter_denials > 0 {
         println!(
@@ -1304,6 +1306,23 @@ fn print_trace_delegated_provider_lookup(trace: &TraceSummary) {
             endpoint.max_elapsed_ms
         );
     }
+}
+
+fn print_trace_dht_provider_lookup(trace: &TraceSummary) {
+    let dht = &trace.dht_provider_lookup;
+    if dht.events == 0 {
+        return;
+    }
+    println!(
+        "  dht provider lookup: events={} successes={} failures={} providers={} max_providers={} max_timeout_ms={} max_elapsed_ms={}",
+        dht.events,
+        dht.successes,
+        dht.failures,
+        dht.providers,
+        dht.max_providers,
+        dht.max_timeout_ms,
+        dht.max_elapsed_ms
+    );
 }
 
 fn print_trace_provider_diversity_low(trace: &TraceSummary) {
@@ -3786,6 +3805,7 @@ struct TraceSummary {
     provider_retries: TraceProviderRetryAggregate,
     delegated_provider_lookup: TraceDelegatedProviderLookupAggregate,
     delegated_provider_lookup_by_endpoint: Vec<TraceDelegatedProviderEndpointAggregate>,
+    dht_provider_lookup: TraceDhtProviderLookupAggregate,
     provider_diversity_low: TraceProviderDiversityLowAggregate,
     request_statuses: Vec<TraceValueCount>,
     gateway_limiter_denials: usize,
@@ -3907,6 +3927,36 @@ struct TraceDelegatedProviderEndpointAggregate {
     failures: usize,
     providers: u128,
     max_elapsed_ms: u128,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct TraceDhtProviderLookupAggregate {
+    events: usize,
+    successes: usize,
+    failures: usize,
+    providers: u128,
+    max_providers: u128,
+    max_timeout_ms: u128,
+    max_elapsed_ms: u128,
+}
+
+impl TraceDhtProviderLookupAggregate {
+    fn record(&mut self, value: &serde_json::Value, elapsed_ms: Option<u128>) {
+        self.events += 1;
+        if value.get("ok").and_then(|ok| ok.as_bool()) == Some(false) {
+            self.failures += 1;
+        } else {
+            self.successes += 1;
+        }
+        self.providers += trace_count_field(value, "provider_count");
+        self.max_providers = self
+            .max_providers
+            .max(trace_count_field(value, "max_providers"));
+        if let Some(timeout_ms) = value.get("timeout_ms").and_then(json_u128) {
+            self.max_timeout_ms = self.max_timeout_ms.max(timeout_ms);
+        }
+        self.max_elapsed_ms = self.max_elapsed_ms.max(elapsed_ms.unwrap_or_default());
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -4471,6 +4521,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut delegated_provider_lookup = TraceDelegatedProviderLookupAggregate::default();
     let mut delegated_provider_lookup_by_endpoint =
         BTreeMap::<String, TraceDelegatedProviderLookupAggregate>::new();
+    let mut dht_provider_lookup = TraceDhtProviderLookupAggregate::default();
     let mut provider_diversity_low = TraceProviderDiversityLowBuilder::default();
     let mut request_statuses = BTreeMap::<String, usize>::new();
     let mut gateway_limiter_denials = 0usize;
@@ -4583,6 +4634,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 .entry(endpoint)
                 .or_default()
                 .record(&value, elapsed_ms);
+        }
+        if phase == "dht_provider_lookup" {
+            dht_provider_lookup.record(&value, elapsed_ms);
         }
         if phase == "provider_diversity_low" {
             provider_diversity_low.record(&value);
@@ -5258,6 +5312,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         delegated_provider_lookup_by_endpoint: sorted_trace_delegated_provider_endpoints(
             delegated_provider_lookup_by_endpoint,
         ),
+        dht_provider_lookup,
         provider_diversity_low: provider_diversity_low.into_aggregate(),
         request_statuses: sorted_trace_counts(request_statuses),
         gateway_limiter_denials,
@@ -6250,6 +6305,8 @@ mod tests {
                 "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid2\",\"provider_count\":1,\"bitswap_provider_count\":1,\"min_bitswap_provider_count\":2,\"fallback\":\"light_dht\"}\n",
                 "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid2\",\"provider_count\":3,\"dht_provider_count\":2,\"bitswap_provider_count\":2,\"fallback\":\"light_dht\"}\n",
                 "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid2\",\"bitswap_provider_count\":1,\"fallback\":\"light_dht\",\"ok\":false,\"timeout_ms\":750}\n",
+                "{\"phase\":\"dht_provider_lookup\",\"elapsed_ms\":6,\"cid\":\"cid2\",\"ok\":false,\"error\":\"dht: timed out\",\"max_providers\":4,\"timeout_ms\":750}\n",
+                "{\"phase\":\"dht_provider_lookup\",\"elapsed_ms\":20,\"cid\":\"cid3\",\"ok\":true,\"provider_count\":2,\"max_providers\":4,\"timeout_ms\":750}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":12,\"cid\":\"cid6\",\"ok\":false,\"trusted_peer_count\":1}\n",
                 "{\"phase\":\"bitswap_peer_expand\",\"elapsed_ms\":3,\"cid\":\"cid7\",\"tcp_addr_count\":4,\"quic_addr_count\":2,\"ws_addr_count\":1,\"wss_addr_count\":0,\"dns_addr_count\":1,\"ip4_addr_count\":3,\"ip6_addr_count\":1,\"provider_addr_count\":10,\"expanded_provider_addr_count\":12,\"supported_provider_addr_count\":4,\"rejected_provider_addr_count\":8,\"id_only_provider_count\":1,\"invalid_provider_id_count\":2,\"provider_without_supported_bitswap_addr_count\":3,\"unsupported_relay_addr_count\":4,\"unsupported_webtransport_addr_count\":1,\"unsupported_webrtc_addr_count\":1,\"unsupported_certhash_addr_count\":1,\"unsupported_transport_addr_count\":1,\"missing_peer_addr_count\":1,\"unparsable_addr_count\":1,\"addr_with_relay_count\":6,\"addr_with_webtransport_count\":2,\"addr_with_webrtc_count\":3,\"addr_with_certhash_count\":4}\n",
                 "{\"phase\":\"bitswap_session_shortcut_start\",\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1}\n",
@@ -6285,9 +6342,9 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 37);
-        assert_eq!(summary.event_count, 36);
-        assert_eq!(summary.slow_events.len(), 15);
+        assert_eq!(summary.line_count, 39);
+        assert_eq!(summary.event_count, 38);
+        assert_eq!(summary.slow_events.len(), 16);
         assert_eq!(
             summary.slow_events[0].phase,
             "bitswap_request_timeout_detail"
@@ -6324,7 +6381,7 @@ mod tests {
             summary.slow_events[2].details.get("source_peer_trusted"),
             Some(&"true".to_string())
         );
-        assert_eq!(summary.phases.len(), 10);
+        assert_eq!(summary.phases.len(), 11);
         assert_eq!(summary.block_sources.len(), 2);
         assert_eq!(summary.block_sources[0].value, "bitswap");
         assert_eq!(summary.block_sources[0].count, 1);
@@ -6360,6 +6417,13 @@ mod tests {
             "light_dht"
         );
         assert_eq!(summary.provider_diversity_low.fallbacks[0].count, 3);
+        assert_eq!(summary.dht_provider_lookup.events, 2);
+        assert_eq!(summary.dht_provider_lookup.successes, 1);
+        assert_eq!(summary.dht_provider_lookup.failures, 1);
+        assert_eq!(summary.dht_provider_lookup.providers, 2);
+        assert_eq!(summary.dht_provider_lookup.max_providers, 4);
+        assert_eq!(summary.dht_provider_lookup.max_timeout_ms, 750);
+        assert_eq!(summary.dht_provider_lookup.max_elapsed_ms, 20);
         assert_eq!(summary.unixfs_metadata_cache.events, 1);
         assert_eq!(summary.unixfs_metadata_cache.hits, 3);
         assert_eq!(summary.unixfs_metadata_cache.misses, 2);
@@ -6423,7 +6487,7 @@ mod tests {
             .iter()
             .map(|error| error.value.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(trace_errors.len(), 8);
+        assert_eq!(trace_errors.len(), 9);
         assert!(trace_errors.iter().any(|error| {
             error.starts_with("bitswap_connection_error: Failed to negotiate transport protocol")
         }));
@@ -6433,6 +6497,7 @@ mod tests {
         assert!(trace_errors.contains(&"bitswap_session_shortcut: ok=false"));
         assert!(trace_errors.contains(&"provider_lookup: dht: timeout"));
         assert!(trace_errors.contains(&"provider_diversity_low: ok=false"));
+        assert!(trace_errors.contains(&"dht_provider_lookup: dht: timed out"));
         assert_eq!(summary.bitswap_addr_mix[0].value, "tcp");
         assert_eq!(summary.bitswap_addr_mix[0].count, 4);
         assert_eq!(summary.bitswap_addr_mix[1].value, "ip4");
@@ -6555,18 +6620,27 @@ mod tests {
         assert_eq!(summary.bitswap_dns_expansion.failed, 1);
         assert_eq!(summary.bitswap_dns_expansion.records, 4);
         assert_eq!(summary.bitswap_dns_expansion.ips, 4);
-        assert_eq!(summary.slow_cids[0].cid, "cid4");
-        assert_eq!(summary.slow_cids[0].total_ms, 60);
-        assert_eq!(summary.slow_cids[0].max_ms, 60);
-        assert_eq!(
-            summary.slow_cids[0].phases[0].value,
-            "bitswap_request_timeout_detail"
-        );
-        assert_eq!(summary.slow_cids[1].cid, "cid3");
-        assert_eq!(summary.slow_cids[1].paths[0].value, "/ipfs/root/index.html");
-        assert_eq!(summary.slow_cids[2].cid, "cid1");
-        assert_eq!(summary.slow_cids[2].total_ms, 30);
-        assert_eq!(summary.slow_cids[2].count, 2);
+        let cid4 = summary
+            .slow_cids
+            .iter()
+            .find(|cid| cid.cid == "cid4")
+            .unwrap();
+        assert_eq!(cid4.total_ms, 60);
+        assert_eq!(cid4.max_ms, 60);
+        assert_eq!(cid4.phases[0].value, "bitswap_request_timeout_detail");
+        let cid3 = summary
+            .slow_cids
+            .iter()
+            .find(|cid| cid.cid == "cid3")
+            .unwrap();
+        assert_eq!(cid3.paths[0].value, "/ipfs/root/index.html");
+        let cid1 = summary
+            .slow_cids
+            .iter()
+            .find(|cid| cid.cid == "cid1")
+            .unwrap();
+        assert_eq!(cid1.total_ms, 30);
+        assert_eq!(cid1.count, 2);
         assert_eq!(summary.slow_requests.len(), 1);
         assert_eq!(summary.slow_requests[0].path, "/ipns/site/asset.js");
         assert_eq!(summary.slow_requests[0].request_id, "9");

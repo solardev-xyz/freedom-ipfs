@@ -586,6 +586,32 @@ impl LightDhtClient {
     }
 
     pub async fn providers(&self, cid: &Cid) -> Result<Vec<Provider>> {
+        let started = Instant::now();
+        let result = self.providers_inner(cid).await;
+        match &result {
+            Ok(providers) => tracing::info!(
+                phase = "dht_provider_lookup",
+                cid = %cid,
+                ok = true,
+                provider_count = providers.len(),
+                max_providers = self.max_providers,
+                timeout_ms = self.query_timeout.as_millis(),
+                elapsed_ms = started.elapsed().as_millis()
+            ),
+            Err(err) => tracing::info!(
+                phase = "dht_provider_lookup",
+                cid = %cid,
+                ok = false,
+                error = %err,
+                max_providers = self.max_providers,
+                timeout_ms = self.query_timeout.as_millis(),
+                elapsed_ms = started.elapsed().as_millis()
+            ),
+        }
+        result
+    }
+
+    async fn providers_inner(&self, cid: &Cid) -> Result<Vec<Provider>> {
         let mut swarm = self.bootstrapped_swarm().await?;
 
         let key = kad::RecordKey::new(&cid.hash().to_bytes());
