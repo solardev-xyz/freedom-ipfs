@@ -406,18 +406,38 @@ impl HttpRetriever {
                                 lookup_result = &mut provider_lookup => {
                                     match lookup_result {
                                         Ok(providers) => {
-                                            match timeout(BITSWAP_SESSION_POST_LOOKUP_GRACE, &mut shortcut).await {
-                                                Ok(shortcut_result) => {
-                                                    if let Some(block) = shortcut_result? {
+                                            if providers.is_empty() {
+                                                match shortcut.await? {
+                                                    Some(block) => {
+                                                        tracing::info!(
+                                                            phase = "bitswap_session_shortcut_empty_providers_wait",
+                                                            cid = %cid,
+                                                            outcome = "hit"
+                                                        );
                                                         return Ok((block, RetrievalSource::Bitswap));
                                                     }
+                                                    None => {
+                                                        tracing::info!(
+                                                            phase = "bitswap_session_shortcut_empty_providers_wait",
+                                                            cid = %cid,
+                                                            outcome = "miss"
+                                                        );
+                                                    }
                                                 }
-                                                Err(_) => {
-                                                    tracing::info!(
-                                                        phase = "bitswap_session_shortcut_post_lookup_wait",
-                                                        cid = %cid,
-                                                        timeout_ms = BITSWAP_SESSION_POST_LOOKUP_GRACE.as_millis()
-                                                    );
+                                            } else {
+                                                match timeout(BITSWAP_SESSION_POST_LOOKUP_GRACE, &mut shortcut).await {
+                                                    Ok(shortcut_result) => {
+                                                        if let Some(block) = shortcut_result? {
+                                                            return Ok((block, RetrievalSource::Bitswap));
+                                                        }
+                                                    }
+                                                    Err(_) => {
+                                                        tracing::info!(
+                                                            phase = "bitswap_session_shortcut_post_lookup_wait",
+                                                            cid = %cid,
+                                                            timeout_ms = BITSWAP_SESSION_POST_LOOKUP_GRACE.as_millis()
+                                                        );
+                                                    }
                                                 }
                                             }
                                             providers
@@ -5704,6 +5724,54 @@ mod bitswap_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn empty_provider_lookup_waits_for_recent_bitswap_peer() {
+        let first = b"empty provider first block";
+        let second = b"empty provider follow-on block";
+        let first_cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, first);
+        let second_cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, second);
+        let (peer_id, addr, swarm_task, stream_task) = spawn_delayed_multi_block_bitswap_peer(
+            vec![(first_cid, first.to_vec()), (second_cid, second.to_vec())],
+            Duration::from_millis(250),
+        )
+        .await;
+        let delegated_requests = Arc::new(AtomicU64::new(0));
+        let (endpoint, routing_task) = spawn_counting_delegated_response(
+            r#"{"Providers":[]}"#.into(),
+            delegated_requests.clone(),
+        )
+        .await;
+
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new(endpoint),
+            store.clone(),
+        );
+        let provider =
+            Provider::from_parts(Some(peer_id.to_string()), vec![addr.to_string()]).unwrap();
+
+        retriever
+            .fetch_from_providers_with_source(&first_cid, &[provider])
+            .await
+            .unwrap();
+
+        let (block, source) = retriever
+            .fetch_block_with_source(&second_cid)
+            .await
+            .unwrap();
+
+        assert_eq!(source, RetrievalSource::Bitswap);
+        assert_eq!(block.data(), second);
+        assert_eq!(delegated_requests.load(Ordering::Relaxed), 1);
+
+        tokio::time::timeout(Duration::from_secs(5), stream_task)
+            .await
+            .unwrap()
+            .unwrap();
+        swarm_task.abort();
+        routing_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn recent_bitswap_peer_can_win_after_fast_provider_lookup() {
         let data = b"post lookup session shortcut block";
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
@@ -6384,6 +6452,18 @@ mod bitswap_tests {
         tokio::task::JoinHandle<()>,
         tokio::task::JoinHandle<()>,
     ) {
+        spawn_delayed_multi_block_bitswap_peer(blocks, Duration::ZERO).await
+    }
+
+    async fn spawn_delayed_multi_block_bitswap_peer(
+        blocks: Vec<(Cid, Vec<u8>)>,
+        response_delay: Duration,
+    ) -> (
+        PeerId,
+        Multiaddr,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let mut swarm = SwarmBuilder::with_new_identity()
             .with_tokio()
             .with_tcp(
@@ -6427,6 +6507,9 @@ mod bitswap_tests {
                 let mut cid_bytes = entry.block.as_slice();
                 let cid = Cid::read_bytes(&mut cid_bytes).unwrap();
                 let data = blocks.remove(&cid).expect("requested known block");
+                if !response_delay.is_zero() {
+                    tokio::time::sleep(response_delay).await;
+                }
 
                 let response = BitswapMessage {
                     payload: vec![BlockPayload {

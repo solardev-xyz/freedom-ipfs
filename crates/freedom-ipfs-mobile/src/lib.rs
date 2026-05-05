@@ -565,6 +565,8 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         | "bitswap_dial_plan"
         | "bitswap_session_shortcut"
         | "bitswap_session_shortcut_start"
+        | "bitswap_session_shortcut_pre_lookup"
+        | "bitswap_session_shortcut_empty_providers_wait"
         | "bitswap_session_shortcut_post_lookup_wait" => "fetching_bitswap",
         "bitswap_fetch_cancelled" => "cancelled",
         "bitswap_request_timeout_detail"
@@ -2174,6 +2176,22 @@ mod tests {
             progress_phase(
                 "bitswap_connection_established",
                 &progress_fields([("phase", "bitswap_connection_established")]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_session_shortcut_pre_lookup",
+                &progress_fields([("phase", "bitswap_session_shortcut_pre_lookup")]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_session_shortcut_empty_providers_wait",
+                &progress_fields([("phase", "bitswap_session_shortcut_empty_providers_wait")]),
                 "active",
             ),
             "fetching_bitswap"

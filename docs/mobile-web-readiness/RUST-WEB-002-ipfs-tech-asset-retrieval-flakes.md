@@ -10483,3 +10483,92 @@ Result:
 Decision: no code change. This does not reopen the earlier rejected default
 `cid.contact` change. The sparse-provider issue remains, but this endpoint did
 not add diversity for the failing `daicowtf` child CID in this run.
+
+## 2026-05-05 Keep: Let Recent Session Peers Finish When Provider Lookup Is Empty
+
+Hypothesis:
+After the session peer head-start change, a known-good recent Bitswap peer can
+still lose if delegated routing quickly returns an empty provider set. In that
+case, failing immediately wastes an in-flight peer request that may answer
+within the existing bounded session shortcut timeout.
+
+Implementation:
+
+- When recent session peers exist and provider lookup returns `Ok([])`, wait for
+  the already-started session shortcut to finish before failing.
+- Keep the existing `100ms` post-lookup grace when provider lookup returns a
+  non-empty provider set.
+- Reuse the existing `2s` internal session shortcut timeout; do not increase
+  provider fanout, add fallback gateways, or trust unverified blocks.
+- Emit `bitswap_session_shortcut_empty_providers_wait` with `hit`/`miss`.
+- Map both pre-lookup and empty-provider session shortcut trace events to the
+  mobile progress phase `fetching_bitswap`.
+
+Focused tests:
+
+```sh
+cargo test -p freedom-ipfs-retrieval empty_provider_lookup_waits_for_recent_bitswap_peer
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+```
+
+Result:
+
+- Both focused tests passed.
+- The retrieval test covers a delayed recent Bitswap peer answering after a
+  delegated `Providers: []` result.
+- The mobile test keeps the new trace phase out of user-facing progress state.
+
+Normal-path regression check:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-empty-provider-wait-page-assets-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-empty-provider-wait-page-assets-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `3/1549ms`, Kubo `3/1515ms`.
+- Asset TTFB p50/p95: Rust `3/405ms`, Kubo `4/435ms`.
+- Rust RSS/FD: `52204KiB`/`44`; Kubo RSS/FD: `118040KiB`/`54`.
+- Delegated provider lookup events were `20`, in line with the previous session
+  head-start run.
+
+Sparse-provider check:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/daicowtf-empty-provider-wait-r1-trace.jsonl \
+  --output /tmp/daicowtf-empty-provider-wait-r1.json
+```
+
+Result:
+
+- Rust failed `0/1` with status `504`.
+- The root still had one provider and the failing child CID hit the existing
+  provider-lookup-error/session-shortcut wait path after delegated routing found
+  `0` providers and DHT timed out.
+- No `bitswap_session_shortcut_empty_providers_wait` hit was expected from this
+  run; this is not a useful keep/reject signal for the empty-provider branch.
+
+Decision: keep. The change is narrow and bounded by an existing `2s` cap only
+when a recent session peer exists and routing returns an empty provider set. It
+does not alter the non-empty provider path or the read-only trust model, and it
+adds diagnostics/progress mapping for the new wait state.
