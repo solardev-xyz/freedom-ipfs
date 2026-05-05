@@ -10254,3 +10254,64 @@ floor, but this removes an avoidable full-block clone from hot raw range reads,
 keeps cold verification intact, adds focused coverage for the new provider
 method, and improves the full-page warm repeat groups without increasing
 routing fanout, timeout budgets, fallback scope, or persistent storage work.
+
+## 2026-05-05 Reject: Gateway MIME Result Cache
+
+Hypothesis:
+Warm page repeat traces still showed `mime_detect` and `mime_total` for every
+request. A small bounded gateway MIME cache keyed by resolved file CID plus
+path might avoid repeated sniff reads and shave another millisecond or two from
+warm page loads.
+
+Temporary experiment:
+
+- Add a bounded in-memory MIME cache to `GatewayState`.
+- Cache extension, sniffed-HTML, and fallback MIME results.
+- Keep the cache opportunistic: a poisoned cache lock would miss rather than
+  failing a request.
+- Add a focused synthetic test where two extensionless raw HTML requests drop
+  from four range reads to three by skipping the second MIME sniff.
+
+Focused validation:
+
+```sh
+cargo fmt --all
+cargo test -p freedom-ipfs-gateway mime_cache_reuses_sniffed_type_for_repeated_raw_requests
+cargo test -p freedom-ipfs-gateway
+```
+
+Result: all passed while the temporary patch was applied.
+
+Live comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-mime-cache-page-assets-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-mime-cache-page-assets-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `4/683ms`, Kubo `3/1775ms`.
+- Asset TTFB p50/p95: Rust `6/307ms`, Kubo `4/264ms`.
+- Rust RSS/FD: `51984KiB`/`41`; Kubo RSS/FD: `112104KiB`/`56`.
+- Warm page repeat groups were `2-5ms`, worse than the immediately previous
+  raw range-slice run's `1-2ms` groups.
+- `block_store_get_range` remained `111`, matching the prior page-assets run;
+  the real `ipfs.tech` page mostly uses extension-derived MIME types, so this
+  cache did not avoid the hot range reads that matter in this workload.
+
+Decision: reject and revert. The synthetic extensionless-raw case works, but
+the real page workload does not justify another gateway cache. Keep MIME
+optimizations focused on cases where traces show actual sniff reads or MIME
+work on extensionless content, not extension-derived assets.
