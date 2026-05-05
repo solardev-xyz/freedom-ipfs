@@ -3772,6 +3772,7 @@ Prototype validation:
 
 ```sh
 cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib dropped_bitswap_fetch_cancels_open_peer_stream
 cargo test -p freedom-ipfs-retrieval --lib recent_bitswap
 cargo build -p freedom-ipfs-gateway
 ```
