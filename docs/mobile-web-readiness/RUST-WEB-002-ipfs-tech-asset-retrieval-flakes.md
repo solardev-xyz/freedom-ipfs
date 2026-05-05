@@ -17876,3 +17876,79 @@ Keep. The same-window `ipfs.tech` comparison improved Rust root p95, asset
 p50/p95, delegated lookup p95, HTTP provider fetch p95/max, Bitswap session
 pressure, RSS, and FD usage. The secondary page/range checks stayed reliable
 and within mobile resource envelopes.
+
+## 2026-05-05 Reject: Tighten Delegated First-HTTP Provider Grace To 50ms
+
+Question:
+After keeping `100ms`, test whether the same streamed delegated-routing grace
+can be tightened further to `50ms`. In the accepted `100ms` run, target-met
+multi-HTTP responses were usually available under about `44ms`, so `50ms`
+looked plausible as a way to shave the remaining single-provider wait.
+
+Prototype:
+
+- Temporarily changed `STREAMING_DELEGATED_FIRST_HTTP_PROVIDER_GRACE` from
+  `100ms` to `50ms`.
+- Restored the committed `100ms` value after the live run regressed.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing streamed_delegated_response
+```
+
+Focused result:
+
+- Formatting passed.
+- Streamed delegated-response focused tests passed: `2 passed`.
+
+Live comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-first-http-grace50-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-first-http-grace50-r3.json
+```
+
+Live result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1313ms` / `1375ms`; Kubo `2662ms` /
+  `3733ms`; ratio `0.49x` / `0.37x`.
+- Asset TTFB p50/p95: Rust `241ms` / `1007ms`; Kubo `218ms` /
+  `978ms`; ratio `1.11x` / `1.03x`.
+- Max RSS/FD: Rust `53644KiB` / `33`; Kubo `266924KiB` / `371`.
+- Delegated provider lookups: `103`, p50/p95/max `29ms` / `307ms` /
+  `762ms`.
+- Single-HTTP-provider delegated lookups: `59`, first-HTTP p50/p95/max
+  `35ms` / `284ms` / `723ms`, total p50/p95/max `37ms` / `286ms` /
+  `723ms`.
+- HTTP-provider fetch p50/p95/max: `158ms` / `687ms` / `947ms`.
+- Bitswap session work stayed lower than the old `250ms` baseline but worse
+  than the kept `100ms` run: `shortcut_starts=19`, `post_lookup_hits=7`,
+  `post_lookup_timeouts=10`.
+
+Comparison against kept `100ms`:
+
+- Rust root p95 worsened from `886ms` to `1375ms`.
+- Rust asset p95 worsened from `702ms` to `1007ms`.
+- Delegated lookup p95 worsened from `50ms` to `307ms`.
+- HTTP-provider fetch p95 worsened from `626ms` to `687ms`.
+- RSS/FD worsened from `53120KiB` / `30` to `53644KiB` / `33`.
+
+Decision:
+Reject and keep `100ms`. The `50ms` prototype did not preserve the accepted
+latency shape and caught a worse first-HTTP/delegated-routing tail. The next
+delegated grace retune should not go below `100ms` without repeated evidence
+that first-HTTP p95 and target-met p95 have moved lower in the same window.
