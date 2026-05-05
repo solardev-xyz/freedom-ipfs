@@ -8372,3 +8372,38 @@ with_parent 32
 Decision: keep. This is harness-only, ABI-neutral, and improves the evidence
 quality of future mobile progress and page-level latency experiments without
 changing gateway retrieval semantics, cache behavior, or resource limits.
+
+## 2026-05-05 Keep: Trace Summary Progress Correlation Fields
+
+Motivation:
+After adding harness-generated progress correlation headers, live traces could
+be checked with one-off JSONL scripts, but the normal harness summary still
+printed only gateway-local request IDs. That made page-level diagnosis too easy
+to lose in long runs. The trace summary should surface the mobile correlation
+fields directly in `slow_requests` and `slow_events`.
+
+Implementation:
+
+- Add `progress_request_id`, `parent_progress_request_id`, and `top_level_path`
+  to serialized `slow_requests`.
+- Print those fields in the slow-request console summary when present.
+- Copy `progress_request_id`, `parent_request_id`, and `top_level_path` from
+  trace spans into slow-event details.
+- Extend the existing trace-summary test fixture to cover correlation fields.
+- Update `docs/mobile-web-readiness/README.md`.
+
+Validation:
+
+```sh
+cargo fmt --all
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+git diff --check
+```
+
+Decision: keep. This is diagnostics-only and makes the previous correlation
+header change useful in regular harness output and JSON reports, without
+changing request behavior or gateway runtime paths.

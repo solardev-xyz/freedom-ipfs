@@ -956,12 +956,14 @@ fn print_summary(report: &RunReport) {
                 } else {
                     format!("{}:{}", request.process_id, request.request_id)
                 };
+                let correlation = format_request_correlation(request);
                 println!(
-                    "    {}: {}ms status={} request_id={} events={} max_event={}ms phases={} cids={}",
+                    "    {}: {}ms status={} request_id={}{} events={} max_event={}ms phases={} cids={}",
                     request.path,
                     request.elapsed_ms,
                     status,
                     request_id,
+                    correlation,
                     request.event_count,
                     request.max_event_ms,
                     phases,
@@ -4214,6 +4216,9 @@ struct TraceRequestAggregate {
     path: String,
     process_id: String,
     request_id: String,
+    progress_request_id: Option<String>,
+    parent_progress_request_id: Option<String>,
+    top_level_path: Option<String>,
     status: Option<String>,
     elapsed_ms: u128,
     max_event_ms: u128,
@@ -4234,6 +4239,9 @@ struct TraceRequestBuilder {
     path: String,
     process_id: String,
     request_id: String,
+    progress_request_id: Option<String>,
+    parent_progress_request_id: Option<String>,
+    top_level_path: Option<String>,
     status: Option<String>,
     elapsed_ms: Option<u128>,
     max_event_ms: u128,
@@ -4248,6 +4256,9 @@ impl TraceRequestBuilder {
             path: key.path,
             process_id: key.process_id,
             request_id: key.request_id,
+            progress_request_id: None,
+            parent_progress_request_id: None,
+            top_level_path: None,
             status: None,
             elapsed_ms: None,
             max_event_ms: 0,
@@ -4260,6 +4271,15 @@ impl TraceRequestBuilder {
     fn record_event(&mut self, phase: &str, value: &serde_json::Value, elapsed_ms: Option<u128>) {
         self.event_count += 1;
         *self.phases.entry(phase.to_string()).or_default() += 1;
+        if self.progress_request_id.is_none() {
+            self.progress_request_id = trace_span_string(value, "progress_request_id");
+        }
+        if self.parent_progress_request_id.is_none() {
+            self.parent_progress_request_id = trace_span_string(value, "parent_request_id");
+        }
+        if self.top_level_path.is_none() {
+            self.top_level_path = trace_span_string(value, "top_level_path");
+        }
         if let Some(cid) = json_detail_string(value.get("cid")) {
             *self.cids.entry(cid).or_default() += 1;
         }
@@ -4277,6 +4297,9 @@ impl TraceRequestBuilder {
             path: self.path,
             process_id: self.process_id,
             request_id: self.request_id,
+            progress_request_id: self.progress_request_id,
+            parent_progress_request_id: self.parent_progress_request_id,
+            top_level_path: self.top_level_path,
             status: self.status,
             elapsed_ms: self.elapsed_ms.unwrap_or(self.max_event_ms),
             max_event_ms: self.max_event_ms,
@@ -5373,6 +5396,21 @@ fn format_trace_counts(counts: &[TraceValueCount]) -> String {
         .join(", ")
 }
 
+fn format_request_correlation(request: &TraceRequestAggregate) -> String {
+    if request.progress_request_id.is_none()
+        && request.parent_progress_request_id.is_none()
+        && request.top_level_path.is_none()
+    {
+        return String::new();
+    }
+    format!(
+        " progress_id={} parent_progress_id={} top_level_path={}",
+        request.progress_request_id.as_deref().unwrap_or("-"),
+        request.parent_progress_request_id.as_deref().unwrap_or("-"),
+        request.top_level_path.as_deref().unwrap_or("-")
+    )
+}
+
 fn trace_error_key(phase: &str, value: &serde_json::Value) -> Option<String> {
     if let Some(error) = json_detail_string(value.get("error")) {
         return Some(format!("{phase}: {error}"));
@@ -5413,6 +5451,11 @@ fn bitswap_connection_error_addr_family(error: &str) -> &'static str {
 fn trace_event_path(value: &serde_json::Value) -> Option<String> {
     json_detail_string(value.get("path"))
         .or_else(|| json_detail_string(value.get("span").and_then(|span| span.get("path"))))
+}
+
+fn trace_span_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    json_detail_string(value.get(key))
+        .or_else(|| json_detail_string(value.get("span").and_then(|span| span.get(key))))
 }
 
 fn trace_request_key(value: &serde_json::Value) -> Option<TraceRequestKey> {
@@ -5520,6 +5563,13 @@ fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
             json_detail_string(value.get("span").and_then(|span| span.get("process_id")))
         {
             details.insert("process_id".to_string(), process_id);
+        }
+    }
+    for key in ["progress_request_id", "parent_request_id", "top_level_path"] {
+        if !details.contains_key(key) {
+            if let Some(detail) = trace_span_string(value, key) {
+                details.insert(key.to_string(), detail);
+            }
         }
     }
     details
@@ -5887,8 +5937,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "{\"phase\":\"request_start\",\"request_id\":9,\"path\":\"/ipns/site/asset.js\"}\n",
-                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":\"25\",\"cid\":\"cid1\",\"ok\":true,\"bytes\":100,\"extra_blocks\":2,\"source\":\"bitswap\",\"source_peer\":\"peer1\",\"source_transport\":\"tcp\",\"bitswap_delivery\":\"incoming\",\"source_peer_trusted\":true,\"trusted_peer_count\":1,\"provider_peer_count\":2,\"session_peer_count\":0,\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9}}\n",
+                "{\"phase\":\"request_start\",\"request_id\":9,\"path\":\"/ipns/site/asset.js\",\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9,\"progress_request_id\":77,\"parent_request_id\":1,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":\"25\",\"cid\":\"cid1\",\"ok\":true,\"bytes\":100,\"extra_blocks\":2,\"source\":\"bitswap\",\"source_peer\":\"peer1\",\"source_transport\":\"tcp\",\"bitswap_delivery\":\"incoming\",\"source_peer_trusted\":true,\"trusted_peer_count\":1,\"provider_peer_count\":2,\"session_peer_count\":0,\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9,\"progress_request_id\":77,\"parent_request_id\":1,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"request_done\",\"request_id\":9,\"path\":\"/ipns/site/asset.js\",\"status\":200,\"elapsed_ms\":1}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":5,\"cid\":\"cid1\",\"source\":\"bitswap\"}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":4,\"cid\":\"cid5\",\"source\":\"cache\"}\n",
@@ -6195,6 +6245,20 @@ mod tests {
         assert_eq!(summary.slow_requests.len(), 1);
         assert_eq!(summary.slow_requests[0].path, "/ipns/site/asset.js");
         assert_eq!(summary.slow_requests[0].request_id, "9");
+        assert_eq!(
+            summary.slow_requests[0].progress_request_id.as_deref(),
+            Some("77")
+        );
+        assert_eq!(
+            summary.slow_requests[0]
+                .parent_progress_request_id
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            summary.slow_requests[0].top_level_path.as_deref(),
+            Some("/ipns/site/")
+        );
         assert_eq!(summary.slow_requests[0].status.as_deref(), Some("200"));
         assert_eq!(summary.slow_requests[0].elapsed_ms, 1);
         assert_eq!(summary.slow_requests[0].max_event_ms, 25);
@@ -6202,6 +6266,32 @@ mod tests {
         assert_eq!(summary.slow_requests[0].cids[0].value, "cid1");
         assert_eq!(summary.slow_requests[0].cids[0].count, 1);
         assert_eq!(summary.slow_requests[0].phases.len(), 3);
+        let bitswap_event = summary
+            .slow_events
+            .iter()
+            .find(|event| event.phase == "bitswap_fetch" && event.elapsed_ms == 25)
+            .expect("bitswap_fetch should remain in slow events");
+        assert_eq!(
+            bitswap_event
+                .details
+                .get("progress_request_id")
+                .map(String::as_str),
+            Some("77")
+        );
+        assert_eq!(
+            bitswap_event
+                .details
+                .get("parent_request_id")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            bitswap_event
+                .details
+                .get("top_level_path")
+                .map(String::as_str),
+            Some("/ipns/site/")
+        );
     }
 
     #[test]
