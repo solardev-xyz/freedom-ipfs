@@ -62,6 +62,7 @@ const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD: usize = 2;
 const BITSWAP_SESSION_SHORTCUT_GRACE: Duration = Duration::from_millis(0);
 const BITSWAP_SESSION_PRE_LOOKUP_GRACE: Duration = Duration::from_millis(50);
 const BITSWAP_SESSION_POST_LOOKUP_GRACE: Duration = Duration::from_millis(100);
+const BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE: Duration = Duration::from_millis(250);
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
 const BITSWAP_SESSION_LATE_PEER_WAIT: Duration = Duration::from_secs(2);
 const BITSWAP_SESSION_LATE_PEER_POLL: Duration = Duration::from_millis(50);
@@ -426,7 +427,11 @@ impl HttpRetriever {
                                                         }
                                                     }
                                                 } else {
-                                                    match timeout(BITSWAP_SESSION_POST_LOOKUP_GRACE, &mut shortcut).await {
+                                                    let post_lookup_grace =
+                                                        bitswap_session_post_lookup_grace(&providers);
+                                                    let http_provider_count =
+                                                        provider_http_url_count(&providers);
+                                                    match timeout(post_lookup_grace, &mut shortcut).await {
                                                         Ok(shortcut_result) => {
                                                             if let Some(block) = shortcut_result? {
                                                                 return Ok((block, RetrievalSource::Bitswap));
@@ -436,7 +441,9 @@ impl HttpRetriever {
                                                             tracing::info!(
                                                                 phase = "bitswap_session_shortcut_post_lookup_wait",
                                                                 cid = %cid,
-                                                                timeout_ms = BITSWAP_SESSION_POST_LOOKUP_GRACE.as_millis()
+                                                                timeout_ms = post_lookup_grace.as_millis(),
+                                                                provider_count = providers.len(),
+                                                                http_provider_count
                                                             );
                                                         }
                                                     }
@@ -550,7 +557,11 @@ impl HttpRetriever {
                                                     }
                                                 }
                                             } else {
-                                                match timeout(BITSWAP_SESSION_POST_LOOKUP_GRACE, &mut shortcut).await {
+                                                let post_lookup_grace =
+                                                    bitswap_session_post_lookup_grace(&providers);
+                                                let http_provider_count =
+                                                    provider_http_url_count(&providers);
+                                                match timeout(post_lookup_grace, &mut shortcut).await {
                                                     Ok(shortcut_result) => {
                                                         if let Some(block) = shortcut_result? {
                                                             return Ok((block, RetrievalSource::Bitswap));
@@ -560,7 +571,9 @@ impl HttpRetriever {
                                                         tracing::info!(
                                                             phase = "bitswap_session_shortcut_post_lookup_wait",
                                                             cid = %cid,
-                                                            timeout_ms = BITSWAP_SESSION_POST_LOOKUP_GRACE.as_millis()
+                                                            timeout_ms = post_lookup_grace.as_millis(),
+                                                            provider_count = providers.len(),
+                                                            http_provider_count
                                                         );
                                                     }
                                                 }
@@ -1574,6 +1587,21 @@ fn retrieval_source_label(source: RetrievalSource) -> &'static str {
         RetrievalSource::Cache => "cache",
         RetrievalSource::HttpProvider => "http_provider",
         RetrievalSource::Bitswap => "bitswap",
+    }
+}
+
+fn provider_http_url_count(providers: &[Provider]) -> usize {
+    providers
+        .iter()
+        .map(|provider| provider.http_urls.len())
+        .sum()
+}
+
+fn bitswap_session_post_lookup_grace(providers: &[Provider]) -> Duration {
+    if provider_http_url_count(providers) == 1 {
+        BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE
+    } else {
+        BITSWAP_SESSION_POST_LOOKUP_GRACE
     }
 }
 
@@ -6736,6 +6764,125 @@ mod bitswap_tests {
             .unwrap();
         session_swarm.abort();
         http_task.abort();
+        routing_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn single_http_provider_waits_longer_for_recent_bitswap_peer() {
+        let data = b"single http waits for recent peer";
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
+        let (session_peer_id, session_addr, session_swarm, session_stream) =
+            spawn_delayed_multi_block_bitswap_peer(
+                vec![(cid, data.to_vec())],
+                Duration::from_millis(175),
+            )
+            .await;
+        let http_requests = Arc::new(AtomicU64::new(0));
+        let (http_addr, http_task) = spawn_hanging_http_provider(http_requests.clone()).await;
+        let response = format!(
+            r#"{{"Providers":[{{"ID":"slow-http","Addrs":["/ip4/127.0.0.1/tcp/{}/http"]}}]}}"#,
+            http_addr.port()
+        );
+        let (endpoint, routing_task) = spawn_sequence_delegated_response(vec![response]).await;
+
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new(endpoint),
+            store.clone(),
+        );
+        retriever
+            .record_successful_bitswap_peer(
+                session_peer_id,
+                vec![session_addr],
+                Duration::from_millis(25),
+            )
+            .await;
+
+        let (block, source) = tokio::time::timeout(
+            Duration::from_secs(2),
+            retriever.fetch_block_with_source(&cid),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(source, RetrievalSource::Bitswap);
+        assert_eq!(block.data(), data);
+        assert_eq!(http_requests.load(Ordering::Relaxed), 0);
+
+        tokio::time::timeout(Duration::from_secs(5), session_stream)
+            .await
+            .unwrap()
+            .unwrap();
+        session_swarm.abort();
+        http_task.abort();
+        routing_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_http_provider_keeps_short_recent_peer_wait() {
+        let data = b"multi http keeps short recent peer wait";
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
+        let (session_peer_id, session_addr, session_swarm, session_stream) =
+            spawn_delayed_multi_block_bitswap_peer(
+                vec![(cid, data.to_vec())],
+                Duration::from_millis(175),
+            )
+            .await;
+        let first_http_requests = Arc::new(AtomicU64::new(0));
+        let second_http_requests = Arc::new(AtomicU64::new(0));
+        let (first_http_addr, first_http_task) = spawn_counting_http_provider(
+            data.to_vec(),
+            Duration::ZERO,
+            first_http_requests.clone(),
+        )
+        .await;
+        let (second_http_addr, second_http_task) = spawn_counting_http_provider(
+            data.to_vec(),
+            Duration::ZERO,
+            second_http_requests.clone(),
+        )
+        .await;
+        let response = format!(
+            r#"{{"Providers":[{{"ID":"multi-http","Addrs":["/ip4/127.0.0.1/tcp/{}/http","/ip4/127.0.0.1/tcp/{}/http"]}}]}}"#,
+            first_http_addr.port(),
+            second_http_addr.port()
+        );
+        let (endpoint, routing_task) = spawn_sequence_delegated_response(vec![response]).await;
+
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new(endpoint),
+            store.clone(),
+        );
+        retriever
+            .record_successful_bitswap_peer(
+                session_peer_id,
+                vec![session_addr],
+                Duration::from_millis(25),
+            )
+            .await;
+
+        let (block, source) = tokio::time::timeout(
+            Duration::from_secs(2),
+            retriever.fetch_block_with_source(&cid),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(source, RetrievalSource::HttpProvider);
+        assert_eq!(block.data(), data);
+        assert!(
+            first_http_requests.load(Ordering::Relaxed)
+                + second_http_requests.load(Ordering::Relaxed)
+                > 0
+        );
+
+        session_stream.abort();
+        session_swarm.abort();
+        first_http_task.abort();
+        second_http_task.abort();
         routing_task.abort();
     }
 

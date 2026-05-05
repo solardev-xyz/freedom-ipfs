@@ -16262,3 +16262,186 @@ not, but the deterministic test proves the exact missed-session-peer shape and
 the live run shows the new path firing once with low cost. Fast provider
 lookups are not delayed because provider lookup still wins the race, and the
 secondary cases stayed within previous resource and latency envelopes.
+
+## 2026-05-05 Keep: Extend Session Wait For Single HTTP Provider Results
+
+Question:
+After the late-session-peer change, Rust was faster than Kubo on `ipfs.tech`
+root startup but still slower on asset TTFB. The traces showed that
+multi-provider HTTP races were already fast, while single HTTP-provider results
+still often meant `ipfs-bridge.sia.dev` tails. Recent Bitswap shortcut hits in
+the same page session were usually under a few hundred milliseconds, but the
+generic post-lookup wait was only `100ms`.
+
+Hypothesis:
+When provider lookup returns exactly one HTTP provider URL, waiting a little
+longer for an already-running recent Bitswap session shortcut can cut asset
+tails. Keep the normal `100ms` post-lookup wait for zero-HTTP and multi-HTTP
+results so fast HTTP races are not delayed.
+
+Implementation:
+
+- Add `BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE=250ms`.
+- Keep `BITSWAP_SESSION_POST_LOOKUP_GRACE=100ms` for all other provider sets.
+- Select the longer wait only when the provider result contains exactly one
+  HTTP provider URL.
+- Include `provider_count` and `http_provider_count` on
+  `bitswap_session_shortcut_post_lookup_wait` trace events.
+- Add deterministic tests proving:
+  - a delayed recent Bitswap peer can beat a hanging single HTTP provider; and
+  - multi-HTTP provider results still keep the short wait and return via HTTP.
+
+Focused validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval recent_bitswap_peer
+cargo test -p freedom-ipfs-retrieval single_http_provider_waits_longer_for_recent_bitswap_peer
+cargo test -p freedom-ipfs-retrieval multi_http_provider_keeps_short_recent_peer_wait
+```
+
+Result:
+
+- Recent Bitswap peer tests passed: `6 passed`.
+- Single HTTP provider selective-wait test passed.
+- Multi HTTP provider short-wait test passed.
+
+Same-window baseline:
+
+- Artifact paths:
+  `/tmp/ipfs-tech-late-session-peer-r3-trace.jsonl` and
+  `/tmp/ipfs-tech-late-session-peer-r3.json`.
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1390ms` / `2060ms` / `2060ms`.
+- Asset TTFB p50/p95/max: `164ms` / `939ms` / `1493ms`.
+- Run total p50/p95/max: `3607ms` / `4087ms` / `4087ms`.
+- Max RSS/FD: `53240KiB` / `32`.
+- HTTP-provider races: `58` results, `36` single-provider successes, `0`
+  failures, single-provider winner elapsed p50/p95/max `305ms` / `955ms` /
+  `1023ms`, multi-provider winner elapsed p50/p95/max `85ms` / `168ms` /
+  `182ms`.
+- Block sources: `http_provider=73`, `bitswap=46`, `cache=1`.
+
+Experiment:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-single-http-postlookup250-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-single-http-postlookup250-r3.json
+```
+
+Result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1272ms` / `1420ms` / `1420ms`.
+- Asset TTFB p50/p95/max: `244ms` / `663ms` / `1076ms`.
+- Run total p50/p95/max: `2848ms` / `3814ms` / `3814ms`.
+- Max RSS/FD: `53588KiB` / `36`.
+- HTTP-provider races: `43` results, `18` single-provider successes, `0`
+  failures, single-provider winner elapsed p50/p95/max `232ms` / `931ms` /
+  `931ms`, multi-provider winner elapsed p50/p95/max `73ms` / `227ms` /
+  `306ms`.
+- Bitswap session shortcuts increased to `57` hits, with `24`
+  post-lookup waits; late-peer wait fired twice and hit twice.
+- Block sources shifted toward the session path: `bitswap=69`,
+  `http_provider=47`, `cache=1`.
+
+Additional checks:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-single-http-postlookup250-r3-trace.jsonl \
+  --output /tmp/vitalik-single-http-postlookup250-r3.json
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-single-http-postlookup250-r3-trace.jsonl \
+  --output /tmp/daicowtf-single-http-postlookup250-r3.json
+```
+
+Results:
+
+- `vitalik-root-html-range` passed `3/3`; root/range TTFB p50/p95/max
+  `151ms` / `424ms` / `424ms`, max RSS/FD `31872KiB` / `13`, block sources
+  `http_provider=6`.
+- `daicowtf-page-assets` passed `3/3`; root TTFB p50/p95/max
+  `1050ms` / `1419ms` / `1419ms`, max RSS/FD `42684KiB` / `17`, block sources
+  `http_provider=6`, `bitswap=3`.
+
+Kubo comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --output /tmp/ipfs-tech-rust-vs-kubo-single-http-postlookup250-r3.json
+```
+
+Result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Root TTFB: Rust p50/p95 `707ms` / `971ms`; Kubo p50/p95 `3302ms` /
+  `4695ms`; Rust/Kubo ratios `0.21x` p50 and `0.21x` p95.
+- Asset TTFB: Rust p50/p95 `250ms` / `966ms`; Kubo p50/p95 `211ms` /
+  `784ms`; Rust/Kubo ratios `1.18x` p50 and `1.23x` p95.
+- Resources: Rust max RSS/FD `53560KiB` / `37`; Kubo max RSS/FD
+  `293812KiB` / `292`.
+
+Final validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval
+cargo test -p freedom-ipfs-gateway
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting passed.
+- Full retrieval suite passed: `72 passed`, `1 ignored`.
+- Full gateway suite passed; all non-ignored unit/integration tests passed.
+- Workspace check passed.
+- Workspace clippy passed with `-D warnings`.
+- Diff whitespace check passed.
+
+Decision:
+Keep. The live experiment reduced `ipfs.tech` asset p95/max versus the
+immediately previous baseline and moved more blocks onto verified session
+Bitswap without widening provider fanout. The Kubo comparison also narrowed the
+asset gap materially, though Kubo still wins asset TTFB. The main risk is that
+a fast single HTTP provider might be delayed by up to `150ms` more than before
+when a recent session shortcut is active, but the secondary `vitalik` and
+`daicowtf` checks stayed inside prior resource/latency envelopes.
