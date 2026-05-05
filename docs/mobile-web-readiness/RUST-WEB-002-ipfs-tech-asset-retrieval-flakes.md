@@ -6902,3 +6902,120 @@ git diff --check
 
 Decision: keep. This is diagnostics/API polish only; it does not change
 retrieval behavior or the mobile ABI.
+
+## 2026-05-05 Keep: Cache Positive UnixFS Path Resolution
+
+Motivation:
+Warm same-daemon `ipfs.tech-page-assets` replay is reliable and resource-light,
+but still visibly slower than Kubo on hot page loads. Before this experiment,
+the gateway reused decoded DAG-PB metadata but still repeated UnixFS path
+resolution for each hot root and asset request.
+
+Implementation:
+
+- Add a bounded positive `(root CID, path) -> resolved node` cache beside the
+  existing decoded DAG-PB metadata cache.
+- Use the same small capacity as the metadata cache, skip paths over 1024
+  bytes, and do not cache failures or negative lookups.
+- Keep the cache in memory only; no persistence and no mutable IPNS keying. IPNS
+  paths are cached only after resolving to an immutable root CID.
+- Extend `unixfs_metadata_cache` traces and harness summaries with
+  `path_hits`, `path_misses`, `path_inserts`, `path_evictions`,
+  `path_oversized_skips`, and `path_cache_len`.
+- Print UnixFS metadata/path cache summaries in Rust-vs-Kubo comparison output.
+
+Baseline:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --warmup-runs 1 \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-warm-persistent-pathcache-baseline-trace.jsonl \
+  --output /tmp/ipfs-tech-warm-persistent-pathcache-baseline.json
+```
+
+Baseline result:
+
+- Rust and Kubo both passed `3/3`.
+- Measured warm root TTFB p50/p95: Rust `20/21ms`, Kubo `2/3ms`.
+- Measured warm asset TTFB p50/p95: Rust `20/76ms`, Kubo `3/5ms`.
+- Max RSS/FD: Rust `48884KiB`/`34`, Kubo `322592KiB`/`555`.
+- Rust `unixfs_resource` trace p50/p90/p95/max across warmup + measured:
+  `10/142/202/2973ms`.
+
+Experiment:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --warmup-runs 1 \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-warm-persistent-pathcache-experiment-trace.jsonl \
+  --output /tmp/ipfs-tech-warm-persistent-pathcache-experiment.json
+```
+
+Experiment result:
+
+- Rust and Kubo both passed `3/3`.
+- Measured warm root TTFB p50/p95: Rust `24/25ms`, Kubo `3/3ms`.
+- Measured warm asset TTFB p50/p95: Rust `18/69ms`, Kubo `2/8ms`.
+- Max RSS/FD: Rust `49888KiB`/`48`, Kubo `256884KiB`/`193`.
+- Rust `unixfs_resource` trace p50/p90/p95/max across warmup + measured:
+  `6/146/297/970ms`.
+- Path cache summary:
+  `path_hits=497`, `path_misses=172`, `path_inserts=173`,
+  `path_evictions=0`, `path_oversized_skips=0`, `max_path_len=34`.
+
+Cold sanity:
+
+```sh
+timeout 360s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/ipfs-tech-pathcache-cold-rust-vs-kubo-trace.jsonl \
+  --output /tmp/ipfs-tech-pathcache-cold-rust-vs-kubo.json
+```
+
+Cold result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `2800/7383ms`, Kubo `1691/2883ms`.
+- Asset TTFB p50/p95: Rust `145/1816ms`, Kubo `118/6402ms`.
+- Max RSS/FD: Rust `51428KiB`/`47`, Kubo `328932KiB`/`344`.
+- Path cache summary:
+  `path_hits=445`, `path_misses=509`, `path_inserts=521`,
+  `path_evictions=0`, `path_oversized_skips=0`, `max_path_len=34`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-unixfs
+cargo test -p freedom-ipfs-gateway
+cargo test -p mobile-web-harness
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Decision: keep. The wall-clock warm root result did not improve in this noisy
+same-window sample, but asset p50/p95 improved modestly, the trace shows
+hundreds of hot path-resolution hits with no evictions, and the cache is bounded
+and positive-only. This is a small warm-path building block; future work should
+look at the remaining hot request overhead that keeps Rust around `20ms` while
+Kubo is still in the low single-digit milliseconds.

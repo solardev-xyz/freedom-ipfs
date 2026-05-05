@@ -144,8 +144,9 @@ Bitswap connections are also counted by transport as
 connections are using TCP, QUIC, WS, or WSS. Immediate dial rejections are
 counted by transport as `bitswap_dial_rejected_transports`, which helps spot
 connection-limit pressure by transport. UnixFS metadata-cache traces are also
-aggregated so reports show cache events, hits, misses, inserts, evictions, skip
-counts, maximum length, and capacity without manual JSONL greps.
+aggregated so reports show decoded DAG-PB cache events, path-resolution cache
+hits/misses, inserts, evictions, skip counts, maximum lengths, and capacity
+without manual JSONL greps.
 Bitswap DNS expansion traces are aggregated as well, including cached versus
 uncached expansion events, failed DNSAddr lookups, TXT records, and resolved IPs.
 The `slow_cids` list groups elapsed trace events by CID with phase and path

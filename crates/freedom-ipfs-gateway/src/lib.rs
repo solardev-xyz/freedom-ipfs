@@ -608,7 +608,15 @@ fn trace_unixfs_metadata_cache_delta(
         misses = after.misses.saturating_sub(before.misses),
         inserts = after.inserts.saturating_sub(before.inserts),
         evictions = after.evictions.saturating_sub(before.evictions),
-        oversized_skips = after.oversized_skips.saturating_sub(before.oversized_skips)
+        oversized_skips = after.oversized_skips.saturating_sub(before.oversized_skips),
+        path_cache_len = after.path_len,
+        path_hits = after.path_hits.saturating_sub(before.path_hits),
+        path_misses = after.path_misses.saturating_sub(before.path_misses),
+        path_inserts = after.path_inserts.saturating_sub(before.path_inserts),
+        path_evictions = after.path_evictions.saturating_sub(before.path_evictions),
+        path_oversized_skips = after
+            .path_oversized_skips
+            .saturating_sub(before.path_oversized_skips)
     );
 }
 

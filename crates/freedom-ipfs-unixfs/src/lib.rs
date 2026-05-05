@@ -14,6 +14,7 @@ const HAMT_FANOUT_256: u64 = 256;
 const HAMT_LINK_PREFIX_LEN: usize = 2;
 const HAMT_MAX_SHARDS_VISITED: usize = 1024;
 const UNIXFS_METADATA_CACHE_MAX_BLOCK_BYTES: usize = 64 * 1024;
+const UNIXFS_PATH_CACHE_MAX_PATH_BYTES: usize = 1024;
 
 #[derive(Debug, Error)]
 pub enum UnixfsError {
@@ -190,6 +191,12 @@ pub struct UnixfsMetadataCacheStats {
     pub inserts: u64,
     pub evictions: u64,
     pub oversized_skips: u64,
+    pub path_len: usize,
+    pub path_hits: u64,
+    pub path_misses: u64,
+    pub path_inserts: u64,
+    pub path_evictions: u64,
+    pub path_oversized_skips: u64,
 }
 
 #[derive(Debug)]
@@ -220,6 +227,24 @@ impl UnixfsMetadataCache {
         }
     }
 
+    fn get_path(&self, root: &Cid, path: &str) -> Option<ResolvedNode> {
+        if path.len() > UNIXFS_PATH_CACHE_MAX_PATH_BYTES {
+            return None;
+        }
+
+        let key = UnixfsPathCacheKey::new(root, path);
+        let mut inner = self.lock_inner();
+        let resolved = inner.path_entries.get(&key).cloned();
+        if let Some(resolved) = resolved {
+            inner.path_hits = inner.path_hits.saturating_add(1);
+            touch_path_cache_order(&mut inner, &key);
+            Some(resolved)
+        } else {
+            inner.path_misses = inner.path_misses.saturating_add(1);
+            None
+        }
+    }
+
     fn insert(&self, cid: &Cid, encoded_len: usize, decoded: DecodedDagPb) {
         let mut inner = self.lock_inner();
         if inner.capacity == 0 {
@@ -245,10 +270,38 @@ impl UnixfsMetadataCache {
         }
     }
 
+    fn insert_path(&self, root: &Cid, path: &str, resolved: ResolvedNode) {
+        let mut inner = self.lock_inner();
+        if inner.capacity == 0 {
+            return;
+        }
+        if path.len() > UNIXFS_PATH_CACHE_MAX_PATH_BYTES {
+            inner.path_oversized_skips = inner.path_oversized_skips.saturating_add(1);
+            return;
+        }
+
+        let key = UnixfsPathCacheKey::new(root, path);
+        if inner.path_entries.insert(key.clone(), resolved).is_none() {
+            inner.path_inserts = inner.path_inserts.saturating_add(1);
+        }
+        touch_path_cache_order(&mut inner, &key);
+
+        while inner.path_entries.len() > inner.capacity {
+            let Some(evicted) = inner.path_order.pop_front() else {
+                break;
+            };
+            if inner.path_entries.remove(&evicted).is_some() {
+                inner.path_evictions = inner.path_evictions.saturating_add(1);
+            }
+        }
+    }
+
     fn clear(&self) {
         let mut inner = self.lock_inner();
         inner.entries.clear();
         inner.order.clear();
+        inner.path_entries.clear();
+        inner.path_order.clear();
     }
 
     fn stats(&self) -> UnixfsMetadataCacheStats {
@@ -261,6 +314,12 @@ impl UnixfsMetadataCache {
             inserts: inner.inserts,
             evictions: inner.evictions,
             oversized_skips: inner.oversized_skips,
+            path_len: inner.path_entries.len(),
+            path_hits: inner.path_hits,
+            path_misses: inner.path_misses,
+            path_inserts: inner.path_inserts,
+            path_evictions: inner.path_evictions,
+            path_oversized_skips: inner.path_oversized_skips,
         }
     }
 
@@ -276,16 +335,43 @@ struct UnixfsMetadataCacheInner {
     capacity: usize,
     entries: HashMap<Cid, DecodedDagPb>,
     order: VecDeque<Cid>,
+    path_entries: HashMap<UnixfsPathCacheKey, ResolvedNode>,
+    path_order: VecDeque<UnixfsPathCacheKey>,
     hits: u64,
     misses: u64,
     inserts: u64,
     evictions: u64,
     oversized_skips: u64,
+    path_hits: u64,
+    path_misses: u64,
+    path_inserts: u64,
+    path_evictions: u64,
+    path_oversized_skips: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct UnixfsPathCacheKey {
+    root: Cid,
+    path: String,
+}
+
+impl UnixfsPathCacheKey {
+    fn new(root: &Cid, path: &str) -> Self {
+        Self {
+            root: *root,
+            path: path.to_string(),
+        }
+    }
 }
 
 fn touch_metadata_cache_order(inner: &mut UnixfsMetadataCacheInner, cid: &Cid) {
     inner.order.retain(|candidate| candidate != cid);
     inner.order.push_back(*cid);
+}
+
+fn touch_path_cache_order(inner: &mut UnixfsMetadataCacheInner, key: &UnixfsPathCacheKey) {
+    inner.path_order.retain(|candidate| candidate != key);
+    inner.path_order.push_back(key.clone());
 }
 
 #[derive(Clone, Debug)]
@@ -345,6 +431,20 @@ impl<'a> UnixfsContext<'a> {
     }
 
     fn resolve_path(&self, root: &Cid, path: &str) -> Result<ResolvedNode> {
+        if let Some(cache) = self.metadata_cache {
+            if let Some(resolved) = cache.get_path(root, path) {
+                return Ok(resolved);
+            }
+        }
+
+        let resolved = self.resolve_path_uncached(root, path)?;
+        if let Some(cache) = self.metadata_cache {
+            cache.insert_path(root, path, resolved.clone());
+        }
+        Ok(resolved)
+    }
+
+    fn resolve_path_uncached(&self, root: &Cid, path: &str) -> Result<ResolvedNode> {
         let mut current = *root;
         let mut segments = path
             .split('/')
@@ -1031,6 +1131,12 @@ mod tests {
                 inserts: 1,
                 evictions: 0,
                 oversized_skips: 0,
+                path_len: 2,
+                path_hits: 0,
+                path_misses: 2,
+                path_inserts: 2,
+                path_evictions: 0,
+                path_oversized_skips: 0,
             }
         );
     }
@@ -1060,7 +1166,39 @@ mod tests {
         let stats = resolver.metadata_cache_stats();
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.inserts, 1);
-        assert_eq!(stats.hits, 3);
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.path_misses, 1);
+        assert_eq!(stats.path_inserts, 1);
+        assert_eq!(stats.path_hits, 1);
+    }
+
+    #[test]
+    fn cached_resolver_reuses_path_resolution_across_repeated_reads() {
+        let file_data = pb_file(b"abcdef", Vec::new());
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_data);
+        let dir_data = pb_directory(vec![link("file.txt", &file_cid)]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_data);
+
+        let provider =
+            CountingProvider::new(HashMap::from([(file_cid, file_data), (dir_cid, dir_data)]));
+        let resolver = UnixfsResolver::with_metadata_cache_capacity(8);
+
+        assert_eq!(
+            resolver.file_size(&provider, &dir_cid, "file.txt").unwrap(),
+            6
+        );
+        assert_eq!(
+            resolver.file_size(&provider, &dir_cid, "file.txt").unwrap(),
+            6
+        );
+
+        assert_eq!(provider.call_count(&dir_cid), 1);
+        assert_eq!(provider.call_count(&file_cid), 1);
+        let stats = resolver.metadata_cache_stats();
+        assert_eq!(stats.path_len, 1);
+        assert_eq!(stats.path_misses, 1);
+        assert_eq!(stats.path_inserts, 1);
+        assert_eq!(stats.path_hits, 1);
     }
 
     #[test]
@@ -1086,6 +1224,8 @@ mod tests {
         assert_eq!(stats.capacity, 1);
         assert_eq!(stats.len, 1);
         assert_eq!(stats.evictions, 2);
+        assert_eq!(stats.path_len, 1);
+        assert_eq!(stats.path_evictions, 2);
     }
 
     #[test]
