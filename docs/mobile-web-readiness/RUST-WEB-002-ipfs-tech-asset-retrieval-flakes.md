@@ -16735,3 +16735,127 @@ Decision:
 Keep. This is diagnostics-only and preserves read-only, verified-block
 behavior. It gives the next long-running optimization agent a provider-level
 latency lens for live Kubo comparisons and future routing/provider experiments.
+
+## 2026-05-05 Keep: Summarize Delegated Routing Latencies
+
+Question:
+The previous HTTP-provider latency summary showed per-provider fetch costs, but
+some visible page-load tails happen before the HTTP-provider race starts. The
+delegated routing summary still showed only max elapsed values for response
+headers, first chunk, first HTTP provider, and target-met events. Add
+distribution summaries so future experiments can tell whether first-HTTP delay
+is rare tail noise or a repeated routing bottleneck.
+
+Implementation:
+
+- Keep gateway, routing, retrieval, provider selection, verification, and cache
+  behavior unchanged.
+- Extend delegated-provider lookup summaries with `LatencySummary` fields for:
+  - full delegated lookup elapsed time
+  - response headers
+  - first response chunk
+  - first HTTP provider
+  - target-met elapsed time
+  - single-HTTP-provider lookup elapsed time
+  - single-HTTP-provider first-HTTP time
+- Keep raw sample vectors out of serialized summary output after finalization.
+- Print the summaries globally and per delegated endpoint.
+- Add focused harness assertions for the new summary fields.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_delegated_http_provider_distribution
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+```
+
+Focused result:
+
+- Formatting passed after rustfmt.
+- Delegated HTTP-provider distribution summary test passed.
+- Existing mobile progress phase summary test passed.
+
+Live smoke:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-delegated-latency-summary-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-delegated-latency-summary-r3.json
+```
+
+Live result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1551ms` / `1561ms` / `1561ms`.
+- Asset TTFB p50/p95/max: `264ms` / `1001ms` / `1942ms`.
+- Run total p50/p95/max: `4081ms` / `4661ms` / `4661ms`.
+- Max RSS/FD: `54376KiB` / `35`.
+- Block sources: `http_provider=112`, `bitswap=8`.
+- Delegated lookup events: `105`, all successful, `1388` providers,
+  `185` HTTP providers.
+- Delegated lookup elapsed p50/p90/p95/max:
+  `23ms` / `59ms` / `426ms` / `1865ms`.
+- Delegated response headers p50/p90/p95/max:
+  `18ms` / `54ms` / `419ms` / `1865ms`.
+- First HTTP provider p50/p90/p95/max:
+  `20ms` / `57ms` / `425ms` / `1865ms`.
+- Target-met elapsed p50/p90/p95/max:
+  `0ms` / `39ms` / `45ms` / `1865ms`.
+- HTTP-provider distribution: `zero=4`, `single=59`, `multi=42`,
+  `single_target_miss=59`.
+- Single-HTTP-provider elapsed p50/p90/p95/max:
+  `26ms` / `59ms` / `426ms` / `895ms`.
+- Single-HTTP-provider first-HTTP p50/p90/p95/max:
+  `23ms` / `57ms` / `425ms` / `893ms`.
+- HTTP-provider races: `97` results, all successful, `0` late winners;
+  `56` single-provider races and `41` multi-provider races.
+- HTTP-provider fetch p50/p95/max: `163ms` / `699ms` / `739ms`.
+
+Interpretation:
+
+- The first-HTTP-provider tail is visible but not dominant in this live window:
+  p95 is `425ms`, with one `1865ms` max. This is much less severe than the
+  earlier `5875ms` first-HTTP tail, but the summary now makes that distinction
+  explicit.
+- Single-provider responses remain common: `59/105` delegated lookups had
+  exactly one HTTP provider and all missed the three-provider target.
+- The slowest request in this run was
+  `/ipns/ipfs.tech/_nuxt/community-hero.Cp0BCcC7.jpg`, with the delegated
+  provider lookup itself taking `1865ms`.
+- This does not justify a routing behavior change by itself. It gives future
+  behavior experiments a compact gate: only prototype first-HTTP hedging,
+  endpoint fanout, or DHT overlap when repeated traces show persistent high
+  p95, not only isolated maxes.
+
+Final validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting passed.
+- Full mobile web harness suite passed: `35 passed`.
+- Workspace check passed.
+- Workspace clippy passed with `-D warnings`.
+- Diff whitespace check passed.
+
+Decision:
+Keep. This is harness-only diagnostics and preserves the read-only,
+verified-block retrieval model. The next optimization agent can now compare
+delegated-routing p95/max against HTTP-provider p95/max without spelunking raw
+JSONL.

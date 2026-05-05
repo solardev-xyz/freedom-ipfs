@@ -1432,7 +1432,7 @@ fn print_trace_delegated_provider_lookup(trace: &TraceSummary) {
         return;
     }
     println!(
-        "  delegated provider lookup: events={} successes={} failures={} providers={} http_providers={} response_bytes={} response_lines={} max_elapsed_ms={}",
+        "  delegated provider lookup: events={} successes={} failures={} providers={} http_providers={} response_bytes={} response_lines={} elapsed={} max_elapsed_ms={}",
         delegated.events,
         delegated.successes,
         delegated.failures,
@@ -1440,32 +1440,39 @@ fn print_trace_delegated_provider_lookup(trace: &TraceSummary) {
         delegated.http_providers,
         delegated.response_bytes,
         delegated.response_lines,
+        delegated.elapsed_ms,
         delegated.max_elapsed_ms
     );
     if delegated.has_response_milestones() {
         println!(
-            "    response milestones: header_max={}ms first_chunk_seen={} first_chunk_max={}ms first_http_seen={} first_http_max={}ms target_met={} target_met_max={}ms",
+            "    response milestones: headers={} header_max={}ms first_chunk_seen={} first_chunks={} first_chunk_max={}ms first_http_seen={} first_http={} first_http_max={}ms target_met={} target_met_elapsed={} target_met_max={}ms",
+            delegated.response_headers_elapsed_ms,
             delegated.max_response_headers_elapsed_ms,
             delegated.first_chunk_events,
+            delegated.response_first_chunk_elapsed_ms,
             delegated.max_response_first_chunk_elapsed_ms,
             delegated.first_http_provider_events,
+            delegated.response_first_http_provider_elapsed_ms,
             delegated.max_response_first_http_provider_elapsed_ms,
             delegated.target_met_events,
+            delegated.response_target_met_elapsed_ms,
             delegated.max_response_target_met_elapsed_ms
         );
     }
     println!(
-        "    http provider distribution: zero={} single={} multi={} single_target_miss={} single_max={}ms single_first_http_max={}ms",
+        "    http provider distribution: zero={} single={} multi={} single_target_miss={} single_elapsed={} single_max={}ms single_first_http={} single_first_http_max={}ms",
         delegated.zero_http_provider_events,
         delegated.single_http_provider_events,
         delegated.multi_http_provider_events,
         delegated.single_http_provider_target_miss_events,
+        delegated.single_http_provider_elapsed_ms,
         delegated.max_single_http_provider_elapsed_ms,
+        delegated.single_http_provider_first_http_elapsed_ms,
         delegated.max_single_http_provider_first_http_elapsed_ms
     );
     for endpoint in trace.delegated_provider_lookup_by_endpoint.iter().take(4) {
         println!(
-            "    {}: events={} successes={} failures={} providers={} http_providers={} http_zero={} http_single={} http_multi={} http_single_target_miss={} max_elapsed_ms={} header_max={}ms first_http_max={}ms target_met={}",
+            "    {}: events={} successes={} failures={} providers={} http_providers={} http_zero={} http_single={} http_multi={} http_single_target_miss={} elapsed={} max_elapsed_ms={} headers={} header_max={}ms first_http={} first_http_max={}ms target_met={}",
             endpoint.endpoint,
             endpoint.events,
             endpoint.successes,
@@ -1476,8 +1483,11 @@ fn print_trace_delegated_provider_lookup(trace: &TraceSummary) {
             endpoint.single_http_provider_events,
             endpoint.multi_http_provider_events,
             endpoint.single_http_provider_target_miss_events,
+            endpoint.elapsed_ms,
             endpoint.max_elapsed_ms,
+            endpoint.response_headers_elapsed_ms,
             endpoint.max_response_headers_elapsed_ms,
+            endpoint.response_first_http_provider_elapsed_ms,
             endpoint.max_response_first_http_provider_elapsed_ms,
             endpoint.target_met_events
         );
@@ -4852,6 +4862,13 @@ struct TraceDelegatedProviderLookupAggregate {
     first_chunk_events: usize,
     first_http_provider_events: usize,
     target_met_events: usize,
+    elapsed_ms: LatencySummary,
+    response_headers_elapsed_ms: LatencySummary,
+    response_first_chunk_elapsed_ms: LatencySummary,
+    response_first_http_provider_elapsed_ms: LatencySummary,
+    response_target_met_elapsed_ms: LatencySummary,
+    single_http_provider_elapsed_ms: LatencySummary,
+    single_http_provider_first_http_elapsed_ms: LatencySummary,
     max_elapsed_ms: u128,
     max_response_headers_elapsed_ms: u128,
     max_response_first_chunk_elapsed_ms: u128,
@@ -4859,6 +4876,20 @@ struct TraceDelegatedProviderLookupAggregate {
     max_response_target_met_elapsed_ms: u128,
     max_single_http_provider_elapsed_ms: u128,
     max_single_http_provider_first_http_elapsed_ms: u128,
+    #[serde(skip)]
+    elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    response_headers_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    response_first_chunk_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    response_first_http_provider_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    response_target_met_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    single_http_provider_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    single_http_provider_first_http_elapsed_values: Vec<u128>,
 }
 
 impl TraceDelegatedProviderLookupAggregate {
@@ -4873,6 +4904,9 @@ impl TraceDelegatedProviderLookupAggregate {
             .get("provider_count")
             .and_then(json_u128)
             .unwrap_or_default();
+        if let Some(elapsed_ms) = elapsed_ms {
+            self.elapsed_values.push(elapsed_ms);
+        }
         let http_provider_count = value
             .get("http_provider_count")
             .and_then(json_u128)
@@ -4892,6 +4926,9 @@ impl TraceDelegatedProviderLookupAggregate {
                 self.max_single_http_provider_elapsed_ms = self
                     .max_single_http_provider_elapsed_ms
                     .max(elapsed_ms.unwrap_or_default());
+                if let Some(elapsed_ms) = elapsed_ms {
+                    self.single_http_provider_elapsed_values.push(elapsed_ms);
+                }
                 self.max_single_http_provider_first_http_elapsed_ms =
                     self.max_single_http_provider_first_http_elapsed_ms.max(
                         value
@@ -4899,6 +4936,13 @@ impl TraceDelegatedProviderLookupAggregate {
                             .and_then(json_u128)
                             .unwrap_or_default(),
                     );
+                if let Some(first_http_elapsed_ms) = value
+                    .get("response_first_http_provider_elapsed_ms")
+                    .and_then(json_u128)
+                {
+                    self.single_http_provider_first_http_elapsed_values
+                        .push(first_http_elapsed_ms);
+                }
             }
             _ => self.multi_http_provider_events += 1,
         }
@@ -4917,6 +4961,19 @@ impl TraceDelegatedProviderLookupAggregate {
         {
             self.first_chunk_events += 1;
         }
+        if let Some(headers_elapsed_ms) =
+            value.get("response_headers_elapsed_ms").and_then(json_u128)
+        {
+            self.response_headers_elapsed_values
+                .push(headers_elapsed_ms);
+        }
+        if let Some(first_chunk_elapsed_ms) = value
+            .get("response_first_chunk_elapsed_ms")
+            .and_then(json_u128)
+        {
+            self.response_first_chunk_elapsed_values
+                .push(first_chunk_elapsed_ms);
+        }
         if value
             .get("response_first_http_provider_seen")
             .and_then(|seen| seen.as_bool())
@@ -4924,12 +4981,26 @@ impl TraceDelegatedProviderLookupAggregate {
         {
             self.first_http_provider_events += 1;
         }
+        if let Some(first_http_elapsed_ms) = value
+            .get("response_first_http_provider_elapsed_ms")
+            .and_then(json_u128)
+        {
+            self.response_first_http_provider_elapsed_values
+                .push(first_http_elapsed_ms);
+        }
         if value
             .get("response_target_met")
             .and_then(|seen| seen.as_bool())
             == Some(true)
         {
             self.target_met_events += 1;
+        }
+        if let Some(target_met_elapsed_ms) = value
+            .get("response_target_met_elapsed_ms")
+            .and_then(json_u128)
+        {
+            self.response_target_met_elapsed_values
+                .push(target_met_elapsed_ms);
         }
         self.max_elapsed_ms = self.max_elapsed_ms.max(elapsed_ms.unwrap_or_default());
         self.max_response_headers_elapsed_ms = self.max_response_headers_elapsed_ms.max(
@@ -4956,6 +5027,27 @@ impl TraceDelegatedProviderLookupAggregate {
                 .get("response_target_met_elapsed_ms")
                 .and_then(json_u128)
                 .unwrap_or_default(),
+        );
+    }
+
+    fn finish(&mut self) {
+        self.elapsed_ms = LatencySummary::from_values(std::mem::take(&mut self.elapsed_values));
+        self.response_headers_elapsed_ms =
+            LatencySummary::from_values(std::mem::take(&mut self.response_headers_elapsed_values));
+        self.response_first_chunk_elapsed_ms = LatencySummary::from_values(std::mem::take(
+            &mut self.response_first_chunk_elapsed_values,
+        ));
+        self.response_first_http_provider_elapsed_ms = LatencySummary::from_values(std::mem::take(
+            &mut self.response_first_http_provider_elapsed_values,
+        ));
+        self.response_target_met_elapsed_ms = LatencySummary::from_values(std::mem::take(
+            &mut self.response_target_met_elapsed_values,
+        ));
+        self.single_http_provider_elapsed_ms = LatencySummary::from_values(std::mem::take(
+            &mut self.single_http_provider_elapsed_values,
+        ));
+        self.single_http_provider_first_http_elapsed_ms = LatencySummary::from_values(
+            std::mem::take(&mut self.single_http_provider_first_http_elapsed_values),
         );
     }
 
@@ -4987,6 +5079,13 @@ struct TraceDelegatedProviderEndpointAggregate {
     first_chunk_events: usize,
     first_http_provider_events: usize,
     target_met_events: usize,
+    elapsed_ms: LatencySummary,
+    response_headers_elapsed_ms: LatencySummary,
+    response_first_chunk_elapsed_ms: LatencySummary,
+    response_first_http_provider_elapsed_ms: LatencySummary,
+    response_target_met_elapsed_ms: LatencySummary,
+    single_http_provider_elapsed_ms: LatencySummary,
+    single_http_provider_first_http_elapsed_ms: LatencySummary,
     max_elapsed_ms: u128,
     max_response_headers_elapsed_ms: u128,
     max_response_first_chunk_elapsed_ms: u128,
@@ -6693,6 +6792,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             .then_with(|| left.path.cmp(&right.path))
     });
     slow_requests.truncate(MAX_TRACE_SLOW_EVENTS);
+    delegated_provider_lookup.finish();
     http_provider_races.finish();
 
     Ok(TraceSummary {
@@ -7079,8 +7179,9 @@ fn sorted_trace_delegated_provider_endpoints(
 ) -> Vec<TraceDelegatedProviderEndpointAggregate> {
     let mut values = endpoints
         .into_iter()
-        .map(
-            |(endpoint, aggregate)| TraceDelegatedProviderEndpointAggregate {
+        .map(|(endpoint, mut aggregate)| {
+            aggregate.finish();
+            TraceDelegatedProviderEndpointAggregate {
                 endpoint,
                 events: aggregate.events,
                 successes: aggregate.successes,
@@ -7097,6 +7198,15 @@ fn sorted_trace_delegated_provider_endpoints(
                 first_chunk_events: aggregate.first_chunk_events,
                 first_http_provider_events: aggregate.first_http_provider_events,
                 target_met_events: aggregate.target_met_events,
+                elapsed_ms: aggregate.elapsed_ms,
+                response_headers_elapsed_ms: aggregate.response_headers_elapsed_ms,
+                response_first_chunk_elapsed_ms: aggregate.response_first_chunk_elapsed_ms,
+                response_first_http_provider_elapsed_ms: aggregate
+                    .response_first_http_provider_elapsed_ms,
+                response_target_met_elapsed_ms: aggregate.response_target_met_elapsed_ms,
+                single_http_provider_elapsed_ms: aggregate.single_http_provider_elapsed_ms,
+                single_http_provider_first_http_elapsed_ms: aggregate
+                    .single_http_provider_first_http_elapsed_ms,
                 max_elapsed_ms: aggregate.max_elapsed_ms,
                 max_response_headers_elapsed_ms: aggregate.max_response_headers_elapsed_ms,
                 max_response_first_chunk_elapsed_ms: aggregate.max_response_first_chunk_elapsed_ms,
@@ -7106,8 +7216,8 @@ fn sorted_trace_delegated_provider_endpoints(
                 max_single_http_provider_elapsed_ms: aggregate.max_single_http_provider_elapsed_ms,
                 max_single_http_provider_first_http_elapsed_ms: aggregate
                     .max_single_http_provider_first_http_elapsed_ms,
-            },
-        )
+            }
+        })
         .collect::<Vec<_>>();
     values.sort_by(|left, right| {
         right
@@ -8631,9 +8741,17 @@ mod tests {
         assert_eq!(summary.delegated_provider_lookup.successes, 1);
         assert_eq!(summary.delegated_provider_lookup.providers, 3);
         assert_eq!(summary.delegated_provider_lookup.max_elapsed_ms, 9);
+        assert_eq!(summary.delegated_provider_lookup.elapsed_ms.p50_ms, Some(9));
         assert_eq!(summary.delegated_provider_lookup.http_providers, 2);
         assert_eq!(summary.delegated_provider_lookup.response_bytes, 512);
         assert_eq!(summary.delegated_provider_lookup.response_lines, 4);
+        assert_eq!(
+            summary
+                .delegated_provider_lookup
+                .response_headers_elapsed_ms
+                .p50_ms,
+            Some(5)
+        );
         assert_eq!(
             summary
                 .delegated_provider_lookup
@@ -8648,8 +8766,22 @@ mod tests {
             6
         );
         assert_eq!(
+            summary
+                .delegated_provider_lookup
+                .response_first_chunk_elapsed_ms
+                .p50_ms,
+            Some(6)
+        );
+        assert_eq!(
             summary.delegated_provider_lookup.first_http_provider_events,
             1
+        );
+        assert_eq!(
+            summary
+                .delegated_provider_lookup
+                .response_first_http_provider_elapsed_ms
+                .p50_ms,
+            Some(7)
         );
         assert_eq!(
             summary
@@ -8664,6 +8796,13 @@ mod tests {
                 .max_response_target_met_elapsed_ms,
             8
         );
+        assert_eq!(
+            summary
+                .delegated_provider_lookup
+                .response_target_met_elapsed_ms
+                .p50_ms,
+            Some(8)
+        );
         assert_eq!(summary.delegated_provider_lookup_by_endpoint.len(), 1);
         assert_eq!(
             summary.delegated_provider_lookup_by_endpoint[0].endpoint,
@@ -8676,6 +8815,12 @@ mod tests {
         assert_eq!(
             summary.delegated_provider_lookup_by_endpoint[0].http_providers,
             2
+        );
+        assert_eq!(
+            summary.delegated_provider_lookup_by_endpoint[0]
+                .response_first_http_provider_elapsed_ms
+                .p50_ms,
+            Some(7)
         );
         assert_eq!(
             summary.delegated_provider_lookup_by_endpoint[0]
@@ -8793,6 +8938,18 @@ mod tests {
         assert_eq!(delegated.single_http_provider_target_miss_events, 1);
         assert_eq!(delegated.max_single_http_provider_elapsed_ms, 96);
         assert_eq!(delegated.max_single_http_provider_first_http_elapsed_ms, 92);
+        assert_eq!(delegated.elapsed_ms.p50_ms, Some(23));
+        assert_eq!(delegated.response_headers_elapsed_ms.p50_ms, Some(20));
+        assert_eq!(
+            delegated.response_first_http_provider_elapsed_ms.p50_ms,
+            Some(21)
+        );
+        assert_eq!(delegated.response_target_met_elapsed_ms.p50_ms, Some(22));
+        assert_eq!(delegated.single_http_provider_elapsed_ms.p50_ms, Some(96));
+        assert_eq!(
+            delegated.single_http_provider_first_http_elapsed_ms.p50_ms,
+            Some(92)
+        );
 
         let endpoint = &summary.delegated_provider_lookup_by_endpoint[0];
         assert_eq!(endpoint.zero_http_provider_events, 1);
@@ -8801,6 +8958,18 @@ mod tests {
         assert_eq!(endpoint.single_http_provider_target_miss_events, 1);
         assert_eq!(endpoint.max_single_http_provider_elapsed_ms, 96);
         assert_eq!(endpoint.max_single_http_provider_first_http_elapsed_ms, 92);
+        assert_eq!(endpoint.elapsed_ms.p50_ms, Some(23));
+        assert_eq!(endpoint.response_headers_elapsed_ms.p50_ms, Some(20));
+        assert_eq!(
+            endpoint.response_first_http_provider_elapsed_ms.p50_ms,
+            Some(21)
+        );
+        assert_eq!(endpoint.response_target_met_elapsed_ms.p50_ms, Some(22));
+        assert_eq!(endpoint.single_http_provider_elapsed_ms.p50_ms, Some(96));
+        assert_eq!(
+            endpoint.single_http_provider_first_http_elapsed_ms.p50_ms,
+            Some(92)
+        );
     }
 
     #[test]
