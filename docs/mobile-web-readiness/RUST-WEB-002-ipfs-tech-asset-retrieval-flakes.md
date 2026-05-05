@@ -4078,3 +4078,23 @@ summary reported `bitswap deliveries: incoming=2` and
 Decision: keep. This is diagnostics-only, but it gives future multi-want,
 locality prefetch, and extra-block caching experiments a first-class harness
 metric instead of requiring ad hoc trace parsing.
+
+Follow-up coverage:
+
+- Existing traces showed that extra blocks can be a real signal:
+  `/tmp/ipfs-tech-stream-read6-r3-trace.jsonl` had `events=105 total=13
+  max=5 incoming=13`, while `/tmp/ipfs-tech-stream-read4-r3-trace.jsonl` had
+  `events=105 total=58 max=3 incoming=58`.
+- Add deterministic retrieval coverage that a verified extra Bitswap payload
+  block is stored and served as a cache hit on the next request:
+  `bitswap_fetch_caches_verified_extra_blocks`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib bitswap_fetch_caches_verified_extra_blocks
+cargo test -p freedom-ipfs-retrieval --lib fetches_block_from_local_bitswap_peer
+cargo test -p freedom-ipfs-retrieval --lib
+git diff --check
+```

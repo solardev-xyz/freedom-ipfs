@@ -3886,6 +3886,47 @@ mod bitswap_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn bitswap_fetch_caches_verified_extra_blocks() {
+        let requested_data = b"bitswap requested block with extra";
+        let extra_data = b"bitswap verified extra block";
+        let requested =
+            freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, requested_data);
+        let extra = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, extra_data);
+        let (peer_id, addr, swarm_task, stream_task) = spawn_bitswap_peer_with_extra_payload(
+            requested,
+            requested_data.to_vec(),
+            vec![(extra, extra_data.to_vec())],
+        )
+        .await;
+
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let provider =
+            Provider::from_parts(Some(peer_id.to_string()), vec![addr.to_string()]).unwrap();
+
+        let (block, source) = retriever
+            .fetch_from_providers_with_source(&requested, &[provider])
+            .await
+            .unwrap();
+        assert_eq!(source, RetrievalSource::Bitswap);
+        assert_eq!(block.data(), requested_data);
+
+        let (block, source) = retriever.fetch_block_with_source(&extra).await.unwrap();
+        assert_eq!(source, RetrievalSource::Cache);
+        assert_eq!(block.data(), extra_data);
+        assert_eq!(store.get(&extra).unwrap().unwrap().data(), extra_data);
+
+        tokio::time::timeout(Duration::from_secs(5), stream_task)
+            .await
+            .unwrap()
+            .unwrap();
+        swarm_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn shared_bitswap_client_handles_repeated_block_fetches() {
         let first = b"first shared bitswap block";
         let second = b"second shared bitswap block";
@@ -4937,6 +4978,94 @@ mod bitswap_tests {
                     data,
                     tokens: Vec::new(),
                 }],
+                ..BitswapMessage::default()
+            };
+            write_length_prefixed(&mut stream, &response.encode_to_vec())
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+
+            let cancel_bytes = tokio::time::timeout(
+                Duration::from_secs(5),
+                read_length_prefixed(&mut stream, 1024),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let cancel = BitswapMessage::decode(cancel_bytes.as_slice()).unwrap();
+            let entry = cancel.wantlist.unwrap().entries.remove(0);
+            assert_eq!(entry.block, cid.to_bytes());
+            assert!(entry.cancel);
+        });
+
+        (peer_id, addr, swarm_task, stream_task)
+    }
+
+    async fn spawn_bitswap_peer_with_extra_payload(
+        cid: Cid,
+        data: Vec<u8>,
+        extra_blocks: Vec<(Cid, Vec<u8>)>,
+    ) -> (
+        PeerId,
+        Multiaddr,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut swarm = SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                (tls::Config::new, noise::Config::new),
+                yamux::Config::default,
+            )
+            .unwrap()
+            .with_behaviour(|_| libp2p_stream::Behaviour::new())
+            .unwrap()
+            .build();
+        let peer_id = *swarm.local_peer_id();
+        let mut control = swarm.behaviour().new_control();
+        let mut incoming = control
+            .accept(StreamProtocol::new("/ipfs/bitswap/1.2.0"))
+            .unwrap();
+        swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let addr = loop {
+            if let libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } =
+                swarm.select_next_some().await
+            {
+                break address;
+            }
+        };
+
+        let swarm_task = tokio::spawn(async move {
+            loop {
+                let _ = swarm.select_next_some().await;
+            }
+        });
+        let stream_task = tokio::spawn(async move {
+            let (_peer, mut stream) = incoming.next().await.unwrap();
+            let want_bytes = read_length_prefixed(&mut stream, 1024).await.unwrap();
+            let want = BitswapMessage::decode(want_bytes.as_slice()).unwrap();
+            let entry = want.wantlist.unwrap().entries.remove(0);
+            assert_eq!(entry.block, cid.to_bytes());
+            assert!(!entry.cancel);
+
+            let mut payload = extra_blocks
+                .into_iter()
+                .map(|(cid, data)| BlockPayload {
+                    prefix: bitswap_payload_prefix(&cid),
+                    data,
+                    tokens: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            payload.push(BlockPayload {
+                prefix: bitswap_payload_prefix(&cid),
+                data,
+                tokens: Vec::new(),
+            });
+            let response = BitswapMessage {
+                payload,
                 ..BitswapMessage::default()
             };
             write_length_prefixed(&mut stream, &response.encode_to_vec())
