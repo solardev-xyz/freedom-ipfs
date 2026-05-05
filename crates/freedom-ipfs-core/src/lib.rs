@@ -75,6 +75,13 @@ pub trait BlockProvider: Send + Sync {
         Ok(Some(block_data_range(block.data(), start, end)))
     }
 
+    fn get_block_ranges(&self, ranges: &[(Cid, u64, u64)]) -> Result<Vec<Option<Vec<u8>>>> {
+        ranges
+            .iter()
+            .map(|(cid, start, end)| self.get_block_range(cid, *start, *end))
+            .collect()
+    }
+
     fn retain_block(&self, _cid: &Cid) -> Result<()> {
         Ok(())
     }

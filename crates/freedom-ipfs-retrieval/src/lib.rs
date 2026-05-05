@@ -6,7 +6,7 @@ use freedom_ipfs_core::{
 use freedom_ipfs_namesys::{CloudflareDohResolver, DnsTxtResolver};
 use freedom_ipfs_routing::{Provider, ProviderRoutingClient};
 use freedom_ipfs_store::{CachedProviderRecord, SqliteBlockStore};
-use futures::future::{BoxFuture, FutureExt, Shared};
+use futures::future::{join_all, BoxFuture, FutureExt, Shared};
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use futures::stream::{select_all, FuturesUnordered};
 use futures::StreamExt;
@@ -1227,6 +1227,64 @@ impl FetchingBlockProvider {
     pub fn stats(&self) -> RetrievalStats {
         self.stats.snapshot()
     }
+
+    async fn get_block_ranges_async(
+        &self,
+        ranges: Vec<(Cid, u64, u64)>,
+    ) -> CoreResult<Vec<Option<Vec<u8>>>> {
+        let mut results = vec![None; ranges.len()];
+        let mut fetches = Vec::new();
+        for (index, (cid, start, end)) in ranges.iter().copied().enumerate() {
+            let cache_started = Instant::now();
+            match self
+                .store
+                .get_range(&cid, start, end)
+                .map_err(|err| CoreError::Storage(err.to_string()))?
+            {
+                Some(bytes) => {
+                    tracing::info!(
+                        phase = "block_store_get_range",
+                        cid = %cid,
+                        cache_hit = true,
+                        elapsed_ms = cache_started.elapsed().as_millis()
+                    );
+                    self.stats.record(RetrievalSource::Cache);
+                    results[index] = Some(bytes);
+                }
+                None => {
+                    tracing::info!(
+                        phase = "block_store_get_range",
+                        cid = %cid,
+                        cache_hit = false,
+                        batch = true,
+                        elapsed_ms = cache_started.elapsed().as_millis()
+                    );
+                    let retriever = self.retriever.clone();
+                    fetches.push(async move {
+                        (
+                            index,
+                            cid,
+                            start,
+                            end,
+                            retriever.fetch_block_with_source(&cid).await,
+                        )
+                    });
+                }
+            }
+        }
+
+        for (index, cid, start, end, fetched) in join_all(fetches).await {
+            let (block, source) = fetched.map_err(|err| CoreError::Storage(err.to_string()))?;
+            self.stats.record(source);
+            tracing::info!(
+                phase = "block_range_batch_fetch",
+                cid = %cid,
+                source = retrieval_source_label(source)
+            );
+            results[index] = Some(block_data_range(block.data(), start, end));
+        }
+        Ok(results)
+    }
 }
 
 impl BlockProvider for FetchingBlockProvider {
@@ -1317,6 +1375,27 @@ impl BlockProvider for FetchingBlockProvider {
                 Ok(Some(block_data_range(block.data(), start, end)))
             }
             Err(err) => Err(CoreError::Storage(err.to_string())),
+        }
+    }
+
+    fn get_block_ranges(&self, ranges: &[(Cid, u64, u64)]) -> CoreResult<Vec<Option<Vec<u8>>>> {
+        if ranges.len() <= 1 {
+            return ranges
+                .iter()
+                .map(|(cid, start, end)| self.get_block_range(cid, *start, *end))
+                .collect();
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(self.get_block_ranges_async(ranges.to_vec()))
+            }),
+            Err(_) => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|err| CoreError::Storage(err.to_string()))?;
+                runtime.block_on(self.get_block_ranges_async(ranges.to_vec()))
+            }
         }
     }
 

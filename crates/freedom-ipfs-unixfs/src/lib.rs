@@ -15,6 +15,7 @@ const HAMT_LINK_PREFIX_LEN: usize = 2;
 const HAMT_MAX_SHARDS_VISITED: usize = 1024;
 const UNIXFS_METADATA_CACHE_MAX_BLOCK_BYTES: usize = 64 * 1024;
 const UNIXFS_PATH_CACHE_MAX_PATH_BYTES: usize = 1024;
+const UNIXFS_RANGE_BATCH_MAX_BLOCKS: usize = 4;
 
 #[derive(Debug, Error)]
 pub enum UnixfsError {
@@ -486,6 +487,16 @@ impl<'a> UnixfsContext<'a> {
             .ok_or(UnixfsError::NotFound(*cid))
     }
 
+    fn get_block_ranges(&self, ranges: &[(Cid, u64, u64)]) -> Result<Vec<Vec<u8>>> {
+        self.provider
+            .get_block_ranges(ranges)
+            .map_err(|err| UnixfsError::Provider(err.to_string()))?
+            .into_iter()
+            .zip(ranges.iter())
+            .map(|(bytes, (cid, _, _))| bytes.ok_or(UnixfsError::NotFound(*cid)))
+            .collect()
+    }
+
     fn dag_pb(&self, cid: &Cid) -> Result<DecodedDagPb> {
         if let Some(cache) = self.metadata_cache {
             if let Some(decoded) = cache.get(cid) {
@@ -758,6 +769,7 @@ impl UnixfsContext<'_> {
                             offset = offset.saturating_add(inline.len() as u64);
                         }
 
+                        let mut child_ranges = Vec::new();
                         for (index, link) in decoded.node.links.iter().enumerate() {
                             let child = link_cid(link)?;
                             let child_size = decoded
@@ -774,15 +786,40 @@ impl UnixfsContext<'_> {
                             if ranges_intersect(offset, child_end, start, end) {
                                 let range_start = start.saturating_sub(offset);
                                 let range_end = end.min(child_end).saturating_sub(offset);
+                                child_ranges.push((child, range_start, range_end));
+                            }
+                            offset = offset.saturating_add(child_size);
+                            if offset > end {
+                                break;
+                            }
+                        }
+                        let mut raw_batch = Vec::new();
+                        for (child, range_start, range_end) in child_ranges {
+                            if child.codec() == CODEC_RAW {
+                                raw_batch.push((child, range_start, range_end));
+                                if raw_batch.len() >= UNIXFS_RANGE_BATCH_MAX_BLOCKS {
+                                    for bytes in self.get_block_ranges(&raw_batch)? {
+                                        out.extend_from_slice(&bytes);
+                                    }
+                                    raw_batch.clear();
+                                }
+                            } else {
+                                if !raw_batch.is_empty() {
+                                    for bytes in self.get_block_ranges(&raw_batch)? {
+                                        out.extend_from_slice(&bytes);
+                                    }
+                                    raw_batch.clear();
+                                }
                                 out.extend_from_slice(&self.read_file_cid_range(
                                     &child,
                                     range_start,
                                     range_end,
                                 )?);
                             }
-                            offset = offset.saturating_add(child_size);
-                            if offset > end {
-                                break;
+                        }
+                        if !raw_batch.is_empty() {
+                            for bytes in self.get_block_ranges(&raw_batch)? {
+                                out.extend_from_slice(&bytes);
                             }
                         }
                         Ok(out)
@@ -1078,11 +1115,14 @@ mod tests {
         }
     }
 
+    type RangeBatchCalls = Arc<Mutex<Vec<Vec<(Cid, u64, u64)>>>>;
+
     #[derive(Clone)]
     struct CountingProvider {
         blocks: Arc<HashMap<Cid, Vec<u8>>>,
         calls: Arc<Mutex<HashMap<Cid, usize>>>,
         range_calls: Arc<Mutex<HashMap<Cid, usize>>>,
+        range_batch_calls: RangeBatchCalls,
     }
 
     impl CountingProvider {
@@ -1091,6 +1131,7 @@ mod tests {
                 blocks: Arc::new(blocks),
                 calls: Arc::new(Mutex::new(HashMap::new())),
                 range_calls: Arc::new(Mutex::new(HashMap::new())),
+                range_batch_calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1110,6 +1151,13 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(cid)
                 .unwrap_or(&0)
+        }
+
+        fn range_batch_calls(&self) -> Vec<Vec<(Cid, u64, u64)>> {
+            self.range_batch_calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
     }
 
@@ -1136,6 +1184,17 @@ mod tests {
                 return Ok(Some(block_data_range(data, start, end)));
             }
             Ok(None)
+        }
+
+        fn get_block_ranges(&self, ranges: &[(Cid, u64, u64)]) -> CoreResult<Vec<Option<Vec<u8>>>> {
+            self.range_batch_calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(ranges.to_vec());
+            ranges
+                .iter()
+                .map(|(cid, start, end)| self.get_block_range(cid, *start, *end))
+                .collect()
         }
     }
 
@@ -1390,6 +1449,47 @@ mod tests {
 
         assert_eq!(provider.call_count(&cid), 0);
         assert_eq!(provider.range_call_count(&cid), 1);
+    }
+
+    #[test]
+    fn file_range_batches_adjacent_raw_child_ranges() {
+        let first_data = b"abcdef";
+        let first_cid = cid_from_data(CODEC_RAW, first_data);
+        let second_data = b"ghijkl";
+        let second_cid = cid_from_data(CODEC_RAW, second_data);
+        let third_data = b"mnopqr";
+        let third_cid = cid_from_data(CODEC_RAW, third_data);
+        let file_data = pb_file_with_metadata(
+            b"",
+            vec![
+                link("first", &first_cid),
+                link("second", &second_cid),
+                link("third", &third_cid),
+            ],
+            (first_data.len() + second_data.len() + third_data.len()) as u64,
+            vec![
+                first_data.len() as u64,
+                second_data.len() as u64,
+                third_data.len() as u64,
+            ],
+        );
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_data);
+        let provider = CountingProvider::new(HashMap::from([
+            (first_cid, first_data.to_vec()),
+            (second_cid, second_data.to_vec()),
+            (third_cid, third_data.to_vec()),
+            (file_cid, file_data),
+        ]));
+
+        assert_eq!(
+            read_file_range(&provider, &file_cid, "", 4, 9).unwrap(),
+            b"efghij"
+        );
+
+        assert_eq!(
+            provider.range_batch_calls(),
+            vec![vec![(first_cid, 4, 5), (second_cid, 0, 3)]]
+        );
     }
 
     #[test]

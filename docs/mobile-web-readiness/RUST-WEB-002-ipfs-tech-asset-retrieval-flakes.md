@@ -11616,3 +11616,112 @@ improving it. Future work should not add a synchronous UnixFS prefetch barrier.
 If this area is revisited, prefer non-blocking/background overlap or improving
 normal child fetch coalescing/session behavior, and require the seeded harness
 to beat the `205ms` Rust baseline before keeping the change.
+
+## 2026-05-05 Keep: Bounded Parallel Raw Range Child Fetch
+
+Hypothesis:
+The seeded boundary-range trace showed the useful work is not a multi-want
+batch: it is one DAG-PB root fetch followed by two independent raw child range
+fetches. A safer optimization is to let UnixFS pass adjacent raw child ranges to
+the provider as a bounded batch, and let `FetchingBlockProvider` overlap the
+normal single-CID retrieval path for those children. This keeps existing block
+verification, provider routing, Bitswap session behavior, and cache insertion
+semantics instead of adding a new prefetch barrier.
+
+Change:
+
+- Add default `BlockProvider::get_block_ranges`.
+- Use it from UnixFS range reads for intersecting raw child links, capped to
+  `4` child ranges per batch.
+- Preserve recursive `read_file_cid_range` behavior for non-raw child links.
+- Override `FetchingBlockProvider::get_block_ranges` to:
+  - serve cached ranges immediately
+  - overlap uncached child fetches with existing `fetch_block_with_source`
+  - record the same retrieval stats and trace phases as normal block fetches
+  - emit `block_range_batch_fetch` for each fetched child range
+
+Focused validation:
+
+```sh
+cargo test -p freedom-ipfs-unixfs file_range_batches_adjacent_raw_child_ranges
+cargo test -p freedom-ipfs-retrieval shared_bitswap_client_fetch_many_requests_multiple_blocks_from_one_peer
+```
+
+Regression validation:
+
+```sh
+cargo test -p freedom-ipfs-core
+cargo test -p freedom-ipfs-unixfs
+cargo test -p freedom-ipfs-retrieval
+cargo test -p freedom-ipfs-gateway
+cargo fmt --all --check
+cargo clippy -p freedom-ipfs-core -p freedom-ipfs-unixfs -p freedom-ipfs-retrieval -p freedom-ipfs-gateway --all-targets -- -D warnings
+cargo check --workspace --all-targets
+git diff --check
+```
+
+Seeded comparison:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 1 \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-range-batch-boundary-rust-trace.jsonl \
+  --comparison-output /tmp/harness-range-batch-boundary-rust-vs-kubo.json
+
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-range-batch-boundary-r3-rust-trace.jsonl \
+  --comparison-output /tmp/harness-range-batch-boundary-r3-rust-vs-kubo.json
+```
+
+Result:
+
+- focused UnixFS range-batch test passed
+- focused retrieval Bitswap batch sanity test still passed
+- regression validation passed:
+  - `freedom-ipfs-core`: `5 passed`
+  - `freedom-ipfs-unixfs`: `15 passed`
+  - `freedom-ipfs-retrieval`: `65 passed; 1 ignored`
+  - `freedom-ipfs-gateway`: gateway library, binary, CLI, and parsing tests passed
+  - affected-crate clippy passed with `-D warnings`
+  - workspace check passed
+  - formatting and diff whitespace checks passed
+- one-run seeded comparison passed Rust and Kubo:
+  - Rust root TTFB `187ms`; Kubo `53ms`
+  - Rust max RSS/FD `38488KiB` / `13`; Kubo `90368KiB` / `45`
+- three-run fresh-gateway seeded comparison passed Rust and Kubo `3/3`:
+  - Rust root TTFB p50/p95 `194ms` / `196ms`
+  - Kubo root TTFB p50/p95 `56ms` / `58ms`
+  - Rust max RSS/FD `39304KiB` / `13`; Kubo `91008KiB` / `38`
+- Trace showed bounded overlap through normal single-CID Bitswap:
+  `block_range_batch_fetch=6`, `bitswap_session_shortcut` hits `6`,
+  `multi_cid_commands=0`, and no prefetch timeout errors.
+- Compared with the seeded one-run baseline before this change, Rust improved
+  from `205ms` to `187ms`. The repeat run shows the optimized cold path is
+  stable around `194ms` p50 on this fixture.
+
+Decision:
+Keep. This is a modest latency improvement, but it is structurally safer than
+the rejected multi-want prefetch: bounded fanout, no public fallback, no
+unverified caching, no new provider source, no synchronous prefetch timeout, and
+mobile resource usage remains low. Future work should use the seeded harness to
+continue driving this gap toward Kubo's `~56ms` p50.
