@@ -3491,3 +3491,136 @@ RSS/FD `52928KiB`/`48` versus Kubo `239240KiB`/`251`.
 Decision: reject and revert. The narrower timeout avoided changing warm/session
 candidate sets directly, but it still did not improve the root tail enough and
 made the asset tail materially worse in the same live window.
+
+Rejected follow-up: latency-aware successful Bitswap peer ordering.
+
+Hypothesis:
+Recent trace data showed large source-peer latency differences. Session peer
+reuse was still recency-only, so a slow peer that happened to respond recently
+could stay hot. A lightweight EWMA of successful Bitswap fetch latency might
+prefer faster peers during warm page loads without increasing dial fanout.
+
+Temporary broad prototype:
+
+- store `latency_ewma_ms` with each successful Bitswap peer
+- sort successful provider candidates by latency EWMA before recency
+- sort inserted recent session peers by latency EWMA before recency
+- trace successful peer recordings with `latency_ms` and `latency_ewma_ms`
+
+Deterministic coverage passed while the broad prototype existed:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib lower_latency
+cargo test -p freedom-ipfs-retrieval --lib
+cargo build -p freedom-ipfs-gateway
+```
+
+Live broad prototype run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-latency-peer-score-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-latency-peer-score-r3.json
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root TTFB p50/p95 was
+`1128/2463ms` versus Kubo `1482/2381ms`; Rust asset p50/p95 was
+`116/1461ms` versus Kubo `119/1197ms`. Resource use stayed mobile-light at
+RSS/FD `51912KiB`/`55` versus Kubo `248900KiB`/`161`.
+
+Immediate committed-baseline comparison from a detached worktree at
+`c63e095`:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-baseline-c63e095-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-baseline-c63e095-r3.json
+```
+
+Baseline result: Rust and Kubo both passed `3/3`. Rust root p50/p95 was
+`1080/1107ms` versus Kubo `2427/3486ms`; Rust asset p50/p95 was `144/834ms`
+versus Kubo `124/248ms`.
+
+Second broad prototype run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-latency-peer-score-r3b-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-latency-peer-score-r3b.json
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root p50/p95 was `897/1342ms`
+versus Kubo `2229/3839ms`; Rust asset p50/p95 was `171/687ms` versus Kubo
+`134/908ms`.
+
+Second committed-baseline comparison:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-baseline-c63e095-r3b-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-baseline-c63e095-r3b.json
+```
+
+Baseline result: Rust and Kubo both passed `3/3`. Rust root p50/p95 was
+`871/878ms` versus Kubo `2033/2419ms`; Rust asset p50/p95 was `179/846ms`
+versus Kubo `108/479ms`.
+
+Narrowed prototype:
+
+- restore recency sorting for successful peers already present in provider
+  candidate sets
+- keep latency EWMA only for ordering the warm recent-session peer shortcut
+  list
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-session-latency-score-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-session-latency-score-r3.json
+```
+
+Result: Rust and Kubo both passed `3/3`, but the asset tail was poor. Rust
+root p50/p95 was `966/1271ms` versus Kubo `1435/1637ms`; Rust asset p50/p95
+was `158/1385ms` versus Kubo `80/179ms`.
+
+Decision: reject and revert both broad and session-only latency ordering. The
+signal was unstable and not enough to beat the committed baseline on absolute
+Rust p95. Also, the measured `bitswap_fetch` elapsed time is not a pure peer
+latency signal: it includes request scheduling, CID/block size effects, and the
+inbound-response model where the winning peer may satisfy the want through the
+shared swarm while outgoing attempts are cancelled. Future peer scoring should
+first collect a cleaner signal, such as per-peer first-byte timing from the
+Bitswap swarm, byte-normalized throughput over multiple blocks, or bounded
+session-level batching outcomes.
