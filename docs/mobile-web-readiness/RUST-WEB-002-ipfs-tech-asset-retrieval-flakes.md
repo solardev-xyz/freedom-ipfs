@@ -19952,3 +19952,68 @@ not leave obvious hot-path latency drift or FD/RSS growth in this 30-run
 same-daemon page soak. Future longer soaks should still track duplicate HTTP
 bytes and Bitswap connection lifetime, but this sample does not show immediate
 mobile-resource regression.
+
+## 2026-05-05 Guardrail: 250ms Self-Hedge Cold `ipfs.tech` 10 Runs
+
+Question:
+Does the 250ms single HTTP self-hedge hold up across a wider cold fresh-gateway
+sample, or was the 3-run signal too noisy?
+
+Command:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-self-hedge250-cold-r10-trace.jsonl \
+  --output /tmp/ipfs-tech-self-hedge250-cold-r10.json
+```
+
+Result:
+
+- Passed: `10/10`.
+- Run total p50/p90/p95/max: `1808/2174/2226/2226ms`.
+- Root TTFB p50/p90/p95/max: `548/722/788/788ms`.
+- Asset TTFB p50/p90/p95/max: `168/459/503/876ms`.
+- Gateway RSS p50/p90/p95/max:
+  `51756/52528/53192/53192KiB`.
+- Gateway FD p50/p90/p95/max: `31/33/33/33`.
+- Gateway statuses: `200=270`, `206=60`, limiter denials `0`.
+
+Trace summary:
+
+- Trace path:
+  `/tmp/ipfs-tech-self-hedge250-cold-r10-trace.jsonl`.
+- JSON output:
+  `/tmp/ipfs-tech-self-hedge250-cold-r10.json`.
+- Trace events/phases: `9842` events, `30` phases.
+- Block sources: `http_provider=276`, `bitswap=123`, `cache=1`.
+- HTTP-provider block totals p50/p90/p95/max:
+  `204/312/346/682ms`.
+- Bitswap block totals p50/p90/p95/max:
+  `129/274/303/526ms`.
+- Delegated provider lookups: `328`, successes `328`, failures `0`,
+  self-hedges `0`, p50/p90/p95/max `23/47/53/635ms`.
+- HTTP-provider races: `226`, single-provider `122`, multi-provider `104`,
+  self-hedges `26`, result max `448ms`.
+- Single-provider HTTP winner p50/p90/p95/max:
+  `211/303/321/448ms`.
+- HTTP-provider fetch p50/p90/p95/max: `159/218/234/401ms`.
+- `https://ipfs-bridge.sia.dev/`: `122` fetches, p50/p90/p95/max
+  `183/233/271/401ms`.
+- `https://dag.w3s.link/`: `104` fetches, p50/p90/p95/max
+  `50/88/95/124ms`.
+- Bitswap connections established: `39` across 10 fresh gateway processes.
+
+Decision:
+Keep. The wider cold sample keeps the same direction as the 3-run experiments:
+sub-second root p95, asset p50 close to warm human-perceived responsiveness,
+and bounded FD/RSS. The most visible remaining tail is no longer HTTP provider
+fetch result latency; it is UnixFS/root path work waiting on the slowest block
+fetches and occasional delegated lookup outliers under `1s`.
