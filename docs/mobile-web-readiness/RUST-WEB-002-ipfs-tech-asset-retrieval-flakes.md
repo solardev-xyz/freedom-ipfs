@@ -4997,3 +4997,70 @@ timeout had already reset the stored shared client. The bad live window also
 shows that repeated reset plus same-provider retry can collapse under asset
 fan-out. A behavior experiment should now target retry fan-out and reset
 coordination, not the existence of the retry itself.
+
+## 2026-05-05 Rejected: Gate Same-Provider Timeout Retries
+
+Hypothesis:
+
+- Same-provider retry after mixed-trusted request timeout usually helps, but
+  many concurrent retries can pressure the shared Bitswap path and connection
+  limits.
+- A small per-retriever semaphore around same-provider request-timeout retries
+  might reduce retry storms without removing the useful retry behavior.
+
+Prototype:
+
+- Add `MAX_BITSWAP_REQUEST_TIMEOUT_RETRIES = 2`.
+- Add a shared semaphore to `HttpRetriever`.
+- Acquire a permit only around the same-provider
+  `provider_retry_after_request_timeout` retry fetch.
+- Emit `provider_retry_gate` and summarize `retry_gate_events` plus
+  `retry_gate_max_wait_ms` in the harness.
+
+Validation before live rejection:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo test -p freedom-ipfs-retrieval --lib shortens_request_timeout_for_mixed_trusted_bitswap_candidates
+cargo build -p freedom-ipfs-gateway
+git diff --check
+```
+
+Prototype live run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-request-timeout-retry-gate-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-request-timeout-retry-gate-r3.json
+```
+
+Result: reject. Rust failed `0/3`; Kubo passed `3/3`. Rust root p50/p95 was
+`2881/5198ms` versus Kubo `2682/2704ms`, and Rust asset p50/p95 was
+`218/12694ms` versus Kubo `92/200ms`. Rust max RSS/FD was `54600KiB`/`82`
+versus Kubo `204452KiB`/`124`.
+
+Trace summary:
+
+- `bitswap timeout recovery: request_timeout_details=35 mixed_trusted=35
+  request_timeout_events=35 reset_true=21 reset_false=14 client_resets=21
+  retry_starts=21 same_provider_retries=16 refreshed_provider_retries=5
+  retry_gate_events=16 retry_gate_max_wait_ms=4176 retry_successes=7
+  trusted_retry_successes=5 untrusted_retry_successes=2 retry_failures=14
+  retry_unresolved=0
+  retry_success_elapsed=p50=183ms p90=1325ms p95=1325ms max=1325ms`
+- `bitswap session request_timeouts_with_trusted=35`.
+- `bitswap dial rejections: events=63 connection_limit=63`.
+
+Decision: reject and revert. The gate reduced some retry concurrency, but it
+queued retries for up to `4176ms`, did not restore reliability, and left the
+asset tail far behind Kubo. A useful fix likely needs smarter peer/provider
+choice or reset coordination, not a blunt semaphore around all same-provider
+timeout retries.
