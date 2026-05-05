@@ -19193,3 +19193,48 @@ Keep as guardrail evidence. The sparse-provider DAICO page remains fast and
 resource-light after the self-hedge changes. Neither hedge fired in this case,
 which is the desired behavior for already-fast delegated and HTTP-provider
 paths.
+
+## 2026-05-05 Guardrail: Vitalik Root HTML Range After Self-Hedges
+
+Question:
+Do the self-hedge changes preserve the current fast HTTP range behavior on the
+`vitalik-root-html-range` case?
+
+Command:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-root-html-range-post-self-hedges-r3-trace.jsonl \
+  --output /tmp/vitalik-root-html-range-post-self-hedges-r3.json
+```
+
+Result:
+
+- Rust passed `3/3`.
+- Root/range TTFB p50/p95/max: `250ms` / `257ms` / `257ms`.
+- Root/range total p50/p95/max: `250ms` / `258ms` / `258ms`.
+- Run total p50/p95/max: `250ms` / `258ms` / `258ms`.
+- Max RSS/FD: `32128KiB` / `14`.
+- Gateway statuses: `206=3`.
+- Block sources: `http_provider=6`.
+- Delegated provider lookup p50/p90/p95/max:
+  `38ms` / `165ms` / `165ms` / `165ms`.
+- Delegated self-hedges: `0`.
+- HTTP-provider races: `6` successes; single-provider winners used
+  `https://trustless.filebase.io/`.
+- HTTP-provider fetch p50/p90/p95/max:
+  `20ms` / `40ms` / `40ms` / `40ms`.
+- HTTP-provider self-hedges: `0`.
+
+Decision:
+Keep as range guardrail evidence. The range path stays fast and resource-light,
+and neither self-hedge fires on already-fast delegated or HTTP-provider
+lookups.
