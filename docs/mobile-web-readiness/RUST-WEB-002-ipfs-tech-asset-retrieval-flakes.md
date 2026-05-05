@@ -7388,3 +7388,90 @@ slots, but it did not reduce connection pressure or tail latency in the
 same-window evidence. A better next step is to collect per-peer success/failure
 quality over time and bias peers with observed page-session success, rather
 than ranking cold public providers by static address shape alone.
+
+## 2026-05-05 Parked: Sorting Recent Bitswap Peers By Success Count
+
+Hypothesis:
+The existing recent-success Bitswap session cache sorts successful peers mostly
+by recency. During page loads, traces usually show one or two peers delivering
+most blocks. Sorting recent/session peers by repeated success count first, then
+recency, might keep the strongest observed page-session peers at the front
+without raising connection caps or changing provider discovery.
+
+Change tested:
+
+- Add `success_count` to the in-memory `SuccessfulBitswapPeer` record.
+- Increment the count on each successful Bitswap delivery.
+- Preserve existing addresses when a later success record has no addresses.
+- Sort provider-trusted and session-only recent peers by `success_count`, then
+  by `seen_at`.
+
+Validation before live run:
+
+```sh
+cargo fmt --all
+cargo test -p freedom-ipfs-retrieval successful_bitswap
+cargo build -p freedom-ipfs-gateway
+```
+
+Experiment:
+
+```sh
+timeout 360s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/ipfs-tech-session-score-cold-rust-vs-kubo-trace.jsonl \
+  --output /tmp/ipfs-tech-session-score-cold-rust-vs-kubo.json
+```
+
+Experiment result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1513/3162ms`, Kubo `3876/4021ms`.
+- Asset TTFB p50/p95: Rust `161/1445ms`, Kubo `210/503ms`.
+- Max RSS/FD: Rust `51596KiB`/`51`, Kubo `289804KiB`/`473`.
+- Bitswap dial plans: `136` events, `535` candidates, `137` new addrs,
+  `196` suppressed addrs, `55` pending peers, `299` connected peers.
+- Bitswap dial rejections: `55`, all connection-limit, transports
+  `tcp=45`, `quic=8`, `ws=2`.
+
+Same-window baseline after reverting the change:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+timeout 360s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/ipfs-tech-session-score-revert-samewindow-cold-trace.jsonl \
+  --output /tmp/ipfs-tech-session-score-revert-samewindow-cold.json
+```
+
+Same-window baseline result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1168/1270ms`, Kubo `2223/3382ms`.
+- Asset TTFB p50/p95: Rust `206/1102ms`, Kubo `152/521ms`.
+- Max RSS/FD: Rust `51512KiB`/`51`, Kubo `273036KiB`/`261`.
+- Bitswap dial plans: `133` events, `532` candidates, `128` new addrs,
+  `214` suppressed addrs, `31` pending peers, `312` connected peers.
+- Bitswap dial rejections: `51`, all connection-limit, transports
+  `tcp=37`, `quic=14`.
+
+Decision: do not keep. Success-count ordering was plausible and stayed within
+the same resource caps, but it made the same-window root p50/p95 and asset p95
+worse. It also left connection-limit pressure essentially unchanged. The trace
+still shows the same basic constraint: a few good peers eventually dominate
+delivery, but early cold requests continue to spend limited dial slots on weak
+or stale candidates before that signal is strong enough. A better next
+experiment should bias against recently failed connection classes earlier, not
+just reorder successful peers after the fact.
