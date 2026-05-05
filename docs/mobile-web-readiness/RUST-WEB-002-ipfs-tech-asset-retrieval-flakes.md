@@ -14966,3 +14966,86 @@ tail in that window. The concept may be worth revisiting only with a stronger
 scoping key, such as an explicit page/root session ID and provider success tied
 to the same resolved UnixFS root; a process-global short TTL is still too blunt
 for mobile resource goals.
+
+## 2026-05-05 Keep: Summarize Delegated HTTP Provider Distribution
+
+Question:
+After rejecting the process-global recent HTTP provider shortcut, the remaining
+tail evidence still pointed at delegated provider records that sometimes expose
+only one HTTP provider, or no HTTP provider at all. The harness already printed
+total delegated provider and HTTP provider counts, but it did not preserve the
+distribution needed to tell whether a run was mostly healthy multi-provider
+lookup or dominated by sparse HTTP-provider responses.
+
+Implementation:
+
+- Extend the mobile web harness trace summary with delegated lookup counters for
+  zero, single, and multi HTTP-provider events.
+- Track single-HTTP-provider target misses separately.
+- Track max elapsed time and max first-HTTP-provider time for single-provider
+  delegated lookup events.
+- Print the distribution both globally and per delegated routing endpoint.
+- Add a focused trace-summary regression test.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_delegated_http_provider_distribution
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Result:
+
+- Formatting passed after rustfmt.
+- Focused delegated distribution test passed.
+- Existing mobile progress phase summary test passed.
+- Full `mobile-web-harness` tests passed: `33 passed`.
+- Workspace check passed.
+- Package and workspace clippy passed with `-D warnings`.
+
+Live smoke:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-delegated-http-dist-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-delegated-http-dist-r3.json
+```
+
+Live result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1454ms` / `1539ms` / `1539ms`.
+- Asset TTFB p50/p95/max: `236ms` / `2504ms` / `3371ms`.
+- Run total p50/p95/max: `3507ms` / `5522ms` / `5522ms`.
+- Max RSS/FD: `52632KiB` / `38`.
+- Delegated provider lookup: `91` events, `91` successes, `1558`
+  providers, `155` HTTP providers.
+- HTTP provider distribution: `zero=6`, `single=50`, `multi=35`,
+  `single_target_miss=50`, `single_max=2198ms`,
+  `single_first_http_max=426ms`.
+- Endpoint `https://delegated-ipfs.dev/routing/v1`: `http_zero=6`,
+  `http_single=50`, `http_multi=35`, `http_single_target_miss=50`,
+  `target_met=35`.
+- HTTP-provider fetch p50/p95/max: `163ms` / `645ms` / `869ms`.
+- Block sources: `http_provider=87`, `bitswap=31`, `cache=2`.
+
+Decision:
+Keep. This is harness-only instrumentation, so it does not affect node runtime
+behavior or mobile resource use. The live run confirms the diagnostic value:
+`50/91` delegated lookups returned exactly one HTTP provider, and all single
+HTTP-provider events missed the target response threshold. That gives future
+experiments a compact signal for sparse-provider tails without spelunking raw
+trace JSONL.
