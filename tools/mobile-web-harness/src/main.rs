@@ -1226,7 +1226,7 @@ fn print_trace_unixfs_metadata_cache(trace: &TraceSummary) {
     }
     let cache = &trace.unixfs_metadata_cache;
     println!(
-        "  unixfs metadata cache: events={} hits={} misses={} inserts={} evictions={} oversized_skips={} max_len={} path_hits={} path_misses={} path_inserts={} path_evictions={} path_oversized_skips={} max_path_len={} capacity={}",
+        "  unixfs metadata cache: events={} hits={} misses={} inserts={} evictions={} oversized_skips={} max_len={} path_hits={} path_misses={} path_inserts={} path_evictions={} path_oversized_skips={} max_path_len={} file_size_hits={} file_size_misses={} file_size_inserts={} file_size_evictions={} max_file_size_len={} capacity={}",
         cache.events,
         cache.hits,
         cache.misses,
@@ -1240,6 +1240,11 @@ fn print_trace_unixfs_metadata_cache(trace: &TraceSummary) {
         cache.path_evictions,
         cache.path_oversized_skips,
         cache.max_path_len,
+        cache.file_size_hits,
+        cache.file_size_misses,
+        cache.file_size_inserts,
+        cache.file_size_evictions,
+        cache.max_file_size_len,
         cache.max_capacity
     );
 }
@@ -3655,6 +3660,11 @@ struct TraceUnixfsMetadataCacheAggregate {
     path_evictions: u128,
     path_oversized_skips: u128,
     max_path_len: u128,
+    file_size_hits: u128,
+    file_size_misses: u128,
+    file_size_inserts: u128,
+    file_size_evictions: u128,
+    max_file_size_len: u128,
     max_capacity: u128,
 }
 
@@ -4271,6 +4281,22 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 .get("path_oversized_skips")
                 .and_then(json_u128)
                 .unwrap_or_default();
+            unixfs_metadata_cache.file_size_hits += value
+                .get("file_size_hits")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            unixfs_metadata_cache.file_size_misses += value
+                .get("file_size_misses")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            unixfs_metadata_cache.file_size_inserts += value
+                .get("file_size_inserts")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            unixfs_metadata_cache.file_size_evictions += value
+                .get("file_size_evictions")
+                .and_then(json_u128)
+                .unwrap_or_default();
             unixfs_metadata_cache.max_len = unixfs_metadata_cache.max_len.max(
                 value
                     .get("cache_len")
@@ -4280,6 +4306,12 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             unixfs_metadata_cache.max_path_len = unixfs_metadata_cache.max_path_len.max(
                 value
                     .get("path_cache_len")
+                    .and_then(json_u128)
+                    .unwrap_or_default(),
+            );
+            unixfs_metadata_cache.max_file_size_len = unixfs_metadata_cache.max_file_size_len.max(
+                value
+                    .get("file_size_cache_len")
                     .and_then(json_u128)
                     .unwrap_or_default(),
             );
@@ -5478,7 +5510,7 @@ mod tests {
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bad.example\",\"cached\":false,\"ok\":false,\"record_count\":0}\n",
                 "{\"phase\":\"bitswap_dns_multiaddr_expand\",\"host\":\"peer.example\",\"cached\":false,\"ip_count\":2}\n",
                 "{\"phase\":\"bitswap_dns_multiaddr_expand\",\"host\":\"peer.example\",\"cached\":true,\"ip_count\":2}\n",
-                "{\"phase\":\"unixfs_metadata_cache\",\"elapsed_ms\":0,\"hits\":3,\"misses\":2,\"inserts\":2,\"evictions\":1,\"oversized_skips\":0,\"cache_len\":4,\"path_hits\":5,\"path_misses\":7,\"path_inserts\":6,\"path_evictions\":1,\"path_oversized_skips\":0,\"path_cache_len\":6,\"cache_capacity\":256}\n",
+                "{\"phase\":\"unixfs_metadata_cache\",\"elapsed_ms\":0,\"hits\":3,\"misses\":2,\"inserts\":2,\"evictions\":1,\"oversized_skips\":0,\"cache_len\":4,\"path_hits\":5,\"path_misses\":7,\"path_inserts\":6,\"path_evictions\":1,\"path_oversized_skips\":0,\"path_cache_len\":6,\"file_size_hits\":8,\"file_size_misses\":9,\"file_size_inserts\":9,\"file_size_evictions\":2,\"file_size_cache_len\":7,\"cache_capacity\":256}\n",
                 "{\"phase\":\"block_store_get\",\"elapsed_ms\":0,\"cid\":\"cid10\",\"cache_hit\":false}\n",
                 "{\"phase\":\"block_store_get\",\"elapsed_ms\":0,\"cid\":\"cid11\",\"cache_hit\":true,\"rechecked\":true}\n",
                 "{\"phase\":\"block_store_get\",\"elapsed_ms\":0,\"cid\":\"cid12\",\"cache_hit\":false,\"rechecked\":true}\n",
@@ -5564,6 +5596,11 @@ mod tests {
         assert_eq!(summary.unixfs_metadata_cache.path_evictions, 1);
         assert_eq!(summary.unixfs_metadata_cache.path_oversized_skips, 0);
         assert_eq!(summary.unixfs_metadata_cache.max_path_len, 6);
+        assert_eq!(summary.unixfs_metadata_cache.file_size_hits, 8);
+        assert_eq!(summary.unixfs_metadata_cache.file_size_misses, 9);
+        assert_eq!(summary.unixfs_metadata_cache.file_size_inserts, 9);
+        assert_eq!(summary.unixfs_metadata_cache.file_size_evictions, 2);
+        assert_eq!(summary.unixfs_metadata_cache.max_file_size_len, 7);
         assert_eq!(summary.unixfs_metadata_cache.max_capacity, 256);
         assert_eq!(summary.bitswap_source_peers.len(), 1);
         assert_eq!(summary.bitswap_source_peers[0].value, "peer1");

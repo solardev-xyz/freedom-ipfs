@@ -616,7 +616,18 @@ fn trace_unixfs_metadata_cache_delta(
         path_evictions = after.path_evictions.saturating_sub(before.path_evictions),
         path_oversized_skips = after
             .path_oversized_skips
-            .saturating_sub(before.path_oversized_skips)
+            .saturating_sub(before.path_oversized_skips),
+        file_size_cache_len = after.file_size_len,
+        file_size_hits = after.file_size_hits.saturating_sub(before.file_size_hits),
+        file_size_misses = after
+            .file_size_misses
+            .saturating_sub(before.file_size_misses),
+        file_size_inserts = after
+            .file_size_inserts
+            .saturating_sub(before.file_size_inserts),
+        file_size_evictions = after
+            .file_size_evictions
+            .saturating_sub(before.file_size_evictions)
     );
 }
 

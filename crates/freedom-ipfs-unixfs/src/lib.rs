@@ -197,6 +197,11 @@ pub struct UnixfsMetadataCacheStats {
     pub path_inserts: u64,
     pub path_evictions: u64,
     pub path_oversized_skips: u64,
+    pub file_size_len: usize,
+    pub file_size_hits: u64,
+    pub file_size_misses: u64,
+    pub file_size_inserts: u64,
+    pub file_size_evictions: u64,
 }
 
 #[derive(Debug)]
@@ -241,6 +246,19 @@ impl UnixfsMetadataCache {
             Some(resolved)
         } else {
             inner.path_misses = inner.path_misses.saturating_add(1);
+            None
+        }
+    }
+
+    fn get_file_size(&self, cid: &Cid) -> Option<u64> {
+        let mut inner = self.lock_inner();
+        let size = inner.file_size_entries.get(cid).copied();
+        if let Some(size) = size {
+            inner.file_size_hits = inner.file_size_hits.saturating_add(1);
+            touch_file_size_cache_order(&mut inner, cid);
+            Some(size)
+        } else {
+            inner.file_size_misses = inner.file_size_misses.saturating_add(1);
             None
         }
     }
@@ -296,12 +314,35 @@ impl UnixfsMetadataCache {
         }
     }
 
+    fn insert_file_size(&self, cid: &Cid, size: u64) {
+        let mut inner = self.lock_inner();
+        if inner.capacity == 0 {
+            return;
+        }
+
+        if inner.file_size_entries.insert(*cid, size).is_none() {
+            inner.file_size_inserts = inner.file_size_inserts.saturating_add(1);
+        }
+        touch_file_size_cache_order(&mut inner, cid);
+
+        while inner.file_size_entries.len() > inner.capacity {
+            let Some(evicted) = inner.file_size_order.pop_front() else {
+                break;
+            };
+            if inner.file_size_entries.remove(&evicted).is_some() {
+                inner.file_size_evictions = inner.file_size_evictions.saturating_add(1);
+            }
+        }
+    }
+
     fn clear(&self) {
         let mut inner = self.lock_inner();
         inner.entries.clear();
         inner.order.clear();
         inner.path_entries.clear();
         inner.path_order.clear();
+        inner.file_size_entries.clear();
+        inner.file_size_order.clear();
     }
 
     fn stats(&self) -> UnixfsMetadataCacheStats {
@@ -320,6 +361,11 @@ impl UnixfsMetadataCache {
             path_inserts: inner.path_inserts,
             path_evictions: inner.path_evictions,
             path_oversized_skips: inner.path_oversized_skips,
+            file_size_len: inner.file_size_entries.len(),
+            file_size_hits: inner.file_size_hits,
+            file_size_misses: inner.file_size_misses,
+            file_size_inserts: inner.file_size_inserts,
+            file_size_evictions: inner.file_size_evictions,
         }
     }
 
@@ -337,6 +383,8 @@ struct UnixfsMetadataCacheInner {
     order: VecDeque<Cid>,
     path_entries: HashMap<UnixfsPathCacheKey, ResolvedNode>,
     path_order: VecDeque<UnixfsPathCacheKey>,
+    file_size_entries: HashMap<Cid, u64>,
+    file_size_order: VecDeque<Cid>,
     hits: u64,
     misses: u64,
     inserts: u64,
@@ -347,6 +395,10 @@ struct UnixfsMetadataCacheInner {
     path_inserts: u64,
     path_evictions: u64,
     path_oversized_skips: u64,
+    file_size_hits: u64,
+    file_size_misses: u64,
+    file_size_inserts: u64,
+    file_size_evictions: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -372,6 +424,11 @@ fn touch_metadata_cache_order(inner: &mut UnixfsMetadataCacheInner, cid: &Cid) {
 fn touch_path_cache_order(inner: &mut UnixfsMetadataCacheInner, key: &UnixfsPathCacheKey) {
     inner.path_order.retain(|candidate| candidate != key);
     inner.path_order.push_back(key.clone());
+}
+
+fn touch_file_size_cache_order(inner: &mut UnixfsMetadataCacheInner, cid: &Cid) {
+    inner.file_size_order.retain(|candidate| candidate != cid);
+    inner.file_size_order.push_back(*cid);
 }
 
 #[derive(Clone, Debug)]
@@ -622,6 +679,20 @@ impl UnixfsContext<'_> {
     }
 
     fn file_size_cid(&self, cid: &Cid) -> Result<u64> {
+        if let Some(cache) = self.metadata_cache {
+            if let Some(size) = cache.get_file_size(cid) {
+                return Ok(size);
+            }
+        }
+
+        let size = self.file_size_cid_uncached(cid)?;
+        if let Some(cache) = self.metadata_cache {
+            cache.insert_file_size(cid, size);
+        }
+        Ok(size)
+    }
+
+    fn file_size_cid_uncached(&self, cid: &Cid) -> Result<u64> {
         match cid.codec() {
             CODEC_RAW => Ok(self.get_block(cid)?.data().len() as u64),
             CODEC_DAG_PB => {
@@ -1137,6 +1208,11 @@ mod tests {
                 path_inserts: 2,
                 path_evictions: 0,
                 path_oversized_skips: 0,
+                file_size_len: 2,
+                file_size_hits: 0,
+                file_size_misses: 2,
+                file_size_inserts: 2,
+                file_size_evictions: 0,
             }
         );
     }
@@ -1173,6 +1249,24 @@ mod tests {
     }
 
     #[test]
+    fn cached_resolver_reuses_raw_file_sizes() {
+        let data = b"raw file size";
+        let cid = cid_from_data(CODEC_RAW, data);
+        let provider = CountingProvider::new(HashMap::from([(cid, data.to_vec())]));
+        let resolver = UnixfsResolver::with_metadata_cache_capacity(8);
+
+        assert_eq!(resolver.file_size(&provider, &cid, "").unwrap(), 13);
+        assert_eq!(resolver.file_size(&provider, &cid, "").unwrap(), 13);
+
+        assert_eq!(provider.call_count(&cid), 2);
+        let stats = resolver.metadata_cache_stats();
+        assert_eq!(stats.file_size_len, 1);
+        assert_eq!(stats.file_size_misses, 1);
+        assert_eq!(stats.file_size_inserts, 1);
+        assert_eq!(stats.file_size_hits, 1);
+    }
+
+    #[test]
     fn cached_resolver_reuses_path_resolution_across_repeated_reads() {
         let file_data = pb_file(b"abcdef", Vec::new());
         let file_cid = cid_from_data(CODEC_DAG_PB, &file_data);
@@ -1199,6 +1293,10 @@ mod tests {
         assert_eq!(stats.path_misses, 1);
         assert_eq!(stats.path_inserts, 1);
         assert_eq!(stats.path_hits, 1);
+        assert_eq!(stats.file_size_len, 1);
+        assert_eq!(stats.file_size_misses, 1);
+        assert_eq!(stats.file_size_inserts, 1);
+        assert_eq!(stats.file_size_hits, 1);
     }
 
     #[test]
@@ -1226,6 +1324,8 @@ mod tests {
         assert_eq!(stats.evictions, 2);
         assert_eq!(stats.path_len, 1);
         assert_eq!(stats.path_evictions, 2);
+        assert_eq!(stats.file_size_len, 1);
+        assert_eq!(stats.file_size_evictions, 2);
     }
 
     #[test]

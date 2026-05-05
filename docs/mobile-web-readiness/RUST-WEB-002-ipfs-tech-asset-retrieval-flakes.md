@@ -7019,3 +7019,106 @@ hundreds of hot path-resolution hits with no evictions, and the cache is bounded
 and positive-only. This is a small warm-path building block; future work should
 look at the remaining hot request overhead that keeps Rust around `20ms` while
 Kubo is still in the low single-digit milliseconds.
+
+## 2026-05-05 Keep: Cache Positive UnixFS File Sizes
+
+Motivation:
+After adding the path-resolution cache, warm same-daemon traces still showed
+repeated hot `block_store_get` reads for raw asset CIDs. A common pattern was:
+resolve path, compute file size for ETag/range decisions, then read the same
+CID again for MIME sniffing or response streaming. File size is immutable once a
+CID has been verified, so it is a good fit for the same bounded in-memory
+UnixFS metadata cache.
+
+Implementation:
+
+- Add a bounded positive `CID -> file size` cache beside decoded DAG-PB metadata
+  and path-resolution entries.
+- Cache only successful file-size results; do not cache directories, unsupported
+  codecs, missing blocks, or other errors.
+- Use the same small capacity as the metadata cache and keep entries in memory
+  only.
+- Extend `unixfs_metadata_cache` traces and harness summaries with
+  `file_size_hits`, `file_size_misses`, `file_size_inserts`,
+  `file_size_evictions`, and `file_size_cache_len`.
+
+Baseline:
+Use the path-cache experiment above as the baseline.
+
+- Warm root TTFB p50/p95: Rust `24/25ms`, Kubo `3/3ms`.
+- Warm asset TTFB p50/p95: Rust `18/69ms`, Kubo `2/8ms`.
+- Rust trace: `block_store events=369`, `path_hits=497`,
+  `max_path_len=34`.
+
+Experiment:
+
+```sh
+cargo build -p freedom-ipfs-gateway
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --warmup-runs 1 \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-warm-persistent-filesize-cache-experiment-rerun-trace.jsonl \
+  --output /tmp/ipfs-tech-warm-persistent-filesize-cache-experiment-rerun.json
+```
+
+Experiment result:
+
+- Rust and Kubo both passed `3/3`.
+- Measured warm root TTFB p50/p95: Rust `19/21ms`, Kubo `2/3ms`.
+- Measured warm asset TTFB p50/p95: Rust `10/42ms`, Kubo `2/5ms`.
+- Max RSS/FD: Rust `50592KiB`/`44`, Kubo `172856KiB`/`137`.
+- Rust trace: `block_store events=266`, `cache_hit=181`,
+  `checking_cache=85`.
+- File-size cache summary:
+  `file_size_hits=146`, `file_size_misses=170`,
+  `file_size_inserts=166`, `file_size_evictions=0`,
+  `max_file_size_len=33`.
+
+Cold sanity:
+
+```sh
+timeout 360s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --run-timeout-secs 240 \
+  --trace-output /tmp/ipfs-tech-filesize-cache-cold-rust-vs-kubo-trace.jsonl \
+  --output /tmp/ipfs-tech-filesize-cache-cold-rust-vs-kubo.json
+```
+
+Cold result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `687/918ms`, Kubo `3845/3938ms`.
+- Asset TTFB p50/p95: Rust `139/731ms`, Kubo `204/484ms`.
+- Max RSS/FD: Rust `52088KiB`/`49`, Kubo `294100KiB`/`378`.
+- File-size cache summary:
+  `file_size_hits=0`, `file_size_misses=511`,
+  `file_size_inserts=501`, `file_size_evictions=0`,
+  `max_file_size_len=33`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-unixfs
+cargo test -p freedom-ipfs-gateway
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Decision: keep. This gives a clear warm-path win: asset p50/p95 improved from
+`18/69ms` to `10/42ms`, root p50/p95 improved from `24/25ms` to `19/21ms`, and
+block-store trace events dropped from `369` to `266` in the same harness mode.
+The cache stays bounded, positive-only, read-only, and in-memory, so it fits the
+mobile resource constraints.
