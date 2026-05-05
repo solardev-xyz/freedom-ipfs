@@ -5616,3 +5616,121 @@ Decision: keep. This is diagnostics-only, but it identifies repeated
 connection-level failures by peer and class. The next behavior work should use
 this signal for bounded peer backoff or smarter candidate selection, instead of
 trying to infer repeated bad peers from request timeouts alone.
+
+## 2026-05-05 Keep: Back Off Repeated Connection-Error Peers
+
+Goal:
+
+- Avoid repeatedly scheduling public peers that have just produced concrete
+  connection-level failures inside the same shared Bitswap swarm.
+- Keep the response bounded and mobile-safe: no higher connection limits, no
+  public gateway fallback, no unbounded peer blacklist.
+
+Implementation:
+
+- Add an in-memory, per-swarm backoff for peers that hit repeated concrete
+  connection errors:
+  - protocol negotiation failure
+  - connection refused
+  - connection reset
+  - no route to host
+- Ignore generic connection timeout errors for this backoff path, since earlier
+  connection-timeout suppression did not help.
+- Threshold: `2` matching concrete errors for the same peer/class.
+- TTL: `30s`.
+- While active, skip that peer for new Bitswap commands in the same swarm and
+  emit `bitswap_connection_error_peer_skipped`.
+- Emit `bitswap_connection_error_backoff` when a peer enters backoff.
+- Extend the harness summary with `bitswap connection backoff`.
+
+Validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval --lib connection_error
+cargo test -p freedom-ipfs-retrieval --lib
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+git diff --check
+cargo build -p freedom-ipfs-gateway
+```
+
+Live validation 1:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-connection-error-backoff-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-connection-error-backoff-r3.json
+```
+
+Result: Rust passed `3/3`; Kubo passed `3/3`. Rust root TTFB p50/p95 was
+`1994/2767ms` versus Kubo `3091/3645ms`. Rust asset TTFB p50/p95 was
+`161/821ms` versus Kubo `209/1125ms`. This run did not exercise backoff; no
+peer hit the repeated-error threshold inside a single fresh gateway process.
+
+Live validation 2:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-connection-error-backoff-r3b-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-connection-error-backoff-r3b.json
+```
+
+Result: Rust passed `3/3`; Kubo passed `3/3`. Rust root TTFB p50/p95 was
+`1187/1848ms` versus Kubo `3704/5033ms`. Rust asset TTFB p50/p95 was
+`142/886ms` versus Kubo `178/451ms`.
+
+Backoff evidence:
+
+- `bitswap_connection_error_backoff` fired once for
+  `12D3KooWCqqNtp7WKk3eQfsN7o3VRmUtPwaq8YpS4LUKc9tbzM7P`
+  with `error_class=connection_reset`.
+- The same peer was skipped for two later CIDs.
+
+Live validation 3:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-connection-error-backoff-r3c-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-connection-error-backoff-r3c.json
+```
+
+Result: Rust passed `3/3`; Kubo passed `3/3`. Rust root TTFB p50/p95 was
+`993/1014ms` versus Kubo `3736/4347ms`. Rust asset TTFB p50/p95 was
+`147/1094ms` versus Kubo `224/561ms`.
+
+Backoff evidence:
+
+- `bitswap_connection_error_backoff` fired for
+  `12D3KooWF1vFVwEbAqHMnXPnKVJmjT5Ncj39zZkZPk87KCBvTFfo`
+  with `error_class=connection_refused`.
+- That peer was skipped for five later CIDs.
+- A second peer,
+  `12D3KooWCqqNtp7WKk3eQfsN7o3VRmUtPwaq8YpS4LUKc9tbzM7P`,
+  also entered backoff with `error_class=connection_reset`.
+
+Decision: keep. Across three `repeat=3` samples Rust passed `9/9` while Kubo
+passed `9/9`, and two samples exercised the new path. The asset p95 can still
+lose to Kubo in some passing runs, but the backoff is bounded, in-memory,
+resource-neutral, and prevents repeatedly scheduling peers that have just
+proven unusable at the connection layer.

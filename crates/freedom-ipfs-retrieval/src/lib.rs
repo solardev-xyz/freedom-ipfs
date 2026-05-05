@@ -51,6 +51,8 @@ const BITSWAP_WANT_HAVE_TIMEOUT: Duration = Duration::from_millis(750);
 const BITSWAP_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(6);
 const BITSWAP_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const BITSWAP_SUCCESSFUL_PEER_TTL: Duration = Duration::from_secs(10 * 60);
+const BITSWAP_CONNECTION_ERROR_BACKOFF_TTL: Duration = Duration::from_secs(30);
+const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD: usize = 2;
 const BITSWAP_SESSION_SHORTCUT_GRACE: Duration = Duration::from_millis(0);
 const BITSWAP_SESSION_POST_LOOKUP_GRACE: Duration = Duration::from_millis(200);
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1236,6 +1238,13 @@ struct PeerTransportState {
     current: Option<&'static str>,
 }
 
+struct ConnectionErrorBackoff {
+    count: usize,
+    last_seen: Instant,
+    suppress_until: Option<Instant>,
+    class: &'static str,
+}
+
 impl SharedBitswapClient {
     async fn spawn() -> Result<Self> {
         let swarm = build_bitswap_swarm().await?;
@@ -1329,6 +1338,7 @@ async fn run_shared_bitswap_swarm(
     let mut connected_peers = HashMap::<PeerId, usize>::new();
     let mut connection_waiters = HashMap::<PeerId, Vec<oneshot::Sender<()>>>::new();
     let mut connection_wait_started = HashMap::<PeerId, Instant>::new();
+    let mut connection_error_backoff = HashMap::<PeerId, ConnectionErrorBackoff>::new();
     let dial_errors = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let peer_transports = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
@@ -1340,6 +1350,7 @@ async fn run_shared_bitswap_swarm(
                 };
                 let command_queued_ms = command.sent_at.elapsed().as_millis();
                 prune_connection_waiters(&mut connection_waiters, &mut connection_wait_started);
+                prune_connection_error_backoff(&mut connection_error_backoff, Instant::now());
                 let (incoming_result, incoming_results) = mpsc::unbounded_channel();
                 pending_incoming.entry(command.cid).or_default().push(
                     PendingIncomingBitswapResult {
@@ -1352,6 +1363,19 @@ async fn run_shared_bitswap_swarm(
                 let mut peer_plans = Vec::new();
                 let mut dial_candidates = Vec::new();
                 for peer in command.peers {
+                    if let Some(remaining_ms) = connection_error_backoff_remaining_ms(
+                        &connection_error_backoff,
+                        &peer.id,
+                        Instant::now(),
+                    ) {
+                        tracing::info!(
+                            phase = "bitswap_connection_error_peer_skipped",
+                            cid = %command.cid,
+                            peer = %peer.id,
+                            remaining_ms
+                        );
+                        continue;
+                    }
                     tracing::debug!(peer = %peer.id, addrs = ?peer.addrs, "adding bitswap peer");
                     let already_connected = connected_peers.contains_key(&peer.id);
                     let already_pending = !already_connected && connection_waiters.contains_key(&peer.id);
@@ -1614,6 +1638,20 @@ async fn run_shared_bitswap_swarm(
                         let error_detail = format_error_detail(&error);
                         if let Some(peer_id) = peer_id {
                             record_dial_error(&dial_errors, peer_id, error_detail.clone()).await;
+                            if let Some(backoff) = record_connection_error_backoff(
+                                &mut connection_error_backoff,
+                                peer_id,
+                                &error_detail,
+                                Instant::now(),
+                            ) {
+                                tracing::info!(
+                                    phase = "bitswap_connection_error_backoff",
+                                    peer = %peer_id,
+                                    error_class = backoff.class,
+                                    count = backoff.count,
+                                    ttl_ms = BITSWAP_CONNECTION_ERROR_BACKOFF_TTL.as_millis()
+                                );
+                            }
                         }
                         tracing::info!(
                             phase = "bitswap_connection_error",
@@ -1647,6 +1685,77 @@ fn should_start_bitswap_dial(
     connection_waiters: &HashMap<PeerId, Vec<oneshot::Sender<()>>>,
 ) -> bool {
     !connected_peers.contains_key(peer) && !connection_waiters.contains_key(peer)
+}
+
+fn prune_connection_error_backoff(
+    backoff: &mut HashMap<PeerId, ConnectionErrorBackoff>,
+    now: Instant,
+) {
+    backoff.retain(|_, state| {
+        now.duration_since(state.last_seen) <= BITSWAP_CONNECTION_ERROR_BACKOFF_TTL
+            || state
+                .suppress_until
+                .is_some_and(|suppress_until| suppress_until > now)
+    });
+}
+
+fn connection_error_backoff_remaining_ms(
+    backoff: &HashMap<PeerId, ConnectionErrorBackoff>,
+    peer: &PeerId,
+    now: Instant,
+) -> Option<u128> {
+    backoff
+        .get(peer)
+        .and_then(|state| state.suppress_until)
+        .and_then(|suppress_until| {
+            (suppress_until > now).then(|| suppress_until.duration_since(now).as_millis())
+        })
+}
+
+fn record_connection_error_backoff<'a>(
+    backoff: &'a mut HashMap<PeerId, ConnectionErrorBackoff>,
+    peer: PeerId,
+    detail: &str,
+    now: Instant,
+) -> Option<&'a ConnectionErrorBackoff> {
+    let class = bitswap_connection_error_backoff_class(detail)?;
+    let state = backoff.entry(peer).or_insert(ConnectionErrorBackoff {
+        count: 0,
+        last_seen: now,
+        suppress_until: None,
+        class,
+    });
+    if now.duration_since(state.last_seen) > BITSWAP_CONNECTION_ERROR_BACKOFF_TTL {
+        state.count = 0;
+        state.suppress_until = None;
+    }
+    if state.class != class {
+        state.count = 0;
+        state.suppress_until = None;
+        state.class = class;
+    }
+    state.count += 1;
+    state.last_seen = now;
+    if state.count >= BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD {
+        state.suppress_until = Some(now + BITSWAP_CONNECTION_ERROR_BACKOFF_TTL);
+        Some(state)
+    } else {
+        None
+    }
+}
+
+fn bitswap_connection_error_backoff_class(detail: &str) -> Option<&'static str> {
+    if detail.contains("Protocol negotiation failed") {
+        Some("protocol_negotiation_failed")
+    } else if detail.contains("Connection refused") {
+        Some("connection_refused")
+    } else if detail.contains("Connection reset by peer") {
+        Some("connection_reset")
+    } else if detail.contains("No route to host") {
+        Some("no_route_to_host")
+    } else {
+        None
+    }
 }
 
 async fn record_dial_error(errors: &DialErrorLog, peer: PeerId, detail: String) {
@@ -4625,6 +4734,78 @@ mod bitswap_tests {
             &connected_peers,
             &connection_waiters
         ));
+    }
+
+    #[test]
+    fn backs_off_repeated_connection_error_peers() {
+        let peer = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let mut backoff = HashMap::new();
+        let now = Instant::now();
+
+        assert!(record_connection_error_backoff(
+            &mut backoff,
+            peer,
+            "Multistream select failed: Protocol negotiation failed.",
+            now,
+        )
+        .is_none());
+        let state = record_connection_error_backoff(
+            &mut backoff,
+            peer,
+            "Multistream select failed: Protocol negotiation failed.",
+            now + Duration::from_millis(10),
+        )
+        .unwrap();
+
+        assert_eq!(state.count, 2);
+        assert_eq!(state.class, "protocol_negotiation_failed");
+        assert!(connection_error_backoff_remaining_ms(
+            &backoff,
+            &peer,
+            now + Duration::from_millis(20)
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn connection_error_backoff_resets_after_ttl() {
+        let peer = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let mut backoff = HashMap::new();
+        let now = Instant::now();
+
+        record_connection_error_backoff(
+            &mut backoff,
+            peer,
+            "Multistream select failed: Protocol negotiation failed.",
+            now,
+        );
+        record_connection_error_backoff(
+            &mut backoff,
+            peer,
+            "Multistream select failed: Protocol negotiation failed.",
+            now + Duration::from_millis(10),
+        );
+        prune_connection_error_backoff(
+            &mut backoff,
+            now + BITSWAP_CONNECTION_ERROR_BACKOFF_TTL + Duration::from_millis(11),
+        );
+
+        assert!(backoff.is_empty());
+    }
+
+    #[test]
+    fn ignores_non_backoff_connection_errors() {
+        let peer = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let mut backoff = HashMap::new();
+
+        assert!(record_connection_error_backoff(
+            &mut backoff,
+            peer,
+            "Timeout has been reached",
+            Instant::now(),
+        )
+        .is_none());
+        assert!(backoff.is_empty());
     }
 
     #[test]

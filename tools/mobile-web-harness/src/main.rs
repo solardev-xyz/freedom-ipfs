@@ -763,6 +763,7 @@ fn print_summary(report: &RunReport) {
             );
         }
         print_trace_connection_errors(trace);
+        print_trace_connection_backoff(trace);
         print_trace_dial_rejections(trace);
         if trace.bitswap_dns_expansion.events > 0 {
             let dns = &trace.bitswap_dns_expansion;
@@ -997,6 +998,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
         );
     }
     print_trace_connection_errors(trace);
+    print_trace_connection_backoff(trace);
     print_trace_dial_rejections(trace);
     if !trace.trace_errors.is_empty() {
         println!(
@@ -1119,6 +1121,21 @@ fn print_trace_connection_errors(trace: &TraceSummary) {
         errors.without_peer,
         format_trace_counts(&errors.classes),
         format_trace_counts(&errors.peers)
+    );
+}
+
+fn print_trace_connection_backoff(trace: &TraceSummary) {
+    let backoff = &trace.bitswap_connection_backoff;
+    if backoff.backoffs == 0 && backoff.skipped == 0 {
+        return;
+    }
+    println!(
+        "  bitswap connection backoff: backoffs={} skipped={} classes={} peers={} skipped_peers={}",
+        backoff.backoffs,
+        backoff.skipped,
+        format_trace_counts(&backoff.classes),
+        format_trace_counts(&backoff.peers),
+        format_trace_counts(&backoff.skipped_peers)
     );
 }
 
@@ -2887,6 +2904,7 @@ struct TraceSummary {
     bitswap_provider_quality: TraceBitswapProviderQualityAggregate,
     bitswap_connection_transports: Vec<TraceValueCount>,
     bitswap_connection_errors: TraceBitswapConnectionErrorAggregate,
+    bitswap_connection_backoff: TraceBitswapConnectionBackoffAggregate,
     bitswap_dial_rejections: TraceBitswapDialRejectedAggregate,
     bitswap_dial_rejected_transports: Vec<TraceValueCount>,
     bitswap_dns_expansion: TraceBitswapDnsExpansionAggregate,
@@ -3043,6 +3061,15 @@ struct TraceBitswapConnectionErrorAggregate {
     without_peer: usize,
     classes: Vec<TraceValueCount>,
     peers: Vec<TraceValueCount>,
+}
+
+#[derive(Debug, Serialize)]
+struct TraceBitswapConnectionBackoffAggregate {
+    backoffs: usize,
+    skipped: usize,
+    classes: Vec<TraceValueCount>,
+    peers: Vec<TraceValueCount>,
+    skipped_peers: Vec<TraceValueCount>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -3366,6 +3393,11 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_connection_error_without_peer = 0usize;
     let mut bitswap_connection_error_classes = BTreeMap::<String, usize>::new();
     let mut bitswap_connection_error_peers = BTreeMap::<String, usize>::new();
+    let mut bitswap_connection_backoffs = 0usize;
+    let mut bitswap_connection_backoff_skips = 0usize;
+    let mut bitswap_connection_backoff_classes = BTreeMap::<String, usize>::new();
+    let mut bitswap_connection_backoff_peers = BTreeMap::<String, usize>::new();
+    let mut bitswap_connection_backoff_skipped_peers = BTreeMap::<String, usize>::new();
     let mut bitswap_dial_rejections = TraceBitswapDialRejectedAggregate::default();
     let mut bitswap_dial_rejected_transports = BTreeMap::<String, usize>::new();
     let mut bitswap_dns_expansion = TraceBitswapDnsExpansionAggregate::default();
@@ -3841,6 +3873,23 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 .entry(class.to_string())
                 .or_default() += 1;
         }
+        if phase == "bitswap_connection_error_backoff" {
+            bitswap_connection_backoffs += 1;
+            if let Some(class) = json_detail_string(value.get("error_class")) {
+                *bitswap_connection_backoff_classes.entry(class).or_default() += 1;
+            }
+            if let Some(peer) = json_detail_string(value.get("peer")) {
+                *bitswap_connection_backoff_peers.entry(peer).or_default() += 1;
+            }
+        }
+        if phase == "bitswap_connection_error_peer_skipped" {
+            bitswap_connection_backoff_skips += 1;
+            if let Some(peer) = json_detail_string(value.get("peer")) {
+                *bitswap_connection_backoff_skipped_peers
+                    .entry(peer)
+                    .or_default() += 1;
+            }
+        }
         if phase == "bitswap_dial_rejected" {
             bitswap_dial_rejections.events += 1;
             if value
@@ -3988,6 +4037,13 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             without_peer: bitswap_connection_error_without_peer,
             classes: sorted_trace_counts(bitswap_connection_error_classes),
             peers: sorted_trace_counts(bitswap_connection_error_peers),
+        },
+        bitswap_connection_backoff: TraceBitswapConnectionBackoffAggregate {
+            backoffs: bitswap_connection_backoffs,
+            skipped: bitswap_connection_backoff_skips,
+            classes: sorted_trace_counts(bitswap_connection_backoff_classes),
+            peers: sorted_trace_counts(bitswap_connection_backoff_peers),
+            skipped_peers: sorted_trace_counts(bitswap_connection_backoff_skipped_peers),
         },
         bitswap_dial_rejections,
         bitswap_dial_rejected_transports: sorted_trace_counts(bitswap_dial_rejected_transports),
@@ -4515,6 +4571,8 @@ mod tests {
                 "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer1\",\"remote_addr\":\"/ip4/127.0.0.1/tcp/4001\",\"transport\":\"tcp\"}\n",
                 "{\"phase\":\"bitswap_connection_error\",\"peer\":\"peer3\",\"error\":\"Failed to negotiate transport protocol(s): Protocol negotiation failed.\"}\n",
                 "{\"phase\":\"bitswap_connection_error\",\"peer\":\"\",\"error\":\"Failed to negotiate transport protocol(s): Connection refused (os error 111)\"}\n",
+                "{\"phase\":\"bitswap_connection_error_backoff\",\"peer\":\"peer3\",\"error_class\":\"protocol_negotiation_failed\",\"count\":2,\"ttl_ms\":30000}\n",
+                "{\"phase\":\"bitswap_connection_error_peer_skipped\",\"cid\":\"cid-skip\",\"peer\":\"peer3\",\"remaining_ms\":25000}\n",
                 "{\"phase\":\"bitswap_dial_rejected\",\"peer\":\"peer2\",\"transport\":\"quic\",\"connection_limit\":true,\"error\":\"Dial error\"}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bootstrap.example\",\"cached\":false,\"ok\":true,\"record_count\":2}\n",
                 "{\"phase\":\"bitswap_dnsaddr_expand\",\"host\":\"bootstrap.example\",\"cached\":true,\"ok\":true,\"record_count\":2}\n",
@@ -4539,8 +4597,8 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.line_count, 32);
-        assert_eq!(summary.event_count, 31);
+        assert_eq!(summary.line_count, 34);
+        assert_eq!(summary.event_count, 33);
         assert_eq!(summary.slow_events.len(), 15);
         assert_eq!(
             summary.slow_events[0].phase,
@@ -4749,6 +4807,17 @@ mod tests {
         );
         assert_eq!(summary.bitswap_connection_errors.peers[0].value, "peer3");
         assert_eq!(summary.bitswap_connection_errors.peers[0].count, 1);
+        assert_eq!(summary.bitswap_connection_backoff.backoffs, 1);
+        assert_eq!(summary.bitswap_connection_backoff.skipped, 1);
+        assert_eq!(
+            summary.bitswap_connection_backoff.classes[0].value,
+            "protocol_negotiation_failed"
+        );
+        assert_eq!(summary.bitswap_connection_backoff.peers[0].value, "peer3");
+        assert_eq!(
+            summary.bitswap_connection_backoff.skipped_peers[0].value,
+            "peer3"
+        );
         assert_eq!(summary.bitswap_dial_rejected_transports.len(), 1);
         assert_eq!(summary.bitswap_dial_rejected_transports[0].value, "quic");
         assert_eq!(summary.bitswap_dial_rejected_transports[0].count, 1);
