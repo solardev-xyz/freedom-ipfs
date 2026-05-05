@@ -7642,3 +7642,54 @@ Decision: keep. This is diagnostics-only, but it identifies the current
 range serving. The next routing experiment should test a bounded fallback or
 race for slow delegated provider lookups while preserving read-only behavior
 and mobile resource caps.
+
+## 2026-05-05 Reject: Light-DHT-Only Vitalik Routing
+
+Hypothesis:
+The previous `vitalik-root-html-range` run showed delegated provider lookup
+latency as high as `4993ms`. If delegated routing is the tail source, a
+light-DHT-only routing mode might beat the delegated path for this range-heavy
+case while keeping resource use low.
+
+Build:
+
+```sh
+cargo build -p freedom-ipfs-gateway -p mobile-web-harness
+```
+
+Experiment:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --routing-mode light-dht \
+  --dht-query-timeout-secs 10 \
+  --dht-max-providers 4 \
+  --asset-concurrency 6 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/vitalik-light-dht-routing-trace.jsonl \
+  --comparison-output /tmp/vitalik-light-dht-routing.json
+```
+
+Experiment result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `11322/11655ms`, Kubo `2850/3111ms`.
+- Max RSS/FD: Rust `46704KiB`/`20`, Kubo `123648KiB`/`89`.
+- Progress phases included `provider_lookup=6`, `providers_found=6`,
+  `fetching_bitswap=46`, and `streaming=30`.
+- Bitswap dial plans were small: `6` events, `8` candidates, `5` new peers,
+  `10` new addrs, `0` pending peers, `3` connected peers.
+- Bitswap delivery itself was quick once providers were found:
+  max pending incoming wait was `481ms`.
+
+Decision: reject. DHT-only routing preserved low FD and memory use but moved
+the tail into provider discovery and was much slower than the delegated auto
+baseline from the previous same-day run. This argues against replacing
+delegated routing for `vitalik-root-html-range`. The more promising direction
+is a bounded slow-delegated fallback/race that preserves fast delegated wins
+instead of forcing every lookup through light DHT.
