@@ -1574,12 +1574,14 @@ fn print_trace_delegated_provider_lookup(trace: &TraceSummary) {
         return;
     }
     println!(
-        "  delegated provider lookup: events={} successes={} failures={} providers={} http_providers={} response_bytes={} response_lines={} elapsed={} max_elapsed_ms={}",
+        "  delegated provider lookup: events={} successes={} failures={} providers={} http_providers={} self_hedges={} self_hedge_timeout_max={}ms response_bytes={} response_lines={} elapsed={} max_elapsed_ms={}",
         delegated.events,
         delegated.successes,
         delegated.failures,
         delegated.providers,
         delegated.http_providers,
+        delegated.self_hedges,
+        delegated.max_self_hedge_timeout_ms,
         delegated.response_bytes,
         delegated.response_lines,
         delegated.elapsed_ms,
@@ -1614,7 +1616,7 @@ fn print_trace_delegated_provider_lookup(trace: &TraceSummary) {
     );
     for endpoint in trace.delegated_provider_lookup_by_endpoint.iter().take(4) {
         println!(
-            "    {}: events={} successes={} failures={} providers={} http_providers={} http_zero={} http_single={} http_multi={} http_single_target_miss={} elapsed={} max_elapsed_ms={} headers={} header_max={}ms first_http={} first_http_max={}ms target_met={}",
+            "    {}: events={} successes={} failures={} providers={} http_providers={} http_zero={} http_single={} http_multi={} http_single_target_miss={} self_hedges={} self_hedge_timeout_max={}ms elapsed={} max_elapsed_ms={} headers={} header_max={}ms first_http={} first_http_max={}ms target_met={}",
             endpoint.endpoint,
             endpoint.events,
             endpoint.successes,
@@ -1625,6 +1627,8 @@ fn print_trace_delegated_provider_lookup(trace: &TraceSummary) {
             endpoint.single_http_provider_events,
             endpoint.multi_http_provider_events,
             endpoint.single_http_provider_target_miss_events,
+            endpoint.self_hedges,
+            endpoint.max_self_hedge_timeout_ms,
             endpoint.elapsed_ms,
             endpoint.max_elapsed_ms,
             endpoint.response_headers_elapsed_ms,
@@ -5173,6 +5177,8 @@ struct TraceDelegatedProviderLookupAggregate {
     single_http_provider_events: usize,
     multi_http_provider_events: usize,
     single_http_provider_target_miss_events: usize,
+    self_hedges: usize,
+    max_self_hedge_timeout_ms: u128,
     response_bytes: u128,
     response_lines: u128,
     first_chunk_events: usize,
@@ -5346,6 +5352,13 @@ impl TraceDelegatedProviderLookupAggregate {
         );
     }
 
+    fn record_self_hedge(&mut self, value: &serde_json::Value) {
+        self.self_hedges += 1;
+        self.max_self_hedge_timeout_ms = self
+            .max_self_hedge_timeout_ms
+            .max(trace_count_field(value, "timeout_ms"));
+    }
+
     fn finish(&mut self) {
         self.elapsed_ms = LatencySummary::from_values(std::mem::take(&mut self.elapsed_values));
         self.response_headers_elapsed_ms =
@@ -5390,6 +5403,8 @@ struct TraceDelegatedProviderEndpointAggregate {
     single_http_provider_events: usize,
     multi_http_provider_events: usize,
     single_http_provider_target_miss_events: usize,
+    self_hedges: usize,
+    max_self_hedge_timeout_ms: u128,
     response_bytes: u128,
     response_lines: u128,
     first_chunk_events: usize,
@@ -6395,6 +6410,18 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 .entry(endpoint)
                 .or_default()
                 .record(&value, elapsed_ms);
+        }
+        if phase == "delegated_provider_self_hedge" {
+            delegated_provider_lookup.record_self_hedge(&value);
+            let endpoint = value
+                .get("endpoint")
+                .and_then(|endpoint| endpoint.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            delegated_provider_lookup_by_endpoint
+                .entry(endpoint)
+                .or_default()
+                .record_self_hedge(&value);
         }
         if phase == "dht_provider_lookup" {
             dht_provider_lookup.record(&value, elapsed_ms);
@@ -7784,6 +7811,8 @@ fn sorted_trace_delegated_provider_endpoints(
                 multi_http_provider_events: aggregate.multi_http_provider_events,
                 single_http_provider_target_miss_events: aggregate
                     .single_http_provider_target_miss_events,
+                self_hedges: aggregate.self_hedges,
+                max_self_hedge_timeout_ms: aggregate.max_self_hedge_timeout_ms,
                 response_bytes: aggregate.response_bytes,
                 response_lines: aggregate.response_lines,
                 first_chunk_events: aggregate.first_chunk_events,
@@ -7879,6 +7908,8 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         "light_dht_provider_lookup" | "dht_provider_lookup" => "dht_fallback_started",
         "provider_fetch_start" => "providers_found",
         "delegated_provider_lookup"
+        | "delegated_provider_self_hedge"
+        | "delegated_provider_self_hedge_result"
         | "delegated_provider_empty_retry"
         | "bitswap_dns_prefetch"
         | "bitswap_dnsaddr_expand"
@@ -9309,6 +9340,7 @@ mod tests {
                 "{\"phase\":\"provider_cache\",\"cid\":\"cid-z\",\"cache_hit\":true,\"provider_count\":0}\n",
                 "{\"phase\":\"provider_lookup\",\"cid\":\"cid-a\",\"provider_count\":3}\n",
                 "{\"phase\":\"delegated_provider_lookup\",\"cid\":\"cid-a\",\"endpoint\":\"https://delegated-ipfs.dev/routing/v1\",\"provider_count\":3,\"http_provider_count\":2,\"response_bytes\":512,\"response_lines\":4,\"response_headers_elapsed_ms\":5,\"response_first_chunk_seen\":true,\"response_first_chunk_elapsed_ms\":6,\"response_first_http_provider_seen\":true,\"response_first_http_provider_elapsed_ms\":7,\"response_target_met\":true,\"response_target_met_elapsed_ms\":8,\"elapsed_ms\":9}\n",
+                "{\"phase\":\"delegated_provider_self_hedge\",\"cid\":\"cid-a\",\"endpoint\":\"https://delegated-ipfs.dev/routing/v1\",\"timeout_ms\":750,\"reason\":\"slow_single_endpoint\"}\n",
                 "{\"phase\":\"delegated_provider_empty_retry\",\"cid\":\"cid-a\",\"provider_count\":1,\"delay_ms\":100,\"elapsed_ms\":116}\n",
                 "{\"phase\":\"provider_diversity_low\",\"cid\":\"cid-a\",\"provider_count\":1,\"fallback\":\"light_dht\"}\n",
                 "{\"phase\":\"bitswap_dns_prefetch\",\"dnsaddr_host_count\":1,\"dns_ip_host_count\":2,\"elapsed_ms\":5}\n",
@@ -9351,7 +9383,7 @@ mod tests {
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "provider_lookup"),
-            5
+            6
         );
         assert_eq!(summary.delegated_provider_lookup.events, 1);
         assert_eq!(summary.delegated_provider_lookup.successes, 1);
@@ -9359,6 +9391,11 @@ mod tests {
         assert_eq!(summary.delegated_provider_lookup.max_elapsed_ms, 9);
         assert_eq!(summary.delegated_provider_lookup.elapsed_ms.p50_ms, Some(9));
         assert_eq!(summary.delegated_provider_lookup.http_providers, 2);
+        assert_eq!(summary.delegated_provider_lookup.self_hedges, 1);
+        assert_eq!(
+            summary.delegated_provider_lookup.max_self_hedge_timeout_ms,
+            750
+        );
         assert_eq!(summary.delegated_provider_lookup.response_bytes, 512);
         assert_eq!(summary.delegated_provider_lookup.response_lines, 4);
         assert_eq!(
@@ -9431,6 +9468,10 @@ mod tests {
         assert_eq!(
             summary.delegated_provider_lookup_by_endpoint[0].http_providers,
             2
+        );
+        assert_eq!(
+            summary.delegated_provider_lookup_by_endpoint[0].self_hedges,
+            1
         );
         assert_eq!(
             summary.delegated_provider_lookup_by_endpoint[0]

@@ -18989,3 +18989,161 @@ block. The next promising target is therefore a narrow delegated-routing tail
 mitigation, such as bounded endpoint hedging or earlier fallback when
 `delegated-ipfs.dev` stalls before the first useful provider, while preserving
 the no-public-gateway-fallback and mobile resource constraints.
+
+## 2026-05-05 Keep: Self-Hedge Slow Single Delegated Router Requests
+
+Question:
+The self-hedge Kubo comparison exposed one `5.2s` delegated-router response
+before the first useful provider for the `ipfs.tech` hero image range request.
+Can a narrow same-endpoint duplicate delegated-routing request guard against
+that rare tail without adding public gateway fallback or starting more DHT work?
+
+Implementation:
+
+- For the default single delegated router endpoint, start the normal provider
+  lookup.
+- If it has not completed after `750ms`, issue one duplicate lookup to the same
+  delegated router endpoint.
+- The first non-error response wins.
+- Empty responses preserve the existing fast empty-result path into the current
+  empty-delegated retry logic.
+- Existing delegated response parsing, byte caps, provider verification by the
+  retrieval layer, and low-diversity DHT fallback behavior are unchanged.
+- Add kill switch:
+  `FREEDOM_IPFS_DISABLE_SINGLE_DELEGATED_SELF_HEDGE=1`.
+- Emit `delegated_provider_self_hedge` only when the duplicate lookup actually
+  starts; normal fast lookups do not emit extra result events.
+- Extend the harness delegated provider summary with self-hedge counts and max
+  timeout.
+- Add a deterministic local routing test where the second same-endpoint request
+  returns before the first slow response.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing delegated_routing_self_hedges_slow_single_endpoint
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+cargo test -p freedom-ipfs-routing
+cargo check -p freedom-ipfs-routing --all-targets
+cargo clippy -p freedom-ipfs-routing --all-targets -- -D warnings
+cargo test -p mobile-web-harness
+cargo check -p mobile-web-harness --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+git diff --check
+```
+
+Focused result:
+
+- Formatting passed.
+- Focused deterministic delegated self-hedge test passed.
+- Focused harness progress summary test passed.
+- Full routing suite passed: `25` passed, `1` ignored.
+- Routing all-target check passed.
+- Routing clippy passed with `-D warnings`.
+- Full harness suite passed: `38` passed.
+- Harness all-target check passed.
+- Harness clippy passed with `-D warnings`.
+- Diff whitespace check passed.
+
+Same-window disabled baseline:
+
+```sh
+FREEDOM_IPFS_DISABLE_SINGLE_DELEGATED_SELF_HEDGE=1 timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-delegated-self-hedge-disabled-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-delegated-self-hedge-disabled-r3.json
+```
+
+Disabled result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1382ms` / `1457ms` / `1457ms`.
+- Asset TTFB p50/p95/max: `196ms` / `715ms` / `869ms`.
+- Run total p50/p95/max: `2834ms` / `3198ms` / `3198ms`.
+- Max RSS/FD: `54852KiB` / `34`.
+- Delegated provider lookup p50/p90/p95/max:
+  `23ms` / `48ms` / `64ms` / `98ms`.
+- Delegated self-hedges: `0`.
+
+Same-window enabled experiment before suppressing no-op result traces:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-delegated-self-hedge-enabled-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-delegated-self-hedge-enabled-r3.json
+```
+
+Enabled result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1164ms` / `1734ms` / `1734ms`.
+- Asset TTFB p50/p95/max: `244ms` / `767ms` / `991ms`.
+- Run total p50/p95/max: `3365ms` / `3466ms` / `3466ms`.
+- Max RSS/FD: `53460KiB` / `37`.
+- Delegated provider lookup p50/p90/p95/max:
+  `26ms` / `47ms` / `48ms` / `87ms`.
+- Delegated self-hedges: `0`.
+- This run confirmed the production threshold did not fire in the same-window
+  sample. It also exposed that the first implementation logged
+  `delegated_provider_self_hedge_result` for every normal lookup; that no-op
+  trace was removed before keeping the change.
+
+Post-fix no-op trace smoke:
+
+```sh
+timeout 420s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --max-concurrent-requests 8 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-delegated-self-hedge-enabled-r1-trace.jsonl \
+  --output /tmp/ipfs-tech-delegated-self-hedge-enabled-r1.json
+```
+
+Post-fix result:
+
+- Rust passed `1/1`.
+- Root TTFB/total: `1022ms` / `1023ms`.
+- Asset TTFB p50/p95/max: `220ms` / `656ms` / `681ms`.
+- Run total: `2617ms`.
+- Max RSS/FD: `51828KiB` / `29`.
+- Delegated provider lookup p50/p90/p95/max:
+  `21ms` / `49ms` / `53ms` / `89ms`.
+- Delegated self-hedges: `0`.
+- No no-op `delegated_provider_self_hedge_result` events were emitted.
+
+Decision:
+Keep, but treat it as a rare-tail guard rather than a proven broad latency win.
+The deterministic test proves the exact mechanism, and the prior comparison
+showed the real failure shape this targets: a single delegated-router request
+stalled for `5.2s` before any useful provider. The same-window live runs did not
+hit that tail, so they cannot prove a p50/p95 improvement. The kept behavior is
+bounded to one duplicate delegated lookup after `750ms`, has a kill switch, does
+not add public gateway fallback, does not start more DHT work, and now has no
+extra trace/progress events when the hedge does not fire. Future comparisons
+should watch `delegated provider lookup self_hedges`, RSS/FD, and slow
+delegated response milestones; revert if self-hedges become frequent without
+reducing request tails.

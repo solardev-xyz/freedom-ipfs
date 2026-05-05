@@ -30,6 +30,9 @@ const MAX_DELEGATED_ROUTING_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_DELEGATED_ROUTING_PROVIDERS: usize = 64;
 const STREAMING_DELEGATED_HTTP_PROVIDER_TARGET: usize = 3;
 const STREAMING_DELEGATED_FIRST_HTTP_PROVIDER_GRACE: Duration = Duration::from_millis(100);
+const SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER: Duration = Duration::from_millis(750);
+const DISABLE_SINGLE_DELEGATED_SELF_HEDGE_ENV: &str =
+    "FREEDOM_IPFS_DISABLE_SINGLE_DELEGATED_SELF_HEDGE";
 const MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY: usize = 2;
 const LOW_DIVERSITY_DELEGATED_MERGE_TIMEOUT: Duration = Duration::from_millis(750);
 const LOW_DIVERSITY_DHT_FALLBACK_TIMEOUT: Duration = Duration::from_millis(250);
@@ -293,6 +296,11 @@ impl DelegatedRoutingClient {
 
     pub async fn providers(&self, cid: &Cid) -> Result<Vec<Provider>> {
         if self.endpoints.len() == 1 {
+            if single_delegated_endpoint_self_hedge_enabled() {
+                return self
+                    .providers_from_single_endpoint_with_self_hedge(cid)
+                    .await;
+            }
             return self.providers_from_endpoint(&self.endpoints[0], cid).await;
         }
 
@@ -355,6 +363,102 @@ impl DelegatedRoutingClient {
                 RoutingError::InvalidResponse("no delegated routing endpoints configured".into())
             }))
         }
+    }
+
+    async fn providers_from_single_endpoint_with_self_hedge(
+        &self,
+        cid: &Cid,
+    ) -> Result<Vec<Provider>> {
+        let endpoint = self.endpoints[0].as_str();
+        let started = Instant::now();
+        let mut pending = FuturesUnordered::new();
+        pending.push(self.providers_from_endpoint_attempt(endpoint, cid, 0));
+        let hedge = tokio::time::sleep(SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER);
+        tokio::pin!(hedge);
+        let mut hedge_fired = false;
+        let mut attempted_request_count = 1usize;
+        let mut empty_response_count = 0usize;
+        let mut error_count = 0usize;
+        let mut first_error = None;
+
+        while !pending.is_empty() {
+            tokio::select! {
+                biased;
+
+                result = pending.next() => {
+                    let Some((attempt, result)) = result else {
+                        break;
+                    };
+                    match result {
+                        Ok(providers) => {
+                            empty_response_count += usize::from(providers.is_empty());
+                            if hedge_fired {
+                                tracing::info!(
+                                    phase = "delegated_provider_self_hedge_result",
+                                    cid = %cid,
+                                    endpoint,
+                                    ok = true,
+                                    provider_count = providers.len(),
+                                    winner_attempt = attempt,
+                                    attempted_request_count,
+                                    empty_response_count,
+                                    error_count,
+                                    hedge_fired,
+                                    elapsed_ms = started.elapsed().as_millis()
+                                );
+                            }
+                            return Ok(providers);
+                        }
+                        Err(err) => {
+                            error_count += 1;
+                            if first_error.is_none() {
+                                first_error = Some(err);
+                            }
+                        }
+                    }
+                }
+                _ = &mut hedge, if !hedge_fired => {
+                    hedge_fired = true;
+                    attempted_request_count += 1;
+                    tracing::info!(
+                        phase = "delegated_provider_self_hedge",
+                        cid = %cid,
+                        endpoint,
+                        timeout_ms = SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER.as_millis(),
+                        reason = "slow_single_endpoint"
+                    );
+                    pending.push(self.providers_from_endpoint_attempt(endpoint, cid, 1));
+                }
+            }
+        }
+
+        let error = first_error.unwrap_or_else(|| {
+            RoutingError::InvalidResponse("no delegated routing endpoint response".into())
+        });
+        if hedge_fired {
+            tracing::info!(
+                phase = "delegated_provider_self_hedge_result",
+                cid = %cid,
+                endpoint,
+                ok = false,
+                error = %error,
+                attempted_request_count,
+                empty_response_count,
+                error_count,
+                hedge_fired,
+                elapsed_ms = started.elapsed().as_millis()
+            );
+        }
+        Err(error)
+    }
+
+    async fn providers_from_endpoint_attempt(
+        &self,
+        endpoint: &str,
+        cid: &Cid,
+        attempt: usize,
+    ) -> (usize, Result<Vec<Provider>>) {
+        (attempt, self.providers_from_endpoint(endpoint, cid).await)
     }
 
     async fn providers_from_endpoint(&self, endpoint: &str, cid: &Cid) -> Result<Vec<Provider>> {
@@ -424,6 +528,10 @@ impl DelegatedRoutingClient {
 
 fn delegated_lookup_cid(cid: &Cid) -> String {
     Cid::new_v1(cid.codec(), *cid.hash()).to_string()
+}
+
+fn single_delegated_endpoint_self_hedge_enabled() -> bool {
+    std::env::var_os(DISABLE_SINGLE_DELEGATED_SELF_HEDGE_ENV).is_none()
 }
 
 #[derive(Debug, Clone)]
@@ -1576,6 +1684,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegated_routing_self_hedges_slow_single_endpoint() {
+        let cid = "bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u"
+            .parse::<Cid>()
+            .unwrap();
+        let (endpoint, task, request_count) = spawn_sequence_delegated_responses_with_delays(vec![
+            (
+                r#"{"Providers":[{"ID":"slow-peer","Addrs":["/dns4/slow.example/tcp/443/tls/http"]}]}"#,
+                SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER + Duration::from_millis(300),
+            ),
+            (
+                r#"{"Providers":[{"ID":"fast-peer","Addrs":["/dns4/fast.example/tcp/443/tls/http"]}]}"#,
+                Duration::ZERO,
+            ),
+        ])
+        .await;
+
+        let started = std::time::Instant::now();
+        let providers = DelegatedRoutingClient::new(endpoint)
+            .providers(&cid)
+            .await
+            .unwrap();
+
+        assert!(
+            started.elapsed()
+                < SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER + Duration::from_millis(250),
+            "delegated self hedge should return before the first slow response"
+        );
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id.as_deref(), Some("fast-peer"));
+        assert_eq!(
+            request_count.load(Ordering::Relaxed),
+            2,
+            "slow single endpoint should receive a duplicate request"
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
     async fn observed_delegated_routing_records_provider_lookup_stats() {
         let cid = "bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u"
             .parse::<Cid>()
@@ -2049,6 +2196,49 @@ mod tests {
                 tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
                     .await
                     .unwrap();
+            }
+        });
+        (format!("http://{addr}/routing/v1"), task, request_count)
+    }
+
+    async fn spawn_sequence_delegated_responses_with_delays(
+        responses: Vec<(&'static str, Duration)>,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let task_request_count = request_count.clone();
+        let responses = responses
+            .into_iter()
+            .map(|(body, delay)| (body.to_string(), delay))
+            .collect::<std::collections::VecDeque<_>>();
+        let responses = Arc::new(tokio::sync::Mutex::new(responses));
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let Some((body, delay)) = responses.lock().await.pop_front() else {
+                    break;
+                };
+                let request_count = task_request_count.clone();
+                tokio::spawn(async move {
+                    request_count.fetch_add(1, Ordering::Relaxed);
+                    let mut request = vec![0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut request).await;
+                    tokio::time::sleep(delay).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+                });
             }
         });
         (format!("http://{addr}/routing/v1"), task, request_count)
