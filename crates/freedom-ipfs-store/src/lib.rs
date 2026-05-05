@@ -34,7 +34,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct SqliteBlockStore {
     conn: Arc<Mutex<Connection>>,
     max_bytes: u64,
-    hot: Arc<Mutex<HotCache>>,
+    hot: Arc<Mutex<VerifiedHotCache>>,
     retained: Arc<Mutex<HashMap<Vec<u8>, usize>>>,
 }
 
@@ -52,10 +52,11 @@ impl SqliteBlockStore {
         } else {
             max_bytes
         };
+        let hot_cache = VerifiedHotCache::new(hot_cache_bytes(max_bytes));
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             max_bytes,
-            hot: Arc::new(Mutex::new(HotCache::new(hot_cache_bytes(max_bytes)))),
+            hot: Arc::new(Mutex::new(hot_cache)),
             retained: Arc::new(Mutex::new(HashMap::new())),
         };
         store.init()?;
@@ -69,10 +70,11 @@ impl SqliteBlockStore {
         } else {
             max_bytes
         };
+        let hot_cache = VerifiedHotCache::new(hot_cache_bytes(max_bytes));
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             max_bytes,
-            hot: Arc::new(Mutex::new(HotCache::new(hot_cache_bytes(max_bytes)))),
+            hot: Arc::new(Mutex::new(hot_cache)),
             retained: Arc::new(Mutex::new(HashMap::new())),
         };
         store.init()?;
@@ -145,7 +147,7 @@ impl SqliteBlockStore {
         )?;
         self.evict_if_needed()?;
         if self.block_exists(&cid_bytes)? {
-            self.hot.lock().put(cid_bytes, data.to_vec(), now);
+            self.hot.lock().put_verified(cid_bytes, data.to_vec(), now);
         } else {
             self.hot.lock().remove(&cid_bytes);
         }
@@ -159,8 +161,7 @@ impl SqliteBlockStore {
     pub fn get(&self, cid: &Cid) -> Result<Option<Block>> {
         let cid_bytes = block_key(cid);
         let now = now_secs();
-        if let Some(hit) = self.hot.lock().get(&cid_bytes, now) {
-            verify_block(cid, &hit.data)?;
+        if let Some(hit) = self.hot.lock().get_verified(&cid_bytes, now) {
             if hit.touch_persistent {
                 self.touch_at(cid, now)?;
             }
@@ -181,7 +182,7 @@ impl SqliteBlockStore {
             Some(data) => {
                 verify_block(cid, &data)?;
                 self.touch_at(cid, now)?;
-                self.hot.lock().put(cid_bytes, data.clone(), now);
+                self.hot.lock().put_verified(cid_bytes, data.clone(), now);
                 Ok(Some(Block::unchecked(*cid, data)))
             }
             None => Ok(None),
@@ -524,25 +525,26 @@ fn hot_cache_bytes(max_bytes: u64) -> u64 {
     max_bytes.min(DEFAULT_HOT_CACHE_BYTES)
 }
 
-struct HotCache {
+// Private cache for block bytes that were already verified on put or cold read.
+struct VerifiedHotCache {
     max_bytes: u64,
     bytes: u64,
     clock: u64,
-    entries: HashMap<Vec<u8>, HotBlock>,
+    entries: HashMap<Vec<u8>, VerifiedHotBlock>,
 }
 
-struct HotBlock {
+struct VerifiedHotBlock {
     data: Vec<u8>,
     last_accessed: u64,
     last_persistent_touch: u64,
 }
 
-struct HotCacheHit {
+struct VerifiedHotCacheHit {
     data: Vec<u8>,
     touch_persistent: bool,
 }
 
-impl HotCache {
+impl VerifiedHotCache {
     fn new(max_bytes: u64) -> Self {
         Self {
             max_bytes,
@@ -552,7 +554,7 @@ impl HotCache {
         }
     }
 
-    fn get(&mut self, cid: &[u8], now: u64) -> Option<HotCacheHit> {
+    fn get_verified(&mut self, cid: &[u8], now: u64) -> Option<VerifiedHotCacheHit> {
         let entry = self.entries.get_mut(cid)?;
         self.clock = self.clock.saturating_add(1);
         entry.last_accessed = self.clock;
@@ -561,13 +563,13 @@ impl HotCache {
         if touch_persistent {
             entry.last_persistent_touch = now;
         }
-        Some(HotCacheHit {
+        Some(VerifiedHotCacheHit {
             data: entry.data.clone(),
             touch_persistent,
         })
     }
 
-    fn put(&mut self, cid: Vec<u8>, data: Vec<u8>, now: u64) {
+    fn put_verified(&mut self, cid: Vec<u8>, data: Vec<u8>, now: u64) {
         if self.max_bytes == 0 || data.len() as u64 > self.max_bytes {
             self.remove(&cid);
             return;
@@ -579,7 +581,7 @@ impl HotCache {
         self.bytes = self.bytes.saturating_add(data.len() as u64);
         self.entries.insert(
             cid,
-            HotBlock {
+            VerifiedHotBlock {
                 data,
                 last_accessed: self.clock,
                 last_persistent_touch: now,
@@ -631,6 +633,46 @@ mod tests {
         assert_eq!(block.data(), data);
         assert_eq!(block.cid(), &cid);
         assert_eq!(store.block_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn rejected_put_does_not_populate_verified_hot_cache() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let cid = cid_from_data(CODEC_RAW, b"valid block");
+
+        assert!(store.put_block(&cid, b"invalid block").is_err());
+        assert!(!store.hot.lock().entries.contains_key(&block_key(&cid)));
+    }
+
+    #[test]
+    fn cold_read_verifies_before_populating_verified_hot_cache() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let cid = cid_from_data(CODEC_RAW, b"valid block");
+        let cid_bytes = block_key(&cid);
+        store
+            .conn
+            .lock()
+            .execute(
+                r#"
+                INSERT INTO blocks(cid, codec, size, data, inserted_at, last_accessed_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                "#,
+                params![
+                    &cid_bytes,
+                    cid.codec() as i64,
+                    13i64,
+                    b"invalid block".as_slice(),
+                    now_secs() as i64
+                ],
+            )
+            .unwrap();
+
+        let err = store.get(&cid).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::Core(CoreError::HashMismatch { .. })
+        ));
+        assert!(!store.hot.lock().entries.contains_key(&cid_bytes));
     }
 
     #[test]

@@ -9987,3 +9987,124 @@ A future keepable version would need an explicit verified-hot-entry design,
 for example storing verified block state in the hot cache and making the safety
 contract clear in the store API, or introducing a CID-range read API that can
 serve from verified hot cache without weakening cold-read verification.
+
+## 2026-05-05 Keep: Verified Hot Cache Entries Avoid Rehashing Warm Blocks
+
+Hypothesis:
+The rejected direct skip showed that hot-cache rehashing was the remaining
+local warm-range cost, but the implementation was too implicit. A keepable
+version can make the private hot cache explicitly store only bytes that have
+already been verified on `put_block` or on cold SQLite read. Hot-cache hits can
+then serve from that verified in-memory entry without rehashing on every warm
+range or body read, while writes and cold reads still verify before caching or
+serving.
+
+Implementation:
+
+- Rename the private hot cache types to `VerifiedHotCache`,
+  `VerifiedHotBlock`, and `VerifiedHotCacheHit`.
+- Rename insertion and read APIs to `put_verified` and `get_verified`.
+- Populate the verified hot cache only after `put_block` verification or cold
+  SQLite read verification.
+- Keep SQLite cold-read verification and all write-time verification unchanged.
+- Add tests proving rejected writes and corrupt cold reads do not populate the
+  verified hot cache.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-store
+cargo test -p freedom-ipfs-gateway
+cargo check -p freedom-ipfs-store -p freedom-ipfs-retrieval -p freedom-ipfs-gateway --all-targets
+cargo clippy -p freedom-ipfs-store -p freedom-ipfs-retrieval -p freedom-ipfs-gateway --all-targets -- -D warnings
+```
+
+Result: all passed.
+
+Range comparison:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-developers-hero-range \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-verified-hot-range-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-verified-hot-range-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Rust warm repeat range requests were `0ms`/`0ms` in the gateway trace, versus
+  `16ms`/`14ms` in the CID-direct baseline.
+- Rust gateway direct-body max elapsed dropped from `13ms` to `0ms`.
+- Rust range TTFB p50/p95 was `2/2477ms`; Kubo was `4/3480ms`. The cold Rust
+  request hit unrelated provider/DNS expansion noise, but the warm-path signal
+  is clear.
+
+Broader page-assets check:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-verified-hot-page-assets-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-verified-hot-page-assets-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `4/716ms`, Kubo `3/4741ms`.
+- Asset TTFB p50/p95: Rust `7/358ms`, Kubo `4/378ms`.
+- Rust RSS/FD: `50628KiB`/`43`; Kubo RSS/FD: `279756KiB`/`392`.
+- Compared with the CID-direct baseline, Rust asset p50/p95 improved from
+  `13/435ms` to `7/358ms`; gateway direct-body max elapsed improved from
+  `10ms` to `2ms`.
+- Warm page repeat groups improved from about `3-12ms` to `2-5ms`.
+
+Additional `/ipfs` range check:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/vitalik-verified-hot-range-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/vitalik-verified-hot-range-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root/range TTFB p50/p95: Rust `5/425ms`, Kubo `4/1851ms`.
+- Rust RSS/FD: `37504KiB`/`18`; Kubo RSS/FD: `166164KiB`/`77`.
+- Warm repeat requests were `2ms` each, and gateway direct-body max elapsed was
+  `0ms`.
+
+Decision: keep. This preserves verification before cache insertion and before
+cold serving, makes the verified-hot-entry contract explicit in the private
+store API, and removes repeated hashing from warm in-memory reads. It improves
+warm media/range behavior and the full `ipfs.tech` page-assets comparison
+without increasing routing fanout, adding fallback, or increasing persistent
+storage work.
