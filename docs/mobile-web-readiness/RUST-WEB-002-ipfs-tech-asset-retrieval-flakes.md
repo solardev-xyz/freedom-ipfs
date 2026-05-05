@@ -4690,3 +4690,81 @@ quic=1, ws=1`.
 Decision: keep. This is diagnostics-only and gives future dial-pressure
 experiments a direct signal for connection-limit churn without replaying the
 previously rejected blunt global cap.
+
+## 2026-05-05 Rejected: Drop Waiters After Immediate Dial Rejection
+
+Hypothesis:
+
+- When `swarm.dial` immediately returns a connection-limit error for every
+  address scheduled for a peer, the fetch task still waits up to
+  `BITSWAP_CONNECTION_READY_TIMEOUT` for that peer's `connection_ready` signal.
+- Dropping those connection waiters immediately might fail impossible peer
+  attempts faster and reduce page-tail latency without raising connection
+  limits or fanout.
+
+Prototype:
+
+- Track immediate dial outcomes per peer inside the shared Bitswap swarm.
+- If all scheduled dial attempts for a peer were rejected immediately, remove
+  that peer's connection waiters and emit `bitswap_dial_waiters_dropped`.
+- Add focused test coverage for the helper: drop waiters when every scheduled
+  dial rejects, but keep waiters when at least one dial attempt is accepted.
+- Extend the harness summary temporarily with waiter-drop counts.
+
+Validation that passed before rejection:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib drops_waiters_only_when_all_scheduled_dials_reject_immediately
+cargo test -p mobile-web-harness trace_summary_counts_bitswap_peer_attempts
+cargo build -p freedom-ipfs-gateway
+git diff --check
+```
+
+Baseline immediately before the prototype:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-dial-rejection-summary-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-dial-rejection-summary-r3.json
+```
+
+Baseline result: Rust and Kubo both passed `3/3`. Rust root p50/p95 was
+`6677/7210ms`, asset p50/p95 was `149/1480ms`, and max RSS/FD was
+`50908KiB`/`57`. Trace summary showed `provider_retries refresh_timeout=2`,
+`request_timeouts_with_trusted=2`, and `bitswap dial rejections: events=9
+connection_limit=9 other=0`.
+
+Prototype run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-drop-rejected-dial-waiters-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-drop-rejected-dial-waiters-r3.json
+```
+
+Prototype result: reject. Rust and Kubo still passed `3/3`, and Rust root
+p50/p95 improved to `1015/1370ms`, but asset p95 regressed badly to `5070ms`.
+Connection-limit churn also increased: `bitswap dial rejections: events=34
+connection_limit=34 other=0 waiter_drop_events=28 dropped_waiters=28`. The run
+still had `request_timeouts_with_trusted=2`.
+
+Decision: reject and revert. Failing fully rejected dial waiters faster removes
+some 5s waits, but it appears to re-open those peers for more immediate redial
+attempts under page fan-out, increasing connection-limit churn and worsening the
+asset tail. A future version needs fair scheduling/backoff for rejected peers,
+not immediate waiter removal by itself.
