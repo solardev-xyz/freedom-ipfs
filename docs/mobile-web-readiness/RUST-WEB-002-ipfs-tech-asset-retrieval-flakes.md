@@ -12583,3 +12583,33 @@ range case, preserves verification and cache-before-return semantics, avoids
 public fallback, and keeps mobile resource use low. The remaining seeded gap is
 now less about SQLite write blocking and more about root-to-child Bitswap
 round-trip structure.
+
+Live public range validation:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-block-store-spawn-blocking-r3-trace.jsonl \
+  --comparison-output /tmp/vitalik-block-store-spawn-blocking-r3.json
+```
+
+Live public result:
+
+- Rust and Kubo passed `vitalik-root-html-range` `3/3`.
+- Rust root TTFB p50/p95 `1475ms` / `5243ms`.
+- Kubo root TTFB p50/p95 `2831ms` / `3345ms`.
+- Rust max RSS/FD `38144KiB` / `18`; Kubo max RSS/FD `170624KiB` / `98`.
+- Rust block-store puts were small on this case: events `6`, bytes `116319`,
+  total elapsed `9ms`, max elapsed `3ms`.
+- The p95 tail came from delegated provider lookup / HTTP provider variability,
+  not local store writes. The trace had two HTTP-provider hash-mismatch errors
+  for the child block, but the request still passed through verified fallback.
