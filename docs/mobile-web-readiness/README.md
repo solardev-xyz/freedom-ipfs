@@ -132,9 +132,10 @@ cargo run -p xtask -- generate-mobile-web-fixture \
   --corpus /tmp/mobile-web-multiblock-corpus.json
 ```
 
-The generated corpus contains prefix, configured deep, first-chunk-boundary,
-and suffix range cases for the same CAR root. Run it without `--case` to cover
-all four shapes, or select a single case such as `multiblock-unixfs-range`.
+The generated corpus contains one full-response case plus prefix, configured
+deep, first-chunk-boundary, and suffix range cases for the same CAR root. Run it
+without `--case` to cover all five shapes, or select a single case such as
+`multiblock-unixfs-range`.
 
 For gateway phase tracing, pass `--trace-output /tmp/run.jsonl`. When the
 harness spawns the Rust gateway it forwards this path to the gateway, parses the

@@ -10890,7 +10890,8 @@ cargo run -p xtask -- generate-mobile-web-fixture \
 - corpus: `/tmp/xtask-mobile-web-multiblock-corpus.json`
 - blocks: `4`
 - bytes: `600000`
-- default range cases:
+- default cases:
+  `multiblock-unixfs-full`,
   `multiblock-unixfs-range`,
   `multiblock-unixfs-prefix-range`,
   `multiblock-unixfs-boundary-range`, and
@@ -11021,16 +11022,18 @@ Keep. This is a bounded range-workload optimization: it avoids fetching data
 outside the requested byte range while preserving HTML sniffing for full
 responses and prefix ranges such as `bytes=0-127`.
 
-## 2026-05-05 Harness: Expand Multi-Block Range Suite
+## 2026-05-05 Harness: Expand Multi-Block Stream/Range Suite
 
 Hypothesis:
 A single deterministic deep range is useful, but it does not cover the range
-shapes that matter for media and UnixFS traversal: prefix sniffing, a range
-crossing a raw-leaf boundary, and suffix reads.
+and streaming shapes that matter for media and UnixFS traversal: full-response
+streaming, prefix sniffing, a range crossing a raw-leaf boundary, and suffix
+reads.
 
 Change:
 
-- `xtask generate-mobile-web-fixture` now emits four cases against the same CAR:
+- `xtask generate-mobile-web-fixture` now emits five cases against the same CAR:
+  - `multiblock-unixfs-full`: full `600000` byte response
   - `multiblock-unixfs-range`: `bytes=262100-262399`
   - `multiblock-unixfs-prefix-range`: `bytes=0-299`
   - `multiblock-unixfs-boundary-range`: `bytes=261994-262293`
@@ -11045,33 +11048,38 @@ Validation:
 
 ```sh
 cargo run -p xtask -- generate-mobile-web-fixture \
-  --car /tmp/xtask-mobile-web-range-suite.car \
-  --corpus /tmp/xtask-mobile-web-range-suite-corpus.json
+  --car /tmp/xtask-mobile-web-stream-suite.car \
+  --corpus /tmp/xtask-mobile-web-stream-suite-corpus.json
 
 timeout 180s cargo run -p mobile-web-harness -- \
   --build-gateway \
   --routing-mode offline \
-  --gateway-import-car /tmp/xtask-mobile-web-range-suite.car \
-  --corpus /tmp/xtask-mobile-web-range-suite-corpus.json \
+  --gateway-import-car /tmp/xtask-mobile-web-stream-suite.car \
+  --corpus /tmp/xtask-mobile-web-stream-suite-corpus.json \
   --repeat 1 \
-  --trace-output /tmp/xtask-mobile-web-range-suite-rust-trace.jsonl \
-  --output /tmp/xtask-mobile-web-range-suite-rust.json
+  --trace-output /tmp/xtask-mobile-web-stream-suite-rust-trace.jsonl \
+  --output /tmp/xtask-mobile-web-stream-suite-rust.json
 ```
 
 Result:
 
-- all four Rust range cases passed
-- run total `15ms`
+- all five Rust stream/range cases passed
+- run total `58ms`
 - case TTFB/total:
-  - deep `4ms` / `4ms`
-  - prefix `3ms` / `3ms`
-  - boundary `3ms` / `3ms`
-  - suffix `3ms` / `3ms`
-- RSS/FD `21524KiB` / `11`
-- trace contained `mime_sniff_read` exactly once, for `bytes=0-299`
+  - full `3ms` / `46ms`
+  - deep `3ms` / `3ms`
+  - prefix `2ms` / `2ms`
+  - boundary `2ms` / `2ms`
+  - suffix `2ms` / `2ms`
+- RSS/FD `21904KiB` / `12`
+- trace contained `mime_sniff_read` twice: once for the full response and once
+  for `bytes=0-299`
 - trace sources:
-  - prefix `source=fallback_after_sniff`
+  - full and prefix `source=fallback_after_sniff`
   - deep/boundary/suffix `source=fallback_no_sniff`
+- the full-response case also shows why this fixture matters for diagnostics:
+  gateway `request_done` tracks response creation, while harness `root_total`
+  captures full body transfer (`46ms` here)
 
 Kubo comparison:
 
@@ -11081,23 +11089,25 @@ timeout 180s cargo run -p mobile-web-harness -- \
   --compare-kubo \
   --kubo-bin target/tools/kubo/kubo/ipfs \
   --routing-mode offline \
-  --gateway-import-car /tmp/xtask-mobile-web-range-suite.car \
-  --corpus /tmp/xtask-mobile-web-range-suite-corpus.json \
+  --gateway-import-car /tmp/xtask-mobile-web-stream-suite.car \
+  --corpus /tmp/xtask-mobile-web-stream-suite-corpus.json \
   --repeat 1 \
-  --comparison-output /tmp/xtask-mobile-web-range-suite-rust-vs-kubo.json
+  --comparison-output /tmp/xtask-mobile-web-stream-suite-rust-vs-kubo.json
 ```
 
 Result:
 
-- Rust and Kubo both passed all four cases
+- Rust and Kubo both passed all five cases
 - TTFB Rust/Kubo:
-  - deep `2ms` / `8ms`
-  - prefix `0ms` / `2ms`
-  - boundary `0ms` / `1ms`
-  - suffix `0ms` / `1ms`
-- RSS/FD: Rust `21004KiB` / `11`, Kubo `88572KiB` / `33`
+  - full `3ms` / `5ms`
+  - deep `1ms` / `2ms`
+  - prefix `0ms` / `4ms`
+  - boundary `0ms` / `2ms`
+  - suffix `1ms` / `1ms`
+- RSS/FD: Rust `21396KiB` / `10`, Kubo `88820KiB` / `32`
 
 Decision:
 Keep. This turns the CAR-seeded fixture from a one-off deep-range smoke into a
-small deterministic media/range harness that future prefetch, multi-want, and
-streaming experiments can run without public-network noise.
+small deterministic stream/range harness that future prefetch, multi-want,
+streaming, and body-progress diagnostics experiments can run without
+public-network noise.
