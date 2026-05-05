@@ -18553,3 +18553,67 @@ HTTP-host suppression. More promising directions are adaptive per-CID/session
 decisions with strict resource caps, or improving Bitswap connection/session
 latency before using Bitswap as a broad substitute for slow single HTTP
 providers.
+
+## 2026-05-05 Keep: Summarize Block Fetch Total Latency By Source
+
+Motivation:
+The rejected host-skip experiment showed that source counts alone are not
+enough. We need a compact way to see whether `cache`, `http_provider`, or
+`bitswap` is contributing the block-fetch latency tail before trying adaptive
+transport policy changes.
+
+Change:
+The mobile web harness trace summary now aggregates `block_fetch_total`
+`elapsed_ms` by `source`. The JSON report includes
+`trace_summary.block_fetch_source_latencies`, and console summaries print
+per-source count, total time, and p50/p90/p95/max latency. This is
+diagnostics-only and does not change retrieval behavior.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details
+cargo check -p mobile-web-harness --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Result:
+
+- Formatting passed.
+- Focused trace-summary parser test passed.
+- Harness all-target check passed.
+- Harness clippy passed with `-D warnings`.
+
+Live sanity run:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-block-fetch-source-latency-r1-trace.jsonl \
+  --output /tmp/ipfs-tech-block-fetch-source-latency-r1.json
+```
+
+Result:
+
+- Rust passed `1/1`.
+- Root TTFB/total: `1489ms` / `1490ms`.
+- Asset TTFB p50/p90/p95/max: `216ms` / `975ms` / `1915ms` / `2214ms`.
+- Run total: `4816ms`.
+- Max RSS/FD: `46564KiB` / `26`.
+- Block sources: `http_provider=40`.
+- New block-fetch source latency summary:
+  `http_provider: count=40 total=14954ms elapsed=p50=192ms p90=764ms p95=953ms max=2209ms`.
+
+Conclusion:
+Keep. This gives future iterations a cheap first-pass signal for whether a
+candidate optimization is moving latency between sources or actually reducing
+the block-fetch tail. It should be used alongside provider-race, Bitswap, cache,
+RSS, and FD summaries before keeping any adaptive HTTP/Bitswap policy.

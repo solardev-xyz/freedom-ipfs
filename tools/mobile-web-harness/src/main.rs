@@ -880,6 +880,7 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.block_sources)
             );
         }
+        print_trace_block_fetch_source_latencies(trace);
         if trace.block_store.events > 0 || trace.block_store.puts > 0 {
             let store = &trace.block_store;
             println!(
@@ -1289,6 +1290,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_block_range_batch_fetches(trace);
     print_trace_unixfs_metadata_cache(trace);
     print_trace_progress_phases(trace);
+    print_trace_block_fetch_source_latencies(trace);
     print_trace_provider_retries(trace);
     print_trace_delegated_provider_lookup(trace);
     print_trace_dht_provider_lookup(trace);
@@ -1533,6 +1535,19 @@ fn print_trace_block_range_batch_fetches(trace: &TraceSummary) {
         ranges.max_uncached_range_count,
         format_trace_counts(&ranges.sources)
     );
+}
+
+fn print_trace_block_fetch_source_latencies(trace: &TraceSummary) {
+    if trace.block_fetch_source_latencies.is_empty() {
+        return;
+    }
+    println!("  block fetch totals:");
+    for source in trace.block_fetch_source_latencies.iter().take(8) {
+        println!(
+            "    {}: count={} total={}ms elapsed={}",
+            source.source, source.count, source.total_ms, source.elapsed_ms
+        );
+    }
 }
 
 fn print_trace_delegated_provider_lookup(trace: &TraceSummary) {
@@ -4601,6 +4616,7 @@ struct TraceSummary {
     progress_phases: Vec<TraceValueCount>,
     slow_events: Vec<TraceSlowEvent>,
     block_sources: Vec<TraceValueCount>,
+    block_fetch_source_latencies: Vec<TraceSourceLatencyAggregate>,
     block_store: TraceBlockStoreAggregate,
     block_range_batch_fetches: TraceBlockRangeBatchFetchAggregate,
     provider_retries: TraceProviderRetryAggregate,
@@ -4665,6 +4681,14 @@ struct TraceSlowEvent {
 struct TraceValueCount {
     value: String,
     count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct TraceSourceLatencyAggregate {
+    source: String,
+    count: usize,
+    total_ms: u128,
+    elapsed_ms: LatencySummary,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -6086,6 +6110,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut progress_phases = BTreeMap::<String, usize>::new();
     let mut slow_events = Vec::<TraceSlowEvent>::new();
     let mut block_sources = BTreeMap::<String, usize>::new();
+    let mut block_fetch_source_latencies = BTreeMap::<String, Vec<u128>>::new();
     let mut block_store = TraceBlockStoreAggregate::default();
     let mut block_range_batch_fetches = TraceBlockRangeBatchFetchAggregate::default();
     let mut provider_retries = TraceProviderRetryAggregate::default();
@@ -6201,6 +6226,12 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         if phase == "block_fetch_total" {
             if let Some(source) = value.get("source").and_then(|source| source.as_str()) {
                 *block_sources.entry(source.to_string()).or_default() += 1;
+                if let Some(elapsed_ms) = elapsed_ms {
+                    block_fetch_source_latencies
+                        .entry(source.to_string())
+                        .or_default()
+                        .push(elapsed_ms);
+                }
             }
         }
         if phase == "block_store_get" {
@@ -7259,6 +7290,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         progress_phases: sorted_trace_counts(progress_phases),
         slow_events,
         block_sources: sorted_trace_counts(block_sources),
+        block_fetch_source_latencies: sorted_trace_source_latencies(block_fetch_source_latencies),
         block_store,
         block_range_batch_fetches,
         provider_retries,
@@ -7627,6 +7659,34 @@ fn sorted_trace_counts(counts: BTreeMap<String, usize>) -> Vec<TraceValueCount> 
             .count
             .cmp(&left.count)
             .then_with(|| left.value.cmp(&right.value))
+    });
+    values.truncate(MAX_TRACE_SLOW_EVENTS);
+    values
+}
+
+fn sorted_trace_source_latencies(
+    values: BTreeMap<String, Vec<u128>>,
+) -> Vec<TraceSourceLatencyAggregate> {
+    let mut values = values
+        .into_iter()
+        .map(|(source, elapsed_values)| {
+            let count = elapsed_values.len();
+            let total_ms = elapsed_values.iter().sum();
+            let elapsed_ms = LatencySummary::from_values(elapsed_values);
+            TraceSourceLatencyAggregate {
+                source,
+                count,
+                total_ms,
+                elapsed_ms,
+            }
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right
+            .total_ms
+            .cmp(&left.total_ms)
+            .then_with(|| right.count.cmp(&left.count))
+            .then_with(|| left.source.cmp(&right.source))
     });
     values.truncate(MAX_TRACE_SLOW_EVENTS);
     values
@@ -8719,6 +8779,17 @@ mod tests {
         assert_eq!(summary.block_sources[0].value, "bitswap");
         assert_eq!(summary.block_sources[0].count, 1);
         assert_eq!(summary.block_sources[1].value, "cache");
+        assert_eq!(summary.block_fetch_source_latencies.len(), 2);
+        assert_eq!(summary.block_fetch_source_latencies[0].source, "bitswap");
+        assert_eq!(summary.block_fetch_source_latencies[0].count, 1);
+        assert_eq!(summary.block_fetch_source_latencies[0].total_ms, 5);
+        assert_eq!(
+            summary.block_fetch_source_latencies[0].elapsed_ms.p50_ms,
+            Some(5)
+        );
+        assert_eq!(summary.block_fetch_source_latencies[1].source, "cache");
+        assert_eq!(summary.block_fetch_source_latencies[1].count, 1);
+        assert_eq!(summary.block_fetch_source_latencies[1].total_ms, 4);
         assert_eq!(summary.block_store.events, 3);
         assert_eq!(summary.block_store.hits, 1);
         assert_eq!(summary.block_store.misses, 2);
