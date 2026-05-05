@@ -80,7 +80,13 @@ temporary DB path and reports it. The JSON report contains separate `online` and
 URLs, offline cache storage bytes, offline response statuses, trace errors, and
 progress phases. If `--trace-output /tmp/replay.jsonl` is also set, the online
 and offline trace files are written as `/tmp/replay-online.jsonl` and
-`/tmp/replay-offline.jsonl`.
+`/tmp/replay-offline.jsonl`. To separate "name not available offline" from
+"content blocks missing", add `--offline-replay-resolved-ipfs`. The online pass
+will use observed successful `name_resolve` trace events to rewrite matching
+offline `/ipns/{name}/...` corpus paths to their resolved `/ipfs/...` targets,
+and the report records every rewrite in `resolved_ipfs_rewrites`. This mode is
+a diagnostics aid; it does not persist IPNS/DNSLink state or change gateway
+behavior.
 
 For gateway phase tracing, pass `--trace-output /tmp/run.jsonl`. When the
 harness spawns the Rust gateway it forwards this path to the gateway, parses the

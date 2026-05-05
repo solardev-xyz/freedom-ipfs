@@ -66,6 +66,9 @@ struct Args {
     /// Run once online to warm a Rust gateway DB, then replay the same corpus with offline routing.
     #[arg(long)]
     offline_replay: bool,
+    /// In offline replay mode, rewrite /ipns corpus paths to online-observed /ipfs targets.
+    #[arg(long)]
+    offline_replay_resolved_ipfs: bool,
     /// Optional paired Rust-vs-Kubo JSON comparison report output path.
     #[arg(long)]
     comparison_output: Option<PathBuf>,
@@ -133,6 +136,9 @@ async fn main() -> Result<()> {
             bail!("mobile web offline replay found failures");
         }
         return Ok(());
+    }
+    if args.offline_replay_resolved_ipfs {
+        bail!("--offline-replay-resolved-ipfs requires --offline-replay");
     }
 
     if args.compare_kubo {
@@ -220,26 +226,34 @@ async fn run_offline_replay(args: &Args, corpus: &Corpus) -> Result<OfflineRepla
     let mut online_args = args.clone();
     online_args.gateway_db = Some(replay_db.clone());
     online_args.routing_mode = args.routing_mode.clone();
-    online_args.trace_output = args
-        .trace_output
-        .as_ref()
-        .map(|path| labeled_trace_output(path, "online"));
+    online_args.trace_output =
+        offline_replay_trace_output(args, "online", "freedom-ipfs-offline-replay-online-trace");
 
     let mut offline_args = args.clone();
     offline_args.gateway_db = Some(replay_db.clone());
     offline_args.routing_mode = "offline".to_string();
-    offline_args.trace_output = args
-        .trace_output
-        .as_ref()
-        .map(|path| labeled_trace_output(path, "offline"));
+    offline_args.trace_output =
+        offline_replay_trace_output(args, "offline", "freedom-ipfs-offline-replay-offline-trace");
 
     let online = run_harness(&online_args, corpus).await?;
-    let offline = run_harness(&offline_args, corpus).await?;
+    let (offline_corpus, resolved_ipfs_rewrites) = if args.offline_replay_resolved_ipfs {
+        let trace_output = online_args
+            .trace_output
+            .as_ref()
+            .context("resolved-IPFS offline replay requires an online trace output path")?;
+        let resolutions = successful_name_resolutions_from_trace(trace_output)?;
+        rewrite_corpus_for_resolved_ipfs_replay(corpus, &resolutions, &args.cases)
+    } else {
+        (corpus.clone(), Vec::new())
+    };
+    let offline = run_harness(&offline_args, &offline_corpus).await?;
     let summary = OfflineReplaySummary::from_report(&offline);
 
     Ok(OfflineReplayReport {
         generated_at_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         replay_db: replay_db.display().to_string(),
+        resolved_ipfs_replay: args.offline_replay_resolved_ipfs,
+        resolved_ipfs_rewrites,
         online,
         offline,
         summary,
@@ -1002,6 +1016,18 @@ fn print_comparison_summary(report: &ComparisonReport) {
 
 fn print_offline_replay_summary(report: &OfflineReplayReport) {
     println!("offline replay db: {}", report.replay_db);
+    if report.resolved_ipfs_replay {
+        println!(
+            "resolved-IPFS replay: rewrote {} path(s)",
+            report.resolved_ipfs_rewrites.len()
+        );
+        for rewrite in report.resolved_ipfs_rewrites.iter().take(12) {
+            println!(
+                "  rewrite {}: {} -> {}",
+                rewrite.case_id, rewrite.original_path, rewrite.rewritten_path
+            );
+        }
+    }
     println!(
         "online: passed={} failed={} pass_rate={:.1}%",
         report.online.summary.pass_count,
@@ -2411,6 +2437,16 @@ fn unique_temp_path(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{}-{millis}", std::process::id()))
 }
 
+fn offline_replay_trace_output(args: &Args, label: &str, temp_prefix: &str) -> Option<PathBuf> {
+    args.trace_output
+        .as_ref()
+        .map(|path| labeled_trace_output(path, label))
+        .or_else(|| {
+            args.offline_replay_resolved_ipfs
+                .then(|| unique_temp_path(temp_prefix))
+        })
+}
+
 fn labeled_trace_output(path: &Path, label: &str) -> PathBuf {
     let parent = path.parent().unwrap_or_else(|| Path::new(""));
     let stem = path
@@ -2423,6 +2459,104 @@ fn labeled_trace_output(path: &Path, label: &str) -> PathBuf {
         _ => format!("{stem}-{label}"),
     };
     parent.join(file_name)
+}
+
+fn successful_name_resolutions_from_trace(path: &Path) -> Result<BTreeMap<String, String>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read trace output {}", path.display()))?;
+    let mut resolutions = BTreeMap::new();
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("phase").and_then(|phase| phase.as_str()) != Some("name_resolve") {
+            continue;
+        }
+        if value.get("ok").and_then(|ok| ok.as_bool()) != Some(true) {
+            continue;
+        }
+        let Some(name) = value.get("name").and_then(|name| name.as_str()) else {
+            continue;
+        };
+        let Some(resolved_target) = value
+            .get("resolved_target")
+            .and_then(|target| target.as_str())
+        else {
+            continue;
+        };
+        if resolved_target.starts_with("/ipfs/") {
+            resolutions.insert(name.to_string(), resolved_target.to_string());
+        }
+    }
+    Ok(resolutions)
+}
+
+fn rewrite_corpus_for_resolved_ipfs_replay(
+    corpus: &Corpus,
+    resolutions: &BTreeMap<String, String>,
+    cases: &[String],
+) -> (Corpus, Vec<OfflineReplayPathRewrite>) {
+    let mut corpus = corpus.clone();
+    let mut rewrites = Vec::new();
+    for entry in &mut corpus.entries {
+        if !cases.is_empty() && !cases.iter().any(|case| case == &entry.id) {
+            continue;
+        }
+        if let Some(rewrite) =
+            rewrite_ipns_path_to_resolved_ipfs(&entry.id, &entry.path, resolutions)
+        {
+            entry.path = rewrite.rewritten_path.clone();
+            rewrites.push(rewrite);
+        }
+    }
+    (corpus, rewrites)
+}
+
+fn rewrite_ipns_path_to_resolved_ipfs(
+    case_id: &str,
+    path: &str,
+    resolutions: &BTreeMap<String, String>,
+) -> Option<OfflineReplayPathRewrite> {
+    let (path_without_suffix, suffix) = split_gateway_path_suffix(path);
+    let ipns = path_without_suffix.strip_prefix("/ipns/")?;
+    let mut parts = ipns.splitn(2, '/');
+    let name = parts.next().filter(|name| !name.is_empty())?;
+    let rest = parts.next().unwrap_or_default();
+    let resolved_target = resolutions.get(name)?;
+    let mut rewritten_path = append_gateway_path(resolved_target, rest);
+    if rest.is_empty() && path_without_suffix.ends_with('/') && !rewritten_path.ends_with('/') {
+        rewritten_path.push('/');
+    }
+    rewritten_path.push_str(suffix);
+    Some(OfflineReplayPathRewrite {
+        case_id: case_id.to_string(),
+        name: name.to_string(),
+        resolved_target: resolved_target.clone(),
+        original_path: path.to_string(),
+        rewritten_path,
+    })
+}
+
+fn split_gateway_path_suffix(path: &str) -> (&str, &str) {
+    match path
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '?' | '#'))
+        .map(|(index, _)| index)
+    {
+        Some(index) => (&path[..index], &path[index..]),
+        None => (path, ""),
+    }
+}
+
+fn append_gateway_path(base: &str, rest: &str) -> String {
+    if rest.is_empty() {
+        return base.to_string();
+    }
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        rest.trim_start_matches('/')
+    )
 }
 
 fn reserve_loopback_port() -> Result<u16> {
@@ -2534,7 +2668,7 @@ fn path_size_bytes(path: &PathBuf) -> std::io::Result<u64> {
     Ok(total)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct Corpus {
     entries: Vec<CorpusEntry>,
 }
@@ -2546,7 +2680,7 @@ impl Corpus {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct CorpusEntry {
     id: String,
     description: Option<String>,
@@ -2562,7 +2696,7 @@ struct CorpusEntry {
     max_ttfb_ms: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct CrawlConfig {
     max_assets: Option<usize>,
     min_assets: Option<usize>,
@@ -2617,9 +2751,20 @@ struct ComparisonReport {
 struct OfflineReplayReport {
     generated_at_unix_seconds: u64,
     replay_db: String,
+    resolved_ipfs_replay: bool,
+    resolved_ipfs_rewrites: Vec<OfflineReplayPathRewrite>,
     online: RunReport,
     offline: RunReport,
     summary: OfflineReplaySummary,
+}
+
+#[derive(Debug, Serialize)]
+struct OfflineReplayPathRewrite {
+    case_id: String,
+    name: String,
+    resolved_target: String,
+    original_path: String,
+    rewritten_path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -5723,6 +5868,86 @@ mod tests {
         assert!(summary.offline_progress_phases.is_empty());
     }
 
+    #[test]
+    fn resolved_ipfs_replay_rewrites_ipns_paths_from_trace_resolutions() {
+        let mut resolutions = BTreeMap::new();
+        resolutions.insert(
+            "ipfs.tech".to_string(),
+            "/ipfs/bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq".to_string(),
+        );
+        let corpus = Corpus {
+            entries: vec![
+                corpus_entry("root", "/ipns/ipfs.tech/"),
+                corpus_entry("asset", "/ipns/ipfs.tech/_nuxt/app.js?cache=1"),
+                corpus_entry("unresolved", "/ipns/example.test/"),
+                corpus_entry("immutable", "/ipfs/bafyroot/index.html"),
+            ],
+        };
+
+        let (rewritten, rewrites) =
+            rewrite_corpus_for_resolved_ipfs_replay(&corpus, &resolutions, &[]);
+
+        assert_eq!(rewrites.len(), 2);
+        assert_eq!(rewrites[0].case_id, "root");
+        assert_eq!(rewrites[0].name, "ipfs.tech");
+        assert_eq!(
+            rewritten.entries[0].path,
+            "/ipfs/bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq/"
+        );
+        assert_eq!(
+            rewritten.entries[1].path,
+            "/ipfs/bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq/_nuxt/app.js?cache=1"
+        );
+        assert_eq!(rewritten.entries[2].path, "/ipns/example.test/");
+        assert_eq!(rewritten.entries[3].path, "/ipfs/bafyroot/index.html");
+    }
+
+    #[test]
+    fn resolved_ipfs_replay_rewrites_only_selected_cases() {
+        let mut resolutions = BTreeMap::new();
+        resolutions.insert("ipfs.tech".to_string(), "/ipfs/bafyroot".to_string());
+        let corpus = Corpus {
+            entries: vec![
+                corpus_entry("root", "/ipns/ipfs.tech/"),
+                corpus_entry("asset", "/ipns/ipfs.tech/app.js"),
+            ],
+        };
+        let cases = vec!["asset".to_string()];
+
+        let (rewritten, rewrites) =
+            rewrite_corpus_for_resolved_ipfs_replay(&corpus, &resolutions, &cases);
+
+        assert_eq!(rewrites.len(), 1);
+        assert_eq!(rewrites[0].case_id, "asset");
+        assert_eq!(rewritten.entries[0].path, "/ipns/ipfs.tech/");
+        assert_eq!(rewritten.entries[1].path, "/ipfs/bafyroot/app.js");
+    }
+
+    #[test]
+    fn trace_name_resolution_parser_keeps_successful_ipfs_targets() {
+        let path = unique_temp_path("trace-name-resolution-parser.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"name_resolve\",\"name\":\"site.test\",\"ok\":true,\"resolved_target\":\"/ipfs/bafyroot\"}\n",
+                "{\"phase\":\"name_resolve\",\"name\":\"nested.test\",\"ok\":true,\"resolved_target\":\"/ipns/other.test\"}\n",
+                "{\"phase\":\"name_resolve\",\"name\":\"bad.test\",\"ok\":false,\"error\":\"not found\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let resolutions = successful_name_resolutions_from_trace(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(
+            resolutions.get("site.test").map(String::as_str),
+            Some("/ipfs/bafyroot")
+        );
+        assert!(!resolutions.contains_key("nested.test"));
+        assert!(!resolutions.contains_key("bad.test"));
+    }
+
     fn trace_value_count(counts: &[TraceValueCount], value: &str) -> usize {
         counts
             .iter()
@@ -5768,6 +5993,23 @@ mod tests {
                 passed: true,
                 failures: Vec::new(),
             }],
+        }
+    }
+
+    fn corpus_entry(id: &str, path: &str) -> CorpusEntry {
+        CorpusEntry {
+            id: id.to_string(),
+            description: None,
+            path: path.to_string(),
+            method: None,
+            range: None,
+            crawl: None,
+            expect_status: None,
+            expect_content_type_prefix: None,
+            expect_content_range_prefix: None,
+            expect_body_contains: None,
+            min_bytes: None,
+            max_ttfb_ms: None,
         }
     }
 }

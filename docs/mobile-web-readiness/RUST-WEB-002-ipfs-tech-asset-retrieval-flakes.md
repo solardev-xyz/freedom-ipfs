@@ -5955,3 +5955,67 @@ the resolved `/ipfs` target. This gives three concrete follow-up options:
 persist bounded successful name resolutions, let the host app replay the
 resolved `/ipfs` URL offline, or improve the offline `/ipns` error page with the
 missing-name cause.
+
+## 2026-05-05 Resolved-IPFS Offline Replay Harness Mode
+
+Hypothesis: the failing offline `ipfs.tech` replay above is a name-resolution
+state gap, not a missing-block/cache-completeness gap. Replaying the online
+observed `/ipfs` target offline should pass if the warmed blocks are complete.
+
+Implementation:
+
+- Add `--offline-replay-resolved-ipfs` to `mobile-web-harness`.
+- In offline replay mode, the online pass always has a trace path when this flag
+  is set, even if the caller did not request `--trace-output`.
+- Successful online `name_resolve` events with `/ipfs/...` `resolved_target`
+  values are used to rewrite selected offline `/ipns/{name}/...` corpus paths.
+- The JSON report records `resolved_ipfs_replay` and
+  `resolved_ipfs_rewrites[]` with case id, original path, resolved target, and
+  rewritten path.
+- This is diagnostics-only; it does not persist DNSLink/IPNS records or change
+  gateway behavior.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo build -p freedom-ipfs-gateway
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+rm -f /tmp/freedom-ipfs-offline-replay-ipfs-tech-resolved-selected.db \
+  /tmp/freedom-ipfs-offline-replay-ipfs-tech-resolved-selected.db-* \
+  /tmp/ipfs-tech-offline-replay-resolved-selected*.json \
+  /tmp/ipfs-tech-offline-replay-resolved-selected*.jsonl
+cargo run -p mobile-web-harness -- --case ipfs-tech-page-assets \
+  --repeat 1 --asset-concurrency 6 --run-timeout-secs 120 \
+  --gateway-db /tmp/freedom-ipfs-offline-replay-ipfs-tech-resolved-selected.db \
+  --offline-replay --offline-replay-resolved-ipfs \
+  --trace-output /tmp/ipfs-tech-offline-replay-resolved-selected-trace.jsonl \
+  --output /tmp/ipfs-tech-offline-replay-resolved-selected.json
+```
+
+Result: validation passed. The live run reported online `1/1`, offline `1/1`,
+`missing_urls=0`, and one selected rewrite:
+
+```text
+/ipns/ipfs.tech/ ->
+/ipfs/bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq/
+```
+
+Offline replay statuses were `200=27, 206=6`; offline progress phases were
+`streaming=199, completed=33, queued=33, started=33`; offline trace errors were
+empty. Evidence:
+
+- `/tmp/ipfs-tech-offline-replay-resolved-selected.json`
+- `/tmp/ipfs-tech-offline-replay-resolved-selected-trace-online.jsonl` (`926`
+  lines)
+- `/tmp/ipfs-tech-offline-replay-resolved-selected-trace-offline.jsonl` (`298`
+  lines)
+- `/tmp/freedom-ipfs-offline-replay-ipfs-tech-resolved-selected.db`
+
+Conclusion: the current warmed `ipfs.tech` page-assets cache is complete enough
+to replay via immutable `/ipfs` paths after a restart. The remaining offline
+failure for the original `/ipns/ipfs.tech/` URL is specifically the lack of
+offline name-resolution state or host-side rewrite policy.
