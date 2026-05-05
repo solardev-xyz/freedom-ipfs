@@ -9658,3 +9658,48 @@ Result: all passed.
 Decision: keep. `100ms` retains the deterministic fast-session behavior while
 cutting the cold asset tail and reducing Bitswap attempt pressure in the primary
 comparison case.
+
+## 2026-05-05 Reject: Make `cid.contact` A Default Delegated Router
+
+Hypothesis:
+The routing layer can already query multiple delegated routing endpoints and
+merge low-diversity results. Adding `cid.contact` alongside
+`delegated-ipfs.dev` might improve provider diversity and reduce Bitswap tails
+without changing verification or adding gateway fallback.
+
+Experiment command:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --delegated-router https://delegated-ipfs.dev/routing/v1,https://cid.contact/routing/v1 \
+  --trace-output /tmp/ipfs-tech-dual-delegated-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-dual-delegated-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `24/2181ms`, Kubo `3/11841ms`.
+- Asset TTFB p50/p95: Rust `13/489ms`, Kubo `4/486ms`.
+- Rust RSS/FD: `57256KiB`/`49`.
+- Bitswap peer attempts rose to `224` from `155` in the preceding 100ms
+  post-lookup-grace run.
+- The trace summary showed completed delegated lookup events only for
+  `https://delegated-ipfs.dev/routing/v1`; `cid.contact` did not contribute
+  visible completed results in this run before the first endpoint satisfied the
+  routing policy.
+
+Decision: reject as a default change for now. The asset p95 was better, but root
+tail and resource pressure worsened, and there was no trace evidence that the
+second endpoint materially contributed. Keep multi-endpoint routing available as
+a CLI/mobile override for further provider-quality sweeps rather than changing
+the default.
