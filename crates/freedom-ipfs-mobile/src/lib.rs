@@ -554,7 +554,9 @@ fn progress_source(raw_phase: &str, fields: &ProgressFields) -> Option<String> {
         {
             Some("cache".into())
         }
-        "http_provider_fetch" | "http_provider_race" => Some("http_provider".into()),
+        "http_provider_fetch" | "http_provider_hedge" | "http_provider_race" => {
+            Some("http_provider".into())
+        }
         "delegated_provider_lookup" | "delegated_provider_empty_retry" => {
             Some("delegated_routing".into())
         }
@@ -632,7 +634,9 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         | "bitswap_dns_prefetch"
         | "bitswap_dnsaddr_expand"
         | "bitswap_dns_multiaddr_expand" => "provider_lookup",
-        "http_provider_fetch" | "http_provider_race" => "fetching_http_provider",
+        "http_provider_fetch" | "http_provider_hedge" | "http_provider_race" => {
+            "fetching_http_provider"
+        }
         "bitswap_fetch"
         | "bitswap_connection_established"
         | "bitswap_incoming_block"
@@ -2305,6 +2309,14 @@ mod tests {
             Some("http_provider")
         );
         assert_eq!(
+            progress_source(
+                "http_provider_hedge",
+                &progress_fields([("phase", "http_provider_hedge")]),
+            )
+            .as_deref(),
+            Some("http_provider")
+        );
+        assert_eq!(
             progress_phase(
                 "name_cache",
                 &progress_fields([("phase", "name_cache"), ("cache_hit", "false")]),
@@ -2503,6 +2515,14 @@ mod tests {
             progress_phase(
                 "http_provider_race",
                 &progress_fields([("phase", "http_provider_race")]),
+                "active",
+            ),
+            "fetching_http_provider"
+        );
+        assert_eq!(
+            progress_phase(
+                "http_provider_hedge",
+                &progress_fields([("phase", "http_provider_hedge")]),
                 "active",
             ),
             "fetching_http_provider"

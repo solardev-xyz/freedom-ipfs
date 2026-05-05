@@ -44,6 +44,7 @@ const BAD_HTTP_PROVIDER_TTL: Duration = Duration::from_secs(10 * 60);
 const BAD_BITSWAP_PROVIDER_TTL: Duration = Duration::from_secs(30);
 const HTTP_PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
 const HTTP_PROVIDER_RACE_WIDTH: usize = 2;
+const HTTP_PROVIDER_HEDGE_AFTER: Duration = Duration::from_millis(250);
 const MAX_CONCURRENT_HTTP_PROVIDER_FETCHES: usize = 4;
 const BITSWAP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 // Start provider retry before a full dial timeout can dominate gateway TTFB.
@@ -719,11 +720,42 @@ impl HttpRetriever {
             pending.push(self.fetch_from_http_provider_candidate(*cid, base));
         }
 
-        while let Some(result) = pending.next().await {
-            match result {
-                Ok(block) => return Ok(Some(block)),
-                Err(_) => {
+        let hedge = tokio::time::sleep(HTTP_PROVIDER_HEDGE_AFTER);
+        tokio::pin!(hedge);
+        let mut completion_seen_before_hedge = false;
+        let mut hedge_fired = false;
+
+        while !pending.is_empty() {
+            tokio::select! {
+                biased;
+
+                result = pending.next() => {
+                    let Some(result) = result else {
+                        break;
+                    };
+                    completion_seen_before_hedge = true;
+                    match result {
+                        Ok(block) => return Ok(Some(block)),
+                        Err(_) => {
+                            if let Some(base) = next_bases.next() {
+                                pending.push(self.fetch_from_http_provider_candidate(*cid, base));
+                            }
+                        }
+                    }
+                }
+                _ = &mut hedge, if !hedge_fired
+                    && !completion_seen_before_hedge
+                    && next_bases.len() > 0 => {
+                    hedge_fired = true;
                     if let Some(base) = next_bases.next() {
+                        tracing::info!(
+                            phase = "http_provider_hedge",
+                            cid = %cid,
+                            provider = %base,
+                            timeout_ms = HTTP_PROVIDER_HEDGE_AFTER.as_millis(),
+                            pending_count = pending.len(),
+                            remaining_provider_count = next_bases.len()
+                        );
                         pending.push(self.fetch_from_http_provider_candidate(*cid, base));
                     }
                 }
@@ -5726,6 +5758,55 @@ mod bitswap_tests {
         assert_eq!(slow_requests.load(Ordering::Relaxed), 1);
         assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
         slow_task.abort();
+        fast_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hedges_slow_http_provider_race_with_extra_candidate() {
+        let expected = b"verified hedged HTTP provider block";
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, expected);
+        let slow_requests = Arc::new(AtomicU64::new(0));
+        let fast_requests = Arc::new(AtomicU64::new(0));
+        let (slow_a_addr, slow_a_task) = spawn_hanging_http_provider(slow_requests.clone()).await;
+        let (slow_b_addr, slow_b_task) = spawn_hanging_http_provider(slow_requests.clone()).await;
+        let (fast_addr, fast_task) =
+            spawn_counting_http_provider(expected.to_vec(), Duration::ZERO, fast_requests.clone())
+                .await;
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let provider = Provider::from_parts(
+            None,
+            vec![
+                format!("/ip4/{}/tcp/{}/http", slow_a_addr.ip(), slow_a_addr.port()),
+                format!("/ip4/{}/tcp/{}/http", slow_b_addr.ip(), slow_b_addr.port()),
+                format!("/ip4/{}/tcp/{}/http", fast_addr.ip(), fast_addr.port()),
+            ],
+        )
+        .unwrap_or_else(|_| panic!("failed to build HTTP providers"));
+
+        let started = Instant::now();
+        let (block, source) = tokio::time::timeout(
+            Duration::from_secs(2),
+            retriever.fetch_from_providers_with_source(&cid, &[provider]),
+        )
+        .await
+        .expect("hedged HTTP provider fetch timed out")
+        .unwrap();
+
+        assert_eq!(source, RetrievalSource::HttpProvider);
+        assert_eq!(block.data(), expected);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "hedged provider should return before the base HTTP timeout"
+        );
+        assert_eq!(fast_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(slow_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
+        slow_a_task.abort();
+        slow_b_task.abort();
         fast_task.abort();
     }
 

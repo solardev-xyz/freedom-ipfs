@@ -13999,3 +13999,139 @@ Live result:
 Decision:
 Keep. This is harness-only and makes the provider/header-latency signal visible
 without changing gateway or retrieval behavior.
+
+## 2026-05-05 Keep: Hedge Stalled HTTP Provider Races
+
+Problem:
+HTTP-provider fetches race two candidates, but if both initial candidates stall
+the request waits until one completes or times out before trying later HTTP
+providers. Recent provider milestone traces showed useful later providers, such
+as `https://calib2.ezpdpz.net/`, sometimes sitting behind slower
+`https://ipfs-bridge.sia.dev/` and `https://dag.w3s.link/` candidates.
+
+Implementation:
+
+- Add a single bounded HTTP-provider hedge after `250ms`.
+- The initial race width remains `2`.
+- If neither initial HTTP candidate has completed after the hedge delay, start
+  exactly one additional provider candidate.
+- Keep the existing global HTTP provider semaphore
+  `MAX_CONCURRENT_HTTP_PROVIDER_FETCHES=4`.
+- Emit `phase="http_provider_hedge"` with the hedged provider, delay,
+  pending count, and remaining provider count.
+- Map `http_provider_hedge` to mobile/harness source
+  `http_provider` and phase `fetching_http_provider`.
+- Add a deterministic retrieval test with two hanging local HTTP providers and a
+  third fast provider. Without the hedge this test would hit the outer timeout.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval hedges_slow_http_provider_race_with_extra_candidate
+cargo test -p freedom-ipfs-retrieval races_http_provider_candidates_and_returns_first_verified_block
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+cargo test -p mobile-web-harness trace_summary_counts_http_provider_fetches
+```
+
+Result:
+
+- Formatting check passed.
+- New hedge test passed.
+- Existing HTTP-provider race test passed.
+- Mobile progress mapping test passed.
+- Harness progress summary test passed.
+- Harness HTTP-provider summary test passed.
+
+Full validation:
+
+```sh
+cargo fmt --all --check && \
+cargo test -p freedom-ipfs-retrieval -p freedom-ipfs-mobile -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Result:
+
+- Retrieval suite passed: `69 passed; 0 failed; 1 ignored`.
+- Mobile suite passed: `26 passed; 0 failed`.
+- Harness suite passed: `32 passed; 0 failed`.
+- Workspace check passed.
+- Workspace clippy passed with `-D warnings`.
+
+Live comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-provider-hedge-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-http-provider-hedge-r3.json
+```
+
+First live result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Root TTFB p50/p95: Rust `1364ms` / `1631ms`, Kubo `3103ms` / `3360ms`.
+- Asset TTFB p50/p95: Rust `311ms` / `2767ms`, Kubo `163ms` / `1260ms`.
+- Rust max RSS/FD: `50400KiB` / `32`; Kubo max RSS/FD:
+  `276928KiB` / `222`.
+- HTTP provider fetch p50/p95/max: `167ms` / `653ms` / `1225ms`.
+- HTTP provider header max: `837ms`.
+- Delegated provider lookup max: `6264ms`.
+- `http_provider_hedge` fired `2` times. One hedged request was won by
+  `https://calib2.ezpdpz.net/` `54ms` after the hedge launched.
+- Decision after this sample was mixed: HTTP-provider tail improved, but asset
+  p95 was dominated by delegated routing outliers, so a second sample was run
+  before keeping the change.
+
+Second live comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-provider-hedge-r3b-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-http-provider-hedge-r3b.json
+```
+
+Second live result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Root TTFB p50/p95: Rust `816ms` / `2044ms`, Kubo `1476ms` / `2485ms`.
+- Asset TTFB p50/p95: Rust `282ms` / `584ms`, Kubo `154ms` / `577ms`.
+- Rust max RSS/FD: `46336KiB` / `26`; Kubo max RSS/FD:
+  `191012KiB` / `162`.
+- HTTP provider fetch p50/p95/max: `163ms` / `506ms` / `1037ms`.
+- HTTP provider header max: `734ms`.
+- Delegated provider lookup max: `182ms`.
+- `http_provider_hedge` fired `2` times.
+
+Decision:
+Keep. The hedge is bounded, preserves verification and read-only behavior, and
+did not increase observed RSS/FD. Across the two live samples it fired rarely
+but usefully, with one request demonstrably won by the hedged third provider.
+Compared with recent no-hedge windows, HTTP-provider p95/max improved
+(`755ms` / `1347ms` previously, then `653ms` / `1225ms`, then `506ms` /
+`1037ms`), while the second live sample also kept asset p95 near Kubo. The
+first sample's asset p95 regression was caused by delegated routing outliers,
+not HTTP provider response time, and points to delegated routing tail work as a
+better next experiment.

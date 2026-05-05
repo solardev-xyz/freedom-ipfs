@@ -6707,7 +6707,9 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         | "bitswap_dns_prefetch"
         | "bitswap_dnsaddr_expand"
         | "bitswap_dns_multiaddr_expand" => "provider_lookup",
-        "http_provider_fetch" | "http_provider_race" => "fetching_http_provider",
+        "http_provider_fetch" | "http_provider_hedge" | "http_provider_race" => {
+            "fetching_http_provider"
+        }
         "bitswap_fetch"
         | "bitswap_connection_established"
         | "bitswap_incoming_block"
@@ -8093,6 +8095,7 @@ mod tests {
                 "{\"phase\":\"block_store_get\",\"cid\":\"cid-a\",\"cache_hit\":false}\n",
                 "{\"phase\":\"block_store_get\",\"cid\":\"cid-b\",\"cache_hit\":true}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-a\",\"ok\":true}\n",
+                "{\"phase\":\"http_provider_hedge\",\"cid\":\"cid-a\",\"provider\":\"https://provider.example\",\"timeout_ms\":250,\"pending_count\":2}\n",
                 "{\"phase\":\"bitswap_peer_expand\",\"cid\":\"cid-a\",\"peer_count\":2}\n",
                 "{\"phase\":\"bitswap_incoming_batch\",\"cid\":\"cid-a\",\"cid_count\":2,\"requested_blocks\":2}\n",
                 "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer-a\",\"transport\":\"tcp\"}\n",
@@ -8199,7 +8202,7 @@ mod tests {
         assert_eq!(trace_value_count(&summary.progress_phases, "cache_hit"), 2);
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_http_provider"),
-            1
+            2
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_bitswap"),
