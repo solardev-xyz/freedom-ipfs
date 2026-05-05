@@ -172,6 +172,7 @@ struct ProgressTarget {
     delivery: Option<String>,
     bytes_loaded: Option<u64>,
     bytes_total: Option<u64>,
+    active_subrequests: usize,
     elapsed_ms: Option<u64>,
     blocks_loaded: u64,
     retry_count: u64,
@@ -312,6 +313,7 @@ impl ProgressRecorder {
                     delivery: target_delivery,
                     bytes_loaded,
                     bytes_total,
+                    active_subrequests: 0,
                     elapsed_ms,
                     blocks_loaded,
                     retry_count,
@@ -330,7 +332,7 @@ impl ProgressRecorder {
                 generated_at_unix_ms: now_ms(),
                 active_count: inner.active_targets.len(),
                 event_count: inner.events.len(),
-                active: inner.active_targets.values().cloned().collect(),
+                active: progress_active_targets(&inner),
                 events: inner.events.iter().cloned().collect(),
             },
             Err(_) => ProgressSnapshot {
@@ -350,6 +352,29 @@ impl ProgressRecorder {
             inner.active_targets.clear();
         }
     }
+}
+
+fn progress_active_targets(inner: &ProgressInner) -> Vec<ProgressTarget> {
+    let mut active = inner.active_targets.values().cloned().collect::<Vec<_>>();
+    let mut active_subrequest_counts = HashMap::<u64, usize>::new();
+    for target in &active {
+        if let Some(parent_id) = target.parent_id {
+            *active_subrequest_counts.entry(parent_id).or_default() += 1;
+        }
+    }
+    for target in &mut active {
+        target.active_subrequests = active_subrequest_counts
+            .get(&target.id)
+            .copied()
+            .unwrap_or_default();
+    }
+    active.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    active
 }
 
 #[derive(Clone)]
@@ -2188,6 +2213,57 @@ mod tests {
         assert_eq!(completed["status"], "completed");
         assert_eq!(completed["bytes_loaded"].as_u64().unwrap(), 600000);
         assert_eq!(completed["bytes_total"].as_u64().unwrap(), 600000);
+    }
+
+    #[test]
+    fn progress_snapshot_counts_active_subrequests() {
+        let recorder = ProgressRecorder::default();
+        let root_span = ProgressSpanFields {
+            request_id: Some(1),
+            progress_request_id: Some(100),
+            path: Some("/ipns/site/".into()),
+            ..ProgressSpanFields::default()
+        };
+        let child_span = ProgressSpanFields {
+            request_id: Some(2),
+            progress_request_id: Some(101),
+            parent_request_id: Some(100),
+            path: Some("/ipns/site/app.js".into()),
+            ..ProgressSpanFields::default()
+        };
+        let second_child_span = ProgressSpanFields {
+            request_id: Some(3),
+            progress_request_id: Some(102),
+            parent_request_id: Some(100),
+            path: Some("/ipns/site/app.css".into()),
+            ..ProgressSpanFields::default()
+        };
+
+        recorder.record_event(
+            root_span,
+            progress_fields([("phase", "request_start")]),
+            "test",
+        );
+        recorder.record_event(
+            child_span,
+            progress_fields([("phase", "request_start")]),
+            "test",
+        );
+        recorder.record_event(
+            second_child_span,
+            progress_fields([("phase", "request_start")]),
+            "test",
+        );
+
+        let snapshot = recorder.snapshot_json();
+        let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(value["active_count"].as_u64().unwrap(), 3);
+        let active = value["active"].as_array().unwrap();
+        let root = active.iter().find(|target| target["id"] == 100).unwrap();
+        assert_eq!(root["active_subrequests"].as_u64().unwrap(), 2);
+        let child = active.iter().find(|target| target["id"] == 101).unwrap();
+        assert_eq!(child["parent_id"].as_u64().unwrap(), 100);
+        assert_eq!(child["active_subrequests"].as_u64().unwrap(), 0);
     }
 
     #[test]

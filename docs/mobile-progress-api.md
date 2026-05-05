@@ -30,6 +30,7 @@ The returned string is owned by Rust and must be released with
       "delivery": "incoming",
       "bytes_loaded": null,
       "bytes_total": 600000,
+      "active_subrequests": 2,
       "elapsed_ms": 812,
       "blocks_loaded": 2,
       "retry_count": 1,
@@ -81,6 +82,10 @@ fields. `bytes_total` is filled when the gateway knows the UnixFS file length or
 streamed response body length. `blocks_loaded` and `retry_count` accumulate
 while the target is active, and the final completed/failed/cancelled event
 carries the last values even though the target is removed from `active`.
+
+`active_subrequests` is computed for active targets in each snapshot from
+`parent_id` relationships. A top-level gateway request can use it to show that
+subresources are still loading under the same page/navigation.
 
 `source` is a stable high-level source such as `cache`, `bitswap`,
 `http_provider`, `delegated_routing`, or `dht`. `transport` is the network
