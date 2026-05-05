@@ -8153,3 +8153,87 @@ Decision: keep. This is diagnostics-only and prevents future warm-path work
 from misattributing client-side/local HTTP timing to gateway, UnixFS, cache, or
 retrieval internals. The next speed experiments should focus on traces where
 `gateway_request_elapsed_ms` is high, not only where external TTFB is high.
+
+## 2026-05-05 Reject: Adaptive Diverse-Provider Post-Lookup Wait
+
+Hypothesis:
+The new gateway request elapsed summary showed some `ipfs-tech-page-assets`
+asset requests spending about `200ms` in
+`bitswap_session_shortcut_post_lookup_wait` after delegated routing had already
+returned a diverse provider set. Shortening that post-lookup wait only when
+provider diversity was high might reduce asset tails without hurting sparse
+provider cases.
+
+Experiment:
+
+- Temporarily add `BITSWAP_SESSION_DIVERSE_POST_LOOKUP_GRACE = 75ms`.
+- Use it when the delegated provider result count is at least `16`.
+- Keep the existing `200ms` grace for sparse provider sets.
+- Add provider count to the post-lookup timeout trace.
+
+Validation and live runs:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval post_lookup_session_grace
+cargo test -p freedom-ipfs-retrieval recent_bitswap_peer
+cargo build -p freedom-ipfs-gateway -p mobile-web-harness
+timeout 420s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/ipfs-tech-adaptive-postlookup-built-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-adaptive-postlookup-built-comparison.json
+```
+
+Important run note:
+An earlier attempt used `cargo run -p mobile-web-harness` without rebuilding
+`freedom-ipfs-gateway`, so it spawned the previous gateway binary and did not
+exercise the retrieval change. The metrics below are from the rebuilt gateway.
+
+Adaptive result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `20/703ms`, Kubo `2/1513ms`.
+- Asset TTFB p50/p95: Rust `14/288ms`, Kubo `4/1016ms`.
+- Gateway request elapsed p50/p90/p95/max:
+  `8/228/319/977ms`.
+- Bitswap session: `shortcut_starts=34`, `shortcut_post_lookup_waits=13`,
+  `shortcut_hits=21`.
+- Dial pressure increased: `starts=137`, `outgoing_completed=22`,
+  `dial_rejections=25`, all connection-limit.
+- Max RSS/FD: Rust `52076KiB`/`44`, Kubo `192048KiB`/`108`.
+
+Same-window baseline after reverting and rebuilding:
+
+```sh
+cargo build -p freedom-ipfs-gateway -p mobile-web-harness
+timeout 420s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/ipfs-tech-postlookup-baseline-rerun-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-postlookup-baseline-rerun-comparison.json
+```
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `19/620ms`, Kubo `3/4573ms`.
+- Asset TTFB p50/p95: Rust `16/255ms`, Kubo `4/373ms`.
+- Gateway request elapsed p50/p90/p95/max:
+  `7/180/253/602ms`.
+- Bitswap session: `shortcut_starts=34`, `shortcut_post_lookup_waits=0`,
+  `shortcut_hits=34`.
+- Dial pressure stayed low: `starts=39`, `outgoing_completed=0`,
+  `dial_rejections=0`.
+- Max RSS/FD: Rust `49416KiB`/`30`, Kubo `297960KiB`/`409`.
+
+Decision: reject. The adaptive wait made the provider path more aggressive,
+but in the rebuilt same-window run it lost shortcut hits, increased peer
+attempts and connection-limit dial rejections, and worsened gateway request
+p95/max versus the kept `200ms` behavior. Keep the fixed `200ms` post-lookup
+grace for now; future work should use the gateway elapsed summary to look for
+cases where the wait repeatedly times out without increasing dial pressure.
