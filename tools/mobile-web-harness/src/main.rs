@@ -1139,6 +1139,11 @@ fn print_comparison_summary(report: &ComparisonReport) {
         || report.kubo.summary.bitswap_seed_connect_ms.count > 0
     {
         println!(
+            "bitswap seed setup: rust={} kubo={}",
+            display_option_seed_setup(report.rust.bitswap_seed_connection_setup),
+            display_option_seed_setup(report.kubo.bitswap_seed_connection_setup)
+        );
+        println!(
             "bitswap seed connect: rust={} kubo={}",
             report.rust.summary.bitswap_seed_connect_ms,
             report.kubo.summary.bitswap_seed_connect_ms
@@ -1160,6 +1165,19 @@ fn print_comparison_summary(report: &ComparisonReport) {
             display_option_ms(case.kubo_root_ttfb_p95_ms),
             display_option_f64(case.root_ttfb_p95_ratio)
         );
+        if case.kubo_setup_adjusted_root_ttfb_p50_ms.is_some()
+            || case.kubo_setup_adjusted_root_ttfb_p95_ms.is_some()
+        {
+            println!(
+                "  root_ttfb_kubo_setup_adjusted: rust_p50={} kubo_p50={} p50_ratio={} rust_p95={} kubo_p95={} p95_ratio={}",
+                display_option_ms(case.rust_root_ttfb_p50_ms),
+                display_option_ms(case.kubo_setup_adjusted_root_ttfb_p50_ms),
+                display_option_f64(case.setup_adjusted_root_ttfb_p50_ratio),
+                display_option_ms(case.rust_root_ttfb_p95_ms),
+                display_option_ms(case.kubo_setup_adjusted_root_ttfb_p95_ms),
+                display_option_f64(case.setup_adjusted_root_ttfb_p95_ratio)
+            );
+        }
         println!(
             "  asset_ttfb: rust_p50={} kubo_p50={} p50_ratio={} rust_p95={} kubo_p95={} p95_ratio={}",
             display_option_ms(case.rust_asset_ttfb_p50_ms),
@@ -2029,6 +2047,12 @@ fn display_option_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn display_option_seed_setup(value: Option<BitswapSeedConnectionSetup>) -> &'static str {
+    value
+        .map(BitswapSeedConnectionSetup::as_str)
+        .unwrap_or("n/a")
 }
 
 fn print_case_result(result: &CaseResult) {
@@ -4090,6 +4114,10 @@ struct ComparisonCase {
     rust_root_ttfb_p95_ms: Option<u128>,
     kubo_root_ttfb_p95_ms: Option<u128>,
     root_ttfb_p95_ratio: Option<f64>,
+    kubo_setup_adjusted_root_ttfb_p50_ms: Option<u128>,
+    setup_adjusted_root_ttfb_p50_ratio: Option<f64>,
+    kubo_setup_adjusted_root_ttfb_p95_ms: Option<u128>,
+    setup_adjusted_root_ttfb_p95_ratio: Option<f64>,
     rust_asset_ttfb_p50_ms: Option<u128>,
     kubo_asset_ttfb_p50_ms: Option<u128>,
     asset_ttfb_p50_ratio: Option<f64>,
@@ -4143,6 +4171,7 @@ impl ComparisonCase {
                     .and_then(|value| usize::try_from(value).ok());
                 let rust_max_storage_bytes = rust.summary.gateway_storage_bytes.max;
                 let kubo_max_storage_bytes = kubo.summary.gateway_storage_bytes.max;
+                let kubo_setup_adjusted_root_ttfb = setup_adjusted_root_ttfb_ms(kubo, &id);
                 Some(Self {
                     id,
                     rust_pass_rate: rust_case.pass_rate,
@@ -4158,6 +4187,16 @@ impl ComparisonCase {
                     root_ttfb_p95_ratio: ratio(
                         rust_case.root_ttfb_ms.p95_ms,
                         kubo_case.root_ttfb_ms.p95_ms,
+                    ),
+                    kubo_setup_adjusted_root_ttfb_p50_ms: kubo_setup_adjusted_root_ttfb.p50_ms,
+                    setup_adjusted_root_ttfb_p50_ratio: ratio(
+                        rust_case.root_ttfb_ms.p50_ms,
+                        kubo_setup_adjusted_root_ttfb.p50_ms,
+                    ),
+                    kubo_setup_adjusted_root_ttfb_p95_ms: kubo_setup_adjusted_root_ttfb.p95_ms,
+                    setup_adjusted_root_ttfb_p95_ratio: ratio(
+                        rust_case.root_ttfb_ms.p95_ms,
+                        kubo_setup_adjusted_root_ttfb.p95_ms,
                     ),
                     rust_asset_ttfb_p50_ms: rust_case.asset_ttfb_ms.p50_ms,
                     kubo_asset_ttfb_p50_ms: kubo_case.asset_ttfb_ms.p50_ms,
@@ -4186,6 +4225,20 @@ impl ComparisonCase {
             })
             .collect()
     }
+}
+
+fn setup_adjusted_root_ttfb_ms(report: &RunReport, id: &str) -> LatencySummary {
+    let values = report
+        .runs
+        .iter()
+        .filter(|run| run.phase == RunPhase::Measured)
+        .filter_map(|run| {
+            let setup_ms = run.bitswap_seed_connect_elapsed_ms?;
+            let result = run.results.iter().find(|result| result.id == id)?;
+            Some(result.ttfb_ms.saturating_add(setup_ms))
+        })
+        .collect::<Vec<_>>();
+    LatencySummary::from_values(values)
 }
 
 fn ratio(left: Option<u128>, right: Option<u128>) -> Option<f64> {
@@ -9694,6 +9747,76 @@ mod tests {
     }
 
     #[test]
+    fn comparison_case_reports_kubo_setup_adjusted_root_ttfb() {
+        let rust_runs = vec![
+            run_result(
+                RunPhase::Measured,
+                1,
+                200,
+                Some(40),
+                Some(12),
+                Some(0),
+                None,
+            ),
+            run_result(
+                RunPhase::Measured,
+                2,
+                400,
+                Some(41),
+                Some(12),
+                Some(0),
+                None,
+            ),
+        ];
+        let mut kubo_runs = vec![
+            run_result(
+                RunPhase::Measured,
+                1,
+                80,
+                Some(100),
+                Some(30),
+                Some(0),
+                None,
+            ),
+            run_result(
+                RunPhase::Measured,
+                2,
+                100,
+                Some(101),
+                Some(31),
+                Some(0),
+                None,
+            ),
+        ];
+        kubo_runs[0].bitswap_seed_connect_elapsed_ms = Some(60);
+        kubo_runs[1].bitswap_seed_connect_elapsed_ms = Some(70);
+
+        let rust = run_report(
+            HarnessEngine::Rust,
+            Some(BitswapSeedConnectionSetup::DelegatedRouterProviderLookup),
+            rust_runs,
+        );
+        let kubo = run_report(
+            HarnessEngine::Kubo,
+            Some(BitswapSeedConnectionSetup::SwarmConnectBeforeRequest),
+            kubo_runs,
+        );
+
+        let cases = ComparisonCase::from_reports(&rust, &kubo);
+        let case = &cases[0];
+
+        assert_eq!(case.rust_root_ttfb_p50_ms, Some(100));
+        assert_eq!(case.rust_root_ttfb_p95_ms, Some(200));
+        assert_eq!(case.kubo_root_ttfb_p50_ms, Some(40));
+        assert_eq!(case.kubo_root_ttfb_p95_ms, Some(50));
+        assert_eq!(case.kubo_setup_adjusted_root_ttfb_p50_ms, Some(100));
+        assert_eq!(case.kubo_setup_adjusted_root_ttfb_p95_ms, Some(120));
+        assert_eq!(case.setup_adjusted_root_ttfb_p50_ratio, Some(1.0));
+        let p95_ratio = case.setup_adjusted_root_ttfb_p95_ratio.unwrap();
+        assert!((p95_ratio - (200.0 / 120.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn case_aggregate_counts_conditional_revalidations() {
         let mut run = run_result(
             RunPhase::Measured,
@@ -10648,6 +10771,34 @@ mod tests {
             .find(|count| count.value == value)
             .map(|count| count.count)
             .unwrap_or_default()
+    }
+
+    fn run_report(
+        engine: HarnessEngine,
+        bitswap_seed_connection_setup: Option<BitswapSeedConnectionSetup>,
+        runs: Vec<RunResult>,
+    ) -> RunReport {
+        let summary = RepeatSummary::from_runs(&runs);
+        RunReport {
+            gateway_url: None,
+            generated_at_unix_seconds: 0,
+            repeat: summary.measured_runs,
+            warmup_runs: 0,
+            fresh_gateway_per_run: true,
+            asset_concurrency: 1,
+            conditional_revalidate: false,
+            run_timeout_secs: None,
+            engine,
+            gateway_db: None,
+            gateway_import_car: None,
+            bitswap_seed_car: Some("/tmp/mobile-fixture.car".to_string()),
+            bitswap_seed_connection_setup,
+            kubo_repo: None,
+            trace_output: None,
+            trace_summary: None,
+            summary,
+            runs,
+        }
     }
 
     fn run_result(

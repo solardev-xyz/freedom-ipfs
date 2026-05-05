@@ -17488,3 +17488,82 @@ The prototype was removed after the A/B run. Future work should not add a
 replacement multi-CID range shortcut unless repeated seeded and public workload
 evidence shows a real p50/p95 win without weakening verification, cache
 ordering, read-only behavior, or mobile resource limits.
+
+## 2026-05-05 Keep: Kubo Seed-Setup Adjusted Comparison Metrics
+
+Question:
+The deterministic seeded Bitswap range harness is useful for range/session
+experiments, but its Rust and Kubo setup paths are intentionally different.
+Rust learns the seed through the delegated-routing endpoint during the gateway
+request. Kubo is swarm-connected to the seed before the gateway request starts.
+That makes raw Kubo root TTFB look like pure request latency while hiding setup
+work that Rust pays inside the request.
+
+Implementation:
+
+- Keep gateway and retrieval behavior unchanged.
+- Preserve the existing raw Rust and Kubo root/asset TTFB ratios.
+- Add comparison JSON fields:
+  `kubo_setup_adjusted_root_ttfb_p50_ms`,
+  `setup_adjusted_root_ttfb_p50_ratio`,
+  `kubo_setup_adjusted_root_ttfb_p95_ms`, and
+  `setup_adjusted_root_ttfb_p95_ratio`.
+- Compute the adjusted Kubo metric from measured runs by adding each run's
+  `bitswap_seed_connect_elapsed_ms` to that run's root `ttfb_ms`, then deriving
+  p50/p95 from the adjusted samples.
+- Print `bitswap seed setup` in the comparison console summary so seeded reports
+  explicitly show `delegated_router_provider_lookup` versus
+  `swarm_connect_before_request`.
+- Print `root_ttfb_kubo_setup_adjusted` only when adjusted samples exist.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness comparison_case_reports_kubo_setup_adjusted_root_ttfb
+cargo test -p mobile-web-harness
+git diff --check
+```
+
+Focused result:
+
+- Formatting passed.
+- Focused adjusted comparison metric test passed.
+- Full mobile web harness suite passed: `38 passed`.
+- Diff whitespace check passed.
+
+Live seeded validation:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-kubo-setup-adjusted-r1-trace.jsonl \
+  --comparison-output /tmp/harness-kubo-setup-adjusted-r1.json
+```
+
+Live result:
+
+- Rust and Kubo both passed `1/1`.
+- Seed setup: Rust `delegated_router_provider_lookup`; Kubo
+  `swarm_connect_before_request`.
+- Kubo seed connect p50/p95/max: `54ms` / `54ms` / `54ms`.
+- Raw root TTFB: Rust `158ms`, Kubo `52ms`, ratio `3.04x`.
+- Setup-adjusted root TTFB: Rust `158ms`, Kubo `106ms`, ratio `1.49x`.
+- Max RSS/FD: Rust `39548KiB` / `13`; Kubo `88192KiB` / `36`.
+- Rust trace: `54` lines, block range batch fetch elapsed p50/p95/max
+  `50ms` / `83ms` / `83ms`.
+
+Decision:
+Keep. This is benchmark reporting only, and it makes seeded Rust-vs-Kubo range
+experiments more honest without changing gateway, retrieval, verification,
+caching, provider policy, or mobile resource behavior.

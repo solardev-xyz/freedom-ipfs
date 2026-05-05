@@ -272,8 +272,12 @@ cargo run -p mobile-web-harness -- \
 ```
 
 The comparison report embeds both engine reports and adds per-case ratios for
-root/asset TTFB plus RSS and storage size. Rust-only trace summaries still use
-`--trace-output`; Kubo runs do not produce Rust gateway phase traces.
+root/asset TTFB plus RSS and storage size. In seeded Bitswap comparisons it also
+prints and serializes Kubo root TTFB with the pre-request seed swarm-connect
+time folded back in, because Kubo connects to the seed before the request while
+Rust discovers the seed through delegated routing on the request path.
+Rust-only trace summaries still use `--trace-output`; Kubo runs do not produce
+Rust gateway phase traces.
 
 The default live corpus is `tools/mobile-web-harness/corpus/mobile-web.json`.
 It captures browser-facing checks such as status, MIME type, byte ranges,
