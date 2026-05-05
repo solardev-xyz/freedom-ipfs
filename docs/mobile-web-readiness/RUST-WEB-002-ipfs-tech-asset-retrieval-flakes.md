@@ -8091,3 +8091,65 @@ git diff --check
 Decision: keep. This is ABI-neutral because the existing Swift wrapper returns
 JSON, and it directly fills part of the mobile-facing progress API requirement
 for per-load counters without adding callbacks or unbounded state.
+
+## 2026-05-05 Keep: Gateway Request Elapsed Trace Summary
+
+Motivation:
+The latest warm `ipfs-tech-page-assets` comparison showed client-observed Rust
+root TTFB of `57ms` and `21ms` on the second and third measured runs, while the
+gateway trace showed the corresponding warm root handlers completing in `0ms`
+and `1ms`. That gap is outside UnixFS/retrieval work, so the harness needs a
+first-class way to compare client TTFB with gateway-internal request elapsed
+time before tuning the node.
+
+Implementation:
+
+- Add `gateway_request_elapsed_ms` to the parsed trace summary.
+- Populate it from `request_done elapsed_ms` values.
+- Print it with gateway status summaries in single-engine and Rust-vs-Kubo
+  trace output.
+- Include the field in JSON reports because `TraceSummary` is serialized.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_
+cargo test -p mobile-web-harness
+timeout 180s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --timeout-secs 90 \
+  --run-timeout-secs 90 \
+  --trace-output /tmp/vitalik-gateway-elapsed-trace.jsonl \
+  --comparison-output /tmp/vitalik-gateway-elapsed-comparison.json
+timeout 420s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/ipfs-tech-gateway-elapsed-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-gateway-elapsed-comparison.json
+```
+
+Live results:
+
+- `vitalik-root-html-range`: Rust and Kubo both passed `1/1`. Rust root TTFB
+  was `1981ms`, Kubo `1859ms`; Rust max RSS/FD was `38272KiB`/`22` versus Kubo
+  `182304KiB`/`92`. Gateway request elapsed summary was
+  `p50=1978ms p90=1978ms p95=1978ms max=1978ms`, confirming this cold sample
+  was real retrieval time, not local HTTP overhead.
+- `ipfs-tech-page-assets`: Rust and Kubo both passed `3/3`. Root TTFB p50/p95:
+  Rust `19/1134ms`, Kubo `3/1243ms`. Asset TTFB p50/p95: Rust `10/197ms`,
+  Kubo `5/242ms`. Rust max RSS/FD was `50824KiB`/`42`, Kubo
+  `114948KiB`/`43`.
+- The Rust trace reported gateway request elapsed
+  `p50=6ms p90=134ms p95=201ms max=1114ms`, delegated provider lookup
+  max `57ms`, and direct-body max elapsed `10ms`.
+
+Decision: keep. This is diagnostics-only and prevents future warm-path work
+from misattributing client-side/local HTTP timing to gateway, UnixFS, cache, or
+retrieval internals. The next speed experiments should focus on traces where
+`gateway_request_elapsed_ms` is high, not only where external TTFB is high.

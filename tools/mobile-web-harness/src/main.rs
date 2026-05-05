@@ -773,9 +773,10 @@ fn print_summary(report: &RunReport) {
         print_trace_delegated_provider_lookup(trace);
         if !trace.request_statuses.is_empty() || trace.gateway_limiter_denials > 0 {
             println!(
-                "  gateway responses: statuses={} limiter_denials={}",
+                "  gateway responses: statuses={} limiter_denials={} elapsed={}",
                 format_trace_counts(&trace.request_statuses),
-                trace.gateway_limiter_denials
+                trace.gateway_limiter_denials,
+                trace.gateway_request_elapsed_ms
             );
         }
         print_trace_unixfs_metadata_cache(trace);
@@ -1116,6 +1117,14 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_progress_phases(trace);
     print_trace_provider_retries(trace);
     print_trace_delegated_provider_lookup(trace);
+    if !trace.request_statuses.is_empty() || trace.gateway_limiter_denials > 0 {
+        println!(
+            "  gateway responses: statuses={} limiter_denials={} elapsed={}",
+            format_trace_counts(&trace.request_statuses),
+            trace.gateway_limiter_denials,
+            trace.gateway_request_elapsed_ms
+        );
+    }
     print_trace_timeout_recovery(trace);
     print_trace_gateway_direct_body(trace);
     print_trace_bitswap_peer_attempts(trace);
@@ -3630,6 +3639,7 @@ struct TraceSummary {
     delegated_provider_lookup_by_endpoint: Vec<TraceDelegatedProviderEndpointAggregate>,
     request_statuses: Vec<TraceValueCount>,
     gateway_limiter_denials: usize,
+    gateway_request_elapsed_ms: LatencySummary,
     gateway_direct_body: TraceGatewayDirectBodyAggregate,
     unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
     bitswap_source_peers: Vec<TraceValueCount>,
@@ -4198,6 +4208,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         BTreeMap::<String, TraceDelegatedProviderLookupAggregate>::new();
     let mut request_statuses = BTreeMap::<String, usize>::new();
     let mut gateway_limiter_denials = 0usize;
+    let mut gateway_request_elapsed_values = Vec::<u128>::new();
     let mut gateway_direct_body = TraceGatewayDirectBodyAggregate::default();
     let mut unixfs_metadata_cache = TraceUnixfsMetadataCacheAggregate::default();
     let mut bitswap_source_peers = BTreeMap::<String, usize>::new();
@@ -4364,6 +4375,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         if phase == "request_done" {
             if let Some(status) = json_detail_string(value.get("status")) {
                 *request_statuses.entry(status).or_default() += 1;
+            }
+            if let Some(elapsed_ms) = elapsed_ms {
+                gateway_request_elapsed_values.push(elapsed_ms);
             }
         }
         if phase == "gateway_limiter"
@@ -4976,6 +4990,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         ),
         request_statuses: sorted_trace_counts(request_statuses),
         gateway_limiter_denials,
+        gateway_request_elapsed_ms: LatencySummary::from_values(gateway_request_elapsed_values),
         gateway_direct_body,
         unixfs_metadata_cache,
         bitswap_source_peers: sorted_trace_counts(bitswap_source_peers),
@@ -5797,6 +5812,9 @@ mod tests {
         assert_eq!(summary.request_statuses[0].count, 2);
         assert_eq!(summary.request_statuses[1].value, "503");
         assert_eq!(summary.gateway_limiter_denials, 1);
+        assert_eq!(summary.gateway_request_elapsed_ms.count, 1);
+        assert_eq!(summary.gateway_request_elapsed_ms.p50_ms, Some(1));
+        assert_eq!(summary.gateway_request_elapsed_ms.p95_ms, Some(1));
         assert_eq!(summary.unixfs_metadata_cache.events, 1);
         assert_eq!(summary.unixfs_metadata_cache.hits, 3);
         assert_eq!(summary.unixfs_metadata_cache.misses, 2);
@@ -6152,6 +6170,9 @@ mod tests {
         assert_eq!(summary.slow_requests[1].request_id, "1");
         assert_eq!(summary.slow_requests[1].elapsed_ms, 11);
         assert_eq!(summary.slow_requests[1].cids[0].value, "cid-a");
+        assert_eq!(summary.gateway_request_elapsed_ms.count, 2);
+        assert_eq!(summary.gateway_request_elapsed_ms.p50_ms, Some(11));
+        assert_eq!(summary.gateway_request_elapsed_ms.p95_ms, Some(31));
     }
 
     #[test]

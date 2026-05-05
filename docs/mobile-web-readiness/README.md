@@ -162,6 +162,9 @@ JSONL inspection.
 Rust-vs-Kubo trace output also prints Bitswap source peer, source transport,
 delivery, and per-peer fetch summaries so provider-quality experiments can see
 which peers actually supplied blocks.
+Trace summaries include gateway request-handler elapsed p50/p90/p95/max from
+`request_done` events. Use this alongside client-observed TTFB to avoid chasing
+warm-path gaps that occur before the request reaches the gateway handler.
 Rejected Bitswap dials now drop their connection waiters when no dial for that
 peer actually started, preventing later requests from treating a locally
 rejected peer as still pending.
