@@ -554,9 +554,10 @@ fn progress_source(raw_phase: &str, fields: &ProgressFields) -> Option<String> {
         {
             Some("cache".into())
         }
-        "http_provider_fetch" | "http_provider_hedge" | "http_provider_race" => {
-            Some("http_provider".into())
-        }
+        "http_provider_fetch"
+        | "http_provider_hedge"
+        | "http_provider_race"
+        | "http_provider_race_result" => Some("http_provider".into()),
         "delegated_provider_lookup" | "delegated_provider_empty_retry" => {
             Some("delegated_routing".into())
         }
@@ -634,9 +635,10 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         | "bitswap_dns_prefetch"
         | "bitswap_dnsaddr_expand"
         | "bitswap_dns_multiaddr_expand" => "provider_lookup",
-        "http_provider_fetch" | "http_provider_hedge" | "http_provider_race" => {
-            "fetching_http_provider"
-        }
+        "http_provider_fetch"
+        | "http_provider_hedge"
+        | "http_provider_race"
+        | "http_provider_race_result" => "fetching_http_provider",
         "bitswap_fetch"
         | "bitswap_connection_established"
         | "bitswap_incoming_block"

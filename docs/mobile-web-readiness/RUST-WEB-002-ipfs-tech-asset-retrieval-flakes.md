@@ -15686,3 +15686,90 @@ large delegated lookup tail means this single run is noisy, but the evidence
 does not support spending more mobile resources by default. Revisit only with a
 selective policy, for example provider-specific race admission or a live signal
 that the first two candidates are likely slow.
+
+## 2026-05-05 Keep: Trace HTTP Provider Race Outcomes
+
+Question:
+After rejecting both in-memory HTTP-provider scoring and default race width `3`,
+the next selective-racing question needs better evidence. The existing harness
+could count race candidates, but it could not tell whether the winning HTTP
+provider was already inside the first two candidates, whether a hedge fired, or
+how many providers were actually attempted before the race completed.
+
+Implementation:
+
+- Emit `http_provider_race_result` after every HTTP-provider candidate race.
+- On success, include the winning provider URL, zero-based
+  `winner_provider_index`, one-based `winner_provider_rank`, whether the winner
+  was inside the initial race width, provider count, race width, attempted
+  provider count, failed provider count, hedge status, and elapsed time.
+- On failure, include provider count, race width, attempted provider count,
+  failed provider count, hedge status, and elapsed time.
+- Extend the harness `http_provider_races` summary with result counts,
+  winner-inside-initial-width counts, late-winner counts, max winner rank, max
+  attempted providers, and max race-result elapsed time.
+- Map the new raw phase to `fetching_http_provider` in both the harness
+  progress summary and the mobile progress snapshot so this remains a
+  diagnostic detail, not a new app-facing loading state.
+- Document the race-outcome summary in the mobile web readiness README.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_http_provider_fetches
+cargo test -p freedom-ipfs-retrieval http_provider
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+```
+
+Result:
+
+- Formatting passed.
+- Focused harness HTTP-provider summary test passed.
+- Focused retrieval HTTP-provider tests passed: `5 passed`.
+- Focused mobile progress phase mapping test passed.
+
+Live smoke:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-race-result-r1-trace.jsonl \
+  --output /tmp/ipfs-tech-http-race-result-r1.json
+```
+
+Live result:
+
+- Rust passed `1/1`.
+- Root TTFB/total: `1794ms` / `1795ms`.
+- Asset TTFB p50/p95/max: `345ms` / `994ms` / `1008ms`.
+- Run total: `4456ms`.
+- Max RSS/FD: `43896KiB` / `27`.
+- Delegated provider lookup max: `640ms`.
+- HTTP provider distribution: `zero=0`, `single=21`, `multi=14`,
+  `single_target_miss=21`, `single_first_http_max=639ms`.
+- HTTP-provider races: `35` events, `63` total providers,
+  `21` single-provider races, `14` multi-provider races, `14` races above the
+  race width, race width max `2`, provider count max `3`, `2` hedges,
+  `35` race results, `35` successes, `0` failures, `35` winners inside the
+  initial race width, `0` late winners, max winner rank `2`, max attempted
+  provider count `3`, max race-result elapsed `775ms`.
+- HTTP-provider fetch p50/p95/max: `166ms` / `671ms` / `775ms`.
+- Provider spread: `ipfs-bridge.sia.dev=21`, `dag.w3s.link=14`.
+- Block sources: `http_provider=40`.
+
+Decision:
+Keep. This is diagnostics-only and does not alter retrieval policy or mobile
+resource use. The first live run shows why the rejected width-3 result was not
+surprising: even though `14/35` races had more candidates than the current race
+width, every successful race was won by a candidate already inside the initial
+two slots. Future HTTP-provider race work should use this result summary as a
+gate: a wider or selective third-provider policy is only worth prototyping when
+live traces show nonzero late winners or repeated slow initial-width winners.

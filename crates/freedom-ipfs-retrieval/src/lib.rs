@@ -704,20 +704,29 @@ impl HttpRetriever {
             return Ok(None);
         }
 
+        let started = Instant::now();
+        let provider_count = bases.len();
         tracing::info!(
             phase = "http_provider_race",
             cid = %cid,
-            provider_count = bases.len(),
+            provider_count,
             race_width = HTTP_PROVIDER_RACE_WIDTH
         );
 
-        let mut next_bases = bases.into_iter();
+        let mut next_bases = bases.into_iter().enumerate();
         let mut pending = FuturesUnordered::new();
+        let mut attempted_provider_count = 0usize;
+        let mut failed_provider_count = 0usize;
         for _ in 0..HTTP_PROVIDER_RACE_WIDTH {
-            let Some(base) = next_bases.next() else {
+            let Some((provider_index, base)) = next_bases.next() else {
                 break;
             };
-            pending.push(self.fetch_from_http_provider_candidate(*cid, base));
+            attempted_provider_count += 1;
+            pending.push(self.fetch_from_http_provider_candidate_with_index(
+                *cid,
+                provider_index,
+                base,
+            ));
         }
 
         let hedge = tokio::time::sleep(HTTP_PROVIDER_HEDGE_AFTER);
@@ -734,11 +743,34 @@ impl HttpRetriever {
                         break;
                     };
                     completion_seen_before_hedge = true;
-                    match result {
-                        Ok(block) => return Ok(Some(block)),
+                    match result.result {
+                        Ok(block) => {
+                            tracing::info!(
+                                phase = "http_provider_race_result",
+                                cid = %cid,
+                                ok = true,
+                                provider = %result.base,
+                                winner_provider_index = result.provider_index,
+                                winner_provider_rank = result.provider_index + 1,
+                                winner_within_initial_width = (result.provider_index < HTTP_PROVIDER_RACE_WIDTH),
+                                provider_count,
+                                race_width = HTTP_PROVIDER_RACE_WIDTH,
+                                attempted_provider_count,
+                                failed_provider_count,
+                                hedge_fired,
+                                elapsed_ms = started.elapsed().as_millis()
+                            );
+                            return Ok(Some(block));
+                        }
                         Err(_) => {
-                            if let Some(base) = next_bases.next() {
-                                pending.push(self.fetch_from_http_provider_candidate(*cid, base));
+                            failed_provider_count += 1;
+                            if let Some((provider_index, base)) = next_bases.next() {
+                                attempted_provider_count += 1;
+                                pending.push(self.fetch_from_http_provider_candidate_with_index(
+                                    *cid,
+                                    provider_index,
+                                    base,
+                                ));
                             }
                         }
                     }
@@ -747,7 +779,7 @@ impl HttpRetriever {
                     && !completion_seen_before_hedge
                     && next_bases.len() > 0 => {
                     hedge_fired = true;
-                    if let Some(base) = next_bases.next() {
+                    if let Some((provider_index, base)) = next_bases.next() {
                         tracing::info!(
                             phase = "http_provider_hedge",
                             cid = %cid,
@@ -756,13 +788,45 @@ impl HttpRetriever {
                             pending_count = pending.len(),
                             remaining_provider_count = next_bases.len()
                         );
-                        pending.push(self.fetch_from_http_provider_candidate(*cid, base));
+                        attempted_provider_count += 1;
+                        pending.push(self.fetch_from_http_provider_candidate_with_index(
+                            *cid,
+                            provider_index,
+                            base,
+                        ));
                     }
                 }
             }
         }
 
+        tracing::info!(
+            phase = "http_provider_race_result",
+            cid = %cid,
+            ok = false,
+            provider_count,
+            race_width = HTTP_PROVIDER_RACE_WIDTH,
+            attempted_provider_count,
+            failed_provider_count,
+            hedge_fired,
+            elapsed_ms = started.elapsed().as_millis()
+        );
         Ok(None)
+    }
+
+    async fn fetch_from_http_provider_candidate_with_index(
+        &self,
+        cid: Cid,
+        provider_index: usize,
+        base: Url,
+    ) -> HttpProviderCandidateResult {
+        let result = self
+            .fetch_from_http_provider_candidate(cid, base.clone())
+            .await;
+        HttpProviderCandidateResult {
+            provider_index,
+            base,
+            result,
+        }
     }
 
     async fn fetch_from_http_provider_candidate(&self, cid: Cid, base: Url) -> Result<Block> {
@@ -1607,6 +1671,12 @@ struct HttpProviderResponseStats {
     headers_elapsed: Duration,
     first_chunk_elapsed: Option<Duration>,
     body_elapsed: Duration,
+}
+
+struct HttpProviderCandidateResult {
+    provider_index: usize,
+    base: Url,
+    result: Result<Block>,
 }
 
 struct BitswapPeerTarget {
