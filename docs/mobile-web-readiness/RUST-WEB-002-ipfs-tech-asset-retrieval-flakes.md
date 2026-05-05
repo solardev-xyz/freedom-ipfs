@@ -14524,3 +14524,163 @@ latency tradeoff when it does fire. Do not reintroduce this range-batch
 multi-want hook without first solving duplicate cache writes and proving a
 request shape where the multi-CID batch consistently wins before the existing
 single-CID child fetch path.
+
+## 2026-05-05 Keep: Stream Delegated Results After Three HTTP Providers
+
+Hypothesis:
+The streamed delegated routing path waited for four HTTP-provider records
+before returning partial results. The HTTP-provider fetcher currently races two
+providers and has a bounded hedge for one stalled candidate, so a target of
+three should preserve useful diversity while avoiding a fourth-provider tail.
+
+Change:
+
+- Lower `STREAMING_DELEGATED_HTTP_PROVIDER_TARGET` from `4` to `3`.
+- Keep all existing verification, HTTP-provider racing, Bitswap provider
+  diversity, low-diversity DHT fallback, and stale-peer behavior unchanged.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing streamed
+```
+
+Focused result:
+
+- Formatting passed.
+- Streamed routing tests passed: `2 passed`.
+
+Live `ipfs.tech` comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-target3-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-http-target3-r3.json
+```
+
+Live comparison result:
+
+- Rust and Kubo passed `3/3`.
+- Root TTFB p50/p95: Rust `1030ms` / `1841ms`, Kubo `2337ms` / `2346ms`.
+- Asset TTFB p50/p95: Rust `273ms` / `943ms`, Kubo `111ms` / `1786ms`.
+- Rust max RSS/FD: `49268KiB` / `31`; Kubo max RSS/FD:
+  `263476KiB` / `172`.
+- Delegated lookup events: `103` successes, `0` failures, `1761` providers,
+  `185` HTTP providers, max `966ms`.
+- Delegated response milestones: header/first-HTTP-provider max `966ms`;
+  target-met events `42`, target-met max `966ms`.
+- HTTP-provider fetch p50/p95/max: `161ms` / `642ms` / `730ms`.
+- HTTP providers used: `ipfs-bridge.sia.dev=54`, `dag.w3s.link=42`.
+- Bitswap work stayed low: peer attempt starts `19`, commands `15`, no
+  multi-CID batch activity.
+
+This directly addressed the previous live tail seen in
+`/tmp/ipfs-tech-bitswap-range-batch-r3.json`, where delegated lookup max was
+`6768ms`, asset p95 was `1312ms`, root p50 was `1349ms`, and RSS/FD were
+`52284KiB` / `35`.
+
+Second Rust-only `ipfs.tech` check:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-target3-r3b-trace.jsonl \
+  --output /tmp/ipfs-tech-http-target3-r3b.json
+```
+
+Second result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `891ms` / `1423ms` / `1423ms`.
+- Asset TTFB p50/p95/max: `275ms` / `720ms` / `1252ms`.
+- Run total p50/p95/max: `3025ms` / `3255ms` / `3255ms`.
+- Max RSS/FD: `45524KiB` / `28`.
+- Block sources were HTTP-provider-only: `http_provider=120`.
+- Delegated lookup events: `105` successes, `0` failures, `1842` providers,
+  `189` HTTP providers, max `85ms`.
+- Delegated milestones: header max `84ms`, first-HTTP-provider max `84ms`,
+  target-met max `84ms`.
+- HTTP-provider fetch p50/p95/max: `162ms` / `602ms` / `790ms`.
+- HTTP providers used: `ipfs-bridge.sia.dev=63`, `dag.w3s.link=42`.
+
+Guard, Vitalik range:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/vitalik-http-target3-guard-r3-trace.jsonl \
+  --output /tmp/vitalik-http-target3-guard-r3.json
+```
+
+Vitalik result:
+
+- Rust passed `3/3`.
+- Root/range TTFB p50/p95/max: `137ms` / `346ms` / `346ms`.
+- Max RSS/FD: `31488KiB` / `14`.
+- Block sources were HTTP-provider-only: `http_provider=6`.
+- Delegated lookup events: `6` successes, `0` failures, `121` providers,
+  `12` HTTP providers, max `259ms`.
+- Target-met events `3`, target-met max `15ms`.
+- HTTP-provider fetch p50/p95/max: `20ms` / `43ms` / `43ms` from
+  `https://trustless.filebase.io/`.
+
+Guard, daicowtf:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-http-target3-guard-r3-trace.jsonl \
+  --output /tmp/daicowtf-http-target3-guard-r3.json
+```
+
+Daicowtf result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1112ms` / `1365ms` / `1365ms`.
+- Max RSS/FD: `43432KiB` / `20`.
+- Block sources were Bitswap-only: `bitswap=9`.
+- Delegated lookup events: `9` successes, `0` failures, `12` providers,
+  `0` HTTP providers, max `44ms`.
+- Target-met events `0`, as expected for this sparse non-HTTP-provider case.
+- Low-diversity DHT fallback timed out in `3` cases without affecting success.
+- Bitswap source transports included `wss=3`, `tcp=2`, and `quic=1`.
+
+Decision:
+Keep. This is a small mobile-friendly latency tune that specifically reduces
+the streamed delegated routing tail for HTTP-provider-heavy page loads while
+preserving the HTTP-provider race plus hedge width. The two `ipfs.tech` samples
+showed lower delegated milestone tails and lower resource use than the
+immediate previous target-four run, and the Vitalik and daicowtf guards did not
+show regressions in fast HTTP range or sparse Bitswap-only workloads.
