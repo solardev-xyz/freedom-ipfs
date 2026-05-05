@@ -13930,3 +13930,72 @@ Keep. This is diagnostic-only and confirms that in this window the largest
 HTTP-provider tails were mostly header wait on `ipfs-bridge.sia.dev`, not body
 transfer or block-store time. Future HTTP-provider quality work should account
 for provider/header latency, not only bytes or block size.
+
+## 2026-05-05 Keep: Summarize HTTP Provider Milestones By Provider
+
+Problem:
+The HTTP-provider response milestone summary exposed aggregate header/body
+latency, but did not break those timings down by provider. That is not enough
+for provider-quality experiments because the next behavior change needs to know
+which provider is contributing header wait and whether later runs shift work
+away from it.
+
+Implementation:
+
+- Extend the harness HTTP-provider summary with `provider_milestones`.
+- For each provider, aggregate:
+  - events, successes, failures
+  - bytes and response bytes
+  - first-chunk event count
+  - total and max elapsed time
+  - max response header, first-chunk, and body elapsed times
+- Sort provider milestones by worst header latency, then max elapsed time.
+- Print the top provider milestone rows under `http provider fetches`.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_http_provider_fetches
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+```
+
+Result:
+
+- Formatting check passed.
+- Focused HTTP-provider summary test passed.
+- Full harness suite passed: `32 passed; 0 failed`.
+- Workspace check passed.
+
+Live smoke:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-provider-by-provider-r1-trace.jsonl \
+  --output /tmp/ipfs-tech-http-provider-by-provider-r1.json
+```
+
+Live result:
+
+- Rust passed `1/1`.
+- Root TTFB was `1268ms`.
+- Asset TTFB p50/p95/max was `134ms` / `291ms` / `344ms`.
+- Rust max RSS/FD was `50844KiB` / `26`.
+- HTTP provider fetches: `1` event, `1` success, `1362` bytes, total `671ms`.
+- Provider milestone row:
+  - `https://ipfs-bridge.sia.dev/`: events `1`, successes `1`, bytes `1362`,
+    elapsed max `671ms`, header max `669ms`, first chunk max `670ms`, body max
+    `670ms`.
+
+Decision:
+Keep. This is harness-only and makes the provider/header-latency signal visible
+without changing gateway or retrieval behavior.
