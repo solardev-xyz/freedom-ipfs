@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -18,6 +19,11 @@ const DEFAULT_KUBO_BIN: &str = "target/tools/kubo/kubo/ipfs";
 const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 const DEFAULT_ASSET_CONCURRENCY: usize = 6;
 const MAX_TRACE_SLOW_EVENTS: usize = 16;
+const X_FREEDOM_REQUEST_ID: &str = "X-Freedom-Request-ID";
+const X_FREEDOM_PARENT_REQUEST_ID: &str = "X-Freedom-Parent-Request-ID";
+const X_FREEDOM_TOP_LEVEL_PATH: &str = "X-Freedom-Top-Level-Path";
+
+static NEXT_HARNESS_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -560,7 +566,16 @@ async fn run_case(
 ) -> CaseResult {
     let url = format!("{}{}", gateway_url.trim_end_matches('/'), entry.path);
     let method = entry.method.as_deref().unwrap_or("GET");
-    let response = match fetch_response(client, &url, method, entry.range.as_deref()).await {
+    let correlation = RequestCorrelation::root(entry.path.clone());
+    let response = match fetch_response(
+        client,
+        &url,
+        method,
+        entry.range.as_deref(),
+        Some(&correlation),
+    )
+    .await
+    {
         Ok(response) => response,
         Err(err) => {
             return CaseResult::failed(entry, url, vec![format!("request error: {err}")]);
@@ -633,6 +648,7 @@ async fn run_case(
         entry.range.as_deref(),
         &response,
         conditional_revalidate,
+        Some(&correlation),
     )
     .await;
     if let Some(revalidation) = &revalidation {
@@ -656,6 +672,7 @@ async fn run_case(
             crawl,
             asset_concurrency,
             conditional_revalidate,
+            &correlation,
         )
         .await;
         failures.extend(crawl_failures);
@@ -1595,11 +1612,59 @@ fn print_revalidation_result(prefix: &str, result: &RevalidationResult) {
     );
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RequestCorrelation {
+    request_id: u64,
+    parent_id: Option<u64>,
+    top_level_path: String,
+}
+
+impl RequestCorrelation {
+    fn root(top_level_path: String) -> Self {
+        Self {
+            request_id: next_harness_request_id(),
+            parent_id: None,
+            top_level_path,
+        }
+    }
+
+    fn child(&self) -> Self {
+        Self {
+            request_id: next_harness_request_id(),
+            parent_id: Some(self.request_id),
+            top_level_path: self.top_level_path.clone(),
+        }
+    }
+}
+
+fn next_harness_request_id() -> u64 {
+    NEXT_HARNESS_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn apply_correlation_headers(
+    mut request: reqwest::RequestBuilder,
+    correlation: Option<&RequestCorrelation>,
+) -> reqwest::RequestBuilder {
+    if let Some(correlation) = correlation {
+        request = request
+            .header(X_FREEDOM_REQUEST_ID, correlation.request_id.to_string())
+            .header(
+                X_FREEDOM_TOP_LEVEL_PATH,
+                correlation.top_level_path.as_str(),
+            );
+        if let Some(parent_id) = correlation.parent_id {
+            request = request.header(X_FREEDOM_PARENT_REQUEST_ID, parent_id.to_string());
+        }
+    }
+    request
+}
+
 async fn fetch_response(
     client: &reqwest::Client,
     url: &str,
     method: &str,
     range: Option<&str>,
+    correlation: Option<&RequestCorrelation>,
 ) -> std::result::Result<FetchResponse, String> {
     let started = Instant::now();
     let response = match method {
@@ -1608,9 +1673,14 @@ async fn fetch_response(
             if let Some(range) = range {
                 request = request.header(RANGE, range);
             }
+            let request = apply_correlation_headers(request, correlation);
             request.send().await
         }
-        "HEAD" => client.head(url).send().await,
+        "HEAD" => {
+            apply_correlation_headers(client.head(url), correlation)
+                .send()
+                .await
+        }
         other => {
             return Err(format!(
                 "unsupported method {other}; only GET and HEAD are supported"
@@ -1667,6 +1737,7 @@ async fn maybe_revalidate_response(
     range: Option<&str>,
     response: &FetchResponse,
     conditional_revalidate: bool,
+    correlation: Option<&RequestCorrelation>,
 ) -> Option<RevalidationResult> {
     if !conditional_revalidate
         || method != "GET"
@@ -1687,12 +1758,19 @@ async fn maybe_revalidate_response(
             failures: vec!["response omitted ETag".to_string()],
         });
     };
-    Some(fetch_revalidation(client, url, etag).await)
+    let revalidation_correlation = correlation.map(RequestCorrelation::child);
+    Some(fetch_revalidation(client, url, etag, revalidation_correlation.as_ref()).await)
 }
 
-async fn fetch_revalidation(client: &reqwest::Client, url: &str, etag: &str) -> RevalidationResult {
+async fn fetch_revalidation(
+    client: &reqwest::Client,
+    url: &str,
+    etag: &str,
+    correlation: Option<&RequestCorrelation>,
+) -> RevalidationResult {
     let started = Instant::now();
-    let response = match client.get(url).header(IF_NONE_MATCH, etag).send().await {
+    let request = client.get(url).header(IF_NONE_MATCH, etag);
+    let response = match apply_correlation_headers(request, correlation).send().await {
         Ok(response) => response,
         Err(err) => {
             return RevalidationResult {
@@ -1766,6 +1844,7 @@ async fn run_page_crawl(
     config: &CrawlConfig,
     asset_concurrency: usize,
     conditional_revalidate: bool,
+    root_correlation: &RequestCorrelation,
 ) -> (AssetSummary, Vec<AssetResult>, Vec<String>) {
     let max_assets = config.max_assets.unwrap_or(32);
     let same_origin_only = config.same_origin_only.unwrap_or(true);
@@ -1791,6 +1870,7 @@ async fn run_page_crawl(
         asset_concurrency,
         config.asset_max_bytes.unwrap_or(2_000_000),
         conditional_revalidate,
+        root_correlation,
     )
     .await;
 
@@ -1809,6 +1889,7 @@ async fn run_page_crawl(
                 asset_concurrency,
                 config.asset_max_bytes.unwrap_or(2_000_000),
                 conditional_revalidate,
+                root_correlation,
             )
             .await;
             fetched.append(&mut css_fetched);
@@ -1856,15 +1937,24 @@ async fn fetch_assets(
     concurrency: usize,
     max_bytes: usize,
     conditional_revalidate: bool,
+    root_correlation: &RequestCorrelation,
 ) -> Vec<FetchedAsset> {
     let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut tasks = JoinSet::new();
     for asset in assets {
         let client = client.clone();
         let semaphore = semaphore.clone();
+        let correlation = root_correlation.child();
         tasks.spawn(async move {
             let _permit = semaphore.acquire_owned().await.ok();
-            fetch_asset(&client, asset, max_bytes, conditional_revalidate).await
+            fetch_asset(
+                &client,
+                asset,
+                max_bytes,
+                conditional_revalidate,
+                correlation,
+            )
+            .await
         });
     }
 
@@ -1882,10 +1972,11 @@ async fn fetch_asset(
     asset: DiscoveredAsset,
     max_bytes: usize,
     conditional_revalidate: bool,
+    correlation: RequestCorrelation,
 ) -> FetchedAsset {
     let range = range_for_kind(asset.kind);
     let started_url = asset.url.to_string();
-    let response = fetch_response(client, &started_url, "GET", range).await;
+    let response = fetch_response(client, &started_url, "GET", range, Some(&correlation)).await;
     let mut failures = Vec::new();
     let mut result = AssetResult {
         kind: asset.kind,
@@ -1960,6 +2051,7 @@ async fn fetch_asset(
         range,
         &response,
         conditional_revalidate,
+        Some(&correlation),
     )
     .await;
     if let Some(revalidation) = &result.revalidation {
@@ -5727,6 +5819,48 @@ mod tests {
     }
 
     #[test]
+    fn request_correlation_headers_include_parent_and_top_level_path() {
+        let root = RequestCorrelation::root("/ipns/site/".to_string());
+        let child = root.child();
+        let request = apply_correlation_headers(
+            reqwest::Client::new().get("http://127.0.0.1/"),
+            Some(&child),
+        )
+        .build()
+        .unwrap();
+
+        assert_ne!(child.request_id, root.request_id);
+        assert_eq!(child.parent_id, Some(root.request_id));
+        assert_eq!(
+            request
+                .headers()
+                .get(X_FREEDOM_REQUEST_ID)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            child.request_id.to_string()
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(X_FREEDOM_PARENT_REQUEST_ID)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            root.request_id.to_string()
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(X_FREEDOM_TOP_LEVEL_PATH)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "/ipns/site/"
+        );
+    }
+
+    #[test]
     fn parses_linux_proc_stat_parent_pid() {
         assert_eq!(
             parse_proc_stat_ppid("12345 (freedom-ipfs) S 42 1 1 0 -1 4194560"),
@@ -6618,6 +6752,7 @@ mod tests {
             None,
             &response,
             true,
+            None,
         )
         .await
         .expect("eligible GET should produce a revalidation result");

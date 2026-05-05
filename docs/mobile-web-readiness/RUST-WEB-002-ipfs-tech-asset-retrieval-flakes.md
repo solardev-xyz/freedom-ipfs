@@ -8279,3 +8279,96 @@ git diff --check
 Decision: keep. This is harness-only and prevents stale-binary measurements
 without changing the gateway, retrieval behavior, mobile ABI, or runtime
 resource profile.
+
+## 2026-05-05 Keep: Harness Progress Correlation Headers
+
+Motivation:
+The mobile progress API can already consume gateway request correlation headers,
+but the live harness was not sending them. That meant page-crawl traces and
+mobile-style progress snapshots could show individual gateway requests without
+consistently tying subresources and conditional revalidations back to the
+top-level page load. Long-running mobile-web runs need that grouping before
+working on page-level latency, progress wording, or per-navigation diagnostics.
+
+Implementation:
+
+- Add harness-generated `X-Freedom-Request-ID`,
+  `X-Freedom-Parent-Request-ID`, and `X-Freedom-Top-Level-Path` headers.
+- Give each root case request a stable root correlation ID and top-level path.
+- Give crawled assets child request IDs with the root request as parent, and
+  give conditional revalidations child request IDs under the request they
+  revalidate.
+- Keep correlation optional inside lower-level request helpers so existing
+  tests and direct helper uses can remain uncorrelated.
+- Add a focused unit test for the generated request headers.
+- Document the behavior in `docs/mobile-web-readiness/README.md`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness request_correlation_headers_include_parent_and_top_level_path
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+timeout 240s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --trace-output /tmp/ipfs-tech-correlation-headers-trace.jsonl \
+  --output /tmp/ipfs-tech-correlation-headers.json
+git diff --check
+```
+
+Live result:
+
+- `ipfs-tech-page-assets` passed `1/1`.
+- Root TTFB was `2195ms`.
+- Asset TTFB p50/p90/p95/max was `94/1477/1790/6607ms`.
+- The slowest asset tail was a network/routing tail in this sample; delegated
+  provider lookup reached `5557ms` for
+  `/ipns/ipfs.tech/_nuxt/Grid.CfsFuo-l.css`.
+- The trace contained `33` `request_start` events. All `33` had
+  `span.progress_request_id`, and `32` had `span.parent_request_id`, matching
+  one root request plus asset/revalidation child requests.
+
+Trace verification:
+
+```sh
+python3 - <<'PY'
+import json
+from pathlib import Path
+seen = []
+for line in Path('/tmp/ipfs-tech-correlation-headers-trace.jsonl').read_text().splitlines():
+    event = json.loads(line)
+    if event.get('phase') == 'request_start':
+        span = event.get('span') or {}
+        seen.append({
+            'request_id': event.get('request_id'),
+            'path': event.get('path'),
+            'span_progress_request_id': span.get('progress_request_id'),
+            'span_parent_request_id': span.get('parent_request_id'),
+            'span_top_level_path': span.get('top_level_path'),
+        })
+for row in seen[:8]:
+    print(row)
+print('count', len(seen), 'with_progress', sum(1 for row in seen if row['span_progress_request_id']))
+print('with_parent', sum(1 for row in seen if row['span_parent_request_id']))
+PY
+```
+
+Sample output:
+
+```text
+{'request_id': 1, 'path': '/ipns/ipfs.tech/', 'span_progress_request_id': 1, 'span_parent_request_id': 0, 'span_top_level_path': '/ipns/ipfs.tech/'}
+{'request_id': 2, 'path': '/ipns/ipfs.tech/_nuxt/index.CZYCeseQ.css', 'span_progress_request_id': 5, 'span_parent_request_id': 1, 'span_top_level_path': '/ipns/ipfs.tech/'}
+{'request_id': 3, 'path': '/ipns/ipfs.tech/_nuxt/CBJE44gf.js', 'span_progress_request_id': 13, 'span_parent_request_id': 1, 'span_top_level_path': '/ipns/ipfs.tech/'}
+count 33 with_progress 33
+with_parent 32
+```
+
+Decision: keep. This is harness-only, ABI-neutral, and improves the evidence
+quality of future mobile progress and page-level latency experiments without
+changing gateway retrieval semantics, cache behavior, or resource limits.

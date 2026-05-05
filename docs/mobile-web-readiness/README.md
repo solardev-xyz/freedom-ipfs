@@ -182,6 +182,13 @@ The `slow_cids` list groups elapsed trace events by CID with phase and path
 counts, which helps separate a slow root from a slow child block. Successful
 Bitswap source peers are also summarized with count, total/max latency, and
 bytes for session/provider-quality analysis.
+Harness requests also attach the mobile progress correlation headers documented
+in `docs/mobile-progress-api.md`. The root request gets a stable
+`X-Freedom-Request-ID` and `X-Freedom-Top-Level-Path`; crawled assets and
+conditional revalidations get their own request IDs plus
+`X-Freedom-Parent-Request-ID`. This lets trace output and mobile progress
+snapshots group subresource work under the top-level page load without changing
+gateway retrieval behavior.
 
 The harness can also spawn Kubo as a comparison engine when a Kubo `ipfs`
 binary is available:
