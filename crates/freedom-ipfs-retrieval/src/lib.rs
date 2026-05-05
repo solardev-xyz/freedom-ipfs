@@ -57,7 +57,7 @@ const BITSWAP_SUCCESSFUL_PEER_TTL: Duration = Duration::from_secs(10 * 60);
 const BITSWAP_CONNECTION_ERROR_BACKOFF_TTL: Duration = Duration::from_secs(30);
 const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD: usize = 2;
 const BITSWAP_SESSION_SHORTCUT_GRACE: Duration = Duration::from_millis(0);
-const BITSWAP_SESSION_PRE_LOOKUP_GRACE: Duration = Duration::from_millis(50);
+const BITSWAP_SESSION_PRE_LOOKUP_GRACE: Duration = Duration::from_millis(75);
 const BITSWAP_SESSION_POST_LOOKUP_GRACE: Duration = Duration::from_millis(100);
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
 // The per-peer read path has its own 10s timeout. This caps broader shared

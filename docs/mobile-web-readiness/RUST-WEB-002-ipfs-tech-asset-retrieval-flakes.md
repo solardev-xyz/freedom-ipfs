@@ -10572,3 +10572,161 @@ Decision: keep. The change is narrow and bounded by an existing `2s` cap only
 when a recent session peer exists and routing returns an empty provider set. It
 does not alter the non-empty provider path or the read-only trust model, and it
 adds diagnostics/progress mapping for the new wait state.
+
+## 2026-05-05 Keep: Tune Session Peer Head Start To 75ms
+
+Hypothesis:
+The `50ms` recent-session pre-lookup grace avoids some delegated provider
+lookups, but real `ipfs.tech` traces still show many session shortcuts winning
+after the provider lookup has already started. A slightly longer grace may let
+more known-good peers win before routing work begins while staying short enough
+not to punish misses.
+
+Implementation:
+
+- Increase `BITSWAP_SESSION_PRE_LOOKUP_GRACE` from `50ms` to `75ms`.
+- Leave the existing `100ms` post-lookup grace and the `2s` session shortcut cap
+  unchanged.
+- No new provider fanout, no gateway fallback, and no change to block
+  verification or caching trust.
+
+Baseline/current `50ms` run:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-session-grace50-page-assets-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-session-grace50-page-assets-r3.json
+```
+
+Result:
+
+- Passed `3/3`.
+- Cold run total/root max: `2423ms` / `856ms`.
+- Asset TTFB p50/p90/p95/max: `4/368/468/710ms`.
+- Delegated provider lookups: `21`.
+- Bitswap fetches: `8`; session shortcuts `26/26`; post-lookup waits `8`.
+- RSS/FD max: `54816KiB` / `43`.
+
+Rejected `100ms` run:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-session-grace100-page-assets-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-session-grace100-page-assets-r3.json
+```
+
+Result:
+
+- Passed `3/3`, but cold run total/root max worsened to `3182ms` / `1357ms`.
+- Asset TTFB p95/max worsened to `633/1096ms`.
+- Delegated provider lookups dropped to `10`, but the latency cost was not worth
+  keeping.
+
+Middle-point `75ms` runs:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-session-grace75-page-assets-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-session-grace75-page-assets-r3.json
+
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-session-grace75b-page-assets-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-session-grace75b-page-assets-r3.json
+```
+
+Results:
+
+- First `75ms` run passed `3/3`; cold total/root max `2026ms` / `825ms`;
+  asset TTFB p95/max `617/776ms`; Bitswap fetches `4`; peer attempts `91`;
+  RSS/FD max `48612KiB` / `37`.
+- Second `75ms` run passed `3/3`; cold total/root max `1738ms` / `538ms`;
+  asset TTFB p95/max `532/605ms`; Bitswap fetches `5`; peer attempts `97`;
+  RSS/FD max `48740KiB` / `36`.
+- A same-window return-to-`50ms` control passed `3/3` but had cold total/root max
+  `2292ms` / `847ms`, asset TTFB p95/max `724/1432ms`, Bitswap fetches `8`, and
+  peer attempts `122`
+  (`/tmp/ipfs-tech-session-grace50b-page-assets-r3.json`).
+
+Kubo comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-session-grace75-kubo-page-assets-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-session-grace75-kubo-page-assets-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `2/2326ms`, Kubo `2/2500ms`.
+- Asset TTFB p50/p95: Rust `5/354ms`, Kubo `4/861ms`.
+- Rust RSS/FD max: `50076KiB` / `42`; Kubo RSS/FD max:
+  `122108KiB` / `64`.
+- The Rust root p95 still had a cold Bitswap outlier, but the asset path was
+  materially better than Kubo in this window.
+
+Range regression check:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/vitalik-session-grace75-range-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/vitalik-session-grace75-range-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root/range TTFB p50/p95: Rust `4/373ms`, Kubo `4/1967ms`.
+- Rust RSS/FD max: `37504KiB` / `18`; Kubo RSS/FD max:
+  `127248KiB` / `72`.
+
+Decision: keep the `75ms` grace. The `100ms` variant bought fewer provider
+lookups at too much latency cost. The `75ms` variant repeatedly reduced Bitswap
+fetches, peer attempts, FD/RSS pressure, and cold page tail versus nearby `50ms`
+controls while preserving the same bounded fallback behavior.
