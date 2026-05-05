@@ -14135,3 +14135,74 @@ Compared with recent no-hedge windows, HTTP-provider p95/max improved
 first sample's asset p95 regression was caused by delegated routing outliers,
 not HTTP provider response time, and points to delegated routing tail work as a
 better next experiment.
+
+## 2026-05-05 Reject: Return Streamed Delegated Results On Bitswap Diversity
+
+Hypothesis:
+Some slow delegated-routing outliers appear to wait for late HTTP provider
+records even after the streamed NDJSON response has already yielded Bitswap
+providers. Returning once a single delegated endpoint has enough Bitswap
+provider diversity might avoid multi-second delegated lookup tails and let
+retrieval begin sooner.
+
+Experiment:
+
+- Add a streamed delegated-response early return when non-HTTP provider records
+  reached `MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY`.
+- Keep the existing HTTP-provider early return target at
+  `STREAMING_DELEGATED_HTTP_PROVIDER_TARGET`.
+- Add a deterministic test with two fast Bitswap-only provider records followed
+  by a delayed HTTP-provider tail.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing streamed
+```
+
+Result:
+
+- First implementation failed existing streamed HTTP-provider tests because
+  HTTP-provider records also carry IDs/addrs and were counted as Bitswap
+  diversity.
+- Tightened implementation counted only provider records with no HTTP URLs.
+- Focused streamed routing tests then passed: `3 passed; 0 failed`.
+
+Live comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-streamed-bitswap-target-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-streamed-bitswap-target-r3.json
+```
+
+Live result:
+
+- Rust passed `2/3`; Kubo passed `3/3`.
+- Rust produced one `502` for the root `/ipns/ipfs.tech/` request.
+- Root TTFB p50/p95 on successful Rust runs was `1050ms` / `1276ms`.
+- Asset TTFB p50/p95 on successful Rust runs was `165ms` / `444ms`.
+- Delegated provider lookup max dropped to `377ms`.
+- HTTP provider fetches collapsed to `7` events total, while Bitswap work rose
+  sharply: `76` Bitswap peer-attempt starts and `66` shortcut starts.
+- The failed root request had `bitswap_provider_candidates_empty` and no
+  successful HTTP-provider path.
+
+Decision:
+Reject and revert. The idea did reduce delegated lookup latency, but it starved
+the HTTP-provider path and made reliability worse. A safer future version would
+need to preserve early HTTP-provider availability, for example by returning a
+partial provider set only when it contains both enough Bitswap diversity and at
+least one usable HTTP provider, or by racing Bitswap startup with continued
+delegated stream consumption instead of dropping the stream tail.
