@@ -26,6 +26,8 @@ The returned string is owned by Rust and must be released with
       "phase": "fetching_bitswap",
       "status": "active",
       "elapsed_ms": 812,
+      "blocks_loaded": 2,
+      "retry_count": 1,
       "last_error_code": null,
       "last_error_message": null,
       "last_event_id": 18,
@@ -50,6 +52,8 @@ The returned string is owned by Rust and must be released with
       "bytes_loaded": 38394,
       "providers_found": null,
       "candidate_peers": 10,
+      "blocks_loaded": 2,
+      "retry_count": 1,
       "elapsed_ms": 812,
       "last_error_code": null,
       "last_error_message": null,
@@ -64,6 +68,10 @@ bounded event array length, not a lifetime total. `active_count` mirrors the
 number of currently active targets. `active` contains currently active targets
 only; completed, failed, and cancelled targets remain visible in recent
 `events`.
+
+`blocks_loaded` and `retry_count` are per-target counters. They accumulate while
+the target is active, and the final completed/failed/cancelled event carries
+the last values even though the target is removed from `active`.
 
 For gateway requests, Swift may pass optional correlation headers:
 

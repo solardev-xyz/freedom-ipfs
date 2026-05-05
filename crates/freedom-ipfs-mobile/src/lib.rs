@@ -146,6 +146,8 @@ struct ProgressEvent {
     bytes_loaded: Option<u64>,
     providers_found: Option<u64>,
     candidate_peers: Option<u64>,
+    blocks_loaded: u64,
+    retry_count: u64,
     elapsed_ms: Option<u64>,
     last_error_code: Option<String>,
     last_error_message: Option<String>,
@@ -164,6 +166,8 @@ struct ProgressTarget {
     phase: String,
     status: String,
     elapsed_ms: Option<u64>,
+    blocks_loaded: u64,
+    retry_count: u64,
     last_error_code: Option<String>,
     last_error_message: Option<String>,
     last_event_id: u64,
@@ -217,6 +221,15 @@ impl ProgressRecorder {
             Err(_) => return,
         };
         inner.next_event_id = inner.next_event_id.saturating_add(1);
+        let target_key = format!("{kind}:{target_id}");
+        let (previous_blocks_loaded, previous_retry_count) = inner
+            .active_targets
+            .get(&target_key)
+            .map(|target| (target.blocks_loaded, target.retry_count))
+            .unwrap_or_default();
+        let blocks_loaded =
+            previous_blocks_loaded.saturating_add(u64::from(raw_phase == "block_fetch_total"));
+        let retry_count = previous_retry_count.saturating_add(u64::from(phase == "retrying"));
         let event = ProgressEvent {
             event_id: inner.next_event_id,
             target_id,
@@ -238,6 +251,8 @@ impl ProgressRecorder {
             candidate_peers: fields
                 .get_u64("peer_count")
                 .or_else(|| fields.get_u64("candidate_peer_count")),
+            blocks_loaded,
+            retry_count,
             elapsed_ms,
             last_error_code: last_error_code.clone(),
             last_error_message: last_error_message.clone(),
@@ -248,7 +263,6 @@ impl ProgressRecorder {
             inner.events.pop_front();
         }
 
-        let target_key = format!("{kind}:{target_id}");
         if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
             inner.active_targets.remove(&target_key);
         } else if target_id != 0 {
@@ -265,6 +279,8 @@ impl ProgressRecorder {
                     phase,
                     status,
                     elapsed_ms,
+                    blocks_loaded,
+                    retry_count,
                     last_error_code,
                     last_error_message,
                     last_event_id: event.event_id,
@@ -1933,7 +1949,9 @@ mod tests {
             assert!(
                 events.iter().any(|event| event["path"] == path
                     && event["phase"] == "completed"
-                    && event["status"] == "completed"),
+                    && event["status"] == "completed"
+                    && event["blocks_loaded"] == 0
+                    && event["retry_count"] == 0),
                 "{snapshot}"
             );
             assert!(
@@ -1946,6 +1964,60 @@ mod tests {
             assert!(freedom_ipfs_node_stop_gateway(node));
             freedom_ipfs_node_free(node);
         }
+    }
+
+    #[test]
+    fn progress_snapshot_accumulates_target_counters() {
+        let recorder = ProgressRecorder::default();
+        let span = ProgressSpanFields {
+            request_id: Some(1),
+            ..ProgressSpanFields::default()
+        };
+
+        recorder.record_event(
+            span.clone(),
+            progress_fields([("phase", "request_start"), ("request_id", "1")]),
+            "test",
+        );
+        recorder.record_event(
+            span.clone(),
+            progress_fields([
+                ("phase", "bitswap_connection_error"),
+                ("request_id", "1"),
+                ("error", "timeout"),
+            ]),
+            "test",
+        );
+        recorder.record_event(
+            span.clone(),
+            progress_fields([
+                ("phase", "block_fetch_total"),
+                ("request_id", "1"),
+                ("source", "bitswap"),
+            ]),
+            "test",
+        );
+        recorder.record_event(
+            span,
+            progress_fields([
+                ("phase", "request_done"),
+                ("request_id", "1"),
+                ("status", "200"),
+            ]),
+            "test",
+        );
+
+        let snapshot = recorder.snapshot_json();
+        let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(value["active_count"].as_u64().unwrap(), 0);
+        let completed = value["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["phase"] == "completed")
+            .unwrap();
+        assert_eq!(completed["blocks_loaded"].as_u64().unwrap(), 1);
+        assert_eq!(completed["retry_count"].as_u64().unwrap(), 1);
     }
 
     #[test]

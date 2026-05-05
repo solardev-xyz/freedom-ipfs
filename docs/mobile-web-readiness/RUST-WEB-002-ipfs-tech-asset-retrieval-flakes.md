@@ -8054,3 +8054,35 @@ regression. Kubo failed every run and used substantially more resources. Keep
 `daicowtf-page-assets` as an opt-in provider-quality target. The likely future
 work is better provider diversity/fallback for sparse roots, not gateway or
 UnixFS serving changes.
+
+## 2026-05-05 Keep: Mobile Progress Target Counters
+
+Motivation:
+The mobile progress snapshot already exposes bounded JSON events and active
+targets, but per-load counters were mostly event-local. Swift needs cheap
+per-target counters to say whether a load is making progress or only retrying.
+
+Implementation:
+
+- Add `blocks_loaded` and `retry_count` to progress events.
+- Add the same fields to active progress targets.
+- Accumulate `blocks_loaded` when a target sees `block_fetch_total`.
+- Accumulate `retry_count` when a target maps to the stable `retrying` phase.
+- Preserve the final counter values on completed, failed, and cancelled events
+  after the target is removed from `active`.
+- Update `docs/mobile-progress-api.md`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-mobile progress_snapshot_records_gateway_request_phases
+cargo test -p freedom-ipfs-mobile progress_snapshot_accumulates_target_counters
+cargo test -p freedom-ipfs-mobile
+cargo check --workspace --all-targets
+git diff --check
+```
+
+Decision: keep. This is ABI-neutral because the existing Swift wrapper returns
+JSON, and it directly fills part of the mobile-facing progress API requirement
+for per-load counters without adding callbacks or unbounded state.
