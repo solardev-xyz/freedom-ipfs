@@ -1653,8 +1653,11 @@ fn stop_gateway(node: &FreedomIpfsNode) {
 
 fn stop_preloads(node: &FreedomIpfsNode) {
     if let Ok(mut tasks) = node.preload_tasks.lock() {
-        for (_, task) in tasks.drain() {
-            task.abort();
+        for (task_id, task) in tasks.drain() {
+            if !task.is_finished() {
+                task.abort();
+                tracing::info!(phase = "preload_cancelled", preload_id = task_id);
+            }
         }
     }
 }
@@ -2876,6 +2879,50 @@ mod tests {
             assert!(freedom_ipfs_node_handle_low_memory(node, 20));
             assert!(freedom_ipfs_node_total_bytes(node) <= 20);
             assert_eq!(freedom_ipfs_node_block_count(node), 1);
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
+    fn lifecycle_preload_cancellation_clears_progress_target() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+            assert!(freedom_ipfs_node_clear_progress(node));
+
+            let preload_id = 77;
+            tracing::info!(
+                phase = "preload_start",
+                preload_id,
+                path = "/ipfs/bafyprogress"
+            );
+            let task = (*node).runtime.spawn(async {
+                std::future::pending::<()>().await;
+            });
+            (*node)
+                .preload_tasks
+                .lock()
+                .unwrap()
+                .insert(preload_id, task);
+
+            let snapshot = progress_snapshot_json(node);
+            let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+            assert_eq!(value["active_count"].as_u64().unwrap(), 1, "{snapshot}");
+
+            assert!(freedom_ipfs_node_enter_background(node));
+
+            let snapshot = progress_snapshot_json(node);
+            let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+            let events = value["events"].as_array().unwrap();
+            assert_eq!(value["active_count"].as_u64().unwrap(), 0, "{snapshot}");
+            assert!(
+                events.iter().any(|event| event["kind"] == "preload"
+                    && event["target_id"] == preload_id
+                    && event["phase"] == "cancelled"
+                    && event["status"] == "cancelled"),
+                "{snapshot}"
+            );
 
             freedom_ipfs_node_free(node);
         }

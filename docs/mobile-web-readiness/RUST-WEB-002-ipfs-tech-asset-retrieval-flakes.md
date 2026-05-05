@@ -20079,3 +20079,33 @@ network/source variance, so there is no measured reason to change the delegated
 hedge threshold now. Keep `750ms` until a repeated live tail actually crosses
 the current guard or a deterministic production-like test shows a narrower
 threshold helps.
+
+## 2026-05-05 Keep: Close Progress Targets For Lifecycle-Cancelled Preloads
+
+Question:
+Mobile lifecycle hooks abort active preload tasks when the app backgrounds,
+receives a low-memory event, changes networks, or frees the node. Do those
+implicit cancellations also close the per-load progress target that Swift polls?
+
+Implementation:
+
+- `stop_preloads` now emits the same `preload_cancelled` structured event used
+  by explicit preload cancellation before aborting an unfinished task.
+- Finished preload tasks are still drained without emitting a duplicate
+  cancellation event.
+- `docs/mobile-progress-api.md` now documents lifecycle cancellation semantics.
+
+Focused validation:
+
+```sh
+cargo test -p freedom-ipfs-mobile lifecycle_preload_cancellation_clears_progress_target
+```
+
+Focused result:
+Passed.
+
+Decision:
+Keep. Without this event, Swift could see a stale active preload target after a
+normal lifecycle stop even though the task had been aborted. The change does not
+alter the FFI ABI or Swift wrapper surface; it only makes existing progress
+snapshots reflect lifecycle-driven cancellation accurately.

@@ -108,6 +108,11 @@ gateway, UnixFS path handling, IPNS/name resolution, routing/provider lookup,
 and retrieval/Bitswap paths. It also records explicit mobile preload
 `started`, `completed`, `failed`, and `cancelled` events.
 
+Lifecycle hooks that stop active preloads also emit `cancelled` preload events
+before pruning the preload task. This includes `enterBackground`, low-memory
+handling, network changes, and node teardown. Swift can treat those events as a
+signal to remove stale preload indicators from the loading UI.
+
 Important stable phases Swift can map immediately:
 
 - `queued`
