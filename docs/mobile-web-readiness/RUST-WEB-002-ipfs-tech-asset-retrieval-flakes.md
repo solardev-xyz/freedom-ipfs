@@ -12395,3 +12395,82 @@ Keep. This is diagnostics-only and does not change retrieval behavior. Seeded
 Kubo comparisons now make the excluded preconnect cost visible next to request
 TTFB, which prevents the remaining Rust-vs-Kubo gap from being interpreted as
 pure block-transfer speed.
+
+## 2026-05-05 Keep: Trace Block Store Put Latency
+
+Hypothesis:
+The seeded boundary-range trace showed time between Bitswap success and
+`block_fetch_total`, especially for the two 256KiB raw child blocks. That hidden
+span was likely durable cache insertion, but the trace only reported cache
+reads. Before changing cache-write behavior, the harness needs direct write
+timing.
+
+Change:
+
+- Emit `block_store_put` around HTTP-provider and Bitswap `put_block` calls.
+- Include CID, source, required-vs-extra block, success/failure, byte count, and
+  elapsed time.
+- Keep extra Bitswap block store failures best-effort, matching previous
+  behavior.
+- Extend the mobile web harness trace summary with block-store put count, bytes,
+  failures, total elapsed time, and max elapsed time.
+- Map `block_store_put` to the mobile progress phase `streaming`, so progress
+  summaries do not expose it as an unknown raw phase.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_block_store_puts
+cargo test -p freedom-ipfs-retrieval shared_bitswap_client_fetch_many_accepts_multi_cid_incoming_blocks
+cargo test -p freedom-ipfs-retrieval
+cargo test -p mobile-web-harness
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Result:
+
+- focused harness block-store-put summary test passed
+- focused retrieval incoming multi-CID regression passed
+- full retrieval suite passed: `66 passed; 0 failed; 1 ignored`
+- full mobile web harness suite passed: `31 passed; 0 failed`
+- retrieval and harness clippy passed with `-D warnings`
+
+Live sanity check:
+
+```sh
+timeout 300s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --bitswap-seed-car /tmp/harness-bitswap-seed.car \
+  --corpus /tmp/harness-bitswap-seed-corpus.json \
+  --case bitswap-seeded-multiblock-boundary-range \
+  --repeat 1 \
+  --timeout-secs 60 \
+  --run-timeout-secs 120 \
+  --asset-concurrency 1 \
+  --trace-output /tmp/harness-block-store-put-r1-trace.jsonl \
+  --comparison-output /tmp/harness-block-store-put-r1.json
+```
+
+Live result:
+
+- Rust and Kubo passed `bitswap-seeded-multiblock-boundary-range`.
+- Rust root TTFB `190ms`; Kubo root TTFB `57ms`.
+- Kubo seed preconnect was `58ms`, still outside Kubo request timing.
+- Rust trace recorded `block_store_put` for all three fetched blocks:
+  - events `3`
+  - bytes `524447`
+  - failures `0`
+  - total elapsed `40ms`
+  - max elapsed `21ms`
+- The write cost confirms that a meaningful part of the post-root child-fetch
+  tail is durable cache insertion, not only Bitswap/network wait.
+
+Decision:
+Keep. This is diagnostics-only and preserves read-only, no-public-fallback, and
+verified-before-caching behavior. The next optimization attempt can now measure
+whether any cache-write overlap or duplicate-write reduction actually moves
+request latency instead of guessing from `block_fetch_total`.

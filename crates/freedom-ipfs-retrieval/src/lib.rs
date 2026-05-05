@@ -722,7 +722,7 @@ impl HttpRetriever {
             .error_for_status()?;
         let bytes = limited_response_bytes(response, DEFAULT_MAX_BLOCK_SIZE).await?;
         verify_block(cid, &bytes)?;
-        self.store.put_block(cid, &bytes)?;
+        self.store_block_with_trace(cid, &bytes, "http_provider", true)?;
         Ok(Block::unchecked(*cid, bytes))
     }
 
@@ -1180,11 +1180,48 @@ impl HttpRetriever {
     fn store_bitswap_result(&self, cid: &Cid, result: BitswapFetchResult) -> Result<Block> {
         for (extra_cid, extra_data) in &result.extra_blocks {
             if extra_cid != cid {
-                let _ = self.store.put_block(extra_cid, extra_data);
+                let _ = self.store_block_with_trace(extra_cid, extra_data, "bitswap_extra", false);
             }
         }
-        self.store.put_block(cid, &result.requested_block)?;
+        self.store_block_with_trace(cid, &result.requested_block, "bitswap", true)?;
         Ok(Block::unchecked(*cid, result.requested_block))
+    }
+
+    fn store_block_with_trace(
+        &self,
+        cid: &Cid,
+        bytes: &[u8],
+        source: &'static str,
+        required: bool,
+    ) -> Result<()> {
+        let started = Instant::now();
+        match self.store.put_block(cid, bytes) {
+            Ok(()) => {
+                tracing::info!(
+                    phase = "block_store_put",
+                    cid = %cid,
+                    source,
+                    required,
+                    ok = true,
+                    bytes = bytes.len(),
+                    elapsed_ms = started.elapsed().as_millis()
+                );
+                Ok(())
+            }
+            Err(err) => {
+                tracing::info!(
+                    phase = "block_store_put",
+                    cid = %cid,
+                    source,
+                    required,
+                    ok = false,
+                    bytes = bytes.len(),
+                    error = %err,
+                    elapsed_ms = started.elapsed().as_millis()
+                );
+                Err(err.into())
+            }
+        }
     }
 }
 

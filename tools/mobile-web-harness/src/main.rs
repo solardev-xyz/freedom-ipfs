@@ -880,16 +880,21 @@ fn print_summary(report: &RunReport) {
                 format_trace_counts(&trace.block_sources)
             );
         }
-        if trace.block_store.events > 0 {
+        if trace.block_store.events > 0 || trace.block_store.puts > 0 {
             let store = &trace.block_store;
             println!(
-                "  block store: events={} hits={} misses={} rechecks={} recheck_hits={} recheck_misses={}",
+                "  block store: events={} hits={} misses={} rechecks={} recheck_hits={} recheck_misses={} puts={} put_bytes={} put_failures={} put_total_ms={} put_max_ms={}",
                 store.events,
                 store.hits,
                 store.misses,
                 store.rechecks,
                 store.recheck_hits,
-                store.recheck_misses
+                store.recheck_misses,
+                store.puts,
+                store.put_bytes,
+                store.put_failures,
+                store.put_total_ms,
+                store.put_max_ms
             );
         }
         print_trace_provider_retries(trace);
@@ -1185,16 +1190,21 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
         trace.event_count,
         trace.phases.len()
     );
-    if trace.block_store.events > 0 {
+    if trace.block_store.events > 0 || trace.block_store.puts > 0 {
         let store = &trace.block_store;
         println!(
-            "  block store: events={} hits={} misses={} rechecks={} recheck_hits={} recheck_misses={}",
+            "  block store: events={} hits={} misses={} rechecks={} recheck_hits={} recheck_misses={} puts={} put_bytes={} put_failures={} put_total_ms={} put_max_ms={}",
             store.events,
             store.hits,
             store.misses,
             store.rechecks,
             store.recheck_hits,
-            store.recheck_misses
+            store.recheck_misses,
+            store.puts,
+            store.put_bytes,
+            store.put_failures,
+            store.put_total_ms,
+            store.put_max_ms
         );
     }
     print_trace_unixfs_metadata_cache(trace);
@@ -4318,6 +4328,11 @@ struct TraceBlockStoreAggregate {
     rechecks: usize,
     recheck_hits: usize,
     recheck_misses: usize,
+    puts: usize,
+    put_bytes: u128,
+    put_failures: usize,
+    put_total_ms: u128,
+    put_max_ms: u128,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -5140,6 +5155,17 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                     Some(false) => block_store.recheck_misses += 1,
                     None => {}
                 }
+            }
+        }
+        if phase == "block_store_put" {
+            block_store.puts += 1;
+            block_store.put_bytes += value.get("bytes").and_then(json_u128).unwrap_or_default();
+            if value.get("ok").and_then(|ok| ok.as_bool()) == Some(false) {
+                block_store.put_failures += 1;
+            }
+            if let Some(elapsed_ms) = elapsed_ms {
+                block_store.put_total_ms += elapsed_ms;
+                block_store.put_max_ms = block_store.put_max_ms.max(elapsed_ms);
             }
         }
         if phase == "delegated_provider_lookup" {
@@ -6266,7 +6292,7 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
             Some("http_provider") => "fetching_http_provider",
             _ => "streaming",
         },
-        "block_fetch_coalesced" => "streaming",
+        "block_fetch_coalesced" | "block_store_put" => "streaming",
         "name_cache" => match value.get("cache_hit").and_then(|hit| hit.as_bool()) {
             Some(true) => "name_resolved",
             _ => "resolving_name",
@@ -8428,6 +8454,40 @@ mod tests {
         assert!(summary.offline_request_statuses.is_empty());
         assert!(summary.offline_trace_errors.is_empty());
         assert!(summary.offline_progress_phases.is_empty());
+    }
+
+    #[test]
+    fn trace_summary_counts_block_store_puts() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-block-store-put-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"block_store_get\",\"cid\":\"cid-a\",\"cache_hit\":false}\n",
+                "{\"phase\":\"block_store_put\",\"cid\":\"cid-a\",\"source\":\"bitswap\",\"required\":true,\"ok\":true,\"bytes\":262144,\"elapsed_ms\":17}\n",
+                "{\"phase\":\"block_store_put\",\"cid\":\"cid-b\",\"source\":\"bitswap_extra\",\"required\":false,\"ok\":false,\"bytes\":64,\"elapsed_ms\":3}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(summary.block_store.events, 1);
+        assert_eq!(summary.block_store.misses, 1);
+        assert_eq!(summary.block_store.puts, 2);
+        assert_eq!(summary.block_store.put_bytes, 262208);
+        assert_eq!(summary.block_store.put_failures, 1);
+        assert_eq!(summary.block_store.put_total_ms, 20);
+        assert_eq!(summary.block_store.put_max_ms, 17);
+        assert_eq!(trace_value_count(&summary.progress_phases, "streaming"), 2);
     }
 
     #[test]
