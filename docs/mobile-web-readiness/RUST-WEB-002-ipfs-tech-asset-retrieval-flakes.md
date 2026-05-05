@@ -10835,46 +10835,61 @@ Change:
 Intended use:
 
 ```sh
+cargo run -p xtask -- generate-mobile-web-fixture \
+  --car /tmp/xtask-mobile-web-multiblock.car \
+  --corpus /tmp/xtask-mobile-web-multiblock-corpus.json
+
 cargo run -p mobile-web-harness -- \
   --build-gateway \
   --routing-mode offline \
-  --gateway-import-car /tmp/multiblock-unixfs.car \
-  --corpus /tmp/multiblock-unixfs-corpus.json \
+  --gateway-import-car /tmp/xtask-mobile-web-multiblock.car \
+  --corpus /tmp/xtask-mobile-web-multiblock-corpus.json \
   --case multiblock-unixfs-range \
   --repeat 5 \
-  --trace-output /tmp/multiblock-unixfs-rust-trace.jsonl \
-  --output /tmp/multiblock-unixfs-rust.json
+  --trace-output /tmp/xtask-mobile-web-multiblock-rust-trace.jsonl \
+  --output /tmp/xtask-mobile-web-multiblock-rust.json
 
 cargo run -p mobile-web-harness -- \
   --build-gateway \
   --compare-kubo \
   --kubo-bin target/tools/kubo/kubo/ipfs \
-  --gateway-import-car /tmp/multiblock-unixfs.car \
-  --corpus /tmp/multiblock-unixfs-corpus.json \
+  --routing-mode offline \
+  --gateway-import-car /tmp/xtask-mobile-web-multiblock.car \
+  --corpus /tmp/xtask-mobile-web-multiblock-corpus.json \
   --case multiblock-unixfs-range \
   --repeat 5 \
-  --comparison-output /tmp/multiblock-unixfs-rust-vs-kubo.json
+  --comparison-output /tmp/xtask-mobile-web-multiblock-rust-vs-kubo.json
 ```
 
 Validation:
 
 ```sh
 cargo test -p mobile-web-harness
+cargo test -p xtask
 cargo test -p freedom-ipfs-gateway explicit_offline_routing_runs_cache_only_gateway
 cargo fmt --all --check
 cargo check -p mobile-web-harness --all-targets
-cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+cargo check -p xtask --all-targets
+cargo clippy -p mobile-web-harness -p xtask --all-targets -- -D warnings
 git diff --check
 ```
 
 Result: all passed.
 
-Temporary multi-block fixture generated with Kubo:
+Repo-native multi-block fixture generated with xtask:
+
+```sh
+cargo run -p xtask -- generate-mobile-web-fixture \
+  --car /tmp/xtask-mobile-web-multiblock.car \
+  --corpus /tmp/xtask-mobile-web-multiblock-corpus.json
+```
 
 - root CID:
-  `bafybeia4mzkpepxsp6sbltl6yk6aost4xe5ut47annbokwikepvtegngwq`
-- CAR: `/tmp/mobile-web-multiblock-unixfs.car`
-- corpus: `/tmp/mobile-web-multiblock-unixfs-corpus.json`
+  `bafybeig45rg3a5hszbyqnqanqjkgbkwrx7vjcv4uligjzw4jmhomgsshty`
+- CAR: `/tmp/xtask-mobile-web-multiblock.car`
+- corpus: `/tmp/xtask-mobile-web-multiblock-corpus.json`
+- blocks: `4`
+- bytes: `600000`
 
 Rust offline import smoke:
 
@@ -10882,20 +10897,20 @@ Rust offline import smoke:
 timeout 180s cargo run -p mobile-web-harness -- \
   --build-gateway \
   --routing-mode offline \
-  --gateway-import-car /tmp/mobile-web-multiblock-unixfs.car \
-  --corpus /tmp/mobile-web-multiblock-unixfs-corpus.json \
+  --gateway-import-car /tmp/xtask-mobile-web-multiblock.car \
+  --corpus /tmp/xtask-mobile-web-multiblock-corpus.json \
   --case multiblock-unixfs-range \
   --repeat 1 \
-  --trace-output /tmp/mobile-web-multiblock-unixfs-rust-trace.jsonl \
-  --output /tmp/mobile-web-multiblock-unixfs-rust.json
+  --trace-output /tmp/xtask-mobile-web-multiblock-rust-trace.jsonl \
+  --output /tmp/xtask-mobile-web-multiblock-rust.json
 ```
 
 Result:
 
-- gateway imported `3` CAR blocks
+- gateway imported `4` CAR blocks
 - passed `1/1`
-- root/range TTFB `2ms`, total `2ms`
-- RSS/FD `20828KiB` / `12`
+- root/range TTFB `4ms`, total `4ms`
+- RSS/FD `21392KiB` / `11`
 
 Rust-vs-Kubo import smoke:
 
@@ -10905,18 +10920,18 @@ timeout 180s cargo run -p mobile-web-harness -- \
   --compare-kubo \
   --kubo-bin target/tools/kubo/kubo/ipfs \
   --routing-mode offline \
-  --gateway-import-car /tmp/mobile-web-multiblock-unixfs.car \
-  --corpus /tmp/mobile-web-multiblock-unixfs-corpus.json \
+  --gateway-import-car /tmp/xtask-mobile-web-multiblock.car \
+  --corpus /tmp/xtask-mobile-web-multiblock-corpus.json \
   --case multiblock-unixfs-range \
   --repeat 1 \
-  --comparison-output /tmp/mobile-web-multiblock-unixfs-rust-vs-kubo.json
+  --comparison-output /tmp/xtask-mobile-web-multiblock-rust-vs-kubo.json
 ```
 
 Result:
 
 - Rust and Kubo both passed `1/1`
-- root/range TTFB: Rust `2ms`, Kubo `5ms`
-- RSS/FD: Rust `20444KiB` / `10`, Kubo `93800KiB` / `36`
+- root/range TTFB: Rust `1ms`, Kubo `6ms`
+- RSS/FD: Rust `21004KiB` / `10`, Kubo `86712KiB` / `35`
 
 Decision:
 Keep this as measurement infrastructure. It does not change gateway retrieval

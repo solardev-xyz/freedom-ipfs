@@ -121,6 +121,13 @@ the daemon. This is useful for offline UnixFS fixtures, range fixtures, and
 Rust-vs-Kubo byte/latency checks that should not depend on public provider
 availability. The option is rejected with `--gateway-url` because the harness
 cannot seed an already-running external gateway.
+Generate a deterministic multi-block UnixFS file fixture with:
+
+```sh
+cargo run -p xtask -- generate-mobile-web-fixture \
+  --car /tmp/mobile-web-multiblock.car \
+  --corpus /tmp/mobile-web-multiblock-corpus.json
+```
 
 For gateway phase tracing, pass `--trace-output /tmp/run.jsonl`. When the
 harness spawns the Rust gateway it forwards this path to the gateway, parses the

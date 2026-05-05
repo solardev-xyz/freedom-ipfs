@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use freedom_ipfs_core::{cid_from_data, encode_car_v1, CarBlock, CODEC_RAW};
+use freedom_ipfs_core::{cid_from_data, encode_car_v1, CarBlock, CODEC_DAG_PB, CODEC_RAW};
+use prost::Message;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
@@ -19,6 +20,20 @@ struct Args {
 enum XtaskCommand {
     BuildXcframework,
     VerifyXcframework,
+    GenerateMobileWebFixture {
+        #[arg(long)]
+        car: PathBuf,
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long, default_value_t = 600_000)]
+        bytes: usize,
+        #[arg(long, default_value_t = 262_100)]
+        range_start: u64,
+        #[arg(long, default_value_t = 300)]
+        range_len: u64,
+        #[arg(long, default_value = "multiblock-unixfs-range")]
+        case_id: String,
+    },
     ValidateIosDeviceEvidence {
         #[arg(default_value = "docs/ios-device-evidence-template.csv")]
         path: PathBuf,
@@ -32,10 +47,190 @@ fn main() -> Result<()> {
     match args.command {
         XtaskCommand::BuildXcframework => build_xcframework(),
         XtaskCommand::VerifyXcframework => verify_xcframework_command(),
+        XtaskCommand::GenerateMobileWebFixture {
+            car,
+            corpus,
+            bytes,
+            range_start,
+            range_len,
+            case_id,
+        } => generate_mobile_web_fixture(&car, &corpus, bytes, range_start, range_len, &case_id),
         XtaskCommand::ValidateIosDeviceEvidence { path, filled } => {
             validate_ios_device_evidence(&path, filled)
         }
     }
+}
+
+const UNIXFS_CHUNK_SIZE: usize = 256 * 1024;
+const MOBILE_FIXTURE_PATTERN: &[u8] = b"freedom-ipfs multiblock fixture payload\n";
+
+#[derive(Clone, PartialEq, Message)]
+struct FixturePbNode {
+    #[prost(bytes, optional, tag = "1")]
+    data: Option<Vec<u8>>,
+    #[prost(message, repeated, tag = "2")]
+    links: Vec<FixturePbLink>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct FixturePbLink {
+    #[prost(bytes, optional, tag = "1")]
+    hash: Option<Vec<u8>>,
+    #[prost(string, optional, tag = "2")]
+    name: Option<String>,
+    #[prost(uint64, optional, tag = "3")]
+    tsize: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct FixtureUnixfsData {
+    #[prost(enumeration = "FixtureUnixfsDataType", optional, tag = "1")]
+    r#type: Option<i32>,
+    #[prost(bytes, optional, tag = "2")]
+    data: Option<Vec<u8>>,
+    #[prost(uint64, optional, tag = "3")]
+    filesize: Option<u64>,
+    #[prost(uint64, repeated, tag = "4")]
+    blocksizes: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+enum FixtureUnixfsDataType {
+    File = 2,
+}
+
+fn generate_mobile_web_fixture(
+    car_path: &Path,
+    corpus_path: &Path,
+    bytes: usize,
+    range_start: u64,
+    range_len: u64,
+    case_id: &str,
+) -> Result<()> {
+    if bytes == 0 {
+        bail!("--bytes must be greater than zero");
+    }
+    if range_len == 0 {
+        bail!("--range-len must be greater than zero");
+    }
+    let range_end = range_start
+        .checked_add(range_len - 1)
+        .context("range end overflow")?;
+    if range_end >= bytes as u64 {
+        bail!(
+            "range {}-{} is outside generated fixture length {}",
+            range_start,
+            range_end,
+            bytes
+        );
+    }
+
+    let payload = deterministic_fixture_payload(bytes);
+    let mut blocks = Vec::new();
+    let mut links = Vec::new();
+    let mut blocksizes = Vec::new();
+    for chunk in payload.chunks(UNIXFS_CHUNK_SIZE) {
+        let data = chunk.to_vec();
+        let cid = cid_from_data(CODEC_RAW, &data);
+        blocksizes.push(data.len() as u64);
+        links.push(FixturePbLink {
+            hash: Some(cid.to_bytes()),
+            name: Some(String::new()),
+            tsize: Some(data.len() as u64),
+        });
+        blocks.push(CarBlock { cid, data });
+    }
+
+    let root_data = FixturePbNode {
+        data: Some(
+            FixtureUnixfsData {
+                r#type: Some(FixtureUnixfsDataType::File as i32),
+                data: Some(Vec::new()),
+                filesize: Some(bytes as u64),
+                blocksizes,
+            }
+            .encode_to_vec(),
+        ),
+        links,
+    }
+    .encode_to_vec();
+    let root = cid_from_data(CODEC_DAG_PB, &root_data);
+    blocks.insert(
+        0,
+        CarBlock {
+            cid: root,
+            data: root_data,
+        },
+    );
+
+    write_parent_dir(car_path)?;
+    fs::write(car_path, encode_car_v1(&blocks))
+        .with_context(|| format!("write {}", car_path.display()))?;
+
+    write_parent_dir(corpus_path)?;
+    let corpus = format!(
+        concat!(
+            "{{\n",
+            "  \"entries\": [\n",
+            "    {{\n",
+            "      \"id\": \"{}\",\n",
+            "      \"description\": \"Deterministic multi-block DAG-PB UnixFS file generated by xtask.\",\n",
+            "      \"path\": \"/ipfs/{}\",\n",
+            "      \"range\": \"bytes={}-{}\",\n",
+            "      \"expect_status\": 206,\n",
+            "      \"expect_content_range_prefix\": \"bytes {}-{}/{}\",\n",
+            "      \"min_bytes\": {},\n",
+            "      \"max_ttfb_ms\": 5000\n",
+            "    }}\n",
+            "  ]\n",
+            "}}\n"
+        ),
+        escape_json(case_id),
+        root,
+        range_start,
+        range_end,
+        range_start,
+        range_end,
+        bytes,
+        range_len
+    );
+    fs::write(corpus_path, corpus).with_context(|| format!("write {}", corpus_path.display()))?;
+
+    println!("root_cid: {root}");
+    println!("car: {}", car_path.display());
+    println!("corpus: {}", corpus_path.display());
+    println!("blocks: {}", blocks.len());
+    println!("bytes: {bytes}");
+    println!("range: bytes={range_start}-{range_end}");
+    Ok(())
+}
+
+fn deterministic_fixture_payload(bytes: usize) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(bytes);
+    while payload.len() < bytes {
+        payload.extend_from_slice(MOBILE_FIXTURE_PATTERN);
+    }
+    payload.truncate(bytes);
+    payload
+}
+
+fn write_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn escape_json(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 const IOS_DEVICE_EVIDENCE_HEADER: [&str; 25] = [
@@ -1223,6 +1418,37 @@ fn format_swift_byte_array(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freedom_ipfs_core::parse_car_v1;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn generates_multiblock_mobile_web_fixture() {
+        let stamp = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(format!("freedom-ipfs-xtask-fixture-{stamp}"));
+        let car = dir.join("fixture.car");
+        let corpus = dir.join("corpus.json");
+
+        generate_mobile_web_fixture(&car, &corpus, 600_000, 262_100, 300, "fixture-case").unwrap();
+
+        let parsed = parse_car_v1(&fs::read(&car).unwrap()).unwrap();
+        assert_eq!(parsed.blocks.len(), 4);
+        assert_eq!(parsed.blocks[0].cid.codec(), CODEC_DAG_PB);
+        assert_eq!(parsed.blocks[1].cid.codec(), CODEC_RAW);
+
+        let corpus = fs::read_to_string(&corpus).unwrap();
+        assert!(corpus.contains("fixture-case"));
+        assert!(corpus.contains(&format!("/ipfs/{}", parsed.blocks[0].cid)));
+        assert!(corpus.contains("bytes=262100-262399"));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn parses_quoted_csv_fields() {
