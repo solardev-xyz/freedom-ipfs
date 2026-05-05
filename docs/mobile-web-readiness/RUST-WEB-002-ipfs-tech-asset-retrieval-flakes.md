@@ -18430,3 +18430,126 @@ This strengthens the rejection. `cid.contact` should not be a default router
 and should not be used alone for this workload. The URL shape may be
 incompatible with this CID/routing endpoint, or `cid.contact` may not serve this
 content; either way, it is not a usable default for the mobile read path.
+
+## 2026-05-05 Reject: Skip Slow Single HTTP Provider Host
+
+Question:
+Current `ipfs.tech` runs still show the asset tail concentrated in
+single-HTTP-provider races where the only HTTP provider is
+`https://ipfs-bridge.sia.dev/`. Multi-provider races usually select
+`https://dag.w3s.link/` quickly, but the single-provider CIDs have no HTTP
+alternative in the current delegated response.
+
+Direct delegated-response probe:
+
+- Queried the top slow single-provider CIDs from
+  `/tmp/ipfs-tech-router-default-rerun-after-cidcontact-r3-trace.jsonl`
+  directly against `https://delegated-ipfs.dev/routing/v1/providers/<cid>`.
+- Used `accept: application/x-ndjson, application/json` and a non-empty
+  `user-agent`.
+- The five checked CIDs returned `12-35` provider records, but exactly one HTTP
+  provider each: `12D3KooWKosAkdeGoRQVT5cAGRcFvBexq3q4joZG4amDWhxZzt2p`
+  with `/dns4/ipfs-bridge.sia.dev/tcp/443/https`.
+- Conclusion from the probe: longer delegated-routing patience will not reveal
+  hidden `dag.w3s.link` diversity for these CIDs; any mitigation needs to use
+  Bitswap or a different provider source.
+
+Prototype:
+
+- Temporarily added an opt-in `FREEDOM_IPFS_SKIP_HTTP_PROVIDER_HOSTS` retrieval
+  experiment knob.
+- With `FREEDOM_IPFS_SKIP_HTTP_PROVIDER_HOSTS=ipfs-bridge.sia.dev`, retrieval
+  skipped only that HTTP host and fell through to existing verified Bitswap for
+  affected CIDs.
+- No public gateway fallback was added, and block verification/caching stayed on
+  the existing paths.
+- The prototype and focused skip-list test were reverted after the measurement.
+
+Focused validation while the prototype was present:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval http_provider_skip_list_matches_host_or_origin
+cargo check -p freedom-ipfs-retrieval --all-targets
+```
+
+Focused result:
+
+- Formatting passed.
+- Focused retrieval skip-list test passed.
+- Retrieval all-target check passed.
+
+Same-window baseline:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-skip-host-baseline-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-http-skip-host-baseline-r3.json
+```
+
+Baseline result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `829ms` / `1439ms` / `1439ms`.
+- Asset TTFB p50/p95/max: `252ms` / `935ms` / `1574ms`.
+- Run total p50/p95/max: `2759ms` / `4442ms` / `4442ms`.
+- Max RSS/FD: `47584KiB` / `26`.
+- Block sources: `http_provider=120`.
+- Delegated lookup p50/p95/max: `25ms` / `62ms` / `1400ms`.
+- HTTP-provider fetch p50/p95/max: `159ms` / `660ms` / `933ms`.
+- Single-provider HTTP winners: `63`, all `https://ipfs-bridge.sia.dev/`,
+  p50/p95/max `240ms` / `694ms` / `933ms`.
+- Multi-provider winner p50/p95/max: `99ms` / `279ms` / `399ms`.
+
+Host-skip experiment:
+
+```sh
+FREEDOM_IPFS_SKIP_HTTP_PROVIDER_HOSTS=ipfs-bridge.sia.dev \
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-http-skip-ipfs-bridge-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-http-skip-ipfs-bridge-r3.json
+```
+
+Experiment result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max worsened to `2652ms` / `2835ms` / `2835ms`.
+- Asset TTFB p50 improved but p95/max worsened: `173ms` / `1069ms` /
+  `1336ms`.
+- Run total p50/p95/max worsened to `4058ms` / `5270ms` / `5270ms`.
+- Max RSS/FD worsened to `54340KiB` / `39`.
+- Block sources shifted to `bitswap=100`, `http_provider=19`.
+- HTTP-provider fetches were only from `https://dag.w3s.link/`, with
+  p50/p95/max `48ms` / `118ms` / `118ms`.
+- Bitswap fetch p50/p95/max: `219ms` / `1717ms` / `1989ms`.
+- Bitswap commands: `122`; incoming deliveries: `86`; extra blocks: `76`.
+- Bitswap connection establishment p50/p95/max: `326ms` / `546ms` / `546ms`.
+- Block-store puts increased from `105` to `181`, and put bytes increased from
+  `2381466` to `2898210`.
+
+Decision:
+Reject and revert. The measurement confirms that blindly suppressing
+`ipfs-bridge.sia.dev` is not a safe policy even though that host is the slow
+single HTTP provider in this workload. Verified Bitswap recovered reliability
+but increased root latency, p95 asset latency, total time, RSS, FD count,
+connection work, and cache-write pressure. Future work should avoid static
+HTTP-host suppression. More promising directions are adaptive per-CID/session
+decisions with strict resource caps, or improving Bitswap connection/session
+latency before using Bitswap as a broad substitute for slow single HTTP
+providers.
