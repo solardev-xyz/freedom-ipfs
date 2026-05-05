@@ -4930,3 +4930,70 @@ mixed-trusted request timeouts, but one retry failure can still fail the page
 and asset p95 remains far behind Kubo. The next likely experiment should focus
 on reducing repeated same-provider mixed timeouts under page fan-out without
 discarding the retry path that succeeds most of the time.
+
+## 2026-05-05 Keep: Count Bitswap Timeout Reset Outcomes
+
+Goal:
+
+- Explain why request timeout counts can exceed `bitswap_client_reset` counts.
+- Determine whether concurrent mixed-trusted request timeouts are racing against
+  the same stored shared Bitswap client reset.
+
+Implementation:
+
+- Make `reset_shared_bitswap_client()` return whether it actually removed a
+  stored shared client.
+- Emit `reset_client=true|false` on `bitswap_request_timeout`.
+- Extend the harness `bitswap_timeout_recovery` aggregate with:
+  - `request_timeout_events`
+  - `reset_true`
+  - `reset_false`
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo test -p freedom-ipfs-retrieval --lib shortens_request_timeout_for_mixed_trusted_bitswap_candidates
+cargo build -p freedom-ipfs-gateway
+git diff --check
+```
+
+Live validation:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-timeout-reset-field-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-timeout-reset-field-r3.json
+```
+
+Result: Rust failed `0/3`; Kubo passed `3/3`. Rust root p50/p95 was
+`6544/17891ms` versus Kubo `4617/4947ms`, and Rust asset p50/p95 was
+`5004/16266ms` versus Kubo `268/643ms`. Rust still used much less memory and
+file descriptors: max RSS/FD `58484KiB`/`88` versus Kubo `314780KiB`/`574`.
+
+Trace summary:
+
+- `bitswap timeout recovery: request_timeout_details=88 mixed_trusted=87
+  request_timeout_events=88 reset_true=57 reset_false=31 client_resets=57
+  retry_starts=53 same_provider_retries=46 refreshed_provider_retries=7
+  retry_successes=19 trusted_retry_successes=11 untrusted_retry_successes=8
+  retry_failures=34 retry_unresolved=0
+  retry_success_elapsed=p50=894ms p90=1654ms p95=1992ms max=1992ms`
+- `provider_retries refresh_timeout=53`, `same_bitswap_request_timeouts=46`.
+- `bitswap session request_timeouts_with_trusted=87`.
+- `bitswap dial rejections: events=90 connection_limit=90`.
+
+Decision: keep. This is diagnostics-only and confirms timeout/reset contention:
+about one third of outer request timeout handlers found that another concurrent
+timeout had already reset the stored shared client. The bad live window also
+shows that repeated reset plus same-provider retry can collapse under asset
+fan-out. A behavior experiment should now target retry fan-out and reset
+coordination, not the existence of the retry itself.

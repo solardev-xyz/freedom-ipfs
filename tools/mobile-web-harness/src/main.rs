@@ -1042,9 +1042,12 @@ fn print_trace_timeout_recovery(trace: &TraceSummary) {
     }
     let recovery = &trace.bitswap_timeout_recovery;
     println!(
-        "  bitswap timeout recovery: request_timeouts={} mixed_trusted={} client_resets={} retry_starts={} same_provider_retries={} refreshed_provider_retries={} retry_successes={} trusted_retry_successes={} untrusted_retry_successes={} retry_failures={} retry_unresolved={} retry_success_elapsed={}",
+        "  bitswap timeout recovery: request_timeout_details={} mixed_trusted={} request_timeout_events={} reset_true={} reset_false={} client_resets={} retry_starts={} same_provider_retries={} refreshed_provider_retries={} retry_successes={} trusted_retry_successes={} untrusted_retry_successes={} retry_failures={} retry_unresolved={} retry_success_elapsed={}",
         recovery.request_timeouts,
         recovery.mixed_trusted_request_timeouts,
+        recovery.request_timeout_events,
+        recovery.request_timeout_reset_true,
+        recovery.request_timeout_reset_false,
         recovery.client_resets,
         recovery.provider_retry_starts,
         recovery.same_provider_retry_starts,
@@ -3059,6 +3062,9 @@ struct TraceBitswapIncomingBlockAggregate {
 struct TraceBitswapTimeoutRecoveryAggregate {
     request_timeouts: usize,
     mixed_trusted_request_timeouts: usize,
+    request_timeout_events: usize,
+    request_timeout_reset_true: usize,
+    request_timeout_reset_false: usize,
     client_resets: usize,
     provider_retry_starts: usize,
     same_provider_retry_starts: usize,
@@ -3074,6 +3080,7 @@ struct TraceBitswapTimeoutRecoveryAggregate {
 impl TraceBitswapTimeoutRecoveryAggregate {
     fn has_events(&self) -> bool {
         self.request_timeouts > 0
+            || self.request_timeout_events > 0
             || self.client_resets > 0
             || self.provider_retry_starts > 0
             || self.retry_successes > 0
@@ -3086,6 +3093,9 @@ impl TraceBitswapTimeoutRecoveryAggregate {
 struct TraceBitswapTimeoutRecoveryBuilder {
     request_timeouts: usize,
     mixed_trusted_request_timeouts: usize,
+    request_timeout_events: usize,
+    request_timeout_reset_true: usize,
+    request_timeout_reset_false: usize,
     client_resets: usize,
     provider_retry_starts: usize,
     same_provider_retry_starts: usize,
@@ -3105,6 +3115,9 @@ impl TraceBitswapTimeoutRecoveryBuilder {
         TraceBitswapTimeoutRecoveryAggregate {
             request_timeouts: self.request_timeouts,
             mixed_trusted_request_timeouts: self.mixed_trusted_request_timeouts,
+            request_timeout_events: self.request_timeout_events,
+            request_timeout_reset_true: self.request_timeout_reset_true,
+            request_timeout_reset_false: self.request_timeout_reset_false,
             client_resets: self.client_resets,
             provider_retry_starts: self.provider_retry_starts,
             same_provider_retry_starts: self.same_provider_retry_starts,
@@ -3487,6 +3500,17 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         }
         if phase == "bitswap_client_reset" {
             bitswap_timeout_recovery.client_resets += 1;
+        }
+        if phase == "bitswap_request_timeout" {
+            bitswap_timeout_recovery.request_timeout_events += 1;
+            match value
+                .get("reset_client")
+                .and_then(|reset_client| reset_client.as_bool())
+            {
+                Some(true) => bitswap_timeout_recovery.request_timeout_reset_true += 1,
+                Some(false) => bitswap_timeout_recovery.request_timeout_reset_false += 1,
+                None => {}
+            }
         }
         if phase == "bitswap_session_shortcut_start" {
             bitswap_session.session_shortcut_starts += 1;
@@ -4729,10 +4753,12 @@ mod tests {
             concat!(
                 "{\"phase\":\"bitswap_request_timeout_detail\",\"elapsed_ms\":4000,\"cid\":\"cid-a\",\"peer_count\":10,\"trusted_peer_count\":2,\"timeout_ms\":4000}\n",
                 "{\"phase\":\"bitswap_client_reset\"}\n",
+                "{\"phase\":\"bitswap_request_timeout\",\"elapsed_ms\":4001,\"cid\":\"cid-a\",\"peer_count\":10,\"trusted_peer_count\":2,\"timeout_ms\":4000,\"reset_client\":true}\n",
                 "{\"phase\":\"retry_provider_count\",\"cid\":\"cid-a\",\"same_provider_set\":true,\"same_bitswap_peer_set\":true,\"request_timeout\":true}\n",
                 "{\"phase\":\"provider_retry_after_request_timeout\",\"cid\":\"cid-a\",\"provider_count\":8,\"request_timeout\":true}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":75,\"cid\":\"cid-a\",\"ok\":true,\"trusted_peer_count\":2,\"source_peer_trusted\":false,\"source_peer\":\"peer-a\",\"source_transport\":\"tcp\",\"bitswap_delivery\":\"incoming\",\"extra_blocks\":0,\"bytes\":123}\n",
                 "{\"phase\":\"bitswap_request_timeout_detail\",\"elapsed_ms\":15000,\"cid\":\"cid-b\",\"peer_count\":1,\"trusted_peer_count\":0,\"timeout_ms\":15000}\n",
+                "{\"phase\":\"bitswap_request_timeout\",\"elapsed_ms\":15001,\"cid\":\"cid-b\",\"peer_count\":1,\"trusted_peer_count\":0,\"timeout_ms\":15000,\"reset_client\":false}\n",
                 "{\"phase\":\"retry_provider_count\",\"cid\":\"cid-b\",\"same_provider_set\":false,\"same_bitswap_peer_set\":false,\"request_timeout\":true}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":15000,\"cid\":\"cid-b\",\"ok\":false,\"trusted_peer_count\":0,\"error\":\"bitswap request timed out\"}\n",
                 "{\"phase\":\"retry_provider_count\",\"cid\":\"cid-c\",\"same_provider_set\":true,\"same_bitswap_peer_set\":true,\"request_timeout\":true}\n",
@@ -4749,6 +4775,15 @@ mod tests {
             summary
                 .bitswap_timeout_recovery
                 .mixed_trusted_request_timeouts,
+            1
+        );
+        assert_eq!(summary.bitswap_timeout_recovery.request_timeout_events, 2);
+        assert_eq!(
+            summary.bitswap_timeout_recovery.request_timeout_reset_true,
+            1
+        );
+        assert_eq!(
+            summary.bitswap_timeout_recovery.request_timeout_reset_false,
             1
         );
         assert_eq!(summary.bitswap_timeout_recovery.client_resets, 1);

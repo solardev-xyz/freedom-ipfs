@@ -750,15 +750,16 @@ impl HttpRetriever {
             }
             Err(err) => {
                 if is_bitswap_request_timeout(&err) {
+                    let reset_client = self.reset_shared_bitswap_client().await;
                     tracing::info!(
                         phase = "bitswap_request_timeout",
                         cid = %cid,
                         peer_count,
                         trusted_peer_count,
                         timeout_ms = bitswap_request_timeout(peer_count, trusted_peer_count).as_millis(),
+                        reset_client,
                         elapsed_ms = bitswap_started.elapsed().as_millis()
                     );
-                    self.reset_shared_bitswap_client().await;
                 }
                 tracing::info!(
                     phase = "bitswap_fetch",
@@ -850,10 +851,13 @@ impl HttpRetriever {
         Ok(spawned)
     }
 
-    async fn reset_shared_bitswap_client(&self) {
+    async fn reset_shared_bitswap_client(&self) -> bool {
         let mut client = self.bitswap.lock().await;
         if client.take().is_some() {
             tracing::info!(phase = "bitswap_client_reset");
+            true
+        } else {
+            false
         }
     }
 
