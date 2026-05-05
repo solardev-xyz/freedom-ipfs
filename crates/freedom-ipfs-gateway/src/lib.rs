@@ -1233,6 +1233,39 @@ impl BlockProvider for ScopedBlockProvider {
             }
         }
     }
+
+    fn get_block_range(
+        &self,
+        cid: &Cid,
+        start: u64,
+        end: u64,
+    ) -> freedom_ipfs_core::Result<Option<Vec<u8>>> {
+        let mut retained_here = false;
+        {
+            let mut retained = self.retained.lock().map_err(|err| {
+                freedom_ipfs_core::CoreError::Storage(format!(
+                    "stream retention lock poisoned: {err}"
+                ))
+            })?;
+            if retained.insert(*cid) {
+                self.inner.retain_block(cid)?;
+                retained_here = true;
+            }
+        }
+
+        match self.inner.get_block_range(cid, start, end)? {
+            Some(bytes) => Ok(Some(bytes)),
+            None => {
+                if retained_here {
+                    if let Ok(mut retained) = self.retained.lock() {
+                        retained.remove(cid);
+                    }
+                    self.inner.release_block(cid);
+                }
+                Ok(None)
+            }
+        }
+    }
 }
 
 impl Drop for ScopedBlockProvider {

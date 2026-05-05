@@ -1,7 +1,7 @@
 use cid::Cid;
 use freedom_ipfs_core::{
-    verify_block, Block, BlockProvider, CoreError, Result as CoreResult, CODEC_DAG_PB,
-    DEFAULT_MAX_BLOCK_SIZE, HASH_IDENTITY, HASH_SHA2_256,
+    block_data_range, verify_block, Block, BlockProvider, CoreError, Result as CoreResult,
+    CODEC_DAG_PB, DEFAULT_MAX_BLOCK_SIZE, HASH_IDENTITY, HASH_SHA2_256,
 };
 use freedom_ipfs_namesys::{CloudflareDohResolver, DnsTxtResolver};
 use freedom_ipfs_routing::{Provider, ProviderRoutingClient};
@@ -1207,6 +1207,51 @@ impl BlockProvider for FetchingBlockProvider {
             Ok((block, source)) => {
                 self.stats.record(source);
                 Ok(Some(block))
+            }
+            Err(err) => Err(CoreError::Storage(err.to_string())),
+        }
+    }
+
+    fn get_block_range(&self, cid: &Cid, start: u64, end: u64) -> CoreResult<Option<Vec<u8>>> {
+        let cache_started = Instant::now();
+        if let Some(bytes) = self
+            .store
+            .get_range(cid, start, end)
+            .map_err(|err| CoreError::Storage(err.to_string()))?
+        {
+            tracing::info!(
+                phase = "block_store_get_range",
+                cid = %cid,
+                cache_hit = true,
+                elapsed_ms = cache_started.elapsed().as_millis()
+            );
+            self.stats.record(RetrievalSource::Cache);
+            return Ok(Some(bytes));
+        }
+        tracing::info!(
+            phase = "block_store_get_range",
+            cid = %cid,
+            cache_hit = false,
+            elapsed_ms = cache_started.elapsed().as_millis()
+        );
+
+        let fetched = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(self.retriever.fetch_block_with_source(cid))
+            }),
+            Err(_) => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|err| CoreError::Storage(err.to_string()))?;
+                runtime.block_on(self.retriever.fetch_block_with_source(cid))
+            }
+        };
+
+        match fetched {
+            Ok((block, source)) => {
+                self.stats.record(source);
+                Ok(Some(block_data_range(block.data(), start, end)))
             }
             Err(err) => Err(CoreError::Storage(err.to_string())),
         }

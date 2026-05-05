@@ -479,6 +479,13 @@ impl<'a> UnixfsContext<'a> {
             .ok_or(UnixfsError::NotFound(*cid))
     }
 
+    fn get_block_range(&self, cid: &Cid, start: u64, end: u64) -> Result<Vec<u8>> {
+        self.provider
+            .get_block_range(cid, start, end)
+            .map_err(|err| UnixfsError::Provider(err.to_string()))?
+            .ok_or(UnixfsError::NotFound(*cid))
+    }
+
     fn dag_pb(&self, cid: &Cid) -> Result<DecodedDagPb> {
         if let Some(cache) = self.metadata_cache {
             if let Some(decoded) = cache.get(cid) {
@@ -739,7 +746,7 @@ impl UnixfsContext<'_> {
 
     fn read_file_cid_range(&self, cid: &Cid, start: u64, end: u64) -> Result<Vec<u8>> {
         match cid.codec() {
-            CODEC_RAW => Ok(slice_bytes(self.get_block(cid)?.data(), start, end)),
+            CODEC_RAW => self.get_block_range(cid, start, end),
             CODEC_DAG_PB => {
                 let decoded = self.dag_pb(cid)?;
                 match decoded.kind {
@@ -991,7 +998,9 @@ fn link_cid(link: &PbLink) -> Result<Cid> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freedom_ipfs_core::{cid_from_data, Block, Result as CoreResult, CODEC_DAG_PB, CODEC_RAW};
+    use freedom_ipfs_core::{
+        block_data_range, cid_from_data, Block, Result as CoreResult, CODEC_DAG_PB, CODEC_RAW,
+    };
     use freedom_ipfs_store::SqliteBlockStore;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1073,6 +1082,7 @@ mod tests {
     struct CountingProvider {
         blocks: Arc<HashMap<Cid, Vec<u8>>>,
         calls: Arc<Mutex<HashMap<Cid, usize>>>,
+        range_calls: Arc<Mutex<HashMap<Cid, usize>>>,
     }
 
     impl CountingProvider {
@@ -1080,12 +1090,22 @@ mod tests {
             Self {
                 blocks: Arc::new(blocks),
                 calls: Arc::new(Mutex::new(HashMap::new())),
+                range_calls: Arc::new(Mutex::new(HashMap::new())),
             }
         }
 
         fn call_count(&self, cid: &Cid) -> usize {
             *self
                 .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(cid)
+                .unwrap_or(&0)
+        }
+
+        fn range_call_count(&self, cid: &Cid) -> usize {
+            *self
+                .range_calls
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(cid)
@@ -1102,6 +1122,18 @@ mod tests {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 *calls.entry(*cid).or_default() += 1;
                 return Ok(Some(Block::unchecked(*cid, data.clone())));
+            }
+            Ok(None)
+        }
+
+        fn get_block_range(&self, cid: &Cid, start: u64, end: u64) -> CoreResult<Option<Vec<u8>>> {
+            if let Some(data) = self.blocks.get(cid) {
+                let mut calls = self
+                    .range_calls
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *calls.entry(*cid).or_default() += 1;
+                return Ok(Some(block_data_range(data, start, end)));
             }
             Ok(None)
         }
@@ -1342,6 +1374,22 @@ mod tests {
         assert_eq!(after.path_misses, before.path_misses);
         assert_eq!(provider.call_count(&dir_cid), 1);
         assert_eq!(provider.call_count(&file_cid), 1);
+    }
+
+    #[test]
+    fn raw_cid_range_uses_provider_range_read() {
+        let data = b"0123456789".to_vec();
+        let cid = cid_from_data(CODEC_RAW, &data);
+        let provider = CountingProvider::new(HashMap::from([(cid, data)]));
+        let resolver = UnixfsResolver::default();
+
+        assert_eq!(
+            resolver.read_file_cid_range(&provider, &cid, 2, 5).unwrap(),
+            b"2345"
+        );
+
+        assert_eq!(provider.call_count(&cid), 0);
+        assert_eq!(provider.range_call_count(&cid), 1);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use cid::Cid;
 use freedom_ipfs_core::{
-    encode_car_v1, parse_car_v1, verify_block, Block, BlockProvider, CarBlock, CoreError,
-    Result as CoreResult,
+    block_data_range, encode_car_v1, parse_car_v1, verify_block, Block, BlockProvider, CarBlock,
+    CoreError, Result as CoreResult,
 };
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -184,6 +184,42 @@ impl SqliteBlockStore {
                 self.touch_at(cid, now)?;
                 self.hot.lock().put_verified(cid_bytes, data.clone(), now);
                 Ok(Some(Block::unchecked(*cid, data)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_range(&self, cid: &Cid, start: u64, end: u64) -> Result<Option<Vec<u8>>> {
+        let cid_bytes = block_key(cid);
+        let now = now_secs();
+        if let Some(hit) = self
+            .hot
+            .lock()
+            .get_verified_range(&cid_bytes, now, start, end)
+        {
+            if hit.touch_persistent {
+                self.touch_at(cid, now)?;
+            }
+            return Ok(Some(hit.data));
+        }
+
+        let row = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT data FROM blocks WHERE cid = ?1",
+                params![&cid_bytes],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+
+        match row {
+            Some(data) => {
+                verify_block(cid, &data)?;
+                self.touch_at(cid, now)?;
+                let range = block_data_range(&data, start, end);
+                self.hot.lock().put_verified(cid_bytes, data, now);
+                Ok(Some(range))
             }
             None => Ok(None),
         }
@@ -496,6 +532,11 @@ impl BlockProvider for SqliteBlockStore {
             .map_err(|err| CoreError::Storage(err.to_string()))
     }
 
+    fn get_block_range(&self, cid: &Cid, start: u64, end: u64) -> CoreResult<Option<Vec<u8>>> {
+        self.get_range(cid, start, end)
+            .map_err(|err| CoreError::Storage(err.to_string()))
+    }
+
     fn retain_block(&self, cid: &Cid) -> CoreResult<()> {
         self.retain_cid_bytes(block_key(cid));
         Ok(())
@@ -565,6 +606,27 @@ impl VerifiedHotCache {
         }
         Some(VerifiedHotCacheHit {
             data: entry.data.clone(),
+            touch_persistent,
+        })
+    }
+
+    fn get_verified_range(
+        &mut self,
+        cid: &[u8],
+        now: u64,
+        start: u64,
+        end: u64,
+    ) -> Option<VerifiedHotCacheHit> {
+        let entry = self.entries.get_mut(cid)?;
+        self.clock = self.clock.saturating_add(1);
+        entry.last_accessed = self.clock;
+        let touch_persistent =
+            now.saturating_sub(entry.last_persistent_touch) >= HOT_CACHE_TOUCH_INTERVAL.as_secs();
+        if touch_persistent {
+            entry.last_persistent_touch = now;
+        }
+        Some(VerifiedHotCacheHit {
+            data: block_data_range(&entry.data, start, end),
             touch_persistent,
         })
     }
@@ -673,6 +735,62 @@ mod tests {
             StoreError::Core(CoreError::HashMismatch { .. })
         ));
         assert!(!store.hot.lock().entries.contains_key(&cid_bytes));
+    }
+
+    #[test]
+    fn range_read_verifies_cold_block_before_populating_verified_hot_cache() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let cid = cid_from_data(CODEC_RAW, b"valid block");
+        let cid_bytes = block_key(&cid);
+        store
+            .conn
+            .lock()
+            .execute(
+                r#"
+                INSERT INTO blocks(cid, codec, size, data, inserted_at, last_accessed_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                "#,
+                params![
+                    &cid_bytes,
+                    cid.codec() as i64,
+                    13i64,
+                    b"invalid block".as_slice(),
+                    now_secs() as i64
+                ],
+            )
+            .unwrap();
+
+        let err = store.get_range(&cid, 0, 4).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::Core(CoreError::HashMismatch { .. })
+        ));
+        assert!(!store.hot.lock().entries.contains_key(&cid_bytes));
+    }
+
+    #[test]
+    fn hot_cache_range_hit_returns_requested_bytes() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"0123456789";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+        set_block_last_accessed_at(&store, &cid, 1);
+
+        assert_eq!(store.get_range(&cid, 2, 5).unwrap().unwrap(), b"2345");
+        assert_eq!(block_last_accessed_at(&store, &cid), 1);
+    }
+
+    #[test]
+    fn cold_range_read_populates_verified_hot_cache() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"cold range block";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+        store.hot.lock().clear();
+
+        assert_eq!(store.get_range(&cid, 5, 9).unwrap().unwrap(), b"range");
+
+        assert!(store.hot.lock().entries.contains_key(&block_key(&cid)));
     }
 
     #[test]

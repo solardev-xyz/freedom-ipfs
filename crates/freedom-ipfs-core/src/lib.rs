@@ -68,6 +68,13 @@ impl Block {
 pub trait BlockProvider: Send + Sync {
     fn get_block(&self, cid: &Cid) -> Result<Option<Block>>;
 
+    fn get_block_range(&self, cid: &Cid, start: u64, end: u64) -> Result<Option<Vec<u8>>> {
+        let Some(block) = self.get_block(cid)? else {
+            return Ok(None);
+        };
+        Ok(Some(block_data_range(block.data(), start, end)))
+    }
+
     fn retain_block(&self, _cid: &Cid) -> Result<()> {
         Ok(())
     }
@@ -88,6 +95,15 @@ pub fn cid_to_string(cid: &Cid) -> String {
 pub fn cid_from_data(codec: u64, data: &[u8]) -> Cid {
     let hash = Code::Sha2_256.digest(data);
     Cid::new_v1(codec, hash)
+}
+
+pub fn block_data_range(bytes: &[u8], start: u64, end: u64) -> Vec<u8> {
+    if bytes.is_empty() || start > end || start >= bytes.len() as u64 {
+        return Vec::new();
+    }
+    let start = start.min(bytes.len() as u64) as usize;
+    let end = end.min(bytes.len() as u64 - 1) as usize;
+    bytes[start..=end].to_vec()
 }
 
 pub fn verify_block(cid: &Cid, data: &[u8]) -> Result<()> {
@@ -213,6 +229,14 @@ mod tests {
         verify_block(&cid, data).unwrap();
         assert!(verify_block(&cid, b"tampered").is_err());
         assert_eq!(parse_cid(&cid.to_string()).unwrap(), cid);
+    }
+
+    #[test]
+    fn block_data_range_clamps_to_available_bytes() {
+        assert_eq!(block_data_range(b"abcdef", 1, 3), b"bcd");
+        assert_eq!(block_data_range(b"abcdef", 4, 99), b"ef");
+        assert!(block_data_range(b"abcdef", 6, 9).is_empty());
+        assert!(block_data_range(b"abcdef", 4, 3).is_empty());
     }
 
     #[test]

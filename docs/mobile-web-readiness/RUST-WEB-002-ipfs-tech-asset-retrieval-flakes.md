@@ -10108,3 +10108,149 @@ store API, and removes repeated hashing from warm in-memory reads. It improves
 warm media/range behavior and the full `ipfs.tech` page-assets comparison
 without increasing routing fanout, adding fallback, or increasing persistent
 storage work.
+
+## 2026-05-05 Keep: Raw Range Reads Slice Verified Hot Cache Entries
+
+Hypothesis:
+After verified hot-cache entries removed repeated rehashing, small media/range
+responses could still clone the whole cached raw block before slicing the
+requested byte window. A narrow block-range provider API should let hot cached
+raw blocks copy only the requested range, without changing network retrieval,
+read-only behavior, or the rule that cold blocks are verified before serving or
+caching.
+
+Implementation:
+
+- Add a default `BlockProvider::get_block_range(cid, start, end)` method and a
+  shared `block_data_range` helper.
+- Override the range method in `SqliteBlockStore` so verified hot-cache hits
+  clone only the requested bytes.
+- Keep cold SQLite range reads conservative: read the full block, verify it,
+  then populate the verified hot cache and return the requested slice.
+- Override `FetchingBlockProvider::get_block_range` so gateway reads use the
+  store range path on cache hits and fall back to normal full-block retrieval
+  on cache misses.
+- Propagate the method through `ScopedBlockProvider` so streaming/ranged
+  gateway responses keep their existing retention behavior.
+- Use the range method for UnixFS raw CID range reads.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-core -p freedom-ipfs-store -p freedom-ipfs-unixfs
+cargo test -p freedom-ipfs-retrieval -p freedom-ipfs-gateway
+cargo test -p freedom-ipfs-mobile
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result: all passed.
+
+Range comparison:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-developers-hero-range \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-range-slice-warm-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-range-slice-warm-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Rust range TTFB p50/p95 was `4/2848ms`; Kubo was `279/2461ms`.
+- Rust RSS/FD: `39616KiB`/`28`; Kubo RSS/FD: `186476KiB`/`107`.
+- Warm Rust repeat requests were `2ms`/`2ms`.
+- Gateway direct-body max elapsed stayed at `0ms`.
+- The trace shows `block_store_get_range=3`, with the two warm requests using
+  the range path instead of full raw block reads.
+
+Broader page-assets check:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-range-slice-page-assets-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-range-slice-page-assets-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `4/2298ms`, Kubo `3/4446ms`.
+- Asset TTFB p50/p95: Rust `4/484ms`, Kubo `4/272ms`.
+- Rust RSS/FD: `50244KiB`/`42`; Kubo RSS/FD: `292800KiB`/`464`.
+- Warm page repeat groups were `1-2ms`.
+- Gateway direct-body max elapsed stayed at `0ms`.
+
+Additional `/ipfs` range check:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/vitalik-range-slice-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/vitalik-range-slice-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root/range TTFB p50/p95: Rust `4/353ms`, Kubo `5/4003ms`.
+- Rust RSS/FD: `37376KiB`/`18`; Kubo RSS/FD: `125084KiB`/`101`.
+- Warm repeat requests were `2ms` each, and gateway direct-body max elapsed was
+  `0ms`.
+
+Additional cold-only check:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-developers-hero-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --trace-output /tmp/ipfs-tech-range-slice-rust-vs-kubo-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-range-slice-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Fresh-gateway range TTFB p50/p95: Rust `2328/2389ms`, Kubo
+  `3825/4959ms`.
+- This mainly measured public-network/provider cold behavior. It is not the
+  keep signal for this patch, but it confirmed the range API did not break cold
+  reads.
+
+Decision: keep. The live latency effect is small because the previous verified
+hot-cache change already drove direct-body work to the harness millisecond
+floor, but this removes an avoidable full-block clone from hot raw range reads,
+keeps cold verification intact, adds focused coverage for the new provider
+method, and improves the full-page warm repeat groups without increasing
+routing fanout, timeout budgets, fallback scope, or persistent storage work.
