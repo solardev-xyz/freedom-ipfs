@@ -1573,6 +1573,26 @@ fn print_trace_http_provider_races(trace: &TraceSummary) {
         race.max_attempted_provider_count,
         race.max_result_elapsed_ms
     );
+    if race.single_provider_result_successes > 0 || race.single_provider_result_failures > 0 {
+        println!(
+            "    single-provider results: ok={} fail={} winner_elapsed={}",
+            race.single_provider_result_successes,
+            race.single_provider_result_failures,
+            race.single_provider_success_elapsed_ms
+        );
+        for provider in race.single_provider_winners.iter().take(4) {
+            println!(
+                "    single-provider winner {}: events={} elapsed_max={}ms total={}ms",
+                provider.provider, provider.events, provider.max_ms, provider.total_ms
+            );
+        }
+    }
+    if race.multi_provider_success_elapsed_ms.count > 0 {
+        println!(
+            "    multi-provider winner elapsed={}",
+            race.multi_provider_success_elapsed_ms
+        );
+    }
 }
 
 fn print_trace_provider_retries(trace: &TraceSummary) {
@@ -4284,7 +4304,7 @@ impl CaseAggregate {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 struct LatencySummary {
     count: usize,
     p50_ms: Option<u128>,
@@ -4491,6 +4511,17 @@ struct TraceHttpProviderRaceAggregate {
     max_winner_provider_rank: u128,
     max_attempted_provider_count: u128,
     max_result_elapsed_ms: u128,
+    single_provider_result_successes: usize,
+    single_provider_result_failures: usize,
+    single_provider_success_elapsed_ms: LatencySummary,
+    multi_provider_success_elapsed_ms: LatencySummary,
+    single_provider_winners: Vec<TraceHttpProviderRaceWinnerProviderAggregate>,
+    #[serde(skip)]
+    single_provider_success_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    multi_provider_success_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    single_provider_winner_builders: BTreeMap<String, TraceHttpProviderRaceWinnerProviderBuilder>,
 }
 
 impl TraceHttpProviderRaceAggregate {
@@ -4530,15 +4561,27 @@ impl TraceHttpProviderRaceAggregate {
 
     fn record_result(&mut self, value: &serde_json::Value, elapsed_ms: Option<u128>) {
         self.result_events += 1;
+        let provider_count = trace_count_field(value, "provider_count");
+        let elapsed_ms = elapsed_ms.unwrap_or_else(|| trace_count_field(value, "elapsed_ms"));
         self.max_attempted_provider_count = self
             .max_attempted_provider_count
             .max(trace_count_field(value, "attempted_provider_count"));
-        self.max_result_elapsed_ms = self
-            .max_result_elapsed_ms
-            .max(elapsed_ms.unwrap_or_else(|| trace_count_field(value, "elapsed_ms")));
+        self.max_result_elapsed_ms = self.max_result_elapsed_ms.max(elapsed_ms);
         match value.get("ok").and_then(|ok| ok.as_bool()) {
             Some(true) => {
                 self.result_successes += 1;
+                if provider_count == 1 {
+                    self.single_provider_result_successes += 1;
+                    self.single_provider_success_elapsed_values.push(elapsed_ms);
+                    if let Some(provider) = json_detail_string(value.get("provider")) {
+                        self.single_provider_winner_builders
+                            .entry(provider)
+                            .or_default()
+                            .record(elapsed_ms);
+                    }
+                } else if provider_count > 1 {
+                    self.multi_provider_success_elapsed_values.push(elapsed_ms);
+                }
                 let winner_rank = trace_count_field(value, "winner_provider_rank");
                 self.max_winner_provider_rank = self.max_winner_provider_rank.max(winner_rank);
                 match winner_rank {
@@ -4557,13 +4600,53 @@ impl TraceHttpProviderRaceAggregate {
                     self.winner_late_events += 1;
                 }
             }
-            Some(false) => self.result_failures += 1,
+            Some(false) => {
+                self.result_failures += 1;
+                if provider_count == 1 {
+                    self.single_provider_result_failures += 1;
+                }
+            }
             None => {}
         }
     }
 
+    fn finish(&mut self) {
+        self.single_provider_success_elapsed_ms = LatencySummary::from_values(std::mem::take(
+            &mut self.single_provider_success_elapsed_values,
+        ));
+        self.multi_provider_success_elapsed_ms = LatencySummary::from_values(std::mem::take(
+            &mut self.multi_provider_success_elapsed_values,
+        ));
+        self.single_provider_winners = sorted_trace_http_provider_race_winners(std::mem::take(
+            &mut self.single_provider_winner_builders,
+        ));
+    }
+
     fn has_events(&self) -> bool {
         self.events > 0 || self.hedges > 0 || self.result_events > 0
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TraceHttpProviderRaceWinnerProviderAggregate {
+    provider: String,
+    events: usize,
+    total_ms: u128,
+    max_ms: u128,
+}
+
+#[derive(Debug, Default)]
+struct TraceHttpProviderRaceWinnerProviderBuilder {
+    events: usize,
+    total_ms: u128,
+    max_ms: u128,
+}
+
+impl TraceHttpProviderRaceWinnerProviderBuilder {
+    fn record(&mut self, elapsed_ms: u128) {
+        self.events += 1;
+        self.total_ms += elapsed_ms;
+        self.max_ms = self.max_ms.max(elapsed_ms);
     }
 }
 
@@ -6472,6 +6555,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             .then_with(|| left.path.cmp(&right.path))
     });
     slow_requests.truncate(MAX_TRACE_SLOW_EVENTS);
+    http_provider_races.finish();
 
     Ok(TraceSummary {
         line_count,
@@ -6753,6 +6837,32 @@ fn sorted_trace_http_provider_milestones(
             .cmp(&left.max_response_headers_elapsed_ms)
             .then_with(|| right.max_ms.cmp(&left.max_ms))
             .then_with(|| right.total_ms.cmp(&left.total_ms))
+            .then_with(|| left.provider.cmp(&right.provider))
+    });
+    values.truncate(MAX_TRACE_SLOW_EVENTS);
+    values
+}
+
+fn sorted_trace_http_provider_race_winners(
+    counts: BTreeMap<String, TraceHttpProviderRaceWinnerProviderBuilder>,
+) -> Vec<TraceHttpProviderRaceWinnerProviderAggregate> {
+    let mut values = counts
+        .into_iter()
+        .map(
+            |(provider, builder)| TraceHttpProviderRaceWinnerProviderAggregate {
+                provider,
+                events: builder.events,
+                total_ms: builder.total_ms,
+                max_ms: builder.max_ms,
+            },
+        )
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right
+            .max_ms
+            .cmp(&left.max_ms)
+            .then_with(|| right.total_ms.cmp(&left.total_ms))
+            .then_with(|| right.events.cmp(&left.events))
             .then_with(|| left.provider.cmp(&right.provider))
     });
     values.truncate(MAX_TRACE_SLOW_EVENTS);
@@ -9209,9 +9319,13 @@ mod tests {
             concat!(
                 "{\"phase\":\"http_provider_race\",\"cid\":\"cid-a\",\"provider_count\":2,\"race_width\":2}\n",
                 "{\"phase\":\"http_provider_race\",\"cid\":\"cid-b\",\"provider_count\":4,\"race_width\":2,\"scored_provider_count\":2}\n",
+                "{\"phase\":\"http_provider_race\",\"cid\":\"cid-single-ok\",\"provider_count\":1,\"race_width\":2}\n",
+                "{\"phase\":\"http_provider_race\",\"cid\":\"cid-single-fail\",\"provider_count\":1,\"race_width\":2}\n",
                 "{\"phase\":\"http_provider_hedge\",\"cid\":\"cid-b\",\"provider\":\"https://provider-c.example\",\"timeout_ms\":250,\"pending_count\":2,\"remaining_provider_count\":1}\n",
                 "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-a\",\"ok\":true,\"provider\":\"https://provider-a.example\",\"winner_provider_index\":1,\"winner_provider_rank\":2,\"winner_within_initial_width\":true,\"provider_count\":2,\"race_width\":2,\"attempted_provider_count\":2,\"failed_provider_count\":0,\"hedge_fired\":false,\"elapsed_ms\":25}\n",
                 "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-b\",\"ok\":false,\"provider_count\":4,\"race_width\":2,\"attempted_provider_count\":4,\"failed_provider_count\":4,\"hedge_fired\":true,\"elapsed_ms\":300}\n",
+                "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-single-ok\",\"ok\":true,\"provider\":\"https://provider-single.example\",\"winner_provider_index\":0,\"winner_provider_rank\":1,\"winner_within_initial_width\":true,\"provider_count\":1,\"race_width\":2,\"attempted_provider_count\":1,\"failed_provider_count\":0,\"hedge_fired\":false,\"elapsed_ms\":450}\n",
+                "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-single-fail\",\"ok\":false,\"provider_count\":1,\"race_width\":2,\"attempted_provider_count\":1,\"failed_provider_count\":1,\"hedge_fired\":false,\"elapsed_ms\":900}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-a\",\"provider\":\"https://provider-a.example\",\"ok\":true,\"bytes\":128,\"response_bytes\":128,\"response_headers_elapsed_ms\":7,\"response_first_chunk_seen\":true,\"response_first_chunk_elapsed_ms\":9,\"response_body_elapsed_ms\":20,\"elapsed_ms\":25}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-b\",\"provider\":\"https://provider-b.example\",\"ok\":false,\"error\":\"core: cid hash mismatch for cid-b\",\"response_headers_elapsed_ms\":40,\"elapsed_ms\":40}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-c\",\"provider\":\"https://provider-b.example\",\"ok\":false,\"error\":\"request timed out\",\"response_headers_elapsed_ms\":60,\"elapsed_ms\":60}\n",
@@ -9222,11 +9336,11 @@ mod tests {
         let summary = summarize_trace_output(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(summary.http_provider_races.events, 2);
-        assert_eq!(summary.http_provider_races.provider_count_total, 6);
+        assert_eq!(summary.http_provider_races.events, 4);
+        assert_eq!(summary.http_provider_races.provider_count_total, 8);
         assert_eq!(summary.http_provider_races.max_provider_count, 4);
         assert_eq!(summary.http_provider_races.max_race_width, 2);
-        assert_eq!(summary.http_provider_races.single_provider_events, 0);
+        assert_eq!(summary.http_provider_races.single_provider_events, 2);
         assert_eq!(summary.http_provider_races.multi_provider_events, 2);
         assert_eq!(summary.http_provider_races.above_race_width_events, 1);
         assert_eq!(summary.http_provider_races.scored_events, 1);
@@ -9240,17 +9354,59 @@ mod tests {
                 .max_hedge_remaining_provider_count,
             1
         );
-        assert_eq!(summary.http_provider_races.result_events, 2);
-        assert_eq!(summary.http_provider_races.result_successes, 1);
-        assert_eq!(summary.http_provider_races.result_failures, 1);
-        assert_eq!(summary.http_provider_races.winner_initial_width_events, 1);
+        assert_eq!(summary.http_provider_races.result_events, 4);
+        assert_eq!(summary.http_provider_races.result_successes, 2);
+        assert_eq!(summary.http_provider_races.result_failures, 2);
+        assert_eq!(summary.http_provider_races.winner_initial_width_events, 2);
         assert_eq!(summary.http_provider_races.winner_late_events, 0);
-        assert_eq!(summary.http_provider_races.winner_rank1_events, 0);
+        assert_eq!(summary.http_provider_races.winner_rank1_events, 1);
         assert_eq!(summary.http_provider_races.winner_rank2_events, 1);
         assert_eq!(summary.http_provider_races.winner_rank3_plus_events, 0);
         assert_eq!(summary.http_provider_races.max_winner_provider_rank, 2);
         assert_eq!(summary.http_provider_races.max_attempted_provider_count, 4);
-        assert_eq!(summary.http_provider_races.max_result_elapsed_ms, 300);
+        assert_eq!(summary.http_provider_races.max_result_elapsed_ms, 900);
+        assert_eq!(
+            summary.http_provider_races.single_provider_result_successes,
+            1
+        );
+        assert_eq!(
+            summary.http_provider_races.single_provider_result_failures,
+            1
+        );
+        assert_eq!(
+            summary
+                .http_provider_races
+                .single_provider_success_elapsed_ms
+                .count,
+            1
+        );
+        assert_eq!(
+            summary
+                .http_provider_races
+                .single_provider_success_elapsed_ms
+                .p50_ms,
+            Some(450)
+        );
+        assert_eq!(
+            summary
+                .http_provider_races
+                .multi_provider_success_elapsed_ms
+                .p50_ms,
+            Some(25)
+        );
+        assert_eq!(summary.http_provider_races.single_provider_winners.len(), 1);
+        assert_eq!(
+            summary.http_provider_races.single_provider_winners[0].provider,
+            "https://provider-single.example"
+        );
+        assert_eq!(
+            summary.http_provider_races.single_provider_winners[0].events,
+            1
+        );
+        assert_eq!(
+            summary.http_provider_races.single_provider_winners[0].max_ms,
+            450
+        );
         assert_eq!(summary.http_provider_fetches.events, 3);
         assert_eq!(summary.http_provider_fetches.successes, 1);
         assert_eq!(summary.http_provider_fetches.failures, 2);
@@ -9324,7 +9480,7 @@ mod tests {
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_http_provider"),
-            8
+            12
         );
     }
 

@@ -15966,3 +15966,106 @@ Keep `50ms`. In the same network window, the shorter pre-lookup grace improved
 `1334ms`, while slightly reducing FD/RSS and Bitswap peer-attempt pressure. The
 other live checks stayed reliable and resource-light. This supersedes the
 earlier `75ms` keep decision under the newer HTTP-provider/routing behavior.
+
+## 2026-05-05 Keep: Summarize Slow Single HTTP Provider Winners
+
+Question:
+The current race-result summary proves that widening the default HTTP-provider
+race is not justified when rank-3 winners are absent, but it still hides a
+different possible policy: single-provider lookups can have no alternate HTTP
+candidate to race, and some of those verified wins are now the HTTP-provider
+tail. Add a diagnostic summary that separates single-provider winner latency
+from multi-provider winner latency and names the slowest single-provider
+winners.
+
+Implementation:
+
+- Extend `http_provider_races` with single-provider result success/failure
+  counts.
+- Summarize successful single-provider race-result latency separately from
+  multi-provider winner latency.
+- Add a bounded `single_provider_winners` list sorted by slowest max elapsed
+  time, with provider URL, event count, total elapsed time, and max elapsed
+  time.
+- Print these fields in the console trace summary and include them in the JSON
+  report.
+- This is diagnostics-only: no provider fanout increase, no public gateway
+  fallback, and no verification/caching trust change.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_http_provider_fetches
+```
+
+Result:
+
+- Formatting passed.
+- Focused HTTP-provider trace summary test passed.
+
+Live smoke:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-single-http-winners-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-single-http-winners-r3.json
+```
+
+Result:
+
+- Rust passed `3/3`.
+- Root TTFB p50/p95/max: `1348ms` / `2006ms` / `2006ms`.
+- Asset TTFB p50/p95/max: `269ms` / `1067ms` / `13567ms`.
+- Run total p50/p95/max: `3608ms` / `16090ms` / `16090ms`.
+- Max RSS/FD: `55688KiB` / `38`.
+- Delegated provider lookup max: `10001ms`; one delegated lookup returned an
+  HTTP send error, which caused the 13.6s slow asset tail.
+- HTTP-provider races: `70` results, `70` successes, `0` failures, `70`
+  winners inside the initial race width, `0` late winners, `67` rank-1 winners,
+  `3` rank-2 winners, `0` rank-3-or-later winners.
+- Single-provider HTTP race results: `39` successes, `0` failures, winner
+  elapsed p50/p95/max `221ms` / `941ms` / `1260ms`.
+- Multi-provider winner elapsed p50/p95/max: `78ms` / `181ms` / `252ms`.
+- Slow single-provider winner spread:
+  `https://ipfs-bridge.sia.dev/` had `39` events, total `15217ms`, max
+  `1260ms`.
+- HTTP-provider fetch p50/p95/max: `175ms` / `805ms` / `1208ms`; provider
+  spread `ipfs-bridge.sia.dev=39`, `dag.w3s.link=31`.
+- Block sources: `http_provider=84`, `bitswap=34`, `cache=1`.
+
+Final validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+cargo check --workspace --all-targets
+git diff --check
+```
+
+Result:
+
+- Formatting passed.
+- Full `mobile-web-harness` suite passed: `33 passed`.
+- Harness clippy passed with `-D warnings`.
+- Workspace check passed.
+- Diff whitespace check passed.
+
+Interpretation:
+Keep the diagnostic. The live sample again shows `0` rank-3-or-later HTTP
+provider winners, so default race width should stay at `2`. It also shows a
+clearer future target: single-provider HTTP fetches from
+`ipfs-bridge.sia.dev` can be several times slower than multi-provider winners,
+but the largest page tail in this sample still came from delegated routing
+failure plus Bitswap fallback, not from HTTP-provider racing. A future
+single-provider mitigation should be gated on repeated slow single-provider
+winners and should not broaden all HTTP fanout.
