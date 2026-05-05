@@ -19585,3 +19585,80 @@ Keep as a browser-cache semantics guardrail. The self-hedge changes do not
 break conditional request behavior, and the harness now gives a compact signal
 that a mobile WebKit integration can revalidate cached page resources without
 paying another cold retrieval cost.
+
+## 2026-05-05 Baseline: Current-Head `ipfs.tech` vs Kubo
+
+Question:
+After the delegated-router self-hedge and storage diagnostics fixes, where does
+the current branch stand against Kubo on the focused cold `ipfs.tech` page
+workload?
+
+Command:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-current-head-kubo-comparison-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-current-head-kubo-comparison-r3.json
+```
+
+Result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `1274ms` / `1865ms`; Kubo `1690ms` /
+  `1769ms`; Rust ratio `0.75x` / `1.05x`.
+- Asset TTFB p50/p95: Rust `239ms` / `693ms`; Kubo `115ms` /
+  `1512ms`; Rust ratio `2.08x` / `0.46x`.
+- Max RSS/FD: Rust `47076KiB` / `26`; Kubo `215572KiB` / `91`.
+- Kubo max storage for the run: `833145B`; Rust used the default temporary
+  DB path without storage reporting in this comparison.
+
+Rust trace summary:
+
+- Trace path:
+  `/tmp/ipfs-tech-current-head-kubo-comparison-r3-trace.jsonl`.
+- Comparison JSON:
+  `/tmp/ipfs-tech-current-head-kubo-comparison-r3.json`.
+- Trace events/phases: `2842` events, `22` phases.
+- Gateway statuses: `200=81`, `206=18`, limiter denials `0`.
+- Block-fetch sources: `http_provider=120`, total `28930ms`,
+  p50/p90/p95/max `217/394/557/1071ms`.
+- Delegated provider lookups: `105`, successes `105`, failures `0`,
+  providers `1437`, HTTP providers `189`, self-hedges `0`,
+  p50/p90/p95/max `21/41/46/66ms`.
+- HTTP-provider races: `105`, single-provider `63`, multi-provider `42`,
+  self-hedges `13`, result max `1048ms`.
+- HTTP-provider fetches: `105`, successes `105`, failures `0`, bytes
+  `2381466`, p50/p90/p95/max `160/217/382/1048ms`.
+- `https://ipfs-bridge.sia.dev/`: `63` fetches, p50/p90/p95/max
+  `169/372/524/1048ms`.
+- `https://dag.w3s.link/`: `42` fetches, p50/p90/p95/max
+  `41/69/75/130ms`.
+
+Notes:
+
+- The current branch remains much more mobile-resource-efficient than Kubo in
+  this live sample: about `22%` of Kubo's max RSS and `29%` of its max FD count.
+- Rust still wins cold asset p95 substantially, while Kubo keeps a better asset
+  p50. The trace points at single-provider HTTP provider latency as the main
+  measured asset p50 cost, not delegated-router lookup latency.
+- Delegated self-hedging stayed idle in this comparison because delegated
+  lookups were already fast; HTTP-provider self-hedging fired `13` times.
+- The slowest Rust root request spent `1048ms` fetching the `112239B` index
+  block from a single HTTP provider, with the verified block still required
+  before serving or caching.
+
+Decision:
+Keep as the current cold `ipfs.tech` Rust-vs-Kubo baseline. The next speed
+experiments should avoid increasing fanout blindly and instead target the
+single-provider HTTP path, provider diversity before large cold blocks, and
+warm/local asset p50 overhead while preserving verified-block semantics.
