@@ -3021,3 +3021,78 @@ address-parser change. A serious relay experiment needs at least:
 
 Given the rejected ID-only peer-routing result, relay support should be treated
 as the next substantial experiment, not as a small follow-on to provider lookup.
+
+## 2026-05-05 Inclusive Unsupported Address Counters
+
+Follow-up diagnostic:
+
+The provider-quality trace now includes inclusive address-family counters in
+addition to primary rejection reasons:
+
+- `addr_with_relay_count`
+- `addr_with_webtransport_count`
+- `addr_with_webrtc_count`
+- `addr_with_certhash_count`
+
+This matters because many public provider addresses contain more than one
+unsupported feature, for example WebTransport plus `/p2p-circuit`. The old
+primary-reason counters were still useful for explaining why Rust rejected an
+address, but they understated how many records would become relevant to a relay
+experiment.
+
+Validation run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-inclusive-provider-quality-r1-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-inclusive-provider-quality-r1.json
+```
+
+Result: Rust and Kubo both passed `1/1`. Rust root TTFB was `1075ms` versus
+Kubo `1362ms`; Rust asset p50/p95 was `111/1118ms` versus Kubo `93/230ms`.
+Rust resource use stayed low at RSS/FD `50740KiB`/`44` versus Kubo
+`121024KiB`/`48`.
+
+Provider-quality aggregate:
+
+```text
+events=15
+provider_addr_count=5557
+expanded_provider_addr_count=5602
+supported_provider_addr_count=1370
+rejected_provider_addr_count=4232
+unsupported_relay_addr_count=1491
+unsupported_webtransport_addr_count=1319
+unsupported_webrtc_addr_count=1374
+unsupported_transport_addr_count=48
+addr_with_relay_count=2526
+addr_with_webtransport_count=1319
+addr_with_webrtc_count=1374
+addr_with_certhash_count=2691
+```
+
+Root CID signal:
+
+```text
+provider_addr_count=357
+supported_provider_addr_count=85
+rejected_provider_addr_count=278
+unsupported_relay_addr_count=98
+addr_with_relay_count=157
+addr_with_webtransport_count=83
+addr_with_webrtc_count=89
+addr_with_certhash_count=172
+```
+
+Conclusion: relay exposure is larger than the primary rejection bucket implied.
+For this run, `45%` of expanded provider addresses contained `/p2p-circuit`
+(`2526/5602`), while only `27%` were primarily classified as relay rejection
+(`1491/5602`). That strengthens the case that relay support deserves a
+dedicated experiment, while WebTransport/WebRTC remain non-trivial native
+transport work in the current dependency set.

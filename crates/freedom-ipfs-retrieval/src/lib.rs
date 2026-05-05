@@ -667,6 +667,10 @@ impl HttpRetriever {
             unsupported_transport_addr_count = quality.unsupported_transport_addr_count,
             missing_peer_addr_count = quality.missing_peer_addr_count,
             unparsable_addr_count = quality.unparsable_addr_count,
+            addr_with_relay_count = quality.addr_with_relay_count,
+            addr_with_webtransport_count = quality.addr_with_webtransport_count,
+            addr_with_webrtc_count = quality.addr_with_webrtc_count,
+            addr_with_certhash_count = quality.addr_with_certhash_count,
             elapsed_ms = peer_started.elapsed().as_millis()
         );
         peers.retain(
@@ -1798,6 +1802,10 @@ struct BitswapProviderAddrQuality {
     unsupported_transport_addr_count: usize,
     missing_peer_addr_count: usize,
     unparsable_addr_count: usize,
+    addr_with_relay_count: usize,
+    addr_with_webtransport_count: usize,
+    addr_with_webrtc_count: usize,
+    addr_with_certhash_count: usize,
 }
 
 impl BitswapProviderAddrQuality {
@@ -1823,6 +1831,13 @@ impl BitswapProviderAddrQuality {
             BitswapAddrRejection::MissingPeer => self.missing_peer_addr_count += 1,
             BitswapAddrRejection::InvalidMultiaddr => self.unparsable_addr_count += 1,
         }
+    }
+
+    fn record_features(&mut self, features: BitswapAddrFeatures) {
+        self.addr_with_relay_count += usize::from(features.relay);
+        self.addr_with_webtransport_count += usize::from(features.webtransport);
+        self.addr_with_webrtc_count += usize::from(features.webrtc);
+        self.addr_with_certhash_count += usize::from(features.certhash);
     }
 }
 
@@ -1853,14 +1868,18 @@ async fn bitswap_peers_with_quality(providers: &[Provider]) -> BitswapProviderCa
             expand_provider_multiaddrs(&provider.addrs, &mut dnsaddr_cache, &mut dns_ip_cache).await
         {
             quality.expanded_addr_count += 1;
-            match classify_bitswap_multiaddr(&addr, provider_peer) {
-                Ok((addr_peer, dial_addr)) => {
+            match analyze_bitswap_multiaddr(&addr, provider_peer) {
+                Ok((addr_peer, dial_addr, features)) => {
+                    quality.record_features(features);
                     quality.supported_addr_count += 1;
                     provider_has_supported_addr = true;
                     peer_id.get_or_insert(addr_peer);
                     addrs.push(dial_addr);
                 }
-                Err(rejection) => quality.record_rejection(rejection),
+                Err((rejection, features)) => {
+                    quality.record_features(features);
+                    quality.record_rejection(rejection);
+                }
             }
         }
 
@@ -2147,7 +2166,9 @@ fn parse_bitswap_multiaddr(
     addr: &str,
     provider_peer: Option<PeerId>,
 ) -> Option<(PeerId, Multiaddr)> {
-    classify_bitswap_multiaddr(addr, provider_peer).ok()
+    analyze_bitswap_multiaddr(addr, provider_peer)
+        .ok()
+        .map(|(peer, addr, _)| (peer, addr))
 }
 
 #[derive(Clone, Copy)]
@@ -2161,12 +2182,27 @@ enum BitswapAddrRejection {
     UnsupportedTransport,
 }
 
-fn classify_bitswap_multiaddr(
+#[derive(Clone, Copy, Default)]
+struct BitswapAddrFeatures {
+    relay: bool,
+    webtransport: bool,
+    webrtc: bool,
+    certhash: bool,
+}
+
+fn analyze_bitswap_multiaddr(
     addr: &str,
     provider_peer: Option<PeerId>,
-) -> std::result::Result<(PeerId, Multiaddr), BitswapAddrRejection> {
-    let mut multiaddr =
-        Multiaddr::from_str(addr).map_err(|_| BitswapAddrRejection::InvalidMultiaddr)?;
+) -> std::result::Result<
+    (PeerId, Multiaddr, BitswapAddrFeatures),
+    (BitswapAddrRejection, BitswapAddrFeatures),
+> {
+    let mut multiaddr = Multiaddr::from_str(addr).map_err(|_| {
+        (
+            BitswapAddrRejection::InvalidMultiaddr,
+            BitswapAddrFeatures::default(),
+        )
+    })?;
     let addr_peer = match multiaddr.iter().last() {
         Some(Protocol::P2p(peer)) => {
             multiaddr.pop();
@@ -2174,10 +2210,14 @@ fn classify_bitswap_multiaddr(
         }
         _ => None,
     };
+    let features = bitswap_addr_features(&multiaddr);
     let peer_id = addr_peer
         .or(provider_peer)
-        .ok_or(BitswapAddrRejection::MissingPeer)?;
-    unsupported_bitswap_addr_reason(&multiaddr).map_or(Ok((peer_id, multiaddr)), Err)
+        .ok_or((BitswapAddrRejection::MissingPeer, features))?;
+    unsupported_bitswap_addr_reason(&multiaddr)
+        .map_or(Ok((peer_id, multiaddr, features)), |reason| {
+            Err((reason, features))
+        })
 }
 
 fn parse_peer_id(id: &str) -> Option<PeerId> {
@@ -2207,6 +2247,22 @@ fn unsupported_bitswap_addr_reason(addr: &Multiaddr) -> Option<BitswapAddrReject
     } else {
         Some(BitswapAddrRejection::UnsupportedTransport)
     }
+}
+
+fn bitswap_addr_features(addr: &Multiaddr) -> BitswapAddrFeatures {
+    let mut features = BitswapAddrFeatures::default();
+    for protocol in addr.iter() {
+        match protocol {
+            Protocol::P2pCircuit => features.relay = true,
+            Protocol::WebTransport => features.webtransport = true,
+            Protocol::WebRTC | Protocol::WebRTCDirect | Protocol::P2pWebRtcDirect => {
+                features.webrtc = true;
+            }
+            Protocol::Certhash(_) => features.certhash = true,
+            _ => {}
+        }
+    }
+    features
 }
 
 fn bitswap_addr_score(addr: &Multiaddr) -> u8 {
@@ -3187,6 +3243,7 @@ mod bitswap_tests {
                 vec![
                     "/ip4/164.92.225.198/tcp/4001".to_string(),
                     "/ip4/164.92.225.198/tcp/4001/p2p-circuit".to_string(),
+                    "/ip4/198.244.179.206/udp/4001/quic-v1/webtransport/certhash/uEiCc2vNnfKaaSdrNo5CnuqGRSj_kEJASptn3ReObl-hxYw/certhash/uEiCTfMTTtwAYGsEOVyPqyhHxn_BF-I1DCOou7dq9yWizAA/p2p-circuit".to_string(),
                     "/memory/1234".to_string(),
                 ],
             )
@@ -3206,17 +3263,22 @@ mod bitswap_tests {
         let quality = candidates.quality;
 
         assert_eq!(candidates.peers.len(), 1);
-        assert_eq!(quality.provider_addr_count, 6);
-        assert_eq!(quality.expanded_addr_count, 6);
+        assert_eq!(quality.provider_addr_count, 7);
+        assert_eq!(quality.expanded_addr_count, 7);
         assert_eq!(quality.supported_addr_count, 1);
-        assert_eq!(quality.rejected_addr_count(), 5);
+        assert_eq!(quality.rejected_addr_count(), 6);
         assert_eq!(quality.id_only_provider_count, 1);
         assert_eq!(quality.invalid_provider_id_count, 1);
         assert_eq!(quality.provider_without_supported_bitswap_addr_count, 2);
         assert_eq!(quality.unsupported_relay_addr_count, 1);
+        assert_eq!(quality.unsupported_webtransport_addr_count, 1);
         assert_eq!(quality.unsupported_transport_addr_count, 1);
         assert_eq!(quality.missing_peer_addr_count, 2);
         assert_eq!(quality.unparsable_addr_count, 1);
+        assert_eq!(quality.addr_with_relay_count, 2);
+        assert_eq!(quality.addr_with_webtransport_count, 1);
+        assert_eq!(quality.addr_with_webrtc_count, 0);
+        assert_eq!(quality.addr_with_certhash_count, 1);
     }
 
     #[tokio::test]

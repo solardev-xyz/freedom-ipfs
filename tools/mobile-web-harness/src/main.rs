@@ -672,7 +672,7 @@ fn print_summary(report: &RunReport) {
         if trace.bitswap_provider_quality.events > 0 {
             let quality = &trace.bitswap_provider_quality;
             println!(
-                "  bitswap provider quality: events={} provider_addrs={} expanded={} supported={} rejected={} id_only={} no_supported={} relay={} webtransport={} webrtc={} certhash={} other_transport={} missing_peer={} unparsable={}",
+                "  bitswap provider quality: events={} provider_addrs={} expanded={} supported={} rejected={} id_only={} no_supported={} relay={} webtransport={} webrtc={} certhash={} other_transport={} missing_peer={} unparsable={} with_relay={} with_webtransport={} with_webrtc={} with_certhash={}",
                 quality.events,
                 quality.provider_addr_count,
                 quality.expanded_provider_addr_count,
@@ -686,7 +686,11 @@ fn print_summary(report: &RunReport) {
                 quality.unsupported_certhash_addr_count,
                 quality.unsupported_transport_addr_count,
                 quality.missing_peer_addr_count,
-                quality.unparsable_addr_count
+                quality.unparsable_addr_count,
+                quality.addr_with_relay_count,
+                quality.addr_with_webtransport_count,
+                quality.addr_with_webrtc_count,
+                quality.addr_with_certhash_count
             );
         }
         if !trace.bitswap_connection_transports.is_empty() {
@@ -2678,6 +2682,10 @@ struct TraceBitswapProviderQualityAggregate {
     unsupported_transport_addr_count: u128,
     missing_peer_addr_count: u128,
     unparsable_addr_count: u128,
+    addr_with_relay_count: u128,
+    addr_with_webtransport_count: u128,
+    addr_with_webrtc_count: u128,
+    addr_with_certhash_count: u128,
 }
 
 impl TraceBitswapProviderQualityAggregate {
@@ -2706,6 +2714,11 @@ impl TraceBitswapProviderQualityAggregate {
             trace_count_field(value, "unsupported_transport_addr_count");
         self.missing_peer_addr_count += trace_count_field(value, "missing_peer_addr_count");
         self.unparsable_addr_count += trace_count_field(value, "unparsable_addr_count");
+        self.addr_with_relay_count += trace_count_field(value, "addr_with_relay_count");
+        self.addr_with_webtransport_count +=
+            trace_count_field(value, "addr_with_webtransport_count");
+        self.addr_with_webrtc_count += trace_count_field(value, "addr_with_webrtc_count");
+        self.addr_with_certhash_count += trace_count_field(value, "addr_with_certhash_count");
     }
 }
 
@@ -3288,6 +3301,10 @@ fn trace_event_details(value: &serde_json::Value) -> BTreeMap<String, String> {
         "unsupported_transport_addr_count",
         "missing_peer_addr_count",
         "unparsable_addr_count",
+        "addr_with_relay_count",
+        "addr_with_webtransport_count",
+        "addr_with_webrtc_count",
+        "addr_with_certhash_count",
         "session_peer_count",
         "peer_count",
         "trusted_peer_count",
@@ -3607,7 +3624,7 @@ mod tests {
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":4,\"cid\":\"cid5\",\"source\":\"cache\"}\n",
                 "{\"phase\":\"provider_lookup\",\"elapsed_ms\":10,\"cid\":\"cid2\",\"provider_count\":3,\"error\":\"dht: timeout\"}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":12,\"cid\":\"cid6\",\"ok\":false,\"trusted_peer_count\":1}\n",
-                "{\"phase\":\"bitswap_peer_expand\",\"elapsed_ms\":3,\"cid\":\"cid7\",\"tcp_addr_count\":4,\"quic_addr_count\":2,\"ws_addr_count\":1,\"wss_addr_count\":0,\"dns_addr_count\":1,\"ip4_addr_count\":3,\"ip6_addr_count\":1,\"provider_addr_count\":10,\"expanded_provider_addr_count\":12,\"supported_provider_addr_count\":4,\"rejected_provider_addr_count\":8,\"id_only_provider_count\":1,\"invalid_provider_id_count\":2,\"provider_without_supported_bitswap_addr_count\":3,\"unsupported_relay_addr_count\":4,\"unsupported_webtransport_addr_count\":1,\"unsupported_webrtc_addr_count\":1,\"unsupported_certhash_addr_count\":1,\"unsupported_transport_addr_count\":1,\"missing_peer_addr_count\":1,\"unparsable_addr_count\":1}\n",
+                "{\"phase\":\"bitswap_peer_expand\",\"elapsed_ms\":3,\"cid\":\"cid7\",\"tcp_addr_count\":4,\"quic_addr_count\":2,\"ws_addr_count\":1,\"wss_addr_count\":0,\"dns_addr_count\":1,\"ip4_addr_count\":3,\"ip6_addr_count\":1,\"provider_addr_count\":10,\"expanded_provider_addr_count\":12,\"supported_provider_addr_count\":4,\"rejected_provider_addr_count\":8,\"id_only_provider_count\":1,\"invalid_provider_id_count\":2,\"provider_without_supported_bitswap_addr_count\":3,\"unsupported_relay_addr_count\":4,\"unsupported_webtransport_addr_count\":1,\"unsupported_webrtc_addr_count\":1,\"unsupported_certhash_addr_count\":1,\"unsupported_transport_addr_count\":1,\"missing_peer_addr_count\":1,\"unparsable_addr_count\":1,\"addr_with_relay_count\":6,\"addr_with_webtransport_count\":2,\"addr_with_webrtc_count\":3,\"addr_with_certhash_count\":4}\n",
                 "{\"phase\":\"bitswap_session_shortcut_start\",\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1}\n",
                 "{\"phase\":\"bitswap_session_shortcut_post_lookup_wait\",\"cid\":\"cid8\",\"timeout_ms\":100}\n",
                 "{\"phase\":\"bitswap_session_shortcut\",\"elapsed_ms\":2,\"cid\":\"cid8\",\"peer_count\":1,\"trusted_peer_count\":1,\"ok\":true,\"source_peer\":\"peer1\",\"source_peer_trusted\":true}\n",
@@ -3799,6 +3816,15 @@ mod tests {
         );
         assert_eq!(summary.bitswap_provider_quality.missing_peer_addr_count, 1);
         assert_eq!(summary.bitswap_provider_quality.unparsable_addr_count, 1);
+        assert_eq!(summary.bitswap_provider_quality.addr_with_relay_count, 6);
+        assert_eq!(
+            summary
+                .bitswap_provider_quality
+                .addr_with_webtransport_count,
+            2
+        );
+        assert_eq!(summary.bitswap_provider_quality.addr_with_webrtc_count, 3);
+        assert_eq!(summary.bitswap_provider_quality.addr_with_certhash_count, 4);
         assert_eq!(summary.bitswap_connection_transports.len(), 1);
         assert_eq!(summary.bitswap_connection_transports[0].value, "tcp");
         assert_eq!(summary.bitswap_connection_transports[0].count, 1);
