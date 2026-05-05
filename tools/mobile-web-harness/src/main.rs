@@ -51,6 +51,9 @@ struct Args {
     /// Standalone gateway binary to spawn when --gateway-url is not provided.
     #[arg(long, env = "FREEDOM_IPFS_GATEWAY_BIN")]
     gateway_bin: Option<PathBuf>,
+    /// Build the default Rust gateway binary before spawning it.
+    #[arg(long)]
+    build_gateway: bool,
     /// SQLite cache DB path for spawned gateways; useful for fresh-process warm-store runs.
     #[arg(long)]
     gateway_db: Option<PathBuf>,
@@ -189,6 +192,7 @@ async fn run_comparison(args: &Args, corpus: &Corpus) -> Result<ComparisonReport
     kubo_args.compare_kubo = false;
     kubo_args.comparison_output = None;
     kubo_args.gateway_db = None;
+    kubo_args.build_gateway = false;
     kubo_args.trace_output = None;
     kubo_args.trace_filter = None;
 
@@ -201,6 +205,21 @@ async fn run_comparison(args: &Args, corpus: &Corpus) -> Result<ComparisonReport
         kubo,
         cases,
     })
+}
+
+async fn build_default_rust_gateway() -> Result<()> {
+    eprintln!("building Rust gateway with `cargo build -p freedom-ipfs-gateway`");
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("-p")
+        .arg("freedom-ipfs-gateway")
+        .status()
+        .await
+        .context("run cargo build -p freedom-ipfs-gateway")?;
+    if !status.success() {
+        bail!("cargo build -p freedom-ipfs-gateway failed with {status}");
+    }
+    Ok(())
 }
 
 async fn run_offline_replay(args: &Args, corpus: &Corpus) -> Result<OfflineReplayReport> {
@@ -273,11 +292,23 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
     if args.gateway_url.is_some() && args.gateway_db.is_some() {
         bail!("--gateway-db can only be used when the harness spawns the gateway");
     }
+    if args.gateway_url.is_some() && args.build_gateway {
+        bail!("--build-gateway can only be used when the harness spawns the Rust gateway");
+    }
+    if args.build_gateway && args.engine != HarnessEngine::Rust {
+        bail!("--build-gateway only applies to --engine rust");
+    }
+    if args.build_gateway && args.gateway_bin.is_some() {
+        bail!("--build-gateway cannot be combined with --gateway-bin");
+    }
     if args.engine == HarnessEngine::Kubo && args.gateway_db.is_some() {
         bail!("--gateway-db only applies to --engine rust");
     }
     if args.engine == HarnessEngine::Kubo && args.trace_output.is_some() {
         bail!("--trace-output is only supported for --engine rust");
+    }
+    if args.build_gateway {
+        build_default_rust_gateway().await?;
     }
     if args.gateway_url.is_none() {
         if let Some(gateway_db) = &args.gateway_db {
@@ -5687,6 +5718,12 @@ mod tests {
             args.delegated_router.as_deref(),
             Some("https://delegated-ipfs.dev/routing/v1,https://cid.contact/routing/v1")
         );
+    }
+
+    #[test]
+    fn args_accept_build_gateway_flag() {
+        let args = Args::try_parse_from(["mobile-web-harness", "--build-gateway"]).unwrap();
+        assert!(args.build_gateway);
     }
 
     #[test]

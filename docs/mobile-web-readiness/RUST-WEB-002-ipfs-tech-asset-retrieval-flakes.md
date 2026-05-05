@@ -8237,3 +8237,45 @@ attempts and connection-limit dial rejections, and worsened gateway request
 p95/max versus the kept `200ms` behavior. Keep the fixed `200ms` post-lookup
 grace for now; future work should use the gateway elapsed summary to look for
 cases where the wait repeatedly times out without increasing dial pressure.
+
+## 2026-05-05 Keep: Harness Gateway Build Flag
+
+Motivation:
+The adaptive post-lookup experiment initially produced a misleading run because
+`cargo run -p mobile-web-harness` rebuilt only the harness. The harness then
+spawned the stale `target/debug/freedom-ipfs-gateway`, so retrieval changes were
+not actually under test. Long-running experiments need a low-friction way to
+avoid that mistake.
+
+Implementation:
+
+- Add `mobile-web-harness --build-gateway`.
+- When spawning the default Rust gateway, run
+  `cargo build -p freedom-ipfs-gateway` once before measurement.
+- Reject invalid combinations with `--gateway-url`, `--engine kubo`, or a custom
+  `--gateway-bin`.
+- Clear the flag for the Kubo side of `--compare-kubo`.
+- Document the flag in `docs/mobile-web-readiness/README.md`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness args_accept_build_gateway_flag
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+timeout 180s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case vitalik-root-html-range \
+  --repeat 1 \
+  --timeout-secs 90 \
+  --run-timeout-secs 90 \
+  --trace-output /tmp/vitalik-build-gateway-flag-trace.jsonl \
+  --output /tmp/vitalik-build-gateway-flag.json
+git diff --check
+```
+
+Decision: keep. This is harness-only and prevents stale-binary measurements
+without changing the gateway, retrieval behavior, mobile ABI, or runtime
+resource profile.

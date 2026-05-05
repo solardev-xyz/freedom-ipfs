@@ -73,6 +73,11 @@ manual per-run JSON parsing. Rust-vs-Kubo comparison output prints p50 and p95
 root/asset TTFB ratios plus max RSS, FD, and storage ratios for quick terminal
 triage.
 
+When testing local gateway or retrieval changes, pass `--build-gateway` so the
+harness runs `cargo build -p freedom-ipfs-gateway` before spawning the default
+Rust gateway binary. This avoids accidentally measuring a stale
+`target/debug/freedom-ipfs-gateway` after editing shared crates.
+
 File responses include stable `ETag` validators. Original `/ipfs/...` file
 responses use `Cache-Control: public, max-age=31536000, immutable`; `/ipns/...`
 file responses use `Cache-Control: no-cache` so browsers revalidate mutable
