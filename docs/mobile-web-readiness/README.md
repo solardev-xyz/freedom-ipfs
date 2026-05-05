@@ -71,6 +71,13 @@ manual per-run JSON parsing. Rust-vs-Kubo comparison output prints p50 and p95
 root/asset TTFB ratios plus max RSS, FD, and storage ratios for quick terminal
 triage.
 
+File responses include stable `ETag` validators. Original `/ipfs/...` file
+responses use `Cache-Control: public, max-age=31536000, immutable`; `/ipns/...`
+file responses use `Cache-Control: no-cache` so browsers revalidate mutable
+names. Matching non-range `If-None-Match` requests return `304 Not Modified`,
+while range responses keep `ETag`, `Cache-Control`, `Accept-Ranges`, and
+`Content-Range`.
+
 For cache-completeness checks, pass `--offline-replay`. The harness starts a
 Rust gateway online against a persistent SQLite DB, runs the selected corpus,
 stops that gateway, restarts the same DB with `--routing-mode offline`, and
@@ -99,8 +106,8 @@ harness spawns the Rust gateway it forwards this path to the gateway, parses the
 JSONL events, and adds raw phase and mobile-style progress phase summaries to
 the report. This is the preferred way to distinguish DNSLink/name resolution,
 provider lookup, cache checks, Bitswap fetch, HTTP-provider fetch, retry,
-UnixFS path traversal, MIME sniffing, and gateway limiter behavior during live
-runs.
+UnixFS path traversal, MIME sniffing, conditional `304` handling, and gateway
+limiter behavior during live runs.
 The spawned gateway uses a trace-friendly filter by default whenever
 `--trace-output` is set, so an ambient `RUST_LOG=warn` will not hide phase
 events. Use `--trace-filter` only when intentionally overriding the default.

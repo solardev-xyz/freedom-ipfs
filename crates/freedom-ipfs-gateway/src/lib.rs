@@ -1,6 +1,9 @@
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
+use axum::http::header::{
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
+    RANGE,
+};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -30,6 +33,8 @@ const GATEWAY_STREAM_CHUNK_SIZE: u64 = 64 * 1024;
 const X_FREEDOM_REQUEST_ID: &str = "x-freedom-request-id";
 const X_FREEDOM_PARENT_REQUEST_ID: &str = "x-freedom-parent-request-id";
 const X_FREEDOM_TOP_LEVEL_PATH: &str = "x-freedom-top-level-path";
+const CACHE_CONTROL_IPFS_FILE: &str = "public, max-age=31536000, immutable";
+const CACHE_CONTROL_IPNS_FILE: &str = "no-cache";
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_PERSISTENT_NAME_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
@@ -73,6 +78,21 @@ pub struct GatewayState {
     name_resolver: Arc<dyn NameResolver>,
     unixfs: UnixfsResolver,
     request_limiter: Arc<Semaphore>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FileCachePolicy {
+    ImmutableIpfs,
+    RevalidateIpns,
+}
+
+impl FileCachePolicy {
+    fn header_value(self) -> &'static str {
+        match self {
+            Self::ImmutableIpfs => CACHE_CONTROL_IPFS_FILE,
+            Self::RevalidateIpns => CACHE_CONTROL_IPNS_FILE,
+        }
+    }
 }
 
 impl GatewayState {
@@ -355,6 +375,7 @@ async fn ipfs_get(
             state.unixfs.clone(),
             &path,
             headers.get(RANGE),
+            headers.get(IF_NONE_MATCH),
         )
         .await
         {
@@ -431,6 +452,7 @@ async fn ipns_get(
             state.name_resolver.as_ref(),
             &path,
             headers.get(RANGE),
+            headers.get(IF_NONE_MATCH),
         )
         .await
         {
@@ -468,8 +490,18 @@ async fn serve_ipfs_path(
     unixfs: UnixfsResolver,
     path: &str,
     range: Option<&HeaderValue>,
+    if_none_match: Option<&HeaderValue>,
 ) -> Result<Response, GatewayError> {
-    serve_ipfs_path_with_listing_path(provider, unixfs, path, range, None).await
+    serve_ipfs_path_with_listing_path(
+        provider,
+        unixfs,
+        path,
+        range,
+        if_none_match,
+        None,
+        FileCachePolicy::ImmutableIpfs,
+    )
+    .await
 }
 
 async fn serve_ipfs_path_with_listing_path(
@@ -477,7 +509,9 @@ async fn serve_ipfs_path_with_listing_path(
     unixfs: UnixfsResolver,
     path: &str,
     range: Option<&HeaderValue>,
+    if_none_match: Option<&HeaderValue>,
     listing_path: Option<&DirectoryListingPath>,
+    cache_policy: FileCachePolicy,
 ) -> Result<Response, GatewayError> {
     let parse_started = Instant::now();
     let (cid, unixfs_path) = split_ipfs_path(path)?;
@@ -502,6 +536,17 @@ async fn serve_ipfs_path_with_listing_path(
                 file_len = len,
                 elapsed_ms = resource_elapsed_ms
             );
+            let etag = file_etag(&cid, &path, len);
+            if range.is_none() && if_none_match_matches(if_none_match, &etag) {
+                tracing::info!(
+                    phase = "gateway_conditional",
+                    cid = %cid,
+                    unixfs_path = %path,
+                    etag = %etag,
+                    outcome = "not_modified"
+                );
+                return not_modified_response(&etag, cache_policy);
+            }
             let mime_started = Instant::now();
             let mime = mime_for_served_file(&unixfs, provider.as_ref(), &cid, &path, len)?;
             tracing::info!(
@@ -511,10 +556,15 @@ async fn serve_ipfs_path_with_listing_path(
                 mime = %mime,
                 elapsed_ms = mime_started.elapsed().as_millis()
             );
+            let headers = FileResponseHeaders {
+                mime: &mime,
+                etag: &etag,
+                cache_policy,
+            };
             if let Some(range) = range {
-                ranged_response(provider, unixfs.clone(), cid, path, len, range, &mime)?
+                ranged_response(provider, unixfs.clone(), cid, path, len, range, headers)?
             } else {
-                streaming_response(provider, unixfs.clone(), cid, path, len, &mime)?
+                streaming_response(provider, unixfs.clone(), cid, path, len, headers)?
             }
         }
         ServedResource::Directory { path, entries } => {
@@ -803,6 +853,7 @@ async fn serve_ipns_path(
     name_resolver: &dyn NameResolver,
     path: &str,
     range: Option<&HeaderValue>,
+    if_none_match: Option<&HeaderValue>,
 ) -> Result<Response, GatewayError> {
     let listing_path = DirectoryListingPath::ipns(path);
     let mut target = format!("/ipns/{path}");
@@ -814,7 +865,9 @@ async fn serve_ipns_path(
                 unixfs.clone(),
                 ipfs,
                 range,
+                if_none_match,
                 Some(&listing_path),
+                FileCachePolicy::RevalidateIpns,
             )
             .await;
         }
@@ -960,13 +1013,20 @@ fn percent_encode_segment(segment: &str) -> String {
     out
 }
 
+#[derive(Clone, Copy)]
+struct FileResponseHeaders<'a> {
+    mime: &'a str,
+    etag: &'a str,
+    cache_policy: FileCachePolicy,
+}
+
 fn streaming_response(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
     cid: Cid,
     path: String,
     len: u64,
-    mime: &str,
+    headers: FileResponseHeaders<'_>,
 ) -> Result<Response, GatewayError> {
     let provider = Arc::new(ScopedBlockProvider::new(provider));
     let stream = stream::unfold(Some(0u64), move |offset| {
@@ -1000,7 +1060,8 @@ fn streaming_response(
     let mut response = Body::from_stream(stream).into_response();
     response.headers_mut().insert(
         CONTENT_TYPE,
-        HeaderValue::from_str(mime).map_err(|err| GatewayError::Internal(err.to_string()))?,
+        HeaderValue::from_str(headers.mime)
+            .map_err(|err| GatewayError::Internal(err.to_string()))?,
     );
     response
         .headers_mut()
@@ -1010,6 +1071,7 @@ fn streaming_response(
         HeaderValue::from_str(&len.to_string())
             .map_err(|err| GatewayError::Internal(err.to_string()))?,
     );
+    insert_cache_headers(&mut response, headers.etag, headers.cache_policy)?;
     Ok(response)
 }
 
@@ -1074,7 +1136,7 @@ fn ranged_response(
     path: String,
     total_len: u64,
     range: &HeaderValue,
-    mime: &str,
+    headers: FileResponseHeaders<'_>,
 ) -> Result<Response, GatewayError> {
     let range = range
         .to_str()
@@ -1118,7 +1180,8 @@ fn ranged_response(
     *response.status_mut() = StatusCode::PARTIAL_CONTENT;
     response.headers_mut().insert(
         CONTENT_TYPE,
-        HeaderValue::from_str(mime).map_err(|err| GatewayError::Internal(err.to_string()))?,
+        HeaderValue::from_str(headers.mime)
+            .map_err(|err| GatewayError::Internal(err.to_string()))?,
     );
     response
         .headers_mut()
@@ -1133,7 +1196,52 @@ fn ranged_response(
         HeaderValue::from_str(&(end - start + 1).to_string())
             .map_err(|err| GatewayError::Internal(err.to_string()))?,
     );
+    insert_cache_headers(&mut response, headers.etag, headers.cache_policy)?;
     Ok(response)
+}
+
+fn not_modified_response(
+    etag: &str,
+    cache_policy: FileCachePolicy,
+) -> Result<Response, GatewayError> {
+    let mut response = StatusCode::NOT_MODIFIED.into_response();
+    insert_cache_headers(&mut response, etag, cache_policy)?;
+    Ok(response)
+}
+
+fn insert_cache_headers(
+    response: &mut Response,
+    etag: &str,
+    cache_policy: FileCachePolicy,
+) -> Result<(), GatewayError> {
+    response.headers_mut().insert(
+        ETAG,
+        HeaderValue::from_str(etag).map_err(|err| GatewayError::Internal(err.to_string()))?,
+    );
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static(cache_policy.header_value()),
+    );
+    Ok(())
+}
+
+fn file_etag(cid: &Cid, path: &str, len: u64) -> String {
+    let path = if path.is_empty() {
+        ".".to_string()
+    } else {
+        encode_gateway_path(path)
+    };
+    format!("\"fi1:{cid}:{path}:{len}\"")
+}
+
+fn if_none_match_matches(value: Option<&HeaderValue>, etag: &str) -> bool {
+    let Some(value) = value.and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    value.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*" || candidate == etag || candidate.strip_prefix("W/") == Some(etag)
+    })
 }
 
 fn parse_range_spec(spec: &str, len: u64) -> Result<(u64, u64), GatewayError> {
@@ -1295,6 +1403,87 @@ mod tests {
         let response = reqwest::get(url).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(data));
+    }
+
+    #[tokio::test]
+    async fn ipfs_file_responses_include_etag_and_support_not_modified() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"<html>cache me</html>";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(store);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/ipfs/{cid}");
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response.headers().get(ETAG).unwrap().clone();
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static(CACHE_CONTROL_IPFS_FILE)
+        );
+        assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(data));
+
+        let response = client
+            .get(&url)
+            .header(IF_NONE_MATCH, etag.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers().get(ETAG), Some(&etag));
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static(CACHE_CONTROL_IPFS_FILE)
+        );
+        assert!(response.bytes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn range_requests_include_etag_but_ignore_if_none_match() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"0123456789";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(store);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/ipfs/{cid}");
+        let etag = file_etag(&cid, "", data.len() as u64);
+        let response = client
+            .get(url)
+            .header(RANGE, "bytes=2-5")
+            .header(IF_NONE_MATCH, &etag)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(CONTENT_RANGE).unwrap(),
+            HeaderValue::from_static("bytes 2-5/10")
+        );
+        assert_eq!(
+            response.headers().get(ETAG).unwrap(),
+            HeaderValue::from_str(&etag).unwrap()
+        );
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static(CACHE_CONTROL_IPFS_FILE)
+        );
+        assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(b"2345"));
     }
 
     #[tokio::test]
@@ -1812,6 +2001,50 @@ mod tests {
         let response = reqwest::get(url).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(data));
+    }
+
+    #[tokio::test]
+    async fn ipns_file_responses_use_revalidation_cache_policy() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"<html>ipns cache</html>";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router_with_provider_and_name_resolver(
+            Arc::new(store),
+            Arc::new(StaticNameResolver {
+                name: "example.com".to_string(),
+                target: format!("/ipfs/{cid}"),
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/ipns/example.com");
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response.headers().get(ETAG).unwrap().clone();
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static(CACHE_CONTROL_IPNS_FILE)
+        );
+
+        let response = client
+            .get(&url)
+            .header(IF_NONE_MATCH, format!("W/{}", etag.to_str().unwrap()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers().get(ETAG), Some(&etag));
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static(CACHE_CONTROL_IPNS_FILE)
+        );
     }
 
     #[tokio::test]

@@ -530,6 +530,7 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         | "unixfs_file_size"
         | "unixfs_index_lookup"
         | "unixfs_list_directory" => "streaming",
+        "gateway_conditional" => "cache_hit",
         "gateway_limiter" if fields.get("acquired").map(String::as_str) == Some("false") => {
             "failed"
         }
@@ -2002,6 +2003,17 @@ mod tests {
                 "active",
             ),
             "streaming"
+        );
+        assert_eq!(
+            progress_phase(
+                "gateway_conditional",
+                &progress_fields([
+                    ("phase", "gateway_conditional"),
+                    ("outcome", "not_modified")
+                ]),
+                "active",
+            ),
+            "cache_hit"
         );
         assert_eq!(
             progress_phase(

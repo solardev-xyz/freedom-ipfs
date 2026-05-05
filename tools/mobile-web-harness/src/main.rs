@@ -4584,6 +4584,7 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         | "unixfs_file_size"
         | "unixfs_index_lookup"
         | "unixfs_list_directory" => "streaming",
+        "gateway_conditional" => "cache_hit",
         "gateway_limiter"
             if value
                 .get("acquired")
@@ -5346,6 +5347,7 @@ mod tests {
                 "{\"phase\":\"bitswap_peer_expand\",\"cid\":\"cid-a\",\"peer_count\":2}\n",
                 "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer-a\",\"transport\":\"tcp\"}\n",
                 "{\"phase\":\"unixfs_resource\",\"path\":\"/ipns/site/\",\"ok\":true}\n",
+                "{\"phase\":\"gateway_conditional\",\"path\":\"/ipns/site/\",\"outcome\":\"not_modified\"}\n",
                 "{\"phase\":\"bitswap_request_timeout\",\"cid\":\"cid-a\",\"peer_count\":2}\n",
                 "{\"phase\":\"bitswap_connection_error\",\"peer\":\"peer-b\",\"error\":\"timeout\"}\n",
                 "{\"phase\":\"gateway_limiter\",\"acquired\":false}\n",
@@ -5383,7 +5385,7 @@ mod tests {
             trace_value_count(&summary.progress_phases, "checking_cache"),
             1
         );
-        assert_eq!(trace_value_count(&summary.progress_phases, "cache_hit"), 1);
+        assert_eq!(trace_value_count(&summary.progress_phases, "cache_hit"), 2);
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_http_provider"),
             1

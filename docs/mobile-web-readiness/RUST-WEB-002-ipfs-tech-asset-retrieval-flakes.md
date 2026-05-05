@@ -6094,3 +6094,50 @@ for the original URL while the resolved name record is TTL-valid. This keeps the
 node read-only and cache-only offline; the remaining product decision is how
 strictly the app should treat expired mutable-name records versus offering a
 host-side "last resolved immutable path" replay affordance.
+
+## 2026-05-05 Browser Cache Validators
+
+Hypothesis: WebKit can avoid unnecessary local-gateway reads on repeated loads
+if immutable content carries stable validators and mutable name paths are cheap
+to revalidate.
+
+Implementation:
+
+- Add stable file ETags derived from root CID, resolved UnixFS file path, and
+  file length.
+- Add `Cache-Control: public, max-age=31536000, immutable` for original
+  `/ipfs/...` file responses.
+- Add `Cache-Control: no-cache` for original `/ipns/...` file responses so the
+  browser revalidates mutable names rather than treating them as immutable.
+- Return `304 Not Modified` for matching non-range `If-None-Match` requests
+  before MIME sniffing or streaming file bytes.
+- Keep range semantics intact: range requests still return `206` with `ETag`,
+  `Cache-Control`, `Accept-Ranges`, `Content-Range`, and the requested slice.
+- Map the new `gateway_conditional` trace phase to mobile/harness progress
+  `cache_hit`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-gateway
+cargo test -p freedom-ipfs-mobile
+cargo test -p mobile-web-harness
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
+
+Result: validation passed. Deterministic gateway tests cover:
+
+- `/ipfs` `ETag` and immutable `Cache-Control`
+- matching `If-None-Match` returning `304 Not Modified`
+- `/ipns` file responses using revalidation cache policy
+- weak `If-None-Match` matching for `/ipns`
+- range requests retaining `206`, `Content-Range`, `ETag`, and
+  `Cache-Control` while ignoring `If-None-Match`
+
+Conclusion: this is a low-risk warm-path and browser-compatibility improvement.
+It does not change retrieval, routing, or block verification; it only lets a
+browser avoid asking the Rust node to stream bytes again when its local cached
+copy is still valid.
