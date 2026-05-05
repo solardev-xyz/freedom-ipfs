@@ -15,6 +15,7 @@ use thiserror::Error;
 
 const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_HOT_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+const HOT_CACHE_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_NAME_CACHE_RECORDS: i64 = 128;
 
 #[derive(Debug, Error)]
@@ -144,7 +145,7 @@ impl SqliteBlockStore {
         )?;
         self.evict_if_needed()?;
         if self.block_exists(&cid_bytes)? {
-            self.hot.lock().put(cid_bytes, data.to_vec());
+            self.hot.lock().put(cid_bytes, data.to_vec(), now);
         } else {
             self.hot.lock().remove(&cid_bytes);
         }
@@ -157,10 +158,13 @@ impl SqliteBlockStore {
 
     pub fn get(&self, cid: &Cid) -> Result<Option<Block>> {
         let cid_bytes = block_key(cid);
-        if let Some(data) = self.hot.lock().get(&cid_bytes) {
-            verify_block(cid, &data)?;
-            self.touch(cid)?;
-            return Ok(Some(Block::unchecked(*cid, data)));
+        let now = now_secs();
+        if let Some(hit) = self.hot.lock().get(&cid_bytes, now) {
+            verify_block(cid, &hit.data)?;
+            if hit.touch_persistent {
+                self.touch_at(cid, now)?;
+            }
+            return Ok(Some(Block::unchecked(*cid, hit.data)));
         }
 
         let row = self
@@ -176,8 +180,8 @@ impl SqliteBlockStore {
         match row {
             Some(data) => {
                 verify_block(cid, &data)?;
-                self.touch(cid)?;
-                self.hot.lock().put(cid_bytes, data.clone());
+                self.touch_at(cid, now)?;
+                self.hot.lock().put(cid_bytes, data.clone(), now);
                 Ok(Some(Block::unchecked(*cid, data)))
             }
             None => Ok(None),
@@ -381,10 +385,10 @@ impl SqliteBlockStore {
         self.evict_until(max_bytes)
     }
 
-    fn touch(&self, cid: &Cid) -> Result<()> {
+    fn touch_at(&self, cid: &Cid, now: u64) -> Result<()> {
         self.conn.lock().execute(
             "UPDATE blocks SET last_accessed_at = ?1 WHERE cid = ?2",
-            params![now_secs() as i64, block_key(cid)],
+            params![now as i64, block_key(cid)],
         )?;
         Ok(())
     }
@@ -530,6 +534,12 @@ struct HotCache {
 struct HotBlock {
     data: Vec<u8>,
     last_accessed: u64,
+    last_persistent_touch: u64,
+}
+
+struct HotCacheHit {
+    data: Vec<u8>,
+    touch_persistent: bool,
 }
 
 impl HotCache {
@@ -542,14 +552,22 @@ impl HotCache {
         }
     }
 
-    fn get(&mut self, cid: &[u8]) -> Option<Vec<u8>> {
+    fn get(&mut self, cid: &[u8], now: u64) -> Option<HotCacheHit> {
         let entry = self.entries.get_mut(cid)?;
         self.clock = self.clock.saturating_add(1);
         entry.last_accessed = self.clock;
-        Some(entry.data.clone())
+        let touch_persistent =
+            now.saturating_sub(entry.last_persistent_touch) >= HOT_CACHE_TOUCH_INTERVAL.as_secs();
+        if touch_persistent {
+            entry.last_persistent_touch = now;
+        }
+        Some(HotCacheHit {
+            data: entry.data.clone(),
+            touch_persistent,
+        })
     }
 
-    fn put(&mut self, cid: Vec<u8>, data: Vec<u8>) {
+    fn put(&mut self, cid: Vec<u8>, data: Vec<u8>, now: u64) {
         if self.max_bytes == 0 || data.len() as u64 > self.max_bytes {
             self.remove(&cid);
             return;
@@ -564,6 +582,7 @@ impl HotCache {
             HotBlock {
                 data,
                 last_accessed: self.clock,
+                last_persistent_touch: now,
             },
         );
         self.evict_if_needed();
@@ -690,6 +709,39 @@ mod tests {
     }
 
     #[test]
+    fn hot_cache_hit_skips_redundant_sqlite_touch() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"hot cache touch skip";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+        set_block_last_accessed_at(&store, &cid, 1);
+
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), data);
+
+        assert_eq!(block_last_accessed_at(&store, &cid), 1);
+    }
+
+    #[test]
+    fn hot_cache_hit_periodically_refreshes_sqlite_touch() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"hot cache touch refresh";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+        set_block_last_accessed_at(&store, &cid, 1);
+        store
+            .hot
+            .lock()
+            .entries
+            .get_mut(&block_key(&cid))
+            .unwrap()
+            .last_persistent_touch = 0;
+
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), data);
+
+        assert!(block_last_accessed_at(&store, &cid) > 1);
+    }
+
+    #[test]
     fn trim_removes_hot_cache_entries() {
         let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
         let data = b"hot cache trim";
@@ -763,6 +815,29 @@ mod tests {
         store.trim_blocks_to(0).unwrap();
 
         assert_eq!(store.block_count().unwrap(), 0);
+    }
+
+    fn set_block_last_accessed_at(store: &SqliteBlockStore, cid: &Cid, value: i64) {
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE blocks SET last_accessed_at = ?1 WHERE cid = ?2",
+                params![value, block_key(cid)],
+            )
+            .unwrap();
+    }
+
+    fn block_last_accessed_at(store: &SqliteBlockStore, cid: &Cid) -> i64 {
+        store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT last_accessed_at FROM blocks WHERE cid = ?1",
+                params![block_key(cid)],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     #[test]

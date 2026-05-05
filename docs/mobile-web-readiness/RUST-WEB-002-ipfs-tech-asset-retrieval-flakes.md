@@ -9328,3 +9328,65 @@ cargo test -p mobile-web-harness
 
 Result: both passed. This is diagnostics-only; it does not change gateway,
 retrieval, network, verification, caching, or serving behavior.
+
+## 2026-05-05 Keep: Throttle Hot-Cache SQLite Touches
+
+Hypothesis:
+Warm same-process page loads still spend local time in `block_store_get` even
+when blocks are served from the in-memory hot cache. The store updated
+`blocks.last_accessed_at` in SQLite on every hot-cache hit, which adds lock and
+write work directly on the warm gateway path. Throttling those persistent LRU
+touches should reduce warm-path overhead while keeping long-session eviction
+metadata fresh enough.
+
+Implementation:
+
+- Add `HOT_CACHE_TOUCH_INTERVAL = 30s`.
+- Track `last_persistent_touch` per hot-cache entry.
+- On hot-cache hits, verify the hot block as before, but skip the SQLite
+  `last_accessed_at` update until the entry has not refreshed persistent LRU
+  metadata for at least `30s`.
+- Keep SQLite touches on cold cache reads and block writes.
+- Keep eviction, block verification, retention, trimming, and cache clearing
+  semantics unchanged.
+
+Validation and live run:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-store
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-hot-touch-rust-vs-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-hot-touch-rust-vs-kubo-r3.json
+```
+
+Result:
+
+- Store tests passed, including focused tests proving repeated hot hits skip the
+  SQLite touch and aged hot entries still refresh persistent LRU metadata.
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `22/787ms`, Kubo `3/2351ms`.
+- Asset TTFB p50/p95: Rust `17/235ms`, Kubo `3/149ms`.
+- Gateway request elapsed p50/p90/p95/max: `11/163/234/772ms`.
+- RSS/FD stayed bounded at `49600KiB`/`28`.
+- Compared with the preceding cap-3/source-mode run
+  `/tmp/ipfs-tech-source-modes-rust-vs-kubo-r3.*`, block-store cache-hit elapsed
+  improved from p50/p90/p95/max `1/15/17/26ms` to `0/10/13/15ms`. Cache-hit
+  events with nonzero elapsed fell from `84/144` to `72/144`.
+
+Decision: keep. This is a narrow warm-path local-store optimization: it removes
+redundant SQLite writes during hot same-process reloads, preserves verified
+block serving, and still periodically refreshes persistent LRU timestamps for
+long sessions. The live TTFB numbers remain noisy, but the trace-level
+`block_store_get` improvement is directly on the intended path and resource
+usage did not regress.
