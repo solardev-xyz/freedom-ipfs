@@ -1381,19 +1381,34 @@ async fn run_shared_bitswap_swarm(
                 }
 
                 let control = control.clone();
+                let cid = command.cid;
+                let mut respond = command.respond;
                 let dial_errors = dial_errors.clone();
                 let peer_transports = peer_transports.clone();
+                let fetch_started = Instant::now();
                 fetches.push(Box::pin(async move {
-                    let result = fetch_bitswap_with_incoming_streams(
-                        control,
-                        peer_targets,
-                        command.cid,
-                        incoming_results,
-                        dial_errors,
-                        peer_transports,
-                    ).await;
-                    let _ = command.respond.send(result);
-                    command.cid
+                    let result = tokio::select! {
+                        result = fetch_bitswap_with_incoming_streams(
+                            control,
+                            peer_targets,
+                            cid,
+                            incoming_results,
+                            dial_errors,
+                            peer_transports,
+                        ) => Some(result),
+                        _ = respond.closed() => None,
+                    };
+                    if let Some(result) = result {
+                        let _ = respond.send(result);
+                    } else {
+                        tracing::info!(
+                            phase = "bitswap_fetch_cancelled",
+                            cid = %cid,
+                            command_queued_ms,
+                            elapsed_ms = fetch_started.elapsed().as_millis()
+                        );
+                    }
+                    cid
                 }));
             }
             Some(cid) = fetches.next(), if !fetches.is_empty() => {

@@ -3748,3 +3748,97 @@ Decision: keep. This is harness-only and does not change gateway or retrieval
 behavior. It makes future session batching experiments easier to judge by
 showing whether a change actually lowers dial pressure or merely shifts latency
 elsewhere.
+
+## 2026-05-05 Cancel Dropped Bitswap Commands
+
+Hypothesis:
+The provider-lookup/session shortcut race can drop a `SharedBitswapClient::fetch`
+future after the bounded post-lookup wait, but the shared swarm command may keep
+running until completion even though the caller no longer wants the result.
+Cancelling work when the response receiver is dropped should reduce hidden
+Bitswap dials and inbound block traffic without changing the successful path.
+
+Implementation:
+
+- In `run_shared_bitswap_swarm`, race each per-command Bitswap fetch against
+  `respond.closed()`.
+- If the receiver is dropped first, abort the command future, let the normal
+  pending-count cleanup remove the CID when appropriate, and trace
+  `bitswap_fetch_cancelled` with `command_queued_ms` and `elapsed_ms`.
+- This does not change provider discovery, candidate ordering, request
+  timeouts, block verification, or cache writes.
+
+Prototype validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib recent_bitswap
+cargo build -p freedom-ipfs-gateway
+```
+
+Live prototype run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-cancel-dropped-bitswap-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-cancel-dropped-bitswap-r3.json
+```
+
+Result: Rust and Kubo both passed `3/3`. Rust root TTFB p50/p95 was
+`1842/2768ms` versus Kubo `1977/2207ms`; Rust asset p50/p95 was `137/1015ms`
+versus Kubo `147/1771ms`. The trace showed `bitswap_fetch_cancelled=23`,
+`session_shortcut_hits=78`, `bitswap_fetches=27`, `peer_attempt_starts=432`,
+`new_dial_peers=114`, and inbound Bitswap bytes `2395134`.
+
+Same-window no-cancel baseline from a detached worktree at `18dcf3a`:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-nocancel-18dcf3a-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-nocancel-18dcf3a-r3.json
+```
+
+Baseline result: Rust and Kubo both passed `3/3`. Rust root p50/p95 was
+`1022/2604ms` versus Kubo `1613/2219ms`; Rust asset p50/p95 was `148/1101ms`
+versus Kubo `139/861ms`. No-cancel trace totals were
+`session_shortcut_hits=74`, `bitswap_fetches=31`, `peer_attempt_starts=490`,
+`new_dial_peers=133`, and inbound Bitswap bytes `2950417`.
+
+Regression check:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/cancel-dropped-bitswap-regression-r3-trace.jsonl \
+  --comparison-output /tmp/cancel-dropped-bitswap-regression-r3.json
+```
+
+`vitalik-root-html-range` passed `3/3` for both Rust and Kubo; Rust root
+p50/p95 was `365/547ms` versus Kubo `1884/1899ms`. `daicowtf-page-assets`
+failed `0/3` for both Rust and Kubo with root timeouts, so this is not a
+Rust-only regression signal.
+
+Decision: keep. The root p95 was slightly worse in the `ipfs.tech` A/B window,
+but the prototype reduced hidden Bitswap work in the intended direction:
+peer attempts `490 -> 432`, new dial peers `133 -> 114`, inbound bytes
+`2950417 -> 2395134`, and asset p95 `1101ms -> 1015ms`. This is aligned with
+mobile resource goals and removes work after the caller has already moved on.
