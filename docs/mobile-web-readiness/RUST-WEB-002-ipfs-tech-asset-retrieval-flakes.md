@@ -3988,3 +3988,47 @@ Decision: keep. The `6s` cap improved the same-window `ipfs.tech` root and
 asset tails, reduced peer attempts `552 -> 427`, and lowered inbound pending
 age `1601ms -> 1064ms` without producing a Rust-only regression. This is
 consistent with the inbound-delivery model and mobile resource goals.
+
+Rejected follow-up: lower `BITSWAP_STREAM_READ_TIMEOUT` further from `6s` to
+`4s`.
+
+Focused validation for the prototype passed:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib want_have_probe_falls_back_to_want_block_quickly
+cargo test -p freedom-ipfs-retrieval --lib dropped_bitswap_fetch_cancels_open_peer_stream
+cargo test -p freedom-ipfs-retrieval --lib fetches_block_from_local_bitswap_peer
+cargo build -p freedom-ipfs-gateway
+```
+
+Live `4s` run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 6 \
+  --compare-kubo \
+  --run-timeout-secs 120 \
+  --trace-output /tmp/ipfs-tech-stream-read4-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-stream-read4-r3.json
+```
+
+Result: Rust and Kubo both passed `3/3`, but Rust tail latency regressed
+badly. Rust root TTFB p50/p95 was `1376/15765ms` versus Kubo `1946/3246ms`;
+Rust asset p50/p95 was `155/846ms` versus Kubo `122/415ms`. Resource usage
+remained mobile-friendly at RSS/FD `51156KiB`/`51` versus Kubo
+`264432KiB`/`333`, but the root tail was unacceptable.
+
+Trace summary from `/tmp/ipfs-tech-stream-read4-r3-trace.jsonl`:
+`bitswap_fetches=21`, `session_shortcut_hits=85`,
+`bitswap_fetch_cancelled=15`, `peer_attempt_starts=380`, inbound
+`max_oldest_pending_ms=1365`, `bitswap deliveries: incoming=105`, and one
+`bitswap_request_timeout_detail` at `15001ms`.
+
+Decision: reject. The `4s` stream cap reduced attempt pressure further but
+introduced a severe request-level root TTFB tail, including a full `15s`
+Bitswap request timeout. Keep `6s` as the current balance point unless a later
+change makes earlier stream cutoff safe.
