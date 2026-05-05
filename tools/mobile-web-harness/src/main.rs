@@ -1042,9 +1042,13 @@ fn print_trace_timeout_recovery(trace: &TraceSummary) {
     }
     let recovery = &trace.bitswap_timeout_recovery;
     println!(
-        "  bitswap timeout recovery: request_timeout_details={} mixed_trusted={} request_timeout_events={} reset_true={} reset_false={} client_resets={} retry_starts={} same_provider_retries={} refreshed_provider_retries={} retry_successes={} trusted_retry_successes={} untrusted_retry_successes={} retry_failures={} retry_unresolved={} retry_success_elapsed={}",
+        "  bitswap timeout recovery: request_timeout_details={} cold={} mixed_trusted={} trusted_only={} timeout_ms={} max_peers={} request_timeout_events={} reset_true={} reset_false={} client_resets={} retry_starts={} same_provider_retries={} refreshed_provider_retries={} retry_successes={} trusted_retry_successes={} untrusted_retry_successes={} retry_failures={} retry_unresolved={} retry_success_elapsed={}",
         recovery.request_timeouts,
+        recovery.cold_request_timeouts,
         recovery.mixed_trusted_request_timeouts,
+        recovery.trusted_only_request_timeouts,
+        format_trace_counts(&recovery.request_timeout_budgets),
+        recovery.max_request_timeout_peer_count,
         recovery.request_timeout_events,
         recovery.request_timeout_reset_true,
         recovery.request_timeout_reset_false,
@@ -3061,7 +3065,11 @@ struct TraceBitswapIncomingBlockAggregate {
 #[derive(Debug, Serialize)]
 struct TraceBitswapTimeoutRecoveryAggregate {
     request_timeouts: usize,
+    cold_request_timeouts: usize,
     mixed_trusted_request_timeouts: usize,
+    trusted_only_request_timeouts: usize,
+    request_timeout_budgets: Vec<TraceValueCount>,
+    max_request_timeout_peer_count: u128,
     request_timeout_events: usize,
     request_timeout_reset_true: usize,
     request_timeout_reset_false: usize,
@@ -3092,7 +3100,11 @@ impl TraceBitswapTimeoutRecoveryAggregate {
 #[derive(Default)]
 struct TraceBitswapTimeoutRecoveryBuilder {
     request_timeouts: usize,
+    cold_request_timeouts: usize,
     mixed_trusted_request_timeouts: usize,
+    trusted_only_request_timeouts: usize,
+    request_timeout_budgets: BTreeMap<String, usize>,
+    max_request_timeout_peer_count: u128,
     request_timeout_events: usize,
     request_timeout_reset_true: usize,
     request_timeout_reset_false: usize,
@@ -3114,7 +3126,11 @@ impl TraceBitswapTimeoutRecoveryBuilder {
     ) -> TraceBitswapTimeoutRecoveryAggregate {
         TraceBitswapTimeoutRecoveryAggregate {
             request_timeouts: self.request_timeouts,
+            cold_request_timeouts: self.cold_request_timeouts,
             mixed_trusted_request_timeouts: self.mixed_trusted_request_timeouts,
+            trusted_only_request_timeouts: self.trusted_only_request_timeouts,
+            request_timeout_budgets: sorted_trace_counts(self.request_timeout_budgets),
+            max_request_timeout_peer_count: self.max_request_timeout_peer_count,
             request_timeout_events: self.request_timeout_events,
             request_timeout_reset_true: self.request_timeout_reset_true,
             request_timeout_reset_false: self.request_timeout_reset_false,
@@ -3494,6 +3510,20 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 .get("trusted_peer_count")
                 .and_then(json_u128)
                 .unwrap_or_default();
+            bitswap_timeout_recovery.max_request_timeout_peer_count = bitswap_timeout_recovery
+                .max_request_timeout_peer_count
+                .max(peer_count);
+            if let Some(timeout_ms) = value.get("timeout_ms").and_then(json_u128) {
+                *bitswap_timeout_recovery
+                    .request_timeout_budgets
+                    .entry(timeout_ms.to_string())
+                    .or_default() += 1;
+            }
+            if trusted_peer_count == 0 {
+                bitswap_timeout_recovery.cold_request_timeouts += 1;
+            } else if peer_count == trusted_peer_count {
+                bitswap_timeout_recovery.trusted_only_request_timeouts += 1;
+            }
             if trusted_peer_count > 0 && peer_count > trusted_peer_count {
                 bitswap_timeout_recovery.mixed_trusted_request_timeouts += 1;
             }
@@ -4771,12 +4801,33 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(summary.bitswap_timeout_recovery.request_timeouts, 2);
+        assert_eq!(summary.bitswap_timeout_recovery.cold_request_timeouts, 1);
         assert_eq!(
             summary
                 .bitswap_timeout_recovery
                 .mixed_trusted_request_timeouts,
             1
         );
+        assert_eq!(
+            summary
+                .bitswap_timeout_recovery
+                .trusted_only_request_timeouts,
+            0
+        );
+        assert_eq!(
+            summary
+                .bitswap_timeout_recovery
+                .max_request_timeout_peer_count,
+            10
+        );
+        let timeout_budgets = summary
+            .bitswap_timeout_recovery
+            .request_timeout_budgets
+            .iter()
+            .map(|budget| (budget.value.as_str(), budget.count))
+            .collect::<Vec<_>>();
+        assert!(timeout_budgets.contains(&("4000", 1)));
+        assert!(timeout_budgets.contains(&("15000", 1)));
         assert_eq!(summary.bitswap_timeout_recovery.request_timeout_events, 2);
         assert_eq!(
             summary.bitswap_timeout_recovery.request_timeout_reset_true,

@@ -5192,3 +5192,46 @@ Decision: reject and revert. The live failure shape was cold root request
 timeouts, not repeated per-peer connection-ready failures. Suppressing
 connection-timeout peers may still be useful later, but this run gives no
 evidence that it helps the current `ipfs.tech` failure mode.
+
+## 2026-05-05 Keep: Classify Bitswap Request Timeouts
+
+Goal:
+
+- Make cold root request-timeout failures obvious in the harness summary.
+- Avoid manually grepping `bitswap_request_timeout_detail` events to distinguish
+  cold, mixed trusted/provider, and trusted-only timeout shapes.
+
+Implementation:
+
+- Extend `bitswap_timeout_recovery` with:
+  - `cold_request_timeouts`
+  - `trusted_only_request_timeouts`
+  - `request_timeout_budgets`
+  - `max_request_timeout_peer_count`
+- Keep the existing `mixed_trusted_request_timeouts`, retry recovery, and reset
+  outcome counters.
+- Print the new fields in normal and Rust/Kubo comparison trace summaries.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_bitswap_timeout_recovery
+cargo test -p mobile-web-harness
+git diff --check
+```
+
+Motivation from the immediately preceding rejected live runs:
+
+- `/tmp/ipfs-tech-request-timeout-reset-cooldown-r3.json` showed
+  `request_timeout_details=6 mixed_trusted=0`, Rust `0/3`, Kubo `3/3`, and root
+  p50/p95 around `30s`.
+- `/tmp/ipfs-tech-connection-timeout-suppression-r3.json` showed the same cold
+  shape: `request_timeout_details=6 mixed_trusted=0`, Rust `0/3`, Kubo `3/3`,
+  and no successful asset fetches.
+
+Decision: keep. This is diagnostics-only. The next live run will now print
+whether request timeouts are cold (`trusted_peer_count=0`), mixed
+trusted/provider, or trusted-only, and which timeout budget fired (`4000ms` vs
+`15000ms`). That prevents the warm-session and cold-root failure modes from
+being conflated.
