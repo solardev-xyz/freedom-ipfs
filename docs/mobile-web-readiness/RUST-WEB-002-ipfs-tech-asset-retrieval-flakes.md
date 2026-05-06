@@ -26435,3 +26435,81 @@ race work: in the current focused r10 it produced only one pre-lookup hit out
 of `330` waits. Removing it improved `ipfs.tech` asset p50 and p95 in focused
 and multi-case samples, preserved root wins, and kept RSS/FDs far below Kubo.
 Continue watching Bitswap attempt/connection counts in future guardrails.
+
+## 2026-05-06 Reject: Delaying Session Shortcut Start After Zero Pre-Lookup Grace
+
+Hypothesis:
+After promoting `0ms` pre-lookup grace, provider lookup starts immediately but
+the recent Bitswap session shortcut also starts immediately. The focused r10
+showed more Bitswap attempts/connections than the old `50ms` pre-lookup
+baseline. Add a lab knob for a tiny session-shortcut start delay and test
+whether `25ms` preserves most of the new latency win while reducing background
+Bitswap churn.
+
+Implementation:
+
+- Add env override:
+  `FREEDOM_IPFS_BITSWAP_SESSION_SHORTCUT_GRACE_MS`.
+- Default remains `0ms`.
+- The knob only delays the start of the recent-peer shortcut; provider lookup
+  still starts immediately with the new `0ms` pre-lookup default.
+
+Validation before live run:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval shortcut_grace_env_value_parses_override
+cargo check -p freedom-ipfs-retrieval --all-targets
+```
+
+All passed.
+
+Command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_SESSION_SHORTCUT_GRACE_MS=25 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/shortcut25-ipfs-tech-r10-20260506T234301Z-trace.jsonl \
+  --comparison-output /tmp/shortcut25-ipfs-tech-r10-20260506T234301Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/shortcut25-ipfs-tech-r10-20260506T234301Z.log 2>&1
+```
+
+Result:
+
+- Rust passed `10/10`; Kubo passed `10/10`.
+- Root TTFB p50/p95:
+  - Rust: `614/1680ms`
+  - Kubo: `2333/3080ms`
+- Asset TTFB p50/p95:
+  - Rust: `216/492ms`
+  - Kubo: `161/755ms`
+- Resource max:
+  - Rust: `53272KiB` RSS, `37` FDs
+  - Kubo: `240076KiB` RSS, `278` FDs
+
+Comparison to the preceding `0ms` focused r10:
+
+- Asset TTFB regressed from `201/461ms` to `216/492ms`.
+- Root p95 regressed from `898ms` to `1680ms`.
+- Bitswap attempts dropped from `537` to `499`, but established Bitswap
+  connections stayed at `54`.
+- FD max improved slightly (`39 -> 37`), but the latency regression is not
+  worth it.
+
+Decision:
+Do not set a positive session-shortcut start grace by default. Keep the env knob
+as a disabled lab control, but the current production default should remain
+`0ms`. The next resource-efficiency attempt should be more selective than a
+blanket shortcut delay, for example based on provider-set shape, recent peer
+quality, or per-request source confidence.

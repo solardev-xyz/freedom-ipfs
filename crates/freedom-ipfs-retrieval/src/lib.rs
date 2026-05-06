@@ -86,6 +86,8 @@ const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD: usize = 2;
 const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD";
 const BITSWAP_SESSION_SHORTCUT_GRACE: Duration = Duration::from_millis(0);
+const BITSWAP_SESSION_SHORTCUT_GRACE_MS_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_SESSION_SHORTCUT_GRACE_MS";
 // Start provider lookup immediately. Recent session peers still race during
 // lookup/post-lookup; a separate pre-lookup head start became a median tax once
 // the post-lookup race covered useful session hits.
@@ -600,7 +602,7 @@ impl HttpRetriever {
                     (providers, routing_started.elapsed().as_millis())
                 } else {
                     let shortcut = async {
-                        tokio::time::sleep(BITSWAP_SESSION_SHORTCUT_GRACE).await;
+                        tokio::time::sleep(bitswap_session_shortcut_grace()).await;
                         self.fetch_from_recent_bitswap_peers(cid, recent_peers)
                             .await
                     };
@@ -3158,6 +3160,20 @@ fn single_http_post_lookup_race_min_score() -> Option<Duration> {
 
 fn zero_http_post_lookup_race_enabled() -> bool {
     std::env::var_os(ENABLE_ZERO_HTTP_POST_LOOKUP_RACE_ENV).is_some()
+}
+
+fn bitswap_session_shortcut_grace() -> Duration {
+    let override_value = std::env::var_os(BITSWAP_SESSION_SHORTCUT_GRACE_MS_ENV);
+    bitswap_session_shortcut_grace_from_env_value(
+        override_value.as_deref().and_then(|value| value.to_str()),
+    )
+}
+
+fn bitswap_session_shortcut_grace_from_env_value(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(BITSWAP_SESSION_SHORTCUT_GRACE)
 }
 
 fn bitswap_session_pre_lookup_grace() -> Duration {
@@ -8684,6 +8700,26 @@ mod bitswap_tests {
         assert_eq!(
             bitswap_session_pre_lookup_grace_from_env_value(Some("not-a-number")),
             BITSWAP_SESSION_PRE_LOOKUP_GRACE
+        );
+    }
+
+    #[test]
+    fn shortcut_grace_env_value_parses_override() {
+        assert_eq!(
+            bitswap_session_shortcut_grace_from_env_value(None),
+            BITSWAP_SESSION_SHORTCUT_GRACE
+        );
+        assert_eq!(
+            bitswap_session_shortcut_grace_from_env_value(Some("25")),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            bitswap_session_shortcut_grace_from_env_value(Some("0")),
+            Duration::from_millis(0)
+        );
+        assert_eq!(
+            bitswap_session_shortcut_grace_from_env_value(Some("not-a-number")),
+            BITSWAP_SESSION_SHORTCUT_GRACE
         );
     }
 
