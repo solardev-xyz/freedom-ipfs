@@ -696,6 +696,18 @@ async fn run_case(
             actual => failures.push(format!("accept-ranges {:?}, expected {expected:?}", actual)),
         }
     }
+    if let Some(expected) = &entry.expect_etag_prefix {
+        match response.etag.as_deref() {
+            Some(actual) if actual.starts_with(expected) => {}
+            actual => failures.push(format!("etag {:?}, expected prefix {expected:?}", actual)),
+        }
+    }
+    if let Some(expected) = &entry.expect_cache_control {
+        match response.cache_control.as_deref() {
+            Some(actual) if actual.eq_ignore_ascii_case(expected) => {}
+            actual => failures.push(format!("cache-control {:?}, expected {expected:?}", actual)),
+        }
+    }
     if let Some(expected) = &entry.expect_body_contains {
         let text = String::from_utf8_lossy(&response.body);
         if !text.contains(expected) {
@@ -4041,6 +4053,8 @@ struct CorpusEntry {
     expect_content_range_prefix: Option<String>,
     expect_content_length: Option<u64>,
     expect_accept_ranges: Option<String>,
+    expect_etag_prefix: Option<String>,
+    expect_cache_control: Option<String>,
     expect_body_contains: Option<String>,
     expect_body_bytes: Option<usize>,
     min_bytes: Option<usize>,
@@ -10259,6 +10273,8 @@ mod tests {
                     expect_content_range_prefix: None,
                     expect_content_length: None,
                     expect_accept_ranges: None,
+                    expect_etag_prefix: None,
+                    expect_cache_control: None,
                     expect_body_contains: None,
                     expect_body_bytes: None,
                     min_bytes: None,
@@ -10277,6 +10293,8 @@ mod tests {
                     expect_content_range_prefix: None,
                     expect_content_length: None,
                     expect_accept_ranges: None,
+                    expect_etag_prefix: None,
+                    expect_cache_control: None,
                     expect_body_contains: None,
                     expect_body_bytes: Some(0),
                     min_bytes: None,
@@ -10316,6 +10334,8 @@ mod tests {
             expect_content_range_prefix: None,
             expect_content_length: None,
             expect_accept_ranges: None,
+            expect_etag_prefix: None,
+            expect_cache_control: None,
             expect_body_contains: None,
             expect_body_bytes: None,
             min_bytes: None,
@@ -10334,6 +10354,8 @@ mod tests {
             expect_content_range_prefix: None,
             expect_content_length: None,
             expect_accept_ranges: None,
+            expect_etag_prefix: None,
+            expect_cache_control: None,
             expect_body_contains: None,
             expect_body_bytes: None,
             min_bytes: None,
@@ -11228,6 +11250,8 @@ mod tests {
             expect_content_range_prefix: None,
             expect_content_length: None,
             expect_accept_ranges: None,
+            expect_etag_prefix: None,
+            expect_cache_control: None,
             expect_body_contains: None,
             expect_body_bytes: None,
             min_bytes: None,

@@ -20356,3 +20356,81 @@ Decision:
 Keep. This is harness/reporting coverage only and confirms the existing gateway
 media range and HEAD responses advertise range support in the way browser media
 clients expect.
+
+## 2026-05-05 Keep: Assert Media Cache Validators In Harness
+
+Question:
+The media range and HEAD cases now validate `Content-Range`, `Content-Length`,
+and `Accept-Ranges`, but they still do not assert cache validators. Browser
+cache behavior depends on `ETag` and `Cache-Control`; can the harness verify
+those headers without hard-coding the mutable DNSLink root CID?
+
+Implementation:
+
+- Add optional corpus fields:
+  - `expect_etag_prefix`
+  - `expect_cache_control`
+- Use `expect_etag_prefix: "\"fi1:"` for the `ipfs.tech` developers hero
+  image cases so the harness checks for freedom-ipfs validator format without
+  pinning the current resolved DNSLink root.
+- Use `expect_cache_control: "no-cache"` for these `/ipns` cases.
+
+Focused validation:
+
+```sh
+cargo fmt --all
+cargo test -p mobile-web-harness
+cargo check -p mobile-web-harness --all-targets
+```
+
+Focused result:
+
+- Formatting was applied.
+- Full mobile web harness suite passed: `39 passed`.
+- Harness check passed.
+
+Live Rust validation:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-developers-hero-range \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-hero-cache-validator-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-hero-cache-validator-r3.json
+```
+
+Live Rust result:
+
+- Passed: `3/3`.
+- Run total p50/p95/max: `1097/1348/1348ms`.
+- Gateway max RSS/FD: `32804KiB` / `16`.
+- First range passed with `206`, `ETag: "fi1:..."`,
+  `Cache-Control: no-cache`, `Content-Range: bytes 0-4095/184141`,
+  `Content-Length: 4096`, `Accept-Ranges: bytes`, body bytes `4096`, TTFB
+  p50/p95/max `1089/1335/1335ms`.
+- Middle range passed with `206`, `ETag: "fi1:..."`,
+  `Cache-Control: no-cache`, `Content-Range: bytes 65536-69631/184141`,
+  `Content-Length: 4096`, `Accept-Ranges: bytes`, body bytes `4096`, TTFB
+  p50/p95/max `4/4/4ms`.
+- Suffix range passed with `206`, `ETag: "fi1:..."`,
+  `Cache-Control: no-cache`, `Content-Range: bytes 180045-184140/184141`,
+  `Content-Length: 4096`, `Accept-Ranges: bytes`, body bytes `4096`, TTFB
+  p50/p95/max `3/4/4ms`.
+- HEAD passed with `200`, `ETag: "fi1:..."`, `Cache-Control: no-cache`, no
+  `Content-Range`, `Content-Length: 184141`, `Accept-Ranges: bytes`, body
+  bytes `0`, TTFB p50/p95/max `2/3/3ms`.
+- Block sources: `http_provider=9`.
+
+Decision:
+Keep. This is harness/corpus coverage only and makes the browser-facing media
+header checks complete enough to catch regressions in range support, response
+size metadata, and cache validators without changing gateway retrieval behavior.
