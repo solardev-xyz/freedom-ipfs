@@ -106,6 +106,12 @@ status, MIME type, byte count, and timing.
   Bitswap dials by address rank then removed that root tail in the next
   same-window sample: fresh `ipfs.tech-page-assets` repeat=5 passed 5/5 with
   root p50 1.4s, root max 1.8s, asset p95 1.2s, and asset max 1.5s.
+- `RUST-WEB-003`: repeated sibling UnixFS paths caused the gateway to reread and
+  redecode the same parent directories across file size checks, MIME sniffing,
+  streaming, and ranges. A bounded `UnixfsPathCache` now shares immutable
+  directory links, small directory listings, node kinds, and file sizes across
+  gateway requests without caching misses or errors, and emits a
+  `unixfs_path_cache` trace phase with cumulative hit/miss counters.
 
 ## Next Scenario Targets
 

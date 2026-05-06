@@ -11,7 +11,8 @@ use freedom_ipfs_core::{parse_cid, BlockProvider};
 use freedom_ipfs_namesys::{NameResolver, NamesysError};
 use freedom_ipfs_store::SqliteBlockStore;
 use freedom_ipfs_unixfs::{
-    file_size, list_directory, read_file_range, DirectoryEntry, UnixfsError,
+    file_size_with_cache, list_directory_with_cache, read_file_range_with_cache, DirectoryEntry,
+    UnixfsError, UnixfsPathCache,
 };
 use futures::stream;
 use std::collections::HashSet;
@@ -25,23 +26,35 @@ use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 pub const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
+pub const DEFAULT_GATEWAY_UNIXFS_PATH_CACHE_ENTRIES: usize = 1024;
 const GATEWAY_STREAM_CHUNK_SIZE: u64 = 64 * 1024;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     max_concurrent_requests: usize,
+    unixfs_path_cache_entries: usize,
 }
 
 impl GatewayConfig {
     pub fn new(max_concurrent_requests: usize) -> Self {
         Self {
             max_concurrent_requests: max_concurrent_requests.max(1),
+            unixfs_path_cache_entries: DEFAULT_GATEWAY_UNIXFS_PATH_CACHE_ENTRIES,
         }
     }
 
     pub fn max_concurrent_requests(&self) -> usize {
         self.max_concurrent_requests
+    }
+
+    pub fn unixfs_path_cache_entries(&self) -> usize {
+        self.unixfs_path_cache_entries
+    }
+
+    pub fn with_unixfs_path_cache_entries(mut self, entries: usize) -> Self {
+        self.unixfs_path_cache_entries = entries;
+        self
     }
 }
 
@@ -56,6 +69,7 @@ pub struct GatewayState {
     provider: Arc<dyn BlockProvider>,
     name_resolver: Arc<dyn NameResolver>,
     request_limiter: Arc<Semaphore>,
+    unixfs_path_cache: Arc<UnixfsPathCache>,
 }
 
 impl GatewayState {
@@ -95,6 +109,7 @@ impl GatewayState {
             provider,
             name_resolver,
             request_limiter: Arc::new(Semaphore::new(config.max_concurrent_requests())),
+            unixfs_path_cache: Arc::new(UnixfsPathCache::new(config.unixfs_path_cache_entries())),
         }
     }
 }
@@ -241,11 +256,18 @@ async fn ipfs_get(
             elapsed_ms = limiter_started.elapsed().as_millis()
         );
 
-        let response =
-            match serve_ipfs_path(state.provider.clone(), &path, headers.get(RANGE)).await {
-                Ok(response) => response,
-                Err(err) => gateway_error(err),
-            };
+        let response = match serve_ipfs_path(
+            state.provider.clone(),
+            state.unixfs_path_cache.clone(),
+            &path,
+            headers.get(RANGE),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => gateway_error(err),
+        };
+        trace_unixfs_path_cache(request_id, state.unixfs_path_cache.as_ref());
         tracing::info!(
             phase = "request_done",
             request_id,
@@ -304,6 +326,7 @@ async fn ipns_get(
 
         let response = match serve_ipns_path(
             state.provider.clone(),
+            state.unixfs_path_cache.clone(),
             state.name_resolver.as_ref(),
             &path,
             headers.get(RANGE),
@@ -313,6 +336,7 @@ async fn ipns_get(
             Ok(response) => response,
             Err(err) => gateway_error(err),
         };
+        trace_unixfs_path_cache(request_id, state.unixfs_path_cache.as_ref());
         tracing::info!(
             phase = "request_done",
             request_id,
@@ -332,16 +356,33 @@ fn header_value_for_trace(value: Option<&HeaderValue>) -> String {
         .to_string()
 }
 
+fn trace_unixfs_path_cache(request_id: u64, cache: &UnixfsPathCache) {
+    let stats = cache.stats();
+    tracing::info!(
+        phase = "unixfs_path_cache",
+        request_id,
+        entries = stats.entries,
+        capacity = stats.capacity,
+        hits = stats.hits,
+        misses = stats.misses,
+        inserts = stats.inserts,
+        evictions = stats.evictions,
+        elapsed_ms = 0u64
+    );
+}
+
 async fn serve_ipfs_path(
     provider: Arc<dyn BlockProvider>,
+    unixfs_path_cache: Arc<UnixfsPathCache>,
     path: &str,
     range: Option<&HeaderValue>,
 ) -> Result<Response, GatewayError> {
-    serve_ipfs_path_with_listing_path(provider, path, range, None).await
+    serve_ipfs_path_with_listing_path(provider, unixfs_path_cache, path, range, None).await
 }
 
 async fn serve_ipfs_path_with_listing_path(
     provider: Arc<dyn BlockProvider>,
+    unixfs_path_cache: Arc<UnixfsPathCache>,
     path: &str,
     range: Option<&HeaderValue>,
     listing_path: Option<&DirectoryListingPath>,
@@ -356,7 +397,7 @@ async fn serve_ipfs_path_with_listing_path(
     );
 
     let resource_started = Instant::now();
-    let resource = served_resource(provider.as_ref(), &cid, unixfs_path)?;
+    let resource = served_resource(provider.as_ref(), &cid, unixfs_path, &unixfs_path_cache)?;
     let resource_elapsed_ms = resource_started.elapsed().as_millis();
     let response = match resource {
         ServedResource::File { path, len } => {
@@ -369,7 +410,8 @@ async fn serve_ipfs_path_with_listing_path(
                 elapsed_ms = resource_elapsed_ms
             );
             let mime_started = Instant::now();
-            let mime = mime_for_served_file(provider.as_ref(), &cid, &path, len)?;
+            let mime =
+                mime_for_served_file(provider.as_ref(), &cid, &path, len, &unixfs_path_cache)?;
             tracing::info!(
                 phase = "mime_total",
                 cid = %cid,
@@ -378,9 +420,9 @@ async fn serve_ipfs_path_with_listing_path(
                 elapsed_ms = mime_started.elapsed().as_millis()
             );
             if let Some(range) = range {
-                ranged_response(provider, cid, path, len, range, &mime)?
+                ranged_response(provider, unixfs_path_cache, cid, path, len, range, &mime)?
             } else {
-                streaming_response(provider, cid, path, len, &mime)?
+                streaming_response(provider, unixfs_path_cache, cid, path, len, &mime)?
             }
         }
         ServedResource::Directory { path, entries } => {
@@ -415,6 +457,7 @@ fn mime_for_served_file(
     cid: &Cid,
     path: &str,
     len: u64,
+    unixfs_path_cache: &UnixfsPathCache,
 ) -> Result<String, GatewayError> {
     let started = Instant::now();
     if let Some(mime) = mime_guess::from_path(path).first() {
@@ -430,7 +473,8 @@ fn mime_for_served_file(
     if len > 0 {
         let end = (len - 1).min(512);
         let sniff_started = Instant::now();
-        let prefix = read_file_range(provider, cid, path, 0, end).map_err(GatewayError::Unixfs)?;
+        let prefix = read_file_range_with_cache(provider, cid, path, 0, end, unixfs_path_cache)
+            .map_err(GatewayError::Unixfs)?;
         tracing::info!(
             phase = "mime_sniff_read",
             cid = %cid,
@@ -514,9 +558,10 @@ fn served_resource(
     provider: &dyn BlockProvider,
     cid: &Cid,
     unixfs_path: &str,
+    unixfs_path_cache: &UnixfsPathCache,
 ) -> Result<ServedResource, GatewayError> {
     let file_size_started = Instant::now();
-    match file_size(provider, cid, unixfs_path) {
+    match file_size_with_cache(provider, cid, unixfs_path, unixfs_path_cache) {
         Ok(len) => {
             tracing::info!(
                 phase = "unixfs_file_size",
@@ -541,7 +586,7 @@ fn served_resource(
             );
             let index_path = append_path(unixfs_path, "index.html");
             let index_started = Instant::now();
-            match file_size(provider, cid, &index_path) {
+            match file_size_with_cache(provider, cid, &index_path, unixfs_path_cache) {
                 Ok(len) => {
                     tracing::info!(
                         phase = "unixfs_index_lookup",
@@ -566,7 +611,8 @@ fn served_resource(
                     );
                     let list_started = Instant::now();
                     let entries =
-                        list_directory(provider, cid, unixfs_path).map_err(GatewayError::Unixfs)?;
+                        list_directory_with_cache(provider, cid, unixfs_path, unixfs_path_cache)
+                            .map_err(GatewayError::Unixfs)?;
                     tracing::info!(
                         phase = "unixfs_list_directory",
                         cid = %cid,
@@ -642,6 +688,7 @@ fn split_ipfs_path(path: &str) -> Result<(Cid, &str), GatewayError> {
 
 async fn serve_ipns_path(
     provider: Arc<dyn BlockProvider>,
+    unixfs_path_cache: Arc<UnixfsPathCache>,
     name_resolver: &dyn NameResolver,
     path: &str,
     range: Option<&HeaderValue>,
@@ -653,6 +700,7 @@ async fn serve_ipns_path(
         if let Some(ipfs) = target.strip_prefix("/ipfs/") {
             return serve_ipfs_path_with_listing_path(
                 provider.clone(),
+                unixfs_path_cache.clone(),
                 ipfs,
                 range,
                 Some(&listing_path),
@@ -803,6 +851,7 @@ fn percent_encode_segment(segment: &str) -> String {
 
 fn streaming_response(
     provider: Arc<dyn BlockProvider>,
+    unixfs_path_cache: Arc<UnixfsPathCache>,
     cid: Cid,
     path: String,
     len: u64,
@@ -811,6 +860,7 @@ fn streaming_response(
     let provider = Arc::new(ScopedBlockProvider::new(provider));
     let stream = stream::unfold(Some(0u64), move |offset| {
         let provider = provider.clone();
+        let unixfs_path_cache = unixfs_path_cache.clone();
         let path = path.clone();
         async move {
             let offset = offset?;
@@ -822,12 +872,13 @@ fn streaming_response(
                 .saturating_add(GATEWAY_STREAM_CHUNK_SIZE - 1)
                 .min(last);
             let next = if end == last { None } else { Some(end + 1) };
-            let chunk = read_file_range(
+            let chunk = read_file_range_with_cache(
                 provider.as_ref() as &dyn BlockProvider,
                 &cid,
                 &path,
                 offset,
                 end,
+                &unixfs_path_cache,
             )
             .map(Bytes::from)
             .map_err(|err| io::Error::other(err.to_string()));
@@ -907,6 +958,7 @@ impl Drop for ScopedBlockProvider {
 
 fn ranged_response(
     provider: Arc<dyn BlockProvider>,
+    unixfs_path_cache: Arc<UnixfsPathCache>,
     cid: Cid,
     path: String,
     total_len: u64,
@@ -925,6 +977,7 @@ fn ranged_response(
     let provider = Arc::new(ScopedBlockProvider::new(provider));
     let stream = stream::unfold(Some(start), move |offset| {
         let provider = provider.clone();
+        let unixfs_path_cache = unixfs_path_cache.clone();
         let path = path.clone();
         async move {
             let offset = offset?;
@@ -936,12 +989,13 @@ fn ranged_response(
             } else {
                 Some(chunk_end + 1)
             };
-            let chunk = read_file_range(
+            let chunk = read_file_range_with_cache(
                 provider.as_ref() as &dyn BlockProvider,
                 &cid,
                 &path,
                 offset,
                 chunk_end,
+                &unixfs_path_cache,
             )
             .map(Bytes::from)
             .map_err(|err| io::Error::other(err.to_string()));
@@ -1107,6 +1161,7 @@ mod tests {
     };
     use freedom_ipfs_namesys::{NamesysError, Result as NamesysResult};
     use prost::Message;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::net::TcpListener;
@@ -1284,6 +1339,56 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(data));
+    }
+
+    #[tokio::test]
+    async fn reuses_unixfs_path_cache_across_sibling_gateway_requests() {
+        let alpha_data = b"console.log('alpha');";
+        let alpha_cid = cid_from_data(CODEC_RAW, alpha_data);
+        let beta_data = b"console.log('beta');";
+        let beta_cid = cid_from_data(CODEC_RAW, beta_data);
+
+        let assets_block = test_pb_directory(vec![
+            test_link("alpha.js", &alpha_cid),
+            test_link("beta.js", &beta_cid),
+        ]);
+        let assets_cid = cid_from_data(CODEC_DAG_PB, &assets_block);
+        let root_block = test_pb_directory(vec![test_link("_nuxt", &assets_cid)]);
+        let root_cid = cid_from_data(CODEC_DAG_PB, &root_block);
+
+        let provider = Arc::new(MultiBlockCountingProvider::new(vec![
+            (alpha_cid, alpha_data.to_vec()),
+            (beta_cid, beta_data.to_vec()),
+            (assets_cid, assets_block),
+            (root_cid, root_block),
+        ]));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router_with_provider(provider.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let alpha = client
+            .get(format!("http://{addr}/ipfs/{root_cid}/_nuxt/alpha.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(alpha.status(), StatusCode::OK);
+        assert_eq!(alpha.bytes().await.unwrap(), Bytes::from_static(alpha_data));
+
+        let beta = client
+            .get(format!("http://{addr}/ipfs/{root_cid}/_nuxt/beta.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(beta.status(), StatusCode::OK);
+        assert_eq!(beta.bytes().await.unwrap(), Bytes::from_static(beta_data));
+
+        assert_eq!(provider.calls(&root_cid), 1);
+        assert_eq!(provider.calls(&assets_cid), 1);
     }
 
     #[tokio::test]
@@ -1874,6 +1979,39 @@ mod tests {
             }
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Some(Block::unchecked(*cid, self.data.clone())))
+        }
+    }
+
+    struct MultiBlockCountingProvider {
+        blocks: HashMap<Cid, Vec<u8>>,
+        calls: Mutex<HashMap<Cid, usize>>,
+    }
+
+    impl MultiBlockCountingProvider {
+        fn new(blocks: Vec<(Cid, Vec<u8>)>) -> Self {
+            Self {
+                blocks: blocks.into_iter().collect(),
+                calls: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn calls(&self, cid: &Cid) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .get(cid)
+                .copied()
+                .unwrap_or_default()
+        }
+    }
+
+    impl BlockProvider for MultiBlockCountingProvider {
+        fn get_block(&self, cid: &Cid) -> CoreResult<Option<Block>> {
+            let Some(data) = self.blocks.get(cid) else {
+                return Ok(None);
+            };
+            *self.calls.lock().unwrap().entry(*cid).or_default() += 1;
+            Ok(Some(Block::unchecked(*cid, data.clone())))
         }
     }
 
