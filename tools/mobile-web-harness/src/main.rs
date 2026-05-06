@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 const DEFAULT_CORPUS: &str = "tools/mobile-web-harness/corpus/mobile-web.json";
 const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 const DEFAULT_ASSET_CONCURRENCY: usize = 6;
+const MAX_TRACE_SOURCE_VALUES: usize = 16;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -415,6 +416,39 @@ fn print_summary(report: &RunReport) {
             println!(
                 "  phase {}: count={} total={}ms latency={}",
                 phase.phase, phase.count, phase.total_ms, phase.elapsed_ms
+            );
+        }
+        if !trace.block_sources.is_empty() {
+            println!(
+                "  block sources: {}",
+                format_trace_counts(&trace.block_sources)
+            );
+        }
+        if !trace.block_fetch_source_latencies.is_empty() {
+            println!("  block fetch totals:");
+            for source in trace.block_fetch_source_latencies.iter().take(8) {
+                println!(
+                    "    {}: count={} total={}ms latency={}",
+                    source.source, source.count, source.total_ms, source.elapsed_ms
+                );
+            }
+        }
+        if !trace.bitswap_source_peers.is_empty() {
+            println!(
+                "  bitswap source peers: {}",
+                format_trace_counts(&trace.bitswap_source_peers)
+            );
+        }
+        if !trace.bitswap_source_transports.is_empty() {
+            println!(
+                "  bitswap source transports: {}",
+                format_trace_counts(&trace.bitswap_source_transports)
+            );
+        }
+        if !trace.bitswap_source_request_modes.is_empty() {
+            println!(
+                "  bitswap request modes: {}",
+                format_trace_counts(&trace.bitswap_source_request_modes)
             );
         }
     }
@@ -1681,11 +1715,30 @@ struct TraceSummary {
     line_count: usize,
     event_count: usize,
     phases: Vec<TracePhaseAggregate>,
+    block_sources: Vec<TraceValueCount>,
+    block_fetch_source_latencies: Vec<TraceSourceLatencyAggregate>,
+    bitswap_source_peers: Vec<TraceValueCount>,
+    bitswap_source_transports: Vec<TraceValueCount>,
+    bitswap_source_request_modes: Vec<TraceValueCount>,
 }
 
 #[derive(Debug, Serialize)]
 struct TracePhaseAggregate {
     phase: String,
+    count: usize,
+    total_ms: u128,
+    elapsed_ms: LatencySummary,
+}
+
+#[derive(Debug, Serialize)]
+struct TraceValueCount {
+    value: String,
+    count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct TraceSourceLatencyAggregate {
+    source: String,
     count: usize,
     total_ms: u128,
     elapsed_ms: LatencySummary,
@@ -1697,6 +1750,11 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut line_count = 0usize;
     let mut event_count = 0usize;
     let mut phases = BTreeMap::<String, Vec<u128>>::new();
+    let mut block_sources = BTreeMap::<String, usize>::new();
+    let mut block_fetch_source_latencies = BTreeMap::<String, Vec<u128>>::new();
+    let mut bitswap_source_peers = BTreeMap::<String, usize>::new();
+    let mut bitswap_source_transports = BTreeMap::<String, usize>::new();
+    let mut bitswap_source_request_modes = BTreeMap::<String, usize>::new();
 
     for line in text.lines() {
         line_count += 1;
@@ -1714,6 +1772,31 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             .entry(phase.to_string())
             .or_default()
             .push(elapsed_ms);
+        if phase == "block_fetch_total" {
+            let source = json_non_empty_detail_string(value.get("source"))
+                .unwrap_or_else(|| "unknown".to_string());
+            *block_sources.entry(source.clone()).or_default() += 1;
+            block_fetch_source_latencies
+                .entry(source)
+                .or_default()
+                .push(elapsed_ms);
+        }
+        if phase == "bitswap_fetch" {
+            if let Some(peer) = json_non_empty_detail_string(value.get("source_peer")) {
+                *bitswap_source_peers.entry(peer).or_default() += 1;
+            }
+            if let Some(transport) = json_non_empty_detail_string(value.get("source_transport"))
+                .or_else(|| json_non_empty_detail_string(value.get("transport")))
+            {
+                *bitswap_source_transports.entry(transport).or_default() += 1;
+            }
+            if let Some(mode) = json_non_empty_detail_string(value.get("bitswap_request_mode"))
+                .or_else(|| json_non_empty_detail_string(value.get("request_mode")))
+                .or_else(|| json_non_empty_detail_string(value.get("want_mode")))
+            {
+                *bitswap_source_request_modes.entry(mode).or_default() += 1;
+            }
+        }
     }
 
     let mut phases = phases
@@ -1741,7 +1824,81 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         line_count,
         event_count,
         phases,
+        block_sources: sorted_trace_counts(block_sources),
+        block_fetch_source_latencies: sorted_trace_source_latencies(block_fetch_source_latencies),
+        bitswap_source_peers: sorted_trace_counts(bitswap_source_peers),
+        bitswap_source_transports: sorted_trace_counts(bitswap_source_transports),
+        bitswap_source_request_modes: sorted_trace_counts(bitswap_source_request_modes),
     })
+}
+
+fn sorted_trace_source_latencies(
+    sources: BTreeMap<String, Vec<u128>>,
+) -> Vec<TraceSourceLatencyAggregate> {
+    let mut sources = sources
+        .into_iter()
+        .map(|(source, values)| {
+            let total_ms = values.iter().sum();
+            let count = values.len();
+            TraceSourceLatencyAggregate {
+                source,
+                count,
+                total_ms,
+                elapsed_ms: LatencySummary::from_values(values),
+            }
+        })
+        .collect::<Vec<_>>();
+    sources.sort_by(|left, right| {
+        right
+            .total_ms
+            .cmp(&left.total_ms)
+            .then_with(|| right.elapsed_ms.max_ms.cmp(&left.elapsed_ms.max_ms))
+            .then_with(|| left.source.cmp(&right.source))
+    });
+    sources.truncate(MAX_TRACE_SOURCE_VALUES);
+    sources
+}
+
+fn sorted_trace_counts(counts: BTreeMap<String, usize>) -> Vec<TraceValueCount> {
+    let mut counts = counts
+        .into_iter()
+        .map(|(value, count)| TraceValueCount { value, count })
+        .collect::<Vec<_>>();
+    counts.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    counts.truncate(MAX_TRACE_SOURCE_VALUES);
+    counts
+}
+
+fn format_trace_counts(counts: &[TraceValueCount]) -> String {
+    if counts.is_empty() {
+        return "n/a".to_string();
+    }
+    counts
+        .iter()
+        .take(8)
+        .map(|count| format!("{}={}", count.value, count.count))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn json_non_empty_detail_string(value: Option<&serde_json::Value>) -> Option<String> {
+    json_detail_string(value).filter(|value| !value.is_empty())
+}
+
+fn json_detail_string(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::String(value) => Some(value.clone()),
+        _ => serde_json::to_string(value).ok(),
+    }
 }
 
 fn json_u128(value: &serde_json::Value) -> Option<u128> {
@@ -1757,6 +1914,85 @@ fn json_u128(value: &serde_json::Value) -> Option<u128> {
         return value.parse::<u128>().ok();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarize_trace_output_reports_sources_and_bitswap_provenance() -> Result<()> {
+        let mut path = std::env::temp_dir();
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        path.push(format!(
+            "freedom-ipfs-mobile-web-harness-source-trace-{unique}.jsonl"
+        ));
+        std::fs::write(
+            &path,
+            [
+                r#"{"phase":"block_fetch_total","elapsed_ms":20,"source":"cache"}"#,
+                r#"{"phase":"block_fetch_total","elapsed_ms":"75","source":"bitswap"}"#,
+                r#"{"phase":"block_fetch_total","elapsed_ms":15,"source":"bitswap"}"#,
+                r#"{"phase":"bitswap_fetch","elapsed_ms":70,"ok":true,"source_peer":"peer-a","source_transport":"tcp","bitswap_request_mode":"want_block"}"#,
+                r#"{"phase":"bitswap_fetch","elapsed_ms":40,"ok":true,"source_peer":"peer-a","source_transport":"tcp","request_mode":"want_have"}"#,
+                r#"{"phase":"bitswap_fetch","elapsed_ms":35,"ok":true,"source_peer":"peer-b","transport":"quic","want_mode":"want_block"}"#,
+                r#"{"phase":"bitswap_fetch","elapsed_ms":5,"ok":false,"source_peer":""}"#,
+            ]
+            .join("\n"),
+        )?;
+
+        let summary = summarize_trace_output(&path)?;
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(summary.line_count, 7);
+        assert_eq!(summary.event_count, 7);
+        assert_eq!(trace_value_count(&summary.block_sources, "bitswap"), 2);
+        assert_eq!(trace_value_count(&summary.block_sources, "cache"), 1);
+
+        let bitswap = summary
+            .block_fetch_source_latencies
+            .iter()
+            .find(|source| source.source == "bitswap")
+            .expect("bitswap source latency aggregate");
+        assert_eq!(bitswap.count, 2);
+        assert_eq!(bitswap.total_ms, 90);
+        assert_eq!(bitswap.elapsed_ms.max_ms, Some(75));
+
+        assert_eq!(
+            trace_value_count(&summary.bitswap_source_peers, "peer-a"),
+            2
+        );
+        assert_eq!(
+            trace_value_count(&summary.bitswap_source_peers, "peer-b"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.bitswap_source_transports, "tcp"),
+            2
+        );
+        assert_eq!(
+            trace_value_count(&summary.bitswap_source_transports, "quic"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.bitswap_source_request_modes, "want_block"),
+            2
+        );
+        assert_eq!(
+            trace_value_count(&summary.bitswap_source_request_modes, "want_have"),
+            1
+        );
+
+        Ok(())
+    }
+
+    fn trace_value_count(counts: &[TraceValueCount], value: &str) -> usize {
+        counts
+            .iter()
+            .find(|count| count.value == value)
+            .map(|count| count.count)
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Serialize)]

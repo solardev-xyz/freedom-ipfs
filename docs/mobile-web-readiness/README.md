@@ -66,7 +66,10 @@ to distinguish DNSLink/name resolution, provider lookup, Bitswap fetch, UnixFS
 path traversal, MIME sniffing, and gateway limiter behavior during live runs.
 The spawned gateway uses a trace-friendly filter by default whenever
 `--trace-output` is set, so an ambient `RUST_LOG=warn` will not hide phase
-events. Use `--trace-filter` only when intentionally overriding the default.
+events. Trace summaries also include block-source latency totals and Bitswap
+source peer/transport/request-mode counts when those fields are present in the
+gateway trace. Use `--trace-filter` only when intentionally overriding the
+default.
 
 The default live corpus is `tools/mobile-web-harness/corpus/mobile-web.json`.
 It captures browser-facing checks such as status, MIME type, byte ranges,
