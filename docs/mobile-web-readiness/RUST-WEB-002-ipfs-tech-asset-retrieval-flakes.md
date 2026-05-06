@@ -20531,3 +20531,86 @@ Keep. This remains harness/corpus coverage only. The media range cases now
 check not just that the response is shaped like a range response, but that the
 returned bytes are the expected slices, while still avoiding full-media
 gateway fetches in the range assertions.
+
+## 2026-05-06 Keep: Media Range Offline Replay Baseline
+
+Question:
+After warming the `ipfs.tech` developers hero image ranges online, can the
+gateway restart in offline mode and still serve the same DNSLink-backed media
+ranges and HEAD metadata from persistent cache only?
+
+Command:
+
+```sh
+rm -f /tmp/freedom-ipfs-media-range-offline-replay.db \
+  /tmp/freedom-ipfs-media-range-offline-replay.db-* \
+  /tmp/ipfs-tech-hero-media-offline-replay*.json \
+  /tmp/ipfs-tech-hero-media-offline-replay*.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --gateway-db /tmp/freedom-ipfs-media-range-offline-replay.db \
+  --offline-replay \
+  --case ipfs-tech-developers-hero-range \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-hero-media-offline-replay-trace.jsonl \
+  --output /tmp/ipfs-tech-hero-media-offline-replay.json
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-hero-media-offline-replay.json`
+- `/tmp/ipfs-tech-hero-media-offline-replay-trace-online.jsonl` (`92` lines)
+- `/tmp/ipfs-tech-hero-media-offline-replay-trace-offline.jsonl` (`47` lines)
+- `/tmp/freedom-ipfs-media-range-offline-replay.db`
+- `/tmp/freedom-ipfs-media-range-offline-replay.db-wal`
+
+Result:
+
+- Online pass: `1/1` measured run passed, with all four selected cases passing.
+  Run total `1348ms`, gateway RSS `32892KiB`, FD count `18`, storage
+  `481856B`.
+- Online first range: `206`, `Content-Range: bytes 0-4095/184141`,
+  `Content-Length: 4096`, `Accept-Ranges: bytes`, body bytes `4096`,
+  matching SHA-256, TTFB/total `1335/1335ms`.
+- Online middle range: `206`, `Content-Range: bytes 65536-69631/184141`,
+  `Content-Length: 4096`, `Accept-Ranges: bytes`, body bytes `4096`,
+  matching SHA-256, TTFB/total `3/4ms`.
+- Online suffix range: `206`, `Content-Range: bytes 180045-184140/184141`,
+  `Content-Length: 4096`, `Accept-Ranges: bytes`, body bytes `4096`,
+  matching SHA-256, TTFB/total `3/3ms`.
+- Online HEAD: `200`, no `Content-Range`, `Content-Length: 184141`,
+  `Accept-Ranges: bytes`, body bytes `0`, TTFB/total `3/3ms`.
+- Offline pass: `1/1` measured run passed, with all four selected cases
+  passing. Run total `14ms`, gateway RSS `21460KiB`, FD count `15`, storage
+  `502456B`.
+- Offline first range: `206`, `Content-Range: bytes 0-4095/184141`,
+  `Content-Length: 4096`, `Accept-Ranges: bytes`, body bytes `4096`,
+  matching SHA-256, TTFB/total `9/9ms`.
+- Offline middle range: `206`, `Content-Range: bytes 65536-69631/184141`,
+  `Content-Length: 4096`, `Accept-Ranges: bytes`, body bytes `4096`,
+  matching SHA-256, TTFB/total `1/1ms`.
+- Offline suffix range: `206`, `Content-Range: bytes 180045-184140/184141`,
+  `Content-Length: 4096`, `Accept-Ranges: bytes`, body bytes `4096`,
+  matching SHA-256, TTFB/total `1/1ms`.
+- Offline HEAD: `200`, no `Content-Range`, `Content-Length: 184141`,
+  `Accept-Ranges: bytes`, body bytes `0`, TTFB/total `1/1ms`.
+- Offline replay summary reported `missing_url_count=0`, offline statuses
+  `206=3`, `200=1`, and offline progress phases `streaming=27`,
+  `name_resolved=8`, `completed=4`, `queued=4`, `started=4`.
+- Offline trace phases were cache-only for retrieval: `name_persistent_cache=4`,
+  `unixfs_metadata_cache=4`, `gateway_direct_body=3`, and no provider lookup or
+  block fetch phases.
+
+Decision:
+Keep as a baseline. The warmed `/ipns/ipfs.tech/_nuxt/developers-hero...jpg`
+media slices and HEAD metadata survive a gateway restart and are served
+offline from persistent name, UnixFS metadata, and block/cache state. This gives
+the mobile browser a concrete offline/cache-only expectation for range-heavy
+media workloads without fetching the full media object through the gateway.

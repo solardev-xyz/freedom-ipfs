@@ -342,8 +342,9 @@ status, MIME type, byte count, and timing.
 - Range-heavy media fixtures: request first, middle, and suffix byte ranges from
   known media CIDs and verify `206`, `Content-Range`, `Content-Length`, byte
   digests, and bounded memory. The harness now has opt-in
-  first/middle/suffix/HEAD coverage for the `ipfs.tech` developers hero image;
-  stable audio/video CIDs are still useful future additions.
+  first/middle/suffix/HEAD coverage for the `ipfs.tech` developers hero image,
+  including offline replay for warmed DNSLink media ranges; stable audio/video
+  CIDs are still useful future additions.
 - Cold/warm timing pairs: run each case twice against the same gateway and record
   cache-hit speedups, provider lookup counts, and outlier latencies.
 - Failure classification: distinguish name resolution failures, provider
