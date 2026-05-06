@@ -14,7 +14,7 @@ use freedom_ipfs_unixfs::{
     file_size, list_directory, read_file_range, DirectoryEntry, UnixfsError,
 };
 use futures::stream;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +26,7 @@ use tracing::Instrument;
 
 pub const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 const GATEWAY_STREAM_CHUNK_SIZE: u64 = 64 * 1024;
+const GATEWAY_METADATA_CACHE_CAPACITY: usize = 512;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -56,6 +57,7 @@ pub struct GatewayState {
     provider: Arc<dyn BlockProvider>,
     name_resolver: Arc<dyn NameResolver>,
     request_limiter: Arc<Semaphore>,
+    metadata_cache: Arc<GatewayMetadataCache>,
 }
 
 impl GatewayState {
@@ -95,8 +97,71 @@ impl GatewayState {
             provider,
             name_resolver,
             request_limiter: Arc::new(Semaphore::new(config.max_concurrent_requests())),
+            metadata_cache: Arc::new(GatewayMetadataCache::new(GATEWAY_METADATA_CACHE_CAPACITY)),
         }
     }
+}
+
+struct GatewayMetadataCache {
+    capacity: usize,
+    inner: Mutex<GatewayMetadataCacheInner>,
+}
+
+#[derive(Default)]
+struct GatewayMetadataCacheInner {
+    files: HashMap<String, CachedFileResource>,
+    order: VecDeque<String>,
+}
+
+#[derive(Clone)]
+struct CachedFileResource {
+    path: String,
+    len: u64,
+}
+
+impl GatewayMetadataCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            inner: Mutex::new(GatewayMetadataCacheInner::default()),
+        }
+    }
+
+    fn get_file(&self, cid: &Cid, unixfs_path: &str) -> Option<CachedFileResource> {
+        let key = metadata_cache_key(cid, unixfs_path);
+        self.inner.lock().ok()?.files.get(&key).cloned()
+    }
+
+    fn insert_file(&self, cid: &Cid, unixfs_path: &str, path: &str, len: u64) {
+        if self.capacity == 0 {
+            return;
+        }
+        let key = metadata_cache_key(cid, unixfs_path);
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return,
+        };
+        if !inner.files.contains_key(&key) {
+            inner.order.push_back(key.clone());
+        }
+        inner.files.insert(
+            key,
+            CachedFileResource {
+                path: path.to_string(),
+                len,
+            },
+        );
+        while inner.files.len() > self.capacity {
+            let Some(oldest) = inner.order.pop_front() else {
+                break;
+            };
+            inner.files.remove(&oldest);
+        }
+    }
+}
+
+fn metadata_cache_key(cid: &Cid, unixfs_path: &str) -> String {
+    format!("{cid}\0{unixfs_path}")
 }
 
 pub fn router(store: SqliteBlockStore) -> Router {
@@ -241,11 +306,17 @@ async fn ipfs_get(
             elapsed_ms = limiter_started.elapsed().as_millis()
         );
 
-        let response =
-            match serve_ipfs_path(state.provider.clone(), &path, headers.get(RANGE)).await {
-                Ok(response) => response,
-                Err(err) => gateway_error(err),
-            };
+        let response = match serve_ipfs_path(
+            state.provider.clone(),
+            state.metadata_cache.clone(),
+            &path,
+            headers.get(RANGE),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => gateway_error(err),
+        };
         tracing::info!(
             phase = "request_done",
             request_id,
@@ -304,6 +375,7 @@ async fn ipns_get(
 
         let response = match serve_ipns_path(
             state.provider.clone(),
+            state.metadata_cache.clone(),
             state.name_resolver.as_ref(),
             &path,
             headers.get(RANGE),
@@ -334,14 +406,16 @@ fn header_value_for_trace(value: Option<&HeaderValue>) -> String {
 
 async fn serve_ipfs_path(
     provider: Arc<dyn BlockProvider>,
+    metadata_cache: Arc<GatewayMetadataCache>,
     path: &str,
     range: Option<&HeaderValue>,
 ) -> Result<Response, GatewayError> {
-    serve_ipfs_path_with_listing_path(provider, path, range, None).await
+    serve_ipfs_path_with_listing_path(provider, metadata_cache, path, range, None).await
 }
 
 async fn serve_ipfs_path_with_listing_path(
     provider: Arc<dyn BlockProvider>,
+    metadata_cache: Arc<GatewayMetadataCache>,
     path: &str,
     range: Option<&HeaderValue>,
     listing_path: Option<&DirectoryListingPath>,
@@ -356,7 +430,12 @@ async fn serve_ipfs_path_with_listing_path(
     );
 
     let resource_started = Instant::now();
-    let resource = served_resource(provider.as_ref(), &cid, unixfs_path)?;
+    let resource = served_resource(
+        provider.as_ref(),
+        metadata_cache.as_ref(),
+        &cid,
+        unixfs_path,
+    )?;
     let resource_elapsed_ms = resource_started.elapsed().as_millis();
     let response = match resource {
         ServedResource::File { path, len } => {
@@ -512,6 +591,44 @@ impl DirectoryListingPath {
 
 fn served_resource(
     provider: &dyn BlockProvider,
+    metadata_cache: &GatewayMetadataCache,
+    cid: &Cid,
+    unixfs_path: &str,
+) -> Result<ServedResource, GatewayError> {
+    let cache_started = Instant::now();
+    if let Some(cached) = metadata_cache.get_file(cid, unixfs_path) {
+        tracing::info!(
+            phase = "unixfs_metadata_cache",
+            cache = "served_file",
+            cid = %cid,
+            unixfs_path,
+            hit = true,
+            file_len = cached.len,
+            elapsed_ms = cache_started.elapsed().as_millis()
+        );
+        return Ok(ServedResource::File {
+            path: cached.path,
+            len: cached.len,
+        });
+    }
+    tracing::info!(
+        phase = "unixfs_metadata_cache",
+        cache = "served_file",
+        cid = %cid,
+        unixfs_path,
+        hit = false,
+        elapsed_ms = cache_started.elapsed().as_millis()
+    );
+
+    let resource = served_resource_uncached(provider, cid, unixfs_path)?;
+    if let ServedResource::File { path, len } = &resource {
+        metadata_cache.insert_file(cid, unixfs_path, path, *len);
+    }
+    Ok(resource)
+}
+
+fn served_resource_uncached(
+    provider: &dyn BlockProvider,
     cid: &Cid,
     unixfs_path: &str,
 ) -> Result<ServedResource, GatewayError> {
@@ -642,6 +759,7 @@ fn split_ipfs_path(path: &str) -> Result<(Cid, &str), GatewayError> {
 
 async fn serve_ipns_path(
     provider: Arc<dyn BlockProvider>,
+    metadata_cache: Arc<GatewayMetadataCache>,
     name_resolver: &dyn NameResolver,
     path: &str,
     range: Option<&HeaderValue>,
@@ -653,6 +771,7 @@ async fn serve_ipns_path(
         if let Some(ipfs) = target.strip_prefix("/ipfs/") {
             return serve_ipfs_path_with_listing_path(
                 provider.clone(),
+                metadata_cache.clone(),
                 ipfs,
                 range,
                 Some(&listing_path),
@@ -1415,6 +1534,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn caches_served_file_metadata_for_repeated_head_requests() {
+        let data = b"cached metadata";
+        let file_block = test_pb_file(data);
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_block);
+        let dir_block = test_pb_directory(vec![test_link("image.jpg", &file_cid)]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_block);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(MapCountingProvider {
+            blocks: HashMap::from([(file_cid, file_block), (dir_cid, dir_block)]),
+            calls: calls.clone(),
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router_with_provider(provider);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/ipfs/{dir_cid}/image.jpg");
+        let client = reqwest::Client::new();
+
+        let response = client.head(&url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_LENGTH).unwrap(),
+            HeaderValue::from_str(&data.len().to_string()).unwrap()
+        );
+        assert!(response.bytes().await.unwrap().is_empty());
+        let first_calls = calls.load(Ordering::SeqCst);
+        assert!(
+            first_calls >= 2,
+            "first request should resolve path and file size"
+        );
+
+        let response = client.head(&url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_LENGTH).unwrap(),
+            HeaderValue::from_str(&data.len().to_string()).unwrap()
+        );
+        assert!(response.bytes().await.unwrap().is_empty());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            first_calls,
+            "second HEAD should reuse cached served-file metadata"
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_invalid_and_unsatisfiable_byte_ranges() {
         let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
         let data = b"0123456789";
@@ -1874,6 +2043,21 @@ mod tests {
             }
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Some(Block::unchecked(*cid, self.data.clone())))
+        }
+    }
+
+    struct MapCountingProvider {
+        blocks: HashMap<Cid, Vec<u8>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl BlockProvider for MapCountingProvider {
+        fn get_block(&self, cid: &Cid) -> CoreResult<Option<Block>> {
+            let Some(data) = self.blocks.get(cid) else {
+                return Ok(None);
+            };
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(Block::unchecked(*cid, data.clone())))
         }
     }
 
