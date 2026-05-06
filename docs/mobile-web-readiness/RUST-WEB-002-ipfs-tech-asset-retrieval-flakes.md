@@ -25936,3 +25936,98 @@ latest multi-case r10 window while preserving the mobile resource advantage.
 The next remaining gap is no longer this single-HTTP serial wait. Focus next on
 zero-HTTP/Bitswap-heavy roots and assets where provider discovery yields no HTTP
 providers and Bitswap still has occasional `1.3-1.5s` tails.
+
+## 2026-05-06 Reject For Default: Zero-HTTP Post-Lookup Race
+
+Hypothesis:
+The remaining slow requests often have `http_provider_count=0` and still pay a
+serial `100ms` post-lookup wait before starting the full Bitswap provider-list
+fetch. Race the in-flight recent-peer shortcut against the full zero-HTTP
+provider-list Bitswap fetch to remove that serial wait.
+
+Implementation:
+
+- Add opt-in lab flag:
+  `FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_RACE`.
+- Reuse the post-lookup race helper when provider lookup returns non-empty
+  providers and `http_provider_count == 0`.
+- Leave it disabled by default.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo test -p freedom-ipfs-retrieval post_lookup
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo test -p freedom-ipfs-retrieval
+```
+
+All passed after folding the duplicated race branches that clippy flagged.
+
+Command:
+
+```sh
+FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_RACE=1 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-postlookup-race-multicase-r3-20260506T231100Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-postlookup-race-multicase-r3-20260506T231100Z.json \
+  > /tmp/zero-http-postlookup-race-multicase-r3-20260506T231100Z.log 2>&1
+```
+
+Result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- `daicowtf-page-assets` root TTFB p50/p95:
+  - Rust: `1156/1456ms`
+  - Kubo: `2844/2940ms`
+- `vitalik-root-html-range` root TTFB p50/p95:
+  - Rust: `422/529ms`
+  - Kubo: `2760/2831ms`
+- `ipfs-tech-page-assets` root TTFB p50/p95:
+  - Rust: `682/900ms`
+  - Kubo: `936/1231ms`
+- `ipfs-tech-page-assets` asset TTFB p50/p95:
+  - Rust: `284/796ms`
+  - Kubo: `391/718ms`
+- Resource max:
+  - Rust: `59200KiB` RSS, `34` FDs
+  - Kubo: `157992KiB` RSS, `128` FDs
+
+Trace notes:
+
+- Race events: `66` total:
+  - `http_provider_count=1`: `60`
+  - `http_provider_count=0`: `6`
+  - outcomes: `provider_won=60`, `bitswap_won=6`
+- Remaining post-lookup waits had no zero-HTTP entries:
+  `wait_http=2=3, 3=40`.
+- Canceled Bitswap batches rose to `99` in this small r3 sample.
+- Block fetch totals:
+  - HTTP provider: `117` blocks, p50/p95/max `271/627/748ms`
+  - Bitswap: `18` blocks, p50/p95/max `133/1110/1110ms`
+- The slowest zero-HTTP direct DAICO root still had a `1110ms` Bitswap block
+  fetch. The race removed the `100ms` wait but did not fix the underlying
+  single-WSS-provider latency.
+- `ipfs.tech` asset p95 was worse than the latest no-env default r3
+  (`796ms` vs `555ms`), and slightly worse than Kubo in this window
+  (`796ms` vs `718ms`).
+
+Decision:
+Do not promote zero-HTTP post-lookup racing. It removes the serial wait, but
+the page-level signal was not better and cancellation churn nearly doubled in
+the small guardrail. Keep the disabled env knob as a lab tool. The next zero-HTTP
+work should target the actual Bitswap path: peer/source selection, slow WSS/TCP
+provider handling, and repeated slow CID/source behavior, not another generic
+post-lookup race.

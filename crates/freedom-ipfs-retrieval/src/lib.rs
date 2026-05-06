@@ -96,6 +96,8 @@ const DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE";
 const SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS";
+const ENABLE_ZERO_HTTP_POST_LOOKUP_RACE_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_RACE";
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
 const BITSWAP_SESSION_LATE_PEER_WAIT: Duration = Duration::from_secs(2);
 const BITSWAP_SESSION_LATE_PEER_POLL: Duration = Duration::from_millis(50);
@@ -488,13 +490,20 @@ impl HttpRetriever {
                                                         bitswap_session_post_lookup_grace(&providers);
                                                     let http_provider_count =
                                                         provider_http_url_count(&providers);
-                                                    if self
-                                                        .single_http_post_lookup_race_allows(
+                                                    let post_lookup_race_allowed =
+                                                        if zero_http_post_lookup_race_enabled()
+                                                            && http_provider_count == 0
+                                                        {
+                                                            true
+                                                        } else {
+                                                            self.single_http_post_lookup_race_allows(
                                                             cid,
                                                             &providers,
                                                             http_provider_count,
                                                         )
-                                                        .await
+                                                            .await
+                                                        };
+                                                    if post_lookup_race_allowed
                                                     {
                                                         if let Some((block, source)) = self
                                                             .fetch_after_session_shortcut_provider_lookup(
@@ -678,13 +687,20 @@ impl HttpRetriever {
                                                     bitswap_session_post_lookup_grace(&providers);
                                                 let http_provider_count =
                                                     provider_http_url_count(&providers);
-                                                if self
-                                                    .single_http_post_lookup_race_allows(
+                                                let post_lookup_race_allowed =
+                                                    if zero_http_post_lookup_race_enabled()
+                                                        && http_provider_count == 0
+                                                    {
+                                                        true
+                                                    } else {
+                                                        self.single_http_post_lookup_race_allows(
                                                         cid,
                                                         &providers,
                                                         http_provider_count,
                                                     )
-                                                    .await
+                                                        .await
+                                                    };
+                                                if post_lookup_race_allowed
                                                 {
                                                     if let Some((block, source)) = self
                                                         .fetch_after_session_shortcut_provider_lookup(
@@ -1002,7 +1018,7 @@ impl HttpRetriever {
     {
         let post_lookup_grace = bitswap_session_post_lookup_grace(providers);
         let http_provider_count = provider_http_url_count(providers);
-        debug_assert_eq!(http_provider_count, 1);
+        debug_assert!(http_provider_count <= 1);
         let provider_fetch = self.fetch_from_providers_with_source(cid, providers);
         tokio::pin!(provider_fetch);
         let race_started = Instant::now();
@@ -3118,6 +3134,10 @@ fn single_http_post_lookup_race_min_score() -> Option<Duration> {
     std::env::var_os(SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS_ENV)
         .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
         .map(Duration::from_millis)
+}
+
+fn zero_http_post_lookup_race_enabled() -> bool {
+    std::env::var_os(ENABLE_ZERO_HTTP_POST_LOOKUP_RACE_ENV).is_some()
 }
 
 fn single_http_provider_bitswap_hedge_min_score() -> Option<Duration> {
