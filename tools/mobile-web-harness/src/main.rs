@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use reqwest::header::{CONTENT_RANGE, CONTENT_TYPE, RANGE};
+use reqwest::header::{HeaderValue, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -303,6 +303,17 @@ async fn run_case(
             ));
         }
     }
+    if let Some(min_content_length) = entry.expect_content_length_min {
+        match response.content_length {
+            Some(content_length) if content_length >= min_content_length => {}
+            Some(content_length) => failures.push(format!(
+                "content-length {content_length}, expected at least {min_content_length}"
+            )),
+            None => failures.push(format!(
+                "missing Content-Length, expected at least {min_content_length}"
+            )),
+        }
+    }
     if let Some(expected) = &entry.expect_body_contains {
         let text = String::from_utf8_lossy(&response.body);
         if !text.contains(expected) {
@@ -344,6 +355,7 @@ async fn run_case(
         status: Some(response.status),
         content_type: response.content_type,
         content_range: response.content_range,
+        content_length: response.content_length,
         body_bytes: response.body.len(),
         ttfb_ms: response.ttfb_ms,
         total_ms: response.total_ms,
@@ -451,13 +463,17 @@ fn print_summary(report: &RunReport) {
 fn print_case_result(result: &CaseResult) {
     let mark = if result.passed { "PASS" } else { "FAIL" };
     println!(
-        "{mark} {:32} status={} type={} bytes={} ttfb={}ms total={}ms",
+        "{mark} {:32} status={} type={} content_length={} bytes={} ttfb={}ms total={}ms",
         result.id,
         result
             .status
             .map(|status| status.to_string())
             .unwrap_or_else(|| "-".to_string()),
         result.content_type.as_deref().unwrap_or("-"),
+        result
+            .content_length
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
         result.body_bytes,
         result.ttfb_ms,
         result.total_ms
@@ -478,7 +494,7 @@ fn print_case_result(result: &CaseResult) {
         );
         for asset in result.assets.iter().filter(|asset| !asset.passed).take(8) {
             println!(
-                "    - {} {} status={} type={} bytes={} total={}ms",
+                "    - {} {} status={} type={} content_length={} bytes={} total={}ms",
                 asset.kind,
                 asset.url,
                 asset
@@ -486,6 +502,10 @@ fn print_case_result(result: &CaseResult) {
                     .map(|status| status.to_string())
                     .unwrap_or_else(|| "-".to_string()),
                 asset.content_type.as_deref().unwrap_or("-"),
+                asset
+                    .content_length
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
                 asset.body_bytes,
                 asset.total_ms
             );
@@ -532,6 +552,7 @@ async fn fetch_response(
         .get(CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    let content_length = parse_content_length_header(response.headers().get(CONTENT_LENGTH));
     let body = response
         .bytes()
         .await
@@ -543,10 +564,48 @@ async fn fetch_response(
         status,
         content_type,
         content_range,
+        content_length,
         body,
         ttfb_ms,
         total_ms,
     })
+}
+
+fn parse_content_length_header(value: Option<&HeaderValue>) -> Option<u64> {
+    value?.to_str().ok()?.parse::<u64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_content_length_header_accepts_valid_u64() {
+        assert_eq!(
+            parse_content_length_header(Some(&HeaderValue::from_static("4096"))),
+            Some(4096)
+        );
+        assert_eq!(
+            parse_content_length_header(Some(&HeaderValue::from_static("invalid"))),
+            None
+        );
+        assert_eq!(parse_content_length_header(None), None);
+    }
+
+    #[test]
+    fn corpus_entry_accepts_content_length_expectation() -> Result<()> {
+        let corpus = serde_json::from_str::<Corpus>(
+            r#"{
+              "entries": [{
+                "id": "range",
+                "path": "/ipfs/example",
+                "expect_content_length_min": 4096
+              }]
+            }"#,
+        )?;
+        assert_eq!(corpus.entries[0].expect_content_length_min, Some(4096));
+        Ok(())
+    }
 }
 
 async fn run_page_crawl(
@@ -679,6 +738,7 @@ async fn fetch_asset(
         status: None,
         content_type: None,
         content_range: None,
+        content_length: None,
         body_bytes: 0,
         ttfb_ms: 0,
         total_ms: 0,
@@ -701,6 +761,7 @@ async fn fetch_asset(
     result.status = Some(response.status);
     result.content_type = response.content_type.clone();
     result.content_range = response.content_range.clone();
+    result.content_length = response.content_length;
     result.body_bytes = response.body.len();
     result.ttfb_ms = response.ttfb_ms;
     result.total_ms = response.total_ms;
@@ -1440,6 +1501,7 @@ struct CorpusEntry {
     expect_status: Option<u16>,
     expect_content_type_prefix: Option<String>,
     expect_content_range_prefix: Option<String>,
+    expect_content_length_min: Option<u64>,
     expect_body_contains: Option<String>,
     min_bytes: Option<usize>,
     max_ttfb_ms: Option<u64>,
@@ -1832,6 +1894,7 @@ struct CaseResult {
     status: Option<u16>,
     content_type: Option<String>,
     content_range: Option<String>,
+    content_length: Option<u64>,
     body_bytes: usize,
     ttfb_ms: u128,
     total_ms: u128,
@@ -1852,6 +1915,7 @@ impl CaseResult {
             status: None,
             content_type: None,
             content_range: None,
+            content_length: None,
             body_bytes: 0,
             ttfb_ms: 0,
             total_ms: 0,
@@ -1868,6 +1932,7 @@ struct FetchResponse {
     status: u16,
     content_type: Option<String>,
     content_range: Option<String>,
+    content_length: Option<u64>,
     body: Vec<u8>,
     ttfb_ms: u128,
     total_ms: u128,
@@ -1921,6 +1986,7 @@ struct AssetResult {
     status: Option<u16>,
     content_type: Option<String>,
     content_range: Option<String>,
+    content_length: Option<u64>,
     body_bytes: usize,
     ttfb_ms: u128,
     total_ms: u128,

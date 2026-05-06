@@ -79,7 +79,42 @@
       "expect_status": 206,
       "expect_content_type_prefix": "image/",
       "expect_content_range_prefix": "bytes 0-4095/",
+      "expect_content_length_min": 4096,
       "min_bytes": 4096,
+      "max_ttfb_ms": 45000
+    },
+    {
+      "id": "ipfs-tech-developers-hero-middle-range",
+      "description": "DNSLink-backed image middle byte range from the ipfs.tech page bundle. Exercises non-zero media seek behavior.",
+      "path": "/ipns/ipfs.tech/_nuxt/developers-hero.BRuJDQyf.jpg",
+      "range": "bytes=4096-8191",
+      "expect_status": 206,
+      "expect_content_type_prefix": "image/",
+      "expect_content_range_prefix": "bytes 4096-8191/",
+      "expect_content_length_min": 4096,
+      "min_bytes": 4096,
+      "max_ttfb_ms": 45000
+    },
+    {
+      "id": "ipfs-tech-developers-hero-suffix-range",
+      "description": "DNSLink-backed image suffix byte range from the ipfs.tech page bundle. Exercises browser-style tail range reads.",
+      "path": "/ipns/ipfs.tech/_nuxt/developers-hero.BRuJDQyf.jpg",
+      "range": "bytes=-4096",
+      "expect_status": 206,
+      "expect_content_type_prefix": "image/",
+      "expect_content_range_prefix": "bytes ",
+      "expect_content_length_min": 4096,
+      "min_bytes": 4096,
+      "max_ttfb_ms": 45000
+    },
+    {
+      "id": "ipfs-tech-developers-hero-head",
+      "description": "DNSLink-backed image HEAD request from the ipfs.tech page bundle. Exercises browser metadata probes without downloading the body.",
+      "path": "/ipns/ipfs.tech/_nuxt/developers-hero.BRuJDQyf.jpg",
+      "method": "HEAD",
+      "expect_status": 200,
+      "expect_content_type_prefix": "image/",
+      "expect_content_length_min": 4096,
       "max_ttfb_ms": 45000
     },
     {
