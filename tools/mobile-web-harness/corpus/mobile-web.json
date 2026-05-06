@@ -74,6 +74,25 @@
       }
     },
     {
+      "id": "ipfs-tech-page-assets-cid-direct",
+      "description": "Immutable CID-direct control for the current ipfs.tech DNSLink root. Isolates cached UnixFS/gateway behavior from IPNS/DNSLink resolution.",
+      "path": "/ipfs/bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq/",
+      "default_enabled": false,
+      "expect_status": 200,
+      "expect_content_type_prefix": "text/html",
+      "expect_body_contains": "<title>IPFS",
+      "min_bytes": 100000,
+      "max_ttfb_ms": 45000,
+      "crawl": {
+        "max_assets": 32,
+        "min_assets": 8,
+        "max_failed_assets": 0,
+        "same_origin_only": true,
+        "include_css_assets": true,
+        "asset_max_bytes": 2000000
+      }
+    },
+    {
       "id": "ipfs-tech-developers-hero-range",
       "description": "DNSLink-backed image range from the ipfs.tech page bundle. Exercises media byte ranges without fetching the full image.",
       "path": "/ipns/ipfs.tech/_nuxt/developers-hero.BRuJDQyf.jpg",

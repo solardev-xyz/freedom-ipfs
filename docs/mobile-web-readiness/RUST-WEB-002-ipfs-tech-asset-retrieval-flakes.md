@@ -20897,3 +20897,96 @@ beating Kubo on same-daemon warm TTFB; Kubo's margin is only a few milliseconds,
 while Rust uses much less memory and far fewer FDs. The next warm-path
 optimization should focus on reducing repeated per-request overhead in the
 already-cached path without increasing RSS meaningfully.
+
+## 2026-05-06 Keep: Add ipfs.tech CID-Direct Page-Assets Control
+
+Question:
+How much of the warm `ipfs-tech-page-assets` gap is DNSLink/IPNS resolution
+overhead, and how much remains when the same page is loaded through its
+immutable resolved `/ipfs` root?
+
+Implementation:
+
+- Add opt-in corpus case `ipfs-tech-page-assets-cid-direct`.
+- Use the current observed `ipfs.tech` DNSLink target:
+  `/ipfs/bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq/`.
+- Keep the same page crawl shape as `ipfs-tech-page-assets`: `32` max assets,
+  `min_assets=8`, same-origin only, CSS assets enabled, and no failed assets.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+python3 -m json.tool tools/mobile-web-harness/corpus/mobile-web.json >/tmp/mobile-web-corpus-check.json
+cargo test -p mobile-web-harness corpus_entries_can_be_explicit_only -- --nocapture
+```
+
+Focused result:
+
+- Formatting passed.
+- Corpus JSON parsed successfully.
+- Explicit-only corpus test passed.
+
+Live same-daemon warm comparison:
+
+```sh
+rm -f /tmp/freedom-ipfs-ipfs-tech-cid-direct-warm.db \
+  /tmp/freedom-ipfs-ipfs-tech-cid-direct-warm.db-* \
+  /tmp/ipfs-tech-cid-direct-warm-rust-trace.jsonl \
+  /tmp/ipfs-tech-cid-direct-warm-rust-vs-kubo.json
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --gateway-db /tmp/freedom-ipfs-ipfs-tech-cid-direct-warm.db \
+  --case ipfs-tech-page-assets-cid-direct \
+  --warmup-runs 1 \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-cid-direct-warm-rust-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-cid-direct-warm-rust-vs-kubo.json
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-cid-direct-warm-rust-vs-kubo.json`
+- `/tmp/ipfs-tech-cid-direct-warm-rust-trace.jsonl` (`1987` lines)
+- `/tmp/freedom-ipfs-ipfs-tech-cid-direct-warm.db`
+- `/tmp/freedom-ipfs-ipfs-tech-cid-direct-warm.db-wal`
+
+Result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Rust run total p50/p95/max: `42/48/48ms`.
+- Kubo run total p50/p95/max: `32/40/40ms`.
+- Rust root TTFB p50/p95/max: `3/5/5ms`.
+- Kubo root TTFB p50/p95/max: `2/7/7ms`.
+- Rust asset TTFB p50/p95/max: `4/8/11ms`.
+- Kubo asset TTFB p50/p95/max: `2/6/9ms`.
+- Ratios: root p50 `1.50x` in Kubo's favor, root p95 `0.71x` in Rust's
+  favor, asset p50 `2.00x` in Kubo's favor, asset p95 `1.33x` in Kubo's favor.
+- Rust max RSS/FD: `47284KiB` / `25`.
+- Kubo max RSS/FD: `240640KiB` / `156`.
+- Rust used `0.20x` Kubo RSS and `0.16x` Kubo FD count.
+- Rust storage max: `2480056B`; Kubo storage max: `824420B`.
+
+Trace notes:
+
+- The CID-direct measured request groups remove the repeated `name_cache` /
+  `name_resolve` phases seen in the `/ipns` version.
+- Warm measured groups were dominated by cached path/resource work:
+  `block_store_get_range`, `gateway_limiter`, `ipfs_path_parse`,
+  `mime_detect`, `mime_total`, `request_done`, `request_start`, and
+  `unixfs_file_size`.
+- The warmup still performed `35` delegated provider lookups and `40` HTTP
+  provider block fetch totals; these remain cold/warmup costs, not the measured
+  warm gap.
+
+Decision:
+Keep the CID-direct control. It shows that DNSLink/IPNS resolution is part of
+the warm root gap, but cached asset requests still trail Kubo even without name
+resolution. The next warm-path experiment should target repeated cached
+UnixFS/gateway work for asset requests rather than only name resolution.

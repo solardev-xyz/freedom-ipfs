@@ -341,7 +341,8 @@ status, MIME type, byte count, and timing.
 
 - ENS-to-CID controls: resolve `.eth` names outside the gateway, then test the
   resulting `/ipfs/<cid>/` path directly so ENS bugs stay separate from IPFS
-  retrieval bugs.
+  retrieval bugs. The corpus includes `ipfs-tech-page-assets-cid-direct` as a
+  DNSLink-to-CID control for the current `ipfs.tech` root.
 - Range-heavy media fixtures: request first, middle, and suffix byte ranges from
   known media CIDs and verify `206`, `Content-Range`, `Content-Length`, byte
   digests, and bounded memory. The harness now has opt-in
