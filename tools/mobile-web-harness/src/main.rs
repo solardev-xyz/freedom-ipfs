@@ -26,6 +26,11 @@ const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 const DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_ASSET_CONCURRENCY: usize = 6;
 const MAX_TRACE_SLOW_EVENTS: usize = 16;
+const SYNTHETIC_MULTIBLOCK_RANGE_ID: &str = "synthetic-multiblock-range";
+const SYNTHETIC_MULTIBLOCK_FILE_BYTES: usize = 512 * 1024;
+const SYNTHETIC_MULTIBLOCK_CHUNKER: &str = "size-16384";
+const SYNTHETIC_MULTIBLOCK_RANGE_START: usize = 32 * 1024;
+const SYNTHETIC_MULTIBLOCK_RANGE_BYTES: usize = 64 * 1024;
 const X_FREEDOM_REQUEST_ID: &str = "X-Freedom-Request-ID";
 const X_FREEDOM_PARENT_REQUEST_ID: &str = "X-Freedom-Parent-Request-ID";
 const X_FREEDOM_TOP_LEVEL_PATH: &str = "X-Freedom-Top-Level-Path";
@@ -82,6 +87,9 @@ struct Args {
     /// Kubo repo path. Omit for an isolated temporary repo per spawned Kubo daemon.
     #[arg(long, env = "IPFS_PATH")]
     kubo_repo: Option<PathBuf>,
+    /// Generate the deterministic synthetic multi-block range fixture into this directory and exit.
+    #[arg(long)]
+    prepare_synthetic_multiblock_range_fixture: Option<PathBuf>,
     /// Run paired Rust and Kubo harness passes with the same corpus/options.
     #[arg(long)]
     compare_kubo: bool,
@@ -162,6 +170,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(fixture_dir) = &args.prepare_synthetic_multiblock_range_fixture {
+        prepare_synthetic_multiblock_range_fixture(&args.kubo_bin, fixture_dir)?;
+        return Ok(());
+    }
     let corpus = Corpus::read(&args.corpus)?;
 
     if args.offline_replay {
@@ -446,6 +458,143 @@ async fn build_default_rust_gateway() -> Result<()> {
         bail!("cargo build -p freedom-ipfs-gateway failed with {status}");
     }
     Ok(())
+}
+
+fn prepare_synthetic_multiblock_range_fixture(kubo: &PathBuf, fixture_dir: &Path) -> Result<()> {
+    let repo = fixture_dir.join("repo");
+    if repo.exists()
+        && repo
+            .read_dir()
+            .with_context(|| format!("read fixture repo {}", repo.display()))?
+            .next()
+            .is_some()
+    {
+        bail!(
+            "synthetic fixture repo already exists and is not empty: {}; remove it or choose a new fixture directory",
+            repo.display()
+        );
+    }
+
+    std::fs::create_dir_all(&repo).with_context(|| format!("create {}", repo.display()))?;
+    kubo_ok(kubo, &repo, ["init", "--profile=server"])?;
+
+    let data_path = fixture_dir.join("multiblock.bin");
+    let car_path = fixture_dir.join("multiblock.car");
+    let corpus_path = fixture_dir.join("corpus.json");
+    let manifest_path = fixture_dir.join("manifest.json");
+    let data = synthetic_multiblock_range_bytes();
+    std::fs::write(&data_path, &data).with_context(|| format!("write {}", data_path.display()))?;
+
+    let add_output = std::process::Command::new(kubo)
+        .env("IPFS_PATH", &repo)
+        .env("IPFS_TELEMETRY", "off")
+        .arg("add")
+        .arg("-Q")
+        .arg("--cid-version=1")
+        .arg("--raw-leaves=true")
+        .arg(format!("--chunker={SYNTHETIC_MULTIBLOCK_CHUNKER}"))
+        .arg("--progress=false")
+        .arg(&data_path)
+        .output()
+        .with_context(|| format!("run Kubo add for {}", data_path.display()))?;
+    if !add_output.status.success() {
+        bail!(
+            "Kubo add failed with status {}: stdout={} stderr={}",
+            add_output.status,
+            String::from_utf8_lossy(&add_output.stdout),
+            String::from_utf8_lossy(&add_output.stderr)
+        );
+    }
+    let cid = String::from_utf8(add_output.stdout)
+        .context("Kubo add returned non-UTF8 CID")?
+        .trim()
+        .to_string();
+    if cid.is_empty() {
+        bail!("Kubo add returned an empty CID");
+    }
+
+    let export_output = std::process::Command::new(kubo)
+        .env("IPFS_PATH", &repo)
+        .env("IPFS_TELEMETRY", "off")
+        .arg("dag")
+        .arg("export")
+        .arg(&cid)
+        .output()
+        .with_context(|| format!("run Kubo dag export for {cid}"))?;
+    if !export_output.status.success() {
+        bail!(
+            "Kubo dag export failed with status {}: stdout={} stderr={}",
+            export_output.status,
+            String::from_utf8_lossy(&export_output.stdout),
+            String::from_utf8_lossy(&export_output.stderr)
+        );
+    }
+    std::fs::write(&car_path, export_output.stdout)
+        .with_context(|| format!("write {}", car_path.display()))?;
+
+    let range_end = SYNTHETIC_MULTIBLOCK_RANGE_START + SYNTHETIC_MULTIBLOCK_RANGE_BYTES - 1;
+    let range_sha256 = format!(
+        "{:x}",
+        Sha256::digest(&data[SYNTHETIC_MULTIBLOCK_RANGE_START..=range_end])
+    );
+    let ipfs_path = format!("/ipfs/{cid}");
+    let corpus = serde_json::json!({
+        "entries": [
+            {
+                "id": SYNTHETIC_MULTIBLOCK_RANGE_ID,
+                "description": "Synthetic 512KiB UnixFS file with 16KiB raw leaves; 64KiB middle range spans four raw blocks.",
+                "path": ipfs_path,
+                "range": format!("bytes={SYNTHETIC_MULTIBLOCK_RANGE_START}-{range_end}"),
+                "expect_status": 206,
+                "expect_content_type_prefix": "application/octet-stream",
+                "expect_content_range_prefix": format!("bytes {SYNTHETIC_MULTIBLOCK_RANGE_START}-{range_end}/"),
+                "expect_content_length": SYNTHETIC_MULTIBLOCK_RANGE_BYTES,
+                "expect_accept_ranges": "bytes",
+                "expect_body_sha256": range_sha256,
+                "min_bytes": SYNTHETIC_MULTIBLOCK_RANGE_BYTES,
+                "max_ttfb_ms": 10000
+            }
+        ]
+    });
+    let manifest = serde_json::json!({
+        "id": SYNTHETIC_MULTIBLOCK_RANGE_ID,
+        "cid": cid,
+        "chunker": SYNTHETIC_MULTIBLOCK_CHUNKER,
+        "file_bytes": SYNTHETIC_MULTIBLOCK_FILE_BYTES,
+        "range": {
+            "start": SYNTHETIC_MULTIBLOCK_RANGE_START,
+            "end": range_end,
+            "bytes": SYNTHETIC_MULTIBLOCK_RANGE_BYTES,
+            "sha256": corpus["entries"][0]["expect_body_sha256"],
+        },
+        "paths": {
+            "data": data_path.display().to_string(),
+            "car": car_path.display().to_string(),
+            "corpus": corpus_path.display().to_string(),
+            "repo": repo.display().to_string(),
+        }
+    });
+
+    std::fs::write(&corpus_path, serde_json::to_string_pretty(&corpus)?)
+        .with_context(|| format!("write {}", corpus_path.display()))?;
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)
+        .with_context(|| format!("write {}", manifest_path.display()))?;
+
+    eprintln!("prepared synthetic multi-block range fixture");
+    eprintln!(
+        "  path: {}",
+        corpus["entries"][0]["path"].as_str().unwrap_or("")
+    );
+    eprintln!("  car: {}", car_path.display());
+    eprintln!("  corpus: {}", corpus_path.display());
+    eprintln!("  manifest: {}", manifest_path.display());
+    Ok(())
+}
+
+fn synthetic_multiblock_range_bytes() -> Vec<u8> {
+    (0..SYNTHETIC_MULTIBLOCK_FILE_BYTES)
+        .map(|index| (((index * 31) + (index / 251)) % 256) as u8)
+        .collect()
 }
 
 async fn run_offline_replay(args: &Args, corpus: &Corpus) -> Result<OfflineReplayReport> {
@@ -9556,6 +9705,37 @@ mod tests {
         assert_eq!(
             args.bitswap_seed_car.as_deref(),
             Some(Path::new("/tmp/mobile-fixture.car"))
+        );
+    }
+
+    #[test]
+    fn args_accept_prepare_synthetic_multiblock_range_fixture() {
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--prepare-synthetic-multiblock-range-fixture",
+            "/tmp/synthetic-range-fixture",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.prepare_synthetic_multiblock_range_fixture.as_deref(),
+            Some(Path::new("/tmp/synthetic-range-fixture"))
+        );
+    }
+
+    #[test]
+    fn synthetic_multiblock_range_bytes_are_stable() {
+        let data = synthetic_multiblock_range_bytes();
+        let range_end = SYNTHETIC_MULTIBLOCK_RANGE_START + SYNTHETIC_MULTIBLOCK_RANGE_BYTES - 1;
+        let range_sha256 = format!(
+            "{:x}",
+            Sha256::digest(&data[SYNTHETIC_MULTIBLOCK_RANGE_START..=range_end])
+        );
+
+        assert_eq!(data.len(), SYNTHETIC_MULTIBLOCK_FILE_BYTES);
+        assert_eq!(
+            range_sha256,
+            "008247ddb836acb6aaeea63a8d0a3b0ddcc6384bd838280d792e04de9de09df9"
         );
     }
 

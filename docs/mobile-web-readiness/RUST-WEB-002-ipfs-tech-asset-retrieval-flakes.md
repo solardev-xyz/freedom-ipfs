@@ -24892,3 +24892,96 @@ as the default partial grace for the opt-in path. On the deterministic local
 multi-block range workload this reaches setup-adjusted Kubo parity while staying
 much lighter on RSS and FDs, without regressing the multi-block incoming peer
 unit behavior that failed with a zero default.
+
+## Range Batch Live Guardrail And Fixture Generator
+
+The next guardrail checked whether enabling the opt-in range batching path caused
+any obvious regression on the recurring live cases:
+
+```sh
+FREEDOM_IPFS_ENABLE_BITSWAP_SESSION_RANGE_BATCH=1 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --asset-concurrency 4 \
+  --timeout-secs 30 \
+  --run-timeout-secs 90 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/range-batch-live-guardrail-r3-20260506-trace.jsonl \
+  --comparison-output /tmp/range-batch-live-guardrail-r3-20260506.json \
+  > /tmp/range-batch-live-guardrail-r3-20260506.log 2>&1
+```
+
+Result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Rust max RSS/FD: `53200KiB/32`; Kubo max RSS/FD: `380224KiB/1015`.
+- `daicowtf-page-assets`: Rust root p50/p95 `273/470ms`; Kubo `2269/4576ms`.
+- `vitalik-root-html-range`: Rust root p50/p95 `96/118ms`; Kubo `2706/2850ms`.
+- `ipfs-tech-page-assets`: Rust root p50/p95 `1013/2891ms`; Kubo `2284/2455ms`.
+- `ipfs-tech-page-assets`: Rust asset p50/p95 `307/1045ms`; Kubo `133/1282ms`.
+- Rust trace had `block_range_batch_fetches.events=0`, so this was a
+  no-regression guardrail, not evidence that public live cases exercise the new
+  range batch path.
+
+To make the deterministic local range benchmark repeatable, the harness now has
+a fixture-preparation mode:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --prepare-synthetic-multiblock-range-fixture /tmp/freedom-ipfs-range-batch-fixture-generated-20260506-1
+```
+
+Generated fixture:
+
+- Manifest:
+  `/tmp/freedom-ipfs-range-batch-fixture-generated-20260506-1/manifest.json`
+- Corpus:
+  `/tmp/freedom-ipfs-range-batch-fixture-generated-20260506-1/corpus.json`
+- CAR:
+  `/tmp/freedom-ipfs-range-batch-fixture-generated-20260506-1/multiblock.car`
+- CID:
+  `bafybeifdktnvudm2oz7qf2lho4wcb5vehxr5jsrwrrqt4n4tugkfopg32e`
+- Range:
+  `bytes=32768-98303`
+- Range SHA-256:
+  `008247ddb836acb6aaeea63a8d0a3b0ddcc6384bd838280d792e04de9de09df9`
+
+Validation command for the generated fixture:
+
+```sh
+FREEDOM_IPFS_ENABLE_BITSWAP_SESSION_RANGE_BATCH=1 \
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --corpus /tmp/freedom-ipfs-range-batch-fixture-generated-20260506-1/corpus.json \
+  --case synthetic-multiblock-range \
+  --bitswap-seed-car /tmp/freedom-ipfs-range-batch-fixture-generated-20260506-1/multiblock.car \
+  --repeat 1 \
+  --asset-concurrency 1 \
+  --timeout-secs 30 \
+  --run-timeout-secs 60 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/synthetic-multiblock-range-generated-r1-20260506-trace.jsonl \
+  --output /tmp/synthetic-multiblock-range-generated-r1-20260506.json \
+  > /tmp/synthetic-multiblock-range-generated-r1-20260506.log 2>&1
+```
+
+Validation result:
+
+- Rust passed `1/1`.
+- Root TTFB: `113ms`.
+- RSS/FD max: `38144KiB/12`.
+- `block_range_batch_fetches.events=4`, sources `bitswap_batch=2`,
+  `bitswap=2`.
+
+Decision:
+Do not enable range batching by default from the live guardrail, because the live
+cases did not exercise the path. Keep it opt-in for now, but use the new fixture
+generator for future repeatable range-batch experiments and default-promotion
+evidence.
