@@ -148,6 +148,9 @@ struct Args {
     /// Optional tracing filter for spawned gateway trace output.
     #[arg(long)]
     trace_filter: Option<String>,
+    /// Include the full tracing span stack in each spawned gateway JSONL event.
+    #[arg(long)]
+    trace_span_list: bool,
 }
 
 #[tokio::main]
@@ -555,6 +558,7 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             .trace_output
             .as_ref()
             .map(|path| path.display().to_string()),
+        trace_span_list: args.trace_output.as_ref().map(|_| args.trace_span_list),
         trace_summary,
         summary,
         runs,
@@ -3602,6 +3606,9 @@ impl SpawnedGateway {
         if let Some(trace_filter) = &args.trace_filter {
             command.arg("--trace-filter").arg(trace_filter);
         }
+        if args.trace_span_list {
+            command.arg("--trace-span-list");
+        }
         if let Some(seed) = bitswap_seed {
             command.arg("--delegated-router").arg(&seed.router_endpoint);
         } else if let Some(delegated_router) = &args.delegated_router {
@@ -4164,6 +4171,7 @@ struct RunReport {
     bitswap_seed_connection_setup: Option<BitswapSeedConnectionSetup>,
     kubo_repo: Option<String>,
     trace_output: Option<String>,
+    trace_span_list: Option<bool>,
     trace_summary: Option<TraceSummary>,
     summary: RepeatSummary,
     runs: Vec<RunResult>,
@@ -8839,6 +8847,23 @@ mod tests {
     }
 
     #[test]
+    fn args_accept_trace_span_list_flag() {
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--trace-output",
+            "/tmp/mobile-trace.jsonl",
+            "--trace-span-list",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.trace_output.as_deref(),
+            Some(Path::new("/tmp/mobile-trace.jsonl"))
+        );
+        assert!(args.trace_span_list);
+    }
+
+    #[test]
     fn args_accept_gateway_import_car() {
         let args = Args::try_parse_from([
             "mobile-web-harness",
@@ -10731,6 +10756,7 @@ mod tests {
             bitswap_seed_connection_setup: None,
             kubo_repo: None,
             trace_output: None,
+            trace_span_list: None,
             trace_summary: None,
             summary: RepeatSummary::from_runs(&runs),
             runs,
@@ -10810,6 +10836,7 @@ mod tests {
             bitswap_seed_connection_setup: None,
             kubo_repo: None,
             trace_output: Some(path.display().to_string()),
+            trace_span_list: Some(false),
             trace_summary: Some(summarize_trace_output(&path).unwrap()),
             summary: RepeatSummary::from_runs(&runs),
             runs,
@@ -11583,6 +11610,7 @@ mod tests {
             bitswap_seed_connection_setup,
             kubo_repo: None,
             trace_output: None,
+            trace_span_list: None,
             trace_summary: None,
             summary,
             runs,

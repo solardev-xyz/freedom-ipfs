@@ -21244,3 +21244,124 @@ warm root and asset reads while using less RSS and fewer FDs. Follow-up work
 should separate production hot-path latency from trace overhead before adding
 more gateway cache layers; trace sampling or cheaper trace aggregation may be
 higher leverage than another read-path cache.
+
+## 2026-05-06 Keep: Make Full Trace Span Lists Opt-In
+
+Question:
+Can we reduce trace-induced latency and JSONL volume without losing the current
+mobile harness request-correlation summaries?
+
+Implementation:
+
+- Keep `span` on gateway JSON events by default, since the harness parser uses
+  it for request grouping and slow-event details.
+- Stop emitting the duplicate full `spans` stack by default.
+- Add gateway and harness CLI flag `--trace-span-list` for the rare cases where
+  full span-stack output is needed.
+- Add `trace_span_list` to harness JSON reports when trace output is enabled, so
+  future artifacts make the trace shape explicit.
+
+No-span-list traced run:
+
+```sh
+rm -f /tmp/freedom-ipfs-cid-direct-trace-no-span-list.db \
+  /tmp/freedom-ipfs-cid-direct-trace-no-span-list.db-* \
+  /tmp/ipfs-tech-cid-direct-trace-no-span-list-r5.json \
+  /tmp/ipfs-tech-cid-direct-trace-no-span-list-r5-trace.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --gateway-db /tmp/freedom-ipfs-cid-direct-trace-no-span-list.db \
+  --case ipfs-tech-page-assets-cid-direct \
+  --warmup-runs 1 \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-cid-direct-trace-no-span-list-r5-trace.jsonl \
+  --output /tmp/ipfs-tech-cid-direct-trace-no-span-list-r5.json
+```
+
+Span-list traced run:
+
+```sh
+rm -f /tmp/freedom-ipfs-cid-direct-trace-span-list.db \
+  /tmp/freedom-ipfs-cid-direct-trace-span-list.db-* \
+  /tmp/ipfs-tech-cid-direct-trace-span-list-r5.json \
+  /tmp/ipfs-tech-cid-direct-trace-span-list-r5-trace.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --gateway-db /tmp/freedom-ipfs-cid-direct-trace-span-list.db \
+  --case ipfs-tech-page-assets-cid-direct \
+  --warmup-runs 1 \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-cid-direct-trace-span-list-r5-trace.jsonl \
+  --trace-span-list \
+  --output /tmp/ipfs-tech-cid-direct-trace-span-list-r5.json
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-cid-direct-trace-no-span-list-r5.json`
+- `/tmp/ipfs-tech-cid-direct-trace-no-span-list-r5-trace.jsonl` (`2817`
+  lines, `1775630` bytes)
+- `/tmp/ipfs-tech-cid-direct-trace-span-list-r5.json`
+- `/tmp/ipfs-tech-cid-direct-trace-span-list-r5-trace.jsonl` (`2825` lines,
+  `2723594` bytes)
+
+Result:
+
+- Both runs passed `5/5`.
+- No-span-list trace output averaged about `630` bytes/line.
+- Span-list trace output averaged about `964` bytes/line.
+- For this sample, dropping `spans` reduced trace bytes by about `35%`.
+- No-span-list run total p50/p95/max: `28/41/41ms`.
+- Span-list run total p50/p95/max: `46/60/60ms`.
+- No-span-list root TTFB p50/p95/max: `2/3/3ms`.
+- Span-list root TTFB p50/p95/max: `4/5/5ms`.
+- No-span-list asset TTFB p50/p95/max: `2/6/7ms`.
+- Span-list asset TTFB p50/p95/max: `4/8/11ms`.
+- No-span-list asset total p50/p95/max: `2/6/7ms`.
+- Span-list asset total p50/p95/max: `4/8/47ms`.
+- The no-span-list trace still parsed successfully and preserved progress
+  request groups, slow-event details, cache counters, Bitswap summaries, and
+  provider summaries.
+
+Focused validation before final gate:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness args_accept_trace_span_list_flag -- --nocapture
+cargo check -p mobile-web-harness --all-targets
+cargo check -p freedom-ipfs-gateway --all-targets
+```
+
+Focused result:
+All focused checks passed.
+
+Final validation:
+
+```sh
+cargo fmt --all --check
+git diff --check
+cargo test -p freedom-ipfs-gateway
+cargo test -p mobile-web-harness
+cargo clippy -p freedom-ipfs-gateway --all-targets -- -D warnings
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+cargo check --workspace --all-targets
+```
+
+Final validation result:
+All commands passed.
+
+Decision:
+Keep. The duplicate span-stack field was a material trace payload multiplier,
+and the harness does not need it for normal mobile-web summaries. This does not
+change production/no-trace behavior, keeps request correlation intact for traced
+runs, and leaves an explicit `--trace-span-list` escape hatch for deeper tracing.

@@ -58,6 +58,8 @@ struct Args {
     trace_output: Option<PathBuf>,
     #[arg(long)]
     trace_filter: Option<String>,
+    #[arg(long)]
+    trace_span_list: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -71,7 +73,11 @@ enum RoutingMode {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    init_tracing(args.trace_output.as_deref(), args.trace_filter.as_deref())?;
+    init_tracing(
+        args.trace_output.as_deref(),
+        args.trace_filter.as_deref(),
+        args.trace_span_list,
+    )?;
     let start_online_gateway = should_start_online_gateway(&args);
     let store = if let Some(path) = args.db {
         SqliteBlockStore::open(path, 256 * 1024 * 1024)?
@@ -135,7 +141,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_tracing(trace_output: Option<&std::path::Path>, trace_filter: Option<&str>) -> Result<()> {
+fn init_tracing(
+    trace_output: Option<&std::path::Path>,
+    trace_filter: Option<&str>,
+    trace_span_list: bool,
+) -> Result<()> {
     let filter = if let Some(trace_filter) = trace_filter {
         tracing_subscriber::EnvFilter::try_new(trace_filter)
             .with_context(|| format!("parse trace filter {trace_filter:?}"))?
@@ -157,7 +167,7 @@ fn init_tracing(trace_output: Option<&std::path::Path>, trace_filter: Option<&st
             .json()
             .flatten_event(true)
             .with_current_span(true)
-            .with_span_list(true)
+            .with_span_list(trace_span_list)
             .with_writer(TraceFileWriter(Arc::new(file)))
             .init();
     } else {

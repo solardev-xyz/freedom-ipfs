@@ -341,7 +341,12 @@ status, MIME type, byte count, and timing.
   asset TTFB `2/3ms`, versus Kubo root `2/2ms` and asset `2/6ms`, while using
   less RSS and fewer FDs. A Rust-only no-trace repeat=5 sample kept asset TTFB
   at `2/3ms`, so future warm-path comparisons should account for trace overhead
-  before adding more gateway cache layers.
+  before adding more gateway cache layers. Gateway JSONL traces now omit the
+  duplicate full `spans` stack by default while retaining `span` for request
+  correlation; `--trace-span-list` restores the full stack when needed. On the
+  CID-direct warm traced repeat=5 sample, omitting `spans` reduced trace output
+  from about `2.72MiB` to `1.78MiB` and improved asset TTFB p50/p95 from
+  `4/8ms` to `2/6ms`.
 
 ## Next Scenario Targets
 
