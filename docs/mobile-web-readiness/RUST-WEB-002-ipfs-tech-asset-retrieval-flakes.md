@@ -24383,3 +24383,71 @@ behavior. Kubo won asset p50 and p95 in this same-window comparison even though
 Rust passed reliably and exercised zero-HTTP cold Bitswap. Next performance work
 should target small subresource fetches, session reuse, or bounded batching
 rather than root discovery alone.
+
+## Rejected: Enable Single-HTTP Bitswap Hedge By Default
+
+Hypothesis:
+The `125ms` Rust-vs-Kubo trace still showed asset p95 dominated partly by
+single HTTP-provider tails, especially `https://ipfs-bridge.sia.dev/`. The code
+already has an opt-in single-HTTP Bitswap hedge behind
+`FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE`; enabling it might let Bitswap
+beat slow single HTTP-provider responses without changing provider discovery or
+block verification.
+
+Experiment command:
+
+```sh
+FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/ipfs-tech-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506.log 2>&1
+```
+
+Result:
+
+- Rust passed `3/3`
+- Kubo passed `3/3`
+- root TTFB p50/p95:
+  - Rust: `1289/1696ms`
+  - Kubo: `1862/1890ms`
+  - Rust/Kubo ratio: `0.69x/0.90x`
+- asset TTFB p50/p95:
+  - Rust: `230/875ms`
+  - Kubo: `135/811ms`
+  - Rust/Kubo ratio: `1.70x/1.08x`
+- resource max:
+  - RSS: Rust `54144KiB`, Kubo `119212KiB`
+  - FDs: Rust `39`, Kubo `64`
+- HTTP-provider fetch p95 improved from the immediate default run's `805ms` to
+  `516ms`, and `ipfs-bridge.sia.dev` p95 improved from `687ms` to `325ms`.
+- The hedge fired `28` times and won with Bitswap only `2` times.
+- Bitswap work increased: progress `fetching_bitswap` rose from `550` to `820`,
+  peer attempt starts rose from `89` to `198`, and established Bitswap
+  connections rose from `11` to `15`.
+
+Artifacts:
+
+- `/tmp/ipfs-tech-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506.json`
+- `/tmp/ipfs-tech-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506-trace.jsonl`
+- `/tmp/ipfs-tech-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506.log`
+
+Decision:
+Reject enabling the single-HTTP Bitswap hedge by default. It did reduce the
+slowest HTTP-provider fetches, but the page-level result did not improve versus
+the immediately preceding default run: Rust root p50/p95 worsened from
+`760/1421ms` to `1289/1696ms`, asset p95 moved from `826ms` to `875ms`, max FD
+count rose from `29` to `39`, and the hedge rarely won. Keep it as an env lab
+knob. A future version would need stronger gating, such as only hedging
+providers with a high EWMA latency and a recent successful session peer.
