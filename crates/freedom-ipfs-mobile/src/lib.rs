@@ -697,7 +697,8 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         | "bitswap_session_shortcut_pre_lookup"
         | "bitswap_session_late_peer_wait"
         | "bitswap_session_shortcut_empty_providers_wait"
-        | "bitswap_session_shortcut_post_lookup_wait" => "fetching_bitswap",
+        | "bitswap_session_shortcut_post_lookup_wait"
+        | "bitswap_session_shortcut_post_lookup_race" => "fetching_bitswap",
         "bitswap_fetch_cancelled" => "cancelled",
         "bitswap_request_timeout_detail"
         | "retry_provider_count"
@@ -2528,6 +2529,14 @@ mod tests {
             progress_phase(
                 "bitswap_session_shortcut_pre_lookup",
                 &progress_fields([("phase", "bitswap_session_shortcut_pre_lookup")]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_session_shortcut_post_lookup_race",
+                &progress_fields([("phase", "bitswap_session_shortcut_post_lookup_race")]),
                 "active",
             ),
             "fetching_bitswap"

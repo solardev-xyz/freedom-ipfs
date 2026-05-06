@@ -27,8 +27,10 @@ use prost::Message;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error as StdError;
 use std::fmt::Debug;
+use std::future::Future;
 use std::io;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -90,6 +92,8 @@ const BITSWAP_SESSION_POST_LOOKUP_GRACE: Duration = Duration::from_millis(100);
 const BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE: Duration = Duration::from_millis(125);
 const BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS";
+const ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE";
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
 const BITSWAP_SESSION_LATE_PEER_WAIT: Duration = Duration::from_secs(2);
 const BITSWAP_SESSION_LATE_PEER_POLL: Duration = Duration::from_millis(50);
@@ -163,6 +167,16 @@ pub enum RetrievalSource {
     Cache,
     HttpProvider,
     Bitswap,
+}
+
+impl RetrievalSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cache => "cache",
+            Self::HttpProvider => "http_provider",
+            Self::Bitswap => "bitswap",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -472,8 +486,22 @@ impl HttpRetriever {
                                                         bitswap_session_post_lookup_grace(&providers);
                                                     let http_provider_count =
                                                         provider_http_url_count(&providers);
-                                                    let post_lookup_started = Instant::now();
-                                                    match timeout(post_lookup_grace, &mut shortcut).await {
+                                                    if single_http_post_lookup_race_enabled()
+                                                        && http_provider_count == 1
+                                                    {
+                                                        if let Some((block, source)) = self
+                                                            .fetch_after_session_shortcut_provider_lookup(
+                                                                cid,
+                                                                &providers,
+                                                                shortcut.as_mut(),
+                                                            )
+                                                            .await?
+                                                        {
+                                                            return Ok((block, source));
+                                                        }
+                                                    } else {
+                                                        let post_lookup_started = Instant::now();
+                                                        match timeout(post_lookup_grace, &mut shortcut).await {
                                                         Ok(shortcut_result) => match shortcut_result {
                                                             Ok(Some(block)) => {
                                                                 tracing::info!(
@@ -523,6 +551,7 @@ impl HttpRetriever {
                                                                 http_provider_count
                                                             );
                                                         }
+                                                    }
                                                     }
                                                 }
                                                 providers
@@ -642,8 +671,22 @@ impl HttpRetriever {
                                                     bitswap_session_post_lookup_grace(&providers);
                                                 let http_provider_count =
                                                     provider_http_url_count(&providers);
-                                                let post_lookup_started = Instant::now();
-                                                match timeout(post_lookup_grace, &mut shortcut).await {
+                                                if single_http_post_lookup_race_enabled()
+                                                    && http_provider_count == 1
+                                                {
+                                                    if let Some((block, source)) = self
+                                                        .fetch_after_session_shortcut_provider_lookup(
+                                                            cid,
+                                                            &providers,
+                                                            shortcut.as_mut(),
+                                                        )
+                                                        .await?
+                                                    {
+                                                        return Ok((block, source));
+                                                    }
+                                                } else {
+                                                    let post_lookup_started = Instant::now();
+                                                    match timeout(post_lookup_grace, &mut shortcut).await {
                                                     Ok(shortcut_result) => match shortcut_result {
                                                         Ok(Some(block)) => {
                                                             tracing::info!(
@@ -693,6 +736,7 @@ impl HttpRetriever {
                                                             http_provider_count
                                                         );
                                                     }
+                                                }
                                                 }
                                             }
                                             providers
@@ -932,6 +976,126 @@ impl HttpRetriever {
             Ok(block) => Ok((block, RetrievalSource::Bitswap)),
             Err(RetrievalError::NoBitswapProviders) => Err(RetrievalError::NoHttpProviders),
             Err(err) => Err(err),
+        }
+    }
+
+    async fn fetch_after_session_shortcut_provider_lookup<F>(
+        &self,
+        cid: &Cid,
+        providers: &[Provider],
+        mut shortcut: Pin<&mut F>,
+    ) -> Result<Option<(Block, RetrievalSource)>>
+    where
+        F: Future<Output = Result<Option<Block>>>,
+    {
+        let post_lookup_grace = bitswap_session_post_lookup_grace(providers);
+        let http_provider_count = provider_http_url_count(providers);
+        debug_assert_eq!(http_provider_count, 1);
+        let provider_fetch = self.fetch_from_providers_with_source(cid, providers);
+        tokio::pin!(provider_fetch);
+        let race_started = Instant::now();
+        let provider_count = providers.len();
+        tokio::select! {
+            biased;
+
+            shortcut_result = shortcut.as_mut() => {
+                match shortcut_result {
+                Ok(Some(block)) => {
+                    tracing::info!(
+                        phase = "bitswap_session_shortcut_post_lookup_race",
+                        cid = %cid,
+                        outcome = "bitswap_won",
+                        timeout_ms = post_lookup_grace.as_millis(),
+                        elapsed_ms = race_started.elapsed().as_millis(),
+                        provider_count,
+                        http_provider_count
+                    );
+                    Ok(Some((block, RetrievalSource::Bitswap)))
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        phase = "bitswap_session_shortcut_post_lookup_race",
+                        cid = %cid,
+                        outcome = "bitswap_miss",
+                        timeout_ms = post_lookup_grace.as_millis(),
+                        elapsed_ms = race_started.elapsed().as_millis(),
+                        provider_count,
+                        http_provider_count
+                    );
+                    match provider_fetch.await {
+                        Ok((block, source)) => {
+                            tracing::info!(
+                                phase = "bitswap_session_shortcut_post_lookup_race",
+                                cid = %cid,
+                                outcome = "provider_after_bitswap_miss",
+                                source = source.as_str(),
+                                timeout_ms = post_lookup_grace.as_millis(),
+                                elapsed_ms = race_started.elapsed().as_millis(),
+                                provider_count,
+                                http_provider_count
+                            );
+                            Ok(Some((block, source)))
+                        }
+                        Err(err) => {
+                            tracing::info!(
+                                phase = "bitswap_session_shortcut_post_lookup_race",
+                                cid = %cid,
+                                outcome = "provider_error_after_bitswap_miss",
+                                timeout_ms = post_lookup_grace.as_millis(),
+                                elapsed_ms = race_started.elapsed().as_millis(),
+                                provider_count,
+                                http_provider_count,
+                                error = %err
+                            );
+                            Ok(None)
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::info!(
+                        phase = "bitswap_session_shortcut_post_lookup_race",
+                        cid = %cid,
+                        outcome = "bitswap_error",
+                        timeout_ms = post_lookup_grace.as_millis(),
+                        elapsed_ms = race_started.elapsed().as_millis(),
+                        provider_count,
+                        http_provider_count,
+                        error = %err
+                    );
+                    Err(err)
+                }
+                }
+            }
+            provider_result = &mut provider_fetch => {
+                match provider_result {
+                    Ok((block, source)) => {
+                        tracing::info!(
+                            phase = "bitswap_session_shortcut_post_lookup_race",
+                            cid = %cid,
+                            outcome = "provider_won",
+                            source = source.as_str(),
+                            timeout_ms = post_lookup_grace.as_millis(),
+                            elapsed_ms = race_started.elapsed().as_millis(),
+                            provider_count,
+                            http_provider_count
+                        );
+                        Ok(Some((block, source)))
+                    }
+                    Err(err) => {
+                        tracing::info!(
+                            phase = "bitswap_session_shortcut_post_lookup_race",
+                            cid = %cid,
+                            outcome = "provider_error",
+                            timeout_ms = post_lookup_grace.as_millis(),
+                            elapsed_ms = race_started.elapsed().as_millis(),
+                            provider_count,
+                            http_provider_count,
+                            error = %err
+                        );
+                        Ok(None)
+                    }
+                }
+            }
         }
     }
 
@@ -2828,6 +2992,10 @@ fn single_http_provider_self_hedge_min_score() -> Option<Duration> {
 
 fn single_http_provider_bitswap_hedge_enabled() -> bool {
     std::env::var_os(ENABLE_SINGLE_HTTP_BITSWAP_HEDGE_ENV).is_some()
+}
+
+fn single_http_post_lookup_race_enabled() -> bool {
+    std::env::var_os(ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE_ENV).is_some()
 }
 
 fn single_http_provider_bitswap_hedge_min_score() -> Option<Duration> {

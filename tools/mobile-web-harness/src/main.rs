@@ -9000,7 +9000,8 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         | "bitswap_session_shortcut_start"
         | "bitswap_session_shortcut_pre_lookup"
         | "bitswap_session_late_peer_wait"
-        | "bitswap_session_shortcut_post_lookup_wait" => "fetching_bitswap",
+        | "bitswap_session_shortcut_post_lookup_wait"
+        | "bitswap_session_shortcut_post_lookup_race" => "fetching_bitswap",
         "bitswap_fetch_cancelled" => "cancelled",
         "bitswap_request_timeout_detail"
         | "retry_provider_count"

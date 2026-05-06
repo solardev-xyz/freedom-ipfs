@@ -25439,3 +25439,114 @@ session behavior. In this window, delegated lookup was already fast; the tail
 was split between HTTP-provider blocks and a small number of Bitswap/range-ish
 blocks. Avoid spending the next iteration on root discovery or broad direct
 Bitswap stream truncation.
+
+## 2026-05-06 Promising Lab Control: Single-HTTP Post-Lookup Provider Race
+
+Hypothesis:
+The current single-HTTP recent-peer policy is still serial on a miss: after
+delegated routing finds exactly one HTTP provider, retrieval waits up to the
+single-HTTP session grace for a recent Bitswap peer before starting the HTTP
+provider. For page assets this can add `125ms` to the common miss path. Start
+the single HTTP-provider fetch immediately while the recent Bitswap shortcut is
+still running, then take whichever source wins first.
+
+Implementation:
+
+- Add an opt-in lab flag:
+  `FREEDOM_IPFS_ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE`.
+- Only applies when delegated/provider-cache results contain exactly one HTTP
+  provider and a recent Bitswap session shortcut is already in progress.
+- Default behavior is unchanged when the flag is absent.
+- Emit `bitswap_session_shortcut_post_lookup_race` with outcomes such as
+  `provider_won`, `bitswap_won`, `bitswap_miss`, and provider/source details.
+- Map the new trace phase to mobile/harness progress phase `fetching_bitswap`
+  so the progress API remains useful if the lab flag is enabled.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo test -p freedom-ipfs-retrieval
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo test -p freedom-ipfs-mobile
+cargo check -p mobile-web-harness --all-targets
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details -- --nocapture
+```
+
+All passed.
+
+Default same-window command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/single-http-postlookup-race-default-r3-20260506T223511Z-trace.jsonl \
+  --comparison-output /tmp/single-http-postlookup-race-default-r3-20260506T223511Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/single-http-postlookup-race-default-r3-20260506T223511Z.log 2>&1
+```
+
+Candidate command:
+
+```sh
+FREEDOM_IPFS_ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE=1 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/single-http-postlookup-race-on-r3-20260506T223612Z-trace.jsonl \
+  --comparison-output /tmp/single-http-postlookup-race-on-r3-20260506T223612Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/single-http-postlookup-race-on-r3-20260506T223612Z.log 2>&1
+```
+
+Results:
+
+| Mode | Pass | Root TTFB p50/p95 | Asset TTFB p50/p95 | Kubo asset p50/p95 | Rust max RSS/FD |
+| --- | --- | --- | --- | --- | --- |
+| Default | Rust `3/3`, Kubo `3/3` | `1388/1921ms` | `270/959ms` | `249/774ms` | `54668KiB` / `38` |
+| Race flag | Rust `3/3`, Kubo `3/3` | `725/967ms` | `264/617ms` | `158/1778ms` | `54208KiB` / `33` |
+
+Trace findings:
+
+- Race flag emitted `51` post-lookup race events:
+  - `provider_won=34`
+  - `bitswap_won=17`
+- Race event latency p50/p90/p95/max was `181/264/345/422ms`.
+- Single-provider HTTP race result tail improved in this window:
+  - default p50/p90/p95/max `269/694/755/1078ms`
+  - race flag p50/p90/p95/max `185/260/384/422ms`
+- HTTP provider block totals improved:
+  - default p50/p95/max `313/911/1277ms`
+  - race flag p50/p95/max `267/366/515ms`
+- The candidate increased canceled Bitswap work (`53 -> 77` cancelled batch
+  events), but max RSS and FDs stayed lower in this sample.
+- `ipfs.tech` asset p95 improved materially (`959ms -> 617ms`) and Rust beat
+  Kubo p95 in this window, but Kubo still won asset p50 (`158ms` vs Rust
+  `264ms`).
+
+Decision:
+Keep as an opt-in lab control, not a default. This is the cleanest signal so
+far that the serial single-HTTP post-lookup wait is part of the remaining
+subresource tail. The duplicate/cancelled Bitswap work needs longer r10/r20 and
+multi-case guardrails before considering default promotion. The next iteration
+should test this flag across broader same-window samples and look for a
+narrower production policy, for example only page subresources or only
+single-HTTP providers with recent HTTP score above a threshold.
