@@ -30,6 +30,9 @@ const MAX_DELEGATED_ROUTING_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_DELEGATED_ROUTING_PROVIDERS: usize = 64;
 const STREAMING_DELEGATED_HTTP_PROVIDER_TARGET: usize = 3;
 const STREAMING_DELEGATED_FIRST_HTTP_PROVIDER_GRACE: Duration = Duration::from_millis(100);
+const STREAMING_DELEGATED_DIRECT_BITSWAP_PROVIDER_TARGET: usize = 4;
+const ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET";
 const SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER: Duration = Duration::from_millis(750);
 const DISABLE_SINGLE_DELEGATED_SELF_HEDGE_ENV: &str =
     "FREEDOM_IPFS_DISABLE_SINGLE_DELEGATED_SELF_HEDGE";
@@ -506,6 +509,7 @@ impl DelegatedRoutingClient {
                     .map(|elapsed| response_headers_elapsed_ms + elapsed.as_millis())
                     .unwrap_or_default(),
                 response_target_met = response.stats.target_met_elapsed.is_some(),
+                response_target_kind = response.stats.target_kind.unwrap_or("none"),
                 response_target_met_elapsed_ms = response
                     .stats
                     .target_met_elapsed
@@ -1083,12 +1087,26 @@ struct DelegatedResponseStats {
     first_chunk_elapsed: Option<Duration>,
     first_http_provider_elapsed: Option<Duration>,
     target_met_elapsed: Option<Duration>,
+    target_kind: Option<&'static str>,
     http_provider_count: usize,
 }
 
 async fn limited_response_providers(
     response: reqwest::Response,
     max_bytes: usize,
+) -> Result<LimitedProviderResponse> {
+    limited_response_providers_with_direct_bitswap_target(
+        response,
+        max_bytes,
+        streaming_delegated_direct_bitswap_target_enabled(),
+    )
+    .await
+}
+
+async fn limited_response_providers_with_direct_bitswap_target(
+    response: reqwest::Response,
+    max_bytes: usize,
+    direct_bitswap_target_enabled: bool,
 ) -> Result<LimitedProviderResponse> {
     let started = Instant::now();
     let is_ndjson = response
@@ -1132,6 +1150,7 @@ async fn limited_response_providers(
                             first_chunk_elapsed,
                             first_http_provider_elapsed,
                             target_met_elapsed: None,
+                            target_kind: None,
                             http_provider_count: http_provider_url_count(&providers),
                         },
                         providers,
@@ -1173,6 +1192,25 @@ async fn limited_response_providers(
                         first_chunk_elapsed,
                         first_http_provider_elapsed,
                         target_met_elapsed: Some(started.elapsed()),
+                        target_kind: Some("http_provider"),
+                        http_provider_count: http_provider_url_count(&providers),
+                    },
+                    providers,
+                });
+            }
+            if direct_bitswap_target_enabled
+                && supported_direct_bitswap_provider_diversity(&providers)
+                    >= STREAMING_DELEGATED_DIRECT_BITSWAP_PROVIDER_TARGET
+            {
+                let providers = limit_delegated_providers(providers);
+                return Ok(LimitedProviderResponse {
+                    stats: DelegatedResponseStats {
+                        bytes_read,
+                        line_count,
+                        first_chunk_elapsed,
+                        first_http_provider_elapsed,
+                        target_met_elapsed: Some(started.elapsed()),
+                        target_kind: Some("direct_bitswap"),
                         http_provider_count: http_provider_url_count(&providers),
                     },
                     providers,
@@ -1196,6 +1234,7 @@ async fn limited_response_providers(
             first_chunk_elapsed,
             first_http_provider_elapsed,
             target_met_elapsed: None,
+            target_kind: None,
             http_provider_count: http_provider_url_count(&providers),
         },
         providers,
@@ -1229,6 +1268,62 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
 fn should_return_streamed_providers(providers: &[Provider]) -> bool {
     providers.len() >= MAX_DELEGATED_ROUTING_PROVIDERS
         || http_provider_url_count(providers) >= STREAMING_DELEGATED_HTTP_PROVIDER_TARGET
+}
+
+fn streaming_delegated_direct_bitswap_target_enabled() -> bool {
+    std::env::var_os(ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_ENV).is_some()
+}
+
+fn supported_direct_bitswap_provider_diversity(providers: &[Provider]) -> usize {
+    providers
+        .iter()
+        .filter(|provider| {
+            provider.addrs.iter().any(|addr| {
+                supported_direct_bitswap_multiaddr(
+                    addr,
+                    provider.id.as_deref().and_then(parse_peer_id),
+                )
+            })
+        })
+        .filter_map(provider_dedupe_key)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn supported_direct_bitswap_multiaddr(addr: &str, provider_peer: Option<PeerId>) -> bool {
+    let mut multiaddr = match Multiaddr::from_str(addr) {
+        Ok(addr) => addr,
+        Err(_) => return false,
+    };
+    let addr_peer = match multiaddr.iter().last() {
+        Some(Protocol::P2p(peer)) => {
+            multiaddr.pop();
+            Some(peer)
+        }
+        _ => None,
+    };
+    if provider_peer.or(addr_peer).is_none() {
+        return false;
+    }
+
+    let mut has_tcp = false;
+    let mut has_udp = false;
+    let mut has_quic = false;
+    for protocol in multiaddr.iter() {
+        match protocol {
+            Protocol::Tcp(_) => has_tcp = true,
+            Protocol::Udp(_) => has_udp = true,
+            Protocol::Quic | Protocol::QuicV1 => has_quic = true,
+            Protocol::Http | Protocol::Https => return false,
+            Protocol::P2pCircuit => return false,
+            Protocol::WebTransport => return false,
+            Protocol::WebRTC | Protocol::WebRTCDirect | Protocol::P2pWebRtcDirect => return false,
+            Protocol::Certhash(_) => return false,
+            _ => {}
+        }
+    }
+
+    has_tcp || (has_udp && has_quic)
 }
 
 fn http_provider_url_count(providers: &[Provider]) -> usize {
@@ -2074,6 +2169,75 @@ mod tests {
             .any(|provider| provider.id.as_deref() == Some("late-peer")));
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn streamed_delegated_response_can_return_after_direct_bitswap_target() {
+        let fast_head = (0..STREAMING_DELEGATED_DIRECT_BITSWAP_PROVIDER_TARGET)
+            .map(|index| {
+                format!(
+                    r#"{{"ID":"{}","Addrs":["/ip4/127.0.0.{}/tcp/{}"]}}"#,
+                    Keypair::generate_ed25519().public().to_peer_id(),
+                    index + 1,
+                    4100 + index
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let slow_tail = r#"{"ID":"late-peer","Addrs":["/dns4/late.example/tcp/443/tls/http"]}"#;
+        let (endpoint, task) =
+            spawn_streaming_delegated_response(fast_head, slow_tail.into(), Duration::from_secs(2))
+                .await;
+        let response = reqwest::get(format!("{endpoint}/providers/test"))
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(500),
+            limited_response_providers_with_direct_bitswap_target(
+                response,
+                MAX_DELEGATED_ROUTING_RESPONSE_BYTES,
+                true,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            supported_direct_bitswap_provider_diversity(&response.providers),
+            STREAMING_DELEGATED_DIRECT_BITSWAP_PROVIDER_TARGET
+        );
+        assert_eq!(response.stats.target_kind, Some("direct_bitswap"));
+        assert!(response.stats.target_met_elapsed.is_some());
+        assert_eq!(response.stats.http_provider_count, 0);
+        assert!(!response
+            .providers
+            .iter()
+            .any(|provider| provider.id.as_deref() == Some("late-peer")));
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[test]
+    fn direct_bitswap_target_ignores_http_relay_and_peerless_addrs() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let providers = vec![
+            Provider::from_parts(
+                Some(peer.to_string()),
+                vec![
+                    "/dns4/provider.example/tcp/443/tls/http".to_string(),
+                    "/ip4/127.0.0.1/tcp/4001/p2p-circuit".to_string(),
+                    "/ip4/127.0.0.1/udp/4001/quic-v1/webtransport".to_string(),
+                    "/ip4/127.0.0.1/tcp/4001".to_string(),
+                ],
+            )
+            .unwrap(),
+            Provider::from_parts(None, vec!["/ip4/127.0.0.2/tcp/4002".to_string()]).unwrap(),
+        ];
+
+        assert_eq!(supported_direct_bitswap_provider_diversity(&providers), 1);
     }
 
     #[tokio::test]

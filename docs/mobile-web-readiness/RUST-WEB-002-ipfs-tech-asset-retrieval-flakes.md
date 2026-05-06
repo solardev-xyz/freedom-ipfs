@@ -24985,3 +24985,141 @@ Do not enable range batching by default from the live guardrail, because the liv
 cases did not exercise the path. Keep it opt-in for now, but use the new fixture
 generator for future repeatable range-batch experiments and default-promotion
 evidence.
+
+## 2026-05-06 Promising: Env-Gated Direct Bitswap Streamed Delegated Target
+
+Hypothesis:
+The remaining `ipfs.tech` asset tail can still be dominated by delegated
+routing stream tails in zero-HTTP provider responses. A previous attempt to
+return streamed delegated responses on generic Bitswap provider diversity was
+rejected because it could hand retrieval sparse, relay-only, or otherwise
+unusable providers and starved the HTTP-provider path. A narrower target should
+only return early when the streamed response already contains enough providers
+with directly supported Bitswap addresses.
+
+Implementation:
+
+- Add an env-gated streamed delegated-response target behind
+  `FREEDOM_IPFS_ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET`.
+- The target only fires after at least `4` distinct providers have a parseable
+  peer ID and a directly supported Bitswap address.
+- HTTP, HTTPS, relay, WebTransport, WebRTC, certhash, unsupported transport, and
+  peerless records do not count toward the direct Bitswap target.
+- Add `response_target_kind` to delegated provider lookup traces so runs can
+  distinguish `http_provider` and `direct_bitswap` early returns.
+- Keep the behavior disabled by default while collecting more evidence.
+
+Fresh baseline command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-session-baseline-r3-20260506T215620Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-session-baseline-r3-20260506T215620Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/ipfs-tech-session-baseline-r3-20260506T215620Z.log 2>&1
+```
+
+Baseline result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Root TTFB p50/p95:
+  - Rust: `1536/1541ms`
+  - Kubo: `2984/4178ms`
+- Asset TTFB p50/p95:
+  - Rust: `181/1561ms`
+  - Kubo: `115/764ms`
+- Resource max:
+  - Rust: `55068KiB` RSS, `48` FDs
+  - Kubo: `299436KiB` RSS, `473` FDs
+- Rust delegated provider lookup max was `4270ms`; the slowest retrieval-level
+  provider lookup path, including self-hedge wait, reached `4960ms`.
+- Rust block fetch totals:
+  - Bitswap: `59` blocks, p50/p95/max `148/3686/5052ms`
+  - HTTP provider: `59` blocks, p50/p95/max `272/785/808ms`
+- Slowest asset:
+  - `/ipns/ipfs.tech/_nuxt/DBHrpFkY.js`
+  - request time `5367ms`
+  - underlying block fetch `5052ms`
+  - delegated provider lookup/self-hedge path `4960ms`
+
+Experiment command:
+
+```sh
+FREEDOM_IPFS_ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET=1 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-direct-bitswap-stream-target-r3-20260506T220202Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-direct-bitswap-stream-target-r3-20260506T220202Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/ipfs-tech-direct-bitswap-stream-target-r3-20260506T220202Z.log 2>&1
+```
+
+Experiment result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Root TTFB p50/p95:
+  - Rust: `1165/1321ms`
+  - Kubo: `2482/2597ms`
+- Asset TTFB p50/p95:
+  - Rust: `147/1116ms`
+  - Kubo: `168/1190ms`
+- Resource max:
+  - Rust: `56192KiB` RSS, `42` FDs
+  - Kubo: `207680KiB` RSS, `234` FDs
+- Rust delegated provider lookup max dropped to `586ms`.
+- All `64` delegated lookups met an early target; trace events show
+  `response_target_kind="direct_bitswap"` on zero-HTTP Bitswap paths and
+  `response_target_kind="http_provider"` on HTTP-provider paths.
+- Rust block fetch totals:
+  - Bitswap: `93` blocks, p50/p95/max `122/585/4638ms`
+  - HTTP provider: `25` blocks, p50/p95/max `353/957/957ms`
+- Bitswap work increased:
+  - peer attempt starts: `153` baseline -> `266` experiment
+  - Bitswap progress events: `575` baseline -> `960` experiment
+  - established Bitswap connections: `13` baseline -> `20` experiment
+  - dial rejections: `0` baseline -> `15` experiment, all connection-limit
+    related
+- One asset still hit a `4000ms` mixed-trusted Bitswap request timeout and then
+  succeeded on same-provider retry, producing a `4817ms` request tail.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing direct_bitswap
+cargo test -p freedom-ipfs-routing streamed
+```
+
+Focused result:
+
+- Formatting passed.
+- Direct Bitswap target tests passed: `2 passed`.
+- Streamed delegated routing tests passed: `4 passed`.
+
+Decision:
+Keep the implementation as an env-gated lab knob for now. This run is promising:
+it closed the same-window Kubo asset gap in this sample, materially reduced
+delegated lookup tails, and kept RSS/FDs far below Kubo. Do not promote it to
+default yet because it shifts work from HTTP providers to Bitswap, increases
+peer attempts, and exposed one 4s Bitswap timeout tail. Next evidence should be
+an alternating baseline/env/default run or a repeat=5 guard across
+`ipfs-tech-page-assets`, `daicowtf-page-assets`, and `vitalik-root-html-range`.
