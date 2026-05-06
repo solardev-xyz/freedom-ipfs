@@ -24451,3 +24451,96 @@ the immediately preceding default run: Rust root p50/p95 worsened from
 count rose from `29` to `39`, and the hedge rarely won. Keep it as an env lab
 knob. A future version would need stronger gating, such as only hedging
 providers with a high EWMA latency and a recent successful session peer.
+
+## Inconclusive: Scored Single-HTTP Bitswap Hedge Gates
+
+Follow up on the broad single-HTTP Bitswap hedge with EWMA score gates. The goal
+was to see whether the existing `FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS`
+knob can avoid broad extra Bitswap work while still protecting slow
+`ipfs-bridge.sia.dev` single-provider tails.
+
+Too conservative gate:
+
+```sh
+FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 \
+FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS=300 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-scored-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-scored-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/ipfs-tech-scored-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506.log 2>&1
+```
+
+Result: Rust and Kubo both passed `3/3`, with Rust root TTFB p50/p95
+`565/710ms` and asset p50/p95 `253/892ms`. The score gate skipped every
+Bitswap hedge: `starts=0`, `skips=28`, with skip reasons
+`provider_score_below_threshold=25` and `provider_unscored=3`. Decision:
+`300ms` is too conservative for this workload.
+
+Lower gate:
+
+```sh
+FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 \
+FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS=200 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-scored200-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-scored200-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/ipfs-tech-scored200-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506.log 2>&1
+```
+
+Result:
+
+- Rust passed `3/3`
+- Kubo passed `3/3`
+- root TTFB p50/p95:
+  - Rust: `566/621ms`
+  - Kubo: `2120/2878ms`
+  - Rust/Kubo ratio: `0.27x/0.22x`
+- asset TTFB p50/p95:
+  - Rust: `221/663ms`
+  - Kubo: `176/611ms`
+  - Rust/Kubo ratio: `1.26x/1.09x`
+- resource max:
+  - RSS: Rust `53760KiB`, Kubo `225064KiB`
+  - FDs: Rust `28`, Kubo `158`
+- HTTP-provider fetch p95 was `238ms`; `ipfs-bridge.sia.dev` p95 was `293ms`.
+- Bitswap hedge `starts=4`, `skips=19`, but all four hedge results returned
+  from `http_provider`; Bitswap won `0`.
+
+Artifacts:
+
+- `/tmp/ipfs-tech-scored-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506.json`
+- `/tmp/ipfs-tech-scored-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506-trace.jsonl`
+- `/tmp/ipfs-tech-scored-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506.log`
+- `/tmp/ipfs-tech-scored200-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506.json`
+- `/tmp/ipfs-tech-scored200-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506-trace.jsonl`
+- `/tmp/ipfs-tech-scored200-single-http-bitswap-hedge-rust-vs-kubo-r3-20260506.log`
+
+Decision:
+Do not enable scored single-HTTP Bitswap hedging by default yet. The `200ms`
+sample looked good at the page level, but the hedge itself did not win any
+blocks, so the improvement is not attributable to the behavior change. Keep the
+env knobs. A future larger alternating test can revisit `200ms` only if it also
+records Bitswap hedge wins or a consistent reduction in slow HTTP-provider
+tails without higher peer-attempt/FD pressure.
