@@ -959,6 +959,7 @@ fn print_summary(report: &RunReport) {
         print_trace_delegated_provider_lookup(trace);
         print_trace_dht_provider_lookup(trace);
         print_trace_provider_diversity_low(trace);
+        print_trace_request_classifications(trace);
         if !trace.request_statuses.is_empty() || trace.gateway_limiter_denials > 0 {
             println!(
                 "  gateway responses: statuses={} limiter_denials={} elapsed={}",
@@ -1381,6 +1382,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_delegated_provider_lookup(trace);
     print_trace_dht_provider_lookup(trace);
     print_trace_provider_diversity_low(trace);
+    print_trace_request_classifications(trace);
     if !trace.request_statuses.is_empty() || trace.gateway_limiter_denials > 0 {
         println!(
             "  gateway responses: statuses={} limiter_denials={} elapsed={}",
@@ -1547,13 +1549,15 @@ fn print_trace_slow_details(trace: &TraceSummary) {
                 format!("{}:{}", request.process_id, request.request_id)
             };
             let correlation = format_request_correlation(request);
+            let classifications = format_request_classification_details(request);
             println!(
-                "    {}: {}ms status={} request_id={}{} events={} max_event={}ms phases={} cids={}",
+                "    {}: {}ms status={} request_id={}{}{} events={} max_event={}ms phases={} cids={}",
                 request.path,
                 request.elapsed_ms,
                 status,
                 request_id,
                 correlation,
+                classifications,
                 request.event_count,
                 request.max_event_ms,
                 phases,
@@ -1577,6 +1581,16 @@ fn print_trace_slow_details(trace: &TraceSummary) {
             }
         }
     }
+}
+
+fn print_trace_request_classifications(trace: &TraceSummary) {
+    if trace.request_classifications.is_empty() {
+        return;
+    }
+    println!(
+        "  request classifications: {}",
+        format_trace_counts(&trace.request_classifications)
+    );
 }
 
 fn print_trace_unixfs_metadata_cache(trace: &TraceSummary) {
@@ -4979,6 +4993,7 @@ struct TraceSummary {
     bitswap_dial_rejections: TraceBitswapDialRejectedAggregate,
     bitswap_dial_rejected_transports: Vec<TraceValueCount>,
     bitswap_dns_expansion: TraceBitswapDnsExpansionAggregate,
+    request_classifications: Vec<TraceValueCount>,
     slow_cids: Vec<TraceCidAggregate>,
     slow_requests: Vec<TraceRequestAggregate>,
     progress_request_groups: Vec<TraceProgressRequestGroupAggregate>,
@@ -6440,6 +6455,12 @@ struct TraceRequestAggregate {
     event_count: usize,
     phases: Vec<TraceValueCount>,
     cids: Vec<TraceValueCount>,
+    classifications: Vec<TraceValueCount>,
+    delegated_zero_http_provider_lookups: usize,
+    bitswap_block_fetches: usize,
+    cold_bitswap_peer_expands: usize,
+    max_bitswap_peer_count: u128,
+    max_bitswap_session_peer_count: u128,
 }
 
 #[derive(Debug, Serialize)]
@@ -6488,6 +6509,11 @@ struct TraceRequestBuilder {
     event_count: usize,
     phases: BTreeMap<String, usize>,
     cids: BTreeMap<String, usize>,
+    delegated_zero_http_provider_lookups: usize,
+    bitswap_block_fetches: usize,
+    cold_bitswap_peer_expands: usize,
+    max_bitswap_peer_count: u128,
+    max_bitswap_session_peer_count: u128,
 }
 
 impl TraceRequestBuilder {
@@ -6505,6 +6531,11 @@ impl TraceRequestBuilder {
             event_count: 0,
             phases: BTreeMap::new(),
             cids: BTreeMap::new(),
+            delegated_zero_http_provider_lookups: 0,
+            bitswap_block_fetches: 0,
+            cold_bitswap_peer_expands: 0,
+            max_bitswap_peer_count: 0,
+            max_bitswap_session_peer_count: 0,
         }
     }
 
@@ -6523,6 +6554,37 @@ impl TraceRequestBuilder {
         if let Some(cid) = json_detail_string(value.get("cid")) {
             *self.cids.entry(cid).or_default() += 1;
         }
+        if phase == "delegated_provider_lookup"
+            && value.get("http_provider_count").and_then(json_u128) == Some(0)
+        {
+            self.delegated_zero_http_provider_lookups += 1;
+        }
+        if phase == "block_fetch_total"
+            && value.get("source").and_then(|source| source.as_str()) == Some("bitswap")
+        {
+            self.bitswap_block_fetches += 1;
+        }
+        if phase == "bitswap_peer_expand" {
+            let peer_count = value
+                .get("peer_count")
+                .and_then(json_u128)
+                .or_else(|| {
+                    value
+                        .get("supported_provider_addr_count")
+                        .and_then(json_u128)
+                })
+                .unwrap_or_default();
+            let session_peer_count = value
+                .get("session_peer_count")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            self.max_bitswap_peer_count = self.max_bitswap_peer_count.max(peer_count);
+            self.max_bitswap_session_peer_count =
+                self.max_bitswap_session_peer_count.max(session_peer_count);
+            if session_peer_count == 0 {
+                self.cold_bitswap_peer_expands += 1;
+            }
+        }
         if phase == "request_done" {
             self.status = json_detail_string(value.get("status"));
             self.elapsed_ms = elapsed_ms;
@@ -6533,6 +6595,14 @@ impl TraceRequestBuilder {
     }
 
     fn into_aggregate(self) -> TraceRequestAggregate {
+        let classifications = trace_request_classifications(
+            &self.path,
+            self.parent_progress_request_id.as_deref(),
+            self.top_level_path.as_deref(),
+            self.delegated_zero_http_provider_lookups,
+            self.bitswap_block_fetches,
+            self.cold_bitswap_peer_expands,
+        );
         TraceRequestAggregate {
             path: self.path,
             process_id: self.process_id,
@@ -6546,8 +6616,46 @@ impl TraceRequestBuilder {
             event_count: self.event_count,
             phases: sorted_trace_counts(self.phases),
             cids: sorted_trace_counts(self.cids),
+            classifications,
+            delegated_zero_http_provider_lookups: self.delegated_zero_http_provider_lookups,
+            bitswap_block_fetches: self.bitswap_block_fetches,
+            cold_bitswap_peer_expands: self.cold_bitswap_peer_expands,
+            max_bitswap_peer_count: self.max_bitswap_peer_count,
+            max_bitswap_session_peer_count: self.max_bitswap_session_peer_count,
         }
     }
+}
+
+fn trace_request_classifications(
+    path: &str,
+    parent_progress_request_id: Option<&str>,
+    top_level_path: Option<&str>,
+    delegated_zero_http_provider_lookups: usize,
+    bitswap_block_fetches: usize,
+    cold_bitswap_peer_expands: usize,
+) -> Vec<TraceValueCount> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    let zero_http_bitswap = delegated_zero_http_provider_lookups > 0 && bitswap_block_fetches > 0;
+    if zero_http_bitswap {
+        counts.insert("zero_http_provider_bitswap".to_string(), 1);
+    }
+    if zero_http_bitswap && cold_bitswap_peer_expands > 0 {
+        counts.insert("zero_http_provider_cold_bitswap".to_string(), 1);
+    }
+    if cold_bitswap_peer_expands > 0 {
+        counts.insert("cold_bitswap_peer_expand".to_string(), 1);
+    }
+    let is_top_level = parent_progress_request_id.is_none()
+        && top_level_path
+            .map(|top_level_path| top_level_path == path)
+            .unwrap_or(true);
+    if is_top_level && zero_http_bitswap {
+        counts.insert("top_level_zero_http_provider_bitswap".to_string(), 1);
+    }
+    if is_top_level && zero_http_bitswap && cold_bitswap_peer_expands > 0 {
+        counts.insert("top_level_zero_http_provider_cold_bitswap".to_string(), 1);
+    }
+    sorted_trace_counts(counts)
 }
 
 #[derive(Debug, Serialize)]
@@ -7835,6 +7943,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             .into_values()
             .map(TraceRequestBuilder::into_aggregate),
     );
+    let request_classifications = summarize_request_classifications(&slow_requests);
     let progress_request_groups = summarize_progress_request_groups(&slow_requests);
     slow_requests.sort_by(|left, right| {
         right
@@ -7946,10 +8055,21 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_dial_rejections,
         bitswap_dial_rejected_transports: sorted_trace_counts(bitswap_dial_rejected_transports),
         bitswap_dns_expansion,
+        request_classifications,
         slow_cids: sorted_trace_cids(slow_cids),
         slow_requests,
         progress_request_groups,
     })
+}
+
+fn summarize_request_classifications(requests: &[TraceRequestAggregate]) -> Vec<TraceValueCount> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for request in requests {
+        for classification in &request.classifications {
+            *counts.entry(classification.value.clone()).or_default() += classification.count;
+        }
+    }
+    sorted_trace_counts(counts)
 }
 
 #[derive(Default)]
@@ -8528,6 +8648,30 @@ fn format_request_correlation(request: &TraceRequestAggregate) -> String {
         request.progress_request_id.as_deref().unwrap_or("-"),
         request.parent_progress_request_id.as_deref().unwrap_or("-"),
         request.top_level_path.as_deref().unwrap_or("-")
+    )
+}
+
+fn format_request_classification_details(request: &TraceRequestAggregate) -> String {
+    if request.classifications.is_empty()
+        && request.delegated_zero_http_provider_lookups == 0
+        && request.bitswap_block_fetches == 0
+        && request.cold_bitswap_peer_expands == 0
+    {
+        return String::new();
+    }
+    let classifications = if request.classifications.is_empty() {
+        "-".to_string()
+    } else {
+        format_trace_counts(&request.classifications)
+    };
+    format!(
+        " classifications={} zero_http_lookups={} bitswap_blocks={} cold_expands={} max_peers={} max_session_peers={}",
+        classifications,
+        request.delegated_zero_http_provider_lookups,
+        request.bitswap_block_fetches,
+        request.cold_bitswap_peer_expands,
+        request.max_bitswap_peer_count,
+        request.max_bitswap_session_peer_count
     )
 }
 
@@ -9837,6 +9981,67 @@ mod tests {
         assert_eq!(other.root_progress_request_id.as_deref(), Some("200"));
         assert_eq!(other.request_count, 1);
         assert_eq!(other.failed_request_count, 0);
+    }
+
+    #[test]
+    fn trace_summary_classifies_zero_http_cold_bitswap_requests() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-request-classification-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"request_start\",\"request_id\":1,\"path\":\"/ipns/site/\",\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"delegated_provider_lookup\",\"elapsed_ms\":5,\"cid\":\"cid-root\",\"provider_count\":19,\"http_provider_count\":0,\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"bitswap_peer_expand\",\"elapsed_ms\":6,\"cid\":\"cid-root\",\"peer_count\":5,\"session_peer_count\":0,\"supported_provider_addr_count\":41,\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":1494,\"cid\":\"cid-root\",\"ok\":true,\"bytes\":1362,\"source_peer\":\"peer-root\",\"source_transport\":\"tcp\",\"source_peer_trusted\":false,\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":1618,\"cid\":\"cid-root\",\"source\":\"bitswap\",\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipns/site/\",\"status\":200,\"elapsed_ms\":1888,\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(
+            trace_value_count(
+                &summary.request_classifications,
+                "zero_http_provider_bitswap"
+            ),
+            1
+        );
+        assert_eq!(
+            trace_value_count(
+                &summary.request_classifications,
+                "zero_http_provider_cold_bitswap"
+            ),
+            1
+        );
+        assert_eq!(
+            trace_value_count(
+                &summary.request_classifications,
+                "top_level_zero_http_provider_cold_bitswap"
+            ),
+            1
+        );
+        let request = &summary.slow_requests[0];
+        assert_eq!(request.path, "/ipns/site/");
+        assert_eq!(request.delegated_zero_http_provider_lookups, 1);
+        assert_eq!(request.bitswap_block_fetches, 1);
+        assert_eq!(request.cold_bitswap_peer_expands, 1);
+        assert_eq!(request.max_bitswap_peer_count, 5);
+        assert_eq!(request.max_bitswap_session_peer_count, 0);
+        assert_eq!(
+            trace_value_count(&request.classifications, "cold_bitswap_peer_expand"),
+            1
+        );
     }
 
     #[test]

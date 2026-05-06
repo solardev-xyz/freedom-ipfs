@@ -22758,3 +22758,67 @@ Interpretation:
 - Next behavior work should move away from raw HTTP self-hedge policy and
   investigate cold root/session Bitswap startup or request-shape classification
   for when the root block goes Bitswap instead of verified HTTP provider.
+
+## 2026-05-06 Diagnostic: Classify Zero-HTTP Cold Bitswap Requests
+
+Question:
+Can the harness surface the latest slow-root pattern directly, instead of
+requiring manual JSONL spelunking through the Kubo comparison trace?
+
+Change:
+Added request-level trace classification in `mobile-web-harness` for retrieval
+shapes that matter to this investigation:
+
+- `zero_http_provider_bitswap`
+- `zero_http_provider_cold_bitswap`
+- `cold_bitswap_peer_expand`
+- `top_level_zero_http_provider_bitswap`
+- `top_level_zero_http_provider_cold_bitswap`
+
+The classifier uses gateway request spans to correlate
+`delegated_provider_lookup`, `bitswap_peer_expand`, and `block_fetch_total`
+events. Slow request output now includes classification labels and counters for
+zero-HTTP delegated lookups, Bitswap block fetches, cold Bitswap peer expansions,
+max peer count, and max session peer count. Normal and Rust-vs-Kubo trace
+summaries also print aggregate request classification counts.
+
+Existing trace spot-check:
+
+```sh
+test -f /tmp/current-head-multicase-kubo-r3-trace.jsonl && \
+  sed -n '2396,2420p' /tmp/current-head-multicase-kubo-r3-trace.jsonl
+```
+
+The archived slow `/ipns/ipfs.tech/` root request has the same gateway span on:
+
+- `delegated_provider_lookup`: `provider_count=19`, `http_provider_count=0`
+- `bitswap_peer_expand`: `peer_count=5`, `session_peer_count=0`
+- `bitswap_fetch`: `elapsed_ms=1494`, `source_transport=tcp`
+- `block_fetch_total`: `source=bitswap`, `elapsed_ms=1618`
+
+Validation:
+
+```sh
+cargo test -p mobile-web-harness trace_summary_classifies_zero_http_cold_bitswap_requests
+cargo test -p mobile-web-harness
+cargo check -p mobile-web-harness --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+git diff --check
+```
+
+Results:
+
+- Targeted classifier test: `1 passed`.
+- Harness test suite: `44 passed`.
+- Harness package check/clippy passed.
+- Workspace check/clippy passed.
+- Formatting and whitespace checks passed.
+
+Conclusion:
+Keep this diagnostics-only change. It does not change retrieval behavior, but it
+turns a recurring manual analysis step into a first-class trace summary signal.
+The next behavior experiment can now target root zero-HTTP/cold-Bitswap cases
+with clearer A/B evidence.
