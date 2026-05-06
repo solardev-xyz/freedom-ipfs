@@ -24017,3 +24017,117 @@ Artifacts:
 Decision:
 Keep. The report is now self-contained enough for later agents to audit gate
 success or failure from the JSON artifact alone.
+
+## 2026-05-06 Experiment: Connection-Error Backoff Threshold In Zero-HTTP Window
+
+Hypothesis:
+When delegated routing returns no HTTP provider and the request falls back to
+cold Bitswap, backing off peers after one connection error may reduce repeated
+dial waste without hurting mobile resource use.
+
+Expected win:
+Lower zero-HTTP cold-Bitswap request latency and improved page root TTFB.
+
+Risk:
+Over-suppressing peers can reduce provider diversity and make asset tails worse
+if the first connection error is transient.
+
+Feature flag:
+
+```text
+FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD=1
+```
+
+Baseline 1 command:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-zero-http-baseline-r5-20260506-trace.jsonl \
+  --output /tmp/ipfs-tech-zero-http-baseline-r5-20260506.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/ipfs-tech-zero-http-baseline-r5-20260506.log 2>&1
+```
+
+Experiment command:
+
+```sh
+timeout 1200s env FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD=1 \
+  cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-zero-http-backoff1-r5-20260506-trace.jsonl \
+  --output /tmp/ipfs-tech-zero-http-backoff1-r5-20260506.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/ipfs-tech-zero-http-backoff1-r5-20260506.log 2>&1
+```
+
+Baseline 2 command:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-zero-http-baseline2-r5-20260506-trace.jsonl \
+  --output /tmp/ipfs-tech-zero-http-baseline2-r5-20260506.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/ipfs-tech-zero-http-baseline2-r5-20260506.log 2>&1
+```
+
+Results:
+
+| run | pass | root TTFB p50/p90/max | asset TTFB p50/p90/p95/max | run total p50/p90/max | zero-HTTP cold Bitswap | block sources | conn errors / backoffs |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| baseline 1 | `5/5` | `813/1301/1301ms` | `251/561/659/1311ms` | `2862/3478/3478ms` | `14` | `http_provider=138`, `bitswap=62` | `4 / 0` |
+| threshold 1 | `5/5` | `542/826/826ms` | `263/550/632/1156ms` | `2703/3163/3163ms` | `13` | `http_provider=160`, `bitswap=40` | `2 / 2` |
+| baseline 2 | `5/5` | `724/1181/1181ms` | `267/527/564/821ms` | `2635/2954/2954ms` | `15` | `http_provider=167`, `bitswap=32`, `cache=1` | `6 / 0` |
+
+Trace requirement results:
+
+- baseline 1: `zero_http_provider_cold_bitswap actual=14 passed=true`,
+  `fetching_bitswap actual=852 passed=true`
+- threshold 1: `zero_http_provider_cold_bitswap actual=13 passed=true`,
+  `fetching_bitswap actual=717 passed=true`
+- baseline 2: `zero_http_provider_cold_bitswap actual=15 passed=true`,
+  `fetching_bitswap actual=619 passed=true`
+
+Artifacts:
+
+- `/tmp/ipfs-tech-zero-http-baseline-r5-20260506.json`
+- `/tmp/ipfs-tech-zero-http-baseline-r5-20260506-trace.jsonl`
+- `/tmp/ipfs-tech-zero-http-baseline-r5-20260506.log`
+- `/tmp/ipfs-tech-zero-http-backoff1-r5-20260506.json`
+- `/tmp/ipfs-tech-zero-http-backoff1-r5-20260506-trace.jsonl`
+- `/tmp/ipfs-tech-zero-http-backoff1-r5-20260506.log`
+- `/tmp/ipfs-tech-zero-http-baseline2-r5-20260506.json`
+- `/tmp/ipfs-tech-zero-http-baseline2-r5-20260506-trace.jsonl`
+- `/tmp/ipfs-tech-zero-http-baseline2-r5-20260506.log`
+
+Conclusion:
+Do not change the production default. Threshold `1` improved root TTFB in this
+window and reduced repeated connection-error events, but the second baseline won
+on total run p50/p90 and asset tail latency. Keep the env knob as a lab control
+and only revisit with larger alternating samples or a case where connection
+errors dominate the slow zero-HTTP requests.
