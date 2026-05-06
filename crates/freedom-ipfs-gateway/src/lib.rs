@@ -1,6 +1,8 @@
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
+use axum::http::header::{
+    ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH, RANGE,
+};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -241,11 +243,17 @@ async fn ipfs_get(
             elapsed_ms = limiter_started.elapsed().as_millis()
         );
 
-        let response =
-            match serve_ipfs_path(state.provider.clone(), &path, headers.get(RANGE)).await {
-                Ok(response) => response,
-                Err(err) => gateway_error(err),
-            };
+        let response = match serve_ipfs_path(
+            state.provider.clone(),
+            &path,
+            headers.get(RANGE),
+            headers.get(IF_NONE_MATCH),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => gateway_error(err),
+        };
         tracing::info!(
             phase = "request_done",
             request_id,
@@ -307,6 +315,7 @@ async fn ipns_get(
             state.name_resolver.as_ref(),
             &path,
             headers.get(RANGE),
+            headers.get(IF_NONE_MATCH),
         )
         .await
         {
@@ -336,14 +345,16 @@ async fn serve_ipfs_path(
     provider: Arc<dyn BlockProvider>,
     path: &str,
     range: Option<&HeaderValue>,
+    if_none_match: Option<&HeaderValue>,
 ) -> Result<Response, GatewayError> {
-    serve_ipfs_path_with_listing_path(provider, path, range, None).await
+    serve_ipfs_path_with_listing_path(provider, path, range, if_none_match, None).await
 }
 
 async fn serve_ipfs_path_with_listing_path(
     provider: Arc<dyn BlockProvider>,
     path: &str,
     range: Option<&HeaderValue>,
+    if_none_match: Option<&HeaderValue>,
     listing_path: Option<&DirectoryListingPath>,
 ) -> Result<Response, GatewayError> {
     let parse_started = Instant::now();
@@ -377,11 +388,23 @@ async fn serve_ipfs_path_with_listing_path(
                 mime = %mime,
                 elapsed_ms = mime_started.elapsed().as_millis()
             );
-            if let Some(range) = range {
+            let etag = served_file_etag(&cid, &path, len);
+            let mut response = if range.is_none() && if_none_match_matches(if_none_match, &etag) {
+                tracing::info!(
+                    phase = "gateway_conditional",
+                    cid = %cid,
+                    unixfs_path = %path,
+                    matched = true,
+                    status = StatusCode::NOT_MODIFIED.as_u16()
+                );
+                not_modified_response()
+            } else if let Some(range) = range {
                 ranged_response(provider, cid, path, len, range, &mime)?
             } else {
                 streaming_response(provider, cid, path, len, &mime)?
-            }
+            };
+            insert_etag(&mut response, &etag)?;
+            response
         }
         ServedResource::Directory { path, entries } => {
             tracing::info!(
@@ -469,6 +492,45 @@ fn looks_like_html(bytes: &[u8]) -> bool {
         || lower.starts_with("<html")
         || lower.starts_with("<head")
         || lower.starts_with("<body")
+}
+
+fn served_file_etag(cid: &Cid, path: &str, len: u64) -> String {
+    let path = if path.is_empty() {
+        ".".to_string()
+    } else {
+        encode_gateway_path(path)
+    };
+    format!("\"{cid}/{path}/{len}\"")
+}
+
+fn if_none_match_matches(value: Option<&HeaderValue>, etag: &str) -> bool {
+    let Some(value) = value.and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    value.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*"
+            || candidate == etag
+            || candidate
+                .strip_prefix("W/")
+                .is_some_and(|weak| weak == etag)
+    })
+}
+
+fn insert_etag(response: &mut Response, etag: &str) -> Result<(), GatewayError> {
+    response.headers_mut().insert(
+        ETAG,
+        HeaderValue::from_str(etag).map_err(|err| GatewayError::Internal(err.to_string()))?,
+    );
+    Ok(())
+}
+
+fn not_modified_response() -> Response {
+    let mut response = StatusCode::NOT_MODIFIED.into_response();
+    response
+        .headers_mut()
+        .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    response
 }
 
 enum ServedResource {
@@ -645,6 +707,7 @@ async fn serve_ipns_path(
     name_resolver: &dyn NameResolver,
     path: &str,
     range: Option<&HeaderValue>,
+    if_none_match: Option<&HeaderValue>,
 ) -> Result<Response, GatewayError> {
     let listing_path = DirectoryListingPath::ipns(path);
     let mut target = format!("/ipns/{path}");
@@ -655,6 +718,7 @@ async fn serve_ipns_path(
                 provider.clone(),
                 ipfs,
                 range,
+                if_none_match,
                 Some(&listing_path),
             )
             .await;
@@ -1412,6 +1476,61 @@ mod tests {
             HeaderValue::from_static("4")
         );
         assert!(response.bytes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn supports_etag_conditional_requests_for_files() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"etag target";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(store);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/ipfs/{cid}");
+        let client = reqwest::Client::new();
+
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response.headers().get(ETAG).unwrap().clone();
+        assert_eq!(response.bytes().await.unwrap().as_ref(), data);
+
+        let response = client
+            .get(&url)
+            .header(IF_NONE_MATCH, etag.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers().get(ETAG).unwrap(), &etag);
+        assert!(response.bytes().await.unwrap().is_empty());
+
+        let weak = HeaderValue::from_str(&format!("W/{}", etag.to_str().unwrap())).unwrap();
+        let response = client
+            .head(&url)
+            .header(IF_NONE_MATCH, weak)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers().get(ETAG).unwrap(), &etag);
+        assert!(response.bytes().await.unwrap().is_empty());
+
+        let response = client
+            .get(&url)
+            .header(IF_NONE_MATCH, etag.clone())
+            .header(RANGE, "bytes=0-3")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers().get(ETAG).unwrap(), &etag);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), &data[..4]);
     }
 
     #[tokio::test]
