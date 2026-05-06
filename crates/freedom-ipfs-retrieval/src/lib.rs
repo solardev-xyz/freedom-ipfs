@@ -79,6 +79,8 @@ const BITSWAP_INCOMING_BATCH_PARTIAL_GRACE_MS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_INCOMING_BATCH_PARTIAL_GRACE_MS";
 const BITSWAP_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const BITSWAP_SUCCESSFUL_PEER_TTL: Duration = Duration::from_secs(10 * 60);
+const BITSWAP_SUCCESSFUL_PEER_MAX_LATENCY_MS_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_SUCCESSFUL_PEER_MAX_LATENCY_MS";
 const BITSWAP_CONNECTION_ERROR_BACKOFF_TTL: Duration = Duration::from_secs(30);
 const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD: usize = 2;
 const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD_ENV: &str =
@@ -2280,6 +2282,18 @@ impl HttpRetriever {
         addrs: Vec<Multiaddr>,
         last_latency: Duration,
     ) {
+        if let Some(max_latency) = bitswap_successful_peer_max_latency() {
+            if last_latency > max_latency {
+                tracing::info!(
+                    phase = "bitswap_successful_peer_skipped",
+                    peer = %peer,
+                    reason = "latency_above_threshold",
+                    latency_ms = last_latency.as_millis(),
+                    max_latency_ms = max_latency.as_millis()
+                );
+                return;
+            }
+        }
         let mut successes = self.successful_bitswap_peers.lock().await;
         successes.insert(
             peer,
@@ -3138,6 +3152,12 @@ fn single_http_post_lookup_race_min_score() -> Option<Duration> {
 
 fn zero_http_post_lookup_race_enabled() -> bool {
     std::env::var_os(ENABLE_ZERO_HTTP_POST_LOOKUP_RACE_ENV).is_some()
+}
+
+fn bitswap_successful_peer_max_latency() -> Option<Duration> {
+    std::env::var_os(BITSWAP_SUCCESSFUL_PEER_MAX_LATENCY_MS_ENV)
+        .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+        .map(Duration::from_millis)
 }
 
 fn single_http_provider_bitswap_hedge_min_score() -> Option<Duration> {

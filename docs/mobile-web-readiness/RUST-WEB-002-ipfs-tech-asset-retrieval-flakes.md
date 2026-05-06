@@ -26031,3 +26031,171 @@ the small guardrail. Keep the disabled env knob as a lab tool. The next zero-HTT
 work should target the actual Bitswap path: peer/source selection, slow WSS/TCP
 provider handling, and repeated slow CID/source behavior, not another generic
 post-lookup race.
+
+## 2026-05-06 Lab Control: Skip Slow Successful Bitswap Session Peers
+
+Hypothesis:
+The remaining zero-HTTP/Bitswap-heavy tails sometimes come from a peer that
+successfully serves a block but only after several hundred milliseconds. Because
+successful peers are retained as trusted page-session peers, a slow success can
+pollute later shortcut attempts. Put an optional max-latency cap on recording
+successful Bitswap peers and see whether excluding slow successes improves the
+asset tail.
+
+Implementation:
+
+- Add disabled-by-default env knob:
+  `FREEDOM_IPFS_BITSWAP_SUCCESSFUL_PEER_MAX_LATENCY_MS`.
+- When set, a Bitswap success whose elapsed latency exceeds the threshold is
+  not recorded in the successful-peer/session cache.
+- Emit `bitswap_successful_peer_skipped` with `latency_ms`,
+  `max_latency_ms`, and `reason=latency_above_threshold`.
+- Default behavior is unchanged when the env var is absent.
+
+Validation before live runs:
+
+```sh
+cargo fmt --all --check
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo test -p freedom-ipfs-retrieval successful_bitswap
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+All passed.
+
+Threshold `750ms` command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_SUCCESSFUL_PEER_MAX_LATENCY_MS=750 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/bitswap-success-max750-multicase-r3-20260506T231729Z-trace.jsonl \
+  --comparison-output /tmp/bitswap-success-max750-multicase-r3-20260506T231729Z.json \
+  > /tmp/bitswap-success-max750-multicase-r3-20260506T231729Z.log 2>&1
+```
+
+Result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- `daicowtf-page-assets` root TTFB p50/p95:
+  - Rust: `1100/1416ms`
+  - Kubo: `2793/2887ms`
+- `vitalik-root-html-range` root TTFB p50/p95:
+  - Rust: `410/421ms`
+  - Kubo: `1416/3196ms`
+- `ipfs-tech-page-assets` root TTFB p50/p95:
+  - Rust: `896/1448ms`
+  - Kubo: `1736/1917ms`
+- `ipfs-tech-page-assets` asset TTFB p50/p95:
+  - Rust: `260/848ms`
+  - Kubo: `399/798ms`
+- Resource max:
+  - Rust: `58428KiB` RSS, `41` FDs
+  - Kubo: `246240KiB` RSS, `350` FDs
+
+Trace notes:
+
+- `bitswap_successful_peer_skipped` events: `0`.
+- Block fetch totals:
+  - HTTP provider: `75` blocks, p50/p95/max `269/516/1046ms`
+  - Bitswap: `58` blocks, p50/p95/max `201/761/862ms`
+- Because no successful-peer skip fired, `750ms` did not exercise the new path.
+
+Threshold `500ms` command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_SUCCESSFUL_PEER_MAX_LATENCY_MS=500 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/bitswap-success-max500-multicase-r3-20260506T232125Z-trace.jsonl \
+  --comparison-output /tmp/bitswap-success-max500-multicase-r3-20260506T232125Z.json \
+  > /tmp/bitswap-success-max500-multicase-r3-20260506T232125Z.log 2>&1
+```
+
+Same-window default control:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-default-multicase-r3-20260506T232254Z-trace.jsonl \
+  --comparison-output /tmp/current-default-multicase-r3-20260506T232254Z.json \
+  > /tmp/current-default-multicase-r3-20260506T232254Z.log 2>&1
+```
+
+Results:
+
+| Mode | Pass | `ipfs.tech` root TTFB p50/p95 | `ipfs.tech` asset TTFB p50/p95 | Kubo asset p50/p95 | Rust max RSS/FD |
+| --- | --- | --- | --- | --- | --- |
+| Default | Rust `3/3`, Kubo `3/3` | `806/922ms` | `264/638ms` | `392/922ms` | `59064KiB` / `40` |
+| Max `500ms` | Rust `3/3`, Kubo `3/3` | `786/919ms` | `269/614ms` | `382/871ms` | `60008KiB` / `42` |
+
+Additional guardrail results:
+
+- `daicowtf-page-assets` root TTFB p50/p95:
+  - default Rust/Kubo: `1241/1253ms` vs `2958/3007ms`
+  - max `500ms` Rust/Kubo: `1064/1608ms` vs `2898/3265ms`
+- `vitalik-root-html-range` root TTFB p50/p95:
+  - default Rust/Kubo: `405/432ms` vs `1697/2751ms`
+  - max `500ms` Rust/Kubo: `406/433ms` vs `2325/2675ms`
+
+Trace comparison:
+
+- Max `500ms` emitted only `3` skip events, with skipped latencies
+  `567ms`, `573ms`, and `585ms`.
+- `ipfs.tech` asset median was effectively flat/slightly worse
+  (`264ms -> 269ms`).
+- `ipfs.tech` asset p95 improved slightly in this sample
+  (`638ms -> 614ms`), and `block_fetch_total` max dropped
+  (`1529ms -> 892ms`), but this was a small r3 run with only three skips.
+- Canceled Bitswap batches decreased slightly (`80 -> 74`).
+- Resource use stayed in the same range, with a small FD/RSS increase under the
+  threshold run.
+
+Post-lab validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+All passed.
+
+Decision:
+Keep this as a disabled lab knob, not a default policy. The `750ms` threshold
+did nothing, while `500ms` produced only a weak tail signal and a small median
+regression. The useful takeaway is that slow successful peers can contribute to
+the remaining tail, but a blunt latency cap is too coarse for production. A
+better next experiment should use richer per-peer/session evidence, for example
+recent timeout/error history, repeated success latency, or per-content-root
+peer quality, rather than dropping every success above a fixed threshold.
