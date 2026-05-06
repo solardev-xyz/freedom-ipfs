@@ -52,6 +52,8 @@ const MAX_HTTP_PROVIDER_SCORE_ENTRIES: usize = 64;
 const DISABLE_HTTP_PROVIDER_SCORING_ENV: &str = "FREEDOM_IPFS_DISABLE_HTTP_PROVIDER_SCORING";
 const DISABLE_SINGLE_HTTP_SELF_HEDGE_ENV: &str = "FREEDOM_IPFS_DISABLE_SINGLE_HTTP_SELF_HEDGE";
 const ENABLE_SINGLE_HTTP_BITSWAP_HEDGE_ENV: &str = "FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE";
+const SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS_ENV: &str =
+    "FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS";
 const MAX_CONCURRENT_HTTP_PROVIDER_FETCHES: usize = 4;
 const BITSWAP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 // Start provider retry before a full dial timeout can dominate gateway TTFB.
@@ -873,6 +875,14 @@ impl HttpRetriever {
         if http_provider_bases.len() == 1
             && single_http_provider_bitswap_hedge_enabled()
             && has_bitswap_provider_candidate(providers)
+            && self
+                .single_http_provider_bitswap_hedge_score_allows(
+                    cid,
+                    http_provider_bases
+                        .first()
+                        .expect("single HTTP provider base is present"),
+                )
+                .await
         {
             return self
                 .fetch_single_http_provider_with_bitswap_hedge(
@@ -1469,6 +1479,66 @@ impl HttpRetriever {
             (None, None) => a.original_index.cmp(&b.original_index),
         });
         candidates
+    }
+
+    async fn single_http_provider_bitswap_hedge_score_allows(&self, cid: &Cid, base: &Url) -> bool {
+        let Some(min_score) = single_http_provider_bitswap_hedge_min_score() else {
+            return true;
+        };
+        if !http_provider_scoring_enabled() {
+            tracing::info!(
+                phase = "http_provider_bitswap_hedge_skip",
+                cid = %cid,
+                provider = %base,
+                reason = "scoring_disabled",
+                provider_scored = false,
+                provider_score_ms = 0u128,
+                min_score_ms = min_score.as_millis()
+            );
+            return false;
+        }
+        let Some(key) = http_provider_score_key(base) else {
+            tracing::info!(
+                phase = "http_provider_bitswap_hedge_skip",
+                cid = %cid,
+                provider = %base,
+                reason = "provider_unkeyed",
+                provider_scored = false,
+                provider_score_ms = 0u128,
+                min_score_ms = min_score.as_millis()
+            );
+            return false;
+        };
+        let mut scores = self.http_provider_scores.lock().await;
+        let now = Instant::now();
+        scores.retain(|_, score| {
+            now.saturating_duration_since(score.last_seen) <= HTTP_PROVIDER_SCORE_TTL
+        });
+        let Some(score) = scores.get(&key) else {
+            tracing::info!(
+                phase = "http_provider_bitswap_hedge_skip",
+                cid = %cid,
+                provider = %base,
+                reason = "provider_unscored",
+                provider_scored = false,
+                provider_score_ms = 0u128,
+                min_score_ms = min_score.as_millis()
+            );
+            return false;
+        };
+        if score.ewma_elapsed < min_score {
+            tracing::info!(
+                phase = "http_provider_bitswap_hedge_skip",
+                cid = %cid,
+                provider = %base,
+                reason = "provider_score_below_threshold",
+                provider_scored = true,
+                provider_score_ms = score.ewma_elapsed.as_millis(),
+                min_score_ms = min_score.as_millis()
+            );
+            return false;
+        }
+        true
     }
 
     async fn record_http_provider_success(&self, base: &Url, elapsed: Duration) {
@@ -2383,6 +2453,12 @@ fn single_http_provider_self_hedge_enabled() -> bool {
 
 fn single_http_provider_bitswap_hedge_enabled() -> bool {
     std::env::var_os(ENABLE_SINGLE_HTTP_BITSWAP_HEDGE_ENV).is_some()
+}
+
+fn single_http_provider_bitswap_hedge_min_score() -> Option<Duration> {
+    std::env::var_os(SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS_ENV)
+        .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+        .map(Duration::from_millis)
 }
 
 fn has_bitswap_provider_candidate(providers: &[Provider]) -> bool {

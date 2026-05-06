@@ -21776,3 +21776,151 @@ but the current trigger is still too broad for mobile production because it
 raises connection pressure and does not improve p95/max consistently. Future work
 should retune this around stricter signals, for example a slow-provider score,
 recent peer success, lower per-page Bitswap caps, or a later hedge delay.
+
+## 2026-05-06 Experiment: Score-Gated Single-HTTP Bitswap Hedge
+
+Question:
+The all-or-nothing opt-in Bitswap hedge was too broad for mobile production. Can
+the same lab knob become safer by firing only after the sole HTTP provider has a
+remembered slow EWMA score?
+
+Implementation:
+
+- Add optional env var
+  `FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS`.
+- This env only matters when
+  `FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1` is also set.
+- When the min-score env is set, the Bitswap hedge is skipped until the single
+  HTTP provider has a non-expired score at or above the configured threshold.
+- Skips emit `http_provider_bitswap_hedge_skip` with the provider score,
+  threshold, and skip reason.
+- Mobile progress and harness summaries map the skip phase to
+  `fetching_http_provider` so the raw experimental diagnostic does not become a
+  new UI state.
+- `docs/mobile-progress-api.md` documents the raw-to-stable phase mapping.
+
+No-trace disabled control:
+
+```sh
+rm -f /tmp/ipfs-tech-score-gated-bitswap-hedge-disabled-r3.json
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --output /tmp/ipfs-tech-score-gated-bitswap-hedge-disabled-r3.json
+```
+
+No-trace enabled command:
+
+```sh
+rm -f /tmp/ipfs-tech-score-gated-bitswap-hedge-enabled-r3.json
+
+FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 \
+FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS=250 \
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --output /tmp/ipfs-tech-score-gated-bitswap-hedge-enabled-r3.json
+```
+
+No-trace artifacts:
+
+- `/tmp/ipfs-tech-score-gated-bitswap-hedge-disabled-r3.json`
+- `/tmp/ipfs-tech-score-gated-bitswap-hedge-enabled-r3.json`
+
+No-trace result:
+
+| Mode | Pass | Run total p50/p95/max | Root TTFB p50/p95/max | Asset TTFB p50/p95/max | Max RSS/FD |
+| --- | --- | --- | --- | --- | --- |
+| Disabled | `3/3` | `2873/4233/4233ms` | `1177/1485/1485ms` | `236/910/1122ms` | `48372KiB` / `23` |
+| Score-gated | `3/3` | `2466/2589/2589ms` | `1062/1155/1155ms` | `227/519/689ms` | `54132KiB` / `39` |
+
+Traced disabled control:
+
+```sh
+rm -f /tmp/ipfs-tech-score-gated-bitswap-hedge-disabled-trace-r3.json \
+  /tmp/ipfs-tech-score-gated-bitswap-hedge-disabled-trace-r3-trace.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-score-gated-bitswap-hedge-disabled-trace-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-score-gated-bitswap-hedge-disabled-trace-r3.json
+```
+
+Traced enabled command:
+
+```sh
+rm -f /tmp/ipfs-tech-score-gated-bitswap-hedge-enabled-trace-r3.json \
+  /tmp/ipfs-tech-score-gated-bitswap-hedge-enabled-trace-r3-trace.jsonl
+
+FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 \
+FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS=250 \
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-score-gated-bitswap-hedge-enabled-trace-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-score-gated-bitswap-hedge-enabled-trace-r3.json
+```
+
+Traced artifacts:
+
+- `/tmp/ipfs-tech-score-gated-bitswap-hedge-disabled-trace-r3.json`
+- `/tmp/ipfs-tech-score-gated-bitswap-hedge-disabled-trace-r3-trace.jsonl`
+- `/tmp/ipfs-tech-score-gated-bitswap-hedge-enabled-trace-r3.json`
+- `/tmp/ipfs-tech-score-gated-bitswap-hedge-enabled-trace-r3-trace.jsonl`
+
+Traced result:
+
+| Mode | Pass | Run total p50/p95/max | Root TTFB p50/p95/max | Asset TTFB p50/p95/max | Max RSS/FD |
+| --- | --- | --- | --- | --- | --- |
+| Disabled | `3/3` | `2138/2975/2975ms` | `713/918/918ms` | `255/539/689ms` | `46584KiB` / `26` |
+| Score-gated | `3/3` | `1931/2393/2393ms` | `534/564/564ms` | `229/498/713ms` | `53976KiB` / `38` |
+
+Trace findings:
+
+- Disabled trace had `3004` events and all `120` block fetches came from
+  `http_provider`.
+- Score-gated trace had `3108` events, `4`
+  `http_provider_bitswap_hedge` starts, and `4`
+  `http_provider_bitswap_hedge_result` events.
+- Score-gated trace still had all `120` block fetches from `http_provider`.
+  Bitswap attempted `3` commands, established `5` connections, and all Bitswap
+  fetches were cancelled after HTTP won.
+- Score-gated single-provider result latency improved from p50/p95/max
+  `233/510/644ms` to `216/368/662ms`, but the max did not improve.
+- Resource cost remained visible: traced max RSS rose by about `7MiB`, and max
+  FD count rose from `26` to `38`.
+
+Decision:
+Keep the score-gate as an opt-in lab control, but do not enable or recommend the
+`250ms` threshold as production behavior. The no-trace sample looked good, but
+the trace shows the observed improvement was not due to Bitswap serving blocks.
+This is useful for future controlled experiments because it bounds the broad
+hedge behind provider scoring and emits skip diagnostics, but the next production
+candidate should require actual recent Bitswap success or a stronger per-page
+resource budget before starting extra peer work.

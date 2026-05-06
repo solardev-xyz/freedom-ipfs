@@ -8249,6 +8249,7 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         | "http_provider_hedge"
         | "http_provider_race"
         | "http_provider_self_hedge"
+        | "http_provider_bitswap_hedge_skip"
         | "http_provider_race_result" => "fetching_http_provider",
         "http_provider_bitswap_hedge" => "fetching_bitswap",
         "http_provider_bitswap_hedge_result" => {
@@ -9713,6 +9714,7 @@ mod tests {
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-a\",\"ok\":true}\n",
                 "{\"phase\":\"http_provider_hedge\",\"cid\":\"cid-a\",\"provider\":\"https://provider.example\",\"timeout_ms\":250,\"pending_count\":2}\n",
                 "{\"phase\":\"http_provider_bitswap_hedge\",\"cid\":\"cid-a\",\"provider_count\":4,\"timeout_ms\":150,\"reason\":\"slow_single_http_provider\"}\n",
+                "{\"phase\":\"http_provider_bitswap_hedge_skip\",\"cid\":\"cid-c\",\"provider\":\"https://provider.example\",\"reason\":\"provider_score_below_threshold\",\"provider_scored\":true,\"provider_score_ms\":120,\"min_score_ms\":250}\n",
                 "{\"phase\":\"http_provider_bitswap_hedge_result\",\"cid\":\"cid-a\",\"source\":\"bitswap\",\"provider_count\":4,\"elapsed_ms\":200}\n",
                 "{\"phase\":\"http_provider_bitswap_hedge_result\",\"cid\":\"cid-b\",\"source\":\"http_provider\",\"provider_count\":2,\"elapsed_ms\":75}\n",
                 "{\"phase\":\"bitswap_peer_expand\",\"cid\":\"cid-a\",\"peer_count\":2}\n",
@@ -9865,7 +9867,7 @@ mod tests {
         assert_eq!(trace_value_count(&summary.progress_phases, "cache_hit"), 2);
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_http_provider"),
-            3
+            4
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_bitswap"),

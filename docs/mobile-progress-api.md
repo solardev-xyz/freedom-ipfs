@@ -98,6 +98,13 @@ phases rather than as a UI-facing internal phase: cache hits report
 `phase: "checking_cache"`, and cache insert bookkeeping reports
 `phase: "streaming"`.
 
+Experimental HTTP-provider/Bitswap hedge diagnostics are also normalized before
+Swift sees them as UI states. `http_provider_bitswap_hedge` reports
+`phase: "fetching_bitswap"` with `source: "bitswap"`,
+`http_provider_bitswap_hedge_result` follows its winning `source`, and
+`http_provider_bitswap_hedge_skip` reports
+`phase: "fetching_http_provider"` with `source: "http_provider"`.
+
 For gateway requests, Swift may pass optional correlation headers:
 
 - `X-Freedom-Request-ID`: unsigned integer used as `target_id`
