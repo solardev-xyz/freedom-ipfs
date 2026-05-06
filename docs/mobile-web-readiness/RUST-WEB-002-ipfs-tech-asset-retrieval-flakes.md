@@ -22936,3 +22936,116 @@ win. The next useful experiment is likely not a pure score gate. Better options:
 reduce or parameterize the single-HTTP post-lookup session wait, or run full
 hedge across DAICO/Vitalik and Kubo comparison guardrails to determine whether
 the FD cost is acceptable for the broader workload.
+
+## 2026-05-06 Guardrail: Full Bitswap Hedge Multi-Case Kubo Comparison
+
+Question:
+Does the full opt-in single-HTTP Bitswap hedge remain attractive when checked
+against the multi-case guardrails and Kubo, not only `ipfs.tech` r10?
+
+Full hedge command:
+
+```sh
+rm -f /tmp/fullhedge-multicase-kubo-r3.json \
+  /tmp/fullhedge-multicase-kubo-r3-trace.jsonl \
+  /tmp/fullhedge-multicase-kubo-r3.log
+
+FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 timeout 1500s \
+  cargo run -p mobile-web-harness -- \
+    --build-gateway \
+    --compare-kubo \
+    --kubo-bin target/tools/kubo/kubo/ipfs \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --case daicowtf-page-assets \
+    --case vitalik-root-html-range \
+    --repeat 3 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/fullhedge-multicase-kubo-r3-trace.jsonl \
+    --comparison-output /tmp/fullhedge-multicase-kubo-r3.json \
+    > /tmp/fullhedge-multicase-kubo-r3.log 2>&1
+```
+
+Same-window default command:
+
+```sh
+rm -f /tmp/default-multicase-kubo-posthedge-r3.json \
+  /tmp/default-multicase-kubo-posthedge-r3-trace.jsonl \
+  /tmp/default-multicase-kubo-posthedge-r3.log
+
+timeout 1500s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/default-multicase-kubo-posthedge-r3-trace.jsonl \
+  --comparison-output /tmp/default-multicase-kubo-posthedge-r3.json \
+  > /tmp/default-multicase-kubo-posthedge-r3.log 2>&1
+```
+
+Artifacts:
+
+- `/tmp/fullhedge-multicase-kubo-r3.json`
+- `/tmp/fullhedge-multicase-kubo-r3-trace.jsonl`
+- `/tmp/fullhedge-multicase-kubo-r3.log`
+- `/tmp/default-multicase-kubo-posthedge-r3.json`
+- `/tmp/default-multicase-kubo-posthedge-r3-trace.jsonl`
+- `/tmp/default-multicase-kubo-posthedge-r3.log`
+
+Result:
+
+| Mode | Pass | DAICO root p50/p95 | Vitalik root p50/p95 | IPFS.tech root p50/p95 | IPFS.tech asset p50/p95 | Rust max RSS/FD |
+| --- | --- | --- | --- | --- | --- | --- |
+| Full hedge | Rust `3/3`, Kubo `3/3` | `289/339ms` | `101/122ms` | `539/643ms` | `242/657ms` | `55804KiB` / `54` |
+| Default | Rust `3/3`, Kubo `3/3` | `297/395ms` | `102/116ms` | `709/1087ms` | `229/518ms` | `54616KiB` / `32` |
+
+Kubo comparison notes:
+
+- Full hedge Rust still beat Kubo strongly on DAICO and Vitalik root latency.
+- Full hedge Rust beat Kubo on `ipfs.tech` root p50/p95 in this window.
+- Full hedge Rust lost to Kubo on `ipfs.tech` asset p50/p95:
+  Rust `242/657ms`, Kubo `156/378ms`.
+- Default Rust beat Kubo on `ipfs.tech` asset p50/p95 in the immediately
+  following same-window run: Rust `229/518ms`, Kubo `323/1135ms`.
+- Kubo resource use was much higher in both runs, but full hedge moved Rust FD
+  max from `32` to `54`.
+
+Trace notes:
+
+- Full hedge request classifications:
+  `cold_bitswap_peer_expand=16`, `zero_http_provider_bitswap=3`,
+  `zero_http_provider_cold_bitswap=3`.
+- Default request classifications:
+  `cold_bitswap_peer_expand=3`, `zero_http_provider_bitswap=3`,
+  `zero_http_provider_cold_bitswap=3`.
+- Full hedge emitted `56` Bitswap hedge starts and `68` hedge result events, but
+  all hedge results reported `source=http_provider`; Bitswap did not win a
+  single hedged fetch in this guardrail run.
+- Full hedge introduced `12` Bitswap dial rejections and `7` failed Bitswap peer
+  attempts. Default had no Bitswap dial rejections in this run.
+- Full hedge HTTP-provider race max was lower (`347ms` vs default `568ms`), but
+  the extra Bitswap activity did not translate into asset p95 improvement.
+
+Conclusion:
+Do not enable the full single-HTTP Bitswap hedge by default. It remains a useful
+lab control and an `ipfs.tech` root-tail lever, but the broader guardrail says
+the policy is too expensive and not consistently better: FD max rose `32 -> 54`,
+`ipfs.tech` asset p95 regressed `518 -> 657ms`, and Bitswap did not win any
+hedged fetches in this multi-case run.
+
+Next behavior work should be narrower than "start Bitswap beside every slow
+single HTTP provider." Better candidates are request-shape-specific policies,
+such as shorter single-HTTP post-lookup session waits, or a hedge that only
+arms when the current request is a top-level/root path or when trace
+classification predicts the zero-HTTP/cold-Bitswap root shape.
