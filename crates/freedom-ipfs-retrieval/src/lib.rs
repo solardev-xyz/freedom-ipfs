@@ -94,6 +94,8 @@ const BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS";
 const ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE";
+const SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS_ENV: &str =
+    "FREEDOM_IPFS_SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS";
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
 const BITSWAP_SESSION_LATE_PEER_WAIT: Duration = Duration::from_secs(2);
 const BITSWAP_SESSION_LATE_PEER_POLL: Duration = Duration::from_millis(50);
@@ -486,8 +488,13 @@ impl HttpRetriever {
                                                         bitswap_session_post_lookup_grace(&providers);
                                                     let http_provider_count =
                                                         provider_http_url_count(&providers);
-                                                    if single_http_post_lookup_race_enabled()
-                                                        && http_provider_count == 1
+                                                    if self
+                                                        .single_http_post_lookup_race_allows(
+                                                            cid,
+                                                            &providers,
+                                                            http_provider_count,
+                                                        )
+                                                        .await
                                                     {
                                                         if let Some((block, source)) = self
                                                             .fetch_after_session_shortcut_provider_lookup(
@@ -671,8 +678,13 @@ impl HttpRetriever {
                                                     bitswap_session_post_lookup_grace(&providers);
                                                 let http_provider_count =
                                                     provider_http_url_count(&providers);
-                                                if single_http_post_lookup_race_enabled()
-                                                    && http_provider_count == 1
+                                                if self
+                                                    .single_http_post_lookup_race_allows(
+                                                        cid,
+                                                        &providers,
+                                                        http_provider_count,
+                                                    )
+                                                    .await
                                                 {
                                                     if let Some((block, source)) = self
                                                         .fetch_after_session_shortcut_provider_lookup(
@@ -1097,6 +1109,98 @@ impl HttpRetriever {
                 }
             }
         }
+    }
+
+    async fn single_http_post_lookup_race_allows(
+        &self,
+        cid: &Cid,
+        providers: &[Provider],
+        http_provider_count: usize,
+    ) -> bool {
+        if !single_http_post_lookup_race_enabled() || http_provider_count != 1 {
+            return false;
+        }
+        let Some(min_score) = single_http_post_lookup_race_min_score() else {
+            return true;
+        };
+        let Some(base) = single_http_provider_base(providers) else {
+            tracing::info!(
+                phase = "bitswap_session_shortcut_post_lookup_race_skip",
+                cid = %cid,
+                reason = "provider_unavailable",
+                provider_scored = false,
+                provider_score_ms = 0u128,
+                min_score_ms = min_score.as_millis()
+            );
+            return false;
+        };
+        self.single_http_post_lookup_race_score_allows_with_min(cid, base, Some(min_score))
+            .await
+    }
+
+    async fn single_http_post_lookup_race_score_allows_with_min(
+        &self,
+        cid: &Cid,
+        base: &Url,
+        min_score: Option<Duration>,
+    ) -> bool {
+        let Some(min_score) = min_score else {
+            return true;
+        };
+        if !http_provider_scoring_enabled() {
+            tracing::info!(
+                phase = "bitswap_session_shortcut_post_lookup_race_skip",
+                cid = %cid,
+                provider = %base,
+                reason = "scoring_disabled",
+                provider_scored = false,
+                provider_score_ms = 0u128,
+                min_score_ms = min_score.as_millis()
+            );
+            return false;
+        }
+        let Some(key) = http_provider_score_key(base) else {
+            tracing::info!(
+                phase = "bitswap_session_shortcut_post_lookup_race_skip",
+                cid = %cid,
+                provider = %base,
+                reason = "provider_unkeyed",
+                provider_scored = false,
+                provider_score_ms = 0u128,
+                min_score_ms = min_score.as_millis()
+            );
+            return false;
+        };
+        let mut scores = self.http_provider_scores.lock().await;
+        let now = Instant::now();
+        scores.retain(|_, score| {
+            now.saturating_duration_since(score.last_seen) <= HTTP_PROVIDER_SCORE_TTL
+        });
+        let Some(score) = scores.get(&key) else {
+            tracing::info!(
+                phase = "bitswap_session_shortcut_post_lookup_race_skip",
+                cid = %cid,
+                provider = %base,
+                reason = "provider_unscored",
+                provider_scored = false,
+                provider_score_ms = 0u128,
+                min_score_ms = min_score.as_millis()
+            );
+            return false;
+        };
+        if score.ewma_elapsed < min_score {
+            tracing::info!(
+                phase = "bitswap_session_shortcut_post_lookup_race_skip",
+                cid = %cid,
+                provider = %base,
+                reason = "provider_score_below_threshold",
+                provider_scored = true,
+                provider_score_ms = score.ewma_elapsed.as_millis(),
+                min_score_ms = min_score.as_millis()
+            );
+            return false;
+        }
+        true
     }
 
     fn cached_providers(&self, cid: &Cid) -> Result<Option<Vec<Provider>>> {
@@ -2578,6 +2682,18 @@ fn provider_http_url_count(providers: &[Provider]) -> usize {
         .sum()
 }
 
+fn single_http_provider_base(providers: &[Provider]) -> Option<&Url> {
+    let mut bases = providers
+        .iter()
+        .flat_map(|provider| provider.http_urls.iter());
+    let base = bases.next()?;
+    if bases.next().is_some() {
+        None
+    } else {
+        Some(base)
+    }
+}
+
 fn bitswap_session_post_lookup_grace(providers: &[Provider]) -> Duration {
     let override_value = std::env::var_os(BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS_ENV);
     let override_value = override_value.as_ref().map(|value| value.to_string_lossy());
@@ -2996,6 +3112,12 @@ fn single_http_provider_bitswap_hedge_enabled() -> bool {
 
 fn single_http_post_lookup_race_enabled() -> bool {
     std::env::var_os(ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE_ENV).is_some()
+}
+
+fn single_http_post_lookup_race_min_score() -> Option<Duration> {
+    std::env::var_os(SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS_ENV)
+        .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+        .map(Duration::from_millis)
 }
 
 fn single_http_provider_bitswap_hedge_min_score() -> Option<Duration> {
@@ -7586,6 +7708,59 @@ mod bitswap_tests {
                 )
                 .await,
             "slow scored providers should still get the self-hedge tail guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_http_post_lookup_race_score_gate_skips_unscored_and_fast_providers() {
+        let cid = freedom_ipfs_core::cid_from_data(
+            freedom_ipfs_core::CODEC_RAW,
+            b"score gated single HTTP post lookup race",
+        );
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store,
+        );
+        let base = Url::parse("https://post-lookup-provider.example/").unwrap();
+
+        assert!(
+            !retriever
+                .single_http_post_lookup_race_score_allows_with_min(
+                    &cid,
+                    &base,
+                    Some(Duration::from_millis(100)),
+                )
+                .await,
+            "unscored providers should skip the narrower duplicate race"
+        );
+
+        retriever
+            .record_http_provider_success(&base, Duration::from_millis(50))
+            .await;
+        assert!(
+            !retriever
+                .single_http_post_lookup_race_score_allows_with_min(
+                    &cid,
+                    &base,
+                    Some(Duration::from_millis(100)),
+                )
+                .await,
+            "recently fast providers should not race the shortcut"
+        );
+
+        retriever
+            .record_http_provider_success(&base, Duration::from_millis(500))
+            .await;
+        assert!(
+            retriever
+                .single_http_post_lookup_race_score_allows_with_min(
+                    &cid,
+                    &base,
+                    Some(Duration::from_millis(100)),
+                )
+                .await,
+            "slow scored providers should still race the shortcut"
         );
     }
 

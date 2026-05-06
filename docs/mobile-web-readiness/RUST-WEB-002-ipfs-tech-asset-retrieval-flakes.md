@@ -25696,3 +25696,111 @@ when it is likely to remove tail latency without wasting work, for example by
 gating it on recent single HTTP-provider score, page/subresource context, or a
 small per-session race budget. Validate that candidate against r10/r20 focused
 `ipfs.tech` and the multi-case guardrail before making it default.
+
+## 2026-05-06 Lab Control: Score-Gated Single-HTTP Post-Lookup Race
+
+Hypothesis:
+The broad post-lookup race may be narrowed with the existing HTTP-provider EWMA
+score. Race only single HTTP providers whose recent score is slow enough, and
+keep the default/off behavior unchanged.
+
+Implementation:
+
+- Add optional env knob:
+  `FREEDOM_IPFS_SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS`.
+- The knob only applies when
+  `FREEDOM_IPFS_ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE=1` is also set.
+- If the min-score knob is unset, the race flag keeps its previous broad lab
+  behavior.
+- If the min-score knob is set, unscored providers and providers below the
+  threshold skip the race and use the existing post-lookup grace.
+- Emit `bitswap_session_shortcut_post_lookup_race_skip` with skip reason and
+  score details.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo test -p freedom-ipfs-retrieval single_http_post_lookup_race_score_gate_skips_unscored_and_fast_providers
+cargo test -p freedom-ipfs-retrieval
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+All passed.
+
+Score `200ms` command:
+
+```sh
+FREEDOM_IPFS_ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE=1 \
+FREEDOM_IPFS_SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS=200 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/single-http-postlookup-score200-r3-20260506T225745Z-trace.jsonl \
+  --comparison-output /tmp/single-http-postlookup-score200-r3-20260506T225745Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/single-http-postlookup-score200-r3-20260506T225745Z.log 2>&1
+```
+
+Score `175ms` command:
+
+```sh
+FREEDOM_IPFS_ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE=1 \
+FREEDOM_IPFS_SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS=175 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/single-http-postlookup-score175-r3-20260506T225858Z-trace.jsonl \
+  --comparison-output /tmp/single-http-postlookup-score175-r3-20260506T225858Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/single-http-postlookup-score175-r3-20260506T225858Z.log 2>&1
+```
+
+Results:
+
+| Mode | Pass | Root TTFB p50/p95 | Asset TTFB p50/p95 | Kubo asset p50/p95 | Rust max RSS/FD |
+| --- | --- | --- | --- | --- | --- |
+| Score `200ms` | Rust `3/3`, Kubo `3/3` | `742/1360ms` | `242/590ms` | `124/821ms` | `55136KiB` / `33` |
+| Score `175ms` | Rust `3/3`, Kubo `3/3` | `763/1246ms` | `259/601ms` | `190/602ms` | `53584KiB` / `37` |
+
+Trace comparison:
+
+- Score `200ms`:
+  - race events: `17` total, `bitswap_won=16`, `provider_won=1`
+  - skip events: `33`, all `provider_score_below_threshold`
+  - skipped provider scores p50/p90/p95/max: `184/196/196/196ms`
+  - post-lookup waits stayed high: `78`
+  - canceled Bitswap batches: `47`
+  - HTTP provider block totals p50/p95/max: `277/824/924ms`
+- Score `175ms`:
+  - race events: `49` total, `bitswap_won=20`, `provider_won=29`
+  - skip events: `0`
+  - post-lookup waits: `47`, only multi/zero-provider paths
+  - canceled Bitswap batches: `69`
+  - HTTP provider block totals p50/p95/max: `262/346/775ms`
+
+Decision:
+Keep the score threshold knob because it is useful for lab sweeps, but do not
+assume score-only gating is the production answer. `200ms` was too strict: it
+skipped providers scored around `184-196ms`, yet the live HTTP provider tail
+still reached `824-924ms`. `175ms` avoided those misses but effectively became
+the broad race in this sample. The next narrowing attempt should probably use
+session/request context or a small per-session race budget rather than only a
+global provider EWMA threshold.
