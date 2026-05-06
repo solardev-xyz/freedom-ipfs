@@ -6,16 +6,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 
 const DEFAULT_CORPUS: &str = "tools/mobile-web-harness/corpus/mobile-web.json";
 const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 const DEFAULT_ASSET_CONCURRENCY: usize = 6;
+const PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(300);
+static NEXT_HARNESS_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -75,6 +78,9 @@ struct Args {
     /// Optional tracing filter for spawned gateway trace output.
     #[arg(long)]
     trace_filter: Option<String>,
+    /// Poll /_freedom/progress while each case runs and include a compact summary in the report.
+    #[arg(long)]
+    collect_progress: bool,
 }
 
 #[tokio::main]
@@ -170,6 +176,7 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             timeout,
             args.asset_concurrency,
             &args.cases,
+            args.collect_progress,
         )
         .await?;
         let elapsed_ms = started.elapsed().as_millis();
@@ -213,6 +220,7 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
         warmup_runs: args.warmup_runs,
         fresh_gateway_per_run: args.fresh_gateway_per_run,
         asset_concurrency: args.asset_concurrency,
+        collect_progress: args.collect_progress,
         gateway_db: args
             .gateway_db
             .as_ref()
@@ -233,6 +241,7 @@ async fn run_corpus_once(
     timeout: Duration,
     asset_concurrency: usize,
     cases: &[String],
+    collect_progress: bool,
 ) -> Result<Vec<CaseResult>> {
     let client = reqwest::Client::builder()
         .timeout(timeout)
@@ -243,7 +252,16 @@ async fn run_corpus_once(
         if !cases.is_empty() && !cases.iter().any(|case| case == &entry.id) {
             continue;
         }
-        results.push(run_case(&client, gateway_url, entry, asset_concurrency).await);
+        results.push(
+            run_case(
+                &client,
+                gateway_url,
+                entry,
+                asset_concurrency,
+                collect_progress,
+            )
+            .await,
+        );
     }
     if results.is_empty() {
         bail!("no corpus entries matched the requested case filters");
@@ -256,13 +274,27 @@ async fn run_case(
     gateway_url: &str,
     entry: &CorpusEntry,
     asset_concurrency: usize,
+    collect_progress: bool,
 ) -> CaseResult {
     let url = format!("{}{}", gateway_url.trim_end_matches('/'), entry.path);
     let method = entry.method.as_deref().unwrap_or("GET");
-    let response = match fetch_response(client, &url, method, entry.range.as_deref()).await {
+    let root_progress = RequestProgressHeaders::root(entry.path.clone());
+    let progress_collector =
+        ProgressCaseCollector::start(collect_progress, client.clone(), gateway_url.to_string())
+            .await;
+    let response = match fetch_response(
+        client,
+        &url,
+        method,
+        entry.range.as_deref(),
+        Some(&root_progress),
+    )
+    .await
+    {
         Ok(response) => response,
         Err(err) => {
-            return CaseResult::failed(entry, url, vec![format!("request error: {err}")]);
+            let progress = finish_progress_collector(progress_collector).await;
+            return CaseResult::failed(entry, url, vec![format!("request error: {err}")], progress);
         }
     };
 
@@ -329,13 +361,21 @@ async fn run_case(
     let mut asset_summary = None;
     let mut assets = Vec::new();
     if let Some(crawl) = &entry.crawl {
-        let (summary, mut crawled_assets, crawl_failures) =
-            run_page_crawl(client, &url, &response.body, crawl, asset_concurrency).await;
+        let (summary, mut crawled_assets, crawl_failures) = run_page_crawl(
+            client,
+            &url,
+            &response.body,
+            crawl,
+            asset_concurrency,
+            Some(root_progress),
+        )
+        .await;
         failures.extend(crawl_failures);
         asset_summary = Some(summary);
         assets.append(&mut crawled_assets);
     }
 
+    let progress = finish_progress_collector(progress_collector).await;
     CaseResult {
         id: entry.id.clone(),
         description: entry.description.clone(),
@@ -350,6 +390,7 @@ async fn run_case(
         body_preview,
         asset_summary,
         assets,
+        progress,
         passed: failures.is_empty(),
         failures,
     }
@@ -364,8 +405,12 @@ fn print_summary(report: &RunReport) {
         println!("gateway_db: {gateway_db}");
     }
     println!(
-        "runs: measured={} warmup={} fresh_gateway_per_run={} asset_concurrency={}",
-        report.repeat, report.warmup_runs, report.fresh_gateway_per_run, report.asset_concurrency
+        "runs: measured={} warmup={} fresh_gateway_per_run={} asset_concurrency={} collect_progress={}",
+        report.repeat,
+        report.warmup_runs,
+        report.fresh_gateway_per_run,
+        report.asset_concurrency,
+        report.collect_progress
     );
     println!(
         "summary: passed={} failed={} pass_rate={:.1}%",
@@ -494,6 +539,293 @@ fn print_case_result(result: &CaseResult) {
             }
         }
     }
+    if let Some(progress) = &result.progress {
+        println!(
+            "  progress: snapshots={} final_events={} active_max={} phases={}",
+            progress.snapshot_count,
+            progress.final_event_count,
+            progress.active_count_max,
+            progress
+                .phases
+                .iter()
+                .take(8)
+                .map(|phase| format!("{}={}", phase.name, phase.count))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for error in progress.poll_errors.iter().take(3) {
+            println!("    progress poll error: {error}");
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RequestProgressHeaders {
+    request_id: u64,
+    parent_id: Option<u64>,
+    top_level_path: String,
+}
+
+impl RequestProgressHeaders {
+    fn root(top_level_path: String) -> Self {
+        Self {
+            request_id: NEXT_HARNESS_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+            parent_id: None,
+            top_level_path,
+        }
+    }
+
+    fn child(&self) -> Self {
+        Self {
+            request_id: NEXT_HARNESS_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+            parent_id: Some(self.request_id),
+            top_level_path: self.top_level_path.clone(),
+        }
+    }
+
+    fn apply(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let request = request
+            .header("X-Freedom-Request-ID", self.request_id.to_string())
+            .header("X-Freedom-Top-Level-Path", &self.top_level_path);
+        if let Some(parent_id) = self.parent_id {
+            request.header("X-Freedom-Parent-Request-ID", parent_id.to_string())
+        } else {
+            request
+        }
+    }
+}
+
+struct ProgressCaseCollector {
+    stop: watch::Sender<bool>,
+    handle: JoinHandle<Vec<ProgressPoll>>,
+    clear_error: Option<String>,
+}
+
+impl ProgressCaseCollector {
+    async fn start(enabled: bool, client: reqwest::Client, gateway_url: String) -> Option<Self> {
+        if !enabled {
+            return None;
+        }
+        let endpoint = format!("{}/_freedom/progress", gateway_url.trim_end_matches('/'));
+        let clear_error = match client.post(&endpoint).send().await {
+            Ok(response) if response.status().is_success() => None,
+            Ok(response) => Some(format!("progress clear returned {}", response.status())),
+            Err(err) => Some(format!("progress clear failed: {err}")),
+        };
+        let (stop, mut stop_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(PROGRESS_POLL_INTERVAL);
+            let mut samples = Vec::new();
+            loop {
+                tokio::select! {
+                    changed = stop_rx.changed() => {
+                        if changed.is_ok() && *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        samples.push(fetch_progress_poll(&client, &endpoint).await);
+                    }
+                }
+            }
+            samples.push(fetch_progress_poll(&client, &endpoint).await);
+            samples
+        });
+        Some(Self {
+            stop,
+            handle,
+            clear_error,
+        })
+    }
+
+    async fn finish(self) -> ProgressCaseSummary {
+        let _ = self.stop.send(true);
+        let polls = self.handle.await.unwrap_or_else(|err| {
+            vec![ProgressPoll::Error(format!(
+                "progress poll task failed: {err}"
+            ))]
+        });
+        summarize_progress_polls(polls, self.clear_error)
+    }
+}
+
+async fn finish_progress_collector(
+    collector: Option<ProgressCaseCollector>,
+) -> Option<ProgressCaseSummary> {
+    match collector {
+        Some(collector) => Some(collector.finish().await),
+        None => None,
+    }
+}
+
+enum ProgressPoll {
+    Snapshot(serde_json::Value),
+    Error(String),
+}
+
+async fn fetch_progress_poll(client: &reqwest::Client, endpoint: &str) -> ProgressPoll {
+    match client.get(endpoint).send().await {
+        Ok(response) if response.status().is_success() => match response.json().await {
+            Ok(value) => ProgressPoll::Snapshot(value),
+            Err(err) => ProgressPoll::Error(format!("progress JSON parse failed: {err}")),
+        },
+        Ok(response) => {
+            ProgressPoll::Error(format!("progress snapshot returned {}", response.status()))
+        }
+        Err(err) => ProgressPoll::Error(format!("progress snapshot failed: {err}")),
+    }
+}
+
+fn summarize_progress_polls(
+    polls: Vec<ProgressPoll>,
+    clear_error: Option<String>,
+) -> ProgressCaseSummary {
+    let mut snapshot_count = 0usize;
+    let mut active_count_max = 0usize;
+    let mut event_count_max = 0usize;
+    let mut phase_counts = BTreeMap::<String, usize>::new();
+    let mut status_counts = BTreeMap::<String, usize>::new();
+    let mut poll_errors = Vec::new();
+    let mut last_snapshot = None;
+
+    if let Some(error) = clear_error {
+        poll_errors.push(error);
+    }
+
+    for poll in polls {
+        match poll {
+            ProgressPoll::Snapshot(snapshot) => {
+                snapshot_count += 1;
+                active_count_max = active_count_max.max(json_usize(&snapshot, "active_count"));
+                let events = snapshot
+                    .get("events")
+                    .and_then(|events| events.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                event_count_max = event_count_max.max(events.len());
+                for event in &events {
+                    if let Some(phase) = event.get("phase").and_then(|phase| phase.as_str()) {
+                        *phase_counts.entry(phase.to_string()).or_default() += 1;
+                    }
+                    if let Some(status) = event.get("status").and_then(|status| status.as_str()) {
+                        *status_counts.entry(status.to_string()).or_default() += 1;
+                    }
+                }
+                last_snapshot = Some(snapshot);
+            }
+            ProgressPoll::Error(error) => {
+                if poll_errors.len() < 8 {
+                    poll_errors.push(error);
+                }
+            }
+        }
+    }
+
+    let final_events = last_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.get("events"))
+        .and_then(|events| events.as_array())
+        .map(|events| {
+            events
+                .iter()
+                .rev()
+                .take(16)
+                .map(progress_event_summary)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    let final_event_count = last_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.get("events"))
+        .and_then(|events| events.as_array())
+        .map(Vec::len)
+        .unwrap_or(0);
+
+    ProgressCaseSummary {
+        snapshot_count,
+        poll_error_count: poll_errors.len(),
+        poll_errors,
+        active_count_max,
+        event_count_max,
+        final_event_count,
+        phases: progress_counts(phase_counts),
+        statuses: progress_counts(status_counts),
+        final_events,
+    }
+}
+
+fn progress_counts(counts: BTreeMap<String, usize>) -> Vec<ProgressCount> {
+    let mut counts = counts
+        .into_iter()
+        .map(|(name, count)| ProgressCount { name, count })
+        .collect::<Vec<_>>();
+    counts.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    counts
+}
+
+fn progress_event_summary(event: &serde_json::Value) -> ProgressEventSummary {
+    ProgressEventSummary {
+        id: event
+            .get("id")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        parent_id: event.get("parent_id").and_then(|value| value.as_u64()),
+        kind: json_string(event, "kind"),
+        status: json_string(event, "status"),
+        path: json_string(event, "path"),
+        phase: json_string(event, "phase"),
+        source: event
+            .get("source")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        message: json_string(event, "message"),
+        bytes_loaded: event
+            .get("bytes_loaded")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        bytes_total: event.get("bytes_total").and_then(|value| value.as_u64()),
+        blocks_loaded: event
+            .get("blocks_loaded")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        providers_found: event
+            .get("providers_found")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        retry_count: event
+            .get("retry_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        last_error_code: event
+            .get("last_error_code")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    }
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn json_usize(value: &serde_json::Value, key: &str) -> usize {
+    value
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
+        .try_into()
+        .unwrap_or(usize::MAX)
 }
 
 async fn fetch_response(
@@ -501,6 +833,7 @@ async fn fetch_response(
     url: &str,
     method: &str,
     range: Option<&str>,
+    progress: Option<&RequestProgressHeaders>,
 ) -> std::result::Result<FetchResponse, String> {
     let started = Instant::now();
     let response = match method {
@@ -509,9 +842,18 @@ async fn fetch_response(
             if let Some(range) = range {
                 request = request.header(RANGE, range);
             }
+            if let Some(progress) = progress {
+                request = progress.apply(request);
+            }
             request.send().await
         }
-        "HEAD" => client.head(url).send().await,
+        "HEAD" => {
+            let mut request = client.head(url);
+            if let Some(progress) = progress {
+                request = progress.apply(request);
+            }
+            request.send().await
+        }
         other => {
             return Err(format!(
                 "unsupported method {other}; only GET and HEAD are supported"
@@ -555,6 +897,7 @@ async fn run_page_crawl(
     page_body: &[u8],
     config: &CrawlConfig,
     asset_concurrency: usize,
+    root_progress: Option<RequestProgressHeaders>,
 ) -> (AssetSummary, Vec<AssetResult>, Vec<String>) {
     let max_assets = config.max_assets.unwrap_or(32);
     let same_origin_only = config.same_origin_only.unwrap_or(true);
@@ -579,6 +922,7 @@ async fn run_page_crawl(
         discovery.assets.clone(),
         asset_concurrency,
         config.asset_max_bytes.unwrap_or(2_000_000),
+        root_progress.as_ref(),
     )
     .await;
 
@@ -596,6 +940,7 @@ async fn run_page_crawl(
                 css_assets,
                 asset_concurrency,
                 config.asset_max_bytes.unwrap_or(2_000_000),
+                root_progress.as_ref(),
             )
             .await;
             fetched.append(&mut css_fetched);
@@ -642,15 +987,17 @@ async fn fetch_assets(
     assets: Vec<DiscoveredAsset>,
     concurrency: usize,
     max_bytes: usize,
+    root_progress: Option<&RequestProgressHeaders>,
 ) -> Vec<FetchedAsset> {
     let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let mut tasks = Vec::new();
     for asset in assets {
         let client = client.clone();
         let semaphore = semaphore.clone();
+        let progress = root_progress.map(RequestProgressHeaders::child);
         tasks.push(tokio::spawn(async move {
             let _permit = semaphore.acquire_owned().await.ok();
-            fetch_asset(&client, asset, max_bytes).await
+            fetch_asset(&client, asset, max_bytes, progress.as_ref()).await
         }));
     }
 
@@ -667,10 +1014,11 @@ async fn fetch_asset(
     client: &reqwest::Client,
     asset: DiscoveredAsset,
     max_bytes: usize,
+    progress: Option<&RequestProgressHeaders>,
 ) -> FetchedAsset {
     let range = range_for_kind(asset.kind);
     let started_url = asset.url.to_string();
-    let response = fetch_response(client, &started_url, "GET", range).await;
+    let response = fetch_response(client, &started_url, "GET", range, progress).await;
     let mut failures = Vec::new();
     let mut result = AssetResult {
         kind: asset.kind,
@@ -1349,6 +1697,9 @@ impl SpawnedGateway {
         if let Some(trace_filter) = &args.trace_filter {
             command.arg("--trace-filter").arg(trace_filter);
         }
+        if args.collect_progress {
+            command.arg("--progress");
+        }
         if let Some(gateway_db) = &args.gateway_db {
             command.arg("--db").arg(gateway_db);
         }
@@ -1463,6 +1814,7 @@ struct RunReport {
     warmup_runs: usize,
     fresh_gateway_per_run: bool,
     asset_concurrency: usize,
+    collect_progress: bool,
     gateway_db: Option<String>,
     trace_output: Option<String>,
     trace_summary: Option<TraceSummary>,
@@ -1838,12 +2190,18 @@ struct CaseResult {
     body_preview: String,
     asset_summary: Option<AssetSummary>,
     assets: Vec<AssetResult>,
+    progress: Option<ProgressCaseSummary>,
     passed: bool,
     failures: Vec<String>,
 }
 
 impl CaseResult {
-    fn failed(entry: &CorpusEntry, url: String, failures: Vec<String>) -> Self {
+    fn failed(
+        entry: &CorpusEntry,
+        url: String,
+        failures: Vec<String>,
+        progress: Option<ProgressCaseSummary>,
+    ) -> Self {
         Self {
             id: entry.id.clone(),
             description: entry.description.clone(),
@@ -1858,10 +2216,48 @@ impl CaseResult {
             body_preview: String::new(),
             asset_summary: None,
             assets: Vec::new(),
+            progress,
             passed: false,
             failures,
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct ProgressCaseSummary {
+    snapshot_count: usize,
+    poll_error_count: usize,
+    poll_errors: Vec<String>,
+    active_count_max: usize,
+    event_count_max: usize,
+    final_event_count: usize,
+    phases: Vec<ProgressCount>,
+    statuses: Vec<ProgressCount>,
+    final_events: Vec<ProgressEventSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProgressCount {
+    name: String,
+    count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ProgressEventSummary {
+    id: u64,
+    parent_id: Option<u64>,
+    kind: String,
+    status: String,
+    path: String,
+    phase: String,
+    source: Option<String>,
+    message: String,
+    bytes_loaded: u64,
+    bytes_total: Option<u64>,
+    blocks_loaded: u64,
+    providers_found: u64,
+    retry_count: u64,
+    last_error_code: Option<String>,
 }
 
 struct FetchResponse {

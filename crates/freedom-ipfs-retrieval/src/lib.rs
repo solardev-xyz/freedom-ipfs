@@ -1,7 +1,7 @@
 use cid::Cid;
 use freedom_ipfs_core::{
-    verify_block, Block, BlockProvider, CoreError, Result as CoreResult, CODEC_DAG_PB,
-    DEFAULT_MAX_BLOCK_SIZE, HASH_IDENTITY, HASH_SHA2_256,
+    verify_block, Block, BlockProvider, CoreError, ProgressTarget, ProgressTracker, ProgressUpdate,
+    Result as CoreResult, CODEC_DAG_PB, DEFAULT_MAX_BLOCK_SIZE, HASH_IDENTITY, HASH_SHA2_256,
 };
 use freedom_ipfs_namesys::{CloudflareDohResolver, DnsTxtResolver};
 use freedom_ipfs_routing::{Provider, ProviderRoutingClient};
@@ -171,6 +171,14 @@ impl HttpRetriever {
     }
 
     pub async fn fetch_block_with_source(&self, cid: &Cid) -> Result<(Block, RetrievalSource)> {
+        self.fetch_block_with_source_progress(cid, None).await
+    }
+
+    async fn fetch_block_with_source_progress(
+        &self,
+        cid: &Cid,
+        progress: Option<ProgressTarget>,
+    ) -> Result<(Block, RetrievalSource)> {
         let fetch_started = Instant::now();
         let cache_started = Instant::now();
         if let Some(block) = self.store.get(cid)? {
@@ -186,6 +194,15 @@ impl HttpRetriever {
                 source = "cache",
                 elapsed_ms = fetch_started.elapsed().as_millis()
             );
+            if let Some(progress) = &progress {
+                progress.update(ProgressUpdate {
+                    phase: Some("cache_hit".to_string()),
+                    source: Some("cache".to_string()),
+                    bytes_loaded: Some(block.data().len() as u64),
+                    blocks_loaded: Some(1),
+                    ..ProgressUpdate::default()
+                });
+            }
             return Ok((block, RetrievalSource::Cache));
         }
         tracing::info!(
@@ -194,8 +211,17 @@ impl HttpRetriever {
             cache_hit = false,
             elapsed_ms = cache_started.elapsed().as_millis()
         );
+        if let Some(progress) = &progress {
+            progress.update(ProgressUpdate {
+                phase: Some("cache_miss".to_string()),
+                source: Some("cache".to_string()),
+                ..ProgressUpdate::default()
+            });
+        }
 
-        let (block, source) = self.fetch_block_uncached_coalesced(*cid).await?;
+        let (block, source) = self
+            .fetch_block_uncached_coalesced(*cid, progress.clone())
+            .await?;
         tracing::info!(
             phase = "block_fetch_total",
             cid = %cid,
@@ -205,7 +231,11 @@ impl HttpRetriever {
         Ok((block, source))
     }
 
-    async fn fetch_block_uncached_coalesced(&self, cid: Cid) -> Result<(Block, RetrievalSource)> {
+    async fn fetch_block_uncached_coalesced(
+        &self,
+        cid: Cid,
+        progress: Option<ProgressTarget>,
+    ) -> Result<(Block, RetrievalSource)> {
         let wait_started = Instant::now();
         let mut inflight = self.inflight.lock().await;
         if let Some(fetch) = inflight.get(&cid).cloned() {
@@ -222,6 +252,14 @@ impl HttpRetriever {
                     shared_block_fetch_result(result)
                 }
                 _ = tokio::time::sleep(BLOCK_FETCH_COALESCE_HEDGE_AFTER) => {
+                    if let Some(progress) = &progress {
+                        progress.update(ProgressUpdate {
+                            phase: Some("retrying".to_string()),
+                            message: Some("Retrying slow coalesced block fetch".to_string()),
+                            retry_count: Some(1),
+                            ..ProgressUpdate::default()
+                        });
+                    }
                     tracing::info!(
                         phase = "block_fetch_coalesced",
                         cid = %cid,
@@ -229,7 +267,7 @@ impl HttpRetriever {
                         hedged = true,
                         elapsed_ms = wait_started.elapsed().as_millis()
                     );
-                    self.fetch_block_uncached_with_source(&cid).await
+                    self.fetch_block_uncached_with_source(&cid, progress.clone()).await
                 }
             };
         }
@@ -244,14 +282,14 @@ impl HttpRetriever {
                 inflight_count = MAX_INFLIGHT_BLOCK_FETCHES,
                 elapsed_ms = wait_started.elapsed().as_millis()
             );
-            return self.fetch_block_uncached_with_source(&cid).await;
+            return self.fetch_block_uncached_with_source(&cid, progress).await;
         }
 
         let retriever = self.clone();
         let fetch = async move {
             Arc::new(
                 retriever
-                    .fetch_block_uncached_with_source(&cid)
+                    .fetch_block_uncached_with_source(&cid, progress)
                     .await
                     .map_err(|err| err.to_string()),
             )
@@ -280,6 +318,7 @@ impl HttpRetriever {
     async fn fetch_block_uncached_with_source(
         &self,
         cid: &Cid,
+        progress: Option<ProgressTarget>,
     ) -> Result<(Block, RetrievalSource)> {
         let provider_cache_started = Instant::now();
         let providers = match self.cached_providers(cid)? {
@@ -291,6 +330,13 @@ impl HttpRetriever {
                     provider_count = providers.len(),
                     elapsed_ms = provider_cache_started.elapsed().as_millis()
                 );
+                if let Some(progress) = &progress {
+                    progress.update(provider_progress_update(
+                        "providers_found",
+                        "cache",
+                        &providers,
+                    ));
+                }
                 providers
             }
             None => {
@@ -300,6 +346,13 @@ impl HttpRetriever {
                     cache_hit = false,
                     elapsed_ms = provider_cache_started.elapsed().as_millis()
                 );
+                if let Some(progress) = &progress {
+                    progress.update(ProgressUpdate {
+                        phase: Some("provider_lookup".to_string()),
+                        source: Some("delegated_routing".to_string()),
+                        ..ProgressUpdate::default()
+                    });
+                }
                 let routing_started = Instant::now();
                 let provider_lookup = self.routing.providers(cid);
                 tokio::pin!(provider_lookup);
@@ -339,16 +392,36 @@ impl HttpRetriever {
                     provider_count = providers.len(),
                     elapsed_ms = routing_started.elapsed().as_millis()
                 );
+                if let Some(progress) = &progress {
+                    progress.update(provider_progress_update(
+                        "providers_found",
+                        "delegated_routing",
+                        &providers,
+                    ));
+                }
                 self.cache_providers(cid, &providers)?;
                 providers
             }
         };
-        match self.fetch_from_providers_with_source(cid, &providers).await {
+        match self
+            .fetch_from_providers_with_source_progress(cid, &providers, progress.clone(), 0)
+            .await
+        {
             Ok((block, source)) => Ok((block, source)),
             Err(err) if should_refresh_providers_after_failure(&err) => {
                 let timeout_peer_count = bitswap_timeout_peers(&err).len();
                 let connection_timeout_peer_count = bitswap_connection_timeout_peers(&err).len();
                 let request_timeout = is_bitswap_request_timeout(&err);
+                if let Some(progress) = &progress {
+                    progress.update(ProgressUpdate {
+                        phase: Some("retrying".to_string()),
+                        message: Some("Retrying slow provider".to_string()),
+                        retry_count: Some(1),
+                        last_error_code: Some(Some("provider_refresh_after_failure".to_string())),
+                        last_error_message: Some(Some(err.to_string())),
+                        ..ProgressUpdate::default()
+                    });
+                }
                 tracing::info!(
                     phase = if timeout_peer_count > 0 || request_timeout {
                         "provider_refresh_after_timeout"
@@ -374,6 +447,14 @@ impl HttpRetriever {
                         providers
                     }
                     Err(refresh_err) => {
+                        if let Some(progress) = &progress {
+                            progress.update(ProgressUpdate {
+                                phase: Some("retrying".to_string()),
+                                last_error_code: Some(Some("provider_refresh_failed".to_string())),
+                                last_error_message: Some(Some(refresh_err.to_string())),
+                                ..ProgressUpdate::default()
+                            });
+                        }
                         tracing::info!(
                             phase = "provider_lookup",
                             cid = %cid,
@@ -389,6 +470,13 @@ impl HttpRetriever {
                         return Err(err);
                     }
                 };
+                if let Some(progress) = &progress {
+                    progress.update(provider_progress_update(
+                        "providers_found",
+                        "delegated_routing",
+                        &refreshed,
+                    ));
+                }
                 tracing::info!(
                     phase = "retry_provider_count",
                     cid = %cid,
@@ -413,7 +501,15 @@ impl HttpRetriever {
                             request_timeout,
                             initial_error = %err
                         );
-                        return match self.fetch_from_providers_with_source(cid, &providers).await {
+                        return match self
+                            .fetch_from_providers_with_source_progress(
+                                cid,
+                                &providers,
+                                progress,
+                                1,
+                            )
+                            .await
+                        {
                             Ok((block, source)) => Ok((block, source)),
                             Err(retry_err) => Err(RetrievalError::Bitswap(format!(
                                 "initial provider retrieval failed ({err}); same-provider retry after timeout failed ({retry_err})"
@@ -427,7 +523,15 @@ impl HttpRetriever {
                             provider_count = providers.len(),
                             initial_error = %err
                         );
-                        return match self.fetch_from_providers_with_source(cid, &providers).await {
+                        return match self
+                            .fetch_from_providers_with_source_progress(
+                                cid,
+                                &providers,
+                                progress,
+                                1,
+                            )
+                            .await
+                        {
                             Ok((block, source)) => Ok((block, source)),
                             Err(retry_err) => Err(RetrievalError::Bitswap(format!(
                                 "initial provider retrieval failed ({err}); same-provider retry failed ({retry_err})"
@@ -437,7 +541,10 @@ impl HttpRetriever {
                     return Err(err);
                 }
                 self.cache_providers(cid, &refreshed)?;
-                match self.fetch_from_providers_with_source(cid, &refreshed).await {
+                match self
+                    .fetch_from_providers_with_source_progress(cid, &refreshed, progress, 1)
+                    .await
+                {
                     Ok((block, source)) => Ok((block, source)),
                     Err(refresh_err) => Err(RetrievalError::Bitswap(format!(
                         "initial provider retrieval failed ({err}); refreshed provider retrieval failed ({refresh_err})"
@@ -459,6 +566,17 @@ impl HttpRetriever {
         cid: &Cid,
         providers: &[Provider],
     ) -> Result<(Block, RetrievalSource)> {
+        self.fetch_from_providers_with_source_progress(cid, providers, None, 0)
+            .await
+    }
+
+    async fn fetch_from_providers_with_source_progress(
+        &self,
+        cid: &Cid,
+        providers: &[Provider],
+        progress: Option<ProgressTarget>,
+        retry_count: u64,
+    ) -> Result<(Block, RetrievalSource)> {
         tracing::info!(
             phase = "provider_fetch_start",
             cid = %cid,
@@ -469,6 +587,14 @@ impl HttpRetriever {
                 if self.store.is_bad_provider(base.as_str())? {
                     tracing::debug!(provider = %base, "skipping temporarily bad HTTP provider");
                     continue;
+                }
+                if let Some(progress) = &progress {
+                    progress.update(ProgressUpdate {
+                        phase: Some("fetching_http_provider".to_string()),
+                        source: Some("http_provider".to_string()),
+                        retry_count: Some(retry_count),
+                        ..ProgressUpdate::default()
+                    });
                 }
                 let started = Instant::now();
                 match self.fetch_from_http_provider(cid, base).await {
@@ -483,6 +609,18 @@ impl HttpRetriever {
                         return Ok((block, RetrievalSource::HttpProvider));
                     }
                     Err(err) => {
+                        if let Some(progress) = &progress {
+                            progress.update(ProgressUpdate {
+                                phase: Some("retrying".to_string()),
+                                message: Some("Retrying slow provider".to_string()),
+                                retry_count: Some(retry_count),
+                                last_error_code: Some(Some(
+                                    "http_provider_fetch_failed".to_string(),
+                                )),
+                                last_error_message: Some(Some(err.to_string())),
+                                ..ProgressUpdate::default()
+                            });
+                        }
                         tracing::info!(
                             phase = "http_provider_fetch",
                             cid = %cid,
@@ -500,6 +638,14 @@ impl HttpRetriever {
                     }
                 }
             }
+        }
+        if let Some(progress) = &progress {
+            progress.update(ProgressUpdate {
+                phase: Some("fetching_bitswap".to_string()),
+                source: Some("bitswap".to_string()),
+                retry_count: Some(retry_count),
+                ..ProgressUpdate::default()
+            });
         }
         match self.fetch_from_bitswap_providers(cid, providers).await {
             Ok(block) => Ok((block, RetrievalSource::Bitswap)),
@@ -905,6 +1051,25 @@ fn retrieval_source_label(source: RetrievalSource) -> &'static str {
     }
 }
 
+fn provider_progress_update(
+    phase: &'static str,
+    source: &'static str,
+    providers: &[Provider],
+) -> ProgressUpdate {
+    ProgressUpdate {
+        phase: Some(phase.to_string()),
+        source: Some(source.to_string()),
+        providers_found: Some(providers.len() as u64),
+        candidate_peers: Some(
+            providers
+                .iter()
+                .filter(|provider| provider.id.is_some())
+                .count() as u64,
+        ),
+        ..ProgressUpdate::default()
+    }
+}
+
 fn shared_block_fetch_result(
     result: Arc<SharedBlockFetchResult>,
 ) -> Result<(Block, RetrievalSource)> {
@@ -921,6 +1086,7 @@ pub struct FetchingBlockProvider {
     store: SqliteBlockStore,
     retriever: HttpRetriever,
     stats: Arc<RetrievalStatsInner>,
+    progress: Option<ProgressTracker>,
 }
 
 impl FetchingBlockProvider {
@@ -930,7 +1096,13 @@ impl FetchingBlockProvider {
             store,
             retriever,
             stats: Arc::new(RetrievalStatsInner::default()),
+            progress: None,
         }
+    }
+
+    pub fn with_progress(mut self, progress: ProgressTracker) -> Self {
+        self.progress = Some(progress);
+        self
     }
 
     pub fn stats(&self) -> RetrievalStats {
@@ -940,34 +1112,81 @@ impl FetchingBlockProvider {
 
 impl BlockProvider for FetchingBlockProvider {
     fn get_block(&self, cid: &Cid) -> CoreResult<Option<Block>> {
+        let progress = self.progress.as_ref().map(|tracker| {
+            let target = tracker.start("block_fetch", format!("/ipfs/{cid}"), None);
+            target.root(cid.to_string());
+            target.source_phase("checking_cache", "cache");
+            target
+        });
         if let Some(block) = self
             .store
             .get(cid)
             .map_err(|err| CoreError::Storage(err.to_string()))?
         {
             self.stats.record(RetrievalSource::Cache);
+            if let Some(progress) = &progress {
+                progress.update(ProgressUpdate {
+                    phase: Some("cache_hit".to_string()),
+                    source: Some("cache".to_string()),
+                    bytes_loaded: Some(block.data().len() as u64),
+                    blocks_loaded: Some(1),
+                    ..ProgressUpdate::default()
+                });
+                progress.complete();
+            }
             return Ok(Some(block));
         }
 
+        if let Some(progress) = &progress {
+            progress.phase("provider_lookup");
+        }
         let fetched = match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(self.retriever.fetch_block_with_source(cid))
+                handle.block_on(
+                    self.retriever
+                        .fetch_block_with_source_progress(cid, progress.clone()),
+                )
             }),
             Err(_) => {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|err| CoreError::Storage(err.to_string()))?;
-                runtime.block_on(self.retriever.fetch_block_with_source(cid))
+                runtime.block_on(
+                    self.retriever
+                        .fetch_block_with_source_progress(cid, progress.clone()),
+                )
             }
         };
 
         match fetched {
             Ok((block, source)) => {
                 self.stats.record(source);
+                if let Some(progress) = &progress {
+                    progress.update(ProgressUpdate {
+                        phase: Some(
+                            match source {
+                                RetrievalSource::Cache => "cache_hit",
+                                RetrievalSource::HttpProvider => "fetching_http_provider",
+                                RetrievalSource::Bitswap => "fetching_bitswap",
+                            }
+                            .to_string(),
+                        ),
+                        source: Some(retrieval_source_label(source).to_string()),
+                        bytes_loaded: Some(block.data().len() as u64),
+                        blocks_loaded: Some(1),
+                        ..ProgressUpdate::default()
+                    });
+                    progress.complete();
+                }
                 Ok(Some(block))
             }
-            Err(err) => Err(CoreError::Storage(err.to_string())),
+            Err(err) => {
+                if let Some(progress) = &progress {
+                    progress.fail("block_fetch_failed", err.to_string());
+                }
+                Err(CoreError::Storage(err.to_string()))
+            }
         }
     }
 
@@ -3085,6 +3304,51 @@ mod bitswap_tests {
         }
         assert_eq!(requests.load(Ordering::Relaxed), 1);
         assert_eq!(store.get(&cid).unwrap().unwrap().data(), data);
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetching_provider_records_progress_reports_provider_and_transport() {
+        let data = b"progress provider block";
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
+        let requests = Arc::new(AtomicU64::new(0));
+        let (addr, server_task) =
+            spawn_counting_http_provider(data.to_vec(), Duration::ZERO, requests.clone()).await;
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        store
+            .put_provider_records(
+                &cid,
+                &[CachedProviderRecord {
+                    id: Some("12D3KooWExample".to_string()),
+                    addrs: vec![format!("/ip4/{}/tcp/{}/http", addr.ip(), addr.port())],
+                }],
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        let progress = ProgressTracker::default();
+        let provider = FetchingBlockProvider::new(
+            store,
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+        )
+        .with_progress(progress.clone());
+
+        let block = provider.get_block(&cid).unwrap().unwrap();
+        assert_eq!(block.data(), data);
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+
+        let snapshot: serde_json::Value = serde_json::from_str(&progress.snapshot_json()).unwrap();
+        let events = snapshot["events"].as_array().unwrap();
+        let event = events
+            .iter()
+            .find(|event| event["kind"] == "block_fetch")
+            .expect("block fetch progress event");
+        assert_eq!(event["status"], "completed");
+        assert_eq!(event["phase"], "completed");
+        assert_eq!(event["source"], "http_provider");
+        assert_eq!(event["providers_found"], 1);
+        assert_eq!(event["candidate_peers"], 1);
+        assert_eq!(event["bytes_loaded"], data.len() as u64);
+        assert_eq!(event["blocks_loaded"], 1);
         server_task.abort();
     }
 

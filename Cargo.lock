@@ -899,6 +899,8 @@ dependencies = [
  "data-encoding",
  "multihash",
  "multihash-codetable",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "unsigned-varint 0.8.0",
 ]
@@ -944,6 +946,7 @@ dependencies = [
  "freedom-ipfs-routing",
  "freedom-ipfs-store",
  "reqwest",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use axum::Router;
 use clap::{Parser, ValueEnum};
-use freedom_ipfs_core::parse_cid;
+use freedom_ipfs_core::{parse_cid, ProgressTracker};
 use freedom_ipfs_gateway::{
-    router_with_provider_and_name_resolver_config, router_with_provider_config, GatewayConfig,
-    DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
+    router_with_provider_and_name_resolver_config,
+    router_with_provider_and_name_resolver_config_progress, router_with_provider_config,
+    router_with_provider_config_progress, GatewayConfig, DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
 };
 use freedom_ipfs_namesys::{
     CachedNameResolver, CloudflareDohResolver, DefaultNameResolver, DelegatedIpnsResolver,
@@ -56,6 +57,9 @@ struct Args {
     trace_output: Option<PathBuf>,
     #[arg(long)]
     trace_filter: Option<String>,
+    /// Enable the local progress snapshot endpoint at /_freedom/progress.
+    #[arg(long)]
+    progress: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -95,6 +99,7 @@ async fn main() -> Result<()> {
     }
 
     let gateway_config = GatewayConfig::new(args.max_concurrent_requests);
+    let progress = args.progress.then(ProgressTracker::default);
     let router = if start_online_gateway {
         let delegated_routers = args.delegated_router.clone();
         let delegated_router_endpoints = delegated_router_endpoints(&delegated_routers);
@@ -108,16 +113,30 @@ async fn main() -> Result<()> {
             RoutingMode::LightDht => ProviderRoutingClient::from(dht.clone()),
             RoutingMode::Offline => ProviderRoutingClient::Offline,
         };
-        let provider = FetchingBlockProvider::new(store, routing);
+        let mut provider = FetchingBlockProvider::new(store, routing);
+        if let Some(progress) = &progress {
+            provider = provider.with_progress(progress.clone());
+        }
         let name_resolver = CachedNameResolver::new(DefaultNameResolver::new(
             CloudflareDohResolver::default(),
             ipns_resolver(args.routing_mode, delegated_router_endpoints, dht),
         ));
-        router_with_provider_and_name_resolver_config(
-            Arc::new(provider),
-            Arc::new(name_resolver),
-            gateway_config,
-        )
+        if let Some(progress) = progress.clone() {
+            router_with_provider_and_name_resolver_config_progress(
+                Arc::new(provider),
+                Arc::new(name_resolver),
+                gateway_config,
+                progress,
+            )
+        } else {
+            router_with_provider_and_name_resolver_config(
+                Arc::new(provider),
+                Arc::new(name_resolver),
+                gateway_config,
+            )
+        }
+    } else if let Some(progress) = progress {
+        router_with_provider_config_progress(Arc::new(store), gateway_config, progress)
     } else {
         router_with_provider_config(Arc::new(store), gateway_config)
     };

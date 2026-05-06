@@ -10,6 +10,8 @@ repository.workspace = true
 cid.workspace = true
 multihash.workspace = true
 multihash-codetable.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 unsigned-varint.workspace = true
 

@@ -71,7 +71,8 @@ Early implementation. Current code supports:
 - CIDv0/CIDv1 DAG-PB aliases share block-cache and stream-retention state,
 - CAR import/export for tests, diagnostics, cache warmup, and empty raw-block fixtures,
 - mobile lifecycle hooks for background/foreground, low-memory cache trimming, and network-change provider cache hygiene,
-- an iOS staticlib/XCFramework build skeleton with staged C headers/module map, exported-symbol verification, a simulator Swift gateway smoke, a generated UIKit/WebKit app-rendering smoke in the verifier, and a Swift wrapper for persistent-cache node creation, cache import/export, cache trimming, retrieval/routing counters and deltas, a combined diagnostics snapshot and delta helper, active preload count, routing-mode selection and restart including `.offline`, multi-router configuration, local gateway URL mapping, lifecycle hooks, preload/cancel for `/ipfs`, `/ipns`, `ipfs://`, `ipns://`, and bare-CID inputs, and offline/online gateway start.
+- a bounded mobile progress/event snapshot API for gateway requests, block fetches, and preloads, plus opt-in gateway/harness progress collection for live diagnostics,
+- an iOS staticlib/XCFramework build skeleton with staged C headers/module map, exported-symbol verification, a simulator Swift gateway smoke, a generated UIKit/WebKit app-rendering smoke in the verifier, and a Swift wrapper for persistent-cache node creation, cache import/export, cache trimming, retrieval/routing counters and deltas, a combined diagnostics snapshot and delta helper, progress snapshot polling/clear, active preload count, routing-mode selection and restart including `.offline`, multi-router configuration, local gateway URL mapping, lifecycle hooks, preload/cancel for `/ipfs`, `/ipns`, `ipfs://`, `ipns://`, and bare-CID inputs, and offline/online gateway start.
 
 Still incomplete: resource profiling on device, network path integration in the host app, and hardened DHT-only retrieval for sites whose DHT providers are slow or stale. See [docs/completion-audit.md](docs/completion-audit.md) for the current prompt-to-artifact checklist and [docs/ios-device-verification.md](docs/ios-device-verification.md) for the remaining iPhone/app verification gate.
 
@@ -105,6 +106,15 @@ Limit local-gateway request concurrency for mobile resource testing:
 ```bash
 cargo run -p freedom-ipfs-gateway -- --online --max-concurrent-requests 4
 ```
+
+Enable local progress snapshots for harness/debug runs:
+
+```bash
+cargo run -p freedom-ipfs-gateway -- --online --progress
+cargo run -p mobile-web-harness -- --gateway-bin target/debug/freedom-ipfs-gateway --collect-progress --case daicowtf-page-assets
+```
+
+See [docs/mobile-progress-api.md](docs/mobile-progress-api.md) for the mobile FFI JSON shape and polling guidance.
 
 Tune light-DHT fallback budgets when testing mobile resource behavior:
 

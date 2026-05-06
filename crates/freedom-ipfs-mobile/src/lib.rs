@@ -1,4 +1,4 @@
-use freedom_ipfs_core::parse_cid;
+use freedom_ipfs_core::{parse_cid, ProgressTracker, ProgressUpdate};
 use freedom_ipfs_namesys::{
     CachedNameResolver, CloudflareDohResolver, DefaultNameResolver, DelegatedIpnsResolver,
     FallbackIpnsResolver, IpnsResolver,
@@ -45,6 +45,7 @@ pub struct FreedomIpfsNode {
     retrieval_stats_provider: Mutex<Option<FetchingBlockProvider>>,
     routing_stats: Mutex<Option<RoutingStatsHandle>>,
     lifecycle_state: Mutex<LifecycleState>,
+    progress: ProgressTracker,
     next_preload_id: AtomicU64,
     preload_tasks: Mutex<HashMap<u64, JoinHandle<()>>>,
 }
@@ -165,6 +166,7 @@ fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
         retrieval_stats_provider: Mutex::new(None),
         routing_stats: Mutex::new(None),
         lifecycle_state: Mutex::new(LifecycleState::Foreground),
+        progress: ProgressTracker::default(),
         next_preload_id: AtomicU64::new(1),
         preload_tasks: Mutex::new(HashMap::new()),
     }))
@@ -373,6 +375,36 @@ pub unsafe extern "C" fn freedom_ipfs_node_diagnostics(
 
 /// # Safety
 ///
+/// `ptr` must be a valid node pointer. The returned string must be released
+/// with `freedom_ipfs_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_node_progress_snapshot_json(
+    ptr: *mut FreedomIpfsNode,
+) -> *mut c_char {
+    if ptr.is_null() {
+        return ptr::null_mut();
+    }
+    let node = &*ptr;
+    match CString::new(node.progress.snapshot_json()) {
+        Ok(json) => json.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// # Safety
+///
+/// `ptr` must be a valid node pointer.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_node_progress_clear(ptr: *mut FreedomIpfsNode) {
+    if ptr.is_null() {
+        return;
+    }
+    let node = &*ptr;
+    node.progress.clear();
+}
+
+/// # Safety
+///
 /// `ptr` must be a valid node pointer.
 #[no_mangle]
 pub unsafe extern "C" fn freedom_ipfs_node_clear_cache(ptr: *mut FreedomIpfsNode) -> bool {
@@ -491,7 +523,12 @@ pub unsafe extern "C" fn freedom_ipfs_node_start_gateway(
     };
 
     let store = node.store.clone();
-    if start_gateway_with_router(node, addr, freedom_ipfs_gateway::router(store)) {
+    let router = freedom_ipfs_gateway::router_with_provider_config_progress(
+        Arc::new(store),
+        freedom_ipfs_gateway::GatewayConfig::default(),
+        node.progress.clone(),
+    );
+    if start_gateway_with_router(node, addr, router) {
         clear_online_stats(node);
         true
     } else {
@@ -672,10 +709,12 @@ unsafe fn gateway_router_for_routing_mode(
         let provider = FetchingBlockProvider::new(
             node.store.clone(),
             ProviderRoutingClient::Offline.with_stats(routing_stats.clone()),
-        );
-        let router = freedom_ipfs_gateway::router_with_provider_config(
+        )
+        .with_progress(node.progress.clone());
+        let router = freedom_ipfs_gateway::router_with_provider_config_progress(
             Arc::new(provider.clone()),
             gateway_config,
+            node.progress.clone(),
         );
         return Some(OnlineGatewayParts {
             addr,
@@ -704,15 +743,17 @@ unsafe fn gateway_router_for_routing_mode(
     };
     let routing_stats = RoutingStatsHandle::default();
     let routing = routing.with_stats(routing_stats.clone());
-    let provider = FetchingBlockProvider::new(node.store.clone(), routing);
+    let provider = FetchingBlockProvider::new(node.store.clone(), routing)
+        .with_progress(node.progress.clone());
     let name_resolver = CachedNameResolver::new(DefaultNameResolver::new(
         CloudflareDohResolver::default(),
         ipns_resolver(routing_mode, delegated_router_endpoints, dht),
     ));
-    let router = freedom_ipfs_gateway::router_with_provider_and_name_resolver_config(
+    let router = freedom_ipfs_gateway::router_with_provider_and_name_resolver_config_progress(
         Arc::new(provider.clone()),
         Arc::new(name_resolver),
         gateway_config,
+        node.progress.clone(),
     );
     Some(OnlineGatewayParts {
         addr,
@@ -870,17 +911,57 @@ pub unsafe extern "C" fn freedom_ipfs_node_preload_path(
 
     let id = node.next_preload_id.fetch_add(1, Ordering::Relaxed);
     let url = format!("http://{addr}{path}");
+    let progress = node
+        .progress
+        .start_with_id(id, "preload", path.clone(), None);
+    progress.phase("queued");
     let task = node.runtime.spawn(async move {
         let Ok(client) = reqwest::Client::builder().timeout(PRELOAD_TIMEOUT).build() else {
+            progress.fail("preload_client_failed", "failed to build HTTP client");
             return;
         };
+        progress.phase("started");
         let Ok(response) = client.get(url).send().await else {
+            progress.fail("preload_request_failed", "failed to send preload request");
             return;
         };
+        let total = response.content_length();
         let Ok(mut response) = response.error_for_status() else {
+            progress.fail("preload_status_failed", "preload returned an HTTP error");
             return;
         };
-        while matches!(response.chunk().await, Ok(Some(_))) {}
+        let mut loaded = 0u64;
+        progress.update(ProgressUpdate {
+            phase: Some("first_byte".to_string()),
+            bytes_total: total,
+            ..ProgressUpdate::default()
+        });
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    loaded = loaded.saturating_add(chunk.len() as u64);
+                    progress.update(ProgressUpdate {
+                        phase: Some("streaming".to_string()),
+                        bytes_loaded: Some(loaded),
+                        bytes_total: total,
+                        ..ProgressUpdate::default()
+                    });
+                }
+                Ok(None) => {
+                    progress.update(ProgressUpdate {
+                        bytes_loaded: Some(loaded),
+                        bytes_total: total,
+                        ..ProgressUpdate::default()
+                    });
+                    progress.complete();
+                    break;
+                }
+                Err(err) => {
+                    progress.fail("preload_stream_failed", err.to_string());
+                    break;
+                }
+            }
+        }
     });
 
     let Ok(mut tasks) = node.preload_tasks.lock() else {
@@ -912,6 +993,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_cancel_preload(
         return false;
     };
     task.abort();
+    node.progress.cancel(task_id);
     true
 }
 
@@ -942,8 +1024,9 @@ fn stop_gateway(node: &FreedomIpfsNode) {
 
 fn stop_preloads(node: &FreedomIpfsNode) {
     if let Ok(mut tasks) = node.preload_tasks.lock() {
-        for (_, task) in tasks.drain() {
+        for (id, task) in tasks.drain() {
             task.abort();
+            node.progress.cancel(id);
         }
     }
 }
@@ -1415,6 +1498,38 @@ mod tests {
     }
 
     #[test]
+    fn progress_snapshot_records_gateway_request_and_clear() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let data = b"progress body";
+            let cid = cid_from_data(CODEC_RAW, data);
+            (*node).store.put_block(&cid, data).unwrap();
+            let addr = CString::new("127.0.0.1:0").unwrap();
+            assert!(freedom_ipfs_node_start_gateway(node, addr.as_ptr()));
+
+            freedom_ipfs_node_progress_clear(node);
+            assert_gateway_path(node, &format!("/ipfs/{cid}"), data);
+
+            let snapshot = progress_snapshot_json(node);
+            assert_eq!(snapshot["active_count"], 0);
+            let events = snapshot["events"].as_array().unwrap();
+            assert!(events.iter().any(|event| {
+                event["kind"] == "gateway_request"
+                    && event["status"] == "completed"
+                    && event["path"] == format!("/ipfs/{cid}")
+                    && event["bytes_loaded"] == data.len() as u64
+            }));
+
+            freedom_ipfs_node_progress_clear(node);
+            let snapshot = progress_snapshot_json(node);
+            assert_eq!(snapshot["events"].as_array().unwrap().len(), 0);
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
     fn normalizes_preload_paths_and_uris() {
         let cid = cid_from_data(CODEC_RAW, b"preload cid");
 
@@ -1636,5 +1751,13 @@ mod tests {
         let url = CStr::from_ptr(url_ptr).to_str().unwrap().to_string();
         freedom_ipfs_string_free(url_ptr);
         url
+    }
+
+    unsafe fn progress_snapshot_json(node: *mut FreedomIpfsNode) -> serde_json::Value {
+        let ptr = freedom_ipfs_node_progress_snapshot_json(node);
+        assert!(!ptr.is_null());
+        let json = CStr::from_ptr(ptr).to_str().unwrap().to_string();
+        freedom_ipfs_string_free(ptr);
+        serde_json::from_str(&json).unwrap()
     }
 }

@@ -7,7 +7,9 @@ use axum::routing::get;
 use axum::Router;
 use bytes::Bytes;
 use cid::Cid;
-use freedom_ipfs_core::{parse_cid, BlockProvider};
+use freedom_ipfs_core::{
+    parse_cid, BlockProvider, ProgressTarget, ProgressTracker, ProgressUpdate,
+};
 use freedom_ipfs_namesys::{NameResolver, NamesysError};
 use freedom_ipfs_store::SqliteBlockStore;
 use freedom_ipfs_unixfs::{
@@ -26,6 +28,9 @@ use tracing::Instrument;
 
 pub const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 const GATEWAY_STREAM_CHUNK_SIZE: u64 = 64 * 1024;
+const X_FREEDOM_REQUEST_ID: &str = "X-Freedom-Request-ID";
+const X_FREEDOM_PARENT_REQUEST_ID: &str = "X-Freedom-Parent-Request-ID";
+const X_FREEDOM_TOP_LEVEL_PATH: &str = "X-Freedom-Top-Level-Path";
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -56,6 +61,7 @@ pub struct GatewayState {
     provider: Arc<dyn BlockProvider>,
     name_resolver: Arc<dyn NameResolver>,
     request_limiter: Arc<Semaphore>,
+    progress: Option<ProgressTracker>,
 }
 
 impl GatewayState {
@@ -95,6 +101,21 @@ impl GatewayState {
             provider,
             name_resolver,
             request_limiter: Arc::new(Semaphore::new(config.max_concurrent_requests())),
+            progress: None,
+        }
+    }
+
+    pub fn with_provider_and_name_resolver_config_progress(
+        provider: Arc<dyn BlockProvider>,
+        name_resolver: Arc<dyn NameResolver>,
+        config: GatewayConfig,
+        progress: ProgressTracker,
+    ) -> Self {
+        Self {
+            provider,
+            name_resolver,
+            request_limiter: Arc::new(Semaphore::new(config.max_concurrent_requests())),
+            progress: Some(progress),
         }
     }
 }
@@ -112,6 +133,19 @@ pub fn router_with_provider_config(
     config: GatewayConfig,
 ) -> Router {
     router_with_provider_and_name_resolver_config(provider, Arc::new(OfflineNameResolver), config)
+}
+
+pub fn router_with_provider_config_progress(
+    provider: Arc<dyn BlockProvider>,
+    config: GatewayConfig,
+    progress: ProgressTracker,
+) -> Router {
+    router_with_provider_and_name_resolver_config_progress(
+        provider,
+        Arc::new(OfflineNameResolver),
+        config,
+        progress,
+    )
 }
 
 pub fn router_with_provider_and_name_resolver(
@@ -135,6 +169,30 @@ pub fn router_with_provider_and_name_resolver_config(
             name_resolver,
             config,
         ))
+}
+
+pub fn router_with_provider_and_name_resolver_config_progress(
+    provider: Arc<dyn BlockProvider>,
+    name_resolver: Arc<dyn NameResolver>,
+    config: GatewayConfig,
+    progress: ProgressTracker,
+) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route(
+            "/_freedom/progress",
+            get(progress_snapshot).post(progress_clear),
+        )
+        .route("/ipfs/{*path}", get(ipfs_get))
+        .route("/ipns/{*path}", get(ipns_get))
+        .with_state(
+            GatewayState::with_provider_and_name_resolver_config_progress(
+                provider,
+                name_resolver,
+                config,
+                progress,
+            ),
+        )
 }
 
 #[derive(Debug, Clone)]
@@ -197,19 +255,54 @@ async fn health() -> &'static str {
     "ok\n"
 }
 
+async fn progress_snapshot(State(state): State<GatewayState>) -> Response {
+    let Some(progress) = state.progress else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut response = progress.snapshot_json().into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    response
+}
+
+async fn progress_clear(State(state): State<GatewayState>) -> Response {
+    let Some(progress) = state.progress else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    progress.clear();
+    StatusCode::NO_CONTENT.into_response()
+}
+
 async fn ipfs_get(
     State(state): State<GatewayState>,
     Path(path): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let request_id = progress_request_id(&headers)
+        .unwrap_or_else(|| NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed));
+    let parent_request_id = progress_parent_request_id(&headers);
+    let top_level_path = progress_top_level_path(&headers);
     let request_path = format!("/ipfs/{path}");
     let range = header_value_for_trace(headers.get(RANGE));
+    let progress = state.progress.as_ref().map(|tracker| {
+        let target = tracker.start_with_id(
+            request_id,
+            "gateway_request",
+            top_level_path.as_deref().unwrap_or(&request_path),
+            parent_request_id,
+        );
+        target.phase("started");
+        target
+    });
     let span = tracing::info_span!(
         "gateway_request",
         request_id,
+        parent_request_id = parent_request_id.unwrap_or_default(),
         namespace = "ipfs",
         path = %request_path,
+        top_level_path = %top_level_path.as_deref().unwrap_or(""),
         range = %range
     );
 
@@ -219,6 +312,9 @@ async fn ipfs_get(
 
         let limiter_started = Instant::now();
         let Ok(_permit) = state.request_limiter.clone().try_acquire_owned() else {
+            if let Some(progress) = &progress {
+                progress.fail("gateway_busy", "gateway concurrency limit reached");
+            }
             tracing::info!(
                 phase = "gateway_limiter",
                 request_id,
@@ -241,11 +337,23 @@ async fn ipfs_get(
             elapsed_ms = limiter_started.elapsed().as_millis()
         );
 
-        let response =
-            match serve_ipfs_path(state.provider.clone(), &path, headers.get(RANGE)).await {
-                Ok(response) => response,
-                Err(err) => gateway_error(err),
-            };
+        let response = match serve_ipfs_path(
+            state.provider.clone(),
+            &path,
+            headers.get(RANGE),
+            progress.clone(),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                if let Some(progress) = &progress {
+                    let (code, message) = gateway_error_progress(&err);
+                    progress.fail(code, message);
+                }
+                gateway_error(err)
+            }
+        };
         tracing::info!(
             phase = "request_done",
             request_id,
@@ -263,14 +371,30 @@ async fn ipns_get(
     Path(path): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let request_id = progress_request_id(&headers)
+        .unwrap_or_else(|| NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed));
+    let parent_request_id = progress_parent_request_id(&headers);
+    let top_level_path = progress_top_level_path(&headers);
     let request_path = format!("/ipns/{path}");
     let range = header_value_for_trace(headers.get(RANGE));
+    let progress = state.progress.as_ref().map(|tracker| {
+        let target = tracker.start_with_id(
+            request_id,
+            "gateway_request",
+            top_level_path.as_deref().unwrap_or(&request_path),
+            parent_request_id,
+        );
+        target.root(path.clone());
+        target.phase("started");
+        target
+    });
     let span = tracing::info_span!(
         "gateway_request",
         request_id,
+        parent_request_id = parent_request_id.unwrap_or_default(),
         namespace = "ipns",
         path = %request_path,
+        top_level_path = %top_level_path.as_deref().unwrap_or(""),
         range = %range
     );
 
@@ -280,6 +404,9 @@ async fn ipns_get(
 
         let limiter_started = Instant::now();
         let Ok(_permit) = state.request_limiter.clone().try_acquire_owned() else {
+            if let Some(progress) = &progress {
+                progress.fail("gateway_busy", "gateway concurrency limit reached");
+            }
             tracing::info!(
                 phase = "gateway_limiter",
                 request_id,
@@ -307,11 +434,18 @@ async fn ipns_get(
             state.name_resolver.as_ref(),
             &path,
             headers.get(RANGE),
+            progress.clone(),
         )
         .await
         {
             Ok(response) => response,
-            Err(err) => gateway_error(err),
+            Err(err) => {
+                if let Some(progress) = &progress {
+                    let (code, message) = gateway_error_progress(&err);
+                    progress.fail(code, message);
+                }
+                gateway_error(err)
+            }
         };
         tracing::info!(
             phase = "request_done",
@@ -332,12 +466,37 @@ fn header_value_for_trace(value: Option<&HeaderValue>) -> String {
         .to_string()
 }
 
+fn progress_request_id(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(X_FREEDOM_REQUEST_ID)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value != 0)
+}
+
+fn progress_parent_request_id(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(X_FREEDOM_PARENT_REQUEST_ID)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value != 0)
+}
+
+fn progress_top_level_path(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(X_FREEDOM_TOP_LEVEL_PATH)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.starts_with("/ipfs/") || value.starts_with("/ipns/"))
+        .map(|value| value.chars().take(512).collect())
+}
+
 async fn serve_ipfs_path(
     provider: Arc<dyn BlockProvider>,
     path: &str,
     range: Option<&HeaderValue>,
+    progress: Option<ProgressTarget>,
 ) -> Result<Response, GatewayError> {
-    serve_ipfs_path_with_listing_path(provider, path, range, None).await
+    serve_ipfs_path_with_listing_path(provider, path, range, None, progress).await
 }
 
 async fn serve_ipfs_path_with_listing_path(
@@ -345,9 +504,14 @@ async fn serve_ipfs_path_with_listing_path(
     path: &str,
     range: Option<&HeaderValue>,
     listing_path: Option<&DirectoryListingPath>,
+    progress: Option<ProgressTarget>,
 ) -> Result<Response, GatewayError> {
     let parse_started = Instant::now();
     let (cid, unixfs_path) = split_ipfs_path(path)?;
+    if let Some(progress) = &progress {
+        progress.root(cid.to_string());
+        progress.phase("checking_cache");
+    }
     tracing::info!(
         phase = "ipfs_path_parse",
         cid = %cid,
@@ -378,9 +542,9 @@ async fn serve_ipfs_path_with_listing_path(
                 elapsed_ms = mime_started.elapsed().as_millis()
             );
             if let Some(range) = range {
-                ranged_response(provider, cid, path, len, range, &mime)?
+                ranged_response(provider, cid, path, len, range, &mime, progress.clone())?
             } else {
-                streaming_response(provider, cid, path, len, &mime)?
+                streaming_response(provider, cid, path, len, &mime, progress.clone())?
             }
         }
         ServedResource::Directory { path, entries } => {
@@ -404,7 +568,23 @@ async fn serve_ipfs_path_with_listing_path(
                 default_listing_path = DirectoryListingPath::ipfs(&cid, &path);
                 &default_listing_path
             };
-            directory_listing_response(listing_path, &entries)?
+            let response = directory_listing_response(listing_path, &entries)?;
+            if let Some(progress) = &progress {
+                let bytes = response
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0);
+                progress.update(ProgressUpdate {
+                    phase: Some("completed".to_string()),
+                    bytes_loaded: Some(bytes),
+                    bytes_total: Some(bytes),
+                    ..ProgressUpdate::default()
+                });
+                progress.complete();
+            }
+            response
         }
     };
     Ok(response)
@@ -645,6 +825,7 @@ async fn serve_ipns_path(
     name_resolver: &dyn NameResolver,
     path: &str,
     range: Option<&HeaderValue>,
+    progress: Option<ProgressTarget>,
 ) -> Result<Response, GatewayError> {
     let listing_path = DirectoryListingPath::ipns(path);
     let mut target = format!("/ipns/{path}");
@@ -656,6 +837,7 @@ async fn serve_ipns_path(
                 ipfs,
                 range,
                 Some(&listing_path),
+                progress,
             )
             .await;
         }
@@ -667,8 +849,24 @@ async fn serve_ipns_path(
         };
         let (name, rest) = split_name_path(ipns)?;
         let resolve_started = Instant::now();
+        if let Some(progress) = &progress {
+            progress.update(ProgressUpdate {
+                phase: Some("resolving_name".to_string()),
+                root: Some(name.to_string()),
+                source: Some("delegated_routing".to_string()),
+                ..ProgressUpdate::default()
+            });
+        }
         let resolved = match name_resolver.resolve_name(name).await {
             Ok(resolved) => {
+                if let Some(progress) = &progress {
+                    progress.update(ProgressUpdate {
+                        phase: Some("name_resolved".to_string()),
+                        root: Some(resolved.clone()),
+                        source: Some("delegated_routing".to_string()),
+                        ..ProgressUpdate::default()
+                    });
+                }
                 tracing::info!(
                     phase = "name_resolve",
                     name,
@@ -679,6 +877,9 @@ async fn serve_ipns_path(
                 resolved
             }
             Err(err) => {
+                if let Some(progress) = &progress {
+                    progress.fail("name_resolution_failed", err.to_string());
+                }
                 tracing::info!(
                     phase = "name_resolve",
                     name,
@@ -807,14 +1008,28 @@ fn streaming_response(
     path: String,
     len: u64,
     mime: &str,
+    progress: Option<ProgressTarget>,
 ) -> Result<Response, GatewayError> {
     let provider = Arc::new(ScopedBlockProvider::new(provider));
+    if let Some(progress) = &progress {
+        progress.update(ProgressUpdate {
+            phase: Some("first_byte".to_string()),
+            bytes_total: Some(len),
+            ..ProgressUpdate::default()
+        });
+    }
+    let streamed = Arc::new(AtomicU64::new(0));
     let stream = stream::unfold(Some(0u64), move |offset| {
         let provider = provider.clone();
         let path = path.clone();
+        let progress = progress.clone();
+        let streamed = streamed.clone();
         async move {
             let offset = offset?;
             if offset >= len {
+                if let Some(progress) = &progress {
+                    progress.complete();
+                }
                 return None;
             }
             let last = len - 1;
@@ -822,15 +1037,40 @@ fn streaming_response(
                 .saturating_add(GATEWAY_STREAM_CHUNK_SIZE - 1)
                 .min(last);
             let next = if end == last { None } else { Some(end + 1) };
-            let chunk = read_file_range(
+            let chunk = match read_file_range(
                 provider.as_ref() as &dyn BlockProvider,
                 &cid,
                 &path,
                 offset,
                 end,
-            )
-            .map(Bytes::from)
-            .map_err(|err| io::Error::other(err.to_string()));
+            ) {
+                Ok(bytes) => {
+                    let loaded = streamed.fetch_add(bytes.len() as u64, Ordering::Relaxed)
+                        + bytes.len() as u64;
+                    if let Some(progress) = &progress {
+                        progress.update(ProgressUpdate {
+                            phase: Some(if loaded == bytes.len() as u64 {
+                                "first_byte".to_string()
+                            } else {
+                                "streaming".to_string()
+                            }),
+                            bytes_loaded: Some(loaded),
+                            bytes_total: Some(len),
+                            ..ProgressUpdate::default()
+                        });
+                        if next.is_none() {
+                            progress.complete();
+                        }
+                    }
+                    Ok(Bytes::from(bytes))
+                }
+                Err(err) => {
+                    if let Some(progress) = &progress {
+                        progress.fail("gateway_stream_error", err.to_string());
+                    }
+                    Err(io::Error::other(err.to_string()))
+                }
+            };
             Some((chunk, next))
         }
     });
@@ -912,6 +1152,7 @@ fn ranged_response(
     total_len: u64,
     range: &HeaderValue,
     mime: &str,
+    progress: Option<ProgressTarget>,
 ) -> Result<Response, GatewayError> {
     let range = range
         .to_str()
@@ -923,9 +1164,20 @@ fn ranged_response(
     };
     let (start, end) = parse_range_spec(spec, total_len)?;
     let provider = Arc::new(ScopedBlockProvider::new(provider));
+    let response_len = end - start + 1;
+    if let Some(progress) = &progress {
+        progress.update(ProgressUpdate {
+            phase: Some("first_byte".to_string()),
+            bytes_total: Some(response_len),
+            ..ProgressUpdate::default()
+        });
+    }
+    let streamed = Arc::new(AtomicU64::new(0));
     let stream = stream::unfold(Some(start), move |offset| {
         let provider = provider.clone();
         let path = path.clone();
+        let progress = progress.clone();
+        let streamed = streamed.clone();
         async move {
             let offset = offset?;
             let chunk_end = offset
@@ -936,15 +1188,40 @@ fn ranged_response(
             } else {
                 Some(chunk_end + 1)
             };
-            let chunk = read_file_range(
+            let chunk = match read_file_range(
                 provider.as_ref() as &dyn BlockProvider,
                 &cid,
                 &path,
                 offset,
                 chunk_end,
-            )
-            .map(Bytes::from)
-            .map_err(|err| io::Error::other(err.to_string()));
+            ) {
+                Ok(bytes) => {
+                    let loaded = streamed.fetch_add(bytes.len() as u64, Ordering::Relaxed)
+                        + bytes.len() as u64;
+                    if let Some(progress) = &progress {
+                        progress.update(ProgressUpdate {
+                            phase: Some(if loaded == bytes.len() as u64 {
+                                "first_byte".to_string()
+                            } else {
+                                "streaming".to_string()
+                            }),
+                            bytes_loaded: Some(loaded),
+                            bytes_total: Some(response_len),
+                            ..ProgressUpdate::default()
+                        });
+                        if next.is_none() {
+                            progress.complete();
+                        }
+                    }
+                    Ok(Bytes::from(bytes))
+                }
+                Err(err) => {
+                    if let Some(progress) = &progress {
+                        progress.fail("gateway_stream_error", err.to_string());
+                    }
+                    Err(io::Error::other(err.to_string()))
+                }
+            };
             Some((chunk, next))
         }
     });
@@ -965,7 +1242,7 @@ fn ranged_response(
     );
     response.headers_mut().insert(
         CONTENT_LENGTH,
-        HeaderValue::from_str(&(end - start + 1).to_string())
+        HeaderValue::from_str(&response_len.to_string())
             .map_err(|err| GatewayError::Internal(err.to_string()))?,
     );
     Ok(response)
@@ -1015,6 +1292,31 @@ enum GatewayError {
     Busy,
     BadGateway(String),
     Internal(String),
+}
+
+fn gateway_error_progress(err: &GatewayError) -> (&'static str, String) {
+    match err {
+        GatewayError::BadRequest(message) => ("bad_request", message.clone()),
+        GatewayError::NotFound(message) => ("not_found", message.clone()),
+        GatewayError::Unixfs(UnixfsError::NotFound(_))
+        | GatewayError::Unixfs(UnixfsError::PathNotFound(_)) => {
+            ("not_found", "not found".to_string())
+        }
+        GatewayError::Unixfs(UnixfsError::IsDirectory) => (
+            "bad_request",
+            "directory path could not be served".to_string(),
+        ),
+        GatewayError::Unixfs(err) if is_timeout_error(err) => {
+            ("retrieval_timeout", format!("retrieval timeout: {err}"))
+        }
+        GatewayError::Unixfs(err) => ("unixfs_error", err.to_string()),
+        GatewayError::RangeNotSatisfiable => {
+            ("range_not_satisfiable", "range not satisfiable".to_string())
+        }
+        GatewayError::Busy => ("gateway_busy", "gateway busy".to_string()),
+        GatewayError::BadGateway(message) => ("bad_gateway", message.clone()),
+        GatewayError::Internal(message) => ("internal_error", message.clone()),
+    }
 }
 
 fn gateway_error(err: GatewayError) -> Response {
@@ -1129,6 +1431,76 @@ mod tests {
         let response = reqwest::get(url).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(data));
+    }
+
+    #[tokio::test]
+    async fn progress_endpoint_tracks_gateway_request_headers() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"progress endpoint";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+        let progress = ProgressTracker::default();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router_with_provider_config_progress(
+            Arc::new(store),
+            GatewayConfig::default(),
+            progress,
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let progress_url = format!("http://{addr}/_freedom/progress");
+        let response = client.post(&progress_url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let top_level = format!("/ipfs/{cid}");
+        let response = client
+            .get(format!("http://{addr}/ipfs/{cid}"))
+            .header(X_FREEDOM_REQUEST_ID, "42")
+            .header(X_FREEDOM_PARENT_REQUEST_ID, "7")
+            .header(X_FREEDOM_TOP_LEVEL_PATH, &top_level)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(data));
+
+        let snapshot: serde_json::Value = client
+            .get(&progress_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let events = snapshot["events"].as_array().unwrap();
+        let event = events
+            .iter()
+            .find(|event| event["id"] == 42)
+            .expect("gateway request progress event");
+        assert_eq!(event["parent_id"], 7);
+        assert_eq!(event["kind"], "gateway_request");
+        assert_eq!(event["path"], top_level);
+        assert_eq!(event["status"], "completed");
+        assert_eq!(event["phase"], "completed");
+        assert_eq!(event["bytes_loaded"], data.len() as u64);
+        assert_eq!(event["bytes_total"], data.len() as u64);
+
+        let response = client.post(&progress_url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let snapshot: serde_json::Value = client
+            .get(&progress_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(snapshot["events"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
