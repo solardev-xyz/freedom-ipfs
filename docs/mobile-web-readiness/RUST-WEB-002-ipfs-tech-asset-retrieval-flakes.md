@@ -23729,7 +23729,35 @@ cargo fmt --all --check
 cargo test -p mobile-web-harness
 cargo check -p mobile-web-harness --all-targets
 cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+Smoke command:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-require-zero-http-smoke-trace.jsonl \
+  --output /tmp/ipfs-tech-require-zero-http-smoke.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  > /tmp/ipfs-tech-require-zero-http-smoke.log 2>&1
+```
+
+Smoke result:
+
+- page run passed `1/1`
+- report still written to `/tmp/ipfs-tech-require-zero-http-smoke.json`
+- trace written to `/tmp/ipfs-tech-require-zero-http-smoke-trace.jsonl`
+- command exited non-zero with:
+  `zero_http_provider_cold_bitswap expected>=1 actual=0`
 
 Conclusion:
 Keep. This is diagnostics/harness-only, but it prevents future long-running
