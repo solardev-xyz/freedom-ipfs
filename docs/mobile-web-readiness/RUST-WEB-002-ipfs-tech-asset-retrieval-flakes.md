@@ -23881,6 +23881,46 @@ cargo clippy -p mobile-web-harness --all-targets -- -D warnings
 Result:
 All commands passed.
 
+Live smoke command:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-progress-phase-gate-smoke-trace.jsonl \
+  --output /tmp/ipfs-tech-progress-phase-gate-smoke.json \
+  --require-progress-phase started=1 \
+  --require-progress-phase provider_lookup=1 \
+  --require-progress-phase streaming=1 \
+  > /tmp/ipfs-tech-progress-phase-gate-smoke.log 2>&1
+```
+
+Live smoke result:
+
+- exit code `0`
+- page workload passed `1/1`
+- root TTFB/total: `1587/1588ms`
+- run total: `4106ms`
+- RSS/FD max: `47664KiB/23`
+- progress phases included `streaming=331`,
+  `fetching_http_provider=165`, `checking_cache=138`,
+  `provider_lookup=74`, `providers_found=70`, `name_resolved=65`,
+  `cache_hit=33`
+- block sources: `http_provider=39`
+- delegated provider distribution: `zero=0`, `single=21`, `multi=14`
+
+Artifacts:
+
+- `/tmp/ipfs-tech-progress-phase-gate-smoke.json`
+- `/tmp/ipfs-tech-progress-phase-gate-smoke-trace.jsonl`
+- `/tmp/ipfs-tech-progress-phase-gate-smoke.log`
+
 Decision:
 Keep. This is a narrow harness diagnostic improvement that turns the existing
 progress-phase summary into an enforceable live-run gate.
