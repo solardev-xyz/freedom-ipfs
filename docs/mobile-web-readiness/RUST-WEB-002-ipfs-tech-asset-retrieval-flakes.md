@@ -23219,3 +23219,82 @@ sample. The focused `ipfs.tech` r10 sweep says `50ms` is a real latency lever,
 but the same-window multi-case guardrail is mixed rather than a clean default
 flip. Future work should use this knob for longer r20/r50 sweeps and for
 request-shape policies, especially root/top-level requests versus page assets.
+
+## 2026-05-06 Reject: Default Single-HTTP Post-Lookup Grace 50ms
+
+Follow up the r10 `50ms` signal with a longer focused r20 sweep before changing
+defaults.
+
+Default command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 20 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-postlookup-default-r20-trace.jsonl \
+  --output /tmp/ipfs-tech-postlookup-default-r20.json \
+  > /tmp/ipfs-tech-postlookup-default-r20.log 2>&1
+```
+
+Candidate command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS=50 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 20 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-postlookup-grace50-r20-trace.jsonl \
+  --output /tmp/ipfs-tech-postlookup-grace50-r20.json \
+  > /tmp/ipfs-tech-postlookup-grace50-r20.log 2>&1
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-postlookup-default-r20.json`
+- `/tmp/ipfs-tech-postlookup-default-r20-trace.jsonl`
+- `/tmp/ipfs-tech-postlookup-default-r20.log`
+- `/tmp/ipfs-tech-postlookup-grace50-r20.json`
+- `/tmp/ipfs-tech-postlookup-grace50-r20-trace.jsonl`
+- `/tmp/ipfs-tech-postlookup-grace50-r20.log`
+
+Result:
+
+| Mode | Pass | Root TTFB p50/p90/p95/max | Asset TTFB p50/p90/p95/max | Request classifications | Max RSS/FD |
+| --- | --- | --- | --- | --- | --- |
+| Default `250ms` | `20/20` | `594/708/893/919ms` | `192/633/694/1057ms` | `zero_http_provider_bitswap=55`, `top_level_zero_http_provider_bitswap=19` | `55544KiB` / `35` |
+| `50ms` override | `20/20` | `596/5629/5633/5763ms` | `230/469/619/934ms` | `zero_http_provider_bitswap=57`, `top_level_zero_http_provider_bitswap=20` | `54912KiB` / `39` |
+
+Trace notes:
+
+- The `50ms` run improved asset p90/p95/max, but it repeatedly hit the top-level
+  zero-HTTP cold-Bitswap root shape. The slow root requests clustered around
+  `5.6s` and were classified as `top_level_zero_http_provider_bitswap` plus
+  `top_level_zero_http_provider_cold_bitswap`.
+- Default had similar classification counts but did not show the same repeated
+  top-level root tail in this r20 window.
+- The `50ms` run also produced more Bitswap failures/connection noise:
+  `bitswap batches failures=6`, `peer_attempt failures=30`,
+  `connection_errors=49`, and FD max `39`. Default had `failures=0`,
+  `connection_errors=10`, and FD max `35`.
+- The post-lookup knob does not directly control zero-HTTP provider sets, so the
+  r20 root regression is not clean causal proof against a shorter single-HTTP
+  wait. It is, however, strong evidence against changing the default from the
+  r10 sample alone.
+
+Conclusion:
+Reject changing the production single-HTTP post-lookup default to `50ms`. Keep
+`FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS` as a lab
+control. The next production candidate should target the top-level zero-HTTP
+cold-Bitswap shape directly instead of retuning this wait globally.
