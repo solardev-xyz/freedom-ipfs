@@ -24544,3 +24544,94 @@ blocks, so the improvement is not attributable to the behavior change. Keep the
 env knobs. A future larger alternating test can revisit `200ms` only if it also
 records Bitswap hedge wins or a consistent reduction in slow HTTP-provider
 tails without higher peer-attempt/FD pressure.
+
+## Groundwork: Opt-In Bitswap Session Range Batching
+
+Hypothesis:
+UnixFS range reads that miss several nearby blocks can reuse a recent successful
+Bitswap session peer more efficiently by issuing a bounded multi-CID request,
+instead of fetching each missing range block independently. This should be most
+useful for media/range workloads, but only if a real recent Bitswap peer exists
+and the requested ranges span multiple CIDs.
+
+Change:
+Added an opt-in lab path behind
+`FREEDOM_IPFS_ENABLE_BITSWAP_SESSION_RANGE_BATCH`. When enabled, uncached range
+blocks are grouped in chunks of up to 4 CIDs and requested from recent
+successful Bitswap peers using the shared multi-want Bitswap client. The path is
+bounded by a 750ms timeout and falls back to the existing per-block fetch path on
+miss, timeout, or error. Requested blocks are verified before storage through the
+normal store path, and any unsolicited extra Bitswap blocks are only retained if
+they verify.
+
+Deterministic coverage:
+
+```sh
+cargo test -p freedom-ipfs-retrieval range_batch_can_use_recent_bitswap_multiwant_peer
+cargo test -p freedom-ipfs-retrieval shared_bitswap_client_fetch_many_requests_multiple_blocks_from_one_peer
+```
+
+Both tests passed. A first full `cargo test -p freedom-ipfs-retrieval` run hit a
+pre-existing/flaky timeout in
+`shared_bitswap_client_fetch_many_accepts_multi_cid_incoming_blocks`; rerunning
+that test passed, and a second full retrieval test run passed with `81 passed`,
+`0 failed`, `1 ignored`.
+
+Live harness commands:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-developers-hero-middle-range \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-hero-middle-range-batch-baseline-r3-20260506-trace.jsonl \
+  --output /tmp/ipfs-tech-hero-middle-range-batch-baseline-r3-20260506.json \
+  > /tmp/ipfs-tech-hero-middle-range-batch-baseline-r3-20260506.log 2>&1
+
+FREEDOM_IPFS_ENABLE_BITSWAP_SESSION_RANGE_BATCH=1 \
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-developers-hero-middle-range \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-hero-middle-range-batch-enabled-r3-20260506-trace.jsonl \
+  --output /tmp/ipfs-tech-hero-middle-range-batch-enabled-r3-20260506.json \
+  > /tmp/ipfs-tech-hero-middle-range-batch-enabled-r3-20260506.log 2>&1
+```
+
+Results:
+
+- Baseline passed `3/3`, run/root p50-p95 `1539/1626ms`, RSS/FD max
+  `33332KiB/16`.
+- Enabled passed `3/3`, run/root p50-p95 `655/994ms`, RSS/FD max
+  `33424KiB/15`.
+- Both runs fetched blocks from HTTP providers only:
+  `block sources http_provider=9`.
+- Neither trace recorded `bitswap_session_range_batch` or `multi_cid_commands`.
+
+Artifacts:
+
+- `/tmp/ipfs-tech-hero-middle-range-batch-baseline-r3-20260506.json`
+- `/tmp/ipfs-tech-hero-middle-range-batch-baseline-r3-20260506-trace.jsonl`
+- `/tmp/ipfs-tech-hero-middle-range-batch-baseline-r3-20260506.log`
+- `/tmp/ipfs-tech-hero-middle-range-batch-enabled-r3-20260506.json`
+- `/tmp/ipfs-tech-hero-middle-range-batch-enabled-r3-20260506-trace.jsonl`
+- `/tmp/ipfs-tech-hero-middle-range-batch-enabled-r3-20260506.log`
+
+Decision:
+Keep range batching opt-in. The deterministic test proves the recent-peer
+multi-want path can serve multiple range blocks, but the live hero image range
+case did not exercise it: the asset resolved as one raw block plus metadata, so
+the lower enabled latency is network variance rather than evidence for the new
+path. The next useful experiment needs either a public multi-block UnixFS range
+asset or a synthetic live/local harness case that creates a multi-block UnixFS
+file and performs cold middle ranges with and without a recent Bitswap peer.

@@ -103,6 +103,10 @@ const MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND: usize = 5;
 const MAX_BITSWAP_PEERS_PER_BLOCK: usize = 16;
 const MAX_BITSWAP_SESSION_PEERS: usize = 4;
 const MAX_BITSWAP_ADDRS_PER_PEER: usize = 2;
+const MAX_BITSWAP_SESSION_RANGE_BATCH_CIDS: usize = 4;
+const BITSWAP_SESSION_RANGE_BATCH_TIMEOUT: Duration = Duration::from_millis(750);
+const ENABLE_BITSWAP_SESSION_RANGE_BATCH_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_BITSWAP_SESSION_RANGE_BATCH";
 const MAX_PENDING_INCOMING_BITSWAP_READS: usize = 32;
 // Race a small number of untrusted providers with WANT_BLOCK before falling
 // back to conservative WANT_HAVE probes for the rest. This lowers page-asset
@@ -202,6 +206,14 @@ pub struct HttpRetriever {
 
 type SharedBlockFetch = Shared<BoxFuture<'static, Arc<SharedBlockFetchResult>>>;
 type SharedBlockFetchResult = std::result::Result<(Block, RetrievalSource), String>;
+
+#[derive(Clone, Copy)]
+struct MissingBlockRange {
+    index: usize,
+    cid: Cid,
+    start: u64,
+    end: u64,
+}
 
 impl HttpRetriever {
     pub fn new(routing: impl Into<ProviderRoutingClient>, store: SqliteBlockStore) -> Self {
@@ -2149,6 +2161,119 @@ impl HttpRetriever {
         self.store_bitswap_result(cid, result).await.map(Some)
     }
 
+    async fn fetch_many_from_recent_bitswap_peers(
+        &self,
+        cids: Vec<Cid>,
+    ) -> Result<Option<HashMap<Cid, Block>>> {
+        if cids.len() < 2 {
+            return Ok(None);
+        }
+
+        let peers = self.recent_bitswap_peers_for_fetch().await;
+        if peers.is_empty() {
+            tracing::info!(
+                phase = "bitswap_session_range_batch",
+                cids = %format_cids(&cids),
+                cid_count = cids.len(),
+                ok = false,
+                outcome = "no_recent_peers",
+                timeout_ms = BITSWAP_SESSION_RANGE_BATCH_TIMEOUT.as_millis()
+            );
+            return Ok(None);
+        }
+
+        let peer_count = peers.len();
+        let peers_for_record = peers.clone();
+        let started = Instant::now();
+        tracing::info!(
+            phase = "bitswap_session_range_batch_start",
+            cids = %format_cids(&cids),
+            cid_count = cids.len(),
+            peer_count,
+            trusted_peer_count = peer_count,
+            timeout_ms = BITSWAP_SESSION_RANGE_BATCH_TIMEOUT.as_millis()
+        );
+
+        let fetch = async {
+            let client = self.shared_bitswap_client().await?;
+            client.fetch_many(cids.clone(), peers).await
+        };
+        let result = match timeout(BITSWAP_SESSION_RANGE_BATCH_TIMEOUT, fetch).await {
+            Ok(Ok(Ok(result))) => result,
+            Ok(Ok(Err(err))) => {
+                tracing::info!(
+                    phase = "bitswap_session_range_batch",
+                    cids = %format_cids(&cids),
+                    cid_count = cids.len(),
+                    peer_count,
+                    trusted_peer_count = peer_count,
+                    ok = false,
+                    error = %err,
+                    timeout_ms = BITSWAP_SESSION_RANGE_BATCH_TIMEOUT.as_millis(),
+                    elapsed_ms = started.elapsed().as_millis()
+                );
+                return Ok(None);
+            }
+            Ok(Err(err)) => {
+                tracing::info!(
+                    phase = "bitswap_session_range_batch",
+                    cids = %format_cids(&cids),
+                    cid_count = cids.len(),
+                    peer_count,
+                    trusted_peer_count = peer_count,
+                    ok = false,
+                    error = %err,
+                    timeout_ms = BITSWAP_SESSION_RANGE_BATCH_TIMEOUT.as_millis(),
+                    elapsed_ms = started.elapsed().as_millis()
+                );
+                return Ok(None);
+            }
+            Err(_) => {
+                tracing::info!(
+                    phase = "bitswap_session_range_batch",
+                    cids = %format_cids(&cids),
+                    cid_count = cids.len(),
+                    peer_count,
+                    trusted_peer_count = peer_count,
+                    ok = false,
+                    timeout = true,
+                    timeout_ms = BITSWAP_SESSION_RANGE_BATCH_TIMEOUT.as_millis(),
+                    elapsed_ms = started.elapsed().as_millis()
+                );
+                return Ok(None);
+            }
+        };
+
+        let elapsed = started.elapsed();
+        if let Some(peer) = result.source_peer {
+            self.record_successful_bitswap_peer_from_peers(peer, &peers_for_record, elapsed)
+                .await;
+        }
+        let requested_block_count = result.requested_blocks.len();
+        let extra_block_count = result.extra_blocks.len();
+        let source_peer = result.source_peer;
+        let source_transport = result.source_transport;
+        let delivery = result.delivery;
+        let blocks = self.store_bitswap_batch_result(result).await?;
+        tracing::info!(
+            phase = "bitswap_session_range_batch",
+            cids = %format_cids(&cids),
+            cid_count = cids.len(),
+            peer_count,
+            trusted_peer_count = peer_count,
+            ok = true,
+            source_peer = %source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
+            source_transport = source_transport.unwrap_or("unknown"),
+            bitswap_delivery = delivery,
+            source_peer_trusted = true,
+            requested_blocks = requested_block_count,
+            extra_blocks = extra_block_count,
+            bytes = blocks.values().map(|block| block.data().len()).sum::<usize>(),
+            elapsed_ms = elapsed.as_millis()
+        );
+        Ok(Some(blocks))
+    }
+
     fn mark_single_session_shortcut_timeout_peer(&self, cid: &Cid, peers: &[BitswapPeer]) {
         let [peer] = peers else {
             if !peers.is_empty() {
@@ -2193,6 +2318,33 @@ impl HttpRetriever {
             .store_block_with_trace(*cid, requested_block, "bitswap", true)
             .await?;
         Ok(Block::unchecked(*cid, bytes))
+    }
+
+    async fn store_bitswap_batch_result(
+        &self,
+        result: BitswapFetchBatchResult,
+    ) -> Result<HashMap<Cid, Block>> {
+        let BitswapFetchBatchResult {
+            requested_blocks,
+            extra_blocks,
+            ..
+        } = result;
+        for (extra_cid, extra_data) in extra_blocks {
+            if !requested_blocks.contains_key(&extra_cid) {
+                let _ = self
+                    .store_block_with_trace(extra_cid, extra_data, "bitswap_extra", false)
+                    .await;
+            }
+        }
+
+        let mut blocks = HashMap::with_capacity(requested_blocks.len());
+        for (cid, data) in requested_blocks {
+            let bytes = self
+                .store_block_with_trace(cid, data, "bitswap", true)
+                .await?;
+            blocks.insert(cid, Block::unchecked(cid, bytes));
+        }
+        Ok(blocks)
     }
 
     async fn store_block_with_trace(
@@ -2317,9 +2469,18 @@ impl FetchingBlockProvider {
         &self,
         ranges: Vec<(Cid, u64, u64)>,
     ) -> CoreResult<Vec<Option<Vec<u8>>>> {
+        self.get_block_ranges_async_inner(ranges, bitswap_session_range_batch_enabled())
+            .await
+    }
+
+    async fn get_block_ranges_async_inner(
+        &self,
+        ranges: Vec<(Cid, u64, u64)>,
+        enable_session_batch: bool,
+    ) -> CoreResult<Vec<Option<Vec<u8>>>> {
         let range_count = ranges.len();
         let mut results = vec![None; ranges.len()];
-        let mut fetches = Vec::new();
+        let mut misses = Vec::new();
         for (index, (cid, start, end)) in ranges.iter().copied().enumerate() {
             let cache_started = Instant::now();
             match self
@@ -2345,24 +2506,101 @@ impl FetchingBlockProvider {
                         batch = true,
                         elapsed_ms = cache_started.elapsed().as_millis()
                     );
-                    let retriever = self.retriever.clone();
-                    fetches.push(async move {
-                        let fetch_started = Instant::now();
-                        let fetched = retriever.fetch_block_with_source(&cid).await;
-                        (
-                            index,
-                            cid,
-                            start,
-                            end,
-                            fetch_started.elapsed().as_millis(),
-                            fetched,
-                        )
+                    misses.push(MissingBlockRange {
+                        index,
+                        cid,
+                        start,
+                        end,
                     });
                 }
             }
         }
 
-        let uncached_range_count = fetches.len();
+        let uncached_range_count = misses.len();
+        let mut remaining = Vec::new();
+        if enable_session_batch && uncached_range_count > 1 {
+            for chunk in misses.chunks(MAX_BITSWAP_SESSION_RANGE_BATCH_CIDS) {
+                let mut cids = Vec::new();
+                for missing in chunk {
+                    if !cids.contains(&missing.cid) {
+                        cids.push(missing.cid);
+                    }
+                }
+                let batch_started = Instant::now();
+                match self
+                    .retriever
+                    .fetch_many_from_recent_bitswap_peers(cids)
+                    .await
+                {
+                    Ok(Some(blocks)) => {
+                        let batch_elapsed_ms = batch_started.elapsed().as_millis();
+                        for missing in chunk {
+                            let Some(block) = blocks.get(&missing.cid) else {
+                                remaining.push(*missing);
+                                continue;
+                            };
+                            self.stats.record(RetrievalSource::Bitswap);
+                            let range_len = if missing.start <= missing.end {
+                                missing.end.saturating_sub(missing.start).saturating_add(1)
+                            } else {
+                                0
+                            };
+                            tracing::info!(
+                                phase = "block_range_batch_fetch",
+                                cid = %missing.cid,
+                                source = "bitswap_batch",
+                                range_start = missing.start,
+                                range_end = missing.end,
+                                range_len,
+                                range_count,
+                                uncached_range_count,
+                                elapsed_ms = batch_elapsed_ms
+                            );
+                            results[missing.index] =
+                                Some(block_data_range(block.data(), missing.start, missing.end));
+                        }
+                    }
+                    Ok(None) => remaining.extend_from_slice(chunk),
+                    Err(err) => {
+                        tracing::info!(
+                            phase = "bitswap_session_range_batch",
+                            cids = %format_cids(&chunk.iter().map(|missing| missing.cid).collect::<Vec<_>>()),
+                            cid_count = chunk.len(),
+                            ok = false,
+                            error = %err,
+                            fallback = true
+                        );
+                        remaining.extend_from_slice(chunk);
+                    }
+                }
+            }
+        } else {
+            remaining = misses;
+        }
+
+        let mut fetches = Vec::new();
+        for MissingBlockRange {
+            index,
+            cid,
+            start,
+            end,
+        } in remaining
+        {
+            let retriever = self.retriever.clone();
+            fetches.push(async move {
+                let fetch_started = Instant::now();
+                let fetched = retriever.fetch_block_with_source(&cid).await;
+                (
+                    index,
+                    cid,
+                    start,
+                    end,
+                    fetch_started.elapsed().as_millis(),
+                    fetched,
+                )
+            });
+        }
+
         for (index, cid, start, end, elapsed_ms, fetched) in join_all(fetches).await {
             let (block, source) = fetched.map_err(|err| CoreError::Storage(err.to_string()))?;
             self.stats.record(source);
@@ -2590,6 +2828,10 @@ fn single_http_provider_bitswap_hedge_min_score() -> Option<Duration> {
     std::env::var_os(SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS_ENV)
         .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
         .map(Duration::from_millis)
+}
+
+fn bitswap_session_range_batch_enabled() -> bool {
+    std::env::var_os(ENABLE_BITSWAP_SESSION_RANGE_BATCH_ENV).is_some()
 }
 
 fn bitswap_connection_ready_timeout() -> Duration {
@@ -6256,6 +6498,50 @@ mod bitswap_tests {
         assert_eq!(result.extra_blocks, Vec::<(Cid, Vec<u8>)>::new());
         assert_eq!(result.source_peer, Some(peer_id));
         assert_eq!(result.delivery, "incoming");
+        tokio::time::timeout(Duration::from_secs(5), peer_stream_task)
+            .await
+            .unwrap()
+            .unwrap();
+        peer_swarm_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn range_batch_can_use_recent_bitswap_multiwant_peer() {
+        let first_data = b"first range batch multiwant block";
+        let second_data = b"second range batch multiwant block";
+        let first = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, first_data);
+        let second = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, second_data);
+        let (peer_id, addr, peer_swarm_task, peer_stream_task) =
+            spawn_multi_want_bitswap_peer(vec![
+                (first, first_data.to_vec()),
+                (second, second_data.to_vec()),
+            ])
+            .await;
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        retriever
+            .record_successful_bitswap_peer(peer_id, vec![addr], Duration::from_millis(10))
+            .await;
+        let provider = FetchingBlockProvider {
+            store: store.clone(),
+            retriever,
+            stats: Arc::new(RetrievalStatsInner::default()),
+        };
+
+        let ranges = vec![(first, 1, 5), (second, 2, 7)];
+        let result = provider
+            .get_block_ranges_async_inner(ranges, true)
+            .await
+            .unwrap();
+
+        assert_eq!(result[0].as_deref(), Some(&first_data[1..=5]));
+        assert_eq!(result[1].as_deref(), Some(&second_data[2..=7]));
+        assert_eq!(provider.stats().bitswap_blocks, 2);
+        assert_eq!(store.get(&first).unwrap().unwrap().data(), first_data);
+        assert_eq!(store.get(&second).unwrap().unwrap().data(), second_data);
         tokio::time::timeout(Duration::from_secs(5), peer_stream_task)
             .await
             .unwrap()
