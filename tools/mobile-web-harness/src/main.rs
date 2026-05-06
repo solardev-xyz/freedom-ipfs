@@ -1915,6 +1915,18 @@ fn print_trace_http_provider_races(trace: &TraceSummary) {
             race.multi_provider_success_elapsed_ms
         );
     }
+    if race.bitswap_hedges > 0 || race.bitswap_hedge_results > 0 || race.bitswap_hedge_skips > 0 {
+        println!(
+            "    bitswap hedge: starts={} timeout_max={}ms results={} result_elapsed={} skips={} result_sources={} skip_reasons={}",
+            race.bitswap_hedges,
+            race.max_bitswap_hedge_timeout_ms,
+            race.bitswap_hedge_results,
+            race.bitswap_hedge_result_elapsed_ms,
+            race.bitswap_hedge_skips,
+            format_trace_counts(&race.bitswap_hedge_result_sources),
+            format_trace_counts(&race.bitswap_hedge_skip_reasons)
+        );
+    }
 }
 
 fn print_trace_provider_retries(trace: &TraceSummary) {
@@ -5101,6 +5113,13 @@ struct TraceHttpProviderRaceAggregate {
     hedges: usize,
     self_hedges: usize,
     max_self_hedge_timeout_ms: u128,
+    bitswap_hedges: usize,
+    max_bitswap_hedge_timeout_ms: u128,
+    bitswap_hedge_results: usize,
+    bitswap_hedge_result_elapsed_ms: LatencySummary,
+    bitswap_hedge_result_sources: Vec<TraceValueCount>,
+    bitswap_hedge_skips: usize,
+    bitswap_hedge_skip_reasons: Vec<TraceValueCount>,
     max_hedge_pending_count: u128,
     max_hedge_remaining_provider_count: u128,
     result_events: usize,
@@ -5133,6 +5152,12 @@ struct TraceHttpProviderRaceAggregate {
     winner_score_elapsed_values: Vec<u128>,
     #[serde(skip)]
     single_provider_winner_builders: BTreeMap<String, TraceHttpProviderRaceWinnerProviderBuilder>,
+    #[serde(skip)]
+    bitswap_hedge_result_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    bitswap_hedge_result_source_counts: BTreeMap<String, usize>,
+    #[serde(skip)]
+    bitswap_hedge_skip_reason_counts: BTreeMap<String, usize>,
 }
 
 impl TraceHttpProviderRaceAggregate {
@@ -5175,6 +5200,33 @@ impl TraceHttpProviderRaceAggregate {
         self.max_self_hedge_timeout_ms = self
             .max_self_hedge_timeout_ms
             .max(trace_count_field(value, "timeout_ms"));
+    }
+
+    fn record_bitswap_hedge(&mut self, value: &serde_json::Value) {
+        self.bitswap_hedges += 1;
+        self.max_bitswap_hedge_timeout_ms = self
+            .max_bitswap_hedge_timeout_ms
+            .max(trace_count_field(value, "timeout_ms"));
+    }
+
+    fn record_bitswap_hedge_result(&mut self, value: &serde_json::Value, elapsed_ms: Option<u128>) {
+        self.bitswap_hedge_results += 1;
+        let elapsed_ms = elapsed_ms.unwrap_or_else(|| trace_count_field(value, "elapsed_ms"));
+        self.bitswap_hedge_result_elapsed_values.push(elapsed_ms);
+        let source = json_detail_string(value.get("source")).unwrap_or_else(|| "unknown".into());
+        *self
+            .bitswap_hedge_result_source_counts
+            .entry(source)
+            .or_default() += 1;
+    }
+
+    fn record_bitswap_hedge_skip(&mut self, value: &serde_json::Value) {
+        self.bitswap_hedge_skips += 1;
+        let reason = json_detail_string(value.get("reason")).unwrap_or_else(|| "unknown".into());
+        *self
+            .bitswap_hedge_skip_reason_counts
+            .entry(reason)
+            .or_default() += 1;
     }
 
     fn record_result(&mut self, value: &serde_json::Value, elapsed_ms: Option<u128>) {
@@ -5260,13 +5312,26 @@ impl TraceHttpProviderRaceAggregate {
         ));
         self.winner_score_elapsed_ms =
             LatencySummary::from_values(std::mem::take(&mut self.winner_score_elapsed_values));
+        self.bitswap_hedge_result_elapsed_ms = LatencySummary::from_values(std::mem::take(
+            &mut self.bitswap_hedge_result_elapsed_values,
+        ));
+        self.bitswap_hedge_result_sources =
+            sorted_trace_counts(std::mem::take(&mut self.bitswap_hedge_result_source_counts));
+        self.bitswap_hedge_skip_reasons =
+            sorted_trace_counts(std::mem::take(&mut self.bitswap_hedge_skip_reason_counts));
         self.single_provider_winners = sorted_trace_http_provider_race_winners(std::mem::take(
             &mut self.single_provider_winner_builders,
         ));
     }
 
     fn has_events(&self) -> bool {
-        self.events > 0 || self.hedges > 0 || self.self_hedges > 0 || self.result_events > 0
+        self.events > 0
+            || self.hedges > 0
+            || self.self_hedges > 0
+            || self.bitswap_hedges > 0
+            || self.bitswap_hedge_results > 0
+            || self.bitswap_hedge_skips > 0
+            || self.result_events > 0
     }
 }
 
@@ -6676,6 +6741,15 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         }
         if phase == "http_provider_self_hedge" {
             http_provider_races.record_self_hedge(&value);
+        }
+        if phase == "http_provider_bitswap_hedge" {
+            http_provider_races.record_bitswap_hedge(&value);
+        }
+        if phase == "http_provider_bitswap_hedge_result" {
+            http_provider_races.record_bitswap_hedge_result(&value, elapsed_ms);
+        }
+        if phase == "http_provider_bitswap_hedge_skip" {
+            http_provider_races.record_bitswap_hedge_skip(&value);
         }
         if phase == "http_provider_race_result" {
             http_provider_races.record_result(&value, elapsed_ms);
@@ -11029,6 +11103,10 @@ mod tests {
                 "{\"phase\":\"http_provider_race\",\"cid\":\"cid-single-fail\",\"provider_count\":1,\"race_width\":2}\n",
                 "{\"phase\":\"http_provider_hedge\",\"cid\":\"cid-b\",\"provider\":\"https://provider-c.example\",\"timeout_ms\":250,\"pending_count\":2,\"remaining_provider_count\":1}\n",
                 "{\"phase\":\"http_provider_self_hedge\",\"cid\":\"cid-single-ok\",\"provider\":\"https://provider-single.example\",\"timeout_ms\":350,\"provider_index\":0,\"original_provider_rank\":1,\"reason\":\"slow_single_provider\"}\n",
+                "{\"phase\":\"http_provider_bitswap_hedge\",\"cid\":\"cid-single-ok\",\"provider_count\":3,\"timeout_ms\":150,\"reason\":\"slow_single_http_provider\"}\n",
+                "{\"phase\":\"http_provider_bitswap_hedge_result\",\"cid\":\"cid-single-ok\",\"source\":\"bitswap\",\"provider_count\":3,\"elapsed_ms\":190}\n",
+                "{\"phase\":\"http_provider_bitswap_hedge_result\",\"cid\":\"cid-single-fail\",\"source\":\"http_provider\",\"provider_count\":2,\"elapsed_ms\":75}\n",
+                "{\"phase\":\"http_provider_bitswap_hedge_skip\",\"cid\":\"cid-single-skip\",\"provider\":\"https://provider-single.example\",\"reason\":\"provider_unscored\",\"provider_scored\":false,\"min_score_ms\":250}\n",
                 "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-a\",\"ok\":true,\"provider\":\"https://provider-a.example\",\"winner_provider_index\":1,\"winner_provider_rank\":2,\"winner_original_provider_rank\":3,\"winner_within_initial_width\":true,\"winner_provider_scored\":true,\"winner_provider_score_ms\":42,\"provider_count\":2,\"race_width\":2,\"attempted_provider_count\":2,\"failed_provider_count\":0,\"hedge_fired\":false,\"elapsed_ms\":25}\n",
                 "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-b\",\"ok\":false,\"provider_count\":4,\"race_width\":2,\"attempted_provider_count\":4,\"failed_provider_count\":4,\"hedge_fired\":true,\"elapsed_ms\":300}\n",
                 "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-single-ok\",\"ok\":true,\"provider\":\"https://provider-single.example\",\"winner_provider_index\":0,\"winner_provider_rank\":1,\"winner_original_provider_rank\":1,\"winner_within_initial_width\":true,\"winner_provider_scored\":false,\"provider_count\":1,\"race_width\":2,\"attempted_provider_count\":1,\"failed_provider_count\":0,\"hedge_fired\":false,\"elapsed_ms\":450}\n",
@@ -11056,6 +11134,41 @@ mod tests {
         assert_eq!(summary.http_provider_races.hedges, 1);
         assert_eq!(summary.http_provider_races.self_hedges, 1);
         assert_eq!(summary.http_provider_races.max_self_hedge_timeout_ms, 350);
+        assert_eq!(summary.http_provider_races.bitswap_hedges, 1);
+        assert_eq!(
+            summary.http_provider_races.max_bitswap_hedge_timeout_ms,
+            150
+        );
+        assert_eq!(summary.http_provider_races.bitswap_hedge_results, 2);
+        assert_eq!(
+            summary
+                .http_provider_races
+                .bitswap_hedge_result_elapsed_ms
+                .p50_ms,
+            Some(75)
+        );
+        assert_eq!(
+            trace_value_count(
+                &summary.http_provider_races.bitswap_hedge_result_sources,
+                "bitswap"
+            ),
+            1
+        );
+        assert_eq!(
+            trace_value_count(
+                &summary.http_provider_races.bitswap_hedge_result_sources,
+                "http_provider"
+            ),
+            1
+        );
+        assert_eq!(summary.http_provider_races.bitswap_hedge_skips, 1);
+        assert_eq!(
+            trace_value_count(
+                &summary.http_provider_races.bitswap_hedge_skip_reasons,
+                "provider_unscored"
+            ),
+            1
+        );
         assert_eq!(summary.http_provider_races.max_hedge_pending_count, 2);
         assert_eq!(
             summary
@@ -11232,7 +11345,11 @@ mod tests {
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_http_provider"),
-            13
+            15
+        );
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "fetching_bitswap"),
+            2
         );
     }
 

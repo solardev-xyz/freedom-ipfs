@@ -21924,3 +21924,67 @@ This is useful for future controlled experiments because it bounds the broad
 hedge behind provider scoring and emits skip diagnostics, but the next production
 candidate should require actual recent Bitswap success or a stronger per-page
 resource budget before starting extra peer work.
+
+## 2026-05-06 Keep: Summarize HTTP/Bitswap Hedge Outcomes In Harness
+
+Question:
+The score-gated Bitswap hedge experiment proved that start/result/skip events are
+the key signal for deciding whether extra peer work is useful, but the harness
+only exposed those events indirectly through generic phase and progress counts.
+Can the trace summary report those outcomes directly for future A/B runs?
+
+Implementation:
+
+- Extend `trace_summary.http_provider_races` with:
+  - `bitswap_hedges`
+  - `max_bitswap_hedge_timeout_ms`
+  - `bitswap_hedge_results`
+  - `bitswap_hedge_result_elapsed_ms`
+  - `bitswap_hedge_result_sources`
+  - `bitswap_hedge_skips`
+  - `bitswap_hedge_skip_reasons`
+- Print a concise `bitswap hedge:` line under `http provider races`.
+- Preserve the existing stable progress phase mapping:
+  - start/result from Bitswap source => `fetching_bitswap`
+  - HTTP result/skip => `fetching_http_provider`
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_counts_http_provider_fetches -- --nocapture
+cargo test -p mobile-web-harness
+```
+
+Result:
+
+- Focused HTTP-provider trace summary test passed.
+- Full `mobile-web-harness` tests passed: `43` tests.
+
+Existing score-gated trace artifact check:
+
+```sh
+rg -c '"phase":"http_provider_bitswap_hedge"' \
+  /tmp/ipfs-tech-score-gated-bitswap-hedge-enabled-trace-r3-trace.jsonl
+
+rg -c '"phase":"http_provider_bitswap_hedge_result"' \
+  /tmp/ipfs-tech-score-gated-bitswap-hedge-enabled-trace-r3-trace.jsonl
+
+rg -c '"phase":"http_provider_bitswap_hedge_skip"' \
+  /tmp/ipfs-tech-score-gated-bitswap-hedge-enabled-trace-r3-trace.jsonl
+```
+
+Observed counts:
+
+- Starts: `4`
+- Results: `4`
+- Skips: `59`
+- Result sources: `http_provider=4`
+- Skip reasons: `provider_score_below_threshold=56`,
+  `provider_unscored=3`
+
+Decision:
+Keep. This is diagnostics-only and does not change gateway behavior. It makes
+future single-provider mitigation experiments easier to judge: a promising run
+should show Bitswap result sources or clearly bounded skip behavior, not only a
+better latency sample in a favorable network window.
