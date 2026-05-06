@@ -21463,3 +21463,148 @@ Keep. This is small progress API polish tied to the new gateway cache behavior.
 Swift and harness summaries now see cache work as `checking_cache`, `cache_hit`,
 or `streaming` instead of a new internal phase that was not in the stable mobile
 phase list.
+
+## 2026-05-06 Observe: Cold Empty-Store `ipfs.tech` vs Kubo
+
+Question:
+After the warm-path cache work, where does the current branch stand on true
+cold `ipfs.tech` page loads against Kubo, with trace output disabled and each
+measured run starting from an empty Rust in-memory store and a fresh Kubo repo?
+
+Fair empty-store command:
+
+```sh
+rm -f /tmp/ipfs-tech-cold-empty-store-kubo-notrace-r3.json
+
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --comparison-output /tmp/ipfs-tech-cold-empty-store-kubo-notrace-r3.json
+```
+
+Artifact:
+
+- `/tmp/ipfs-tech-cold-empty-store-kubo-notrace-r3.json`
+
+Result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Rust run total p50/p95/max: `2846/2995/2995ms`.
+- Kubo run total p50/p95/max: `5841/10217/10217ms`.
+- Rust root TTFB p50/p95/max: `1014/1249/1249ms`.
+- Kubo root TTFB p50/p95/max: `2529/4810/4810ms`.
+- Rust asset TTFB p50/p95/max: `250/814/1087ms` over `96` asset requests.
+- Kubo asset TTFB p50/p95/max: `149/7894/8132ms`.
+- Rust asset total p50/p95/max: `251/814/1088ms`.
+- Kubo asset total p50/p95/max: `149/7894/8133ms`.
+- Rust max RSS/FD: `48124KiB` / `25`.
+- Kubo max RSS/FD: `267016KiB` / `225`.
+- Kubo max repo size: `832195B`; Rust used the default in-memory store for
+  this comparison.
+
+Control note:
+A second run used `--gateway-db` with `--fresh-gateway-per-run`, so Rust's store
+persisted across measured daemon restarts while Kubo still used fresh repos. It
+is useful as a "persistent Rust cache, fresh daemon" observation, but it is not
+the fair cold baseline above.
+
+```sh
+rm -f /tmp/freedom-ipfs-ipfs-tech-cold-current-kubo-notrace.db \
+  /tmp/freedom-ipfs-ipfs-tech-cold-current-kubo-notrace.db-* \
+  /tmp/ipfs-tech-cold-current-kubo-notrace-r3.json
+
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --fresh-gateway-per-run \
+  --gateway-db /tmp/freedom-ipfs-ipfs-tech-cold-current-kubo-notrace.db \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --comparison-output /tmp/ipfs-tech-cold-current-kubo-notrace-r3.json
+```
+
+Control artifact:
+
+- `/tmp/ipfs-tech-cold-current-kubo-notrace-r3.json`
+
+Control result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Rust root TTFB p50/p95/max: `12/1185/1185ms`.
+- Kubo root TTFB p50/p95/max: `2204/2788/2788ms`.
+- Rust asset TTFB p50/p95/max: `6/254/992ms`.
+- Kubo asset TTFB p50/p95/max: `101/596/777ms`.
+- Rust max RSS/FD: `51636KiB` / `28`.
+- Kubo max RSS/FD: `160900KiB` / `140`.
+- Rust max cache size: `2274056B`; Kubo max repo size: `834127B`.
+
+Traced Rust-only diagnostic command:
+
+```sh
+rm -f /tmp/ipfs-tech-cold-empty-store-rust-trace-r3.json \
+  /tmp/ipfs-tech-cold-empty-store-rust-trace-r3-trace.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-cold-empty-store-rust-trace-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-cold-empty-store-rust-trace-r3.json
+```
+
+Traced artifacts:
+
+- `/tmp/ipfs-tech-cold-empty-store-rust-trace-r3.json`
+- `/tmp/ipfs-tech-cold-empty-store-rust-trace-r3-trace.jsonl` (`3000` lines)
+
+Traced result:
+
+- Rust passed `3/3`.
+- Run total p50/p95/max: `2101/2485/2485ms`.
+- Root TTFB p50/p95/max: `769/779/779ms`.
+- Asset TTFB p50/p90/p95/max: `235/420/500/849ms`.
+- `block_fetch_total`: `120` events, all `http_provider`, p50/p95/max
+  `214/366/605ms`.
+- `http_provider_race_result`: `105` events, p50/p95/max `185/354/547ms`.
+- `http_provider_fetch`: `105` events, p50/p95/max `161/265/459ms`.
+- `provider_lookup`: `105` events, p50/p95/max `19/49/111ms`.
+- `delegated_provider_lookup`: `105` events, `1902` providers and `189`
+  HTTP providers observed, p50/p95/max `18/49/110ms`.
+- Delegated lookup yielded one HTTP provider for `63` block events and multiple
+  HTTP providers for `42` events.
+- Single-provider HTTP-provider races were slower than multi-provider races:
+  single-provider success p50/p95/max `225/426/547ms`; multi-provider success
+  p50/p95/max `87/189/203ms`.
+- The only single-provider winner was `https://ipfs-bridge.sia.dev/` for `63`
+  events. Direct successful fetch latency by endpoint was
+  `https://ipfs-bridge.sia.dev/` p50/p95/max `171/319/459ms` and
+  `https://dag.w3s.link/` p50/p95/max `39/74/88ms`.
+- Small-body cache behavior in true cold runs was expectedly insert-only:
+  `75` misses, `75` inserts, `0` hits, max `25` entries / `204473` bytes.
+
+Decision:
+Keep as the current fair cold baseline. The current Rust gateway is already
+faster than Kubo on root startup, full page time, asset p95, RSS, and FD count
+for this live sample. Kubo still wins asset p50. The trace says provider lookup
+is not the hot path; cold asset median is mostly bound by verified block fetches
+from HTTP providers, especially single-provider `ipfs-bridge.sia.dev` blocks.
+The next speed work should target cold asset median without increasing mobile
+resource pressure: small bounded DAG/session prefetch, Bitswap multi-want or
+session batching, or selective provider diversity for single slow HTTP-provider
+blocks.
