@@ -22394,3 +22394,66 @@ found the 200ms default competitive and public-network windows vary. The next
 evidence step should be a longer no-trace enabled-vs-disabled A/B, probably
 `repeat=10`, before deciding whether same-provider self-hedging should become
 opt-in, score-gated, or dynamically disabled after low duplicate-win rates.
+
+## 2026-05-06 Observe: No-Trace Self-Hedge Enabled vs Disabled r10
+
+Question:
+The traced winner-attempt sample showed a low duplicate win rate, and the traced
+disabled run looked slightly faster. Does a no-trace `repeat=10` sample provide
+enough evidence to disable same-provider HTTP self-hedging by default?
+
+Default command:
+
+```sh
+rm -f /tmp/ipfs-tech-self-hedge-default-r10.json
+
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --output /tmp/ipfs-tech-self-hedge-default-r10.json
+```
+
+Disabled command:
+
+```sh
+rm -f /tmp/ipfs-tech-self-hedge-disabled-r10.json
+
+FREEDOM_IPFS_DISABLE_SINGLE_HTTP_SELF_HEDGE=1 timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --output /tmp/ipfs-tech-self-hedge-disabled-r10.json
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-self-hedge-default-r10.json`
+- `/tmp/ipfs-tech-self-hedge-disabled-r10.json`
+
+Result:
+
+| Mode | Pass | Run total p50/p90/p95/max | Root TTFB p50/p90/p95/max | Asset TTFB p50/p90/p95/max | Max RSS/FD |
+| --- | --- | --- | --- | --- | --- |
+| Default `200ms` | `10/10` | `2040/2365/2454/2454ms` | `522/732/792/792ms` | `221/457/528/1038ms` | `53352KiB` / `30` |
+| Disabled | `10/10` | `1907/2200/3028/3028ms` | `528/707/784/784ms` | `215/437/495/1412ms` | `53396KiB` / `32` |
+
+Decision:
+Do not flip the default from this sample. Disabling same-provider self-hedge was
+slightly better at p50/p90/p95 asset TTFB and p50 run total, but the kept
+`200ms` default had better run p95/max and better asset max. Both modes stayed
+resource-light and passed `10/10`. The actionable conclusion is narrower: stop
+tuning raw self-hedge delay and use the new winner-attempt diagnostics in future
+longer A/Bs. A production policy change should require a larger sample across
+`ipfs.tech`, `daicowtf`, and range cases, with Kubo comparison if the default is
+changed.
