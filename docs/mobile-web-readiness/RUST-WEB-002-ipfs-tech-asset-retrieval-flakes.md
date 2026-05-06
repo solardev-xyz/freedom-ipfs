@@ -23439,3 +23439,91 @@ Do not change the production `BITSWAP_CONNECTION_READY_TIMEOUT` from `5000ms`
 without a same-window r20/r50 comparison that improves the new
 `top_level_zero_http_provider_cold_bitswap` latency scorecard without raising
 Bitswap failure, connection, RSS, or FD pressure.
+
+## 2026-05-06 Reject: 3000ms Bitswap Connection-Ready Timeout
+
+Run the same-window r20 comparison required by the lab-control section above.
+Only the connection-ready timeout changed between the two runs.
+
+Default command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 20 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-connready-default-r20-v2-trace.jsonl \
+  --output /tmp/ipfs-tech-connready-default-r20-v2.json \
+  > /tmp/ipfs-tech-connready-default-r20-v2.log 2>&1
+```
+
+`3000ms` command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_CONNECTION_READY_TIMEOUT_MS=3000 timeout 2400s \
+  cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 20 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-connready3000-r20-v2-trace.jsonl \
+  --output /tmp/ipfs-tech-connready3000-r20-v2.json \
+  > /tmp/ipfs-tech-connready3000-r20-v2.log 2>&1
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-connready-default-r20-v2.json`
+- `/tmp/ipfs-tech-connready-default-r20-v2-trace.jsonl`
+- `/tmp/ipfs-tech-connready-default-r20-v2.log`
+- `/tmp/ipfs-tech-connready3000-r20-v2.json`
+- `/tmp/ipfs-tech-connready3000-r20-v2-trace.jsonl`
+- `/tmp/ipfs-tech-connready3000-r20-v2.log`
+
+Default result:
+
+- pass `20/20`
+- run total p50/p90/p95/max: `2181/3435/3724/3818ms`
+- root TTFB p50/p90/p95/max: `593/1067/1072/1540ms`
+- asset TTFB p50/p90/p95/max: `230/488/569/1928ms`
+- request classifications:
+  `cold_bitswap_peer_expand=21`, `zero_http_provider_bitswap=21`,
+  `zero_http_provider_cold_bitswap=21`
+- `zero_http_provider_cold_bitswap` request latency:
+  `269/613/1678/1925ms`
+- Bitswap batches failures `0`; peer attempt failures `0`;
+  connection timeouts `0`
+- Bitswap connection errors `2`; max RSS/FD `54716KiB/33`
+
+`3000ms` result:
+
+- pass `20/20`
+- run total p50/p90/p95/max: `2061/4875/4893/5673ms`
+- root TTFB p50/p90/p95/max: `559/715/715/724ms`
+- asset TTFB p50/p90/p95/max: `222/476/526/5026ms`
+- request classifications:
+  `cold_bitswap_peer_expand=20`, `zero_http_provider_bitswap=20`,
+  `zero_http_provider_cold_bitswap=20`
+- `zero_http_provider_cold_bitswap` request latency:
+  `302/3292/3301/5023ms`
+- provider retries: `retry_connection_timeout=3`
+- Bitswap batches failures `3`; peer attempt failures `15`;
+  connection timeouts `15`
+- Bitswap connection errors `21`; max RSS/FD `53636KiB/33`
+
+Conclusion:
+Reject `3000ms` as a production default. The shorter wait improved root TTFB in
+this sample, but it created a clear asset tail around repeated 3s Bitswap
+connection timeouts and raised Bitswap failure/connection noise. Keep the 5s
+default and keep the env var only as a lab control. The next useful experiment
+should target zero-HTTP asset tails by changing peer selection/retry behavior,
+not by globally lowering the connection-ready timeout.
