@@ -20990,3 +20990,178 @@ Keep the CID-direct control. It shows that DNSLink/IPNS resolution is part of
 the warm root gap, but cached asset requests still trail Kubo even without name
 resolution. The next warm-path experiment should target repeated cached
 UnixFS/gateway work for asset requests rather than only name resolution.
+
+## 2026-05-06 Keep: Bounded Small Direct-Body Cache for Warm Assets
+
+Question:
+Can a small process-local cache remove repeated UnixFS range reads for hot
+small JS/CSS/SVG assets without meaningfully increasing mobile resource usage?
+
+Implementation:
+
+- Add a byte-bounded gateway small-body cache for full non-HEAD, non-range file
+  responses up to one gateway chunk (`64KiB`).
+- Default cache budget: `2MiB`, configurable with
+  `--small-body-cache-max-bytes`; `0` disables the cache.
+- Cache key: `(file_cid, len)`, so cached bodies remain content-addressed.
+- Range responses, HEAD, and larger streamed bodies continue through the
+  existing paths.
+- Gateway traces now emit `gateway_small_body_cache` hit/miss/insert/eviction
+  counters, and the mobile web harness reports aggregate cache stats.
+
+Focused validation before live run:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-gateway small_body_cache -- --nocapture
+cargo test -p freedom-ipfs-gateway gateway_reuses_small_direct_body_cache_for_repeated_assets -- --nocapture
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details -- --nocapture
+cargo check -p freedom-ipfs-gateway --all-targets
+cargo check -p mobile-web-harness --all-targets
+cargo test -p mobile-web-harness offline_replay_summary -- --nocapture
+```
+
+Focused result:
+All focused checks passed.
+
+Disabled-cache baseline:
+
+```sh
+rm -f /tmp/freedom-ipfs-cid-direct-no-body-cache.db \
+  /tmp/freedom-ipfs-cid-direct-no-body-cache.db-* \
+  /tmp/ipfs-tech-cid-direct-no-body-cache-r5.json \
+  /tmp/ipfs-tech-cid-direct-no-body-cache-r5-trace.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --gateway-db /tmp/freedom-ipfs-cid-direct-no-body-cache.db \
+  --small-body-cache-max-bytes 0 \
+  --case ipfs-tech-page-assets-cid-direct \
+  --warmup-runs 1 \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-cid-direct-no-body-cache-r5-trace.jsonl \
+  --output /tmp/ipfs-tech-cid-direct-no-body-cache-r5.json
+```
+
+Enabled-cache run:
+
+```sh
+rm -f /tmp/freedom-ipfs-cid-direct-small-body-cache.db \
+  /tmp/freedom-ipfs-cid-direct-small-body-cache.db-* \
+  /tmp/ipfs-tech-cid-direct-small-body-cache-r5.json \
+  /tmp/ipfs-tech-cid-direct-small-body-cache-r5-trace.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --gateway-db /tmp/freedom-ipfs-cid-direct-small-body-cache.db \
+  --case ipfs-tech-page-assets-cid-direct \
+  --warmup-runs 1 \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-cid-direct-small-body-cache-r5-trace.jsonl \
+  --output /tmp/ipfs-tech-cid-direct-small-body-cache-r5.json
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-cid-direct-no-body-cache-r5.json`
+- `/tmp/ipfs-tech-cid-direct-no-body-cache-r5-trace.jsonl` (`3029` lines)
+- `/tmp/ipfs-tech-cid-direct-small-body-cache-r5.json`
+- `/tmp/ipfs-tech-cid-direct-small-body-cache-r5-trace.jsonl` (`2781` lines)
+
+Result:
+
+- Both runs passed `5/5`.
+- Disabled run total p50/p95/max: `33/51/51ms`.
+- Enabled run total p50/p95/max: `23/55/55ms`.
+- Disabled root TTFB p50/p95/max: `3/4/4ms`.
+- Enabled root TTFB p50/p95/max: `2/5/5ms`.
+- Disabled asset TTFB p50/p95/max: `4/7/10ms` over `160` asset requests.
+- Enabled asset TTFB p50/p95/max: `2/7/13ms` over `160` asset requests.
+- Disabled asset total p50/p95/max: `4/7/10ms`.
+- Enabled asset total p50/p95/max: `3/7/13ms`.
+- Disabled RSS/FD max: `45632KiB` / `26`.
+- Enabled RSS/FD max: `47340KiB` / `27`.
+- Enabled cache trace: `175` cache events, `125` hits, `25` misses, `25`
+  inserts, `0` evictions, `1022365` bytes served from the small-body cache,
+  max cached body `61741` bytes, max cache occupancy `25` entries /
+  `204473` bytes.
+
+Same-window Kubo comparison with the cache enabled:
+
+```sh
+rm -f /tmp/freedom-ipfs-ipfs-tech-cid-direct-small-body-cache-kubo.db \
+  /tmp/freedom-ipfs-ipfs-tech-cid-direct-small-body-cache-kubo.db-* \
+  /tmp/ipfs-tech-cid-direct-small-body-cache-kubo-r3.json \
+  /tmp/ipfs-tech-cid-direct-small-body-cache-kubo-r3-trace.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --gateway-db /tmp/freedom-ipfs-ipfs-tech-cid-direct-small-body-cache-kubo.db \
+  --case ipfs-tech-page-assets-cid-direct \
+  --warmup-runs 1 \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-cid-direct-small-body-cache-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-cid-direct-small-body-cache-kubo-r3.json
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-cid-direct-small-body-cache-kubo-r3.json`
+- `/tmp/ipfs-tech-cid-direct-small-body-cache-kubo-r3-trace.jsonl` (`2042`
+  lines)
+
+Comparison result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Rust run total p50/p95/max: `44/65/65ms`.
+- Kubo run total p50/p95/max: `30/32/32ms`.
+- Rust root TTFB p50/p95/max: `4/4/4ms`.
+- Kubo root TTFB p50/p95/max: `2/2/2ms`.
+- Rust asset TTFB p50/p95/max: `4/7/8ms`.
+- Kubo asset TTFB p50/p95/max: `2/3/4ms`.
+- Rust max RSS/FD: `47376KiB` / `29`.
+- Kubo max RSS/FD: `285492KiB` / `187`.
+- Rust used `0.17x` Kubo RSS and `0.16x` Kubo FD count.
+- Rust trace cache stats: `125` cache events, `75` hits, `25` misses, `25`
+  inserts, `0` evictions, `613419` bytes served from the small-body cache, max
+  cache occupancy `25` entries / `204473` bytes.
+
+Final validation:
+
+```sh
+cargo fmt --all --check
+git diff --check
+cargo test -p freedom-ipfs-gateway
+cargo test -p mobile-web-harness
+cargo clippy -p freedom-ipfs-gateway --all-targets -- -D warnings
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+cargo check --workspace --all-targets
+```
+
+Final validation result:
+All commands passed. Gateway tests covered cache reuse and byte-budget eviction;
+mobile harness tests covered the new trace aggregate.
+
+Decision:
+Keep. This is a targeted warm-path improvement for repeated cached page assets:
+asset p50 improved from `4ms` to `2ms`, total run p50 improved from `33ms` to
+`23ms`, and the observed cache footprint was only about `200KiB` for the
+`ipfs.tech` CID-direct corpus. The p95 stayed flat and max outliers were a few
+milliseconds higher in the A/B sample, and the same-window Kubo check still
+shows Kubo ahead on warm same-daemon asset p50/p95. Follow-up soak testing
+should watch tails and continue reducing repeated cached path/file-size work,
+but the change is bounded, opt-out configurable, and moves the median hot asset
+path in the right direction.

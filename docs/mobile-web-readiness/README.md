@@ -331,11 +331,12 @@ status, MIME type, byte count, and timing.
   provider candidate set; a same-window `vitalik-root-html-range` comparison
   dropped Rust root TTFB from `4907ms` to `3080ms` and root
   `bitswap_peer_expand` from `1397ms` to `940ms`. Later warm-path follow-ups
-  added bounded UnixFS path and file-size caches and a conservative direct-body
-  path for non-HEAD responses up to one gateway chunk. In the latest
-  `ipfs.tech-page-assets` warm persistent comparison, Rust passed 3/3 with
-  root p50/p95 `20/20ms`, asset p50/p95 `8/43ms`, and 124 traced direct-body
-  responses, while Kubo passed 3/3 with root `2/3ms` and asset `3/5ms`.
+  added bounded UnixFS path and file-size caches, a conservative direct-body
+  path for non-HEAD responses up to one gateway chunk, and a byte-bounded
+  small-body cache for repeated hot assets. In a later CID-direct `ipfs.tech`
+  warm same-daemon sample, enabling the `2MiB` small-body cache improved run
+  total p50 from `33ms` to `23ms` and asset TTFB p50 from `4ms` to `2ms`,
+  with about `200KiB` observed cache occupancy.
 
 ## Next Scenario Targets
 

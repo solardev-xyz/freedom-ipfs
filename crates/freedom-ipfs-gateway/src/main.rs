@@ -4,7 +4,7 @@ use clap::{Parser, ValueEnum};
 use freedom_ipfs_core::parse_cid;
 use freedom_ipfs_gateway::{
     router_with_provider_and_name_resolver_config, GatewayConfig, PersistentNameResolver,
-    DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
+    DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS, DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
 };
 use freedom_ipfs_namesys::{
     CachedNameResolver, CloudflareDohResolver, DefaultNameResolver, DelegatedIpnsResolver,
@@ -48,6 +48,8 @@ struct Args {
     routing_mode: RoutingMode,
     #[arg(long, default_value_t = DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS)]
     max_concurrent_requests: usize,
+    #[arg(long, default_value_t = DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES)]
+    small_body_cache_max_bytes: usize,
     #[arg(long, default_value_t = DEFAULT_DHT_QUERY_TIMEOUT.as_secs())]
     dht_query_timeout_secs: u64,
     #[arg(long, default_value_t = DEFAULT_MAX_DHT_PROVIDERS)]
@@ -94,7 +96,8 @@ async fn main() -> Result<()> {
         eprintln!("root: {root}");
     }
 
-    let gateway_config = GatewayConfig::new(args.max_concurrent_requests);
+    let gateway_config = GatewayConfig::new(args.max_concurrent_requests)
+        .with_small_body_cache_max_bytes(args.small_body_cache_max_bytes);
     let router = if start_online_gateway {
         let delegated_routers = args.delegated_router.clone();
         let delegated_router_endpoints = delegated_router_endpoints(&delegated_routers);

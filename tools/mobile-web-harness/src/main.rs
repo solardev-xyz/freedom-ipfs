@@ -23,6 +23,7 @@ use tokio::task::{JoinHandle, JoinSet};
 const DEFAULT_CORPUS: &str = "tools/mobile-web-harness/corpus/mobile-web.json";
 const DEFAULT_KUBO_BIN: &str = "target/tools/kubo/kubo/ipfs";
 const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
+const DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_ASSET_CONCURRENCY: usize = 6;
 const MAX_TRACE_SLOW_EVENTS: usize = 16;
 const X_FREEDOM_REQUEST_ID: &str = "X-Freedom-Request-ID";
@@ -120,6 +121,9 @@ struct Args {
     /// Gateway request concurrency budget when spawning a gateway.
     #[arg(long, alias = "gateway-max-concurrent-requests", default_value_t = DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS)]
     max_concurrent_requests: usize,
+    /// Small in-memory full-body response cache byte budget for spawned Rust gateways.
+    #[arg(long, default_value_t = DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES)]
+    small_body_cache_max_bytes: usize,
     /// Gateway routing mode when spawning a gateway.
     #[arg(long, default_value = "auto")]
     routing_mode: String,
@@ -528,6 +532,8 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
         conditional_revalidate: args.conditional_revalidate,
         run_timeout_secs: (args.run_timeout_secs > 0).then_some(args.run_timeout_secs),
         engine: args.engine,
+        small_body_cache_max_bytes: (args.engine == HarnessEngine::Rust)
+            .then_some(args.small_body_cache_max_bytes),
         gateway_db: args
             .gateway_db
             .as_ref()
@@ -959,6 +965,7 @@ fn print_summary(report: &RunReport) {
         }
         print_trace_gateway_limiter(trace);
         print_trace_unixfs_metadata_cache(trace);
+        print_trace_gateway_small_body_cache(trace);
         print_trace_gateway_direct_body(trace);
         print_trace_gateway_stream_body(trace);
         print_trace_http_provider_races(trace);
@@ -1381,6 +1388,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_gateway_limiter(trace);
     print_trace_progress_request_groups(trace);
     print_trace_timeout_recovery(trace);
+    print_trace_gateway_small_body_cache(trace);
     print_trace_gateway_direct_body(trace);
     print_trace_gateway_stream_body(trace);
     print_trace_http_provider_races(trace);
@@ -1760,6 +1768,25 @@ fn print_trace_gateway_direct_body(trace: &TraceSummary) {
     println!(
         "  gateway direct bodies: events={} bytes={} max_body_len={} max_elapsed_ms={}",
         direct.events, direct.bytes, direct.max_body_len, direct.max_elapsed_ms
+    );
+}
+
+fn print_trace_gateway_small_body_cache(trace: &TraceSummary) {
+    let cache = &trace.gateway_small_body_cache;
+    if cache.events == 0 {
+        return;
+    }
+    println!(
+        "  gateway small body cache: events={} hits={} misses={} inserts={} evictions={} bytes_served={} max_body_len={} max_cache_len={} max_cache_bytes={}",
+        cache.events,
+        cache.hits,
+        cache.misses,
+        cache.inserts,
+        cache.evictions,
+        cache.bytes_served,
+        cache.max_body_len,
+        cache.max_cache_len,
+        cache.max_cache_bytes
     );
 }
 
@@ -3559,6 +3586,8 @@ impl SpawnedGateway {
             .arg(routing_mode)
             .arg("--max-concurrent-requests")
             .arg(args.max_concurrent_requests.to_string())
+            .arg("--small-body-cache-max-bytes")
+            .arg(args.small_body_cache_max_bytes.to_string())
             .arg("--dht-query-timeout-secs")
             .arg(args.dht_query_timeout_secs.to_string())
             .arg("--dht-max-providers")
@@ -4128,6 +4157,7 @@ struct RunReport {
     conditional_revalidate: bool,
     run_timeout_secs: Option<u64>,
     engine: HarnessEngine,
+    small_body_cache_max_bytes: Option<usize>,
     gateway_db: Option<String>,
     gateway_import_car: Option<String>,
     bitswap_seed_car: Option<String>,
@@ -4876,6 +4906,7 @@ struct TraceSummary {
     gateway_limiter_denials: usize,
     gateway_limiter: TraceGatewayLimiterAggregate,
     gateway_request_elapsed_ms: LatencySummary,
+    gateway_small_body_cache: TraceGatewaySmallBodyCacheAggregate,
     gateway_direct_body: TraceGatewayDirectBodyAggregate,
     gateway_stream_body: TraceGatewayStreamBodyAggregate,
     http_provider_races: TraceHttpProviderRaceAggregate,
@@ -5753,6 +5784,19 @@ impl TraceProviderDiversityLowBuilder {
 }
 
 #[derive(Debug, Default, Serialize)]
+struct TraceGatewaySmallBodyCacheAggregate {
+    events: usize,
+    hits: u128,
+    misses: u128,
+    inserts: u128,
+    evictions: u128,
+    bytes_served: u128,
+    max_body_len: u128,
+    max_cache_len: u128,
+    max_cache_bytes: u128,
+}
+
+#[derive(Debug, Default, Serialize)]
 struct TraceGatewayDirectBodyAggregate {
     events: usize,
     bytes: u128,
@@ -6407,6 +6451,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut gateway_limiter_denied_elapsed_values = Vec::<u128>::new();
     let mut gateway_limiter_max_timeout_ms = 0u128;
     let mut gateway_request_elapsed_values = Vec::<u128>::new();
+    let mut gateway_small_body_cache = TraceGatewaySmallBodyCacheAggregate::default();
     let mut gateway_direct_body = TraceGatewayDirectBodyAggregate::default();
     let mut gateway_stream_body = TraceGatewayStreamBodyAggregate::default();
     let mut http_provider_races = TraceHttpProviderRaceAggregate::default();
@@ -6744,6 +6789,43 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 }
                 None => {}
             }
+        }
+        if phase == "gateway_small_body_cache" {
+            gateway_small_body_cache.events += 1;
+            match value.get("cache_hit").and_then(|hit| hit.as_bool()) {
+                Some(true) => gateway_small_body_cache.hits += 1,
+                Some(false) => gateway_small_body_cache.misses += 1,
+                None => {}
+            }
+            if value
+                .get("cache_inserted")
+                .and_then(|inserted| inserted.as_bool())
+                == Some(true)
+            {
+                gateway_small_body_cache.inserts += 1;
+            }
+            gateway_small_body_cache.evictions +=
+                value.get("evicted").and_then(json_u128).unwrap_or_default();
+            let body_len = value
+                .get("body_len")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            gateway_small_body_cache.bytes_served += body_len;
+            gateway_small_body_cache.max_body_len =
+                gateway_small_body_cache.max_body_len.max(body_len);
+            gateway_small_body_cache.max_cache_len = gateway_small_body_cache.max_cache_len.max(
+                value
+                    .get("cache_len")
+                    .and_then(json_u128)
+                    .unwrap_or_default(),
+            );
+            gateway_small_body_cache.max_cache_bytes =
+                gateway_small_body_cache.max_cache_bytes.max(
+                    value
+                        .get("cache_bytes")
+                        .and_then(json_u128)
+                        .unwrap_or_default(),
+                );
         }
         if phase == "gateway_direct_body" {
             gateway_direct_body.events += 1;
@@ -7630,6 +7712,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             max_timeout_ms: gateway_limiter_max_timeout_ms,
         },
         gateway_request_elapsed_ms: LatencySummary::from_values(gateway_request_elapsed_values),
+        gateway_small_body_cache,
         gateway_direct_body,
         gateway_stream_body,
         http_provider_races,
@@ -9758,6 +9841,41 @@ mod tests {
     }
 
     #[test]
+    fn trace_summary_counts_gateway_small_body_cache() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-small-body-cache-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"gateway_small_body_cache\",\"cache_hit\":true,\"body_len\":512,\"elapsed_ms\":0}\n",
+                "{\"phase\":\"gateway_small_body_cache\",\"cache_hit\":false,\"elapsed_ms\":0}\n",
+                "{\"phase\":\"gateway_small_body_cache\",\"cache_inserted\":true,\"evicted\":1,\"cache_len\":2,\"cache_bytes\":1536}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(summary.gateway_small_body_cache.events, 3);
+        assert_eq!(summary.gateway_small_body_cache.hits, 1);
+        assert_eq!(summary.gateway_small_body_cache.misses, 1);
+        assert_eq!(summary.gateway_small_body_cache.inserts, 1);
+        assert_eq!(summary.gateway_small_body_cache.evictions, 1);
+        assert_eq!(summary.gateway_small_body_cache.bytes_served, 512);
+        assert_eq!(summary.gateway_small_body_cache.max_body_len, 512);
+        assert_eq!(summary.gateway_small_body_cache.max_cache_len, 2);
+        assert_eq!(summary.gateway_small_body_cache.max_cache_bytes, 1536);
+    }
+
+    #[test]
     fn trace_summary_keeps_restarted_gateway_request_ids_separate() {
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -10606,6 +10724,7 @@ mod tests {
             conditional_revalidate: false,
             run_timeout_secs: None,
             engine: HarnessEngine::Rust,
+            small_body_cache_max_bytes: Some(DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES),
             gateway_db: Some("/tmp/replay.db".to_string()),
             gateway_import_car: None,
             bitswap_seed_car: None,
@@ -10684,6 +10803,7 @@ mod tests {
             conditional_revalidate: false,
             run_timeout_secs: None,
             engine: HarnessEngine::Rust,
+            small_body_cache_max_bytes: Some(DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES),
             gateway_db: Some("/tmp/replay.db".to_string()),
             gateway_import_car: None,
             bitswap_seed_car: None,
@@ -11455,6 +11575,8 @@ mod tests {
             conditional_revalidate: false,
             run_timeout_secs: None,
             engine,
+            small_body_cache_max_bytes: (engine == HarnessEngine::Rust)
+                .then_some(DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES),
             gateway_db: None,
             gateway_import_car: None,
             bitswap_seed_car: Some("/tmp/mobile-fixture.car".to_string()),

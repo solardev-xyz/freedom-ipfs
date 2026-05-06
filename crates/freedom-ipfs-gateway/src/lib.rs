@@ -18,7 +18,7 @@ use freedom_ipfs_unixfs::{
     DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY,
 };
 use futures::stream;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +31,8 @@ use tracing::Instrument;
 pub const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 const GATEWAY_REQUEST_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 const GATEWAY_STREAM_CHUNK_SIZE: u64 = 64 * 1024;
+const GATEWAY_SMALL_BODY_CACHE_MAX_ENTRY_BYTES: usize = GATEWAY_STREAM_CHUNK_SIZE as usize;
+pub const DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const X_FREEDOM_REQUEST_ID: &str = "x-freedom-request-id";
 const X_FREEDOM_PARENT_REQUEST_ID: &str = "x-freedom-parent-request-id";
 const X_FREEDOM_TOP_LEVEL_PATH: &str = "x-freedom-top-level-path";
@@ -54,10 +56,122 @@ impl GatewayBodyMode {
     }
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct SmallBodyCacheKey {
+    file_cid: Cid,
+    len: u64,
+}
+
+#[derive(Debug)]
+struct SmallBodyCache {
+    max_bytes: usize,
+    inner: Mutex<SmallBodyCacheInner>,
+}
+
+#[derive(Debug, Default)]
+struct SmallBodyCacheInner {
+    entries: HashMap<SmallBodyCacheKey, Bytes>,
+    order: VecDeque<SmallBodyCacheKey>,
+    bytes: usize,
+}
+
+impl SmallBodyCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            inner: Mutex::new(SmallBodyCacheInner::default()),
+        }
+    }
+
+    fn get(&self, key: &SmallBodyCacheKey) -> Option<Bytes> {
+        if self.max_bytes == 0 {
+            return None;
+        }
+        let mut inner = self.lock_inner();
+        let body = inner.entries.get(key).cloned();
+        if body.is_some() {
+            touch_small_body_cache_order(&mut inner, key);
+        }
+        body
+    }
+
+    fn insert(&self, key: SmallBodyCacheKey, body: Bytes) -> SmallBodyCacheInsert {
+        let body_len = body.len();
+        if self.max_bytes == 0
+            || body_len > self.max_bytes
+            || body_len > GATEWAY_SMALL_BODY_CACHE_MAX_ENTRY_BYTES
+        {
+            return SmallBodyCacheInsert {
+                inserted: false,
+                evicted: 0,
+                cache_len: self.len(),
+                cache_bytes: self.bytes(),
+            };
+        }
+
+        let mut inner = self.lock_inner();
+        if let Some(previous) = inner.entries.insert(key.clone(), body) {
+            inner.bytes = inner.bytes.saturating_sub(previous.len());
+        }
+        inner.bytes = inner.bytes.saturating_add(body_len);
+        touch_small_body_cache_order(&mut inner, &key);
+
+        let mut evicted = 0usize;
+        while inner.bytes > self.max_bytes {
+            let Some(evicted_key) = inner.order.pop_front() else {
+                break;
+            };
+            if evicted_key == key {
+                inner.order.push_back(evicted_key);
+                break;
+            }
+            if let Some(evicted_body) = inner.entries.remove(&evicted_key) {
+                inner.bytes = inner.bytes.saturating_sub(evicted_body.len());
+                evicted = evicted.saturating_add(1);
+            }
+        }
+
+        SmallBodyCacheInsert {
+            inserted: true,
+            evicted,
+            cache_len: inner.entries.len(),
+            cache_bytes: inner.bytes,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.lock_inner().entries.len()
+    }
+
+    fn bytes(&self) -> usize {
+        self.lock_inner().bytes
+    }
+
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, SmallBodyCacheInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[derive(Debug)]
+struct SmallBodyCacheInsert {
+    inserted: bool,
+    evicted: usize,
+    cache_len: usize,
+    cache_bytes: usize,
+}
+
+fn touch_small_body_cache_order(inner: &mut SmallBodyCacheInner, key: &SmallBodyCacheKey) {
+    inner.order.retain(|candidate| candidate != key);
+    inner.order.push_back(key.clone());
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     max_concurrent_requests: usize,
     unixfs_metadata_cache_capacity: usize,
+    small_body_cache_max_bytes: usize,
 }
 
 impl GatewayConfig {
@@ -65,6 +179,7 @@ impl GatewayConfig {
         Self {
             max_concurrent_requests: max_concurrent_requests.max(1),
             unixfs_metadata_cache_capacity: DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY,
+            small_body_cache_max_bytes: DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
         }
     }
 
@@ -78,6 +193,15 @@ impl GatewayConfig {
 
     pub fn with_unixfs_metadata_cache_capacity(mut self, capacity: usize) -> Self {
         self.unixfs_metadata_cache_capacity = capacity;
+        self
+    }
+
+    pub fn small_body_cache_max_bytes(&self) -> usize {
+        self.small_body_cache_max_bytes
+    }
+
+    pub fn with_small_body_cache_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.small_body_cache_max_bytes = max_bytes;
         self
     }
 }
@@ -94,6 +218,7 @@ pub struct GatewayState {
     name_resolver: Arc<dyn NameResolver>,
     unixfs: UnixfsResolver,
     request_limiter: Arc<Semaphore>,
+    small_body_cache: Arc<SmallBodyCache>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -151,6 +276,7 @@ impl GatewayState {
             name_resolver,
             unixfs,
             request_limiter: Arc::new(Semaphore::new(config.max_concurrent_requests())),
+            small_body_cache: Arc::new(SmallBodyCache::new(config.small_body_cache_max_bytes())),
         }
     }
 }
@@ -380,6 +506,7 @@ async fn ipfs_get(
         let response = match serve_ipfs_path(
             state.provider.clone(),
             state.unixfs.clone(),
+            state.small_body_cache.clone(),
             &path,
             GatewayRequestHeaders {
                 range: headers.get(RANGE),
@@ -451,6 +578,7 @@ async fn ipns_get(
         let response = match serve_ipns_path(
             state.provider.clone(),
             state.unixfs.clone(),
+            state.small_body_cache.clone(),
             state.name_resolver.as_ref(),
             &path,
             GatewayRequestHeaders {
@@ -554,12 +682,14 @@ struct GatewayRequestHeaders<'a> {
 async fn serve_ipfs_path(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
+    small_body_cache: Arc<SmallBodyCache>,
     path: &str,
     request_headers: GatewayRequestHeaders<'_>,
 ) -> Result<Response, GatewayError> {
     serve_ipfs_path_with_listing_path(
         provider,
         unixfs,
+        small_body_cache,
         path,
         request_headers,
         None,
@@ -571,6 +701,7 @@ async fn serve_ipfs_path(
 async fn serve_ipfs_path_with_listing_path(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
+    small_body_cache: Arc<SmallBodyCache>,
     path: &str,
     request_headers: GatewayRequestHeaders<'_>,
     listing_path: Option<&DirectoryListingPath>,
@@ -655,7 +786,13 @@ async fn serve_ipfs_path_with_listing_path(
             if let Some((start, end)) = parsed_range {
                 ranged_response(provider, unixfs.clone(), target, start, end, headers)?
             } else {
-                streaming_response(provider, unixfs.clone(), target, headers)?
+                streaming_response(
+                    provider,
+                    unixfs.clone(),
+                    small_body_cache.clone(),
+                    target,
+                    headers,
+                )?
             }
         }
         ServedResource::Directory { path, entries } => {
@@ -1001,6 +1138,7 @@ fn split_ipfs_path(path: &str) -> Result<(Cid, &str), GatewayError> {
 async fn serve_ipns_path(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
+    small_body_cache: Arc<SmallBodyCache>,
     name_resolver: &dyn NameResolver,
     path: &str,
     request_headers: GatewayRequestHeaders<'_>,
@@ -1013,6 +1151,7 @@ async fn serve_ipns_path(
             return serve_ipfs_path_with_listing_path(
                 provider.clone(),
                 unixfs.clone(),
+                small_body_cache.clone(),
                 ipfs,
                 request_headers,
                 Some(&listing_path),
@@ -1187,6 +1326,7 @@ struct GatewayStreamState {
 fn streaming_response(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
+    small_body_cache: Arc<SmallBodyCache>,
     target: FileResponseTarget,
     headers: FileResponseHeaders<'_>,
 ) -> Result<Response, GatewayError> {
@@ -1201,22 +1341,68 @@ fn streaming_response(
         let body = if len == 0 {
             Bytes::new()
         } else {
-            let started = Instant::now();
-            let bytes = unixfs
-                .read_file_cid_range(provider.as_ref(), &file_cid, 0, end)
-                .map(Bytes::from)
-                .map_err(GatewayError::Unixfs)?;
-            tracing::info!(
-                phase = "gateway_direct_body",
-                cid = %root_cid,
-                file_cid = %file_cid,
-                unixfs_path = %path,
-                range_start = 0u64,
-                range_end = end,
-                body_len = bytes.len(),
-                elapsed_ms = started.elapsed().as_millis()
-            );
-            bytes
+            let cache_key = SmallBodyCacheKey { file_cid, len };
+            let cache_started = Instant::now();
+            if let Some(bytes) = small_body_cache.get(&cache_key) {
+                tracing::info!(
+                    phase = "gateway_small_body_cache",
+                    cid = %root_cid,
+                    file_cid = %file_cid,
+                    unixfs_path = %path,
+                    cache_hit = true,
+                    body_len = bytes.len(),
+                    elapsed_ms = cache_started.elapsed().as_millis()
+                );
+                tracing::info!(
+                    phase = "gateway_direct_body",
+                    cid = %root_cid,
+                    file_cid = %file_cid,
+                    unixfs_path = %path,
+                    range_start = 0u64,
+                    range_end = end,
+                    body_len = bytes.len(),
+                    source = "small_body_cache",
+                    elapsed_ms = cache_started.elapsed().as_millis()
+                );
+                bytes
+            } else {
+                tracing::info!(
+                    phase = "gateway_small_body_cache",
+                    cid = %root_cid,
+                    file_cid = %file_cid,
+                    unixfs_path = %path,
+                    cache_hit = false,
+                    elapsed_ms = cache_started.elapsed().as_millis()
+                );
+                let started = Instant::now();
+                let bytes = unixfs
+                    .read_file_cid_range(provider.as_ref(), &file_cid, 0, end)
+                    .map(Bytes::from)
+                    .map_err(GatewayError::Unixfs)?;
+                tracing::info!(
+                    phase = "gateway_direct_body",
+                    cid = %root_cid,
+                    file_cid = %file_cid,
+                    unixfs_path = %path,
+                    range_start = 0u64,
+                    range_end = end,
+                    body_len = bytes.len(),
+                    source = "unixfs",
+                    elapsed_ms = started.elapsed().as_millis()
+                );
+                let insert = small_body_cache.insert(cache_key, bytes.clone());
+                tracing::info!(
+                    phase = "gateway_small_body_cache",
+                    cid = %root_cid,
+                    file_cid = %file_cid,
+                    unixfs_path = %path,
+                    cache_inserted = insert.inserted,
+                    evicted = insert.evicted,
+                    cache_len = insert.cache_len,
+                    cache_bytes = insert.cache_bytes
+                );
+                bytes
+            }
         };
         let mut response = Body::from(body).into_response();
         set_gateway_body_mode(&mut response, GatewayBodyMode::Direct);
@@ -1937,6 +2123,75 @@ mod tests {
         assert_eq!(body.as_ref(), data);
         assert_eq!(provider.call_count(&dir_cid), 1);
         assert_eq!(provider.call_count(&file_cid), 1);
+    }
+
+    #[tokio::test]
+    async fn gateway_reuses_small_direct_body_cache_for_repeated_assets() {
+        let data = b"console.log('small cached asset');";
+        let file_block = test_pb_file(data);
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_block);
+        let dir_block = test_pb_directory(vec![test_link("app.js", &file_cid)]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (dir_cid, dir_block),
+            (file_cid, file_block),
+        ])));
+        let state = GatewayState::with_provider(provider.clone());
+
+        let first = ipfs_get(
+            State(state.clone()),
+            Path(format!("{dir_cid}/app.js")),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(first_body.as_ref(), data);
+        let dir_calls = provider.call_count(&dir_cid);
+        let file_calls = provider.call_count(&file_cid);
+
+        let second = ipfs_get(
+            State(state),
+            Path(format!("{dir_cid}/app.js")),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(second_body.as_ref(), data);
+        assert_eq!(provider.call_count(&dir_cid), dir_calls);
+        assert_eq!(provider.call_count(&file_cid), file_calls);
+    }
+
+    #[test]
+    fn small_body_cache_evicts_to_byte_budget() {
+        let first = cid_from_data(CODEC_RAW, b"one");
+        let second = cid_from_data(CODEC_RAW, b"two");
+        let cache = SmallBodyCache::new(5);
+        let first_key = SmallBodyCacheKey {
+            file_cid: first,
+            len: 3,
+        };
+        let second_key = SmallBodyCacheKey {
+            file_cid: second,
+            len: 3,
+        };
+
+        let first_insert = cache.insert(first_key.clone(), Bytes::from_static(b"one"));
+        assert!(first_insert.inserted);
+        assert_eq!(first_insert.evicted, 0);
+        let second_insert = cache.insert(second_key.clone(), Bytes::from_static(b"two"));
+
+        assert!(second_insert.inserted);
+        assert_eq!(second_insert.evicted, 1);
+        assert!(cache.get(&first_key).is_none());
+        assert_eq!(cache.get(&second_key).unwrap(), Bytes::from_static(b"two"));
     }
 
     #[tokio::test]
