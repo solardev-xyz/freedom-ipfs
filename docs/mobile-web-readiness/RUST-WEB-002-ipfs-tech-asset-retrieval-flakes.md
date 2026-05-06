@@ -22275,3 +22275,122 @@ trace on run total, root TTFB, asset p50/p95, single-provider result latency,
 and RSS/FD. It also fired more duplicate same-provider requests than `200ms`
 without the block-tail improvement seen at `150ms`. Keep `200ms` as the default
 and move the next optimization effort away from raw self-hedge delay tuning.
+
+## 2026-05-06 Keep: Trace Same-Provider Self-Hedge Winners
+
+Question:
+The harness could count same-provider HTTP self-hedge starts, but could not say
+whether the original request or the duplicate request won. That made delay
+tuning too indirect. Add explicit winner-attempt diagnostics, then use them to
+decide whether more self-hedge tuning is worth doing.
+
+Implementation:
+
+- Add `winner_attempt_index` to `http_provider_race_result` events.
+- Add `attempt_index=1` to `http_provider_self_hedge` start events.
+- Add `winner_self_hedge_attempt=true|false` on same-provider self-hedge race
+  winners.
+- Extend the harness HTTP-provider race summary with:
+  - all same-provider self-hedge winners split by `initial`, `hedged`, and
+    `unknown`
+  - fired self-hedge results split by `fired_initial`, `fired_hedged`, and
+    `fired_unknown`
+  - max winner attempt index
+
+Focused validation:
+
+```sh
+cargo test -p mobile-web-harness trace_summary_counts_http_provider_fetches -- --nocapture
+cargo test -p freedom-ipfs-retrieval self_hedges_slow_single_http_provider -- --nocapture
+```
+
+Result:
+
+- Harness HTTP-provider trace summary test passed.
+- Focused retrieval self-hedge test passed.
+
+Traced default command:
+
+```sh
+rm -f /tmp/ipfs-tech-self-hedge-winner-attempt-final-r3.json \
+  /tmp/ipfs-tech-self-hedge-winner-attempt-final-r3-trace.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-self-hedge-winner-attempt-final-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-self-hedge-winner-attempt-final-r3.json
+```
+
+Default artifacts:
+
+- `/tmp/ipfs-tech-self-hedge-winner-attempt-final-r3.json`
+- `/tmp/ipfs-tech-self-hedge-winner-attempt-final-r3-trace.jsonl`
+
+Default result:
+
+- Passed `3/3`.
+- Run total p50/p95/max: `2641/2851/2851ms`.
+- Root TTFB p50/p95/max: `717/768/768ms`.
+- Asset TTFB p50/p95/max: `239/672/836ms`.
+- Max RSS/FD: `53684KiB` / `31`.
+- HTTP-provider self-hedges: `32`.
+- Same-provider winners: `initial=52`, `hedged=3`, `unknown=0`.
+- Fired self-hedge results: `32`; `fired_initial=29`, `fired_hedged=3`,
+  `fired_unknown=0`.
+- Single-provider result p50/p95/max: `223/458/679ms`.
+- HTTP-provider block fetch p50/p95/max: `226/533/831ms`.
+- Block source mix: HTTP-provider `106`, Bitswap `14`.
+
+Same-window disabled command:
+
+```sh
+rm -f /tmp/ipfs-tech-self-hedge-winner-disabled-r3.json \
+  /tmp/ipfs-tech-self-hedge-winner-disabled-r3-trace.jsonl
+
+FREEDOM_IPFS_DISABLE_SINGLE_HTTP_SELF_HEDGE=1 timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-self-hedge-winner-disabled-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-self-hedge-winner-disabled-r3.json
+```
+
+Disabled artifacts:
+
+- `/tmp/ipfs-tech-self-hedge-winner-disabled-r3.json`
+- `/tmp/ipfs-tech-self-hedge-winner-disabled-r3-trace.jsonl`
+
+Disabled result:
+
+- Passed `3/3`.
+- Run total p50/p95/max: `2449/2469/2469ms`.
+- Root TTFB p50/p95/max: `821/840/840ms`.
+- Asset TTFB p50/p95/max: `228/568/982ms`.
+- Max RSS/FD: `53124KiB` / `31`.
+- HTTP-provider self-hedges: `0`.
+- Single-provider result p50/p95/max: `214/508/691ms`.
+- HTTP-provider block fetch p50/p95/max: `229/528/743ms`.
+- Block source mix: HTTP-provider `91`, Bitswap `29`.
+
+Decision:
+Keep the diagnostics. They show that in this live window only `3` of `32`
+fired duplicate same-provider requests actually won. The disabled run was also
+slightly faster on run total and asset p95, while using a similar RSS/FD shape
+and letting the normal Bitswap session path win more blocks. Do not flip the
+default from this single same-window sample, because prior Kubo comparisons
+found the 200ms default competitive and public-network windows vary. The next
+evidence step should be a longer no-trace enabled-vs-disabled A/B, probably
+`repeat=10`, before deciding whether same-provider self-hedging should become
+opt-in, score-gated, or dynamically disabled after low duplicate-win rates.

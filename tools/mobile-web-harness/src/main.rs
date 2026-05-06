@@ -1915,6 +1915,22 @@ fn print_trace_http_provider_races(trace: &TraceSummary) {
             race.multi_provider_success_elapsed_ms
         );
     }
+    if race.self_hedge_winner_initial_events > 0
+        || race.self_hedge_winner_hedged_events > 0
+        || race.self_hedge_winner_unknown_events > 0
+    {
+        println!(
+            "    self-hedge winners: initial={} hedged={} unknown={} fired_results={} fired_initial={} fired_hedged={} fired_unknown={} winner_attempt_max={}",
+            race.self_hedge_winner_initial_events,
+            race.self_hedge_winner_hedged_events,
+            race.self_hedge_winner_unknown_events,
+            race.self_hedge_fired_result_events,
+            race.self_hedge_fired_winner_initial_events,
+            race.self_hedge_fired_winner_hedged_events,
+            race.self_hedge_fired_winner_unknown_events,
+            race.max_winner_attempt_index
+        );
+    }
     if race.bitswap_hedges > 0 || race.bitswap_hedge_results > 0 || race.bitswap_hedge_skips > 0 {
         println!(
             "    bitswap hedge: starts={} timeout_max={}ms results={} result_elapsed={} skips={} result_sources={} skip_reasons={}",
@@ -5135,6 +5151,14 @@ struct TraceHttpProviderRaceAggregate {
     winner_original_rank2_events: usize,
     winner_original_rank3_plus_events: usize,
     max_winner_original_provider_rank: u128,
+    max_winner_attempt_index: u128,
+    self_hedge_winner_initial_events: usize,
+    self_hedge_winner_hedged_events: usize,
+    self_hedge_winner_unknown_events: usize,
+    self_hedge_fired_result_events: usize,
+    self_hedge_fired_winner_initial_events: usize,
+    self_hedge_fired_winner_hedged_events: usize,
+    self_hedge_fired_winner_unknown_events: usize,
     winner_scored_events: usize,
     winner_score_elapsed_ms: LatencySummary,
     max_attempted_provider_count: u128,
@@ -5255,10 +5279,46 @@ impl TraceHttpProviderRaceAggregate {
                 let winner_rank = trace_count_field(value, "winner_provider_rank");
                 let winner_original_rank =
                     trace_count_field(value, "winner_original_provider_rank");
+                let winner_attempt_index = trace_count_field(value, "winner_attempt_index");
                 self.max_winner_provider_rank = self.max_winner_provider_rank.max(winner_rank);
                 self.max_winner_original_provider_rank = self
                     .max_winner_original_provider_rank
                     .max(winner_original_rank);
+                self.max_winner_attempt_index =
+                    self.max_winner_attempt_index.max(winner_attempt_index);
+                if value
+                    .get("single_provider_self_hedge")
+                    .and_then(|enabled| enabled.as_bool())
+                    == Some(true)
+                {
+                    let has_winner_attempt_index = value
+                        .get("winner_attempt_index")
+                        .and_then(json_u128)
+                        .is_some();
+                    let hedge_fired =
+                        value.get("hedge_fired").and_then(|fired| fired.as_bool()) == Some(true);
+                    if hedge_fired {
+                        self.self_hedge_fired_result_events += 1;
+                    }
+                    if has_winner_attempt_index {
+                        if winner_attempt_index == 0 {
+                            self.self_hedge_winner_initial_events += 1;
+                            if hedge_fired {
+                                self.self_hedge_fired_winner_initial_events += 1;
+                            }
+                        } else {
+                            self.self_hedge_winner_hedged_events += 1;
+                            if hedge_fired {
+                                self.self_hedge_fired_winner_hedged_events += 1;
+                            }
+                        }
+                    } else {
+                        self.self_hedge_winner_unknown_events += 1;
+                        if hedge_fired {
+                            self.self_hedge_fired_winner_unknown_events += 1;
+                        }
+                    }
+                }
                 match winner_rank {
                     1 => self.winner_rank1_events += 1,
                     2 => self.winner_rank2_events += 1,
@@ -11102,14 +11162,14 @@ mod tests {
                 "{\"phase\":\"http_provider_race\",\"cid\":\"cid-single-ok\",\"provider_count\":1,\"race_width\":2}\n",
                 "{\"phase\":\"http_provider_race\",\"cid\":\"cid-single-fail\",\"provider_count\":1,\"race_width\":2}\n",
                 "{\"phase\":\"http_provider_hedge\",\"cid\":\"cid-b\",\"provider\":\"https://provider-c.example\",\"timeout_ms\":250,\"pending_count\":2,\"remaining_provider_count\":1}\n",
-                "{\"phase\":\"http_provider_self_hedge\",\"cid\":\"cid-single-ok\",\"provider\":\"https://provider-single.example\",\"timeout_ms\":350,\"provider_index\":0,\"original_provider_rank\":1,\"reason\":\"slow_single_provider\"}\n",
+                "{\"phase\":\"http_provider_self_hedge\",\"cid\":\"cid-single-ok\",\"provider\":\"https://provider-single.example\",\"timeout_ms\":350,\"provider_index\":0,\"attempt_index\":1,\"original_provider_rank\":1,\"reason\":\"slow_single_provider\"}\n",
                 "{\"phase\":\"http_provider_bitswap_hedge\",\"cid\":\"cid-single-ok\",\"provider_count\":3,\"timeout_ms\":150,\"reason\":\"slow_single_http_provider\"}\n",
                 "{\"phase\":\"http_provider_bitswap_hedge_result\",\"cid\":\"cid-single-ok\",\"source\":\"bitswap\",\"provider_count\":3,\"elapsed_ms\":190}\n",
                 "{\"phase\":\"http_provider_bitswap_hedge_result\",\"cid\":\"cid-single-fail\",\"source\":\"http_provider\",\"provider_count\":2,\"elapsed_ms\":75}\n",
                 "{\"phase\":\"http_provider_bitswap_hedge_skip\",\"cid\":\"cid-single-skip\",\"provider\":\"https://provider-single.example\",\"reason\":\"provider_unscored\",\"provider_scored\":false,\"min_score_ms\":250}\n",
-                "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-a\",\"ok\":true,\"provider\":\"https://provider-a.example\",\"winner_provider_index\":1,\"winner_provider_rank\":2,\"winner_original_provider_rank\":3,\"winner_within_initial_width\":true,\"winner_provider_scored\":true,\"winner_provider_score_ms\":42,\"provider_count\":2,\"race_width\":2,\"attempted_provider_count\":2,\"failed_provider_count\":0,\"hedge_fired\":false,\"elapsed_ms\":25}\n",
+                "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-a\",\"ok\":true,\"provider\":\"https://provider-a.example\",\"winner_provider_index\":1,\"winner_attempt_index\":0,\"winner_provider_rank\":2,\"winner_original_provider_rank\":3,\"winner_within_initial_width\":true,\"winner_provider_scored\":true,\"winner_provider_score_ms\":42,\"provider_count\":2,\"race_width\":2,\"attempted_provider_count\":2,\"failed_provider_count\":0,\"hedge_fired\":false,\"elapsed_ms\":25}\n",
                 "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-b\",\"ok\":false,\"provider_count\":4,\"race_width\":2,\"attempted_provider_count\":4,\"failed_provider_count\":4,\"hedge_fired\":true,\"elapsed_ms\":300}\n",
-                "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-single-ok\",\"ok\":true,\"provider\":\"https://provider-single.example\",\"winner_provider_index\":0,\"winner_provider_rank\":1,\"winner_original_provider_rank\":1,\"winner_within_initial_width\":true,\"winner_provider_scored\":false,\"provider_count\":1,\"race_width\":2,\"attempted_provider_count\":1,\"failed_provider_count\":0,\"hedge_fired\":false,\"elapsed_ms\":450}\n",
+                "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-single-ok\",\"ok\":true,\"provider\":\"https://provider-single.example\",\"winner_provider_index\":0,\"winner_attempt_index\":1,\"winner_self_hedge_attempt\":true,\"winner_provider_rank\":1,\"winner_original_provider_rank\":1,\"winner_within_initial_width\":true,\"winner_provider_scored\":false,\"single_provider_self_hedge\":true,\"provider_count\":1,\"race_width\":2,\"attempted_provider_count\":2,\"failed_provider_count\":0,\"hedge_fired\":true,\"elapsed_ms\":450}\n",
                 "{\"phase\":\"http_provider_race_result\",\"cid\":\"cid-single-fail\",\"ok\":false,\"provider_count\":1,\"race_width\":2,\"attempted_provider_count\":1,\"failed_provider_count\":1,\"hedge_fired\":false,\"elapsed_ms\":900}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-a\",\"provider\":\"https://provider-a.example\",\"ok\":true,\"bytes\":128,\"response_bytes\":128,\"response_headers_elapsed_ms\":7,\"response_first_chunk_seen\":true,\"response_first_chunk_elapsed_ms\":9,\"response_body_elapsed_ms\":20,\"elapsed_ms\":25}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-b\",\"provider\":\"https://provider-b.example\",\"ok\":false,\"error\":\"core: cid hash mismatch for cid-b\",\"response_headers_elapsed_ms\":40,\"elapsed_ms\":40}\n",
@@ -11198,6 +11258,41 @@ mod tests {
                 .http_provider_races
                 .max_winner_original_provider_rank,
             3
+        );
+        assert_eq!(summary.http_provider_races.max_winner_attempt_index, 1);
+        assert_eq!(
+            summary.http_provider_races.self_hedge_winner_initial_events,
+            0
+        );
+        assert_eq!(
+            summary.http_provider_races.self_hedge_winner_hedged_events,
+            1
+        );
+        assert_eq!(
+            summary.http_provider_races.self_hedge_winner_unknown_events,
+            0
+        );
+        assert_eq!(
+            summary.http_provider_races.self_hedge_fired_result_events,
+            1
+        );
+        assert_eq!(
+            summary
+                .http_provider_races
+                .self_hedge_fired_winner_initial_events,
+            0
+        );
+        assert_eq!(
+            summary
+                .http_provider_races
+                .self_hedge_fired_winner_hedged_events,
+            1
+        );
+        assert_eq!(
+            summary
+                .http_provider_races
+                .self_hedge_fired_winner_unknown_events,
+            0
         );
         assert_eq!(summary.http_provider_races.winner_scored_events, 1);
         assert_eq!(

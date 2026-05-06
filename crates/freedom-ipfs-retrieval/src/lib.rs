@@ -988,6 +988,7 @@ impl HttpRetriever {
                 *cid,
                 scheduled_index,
                 candidate,
+                0,
             ));
         }
 
@@ -1013,6 +1014,7 @@ impl HttpRetriever {
                                 ok = true,
                                 provider = %result.base,
                                 winner_provider_index = result.provider_index,
+                                winner_attempt_index = result.attempt_index,
                                 winner_provider_rank = result.provider_index + 1,
                                 winner_original_provider_rank = result.original_provider_index + 1,
                                 winner_within_initial_width = (result.provider_index < HTTP_PROVIDER_RACE_WIDTH),
@@ -1039,6 +1041,7 @@ impl HttpRetriever {
                                     *cid,
                                     scheduled_index,
                                     candidate,
+                                    0,
                                 ));
                             }
                         }
@@ -1069,6 +1072,7 @@ impl HttpRetriever {
                             *cid,
                             scheduled_index,
                             candidate,
+                            0,
                         ));
                     }
                 }
@@ -1126,7 +1130,7 @@ impl HttpRetriever {
             async move {
                 SingleHttpProviderBitswapHedgeResult::HttpCandidate(
                     retriever
-                        .fetch_from_http_provider_candidate_with_index(http_cid, 0, candidate)
+                        .fetch_from_http_provider_candidate_with_index(http_cid, 0, candidate, 0)
                         .await,
                 )
             }
@@ -1158,6 +1162,7 @@ impl HttpRetriever {
                                         ok = true,
                                         provider = %result.base,
                                         winner_provider_index = result.provider_index,
+                                        winner_attempt_index = result.attempt_index,
                                         winner_provider_rank = result.provider_index + 1,
                                         winner_original_provider_rank = result.original_provider_index + 1,
                                         winner_within_initial_width = true,
@@ -1253,6 +1258,7 @@ impl HttpRetriever {
             *cid,
             0,
             candidate.clone(),
+            0,
         ));
         let self_hedge_after = single_http_provider_self_hedge_after();
         let hedge = tokio::time::sleep(self_hedge_after);
@@ -1277,6 +1283,8 @@ impl HttpRetriever {
                                 ok = true,
                                 provider = %result.base,
                                 winner_provider_index = result.provider_index,
+                                winner_attempt_index = result.attempt_index,
+                                winner_self_hedge_attempt = result.attempt_index > 0,
                                 winner_provider_rank = result.provider_index + 1,
                                 winner_original_provider_rank = result.original_provider_index + 1,
                                 winner_within_initial_width = true,
@@ -1307,6 +1315,7 @@ impl HttpRetriever {
                                     provider = %candidate.base,
                                     timeout_ms = self_hedge_after.as_millis(),
                                     provider_index = 0,
+                                    attempt_index = 1usize,
                                     original_provider_rank = candidate.original_index + 1,
                                     provider_scored = candidate.score_elapsed.is_some(),
                                     provider_score_ms = candidate
@@ -1319,6 +1328,7 @@ impl HttpRetriever {
                                     *cid,
                                     0,
                                     candidate.clone(),
+                                    1,
                                 ));
                             }
                         }
@@ -1333,6 +1343,7 @@ impl HttpRetriever {
                         provider = %candidate.base,
                         timeout_ms = self_hedge_after.as_millis(),
                         provider_index = 0,
+                        attempt_index = 1usize,
                         original_provider_rank = candidate.original_index + 1,
                         provider_scored = candidate.score_elapsed.is_some(),
                         provider_score_ms = candidate
@@ -1345,6 +1356,7 @@ impl HttpRetriever {
                         *cid,
                         0,
                         candidate.clone(),
+                        1,
                     ));
                 }
             }
@@ -1370,6 +1382,7 @@ impl HttpRetriever {
         cid: Cid,
         provider_index: usize,
         candidate: ScoredHttpProviderBase,
+        attempt_index: usize,
     ) -> HttpProviderCandidateResult {
         let base = candidate.base;
         let result = self
@@ -1377,6 +1390,7 @@ impl HttpRetriever {
             .await;
         HttpProviderCandidateResult {
             provider_index,
+            attempt_index,
             original_provider_index: candidate.original_index,
             score_elapsed: candidate.score_elapsed,
             base,
@@ -2429,6 +2443,7 @@ struct ScoredHttpProviderBase {
 
 struct HttpProviderCandidateResult {
     provider_index: usize,
+    attempt_index: usize,
     original_provider_index: usize,
     score_elapsed: Option<Duration>,
     base: Url,
