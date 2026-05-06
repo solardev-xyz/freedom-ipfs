@@ -23689,3 +23689,49 @@ than Kubo for root page loads, roughly tied on asset p95, and much lighter on
 RSS/FD. The remaining high-leverage gap is not the normal HTTP-provider path;
 it is the zero-HTTP cold-Bitswap fallback shape that appears when delegated
 routing returns sparse or stale provider diversity.
+
+## 2026-05-06 Keep: Require Request Classification In Harness Runs
+
+The connection-error backoff threshold experiment produced a misleading-looking
+latency win because the intended zero-HTTP Bitswap shape disappeared from the
+network window. Add an opt-in harness gate so future experiments can require
+the exact trace classification they are trying to exercise.
+
+Change:
+
+- Add repeatable CLI flag:
+  `--require-request-classification classification=min_count`
+- The gate checks the Rust trace summary's `request_classifications` counts.
+- It requires `--trace-output`, because classification data comes from the
+  spawned Rust gateway trace.
+- For `--compare-kubo`, the gate applies to the Rust side only.
+- Reports are still written before the command exits non-zero, so the failed
+  run remains inspectable.
+
+Example:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 20 \
+  --asset-concurrency 6 \
+  --trace-output /tmp/ipfs-tech-targeted-trace.jsonl \
+  --output /tmp/ipfs-tech-targeted.json \
+  --require-request-classification zero_http_provider_cold_bitswap=10
+```
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo check -p mobile-web-harness --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Conclusion:
+Keep. This is diagnostics/harness-only, but it prevents future long-running
+optimization loops from accepting proxy wins when delegated routing no longer
+exercises the targeted cold-Bitswap fallback.

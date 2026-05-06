@@ -151,6 +151,9 @@ struct Args {
     /// Include the full tracing span stack in each spawned gateway JSONL event.
     #[arg(long)]
     trace_span_list: bool,
+    /// Require a request classification count in the Rust trace, formatted as classification=min_count.
+    #[arg(long = "require-request-classification")]
+    require_request_classifications: Vec<String>,
 }
 
 #[tokio::main]
@@ -183,8 +186,18 @@ async fn main() -> Result<()> {
             std::fs::write(&output, json).with_context(|| format!("write {}", output.display()))?;
             eprintln!("wrote comparison report to {}", output.display());
         }
+        let trace_requirement_failures = request_classification_requirement_failures(
+            report.rust.trace_summary.as_ref(),
+            &args.require_request_classifications,
+        )?;
+        for failure in &trace_requirement_failures {
+            eprintln!("trace requirement not met: {failure}");
+        }
         if report.rust.summary.fail_count > 0 || report.kubo.summary.fail_count > 0 {
             bail!("mobile web comparison found failures");
+        }
+        if !trace_requirement_failures.is_empty() {
+            bail!("mobile web comparison trace requirements not met");
         }
         return Ok(());
     }
@@ -196,9 +209,19 @@ async fn main() -> Result<()> {
         std::fs::write(&output, json).with_context(|| format!("write {}", output.display()))?;
         eprintln!("wrote report to {}", output.display());
     }
+    let trace_requirement_failures = request_classification_requirement_failures(
+        report.trace_summary.as_ref(),
+        &args.require_request_classifications,
+    )?;
+    for failure in &trace_requirement_failures {
+        eprintln!("trace requirement not met: {failure}");
+    }
 
     if report.summary.fail_count > 0 {
         bail!("mobile web harness found failures");
+    }
+    if !trace_requirement_failures.is_empty() {
+        bail!("mobile web harness trace requirements not met");
     }
     Ok(())
 }
@@ -220,6 +243,7 @@ async fn run_comparison(args: &Args, corpus: &Corpus) -> Result<ComparisonReport
     kubo_args.build_gateway = false;
     kubo_args.trace_output = None;
     kubo_args.trace_filter = None;
+    kubo_args.require_request_classifications = Vec::new();
 
     let rust = run_harness(&rust_args, corpus).await?;
     let kubo = run_harness(&kubo_args, corpus).await?;
@@ -230,6 +254,74 @@ async fn run_comparison(args: &Args, corpus: &Corpus) -> Result<ComparisonReport
         kubo,
         cases,
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RequestClassificationRequirement {
+    classification: String,
+    min_count: usize,
+}
+
+fn request_classification_requirement_failures(
+    trace: Option<&TraceSummary>,
+    raw_requirements: &[String],
+) -> Result<Vec<String>> {
+    let requirements = parse_request_classification_requirements(raw_requirements)?;
+    if requirements.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(trace) = trace else {
+        return Ok(vec![
+            "request classification requirements need a Rust trace summary; pass --trace-output"
+                .to_string(),
+        ]);
+    };
+
+    let mut failures = Vec::new();
+    for requirement in requirements {
+        let actual = trace_request_classification_count(trace, &requirement.classification);
+        if actual < requirement.min_count {
+            failures.push(format!(
+                "{} expected>={} actual={}",
+                requirement.classification, requirement.min_count, actual
+            ));
+        }
+    }
+    Ok(failures)
+}
+
+fn parse_request_classification_requirements(
+    raw_requirements: &[String],
+) -> Result<Vec<RequestClassificationRequirement>> {
+    raw_requirements
+        .iter()
+        .map(|raw| {
+            let (classification, min_count) = raw
+                .split_once('=')
+                .ok_or_else(|| anyhow!("expected classification=min_count, got {raw:?}"))?;
+            let classification = classification.trim();
+            if classification.is_empty() {
+                bail!("request classification requirement has an empty classification");
+            }
+            let min_count = min_count
+                .trim()
+                .parse::<usize>()
+                .with_context(|| format!("parse min_count in {raw:?}"))?;
+            Ok(RequestClassificationRequirement {
+                classification: classification.to_string(),
+                min_count,
+            })
+        })
+        .collect()
+}
+
+fn trace_request_classification_count(trace: &TraceSummary, classification: &str) -> usize {
+    trace
+        .request_classifications
+        .iter()
+        .find(|entry| entry.value == classification)
+        .map(|entry| entry.count)
+        .unwrap_or_default()
 }
 
 async fn build_default_rust_gateway() -> Result<()> {
@@ -340,6 +432,9 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
     }
     if args.engine == HarnessEngine::Kubo && args.trace_output.is_some() {
         bail!("--trace-output is only supported for --engine rust");
+    }
+    if !args.require_request_classifications.is_empty() && args.trace_output.is_none() {
+        bail!("--require-request-classification requires --trace-output");
     }
     if let Some(import_car) = &args.gateway_import_car {
         if !import_car.is_file() {
@@ -9279,6 +9374,28 @@ mod tests {
     }
 
     #[test]
+    fn args_accept_request_classification_requirements() {
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--trace-output",
+            "/tmp/mobile-trace.jsonl",
+            "--require-request-classification",
+            "zero_http_provider_cold_bitswap=3",
+            "--require-request-classification",
+            "top_level_zero_http_provider_cold_bitswap=1",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.require_request_classifications,
+            vec![
+                "zero_http_provider_cold_bitswap=3",
+                "top_level_zero_http_provider_cold_bitswap=1"
+            ]
+        );
+    }
+
+    #[test]
     fn args_accept_gateway_import_car() {
         let args = Args::try_parse_from([
             "mobile-web-harness",
@@ -10147,6 +10264,21 @@ mod tests {
         assert_eq!(
             trace_value_count(&request.classifications, "cold_bitswap_peer_expand"),
             1
+        );
+        let requirements = vec!["top_level_zero_http_provider_cold_bitswap=1".to_string()];
+        assert!(
+            request_classification_requirement_failures(Some(&summary), &requirements)
+                .unwrap()
+                .is_empty()
+        );
+        let requirements = vec!["top_level_zero_http_provider_cold_bitswap=2".to_string()];
+        assert_eq!(
+            request_classification_requirement_failures(Some(&summary), &requirements).unwrap(),
+            vec!["top_level_zero_http_provider_cold_bitswap expected>=2 actual=1"]
+        );
+        assert!(
+            request_classification_requirement_failures(None, &requirements).unwrap()[0]
+                .contains("--trace-output")
         );
     }
 
