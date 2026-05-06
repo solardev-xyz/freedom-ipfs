@@ -25369,3 +25369,73 @@ the code env-gated as a safer lab tool only; future work should shift back to
 the current residual gap: single-provider HTTP tails, page-session reuse around
 subresource CIDs, and avoiding repeated root/subresource metadata work without
 raising mobile RSS, FDs, or fanout.
+
+## 2026-05-06 Observe: Current Default Multi-Case Kubo Guardrail
+
+After rejecting direct Bitswap target promotion, refresh the default branch
+position across the core live guardrail cases.
+
+Command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-default-multicase-kubo-r3-20260506T222100Z-trace.jsonl \
+  --comparison-output /tmp/current-default-multicase-kubo-r3-20260506T222100Z.json \
+  > /tmp/current-default-multicase-kubo-r3-20260506T222100Z.log 2>&1
+```
+
+Result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- `daicowtf-page-assets` root TTFB p50/p95:
+  - Rust: `1498/2486ms`
+  - Kubo: `3100/7124ms`
+- `vitalik-root-html-range` root TTFB p50/p95:
+  - Rust: `406/408ms`
+  - Kubo: `993/1024ms`
+- `ipfs-tech-page-assets` root TTFB p50/p95:
+  - Rust: `894/896ms`
+  - Kubo: `1299/1352ms`
+- `ipfs-tech-page-assets` asset TTFB p50/p95:
+  - Rust: `277/842ms`
+  - Kubo: `258/681ms`
+- Resource max:
+  - Rust: `58448KiB` RSS, `36` FDs
+  - Kubo: `282884KiB` RSS, `453` FDs
+
+Trace notes:
+
+- Rust block fetch totals:
+  - HTTP provider: `109` blocks, p50/p95/max `329/552/1045ms`
+  - Bitswap: `26` blocks, p50/p95/max `140/1018/1138ms`
+- Delegated provider lookup was not the active tail: p50/p95/max
+  `19/49/58ms`.
+- HTTP-provider single winners:
+  - `ipfs-bridge.sia.dev`: `46` events, max `478ms`
+  - `gateway-v3.pinata.cloud`: `5` events, max `1030ms`
+  - `trustless.filebase.io`: `1` event, max `33ms`
+- Bitswap session shortcut post-lookup waits remained bounded:
+  `post_lookup_budgets=125=49, 100=45`.
+- The slowest top-level requests were the `daicowtf` direct `/ipfs/...` case,
+  but Rust still beat Kubo there by a wide margin.
+- The only remaining same-window Kubo win in this guardrail was
+  `ipfs.tech` asset latency.
+
+Conclusion:
+The default branch is still strong on roots and resource use. The remaining
+work should stay focused on `ipfs.tech`-like page assets and subresource
+session behavior. In this window, delegated lookup was already fast; the tail
+was split between HTTP-provider blocks and a small number of Bitswap/range-ish
+blocks. Avoid spending the next iteration on root discovery or broad direct
+Bitswap stream truncation.
