@@ -24635,3 +24635,165 @@ the lower enabled latency is network variance rather than evidence for the new
 path. The next useful experiment needs either a public multi-block UnixFS range
 asset or a synthetic live/local harness case that creates a multi-block UnixFS
 file and performs cold middle ranges with and without a recent Bitswap peer.
+
+## Synthetic Multi-Block Range Batch Follow-Up
+
+The next experiment used a local Kubo seed so the range batching path could be
+measured without public-network variance. The fixture is a 512KiB UnixFS file
+created with 16KiB raw leaves. A 64KiB middle range therefore spans four raw
+child CIDs and exercises `BlockProvider::get_block_ranges`.
+
+Fixture generation:
+
+```sh
+fixture=/tmp/freedom-ipfs-range-batch-fixture-20260506
+kubo=target/tools/kubo/kubo/ipfs
+rm -rf "$fixture"
+mkdir -p "$fixture/repo"
+IPFS_PATH="$fixture/repo" "$kubo" init --profile=server >/dev/null
+perl -e 'binmode STDOUT; for ($i = 0; $i < 512 * 1024; $i++) { print chr((($i * 31) + int($i / 251)) % 256); }' > "$fixture/multiblock.bin"
+cid=$(IPFS_PATH="$fixture/repo" "$kubo" add -Q --cid-version=1 --raw-leaves=true --chunker=size-16384 --progress=false "$fixture/multiblock.bin")
+IPFS_PATH="$fixture/repo" "$kubo" dag export "$cid" > "$fixture/multiblock.car"
+range_sha=$(dd if="$fixture/multiblock.bin" bs=1 skip=32768 count=65536 status=none | sha256sum | awk '{print $1}')
+```
+
+Generated fixture:
+
+- CID: `bafybeifdktnvudm2oz7qf2lho4wcb5vehxr5jsrwrrqt4n4tugkfopg32e`
+- Range: `bytes=32768-98303`
+- Range SHA-256:
+  `008247ddb836acb6aaeea63a8d0a3b0ddcc6384bd838280d792e04de9de09df9`
+- CAR: `/tmp/freedom-ipfs-range-batch-fixture-20260506/multiblock.car`
+- Corpus: `/tmp/freedom-ipfs-range-batch-fixture-20260506/corpus.json`
+
+Baseline command:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --corpus /tmp/freedom-ipfs-range-batch-fixture-20260506/corpus.json \
+  --case synthetic-multiblock-range \
+  --bitswap-seed-car /tmp/freedom-ipfs-range-batch-fixture-20260506/multiblock.car \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 30 \
+  --run-timeout-secs 60 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/synthetic-multiblock-range-batch-baseline-r5-pass-20260506-trace.jsonl \
+  --output /tmp/synthetic-multiblock-range-batch-baseline-r5-pass-20260506.json \
+  > /tmp/synthetic-multiblock-range-batch-baseline-r5-pass-20260506.log 2>&1
+```
+
+Baseline result:
+
+- Rust passed `5/5`
+- root TTFB p50/p95: `252/259ms`
+- RSS/FD max: `38144KiB/13`
+- Bitswap commands: `30`, multi-CID commands: `0`
+- block range sources: `bitswap=20`
+
+Naive enabled command:
+
+```sh
+FREEDOM_IPFS_ENABLE_BITSWAP_SESSION_RANGE_BATCH=1 \
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --corpus /tmp/freedom-ipfs-range-batch-fixture-20260506/corpus.json \
+  --case synthetic-multiblock-range \
+  --bitswap-seed-car /tmp/freedom-ipfs-range-batch-fixture-20260506/multiblock.car \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 30 \
+  --run-timeout-secs 60 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/synthetic-multiblock-range-batch-enabled-r5-20260506-trace.jsonl \
+  --output /tmp/synthetic-multiblock-range-batch-enabled-r5-20260506.json \
+  > /tmp/synthetic-multiblock-range-batch-enabled-r5-20260506.log 2>&1
+```
+
+Naive enabled result:
+
+- Rust passed `5/5`, but root TTFB p50/p95 regressed to `1007/1011ms`.
+- Trace showed `5` multi-CID commands, but all five
+  `bitswap_session_range_batch` attempts timed out at the 750ms cap.
+- Kubo sent partial incoming responses quickly, usually `2/4` requested blocks,
+  but the collector waited for all requested CIDs and discarded the partial work
+  when the outer timeout fired.
+
+Fix:
+`collect_incoming_bitswap_batch` now returns a verified partial multi-CID batch
+after a 50ms quiet grace once at least one requested block has arrived. The
+caller stores those blocks and falls back only for the missing range CIDs.
+
+Fixed enabled command:
+
+```sh
+FREEDOM_IPFS_ENABLE_BITSWAP_SESSION_RANGE_BATCH=1 \
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --corpus /tmp/freedom-ipfs-range-batch-fixture-20260506/corpus.json \
+  --case synthetic-multiblock-range \
+  --bitswap-seed-car /tmp/freedom-ipfs-range-batch-fixture-20260506/multiblock.car \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 30 \
+  --run-timeout-secs 60 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/synthetic-multiblock-range-batch-enabled-partial-r5-20260506-trace.jsonl \
+  --output /tmp/synthetic-multiblock-range-batch-enabled-partial-r5-20260506.json \
+  > /tmp/synthetic-multiblock-range-batch-enabled-partial-r5-20260506.log 2>&1
+```
+
+Fixed enabled result:
+
+- Rust passed `5/5`
+- root TTFB p50/p95: `170/176ms`
+- RSS/FD max: `38016KiB/13`
+- Bitswap commands: `20`, multi-CID commands: `5`, cancellations: `0`
+- incoming batches: `5`, requested blocks delivered by batch: `10`
+- block range sources: `bitswap_batch=10`, `bitswap=10`
+- No trace errors.
+
+Kubo comparison command:
+
+```sh
+FREEDOM_IPFS_ENABLE_BITSWAP_SESSION_RANGE_BATCH=1 \
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --corpus /tmp/freedom-ipfs-range-batch-fixture-20260506/corpus.json \
+  --case synthetic-multiblock-range \
+  --bitswap-seed-car /tmp/freedom-ipfs-range-batch-fixture-20260506/multiblock.car \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 30 \
+  --run-timeout-secs 60 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/synthetic-multiblock-range-batch-enabled-partial-rust-vs-kubo-pass-r5-20260506-trace.jsonl \
+  --comparison-output /tmp/synthetic-multiblock-range-batch-enabled-partial-rust-vs-kubo-pass-r5-20260506.json \
+  > /tmp/synthetic-multiblock-range-batch-enabled-partial-rust-vs-kubo-pass-r5-20260506.log 2>&1
+```
+
+Kubo comparison result:
+
+- Rust passed `5/5`; Kubo passed `5/5`.
+- root TTFB p50/p95:
+  - Rust: `170/179ms`
+  - Kubo: `72/76ms`
+  - Kubo adjusted for one-time seed connect: `124/134ms`
+- resource max:
+  - RSS: Rust `37888KiB`, Kubo `88900KiB`
+  - FDs: Rust `13`, Kubo `41`
+
+Decision:
+Keep range batching opt-in, but keep the partial incoming batch fix. The local
+multi-block range workload shows the path is now useful and mobile-cheap:
+`252ms -> 170ms` p50 versus the no-batch baseline, with no extra FD/RSS
+pressure. Kubo is still faster on this single-seed local microbenchmark, so the
+next range task should study whether Kubo avoids the residual root/metadata
+latency or uses a more efficient wantlist/response pattern for the missing two
+range leaves.

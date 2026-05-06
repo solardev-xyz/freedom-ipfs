@@ -69,6 +69,7 @@ const BITSWAP_WANT_HAVE_TIMEOUT: Duration = Duration::from_millis(750);
 const BITSWAP_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(6);
 const BITSWAP_SINGLE_UNTRUSTED_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(3);
 const BITSWAP_INCOMING_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(6);
+const BITSWAP_INCOMING_BATCH_PARTIAL_GRACE: Duration = Duration::from_millis(50);
 const BITSWAP_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const BITSWAP_SUCCESSFUL_PEER_TTL: Duration = Duration::from_secs(10 * 60);
 const BITSWAP_CONNECTION_ERROR_BACKOFF_TTL: Duration = Duration::from_secs(30);
@@ -4837,10 +4838,26 @@ async fn collect_incoming_bitswap_batch(
     let mut source_transport = None;
 
     while requested_blocks.len() < wanted.len() {
-        let Some(result) = incoming_results.recv().await else {
-            return Err(RetrievalError::Bitswap(
-                "incoming bitswap result channel closed".into(),
-            ));
+        let next_result = if requested_blocks.is_empty() {
+            incoming_results.recv().await
+        } else {
+            match timeout(
+                BITSWAP_INCOMING_BATCH_PARTIAL_GRACE,
+                incoming_results.recv(),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => break,
+            }
+        };
+        let Some(result) = next_result else {
+            if requested_blocks.is_empty() {
+                return Err(RetrievalError::Bitswap(
+                    "incoming bitswap result channel closed".into(),
+                ));
+            }
+            break;
         };
         if source_peer.is_none() {
             source_peer = result.source_peer;
@@ -4863,9 +4880,12 @@ async fn collect_incoming_bitswap_batch(
             cids = %cid_summary.as_deref().unwrap_or(""),
             cid_count,
             requested_blocks = requested_blocks.len(),
+            missing_blocks = wanted.len().saturating_sub(requested_blocks.len()),
             extra_blocks = extra_blocks.len(),
             source_peer = %source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
             source_transport = source_transport.unwrap_or("unknown"),
+            partial = requested_blocks.len() < wanted.len(),
+            partial_grace_ms = BITSWAP_INCOMING_BATCH_PARTIAL_GRACE.as_millis(),
             elapsed_ms = started.elapsed().as_millis()
         );
     }
@@ -6503,6 +6523,39 @@ mod bitswap_tests {
             .unwrap()
             .unwrap();
         peer_swarm_task.abort();
+    }
+
+    #[tokio::test]
+    async fn incoming_bitswap_batch_returns_partial_after_quiet_grace() {
+        let first_data = b"first partial incoming shared client multi-want block";
+        let second_data = b"second missing incoming shared client multi-want block";
+        let first = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, first_data);
+        let second = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, second_data);
+        let (sender, receiver) = mpsc::unbounded_channel();
+        sender
+            .send(BitswapFetchBatchResult {
+                requested_blocks: HashMap::from([(first, first_data.to_vec())]),
+                extra_blocks: Vec::new(),
+                source_peer: None,
+                source_transport: None,
+                delivery: "incoming",
+            })
+            .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            collect_incoming_bitswap_batch(vec![first, second], receiver),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(result.requested_blocks.len(), 1);
+        assert_eq!(result.requested_blocks.get(&first).unwrap(), first_data);
+        assert!(!result.requested_blocks.contains_key(&second));
+        assert_eq!(result.extra_blocks, Vec::<(Cid, Vec<u8>)>::new());
+        assert_eq!(result.delivery, "incoming");
+        drop(sender);
     }
 
     #[tokio::test(flavor = "multi_thread")]
