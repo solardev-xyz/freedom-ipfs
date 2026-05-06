@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 const DEFAULT_CORPUS: &str = "tools/mobile-web-harness/corpus/mobile-web.json";
 const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 const DEFAULT_ASSET_CONCURRENCY: usize = 6;
+const MAX_SLOW_ASSETS: usize = 12;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -399,6 +400,21 @@ fn print_summary(report: &RunReport) {
             println!("  failure x{}: {}", group.count, group.key);
             for example in &group.examples {
                 println!("    - {example}");
+            }
+        }
+        if !case.slow_assets.is_empty() {
+            println!("  slow assets:");
+            for asset in case.slow_assets.iter().take(6) {
+                println!(
+                    "    {} {} count={} passed={} failed={} ttfb={} total={}",
+                    asset.kind,
+                    asset.url,
+                    asset.count,
+                    asset.pass_count,
+                    asset.fail_count,
+                    asset.ttfb_ms,
+                    asset.total_ms
+                );
             }
         }
     }
@@ -1544,6 +1560,7 @@ struct CaseAggregate {
     asset_total_ms: LatencySummary,
     asset_kind_failures: Vec<AssetKindFailure>,
     failure_groups: Vec<FailureGroup>,
+    slow_assets: Vec<SlowAssetAggregate>,
 }
 
 impl CaseAggregate {
@@ -1556,6 +1573,7 @@ impl CaseAggregate {
         let mut asset_total = Vec::new();
         let mut kind_failures = BTreeMap::<String, usize>::new();
         let mut failure_groups = BTreeMap::<String, FailureGroupBuilder>::new();
+        let mut slow_asset_builders = BTreeMap::<String, SlowAssetBuilder>::new();
 
         for run in runs {
             let Some(result) = run.results.iter().find(|result| result.id == id) else {
@@ -1579,6 +1597,7 @@ impl CaseAggregate {
             for asset in &result.assets {
                 asset_ttfb.push(asset.ttfb_ms);
                 asset_total.push(asset.total_ms);
+                push_slow_asset(&mut slow_asset_builders, asset);
                 if asset.passed {
                     continue;
                 }
@@ -1621,6 +1640,20 @@ impl CaseAggregate {
                 .cmp(&left.count)
                 .then_with(|| left.key.cmp(&right.key))
         });
+        let mut slow_assets = slow_asset_builders
+            .into_values()
+            .map(SlowAssetBuilder::finish)
+            .collect::<Vec<_>>();
+        slow_assets.sort_by(|left, right| {
+            right
+                .total_ms
+                .max_ms
+                .cmp(&left.total_ms.max_ms)
+                .then_with(|| right.ttfb_ms.max_ms.cmp(&left.ttfb_ms.max_ms))
+                .then_with(|| right.fail_count.cmp(&left.fail_count))
+                .then_with(|| left.url.cmp(&right.url))
+        });
+        slow_assets.truncate(MAX_SLOW_ASSETS);
 
         Self {
             id: id.to_string(),
@@ -1634,8 +1667,72 @@ impl CaseAggregate {
             asset_total_ms: LatencySummary::from_values(asset_total),
             asset_kind_failures,
             failure_groups,
+            slow_assets,
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct SlowAssetAggregate {
+    kind: String,
+    source: String,
+    url: String,
+    count: usize,
+    pass_count: usize,
+    fail_count: usize,
+    ttfb_ms: LatencySummary,
+    total_ms: LatencySummary,
+}
+
+#[derive(Debug)]
+struct SlowAssetBuilder {
+    kind: String,
+    source: String,
+    url: String,
+    count: usize,
+    pass_count: usize,
+    fail_count: usize,
+    ttfb_values: Vec<u128>,
+    total_values: Vec<u128>,
+}
+
+impl SlowAssetBuilder {
+    fn finish(self) -> SlowAssetAggregate {
+        SlowAssetAggregate {
+            kind: self.kind,
+            source: self.source,
+            url: self.url,
+            count: self.count,
+            pass_count: self.pass_count,
+            fail_count: self.fail_count,
+            ttfb_ms: LatencySummary::from_values(self.ttfb_values),
+            total_ms: LatencySummary::from_values(self.total_values),
+        }
+    }
+}
+
+fn push_slow_asset(builders: &mut BTreeMap<String, SlowAssetBuilder>, asset: &AssetResult) {
+    let key = asset.url.clone();
+    let builder = builders
+        .entry(key.clone())
+        .or_insert_with(|| SlowAssetBuilder {
+            kind: asset.kind.to_string(),
+            source: asset.source.clone(),
+            url: key,
+            count: 0,
+            pass_count: 0,
+            fail_count: 0,
+            ttfb_values: Vec::new(),
+            total_values: Vec::new(),
+        });
+    builder.count += 1;
+    if asset.passed {
+        builder.pass_count += 1;
+    } else {
+        builder.fail_count += 1;
+    }
+    builder.ttfb_values.push(asset.ttfb_ms);
+    builder.total_values.push(asset.total_ms);
 }
 
 #[derive(Debug, Serialize)]
@@ -1821,6 +1918,99 @@ fn percentile(values: &[u128], percentile: usize) -> Option<u128> {
     }
     let rank = (values.len() * percentile).div_ceil(100).max(1);
     values.get(rank - 1).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn case_aggregate_reports_slowest_assets() {
+        let run = RunResult {
+            phase: RunPhase::Measured,
+            run_index: 1,
+            gateway_url: "http://127.0.0.1:50017".to_string(),
+            elapsed_ms: 800,
+            gateway_rss_kib: None,
+            passed: true,
+            results: vec![CaseResult {
+                id: "page".to_string(),
+                description: None,
+                method: "GET".to_string(),
+                url: "http://127.0.0.1:50017/ipfs/root".to_string(),
+                status: Some(200),
+                content_type: Some("text/html".to_string()),
+                content_range: None,
+                body_bytes: 100,
+                ttfb_ms: 10,
+                total_ms: 20,
+                body_preview: String::new(),
+                asset_summary: None,
+                assets: vec![
+                    test_asset(
+                        "http://127.0.0.1:50017/app.js",
+                        AssetKind::Script,
+                        20,
+                        40,
+                        true,
+                    ),
+                    test_asset(
+                        "http://127.0.0.1:50017/hero.jpg",
+                        AssetKind::Image,
+                        200,
+                        700,
+                        true,
+                    ),
+                    test_asset(
+                        "http://127.0.0.1:50017/font.woff2",
+                        AssetKind::Font,
+                        100,
+                        300,
+                        false,
+                    ),
+                ],
+                passed: true,
+                failures: Vec::new(),
+            }],
+        };
+
+        let aggregate = CaseAggregate::from_runs("page", &[&run]);
+        assert_eq!(aggregate.slow_assets.len(), 3);
+        assert_eq!(
+            aggregate.slow_assets[0].url,
+            "http://127.0.0.1:50017/hero.jpg"
+        );
+        assert_eq!(aggregate.slow_assets[0].kind, "image");
+        assert_eq!(aggregate.slow_assets[0].total_ms.max_ms, Some(700));
+        assert_eq!(
+            aggregate.slow_assets[1].url,
+            "http://127.0.0.1:50017/font.woff2"
+        );
+        assert_eq!(aggregate.slow_assets[1].fail_count, 1);
+    }
+
+    fn test_asset(
+        url: &str,
+        kind: AssetKind,
+        ttfb_ms: u128,
+        total_ms: u128,
+        passed: bool,
+    ) -> AssetResult {
+        AssetResult {
+            kind,
+            source: "test".to_string(),
+            url: url.to_string(),
+            status: Some(200),
+            content_type: None,
+            content_range: None,
+            body_bytes: 0,
+            ttfb_ms,
+            total_ms,
+            body_preview: String::new(),
+            passed,
+            failures: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
