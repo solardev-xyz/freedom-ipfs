@@ -26199,3 +26199,239 @@ the remaining tail, but a blunt latency cap is too coarse for production. A
 better next experiment should use richer per-peer/session evidence, for example
 recent timeout/error history, repeated success latency, or per-content-root
 peer quality, rather than dropping every success above a fixed threshold.
+
+## 2026-05-06 Default Promotion: Zero Pre-Lookup Session Grace
+
+Hypothesis:
+The earlier `50ms` pre-lookup head start for recent Bitswap session peers made
+sense when session shortcuts frequently won before routing. After the
+single-HTTP post-lookup race became default, the latest focused trace showed
+`330` pre-lookup waits but only `1` hit. That means the head start now mostly
+adds about `50ms` to page asset medians before provider lookup starts. Remove
+that pre-lookup delay, but keep the shortcut running during provider lookup and
+post-lookup waits.
+
+Implementation:
+
+- Add env override:
+  `FREEDOM_IPFS_BITSWAP_SESSION_PRE_LOOKUP_GRACE_MS`.
+- Set the default `BITSWAP_SESSION_PRE_LOOKUP_GRACE` to `0ms`.
+- Keep existing session shortcut behavior after provider lookup:
+  - single-HTTP provider post-lookup race remains default
+  - multi/zero-HTTP post-lookup waits remain bounded
+  - every returned block is still CID-verified before storing/serving
+- The env override can restore `50ms` or test middle values without another
+  code patch.
+
+Pre-change focused r10 baseline:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-default-ipfs-tech-r10-20260506T232731Z-trace.jsonl \
+  --comparison-output /tmp/current-default-ipfs-tech-r10-20260506T232731Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/current-default-ipfs-tech-r10-20260506T232731Z.log 2>&1
+```
+
+`0ms` focused r10 command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_SESSION_PRE_LOOKUP_GRACE_MS=0 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/prelookup0-ipfs-tech-r10-20260506T233145Z-trace.jsonl \
+  --comparison-output /tmp/prelookup0-ipfs-tech-r10-20260506T233145Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/prelookup0-ipfs-tech-r10-20260506T233145Z.log 2>&1
+```
+
+Focused r10 results:
+
+| Mode | Pass | Root TTFB p50/p95 | Asset TTFB p50/p95 | Kubo asset p50/p95 | Rust max RSS/FD |
+| --- | --- | --- | --- | --- | --- |
+| `50ms` default | Rust `10/10`, Kubo `10/10` | `593/982ms` | `234/549ms` | `175/1136ms` | `55508KiB` / `34` |
+| `0ms` env | Rust `10/10`, Kubo `10/10` | `600/898ms` | `201/461ms` | `102/601ms` | `54292KiB` / `39` |
+
+Focused trace comparison:
+
+- Pre-lookup waits:
+  - `50ms`: `330`, with `1` hit and p50/p95 wait `51/52ms`
+  - `0ms`: `330`, with `0` hits and p50/p95 wait `1/2ms`
+- Request TTFB p50/p95 improved from `236/582ms` to `201/497ms`.
+- Block fetch total p50/p95 improved from `230/342ms` to `193/319ms`.
+- HTTP provider fetch p50/p95 improved from `106/199ms` to `92/194ms`.
+- Bitswap fetch count rose from `12` to `24`, and established Bitswap
+  connections rose from `25` to `54`; FD max still stayed below `40`.
+
+Multi-case r3 command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_SESSION_PRE_LOOKUP_GRACE_MS=0 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/prelookup0-multicase-r3-20260506T233350Z-trace.jsonl \
+  --comparison-output /tmp/prelookup0-multicase-r3-20260506T233350Z.json \
+  > /tmp/prelookup0-multicase-r3-20260506T233350Z.log 2>&1
+```
+
+Same-window default r3 control:
+
+- Artifact paths:
+  `/tmp/current-default-multicase-r3-20260506T232254Z-trace.jsonl` and
+  `/tmp/current-default-multicase-r3-20260506T232254Z.json`.
+
+Multi-case r3 results:
+
+- `daicowtf-page-assets` root TTFB p50/p95:
+  - default Rust/Kubo: `1241/1253ms` vs `2958/3007ms`
+  - `0ms` Rust/Kubo: `1213/1269ms` vs `2914/2938ms`
+- `vitalik-root-html-range` root TTFB p50/p95:
+  - default Rust/Kubo: `405/432ms` vs `1697/2751ms`
+  - `0ms` Rust/Kubo: `308/322ms` vs `1663/2778ms`
+- `ipfs-tech-page-assets` root TTFB p50/p95:
+  - default Rust/Kubo: `806/922ms` vs `1451/1556ms`
+  - `0ms` Rust/Kubo: `719/728ms` vs `1422/1512ms`
+- `ipfs-tech-page-assets` asset TTFB p50/p95:
+  - default Rust/Kubo: `264/638ms` vs `392/922ms`
+  - `0ms` Rust/Kubo: `208/508ms` vs `382/791ms`
+- Resource max:
+  - default Rust/Kubo: `59064KiB` / `40` FDs vs `217656KiB` / `201` FDs
+  - `0ms` Rust/Kubo: `61772KiB` / `37` FDs vs `141100KiB` / `184` FDs
+
+Multi-case r10 command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_SESSION_PRE_LOOKUP_GRACE_MS=0 \
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/prelookup0-multicase-r10-20260506T233459Z-trace.jsonl \
+  --comparison-output /tmp/prelookup0-multicase-r10-20260506T233459Z.json \
+  > /tmp/prelookup0-multicase-r10-20260506T233459Z.log 2>&1
+```
+
+Multi-case r10 result:
+
+- Rust passed `10/10`; Kubo passed `10/10`.
+- `daicowtf-page-assets` root TTFB p50/p95:
+  - Rust: `1232/1521ms`
+  - Kubo: `2710/3123ms`
+- `vitalik-root-html-range` root TTFB p50/p95:
+  - Rust: `307/326ms`
+  - Kubo: `1609/2704ms`
+- `ipfs-tech-page-assets` root TTFB p50/p95:
+  - Rust: `688/1091ms`
+  - Kubo: `1369/2566ms`
+- `ipfs-tech-page-assets` asset TTFB p50/p95:
+  - Rust: `207/478ms`
+  - Kubo: `371/731ms`
+- Resource max:
+  - Rust: `57652KiB` RSS, `39` FDs
+  - Kubo: `302820KiB` RSS, `511` FDs
+
+R10 trace notes:
+
+- Pre-lookup waits: `380`, all using budget `0ms`, p50/p95 elapsed `1/2ms`.
+- Post-lookup waits remained bounded: `180`, with `55` hits and `125`
+  timeouts.
+- HTTP provider blocks: `305`, p50/p95/max `210/323/427ms`.
+- Bitswap blocks: `145`, p50/p95/max `106/835/1149ms`.
+- Bitswap attempts/connections rose compared with the focused `50ms` baseline,
+  but the actual process resource max stayed mobile-sized at `57MiB` and
+  `39` FDs.
+- The remaining slowest requests were still zero-HTTP/Bitswap-heavy DAICO
+  roots, not the pre-lookup path.
+
+Post-promotion validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+All passed after updating the old head-start unit test to assert the new
+contract: provider lookup starts immediately, and a recent Bitswap peer can
+still win through the bounded provider-lookup/post-lookup path.
+
+No-env default smoke:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/prelookup0-default-on-ipfs-tech-r3-20260506T233939Z-trace.jsonl \
+  --comparison-output /tmp/prelookup0-default-on-ipfs-tech-r3-20260506T233939Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/prelookup0-default-on-ipfs-tech-r3-20260506T233939Z.log 2>&1
+```
+
+Result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Root TTFB p50/p95:
+  - Rust: `586/814ms`
+  - Kubo: `2336/3261ms`
+- Asset TTFB p50/p95:
+  - Rust: `196/409ms`
+  - Kubo: `237/1375ms`
+- Resource max:
+  - Rust: `55572KiB` RSS, `32` FDs
+  - Kubo: `304508KiB` RSS, `415` FDs
+- Trace confirmed the default without the env var:
+  `pre_lookup_budgets=0=99`.
+
+Decision:
+Promote `0ms` pre-lookup grace to default and keep
+`FREEDOM_IPFS_BITSWAP_SESSION_PRE_LOOKUP_GRACE_MS` as a rollback/tuning knob.
+The old `50ms` delay had become a repeated median tax after the post-lookup
+race work: in the current focused r10 it produced only one pre-lookup hit out
+of `330` waits. Removing it improved `ipfs.tech` asset p50 and p95 in focused
+and multi-case samples, preserved root wins, and kept RSS/FDs far below Kubo.
+Continue watching Bitswap attempt/connection counts in future guardrails.

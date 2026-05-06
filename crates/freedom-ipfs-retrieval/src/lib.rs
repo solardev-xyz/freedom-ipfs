@@ -86,7 +86,12 @@ const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD: usize = 2;
 const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD";
 const BITSWAP_SESSION_SHORTCUT_GRACE: Duration = Duration::from_millis(0);
-const BITSWAP_SESSION_PRE_LOOKUP_GRACE: Duration = Duration::from_millis(50);
+// Start provider lookup immediately. Recent session peers still race during
+// lookup/post-lookup; a separate pre-lookup head start became a median tax once
+// the post-lookup race covered useful session hits.
+const BITSWAP_SESSION_PRE_LOOKUP_GRACE: Duration = Duration::from_millis(0);
+const BITSWAP_SESSION_PRE_LOOKUP_GRACE_MS_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_SESSION_PRE_LOOKUP_GRACE_MS";
 const BITSWAP_SESSION_POST_LOOKUP_GRACE: Duration = Duration::from_millis(100);
 // Give a recent Bitswap session peer a short chance to win before falling back
 // to the only HTTP provider. Longer waits inflated page-asset tails on mobile
@@ -601,13 +606,14 @@ impl HttpRetriever {
                     };
                     tokio::pin!(shortcut);
                     let pre_lookup_started = Instant::now();
-                    match timeout(BITSWAP_SESSION_PRE_LOOKUP_GRACE, &mut shortcut).await {
+                    let pre_lookup_grace = bitswap_session_pre_lookup_grace();
+                    match timeout(pre_lookup_grace, &mut shortcut).await {
                         Ok(shortcut_result) => {
                             if let Some(block) = shortcut_result? {
                                 tracing::info!(
                                     phase = "bitswap_session_shortcut_pre_lookup",
                                     cid = %cid,
-                                    timeout_ms = BITSWAP_SESSION_PRE_LOOKUP_GRACE.as_millis(),
+                                    timeout_ms = pre_lookup_grace.as_millis(),
                                     outcome = "hit",
                                     elapsed_ms = pre_lookup_started.elapsed().as_millis()
                                 );
@@ -616,7 +622,7 @@ impl HttpRetriever {
                             tracing::info!(
                                 phase = "bitswap_session_shortcut_pre_lookup",
                                 cid = %cid,
-                                timeout_ms = BITSWAP_SESSION_PRE_LOOKUP_GRACE.as_millis(),
+                                timeout_ms = pre_lookup_grace.as_millis(),
                                 outcome = "miss",
                                 elapsed_ms = pre_lookup_started.elapsed().as_millis()
                             );
@@ -638,7 +644,7 @@ impl HttpRetriever {
                             tracing::info!(
                                 phase = "bitswap_session_shortcut_pre_lookup",
                                 cid = %cid,
-                                timeout_ms = BITSWAP_SESSION_PRE_LOOKUP_GRACE.as_millis(),
+                                timeout_ms = pre_lookup_grace.as_millis(),
                                 outcome = "timeout",
                                 elapsed_ms = pre_lookup_started.elapsed().as_millis()
                             );
@@ -3152,6 +3158,20 @@ fn single_http_post_lookup_race_min_score() -> Option<Duration> {
 
 fn zero_http_post_lookup_race_enabled() -> bool {
     std::env::var_os(ENABLE_ZERO_HTTP_POST_LOOKUP_RACE_ENV).is_some()
+}
+
+fn bitswap_session_pre_lookup_grace() -> Duration {
+    let override_value = std::env::var_os(BITSWAP_SESSION_PRE_LOOKUP_GRACE_MS_ENV);
+    bitswap_session_pre_lookup_grace_from_env_value(
+        override_value.as_deref().and_then(|value| value.to_str()),
+    )
+}
+
+fn bitswap_session_pre_lookup_grace_from_env_value(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(BITSWAP_SESSION_PRE_LOOKUP_GRACE)
 }
 
 fn bitswap_successful_peer_max_latency() -> Option<Duration> {
@@ -8438,7 +8458,7 @@ mod bitswap_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn recent_bitswap_peer_head_start_can_avoid_provider_lookup() {
+    async fn recent_bitswap_peer_can_win_after_immediate_provider_lookup() {
         let first = b"session head start first block";
         let second = b"session head start second block";
         let first_cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, first);
@@ -8475,7 +8495,7 @@ mod bitswap_tests {
 
         assert_eq!(source, RetrievalSource::Bitswap);
         assert_eq!(block.data(), second);
-        assert_eq!(delegated_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(delegated_requests.load(Ordering::Relaxed), 1);
 
         tokio::time::timeout(Duration::from_secs(5), stream_task)
             .await
@@ -8644,6 +8664,26 @@ mod bitswap_tests {
         assert_eq!(
             single_http_post_lookup_grace_from_env_value(Some("not-a-number")),
             BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE
+        );
+    }
+
+    #[test]
+    fn pre_lookup_grace_env_value_parses_override() {
+        assert_eq!(
+            bitswap_session_pre_lookup_grace_from_env_value(None),
+            BITSWAP_SESSION_PRE_LOOKUP_GRACE
+        );
+        assert_eq!(
+            bitswap_session_pre_lookup_grace_from_env_value(Some("25")),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            bitswap_session_pre_lookup_grace_from_env_value(Some("0")),
+            Duration::from_millis(0)
+        );
+        assert_eq!(
+            bitswap_session_pre_lookup_grace_from_env_value(Some("not-a-number")),
+            BITSWAP_SESSION_PRE_LOOKUP_GRACE
         );
     }
 
