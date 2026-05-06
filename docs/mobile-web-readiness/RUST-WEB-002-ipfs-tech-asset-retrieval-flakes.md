@@ -22457,3 +22457,189 @@ tuning raw self-hedge delay and use the new winner-attempt diagnostics in future
 longer A/Bs. A production policy change should require a larger sample across
 `ipfs.tech`, `daicowtf`, and range cases, with Kubo comparison if the default is
 changed.
+
+## 2026-05-06 Observe: Multi-Case Self-Hedge Enabled vs Disabled r5
+
+Question:
+The prior wider no-trace sample covered only `ipfs.tech`. Before changing the
+same-provider HTTP self-hedge policy, collect a same-window multi-case sample
+covering the focused page workload plus the recurring sparse-provider and range
+guardrails.
+
+Default command:
+
+```sh
+rm -f /tmp/self-hedge-policy-default-multicase-r5.json
+
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --output /tmp/self-hedge-policy-default-multicase-r5.json
+```
+
+Disabled command:
+
+```sh
+rm -f /tmp/self-hedge-policy-disabled-multicase-r5.json
+
+FREEDOM_IPFS_DISABLE_SINGLE_HTTP_SELF_HEDGE=1 timeout 1800s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --output /tmp/self-hedge-policy-disabled-multicase-r5.json
+```
+
+Artifacts:
+
+- `/tmp/self-hedge-policy-default-multicase-r5.json`
+- `/tmp/self-hedge-policy-disabled-multicase-r5.json`
+
+Result:
+
+| Mode | Pass | Run total p50/p90/p95/max | Max RSS/FD | `ipfs.tech` root p50/p95/max | `ipfs.tech` asset p50/p95/max | DAICO root p50/p95/max | Vitalik range p50/p95/max |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Default `200ms` | `5/5` | `2555/3729/3729/3729ms` | `55900KiB` / `35` | `578/799/799ms` | `189/642/1700ms` | `269/418/418ms` | `92/175/175ms` |
+| Disabled | `5/5` | `2297/2654/2654/2654ms` | `55620KiB` / `40` | `619/727/727ms` | `163/483/1694ms` | `271/283/283ms` | `88/93/93ms` |
+
+Decision:
+Do not change the default from this sample alone. Disabling same-provider HTTP
+self-hedge looked better on overall run p50/p95, `ipfs.tech` asset p50/p95,
+DAICO max, and Vitalik range max. However, the default still had slightly better
+`ipfs.tech` root p50 and lower max FD count, and these no-trace guardrails do
+not expose duplicate winner rates or source mix. Treat this as stronger
+evidence that the current same-provider self-hedge should become conditional,
+not as enough evidence to flip it off globally. The next useful experiment is a
+scored or adaptive policy that disables duplicate same-provider requests after
+low observed hedge win rates, with trace validation that it keeps tail
+protection for genuinely slow single-provider responses.
+
+## 2026-05-06 Keep Lab Control: Single-HTTP Self-Hedge Score Gate
+
+Question:
+Can the same-provider HTTP self-hedge become conditional on recent provider
+latency instead of firing on every single-provider request that crosses the
+`200ms` delay? This should stay opt-in until live evidence proves it helps.
+
+Implementation:
+
+- Add opt-in env var:
+  `FREEDOM_IPFS_SINGLE_HTTP_SELF_HEDGE_MIN_SCORE_MS`.
+- When unset, default behavior is unchanged.
+- When set, a single HTTP provider with a recent EWMA score below the threshold
+  skips the duplicate same-provider self-hedge.
+- Unscored providers keep the existing self-hedge protection, so a new provider
+  can still get rare-tail coverage.
+- Emit `http_provider_self_hedge_skip` with reason
+  `provider_score_below_threshold`, `scoring_disabled`, or `provider_unkeyed`.
+- Extend harness summaries with same-provider self-hedge skip counts and
+  reasons.
+- Map the skip phase to `fetching_http_provider` in the harness and mobile
+  progress mapping.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval single_http_self_hedge_score_gate_skips_fast_scored_provider
+cargo test -p freedom-ipfs-retrieval self_hedges_slow_single_http_provider
+cargo test -p freedom-ipfs-retrieval http_provider
+cargo test -p mobile-web-harness trace_summary_counts_http_provider_fetches
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo check -p mobile-web-harness --all-targets
+git diff --check
+```
+
+Focused result:
+
+- Formatting and diff whitespace checks passed.
+- New score-gate helper test passed.
+- Existing single HTTP self-hedge test passed.
+- Focused HTTP-provider retrieval tests passed: `10 passed`.
+- Focused harness HTTP-provider summary test passed.
+- Focused mobile progress mapping test passed.
+- Retrieval and harness package checks passed.
+
+Score-gated `250ms` experiment:
+
+```sh
+rm -f /tmp/ipfs-tech-self-hedge-scoregate250-r3.json \
+  /tmp/ipfs-tech-self-hedge-scoregate250-r3-trace.jsonl
+
+FREEDOM_IPFS_SINGLE_HTTP_SELF_HEDGE_MIN_SCORE_MS=250 timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-self-hedge-scoregate250-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-self-hedge-scoregate250-r3.json
+```
+
+Same-window default baseline:
+
+```sh
+rm -f /tmp/ipfs-tech-self-hedge-scoregate-baseline-r3.json \
+  /tmp/ipfs-tech-self-hedge-scoregate-baseline-r3-trace.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-self-hedge-scoregate-baseline-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-self-hedge-scoregate-baseline-r3.json
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-self-hedge-scoregate250-r3.json`
+- `/tmp/ipfs-tech-self-hedge-scoregate250-r3-trace.jsonl`
+- `/tmp/ipfs-tech-self-hedge-scoregate-baseline-r3.json`
+- `/tmp/ipfs-tech-self-hedge-scoregate-baseline-r3-trace.jsonl`
+
+Result:
+
+| Mode | Pass | Run total p50/p95/max | Root TTFB p50/p95/max | Asset TTFB p50/p95/max | Max RSS/FD | Self-hedges | Self-hedge skips | Single-provider result p50/p95/max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Score gate `250ms` | `3/3` | `2657/3615/3615ms` | `603/1453/1453ms` | `251/899/1450ms` | `52960KiB` / `33` | `14` | `34` | `234/762/1204ms` |
+| Default | `3/3` | `2538/2705/2705ms` | `750/1038/1038ms` | `256/605/905ms` | `47616KiB` / `24` | `45` | `0` | `267/511/690ms` |
+
+Trace notes:
+
+- The score gate did exactly what it was meant to do mechanically:
+  `34` skips with reason `provider_score_below_threshold`.
+- That reduction in duplicate same-provider requests did not improve the
+  user-facing sample. Root p95, asset p95, asset max, run p95/max, and FD/RSS
+  were all worse than the same-window default baseline.
+- The default run had more self-hedges (`45`) and more duplicate wins (`7`),
+  and it kept the single-provider result tail materially lower.
+
+Decision:
+Keep the opt-in env var and harness/mobile diagnostics as a lab control, but
+reject `250ms` score-gating as a production/default policy. The code path is
+inactive unless the env var is set, and the skip diagnostics are useful for
+future controlled sweeps. Do not enable this by default without a larger
+same-window A/B showing lower p95/max while preserving rare-tail protection.

@@ -562,6 +562,7 @@ fn progress_source(raw_phase: &str, fields: &ProgressFields) -> Option<String> {
         "http_provider_fetch"
         | "http_provider_hedge"
         | "http_provider_race"
+        | "http_provider_self_hedge_skip"
         | "http_provider_bitswap_hedge_skip"
         | "http_provider_race_result" => Some("http_provider".into()),
         "http_provider_bitswap_hedge" => Some("bitswap".into()),
@@ -673,6 +674,7 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         "http_provider_fetch"
         | "http_provider_hedge"
         | "http_provider_race"
+        | "http_provider_self_hedge_skip"
         | "http_provider_bitswap_hedge_skip"
         | "http_provider_race_result" => "fetching_http_provider",
         "http_provider_bitswap_hedge" => "fetching_bitswap",
@@ -2375,6 +2377,14 @@ mod tests {
         );
         assert_eq!(
             progress_source(
+                "http_provider_self_hedge_skip",
+                &progress_fields([("phase", "http_provider_self_hedge_skip")]),
+            )
+            .as_deref(),
+            Some("http_provider")
+        );
+        assert_eq!(
+            progress_source(
                 "http_provider_bitswap_hedge_skip",
                 &progress_fields([("phase", "http_provider_bitswap_hedge_skip")]),
             )
@@ -2676,6 +2686,14 @@ mod tests {
                 "active",
             ),
             "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "http_provider_self_hedge_skip",
+                &progress_fields([("phase", "http_provider_self_hedge_skip")]),
+                "active",
+            ),
+            "fetching_http_provider"
         );
         assert_eq!(
             progress_phase(

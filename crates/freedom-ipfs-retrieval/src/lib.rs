@@ -52,6 +52,8 @@ const MAX_HTTP_PROVIDER_SCORE_ENTRIES: usize = 64;
 const DISABLE_HTTP_PROVIDER_SCORING_ENV: &str = "FREEDOM_IPFS_DISABLE_HTTP_PROVIDER_SCORING";
 const DISABLE_SINGLE_HTTP_SELF_HEDGE_ENV: &str = "FREEDOM_IPFS_DISABLE_SINGLE_HTTP_SELF_HEDGE";
 const SINGLE_HTTP_SELF_HEDGE_AFTER_MS_ENV: &str = "FREEDOM_IPFS_SINGLE_HTTP_SELF_HEDGE_AFTER_MS";
+const SINGLE_HTTP_SELF_HEDGE_MIN_SCORE_MS_ENV: &str =
+    "FREEDOM_IPFS_SINGLE_HTTP_SELF_HEDGE_MIN_SCORE_MS";
 const ENABLE_SINGLE_HTTP_BITSWAP_HEDGE_ENV: &str = "FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE";
 const SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS";
@@ -961,18 +963,26 @@ impl HttpRetriever {
         );
 
         if provider_count == 1 && single_http_provider_self_hedge_enabled() {
-            let Some(candidate) = candidates.into_iter().next() else {
+            let Some(candidate) = candidates.first() else {
                 return Ok(None);
             };
-            return self
-                .fetch_single_http_provider_candidate_with_self_hedge(
-                    cid,
-                    candidate,
-                    provider_count,
-                    scored_provider_count,
-                    started,
-                )
-                .await;
+            if self
+                .single_http_provider_self_hedge_score_allows(cid, &candidate.base)
+                .await
+            {
+                let Some(candidate) = candidates.into_iter().next() else {
+                    return Ok(None);
+                };
+                return self
+                    .fetch_single_http_provider_candidate_with_self_hedge(
+                        cid,
+                        candidate,
+                        provider_count,
+                        scored_provider_count,
+                        started,
+                    )
+                    .await;
+            }
         }
 
         let mut next_bases = candidates.into_iter().enumerate();
@@ -1545,6 +1555,71 @@ impl HttpRetriever {
         if score.ewma_elapsed < min_score {
             tracing::info!(
                 phase = "http_provider_bitswap_hedge_skip",
+                cid = %cid,
+                provider = %base,
+                reason = "provider_score_below_threshold",
+                provider_scored = true,
+                provider_score_ms = score.ewma_elapsed.as_millis(),
+                min_score_ms = min_score.as_millis()
+            );
+            return false;
+        }
+        true
+    }
+
+    async fn single_http_provider_self_hedge_score_allows(&self, cid: &Cid, base: &Url) -> bool {
+        self.single_http_provider_self_hedge_score_allows_with_min(
+            cid,
+            base,
+            single_http_provider_self_hedge_min_score(),
+        )
+        .await
+    }
+
+    async fn single_http_provider_self_hedge_score_allows_with_min(
+        &self,
+        cid: &Cid,
+        base: &Url,
+        min_score: Option<Duration>,
+    ) -> bool {
+        let Some(min_score) = min_score else {
+            return true;
+        };
+        if !http_provider_scoring_enabled() {
+            tracing::info!(
+                phase = "http_provider_self_hedge_skip",
+                cid = %cid,
+                provider = %base,
+                reason = "scoring_disabled",
+                provider_scored = false,
+                provider_score_ms = 0u128,
+                min_score_ms = min_score.as_millis()
+            );
+            return false;
+        }
+        let Some(key) = http_provider_score_key(base) else {
+            tracing::info!(
+                phase = "http_provider_self_hedge_skip",
+                cid = %cid,
+                provider = %base,
+                reason = "provider_unkeyed",
+                provider_scored = false,
+                provider_score_ms = 0u128,
+                min_score_ms = min_score.as_millis()
+            );
+            return false;
+        };
+        let mut scores = self.http_provider_scores.lock().await;
+        let now = Instant::now();
+        scores.retain(|_, score| {
+            now.saturating_duration_since(score.last_seen) <= HTTP_PROVIDER_SCORE_TTL
+        });
+        let Some(score) = scores.get(&key) else {
+            return true;
+        };
+        if score.ewma_elapsed < min_score {
+            tracing::info!(
+                phase = "http_provider_self_hedge_skip",
                 cid = %cid,
                 provider = %base,
                 reason = "provider_score_below_threshold",
@@ -2473,6 +2548,12 @@ fn single_http_provider_self_hedge_after() -> Duration {
         .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER)
+}
+
+fn single_http_provider_self_hedge_min_score() -> Option<Duration> {
+    std::env::var_os(SINGLE_HTTP_SELF_HEDGE_MIN_SCORE_MS_ENV)
+        .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+        .map(Duration::from_millis)
 }
 
 fn single_http_provider_bitswap_hedge_enabled() -> bool {
@@ -6869,6 +6950,59 @@ mod bitswap_tests {
         assert_eq!(requests.load(Ordering::Relaxed), 2);
         assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn single_http_self_hedge_score_gate_skips_fast_scored_provider() {
+        let cid = freedom_ipfs_core::cid_from_data(
+            freedom_ipfs_core::CODEC_RAW,
+            b"score gated single HTTP self hedge",
+        );
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store,
+        );
+        let base = Url::parse("https://fast-provider.example/").unwrap();
+
+        assert!(
+            retriever
+                .single_http_provider_self_hedge_score_allows_with_min(
+                    &cid,
+                    &base,
+                    Some(Duration::from_millis(100)),
+                )
+                .await,
+            "unscored providers keep the existing self-hedge protection"
+        );
+
+        retriever
+            .record_http_provider_success(&base, Duration::from_millis(50))
+            .await;
+        assert!(
+            !retriever
+                .single_http_provider_self_hedge_score_allows_with_min(
+                    &cid,
+                    &base,
+                    Some(Duration::from_millis(100)),
+                )
+                .await,
+            "recently fast providers should skip opt-in duplicate self-hedges"
+        );
+
+        retriever
+            .record_http_provider_success(&base, Duration::from_millis(500))
+            .await;
+        assert!(
+            retriever
+                .single_http_provider_self_hedge_score_allows_with_min(
+                    &cid,
+                    &base,
+                    Some(Duration::from_millis(100)),
+                )
+                .await,
+            "slow scored providers should still get the self-hedge tail guard"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
