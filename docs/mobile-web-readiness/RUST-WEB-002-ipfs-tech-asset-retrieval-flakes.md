@@ -21608,3 +21608,171 @@ The next speed work should target cold asset median without increasing mobile
 resource pressure: small bounded DAG/session prefetch, Bitswap multi-want or
 session batching, or selective provider diversity for single slow HTTP-provider
 blocks.
+
+## 2026-05-06 Experiment: Opt-In Single-HTTP Bitswap Hedge
+
+Question:
+The cold empty-store trace showed that blocks with only one HTTP provider were
+slower than blocks with multiple HTTP providers, and most of those single-provider
+winners were `https://ipfs-bridge.sia.dev/`. Can a narrower Bitswap hedge improve
+cold asset median without taking the broad Bitswap pressure hit from the rejected
+2026-05-05 single-provider race?
+
+Implementation:
+
+- Add opt-in env var `FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE`.
+- Default behavior is unchanged.
+- When exactly one HTTP provider base is available and at least one provider has
+  a peer ID plus a non-HTTP multiaddr, race one verified HTTP provider fetch
+  against a delayed Bitswap fetch.
+- The Bitswap hedge starts after `150ms`.
+- The experiment avoids also self-hedging the same single HTTP provider, so the
+  worst case is one HTTP attempt plus one Bitswap attempt, not two HTTP attempts
+  plus Bitswap.
+- Blocks are still verified before serving or caching. This is not a public
+  gateway fallback.
+- Add trace phases `http_provider_bitswap_hedge` and
+  `http_provider_bitswap_hedge_result`, and map them to stable mobile/harness
+  progress phases.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval bitswap_hedge_can_win_against_slow_single_http_provider -- --nocapture
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states -- --nocapture
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases -- --nocapture
+cargo test -p freedom-ipfs-retrieval
+cargo test -p freedom-ipfs-mobile
+cargo test -p mobile-web-harness
+cargo clippy -p freedom-ipfs-retrieval -p freedom-ipfs-mobile -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Result:
+
+- Focused hedge test passed: a local Bitswap peer beat a deliberately slow
+  single HTTP provider, the served block matched the expected CID, and only one
+  HTTP request was issued.
+- Full retrieval tests passed: `75` passed, `1` ignored.
+- Full mobile tests passed: `27` passed.
+- Full harness tests passed: `43` passed.
+- Focused clippy passed for the touched crates/tools.
+
+Disabled no-trace command:
+
+```sh
+rm -f /tmp/ipfs-tech-single-http-bitswap-hedge-disabled-r3.json
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --output /tmp/ipfs-tech-single-http-bitswap-hedge-disabled-r3.json
+```
+
+Enabled no-trace command:
+
+```sh
+rm -f /tmp/ipfs-tech-single-http-bitswap-hedge-enabled-r3.json
+
+FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --output /tmp/ipfs-tech-single-http-bitswap-hedge-enabled-r3.json
+```
+
+No-trace artifacts:
+
+- `/tmp/ipfs-tech-single-http-bitswap-hedge-disabled-r3.json`
+- `/tmp/ipfs-tech-single-http-bitswap-hedge-enabled-r3.json`
+
+No-trace results:
+
+| Mode | Pass | Run total p50/p95/max | Root TTFB p50/p95/max | Asset TTFB p50/p95/max | Max RSS/FD |
+| --- | --- | --- | --- | --- | --- |
+| Disabled | `3/3` | `3137/4566/4566ms` | `1381/1654/1654ms` | `239/962/1077ms` | `47432KiB` / `23` |
+| Enabled | `3/3` | `3045/3648/3648ms` | `1224/1254/1254ms` | `229/880/1344ms` | `55140KiB` / `38` |
+
+Traced disabled command:
+
+```sh
+rm -f /tmp/ipfs-tech-single-http-bitswap-hedge-disabled-trace-r3.json \
+  /tmp/ipfs-tech-single-http-bitswap-hedge-disabled-trace-r3-trace.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-single-http-bitswap-hedge-disabled-trace-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-single-http-bitswap-hedge-disabled-trace-r3.json
+```
+
+Traced enabled command:
+
+```sh
+rm -f /tmp/ipfs-tech-single-http-bitswap-hedge-enabled-trace-r3.json \
+  /tmp/ipfs-tech-single-http-bitswap-hedge-enabled-trace-r3-trace.jsonl
+
+FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-single-http-bitswap-hedge-enabled-trace-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-single-http-bitswap-hedge-enabled-trace-r3.json
+```
+
+Traced artifacts:
+
+- `/tmp/ipfs-tech-single-http-bitswap-hedge-disabled-trace-r3.json`
+- `/tmp/ipfs-tech-single-http-bitswap-hedge-disabled-trace-r3-trace.jsonl`
+- `/tmp/ipfs-tech-single-http-bitswap-hedge-enabled-trace-r3.json`
+- `/tmp/ipfs-tech-single-http-bitswap-hedge-enabled-trace-r3-trace.jsonl`
+
+Traced results:
+
+| Mode | Pass | Run total p50/p95/max | Root TTFB p50/p95/max | Asset TTFB p50/p95/max | Max RSS/FD |
+| --- | --- | --- | --- | --- | --- |
+| Disabled | `3/3` | `2376/2490/2490ms` | `796/847/847ms` | `245/558/750ms` | `48228KiB` / `25` |
+| Enabled | `3/3` | `2650/2849/2849ms` | `719/1234/1234ms` | `195/675/818ms` | `55732KiB` / `49` |
+
+Trace findings:
+
+- Disabled trace had `3003` events and `120` `block_fetch_total` events, all
+  from `http_provider`.
+- Enabled trace had `3522` events, `25` `http_provider_bitswap_hedge` starts,
+  and `25` `http_provider_bitswap_hedge_result` events.
+- Enabled source mix moved to `68` Bitswap blocks and `51` HTTP-provider blocks.
+- Enabled source latency was Bitswap p50/p95/max `143/291/497ms` and
+  HTTP-provider p50/p95/max `288/575/595ms`.
+- The hedge can move work to faster Bitswap in a favorable window, but it raises
+  RSS by roughly `7MiB` and FD count by `24` in the traced comparison, and it
+  worsened traced p95/max page and asset latency.
+
+Decision:
+Keep the implementation only as an opt-in lab knob. Do not enable it by default.
+The narrower hedge gives useful diagnostic leverage and can improve asset p50,
+but the current trigger is still too broad for mobile production because it
+raises connection pressure and does not improve p95/max consistently. Future work
+should retune this around stricter signals, for example a slow-provider score,
+recent peer success, lower per-page Bitswap caps, or a later hedge delay.

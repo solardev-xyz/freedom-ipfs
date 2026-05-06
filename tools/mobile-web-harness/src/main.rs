@@ -4353,6 +4353,8 @@ const OFFLINE_NETWORK_TRACE_PHASES: &[&str] = &[
     "http_provider_hedge",
     "http_provider_self_hedge",
     "http_provider_race_result",
+    "http_provider_bitswap_hedge",
+    "http_provider_bitswap_hedge_result",
     "http_provider_fetch",
     "bitswap_provider_candidates_empty",
     "bitswap_peer_expand",
@@ -8248,6 +8250,13 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         | "http_provider_race"
         | "http_provider_self_hedge"
         | "http_provider_race_result" => "fetching_http_provider",
+        "http_provider_bitswap_hedge" => "fetching_bitswap",
+        "http_provider_bitswap_hedge_result" => {
+            match value.get("source").and_then(|source| source.as_str()) {
+                Some("bitswap") => "fetching_bitswap",
+                _ => "fetching_http_provider",
+            }
+        }
         "bitswap_fetch"
         | "bitswap_connection_established"
         | "bitswap_incoming_block"
@@ -9703,6 +9712,9 @@ mod tests {
                 "{\"phase\":\"block_store_get\",\"cid\":\"cid-b\",\"cache_hit\":true}\n",
                 "{\"phase\":\"http_provider_fetch\",\"cid\":\"cid-a\",\"ok\":true}\n",
                 "{\"phase\":\"http_provider_hedge\",\"cid\":\"cid-a\",\"provider\":\"https://provider.example\",\"timeout_ms\":250,\"pending_count\":2}\n",
+                "{\"phase\":\"http_provider_bitswap_hedge\",\"cid\":\"cid-a\",\"provider_count\":4,\"timeout_ms\":150,\"reason\":\"slow_single_http_provider\"}\n",
+                "{\"phase\":\"http_provider_bitswap_hedge_result\",\"cid\":\"cid-a\",\"source\":\"bitswap\",\"provider_count\":4,\"elapsed_ms\":200}\n",
+                "{\"phase\":\"http_provider_bitswap_hedge_result\",\"cid\":\"cid-b\",\"source\":\"http_provider\",\"provider_count\":2,\"elapsed_ms\":75}\n",
                 "{\"phase\":\"bitswap_peer_expand\",\"cid\":\"cid-a\",\"peer_count\":2}\n",
                 "{\"phase\":\"bitswap_incoming_batch\",\"cid\":\"cid-a\",\"cid_count\":2,\"requested_blocks\":2}\n",
                 "{\"phase\":\"bitswap_connection_established\",\"peer\":\"peer-a\",\"transport\":\"tcp\"}\n",
@@ -9853,11 +9865,11 @@ mod tests {
         assert_eq!(trace_value_count(&summary.progress_phases, "cache_hit"), 2);
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_http_provider"),
-            2
+            3
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_bitswap"),
-            3
+            5
         );
         assert_eq!(trace_value_count(&summary.progress_phases, "streaming"), 3);
         assert_eq!(summary.gateway_direct_body.events, 1);

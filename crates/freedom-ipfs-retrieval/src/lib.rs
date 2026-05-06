@@ -46,10 +46,12 @@ const HTTP_PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
 const HTTP_PROVIDER_RACE_WIDTH: usize = 2;
 const HTTP_PROVIDER_HEDGE_AFTER: Duration = Duration::from_millis(250);
 const SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER: Duration = Duration::from_millis(250);
+const SINGLE_HTTP_PROVIDER_BITSWAP_HEDGE_AFTER: Duration = Duration::from_millis(150);
 const HTTP_PROVIDER_SCORE_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_HTTP_PROVIDER_SCORE_ENTRIES: usize = 64;
 const DISABLE_HTTP_PROVIDER_SCORING_ENV: &str = "FREEDOM_IPFS_DISABLE_HTTP_PROVIDER_SCORING";
 const DISABLE_SINGLE_HTTP_SELF_HEDGE_ENV: &str = "FREEDOM_IPFS_DISABLE_SINGLE_HTTP_SELF_HEDGE";
+const ENABLE_SINGLE_HTTP_BITSWAP_HEDGE_ENV: &str = "FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE";
 const MAX_CONCURRENT_HTTP_PROVIDER_FETCHES: usize = 4;
 const BITSWAP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 // Start provider retry before a full dial timeout can dominate gateway TTFB.
@@ -868,6 +870,18 @@ impl HttpRetriever {
                 http_provider_bases.push(base.clone());
             }
         }
+        if http_provider_bases.len() == 1
+            && single_http_provider_bitswap_hedge_enabled()
+            && has_bitswap_provider_candidate(providers)
+        {
+            return self
+                .fetch_single_http_provider_with_bitswap_hedge(
+                    cid,
+                    http_provider_bases,
+                    providers.to_vec(),
+                )
+                .await;
+        }
         if let Some(block) = self
             .fetch_from_http_provider_candidates(cid, http_provider_bases)
             .await?
@@ -1062,6 +1076,157 @@ impl HttpRetriever {
             elapsed_ms = started.elapsed().as_millis()
         );
         Ok(None)
+    }
+
+    async fn fetch_single_http_provider_with_bitswap_hedge(
+        &self,
+        cid: &Cid,
+        http_provider_bases: Vec<Url>,
+        providers: Vec<Provider>,
+    ) -> Result<(Block, RetrievalSource)> {
+        let started = Instant::now();
+        let provider_count = providers.len();
+        let candidates = self
+            .scored_http_provider_candidates(http_provider_bases)
+            .await;
+        let scored_provider_count = candidates
+            .iter()
+            .filter(|candidate| candidate.score_elapsed.is_some())
+            .count();
+        let scoring_enabled = http_provider_scoring_enabled();
+        tracing::info!(
+            phase = "http_provider_race",
+            cid = %cid,
+            provider_count = candidates.len(),
+            race_width = HTTP_PROVIDER_RACE_WIDTH,
+            scored_provider_count,
+            scoring_enabled,
+            single_provider_bitswap_hedge = true
+        );
+        let Some(candidate) = candidates.into_iter().next() else {
+            return Err(RetrievalError::NoHttpProviders);
+        };
+        let mut pending =
+            FuturesUnordered::<BoxFuture<'static, SingleHttpProviderBitswapHedgeResult>>::new();
+
+        let retriever = self.clone();
+        let http_cid = *cid;
+        pending.push(
+            async move {
+                SingleHttpProviderBitswapHedgeResult::HttpCandidate(
+                    retriever
+                        .fetch_from_http_provider_candidate_with_index(http_cid, 0, candidate)
+                        .await,
+                )
+            }
+            .boxed(),
+        );
+
+        let hedge = tokio::time::sleep(SINGLE_HTTP_PROVIDER_BITSWAP_HEDGE_AFTER);
+        tokio::pin!(hedge);
+        let mut bitswap_started = false;
+        let mut http_done = false;
+        let mut bitswap_error = None;
+
+        loop {
+            tokio::select! {
+                biased;
+
+                result = pending.next(), if !pending.is_empty() => {
+                    let Some(result) = result else {
+                        break;
+                    };
+                    match result {
+                        SingleHttpProviderBitswapHedgeResult::HttpCandidate(result) => {
+                            http_done = true;
+                            match result.result {
+                                Ok(block) => {
+                                    tracing::info!(
+                                        phase = "http_provider_race_result",
+                                        cid = %cid,
+                                        ok = true,
+                                        provider = %result.base,
+                                        winner_provider_index = result.provider_index,
+                                        winner_provider_rank = result.provider_index + 1,
+                                        winner_original_provider_rank = result.original_provider_index + 1,
+                                        winner_within_initial_width = true,
+                                        provider_count = 1usize,
+                                        race_width = HTTP_PROVIDER_RACE_WIDTH,
+                                        scored_provider_count,
+                                        winner_provider_scored = result.score_elapsed.is_some(),
+                                        winner_provider_score_ms = result
+                                            .score_elapsed
+                                            .map(|elapsed| elapsed.as_millis())
+                                            .unwrap_or_default(),
+                                        single_provider_bitswap_hedge = true,
+                                        bitswap_started,
+                                        elapsed_ms = started.elapsed().as_millis()
+                                    );
+                                    tracing::info!(
+                                        phase = "http_provider_bitswap_hedge_result",
+                                        cid = %cid,
+                                        source = "http_provider",
+                                        provider_count,
+                                        bitswap_started,
+                                        elapsed_ms = started.elapsed().as_millis()
+                                    );
+                                    return Ok((block, RetrievalSource::HttpProvider));
+                                }
+                                Err(_) => {
+                                    if !bitswap_started {
+                                        bitswap_started = true;
+                                        push_single_http_bitswap_hedge(
+                                            &mut pending,
+                                            self.clone(),
+                                            *cid,
+                                            providers.clone(),
+                                            provider_count,
+                                            started,
+                                            "http_provider_failed",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        SingleHttpProviderBitswapHedgeResult::Bitswap(Ok(block)) => {
+                            tracing::info!(
+                                phase = "http_provider_bitswap_hedge_result",
+                                cid = %cid,
+                                source = "bitswap",
+                                provider_count,
+                                http_done,
+                                elapsed_ms = started.elapsed().as_millis()
+                            );
+                            return Ok((block, RetrievalSource::Bitswap));
+                        }
+                        SingleHttpProviderBitswapHedgeResult::Bitswap(Err(err)) => {
+                            bitswap_error = Some(err);
+                            if http_done {
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ = &mut hedge, if !bitswap_started => {
+                    bitswap_started = true;
+                    push_single_http_bitswap_hedge(
+                        &mut pending,
+                        self.clone(),
+                        *cid,
+                        providers.clone(),
+                        provider_count,
+                        started,
+                        "slow_single_http_provider",
+                    );
+                }
+                else => break,
+            }
+        }
+
+        match bitswap_error {
+            Some(RetrievalError::NoBitswapProviders) | None => Err(RetrievalError::NoHttpProviders),
+            Some(err) => Err(err),
+        }
     }
 
     async fn fetch_single_http_provider_candidate_with_self_hedge(
@@ -2214,6 +2379,54 @@ fn http_provider_scoring_enabled() -> bool {
 
 fn single_http_provider_self_hedge_enabled() -> bool {
     std::env::var_os(DISABLE_SINGLE_HTTP_SELF_HEDGE_ENV).is_none()
+}
+
+fn single_http_provider_bitswap_hedge_enabled() -> bool {
+    std::env::var_os(ENABLE_SINGLE_HTTP_BITSWAP_HEDGE_ENV).is_some()
+}
+
+fn has_bitswap_provider_candidate(providers: &[Provider]) -> bool {
+    providers.iter().any(|provider| {
+        provider.id.is_some()
+            && provider.addrs.iter().any(|addr| {
+                let mut parts = addr.split('/').filter(|part| !part.is_empty());
+                !parts.any(|part| matches!(part, "http" | "https"))
+            })
+    })
+}
+
+enum SingleHttpProviderBitswapHedgeResult {
+    HttpCandidate(HttpProviderCandidateResult),
+    Bitswap(Result<Block>),
+}
+
+fn push_single_http_bitswap_hedge(
+    pending: &mut FuturesUnordered<BoxFuture<'static, SingleHttpProviderBitswapHedgeResult>>,
+    retriever: HttpRetriever,
+    cid: Cid,
+    providers: Vec<Provider>,
+    provider_count: usize,
+    started: Instant,
+    reason: &'static str,
+) {
+    tracing::info!(
+        phase = "http_provider_bitswap_hedge",
+        cid = %cid,
+        provider_count,
+        timeout_ms = SINGLE_HTTP_PROVIDER_BITSWAP_HEDGE_AFTER.as_millis(),
+        reason,
+        elapsed_ms = started.elapsed().as_millis()
+    );
+    pending.push(
+        async move {
+            SingleHttpProviderBitswapHedgeResult::Bitswap(
+                retriever
+                    .fetch_from_bitswap_providers(&cid, &providers)
+                    .await,
+            )
+        }
+        .boxed(),
+    );
 }
 
 fn weighted_duration_average(
@@ -6555,6 +6768,68 @@ mod bitswap_tests {
         assert_eq!(requests.load(Ordering::Relaxed), 2);
         assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
         task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bitswap_hedge_can_win_against_slow_single_http_provider() {
+        let expected = b"verified single HTTP bitswap hedge block";
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, expected);
+        let http_requests = Arc::new(AtomicU64::new(0));
+        let (http_addr, http_task) = spawn_counting_http_provider(
+            expected.to_vec(),
+            Duration::from_secs(5),
+            http_requests.clone(),
+        )
+        .await;
+        let (peer_id, bitswap_addr, bitswap_swarm, bitswap_stream) =
+            spawn_local_bitswap_peer(cid, expected.to_vec()).await;
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let http_base = Url::parse(&format!("http://{http_addr}/")).unwrap();
+        let providers = vec![
+            Provider::from_parts(
+                None,
+                vec![format!(
+                    "/ip4/{}/tcp/{}/http",
+                    http_addr.ip(),
+                    http_addr.port()
+                )],
+            )
+            .unwrap(),
+            Provider::from_parts(Some(peer_id.to_string()), vec![bitswap_addr.to_string()])
+                .unwrap(),
+        ];
+
+        let started = Instant::now();
+        let (block, source) = tokio::time::timeout(
+            Duration::from_secs(3),
+            retriever.fetch_single_http_provider_with_bitswap_hedge(
+                &cid,
+                vec![http_base],
+                providers,
+            ),
+        )
+        .await
+        .expect("single HTTP bitswap hedge timed out")
+        .unwrap();
+
+        assert_eq!(source, RetrievalSource::Bitswap);
+        assert_eq!(block.data(), expected);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "bitswap hedge should beat the slow HTTP provider"
+        );
+        assert_eq!(http_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
+        tokio::time::timeout(Duration::from_secs(5), bitswap_stream)
+            .await
+            .unwrap()
+            .unwrap();
+        bitswap_swarm.abort();
+        http_task.abort();
     }
 
     #[tokio::test(flavor = "multi_thread")]

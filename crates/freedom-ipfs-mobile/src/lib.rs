@@ -563,6 +563,11 @@ fn progress_source(raw_phase: &str, fields: &ProgressFields) -> Option<String> {
         | "http_provider_hedge"
         | "http_provider_race"
         | "http_provider_race_result" => Some("http_provider".into()),
+        "http_provider_bitswap_hedge" => Some("bitswap".into()),
+        "http_provider_bitswap_hedge_result" => fields
+            .get("source")
+            .cloned()
+            .or_else(|| Some("unknown".into())),
         "delegated_provider_lookup" | "delegated_provider_empty_retry" => {
             Some("delegated_routing".into())
         }
@@ -668,6 +673,13 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         | "http_provider_hedge"
         | "http_provider_race"
         | "http_provider_race_result" => "fetching_http_provider",
+        "http_provider_bitswap_hedge" => "fetching_bitswap",
+        "http_provider_bitswap_hedge_result"
+            if fields.get("source").map(String::as_str) == Some("bitswap") =>
+        {
+            "fetching_bitswap"
+        }
+        "http_provider_bitswap_hedge_result" => "fetching_http_provider",
         "bitswap_fetch"
         | "bitswap_connection_established"
         | "bitswap_incoming_block"
@@ -2353,6 +2365,25 @@ mod tests {
         );
         assert_eq!(
             progress_source(
+                "http_provider_bitswap_hedge",
+                &progress_fields([("phase", "http_provider_bitswap_hedge")]),
+            )
+            .as_deref(),
+            Some("bitswap")
+        );
+        assert_eq!(
+            progress_source(
+                "http_provider_bitswap_hedge_result",
+                &progress_fields([
+                    ("phase", "http_provider_bitswap_hedge_result"),
+                    ("source", "bitswap")
+                ]),
+            )
+            .as_deref(),
+            Some("bitswap")
+        );
+        assert_eq!(
+            progress_source(
                 "gateway_small_body_cache",
                 &progress_fields([("phase", "gateway_small_body_cache"), ("cache_hit", "true")]),
             )
@@ -2624,6 +2655,36 @@ mod tests {
             progress_phase(
                 "http_provider_hedge",
                 &progress_fields([("phase", "http_provider_hedge")]),
+                "active",
+            ),
+            "fetching_http_provider"
+        );
+        assert_eq!(
+            progress_phase(
+                "http_provider_bitswap_hedge",
+                &progress_fields([("phase", "http_provider_bitswap_hedge")]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "http_provider_bitswap_hedge_result",
+                &progress_fields([
+                    ("phase", "http_provider_bitswap_hedge_result"),
+                    ("source", "bitswap")
+                ]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "http_provider_bitswap_hedge_result",
+                &progress_fields([
+                    ("phase", "http_provider_bitswap_hedge_result"),
+                    ("source", "http_provider")
+                ]),
                 "active",
             ),
             "fetching_http_provider"
