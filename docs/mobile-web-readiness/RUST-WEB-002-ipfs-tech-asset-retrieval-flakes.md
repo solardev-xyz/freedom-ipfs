@@ -24191,3 +24191,133 @@ In this gated cold-Bitswap window, Rust is already meaningfully faster than
 fresh Kubo for the page root and far lighter on RSS/FDs. Kubo still wins asset
 p50 and is roughly tied on asset p95, so the next performance work should focus
 on subresource/session behavior rather than root path discovery alone.
+
+## 2026-05-06 Keep: 125ms Single-HTTP Session Grace
+
+Hypothesis:
+When provider lookup finds exactly one HTTP provider after a recent Bitswap
+session peer exists, the old `250ms` post-lookup grace often waits too long
+before letting the HTTP provider race. A shorter `125ms` default should still
+let a fast recent Bitswap peer win, while reducing page-asset tail latency when
+the only HTTP provider is viable.
+
+Implementation:
+
+- Lower `BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE` from `250ms` to
+  `125ms`.
+- Keep the existing
+  `FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS` override for
+  future lab tuning.
+- Update the deterministic recent-peer test so a `75ms` delayed recent Bitswap
+  peer still wins under the new default.
+
+This does not change provider fanout, add public gateway fallback, increase
+connection limits, or change verification-before-cache behavior.
+
+Alternating live evidence:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-zero-http-baseline2-r5-20260506-trace.jsonl \
+  --output /tmp/ipfs-tech-zero-http-baseline2-r5-20260506.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+
+env FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS=125 \
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-zero-http-single-http-grace125-r5-20260506-trace.jsonl \
+  --output /tmp/ipfs-tech-zero-http-single-http-grace125-r5-20260506.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Results:
+
+| run | pass | root TTFB p50/p90/max | asset TTFB p50/p90/p95/max | run total p50/p90/max | zero-HTTP cold Bitswap | block sources |
+| --- | --- | --- | --- | --- | --- | --- |
+| baseline 2, `250ms` | `5/5` | `724/1181/1181ms` | `267/527/564/821ms` | `2635/2954/2954ms` | `15` | `http_provider=167`, `bitswap=32`, `cache=1` |
+| env `125ms` | `5/5` | `615/677/677ms` | `156/237/449/966ms` | `1514/2413/2413ms` | `5` | `bitswap=163`, `http_provider=28`, `cache=4` |
+| baseline 3, `250ms` | `5/5` | `574/679/679ms` | `244/522/578/795ms` | `2277/2653/2653ms` | `8` | `bitswap=129`, `http_provider=66`, `cache=2` |
+
+The env `125ms` run beat both adjacent `250ms` baselines on asset p50/p90/p95
+and run-total p50/p90. Its root p50 was slightly slower than the second adjacent
+baseline, but root p90/max were comparable and all runs passed the zero-HTTP and
+`fetching_bitswap` gates.
+
+After changing the production default to `125ms`, rerun the same gated page
+case without the env override:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-zero-http-single-http-grace125-default-r5-20260506-trace.jsonl \
+  --output /tmp/ipfs-tech-zero-http-single-http-grace125-default-r5-20260506.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Result: `5/5` passed. Root TTFB p50/p90/p95/max was
+`583/716/716/716ms`; asset TTFB p50/p90/p95/max was
+`293/658/790/944ms`; run total p50/p90/p95/max was
+`3015/3125/3125/3125ms`. Trace requirements passed with
+`zero_http_provider_cold_bitswap actual=9` and `fetching_bitswap actual=962`.
+The source mix was `http_provider=156`, `bitswap=43`, with max RSS `54544KiB`
+and max FD count `33`.
+
+The no-env validation proves the new default still exercises the intended
+fallback path and stays reliable/resource-light, but it was a noisier provider
+window and not a clean latency win over every adjacent baseline. Treat the env
+A/B as the stronger decision signal, and keep watching source mix and asset
+tails in future same-window comparisons.
+
+Artifacts:
+
+- `/tmp/ipfs-tech-zero-http-baseline2-r5-20260506.json`
+- `/tmp/ipfs-tech-zero-http-baseline2-r5-20260506-trace.jsonl`
+- `/tmp/ipfs-tech-zero-http-single-http-grace125-r5-20260506.json`
+- `/tmp/ipfs-tech-zero-http-single-http-grace125-r5-20260506-trace.jsonl`
+- `/tmp/ipfs-tech-zero-http-baseline3-r5-20260506.json`
+- `/tmp/ipfs-tech-zero-http-baseline3-r5-20260506-trace.jsonl`
+- `/tmp/ipfs-tech-zero-http-single-http-grace125-default-r5-20260506.json`
+- `/tmp/ipfs-tech-zero-http-single-http-grace125-default-r5-20260506-trace.jsonl`
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo test -p freedom-ipfs-retrieval single_http_provider_gives_recent_bitswap_peer_short_grace
+cargo test -p freedom-ipfs-retrieval multi_http_provider_keeps_short_recent_peer_wait
+cargo test -p freedom-ipfs-retrieval
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Decision:
+Keep the `125ms` default. It is a narrow mobile-latency tuning that preserves a
+short recent-peer opportunity while avoiding the more expensive `250ms` wait
+when the only discovered HTTP provider is ready to race. Continue using the env
+override for larger alternating samples before making any further grace-window
+changes.

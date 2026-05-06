@@ -78,7 +78,10 @@ const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD_ENV: &str =
 const BITSWAP_SESSION_SHORTCUT_GRACE: Duration = Duration::from_millis(0);
 const BITSWAP_SESSION_PRE_LOOKUP_GRACE: Duration = Duration::from_millis(50);
 const BITSWAP_SESSION_POST_LOOKUP_GRACE: Duration = Duration::from_millis(100);
-const BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE: Duration = Duration::from_millis(250);
+// Give a recent Bitswap session peer a short chance to win before falling back
+// to the only HTTP provider. Longer waits inflated page-asset tails on mobile
+// browsing workloads without enough reliability benefit.
+const BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE: Duration = Duration::from_millis(125);
 const BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS";
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -7938,13 +7941,13 @@ mod bitswap_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn single_http_provider_waits_longer_for_recent_bitswap_peer() {
-        let data = b"single http waits for recent peer";
+    async fn single_http_provider_gives_recent_bitswap_peer_short_grace() {
+        let data = b"single http gives recent peer short grace";
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
         let (session_peer_id, session_addr, session_swarm, session_stream) =
             spawn_delayed_multi_block_bitswap_peer(
                 vec![(cid, data.to_vec())],
-                Duration::from_millis(175),
+                Duration::from_millis(75),
             )
             .await;
         let http_requests = Arc::new(AtomicU64::new(0));
