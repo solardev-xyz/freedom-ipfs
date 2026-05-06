@@ -38,8 +38,7 @@ async fn local_gateway_repeated_cached_reads_keep_rss_bounded() {
     let rss_after = current_rss_kib();
 
     eprintln!(
-        "local gateway soak completed: requests={requests} rss_before_kib={:?} rss_after_kib={:?}",
-        rss_before, rss_after
+        "local gateway soak completed: requests={requests} rss_before_kib={rss_before:?} rss_after_kib={rss_after:?}"
     );
     if let (Some(before), Some(after)) = (rss_before, rss_after) {
         assert!(

@@ -1762,8 +1762,7 @@ mod tests {
         let (dht_peer, dht_addr, dht_task) = spawn_local_dht_provider(cid).await;
         let dht_peer_string = dht_peer.to_string();
         let (endpoint, delegated_task) = spawn_delegated_response_owned(format!(
-            r#"{{"Providers":[{{"ID":"{}","Addrs":["/ip4/127.0.0.1/tcp/4101"]}}]}}"#,
-            delegated_peer
+            r#"{{"Providers":[{{"ID":"{delegated_peer}","Addrs":["/ip4/127.0.0.1/tcp/4101"]}}]}}"#
         ))
         .await;
         let stats = RoutingStatsHandle::default();

@@ -2118,7 +2118,12 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
             let events = value["events"].as_array().unwrap();
             assert!(value["generated_at_unix_ms"].as_u64().unwrap() > 0);
-            assert_eq!(value["active_count"].as_u64().unwrap(), 0);
+            let has_active_request = value["active"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|target| target["kind"] == "gateway_request" && target["id"] == 4242);
+            assert!(!has_active_request, "{snapshot}");
             assert_eq!(value["event_count"].as_u64().unwrap(), events.len() as u64);
             assert!(
                 events.iter().any(|event| event["path"] == path

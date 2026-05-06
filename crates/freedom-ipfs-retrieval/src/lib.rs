@@ -5085,8 +5085,7 @@ async fn request_bitswap_blocks_after_connection(
                     id: peer_id,
                     kind: BitswapPeerFailureKind::Other,
                     detail: format!(
-                        "{}: bitswap connection waiter was dropped before connection",
-                        peer_id
+                        "{peer_id}: bitswap connection waiter was dropped before connection"
                     ),
                 });
             }
@@ -8491,14 +8490,10 @@ mod bitswap_tests {
             spawn_silent_bitswap_peer(cid).await;
         let (good_peer_id, good_addr, good_swarm, good_stream) =
             spawn_local_bitswap_peer(cid, data.to_vec()).await;
-        let first_response = format!(
-            r#"{{"Providers":[{{"ID":"{}","Addrs":["{}"]}}]}}"#,
-            silent_peer_id, silent_addr
-        );
-        let second_response = format!(
-            r#"{{"Providers":[{{"ID":"{}","Addrs":["{}"]}}]}}"#,
-            good_peer_id, good_addr
-        );
+        let first_response =
+            format!(r#"{{"Providers":[{{"ID":"{silent_peer_id}","Addrs":["{silent_addr}"]}}]}}"#);
+        let second_response =
+            format!(r#"{{"Providers":[{{"ID":"{good_peer_id}","Addrs":["{good_addr}"]}}]}}"#);
         let (endpoint, routing_task) =
             spawn_sequence_delegated_response(vec![first_response, second_response]).await;
 

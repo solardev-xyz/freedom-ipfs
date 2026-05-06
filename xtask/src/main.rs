@@ -124,12 +124,7 @@ fn generate_mobile_web_fixture(
         .checked_add(range_len - 1)
         .context("range end overflow")?;
     if range_end >= bytes as u64 {
-        bail!(
-            "range {}-{} is outside generated fixture length {}",
-            range_start,
-            range_end,
-            bytes
-        );
+        bail!("range {range_start}-{range_end} is outside generated fixture length {bytes}");
     }
 
     let payload = deterministic_fixture_payload(bytes);

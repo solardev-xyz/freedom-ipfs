@@ -1062,19 +1062,19 @@ async fn run_case(
     if let Some(expected) = &entry.expect_accept_ranges {
         match response.accept_ranges.as_deref() {
             Some(actual) if actual.eq_ignore_ascii_case(expected) => {}
-            actual => failures.push(format!("accept-ranges {:?}, expected {expected:?}", actual)),
+            actual => failures.push(format!("accept-ranges {actual:?}, expected {expected:?}")),
         }
     }
     if let Some(expected) = &entry.expect_etag_prefix {
         match response.etag.as_deref() {
             Some(actual) if actual.starts_with(expected) => {}
-            actual => failures.push(format!("etag {:?}, expected prefix {expected:?}", actual)),
+            actual => failures.push(format!("etag {actual:?}, expected prefix {expected:?}")),
         }
     }
     if let Some(expected) = &entry.expect_cache_control {
         match response.cache_control.as_deref() {
             Some(actual) if actual.eq_ignore_ascii_case(expected) => {}
-            actual => failures.push(format!("cache-control {:?}, expected {expected:?}", actual)),
+            actual => failures.push(format!("cache-control {actual:?}, expected {expected:?}")),
         }
     }
     if let Some(expected) = &entry.expect_body_contains {
@@ -1517,7 +1517,7 @@ fn print_summary(report: &RunReport) {
             let mark = if run.passed { "PASS" } else { "FAIL" };
             let rss = run
                 .gateway_rss_kib
-                .map(|rss| format!(" rss={}KiB", rss))
+                .map(|rss| format!(" rss={rss}KiB"))
                 .unwrap_or_default();
             let fds = run
                 .gateway_fd_count
@@ -1529,7 +1529,7 @@ fn print_summary(report: &RunReport) {
                 .unwrap_or_default();
             let storage = run
                 .gateway_storage_bytes
-                .map(|bytes| format!(" storage={}B", bytes))
+                .map(|bytes| format!(" storage={bytes}B"))
                 .unwrap_or_default();
             println!(
                 "{mark} measured run {:02} total={}ms{rss}{fds}{children}{storage}",
@@ -4243,16 +4243,17 @@ fn child_process_count(parent_pid: u32) -> Option<usize> {
     Some(count)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn child_process_count(_parent_pid: u32) -> Option<usize> {
-    None
-}
-
+#[cfg(any(target_os = "linux", test))]
 fn parse_proc_stat_ppid(stat: &str) -> Option<u32> {
     let after_name = stat.rsplit_once(") ")?;
     let mut fields = after_name.1.split_whitespace();
     let _state = fields.next()?;
     fields.next()?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn child_process_count(_parent_pid: u32) -> Option<usize> {
+    None
 }
 
 fn log_child_lines<R>(prefix: &'static str, stream: R) -> JoinHandle<()>
