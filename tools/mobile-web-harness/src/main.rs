@@ -189,14 +189,11 @@ async fn main() -> Result<()> {
             std::fs::write(&output, json).with_context(|| format!("write {}", output.display()))?;
             eprintln!("wrote comparison report to {}", output.display());
         }
-        let trace_requirement_failures = request_classification_requirement_failures(
-            report.rust.trace_summary.as_ref(),
-            &args.require_request_classifications,
-        )?;
-        let progress_requirement_failures = progress_phase_requirement_failures(
-            report.rust.trace_summary.as_ref(),
-            &args.require_progress_phases,
-        )?;
+        let trace_requirement_failures = trace_requirement_failure_messages(
+            &report.rust.trace_requirements.request_classifications,
+        );
+        let progress_requirement_failures =
+            trace_requirement_failure_messages(&report.rust.trace_requirements.progress_phases);
         for failure in &trace_requirement_failures {
             eprintln!("trace requirement not met: {failure}");
         }
@@ -222,17 +219,13 @@ async fn main() -> Result<()> {
         std::fs::write(&output, json).with_context(|| format!("write {}", output.display()))?;
         eprintln!("wrote report to {}", output.display());
     }
-    let trace_requirement_failures = request_classification_requirement_failures(
-        report.trace_summary.as_ref(),
-        &args.require_request_classifications,
-    )?;
+    let trace_requirement_failures =
+        trace_requirement_failure_messages(&report.trace_requirements.request_classifications);
     for failure in &trace_requirement_failures {
         eprintln!("trace requirement not met: {failure}");
     }
-    let progress_requirement_failures = progress_phase_requirement_failures(
-        report.trace_summary.as_ref(),
-        &args.require_progress_phases,
-    )?;
+    let progress_requirement_failures =
+        trace_requirement_failure_messages(&report.trace_requirements.progress_phases);
     for failure in &progress_requirement_failures {
         eprintln!("progress requirement not met: {failure}");
     }
@@ -286,34 +279,6 @@ struct RequestClassificationRequirement {
     min_count: usize,
 }
 
-fn request_classification_requirement_failures(
-    trace: Option<&TraceSummary>,
-    raw_requirements: &[String],
-) -> Result<Vec<String>> {
-    let requirements = parse_request_classification_requirements(raw_requirements)?;
-    if requirements.is_empty() {
-        return Ok(Vec::new());
-    }
-    let Some(trace) = trace else {
-        return Ok(vec![
-            "request classification requirements need a Rust trace summary; pass --trace-output"
-                .to_string(),
-        ]);
-    };
-
-    let mut failures = Vec::new();
-    for requirement in requirements {
-        let actual = trace_request_classification_count(trace, &requirement.classification);
-        if actual < requirement.min_count {
-            failures.push(format!(
-                "{} expected>={} actual={}",
-                requirement.classification, requirement.min_count, actual
-            ));
-        }
-    }
-    Ok(failures)
-}
-
 fn parse_request_classification_requirements(
     raw_requirements: &[String],
 ) -> Result<Vec<RequestClassificationRequirement>> {
@@ -348,38 +313,70 @@ fn trace_request_classification_count(trace: &TraceSummary, classification: &str
         .unwrap_or_default()
 }
 
+#[derive(Debug, Default, Serialize)]
+struct TraceRequirementsReport {
+    request_classifications: Vec<TraceRequirementResult>,
+    progress_phases: Vec<TraceRequirementResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct TraceRequirementResult {
+    value: String,
+    min_count: usize,
+    actual_count: usize,
+    passed: bool,
+}
+
+fn trace_requirements_report(
+    trace: Option<&TraceSummary>,
+    args: &Args,
+) -> Result<TraceRequirementsReport> {
+    Ok(TraceRequirementsReport {
+        request_classifications: request_classification_requirement_results(
+            trace,
+            &args.require_request_classifications,
+        )?,
+        progress_phases: progress_phase_requirement_results(trace, &args.require_progress_phases)?,
+    })
+}
+
+fn request_classification_requirement_results(
+    trace: Option<&TraceSummary>,
+    raw_requirements: &[String],
+) -> Result<Vec<TraceRequirementResult>> {
+    parse_request_classification_requirements(raw_requirements)?
+        .into_iter()
+        .map(|requirement| {
+            let actual_count = trace
+                .map(|trace| trace_request_classification_count(trace, &requirement.classification))
+                .unwrap_or_default();
+            Ok(TraceRequirementResult {
+                value: requirement.classification,
+                min_count: requirement.min_count,
+                actual_count,
+                passed: actual_count >= requirement.min_count,
+            })
+        })
+        .collect()
+}
+
+fn trace_requirement_failure_messages(results: &[TraceRequirementResult]) -> Vec<String> {
+    results
+        .iter()
+        .filter(|result| !result.passed)
+        .map(|result| {
+            format!(
+                "{} expected>={} actual={}",
+                result.value, result.min_count, result.actual_count
+            )
+        })
+        .collect()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ProgressPhaseRequirement {
     phase: String,
     min_count: usize,
-}
-
-fn progress_phase_requirement_failures(
-    trace: Option<&TraceSummary>,
-    raw_requirements: &[String],
-) -> Result<Vec<String>> {
-    let requirements = parse_progress_phase_requirements(raw_requirements)?;
-    if requirements.is_empty() {
-        return Ok(Vec::new());
-    }
-    let Some(trace) = trace else {
-        return Ok(vec![
-            "progress phase requirements need a Rust trace summary; pass --trace-output"
-                .to_string(),
-        ]);
-    };
-
-    let mut failures = Vec::new();
-    for requirement in requirements {
-        let actual = trace_progress_phase_count(trace, &requirement.phase);
-        if actual < requirement.min_count {
-            failures.push(format!(
-                "{} expected>={} actual={}",
-                requirement.phase, requirement.min_count, actual
-            ));
-        }
-    }
-    Ok(failures)
 }
 
 fn parse_progress_phase_requirements(
@@ -414,6 +411,26 @@ fn trace_progress_phase_count(trace: &TraceSummary, phase: &str) -> usize {
         .find(|entry| entry.value == phase)
         .map(|entry| entry.count)
         .unwrap_or_default()
+}
+
+fn progress_phase_requirement_results(
+    trace: Option<&TraceSummary>,
+    raw_requirements: &[String],
+) -> Result<Vec<TraceRequirementResult>> {
+    parse_progress_phase_requirements(raw_requirements)?
+        .into_iter()
+        .map(|requirement| {
+            let actual_count = trace
+                .map(|trace| trace_progress_phase_count(trace, &requirement.phase))
+                .unwrap_or_default();
+            Ok(TraceRequirementResult {
+                value: requirement.phase,
+                min_count: requirement.min_count,
+                actual_count,
+                passed: actual_count >= requirement.min_count,
+            })
+        })
+        .collect()
 }
 
 async fn build_default_rust_gateway() -> Result<()> {
@@ -715,6 +732,7 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
         .as_ref()
         .map(summarize_trace_output)
         .transpose()?;
+    let trace_requirements = trace_requirements_report(trace_summary.as_ref(), args)?;
     Ok(RunReport {
         gateway_url: persistent_gateway_url,
         generated_at_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
@@ -750,6 +768,7 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             .map(|path| path.display().to_string()),
         trace_span_list: args.trace_output.as_ref().map(|_| args.trace_span_list),
         trace_summary,
+        trace_requirements,
         summary,
         runs,
     })
@@ -4424,6 +4443,7 @@ struct RunReport {
     trace_output: Option<String>,
     trace_span_list: Option<bool>,
     trace_summary: Option<TraceSummary>,
+    trace_requirements: TraceRequirementsReport,
     summary: RepeatSummary,
     runs: Vec<RunResult>,
 }
@@ -10380,19 +10400,28 @@ mod tests {
             1
         );
         let requirements = vec!["top_level_zero_http_provider_cold_bitswap=1".to_string()];
-        assert!(
-            request_classification_requirement_failures(Some(&summary), &requirements)
-                .unwrap()
-                .is_empty()
-        );
-        let requirements = vec!["top_level_zero_http_provider_cold_bitswap=2".to_string()];
+        let requirement_results =
+            request_classification_requirement_results(Some(&summary), &requirements).unwrap();
         assert_eq!(
-            request_classification_requirement_failures(Some(&summary), &requirements).unwrap(),
+            requirement_results[0].value,
+            "top_level_zero_http_provider_cold_bitswap"
+        );
+        assert_eq!(requirement_results[0].min_count, 1);
+        assert_eq!(requirement_results[0].actual_count, 1);
+        assert!(requirement_results[0].passed);
+        assert!(trace_requirement_failure_messages(&requirement_results).is_empty());
+        let requirements = vec!["top_level_zero_http_provider_cold_bitswap=2".to_string()];
+        let requirement_results =
+            request_classification_requirement_results(Some(&summary), &requirements).unwrap();
+        assert_eq!(
+            trace_requirement_failure_messages(&requirement_results),
             vec!["top_level_zero_http_provider_cold_bitswap expected>=2 actual=1"]
         );
-        assert!(
-            request_classification_requirement_failures(None, &requirements).unwrap()[0]
-                .contains("--trace-output")
+        let requirement_results =
+            request_classification_requirement_results(None, &requirements).unwrap();
+        assert_eq!(
+            trace_requirement_failure_messages(&requirement_results),
+            vec!["top_level_zero_http_provider_cold_bitswap expected>=2 actual=0"]
         );
     }
 
@@ -10607,19 +10636,26 @@ mod tests {
             "provider_lookup=6".to_string(),
             "fetching_bitswap=5".to_string(),
         ];
-        assert!(
-            progress_phase_requirement_failures(Some(&summary), &requirements)
-                .unwrap()
-                .is_empty()
-        );
+        let requirement_results =
+            progress_phase_requirement_results(Some(&summary), &requirements).unwrap();
+        assert_eq!(requirement_results[0].value, "provider_lookup");
+        assert_eq!(requirement_results[0].min_count, 6);
+        assert_eq!(requirement_results[0].actual_count, 6);
+        assert!(requirement_results[0].passed);
+        assert!(trace_requirement_failure_messages(&requirement_results).is_empty());
         let requirements = vec!["fetching_bitswap=6".to_string()];
+        let requirement_results =
+            progress_phase_requirement_results(Some(&summary), &requirements).unwrap();
+        assert_eq!(requirement_results[0].actual_count, 5);
+        assert!(!requirement_results[0].passed);
         assert_eq!(
-            progress_phase_requirement_failures(Some(&summary), &requirements).unwrap(),
+            trace_requirement_failure_messages(&requirement_results),
             vec!["fetching_bitswap expected>=6 actual=5"]
         );
-        assert!(
-            progress_phase_requirement_failures(None, &requirements).unwrap()[0]
-                .contains("--trace-output")
+        let requirement_results = progress_phase_requirement_results(None, &requirements).unwrap();
+        assert_eq!(
+            trace_requirement_failure_messages(&requirement_results),
+            vec!["fetching_bitswap expected>=6 actual=0"]
         );
     }
 
@@ -11526,6 +11562,7 @@ mod tests {
             trace_output: None,
             trace_span_list: None,
             trace_summary: None,
+            trace_requirements: TraceRequirementsReport::default(),
             summary: RepeatSummary::from_runs(&runs),
             runs,
         };
@@ -11606,6 +11643,7 @@ mod tests {
             trace_output: Some(path.display().to_string()),
             trace_span_list: Some(false),
             trace_summary: Some(summarize_trace_output(&path).unwrap()),
+            trace_requirements: TraceRequirementsReport::default(),
             summary: RepeatSummary::from_runs(&runs),
             runs,
         };
@@ -12467,6 +12505,7 @@ mod tests {
             trace_output: None,
             trace_span_list: None,
             trace_summary: None,
+            trace_requirements: TraceRequirementsReport::default(),
             summary,
             runs,
         }

@@ -23924,3 +23924,96 @@ Artifacts:
 Decision:
 Keep. This is a narrow harness diagnostic improvement that turns the existing
 progress-phase summary into an enforceable live-run gate.
+
+## 2026-05-06 Experiment: Self-Contained Trace Requirement Report
+
+Hypothesis:
+Requirement gates should be visible in the JSON artifact itself, not only in
+stderr. A long-running agent may keep the report and trace but lose the log.
+
+Expected win:
+Every gated harness report can now show which request-classification and
+progress-phase requirements were requested, their actual counts, and whether
+they passed.
+
+Risk:
+Additive JSON schema change only.
+
+Implementation:
+Add `trace_requirements` to each `RunReport`:
+
+```json
+{
+  "trace_requirements": {
+    "request_classifications": [],
+    "progress_phases": [
+      {
+        "value": "provider_lookup",
+        "min_count": 1,
+        "actual_count": 63,
+        "passed": true
+      }
+    ]
+  }
+}
+```
+
+The CLI failure path now reads those result objects instead of separately
+recomputing gate failures.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_classifies_zero_http_cold_bitswap_requests
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+cargo test -p mobile-web-harness
+cargo check -p mobile-web-harness --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Result:
+All commands passed.
+
+Live smoke command:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-progress-requirements-report-smoke-trace.jsonl \
+  --output /tmp/ipfs-tech-progress-requirements-report-smoke.json \
+  --require-progress-phase started=1 \
+  --require-progress-phase provider_lookup=1 \
+  --require-progress-phase streaming=1 \
+  > /tmp/ipfs-tech-progress-requirements-report-smoke.log 2>&1
+```
+
+Live smoke result:
+
+- exit code `0`
+- page workload passed `1/1`
+- root TTFB/total: `814/815ms`
+- progress requirements in JSON:
+  - `started expected>=1 actual=33 passed=true`
+  - `provider_lookup expected>=1 actual=63 passed=true`
+  - `streaming expected>=1 actual=367 passed=true`
+- request classifications observed:
+  `zero_http_provider_bitswap=3`, `zero_http_provider_cold_bitswap=1`,
+  `top_level_zero_http_provider_cold_bitswap=1`
+
+Artifacts:
+
+- `/tmp/ipfs-tech-progress-requirements-report-smoke.json`
+- `/tmp/ipfs-tech-progress-requirements-report-smoke-trace.jsonl`
+- `/tmp/ipfs-tech-progress-requirements-report-smoke.log`
+
+Decision:
+Keep. The report is now self-contained enough for later agents to audit gate
+success or failure from the JSON artifact alone.
