@@ -21139,6 +21139,46 @@ Comparison result:
   inserts, `0` evictions, `613419` bytes served from the small-body cache, max
   cache occupancy `25` entries / `204473` bytes.
 
+No-trace same-window Kubo comparison:
+
+```sh
+rm -f /tmp/freedom-ipfs-ipfs-tech-cid-direct-small-body-cache-kubo-notrace.db \
+  /tmp/freedom-ipfs-ipfs-tech-cid-direct-small-body-cache-kubo-notrace.db-* \
+  /tmp/ipfs-tech-cid-direct-small-body-cache-kubo-notrace-r3.json
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --gateway-db /tmp/freedom-ipfs-ipfs-tech-cid-direct-small-body-cache-kubo-notrace.db \
+  --case ipfs-tech-page-assets-cid-direct \
+  --warmup-runs 1 \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --comparison-output /tmp/ipfs-tech-cid-direct-small-body-cache-kubo-notrace-r3.json
+```
+
+Artifact:
+
+- `/tmp/ipfs-tech-cid-direct-small-body-cache-kubo-notrace-r3.json`
+
+No-trace result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Rust run total p50/p95/max: `27/31/31ms`.
+- Kubo run total p50/p95/max: `29/39/39ms`.
+- Rust root TTFB p50/p95/max: `1/2/2ms`.
+- Kubo root TTFB p50/p95/max: `2/2/2ms`.
+- Rust asset TTFB p50/p95/max: `2/3/5ms`.
+- Kubo asset TTFB p50/p95/max: `2/6/9ms`.
+- Rust asset total p50/p95/max: `2/3/5ms`.
+- Kubo asset total p50/p95/max: `2/6/11ms`.
+- Rust max RSS/FD: `53680KiB` / `35`.
+- Kubo max RSS/FD: `127376KiB` / `85`.
+- Rust used `0.42x` Kubo RSS and `0.41x` Kubo FD count.
+
 Final validation:
 
 ```sh
@@ -21159,9 +21199,9 @@ Decision:
 Keep. This is a targeted warm-path improvement for repeated cached page assets:
 asset p50 improved from `4ms` to `2ms`, total run p50 improved from `33ms` to
 `23ms`, and the observed cache footprint was only about `200KiB` for the
-`ipfs.tech` CID-direct corpus. The p95 stayed flat and max outliers were a few
-milliseconds higher in the A/B sample, and the same-window Kubo check still
-shows Kubo ahead on warm same-daemon asset p50/p95. Follow-up soak testing
-should watch tails and continue reducing repeated cached path/file-size work,
-but the change is bounded, opt-out configurable, and moves the median hot asset
-path in the right direction.
+`ipfs.tech` CID-direct corpus. The traced same-window comparison still showed
+Kubo ahead, but the no-trace comparison showed Rust matching or beating Kubo on
+warm root and asset reads while using less RSS and fewer FDs. Follow-up work
+should separate production hot-path latency from trace overhead before adding
+more gateway cache layers; trace sampling or cheaper trace aggregation may be
+higher leverage than another read-path cache.

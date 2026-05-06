@@ -336,7 +336,10 @@ status, MIME type, byte count, and timing.
   small-body cache for repeated hot assets. In a later CID-direct `ipfs.tech`
   warm same-daemon sample, enabling the `2MiB` small-body cache improved run
   total p50 from `33ms` to `23ms` and asset TTFB p50 from `4ms` to `2ms`,
-  with about `200KiB` observed cache occupancy.
+  with about `200KiB` observed cache occupancy. With trace output disabled,
+  the CID-direct warm comparison reached Rust root TTFB p50/p95 `1/2ms` and
+  asset TTFB `2/3ms`, versus Kubo root `2/2ms` and asset `2/6ms`, while using
+  less RSS and fewer FDs.
 
 ## Next Scenario Targets
 
