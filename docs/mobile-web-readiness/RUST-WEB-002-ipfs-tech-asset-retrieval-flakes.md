@@ -20822,3 +20822,78 @@ Keep, but classify this as a root-only offline/cache baseline. The current
 comparable to the `ipfs-tech-page-assets` full page-and-assets cache-completeness
 baseline. It still proves that the warmed root can restart and serve offline
 without provider lookup or retrieval network activity.
+
+## 2026-05-06 Observe: Warm ipfs.tech Rust-vs-Kubo Same-Daemon Comparison
+
+Question:
+After one warmup load against a single long-lived gateway/daemon, how close is
+current Rust to Kubo for `ipfs-tech-page-assets`, and what resource tradeoff
+does the harness report?
+
+Command:
+
+```sh
+rm -f /tmp/freedom-ipfs-ipfs-tech-warm-current.db \
+  /tmp/freedom-ipfs-ipfs-tech-warm-current.db-* \
+  /tmp/ipfs-tech-warm-current-rust-trace.jsonl \
+  /tmp/ipfs-tech-warm-current-rust-vs-kubo.json
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --gateway-db /tmp/freedom-ipfs-ipfs-tech-warm-current.db \
+  --case ipfs-tech-page-assets \
+  --warmup-runs 1 \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-warm-current-rust-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-warm-current-rust-vs-kubo.json
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-warm-current-rust-vs-kubo.json`
+- `/tmp/ipfs-tech-warm-current-rust-trace.jsonl` (`2252` lines)
+- `/tmp/freedom-ipfs-ipfs-tech-warm-current.db`
+- `/tmp/freedom-ipfs-ipfs-tech-warm-current.db-wal`
+
+Result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Rust run total p50/p95/max: `45/49/49ms`.
+- Kubo run total p50/p95/max: `37/38/38ms`.
+- Rust root TTFB p50/p95/max: `5/5/5ms`.
+- Kubo root TTFB p50/p95/max: `2/3/3ms`.
+- Rust asset TTFB p50/p95/max: `4/8/8ms` over `96` asset requests.
+- Kubo asset TTFB p50/p95/max: `3/4/5ms` over `96` asset requests.
+- Ratios: root p50 `2.50x`, root p95 `1.67x`, asset p50 `1.33x`, asset p95
+  `2.00x` in Kubo's favor.
+- Rust max RSS/FD: `47312KiB` / `28`.
+- Kubo max RSS/FD: `277520KiB` / `497`.
+- Rust used `0.17x` Kubo RSS and `0.06x` Kubo FD count.
+- Rust storage max: `2533616B`; Kubo storage max: `831989B`.
+
+Rust trace notes:
+
+- Warm measured runs were very fast after the warmup. The trace includes four
+  request groups because the warmup plus three measured runs are all traced.
+- Warm measured groups had root/request group maxima of `3ms`, `2ms`, and
+  `2ms`; the slow events came from the warmup group.
+- Warm repeated groups were dominated by `block_store_get_range`,
+  `gateway_limiter`, `ipfs_path_parse`, `mime_detect`, `mime_total`,
+  `name_cache`, `name_resolve`, and `request_done`.
+- Across the whole traced command, direct bodies were used `124` times and
+  streamed bodies `8` times.
+- The warmup still fetched `40` blocks from HTTP providers and performed `35`
+  delegated provider lookups; those cold/warmup costs are not part of the
+  measured warm TTFB gap but remain the cold-load optimization target.
+
+Decision:
+Use this as a current warm-path comparison target. Rust is close but still not
+beating Kubo on same-daemon warm TTFB; Kubo's margin is only a few milliseconds,
+while Rust uses much less memory and far fewer FDs. The next warm-path
+optimization should focus on reducing repeated per-request overhead in the
+already-cached path without increasing RSS meaningfully.
