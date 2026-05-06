@@ -154,6 +154,9 @@ struct Args {
     /// Require a request classification count in the Rust trace, formatted as classification=min_count.
     #[arg(long = "require-request-classification")]
     require_request_classifications: Vec<String>,
+    /// Require a mobile progress phase count in the Rust trace, formatted as phase=min_count.
+    #[arg(long = "require-progress-phase")]
+    require_progress_phases: Vec<String>,
 }
 
 #[tokio::main]
@@ -190,14 +193,24 @@ async fn main() -> Result<()> {
             report.rust.trace_summary.as_ref(),
             &args.require_request_classifications,
         )?;
+        let progress_requirement_failures = progress_phase_requirement_failures(
+            report.rust.trace_summary.as_ref(),
+            &args.require_progress_phases,
+        )?;
         for failure in &trace_requirement_failures {
             eprintln!("trace requirement not met: {failure}");
+        }
+        for failure in &progress_requirement_failures {
+            eprintln!("progress requirement not met: {failure}");
         }
         if report.rust.summary.fail_count > 0 || report.kubo.summary.fail_count > 0 {
             bail!("mobile web comparison found failures");
         }
         if !trace_requirement_failures.is_empty() {
             bail!("mobile web comparison trace requirements not met");
+        }
+        if !progress_requirement_failures.is_empty() {
+            bail!("mobile web comparison progress requirements not met");
         }
         return Ok(());
     }
@@ -216,12 +229,22 @@ async fn main() -> Result<()> {
     for failure in &trace_requirement_failures {
         eprintln!("trace requirement not met: {failure}");
     }
+    let progress_requirement_failures = progress_phase_requirement_failures(
+        report.trace_summary.as_ref(),
+        &args.require_progress_phases,
+    )?;
+    for failure in &progress_requirement_failures {
+        eprintln!("progress requirement not met: {failure}");
+    }
 
     if report.summary.fail_count > 0 {
         bail!("mobile web harness found failures");
     }
     if !trace_requirement_failures.is_empty() {
         bail!("mobile web harness trace requirements not met");
+    }
+    if !progress_requirement_failures.is_empty() {
+        bail!("mobile web harness progress requirements not met");
     }
     Ok(())
 }
@@ -244,6 +267,7 @@ async fn run_comparison(args: &Args, corpus: &Corpus) -> Result<ComparisonReport
     kubo_args.trace_output = None;
     kubo_args.trace_filter = None;
     kubo_args.require_request_classifications = Vec::new();
+    kubo_args.require_progress_phases = Vec::new();
 
     let rust = run_harness(&rust_args, corpus).await?;
     let kubo = run_harness(&kubo_args, corpus).await?;
@@ -320,6 +344,74 @@ fn trace_request_classification_count(trace: &TraceSummary, classification: &str
         .request_classifications
         .iter()
         .find(|entry| entry.value == classification)
+        .map(|entry| entry.count)
+        .unwrap_or_default()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ProgressPhaseRequirement {
+    phase: String,
+    min_count: usize,
+}
+
+fn progress_phase_requirement_failures(
+    trace: Option<&TraceSummary>,
+    raw_requirements: &[String],
+) -> Result<Vec<String>> {
+    let requirements = parse_progress_phase_requirements(raw_requirements)?;
+    if requirements.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(trace) = trace else {
+        return Ok(vec![
+            "progress phase requirements need a Rust trace summary; pass --trace-output"
+                .to_string(),
+        ]);
+    };
+
+    let mut failures = Vec::new();
+    for requirement in requirements {
+        let actual = trace_progress_phase_count(trace, &requirement.phase);
+        if actual < requirement.min_count {
+            failures.push(format!(
+                "{} expected>={} actual={}",
+                requirement.phase, requirement.min_count, actual
+            ));
+        }
+    }
+    Ok(failures)
+}
+
+fn parse_progress_phase_requirements(
+    raw_requirements: &[String],
+) -> Result<Vec<ProgressPhaseRequirement>> {
+    raw_requirements
+        .iter()
+        .map(|raw| {
+            let (phase, min_count) = raw
+                .split_once('=')
+                .ok_or_else(|| anyhow!("expected phase=min_count, got {raw:?}"))?;
+            let phase = phase.trim();
+            if phase.is_empty() {
+                bail!("progress phase requirement has an empty phase");
+            }
+            let min_count = min_count
+                .trim()
+                .parse::<usize>()
+                .with_context(|| format!("parse min_count in {raw:?}"))?;
+            Ok(ProgressPhaseRequirement {
+                phase: phase.to_string(),
+                min_count,
+            })
+        })
+        .collect()
+}
+
+fn trace_progress_phase_count(trace: &TraceSummary, phase: &str) -> usize {
+    trace
+        .progress_phases
+        .iter()
+        .find(|entry| entry.value == phase)
         .map(|entry| entry.count)
         .unwrap_or_default()
 }
@@ -435,6 +527,9 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
     }
     if !args.require_request_classifications.is_empty() && args.trace_output.is_none() {
         bail!("--require-request-classification requires --trace-output");
+    }
+    if !args.require_progress_phases.is_empty() && args.trace_output.is_none() {
+        bail!("--require-progress-phase requires --trace-output");
     }
     if let Some(import_car) = &args.gateway_import_car {
         if !import_car.is_file() {
@@ -9396,6 +9491,25 @@ mod tests {
     }
 
     #[test]
+    fn args_accept_progress_phase_requirements() {
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--trace-output",
+            "/tmp/mobile-trace.jsonl",
+            "--require-progress-phase",
+            "provider_lookup=1",
+            "--require-progress-phase",
+            "fetching_bitswap=3",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.require_progress_phases,
+            vec!["provider_lookup=1", "fetching_bitswap=3"]
+        );
+    }
+
+    #[test]
     fn args_accept_gateway_import_car() {
         let args = Args::try_parse_from([
             "mobile-web-harness",
@@ -10487,6 +10601,25 @@ mod tests {
         assert_eq!(
             summary.provider_retries.skipped_empty_provider_set_events,
             1
+        );
+
+        let requirements = vec![
+            "provider_lookup=6".to_string(),
+            "fetching_bitswap=5".to_string(),
+        ];
+        assert!(
+            progress_phase_requirement_failures(Some(&summary), &requirements)
+                .unwrap()
+                .is_empty()
+        );
+        let requirements = vec!["fetching_bitswap=6".to_string()];
+        assert_eq!(
+            progress_phase_requirement_failures(Some(&summary), &requirements).unwrap(),
+            vec!["fetching_bitswap expected>=6 actual=5"]
+        );
+        assert!(
+            progress_phase_requirement_failures(None, &requirements).unwrap()[0]
+                .contains("--trace-output")
         );
     }
 

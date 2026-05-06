@@ -23839,3 +23839,48 @@ cases. Do not spend the next iteration on Bitswap-tail behavior unless a gated
 sample actually exercises `zero_http_provider_cold_bitswap`. The HTTP-provider
 path is currently fast and resource-light; the next productive work should be
 either another harness/diagnostic improvement or a different roadmap track.
+
+## 2026-05-06 Experiment: Progress Phase Requirement Gate
+
+Hypothesis:
+The mobile progress API work already emits and summarizes UI-facing progress
+phases from gateway traces, but future live runs need a simple way to prove that
+the phases a test is meant to exercise actually appeared.
+
+Expected win:
+Long-running progress/retrieval experiments can fail fast when a run does not
+exercise phases such as `provider_lookup`, `fetching_bitswap`, `retrying`, or
+`completed`, instead of treating the page pass rate as enough evidence.
+
+Risk:
+Harness-only. The main risk is making comparison runs awkward; the gate is
+applied only to the Rust trace side and requires `--trace-output`.
+
+Implementation:
+Add repeatable CLI option:
+
+```text
+--require-progress-phase phase=min_count
+```
+
+This mirrors `--require-request-classification`. It reads
+`trace_summary.progress_phases`, prints unmet requirements, and exits nonzero
+after writing the normal report.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness args_accept_progress_phase_requirements
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases
+cargo test -p mobile-web-harness
+cargo check -p mobile-web-harness --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Result:
+All commands passed.
+
+Decision:
+Keep. This is a narrow harness diagnostic improvement that turns the existing
+progress-phase summary into an enforceable live-run gate.
