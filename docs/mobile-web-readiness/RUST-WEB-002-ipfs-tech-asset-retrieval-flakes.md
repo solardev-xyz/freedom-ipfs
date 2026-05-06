@@ -24131,3 +24131,63 @@ window and reduced repeated connection-error events, but the second baseline won
 on total run p50/p90 and asset tail latency. Keep the env knob as a lab control
 and only revisit with larger alternating samples or a case where connection
 errors dominate the slow zero-HTTP requests.
+
+## 2026-05-06 Observe: Zero-HTTP Gated Rust-vs-Kubo
+
+Use the new requirement gates to capture a Rust-vs-Kubo comparison in a network
+window where Rust actually exercised the zero-HTTP cold-Bitswap fallback. This
+avoids comparing Kubo against an HTTP-provider-only Rust run.
+
+Command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-zero-http-rust-vs-kubo-r3-20260506-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-zero-http-rust-vs-kubo-r3-20260506.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/ipfs-tech-zero-http-rust-vs-kubo-r3-20260506.log 2>&1
+```
+
+Result:
+
+- Rust passed `3/3`
+- Kubo passed `3/3`
+- Rust trace requirements:
+  - `zero_http_provider_cold_bitswap expected>=1 actual=6 passed=true`
+  - `fetching_bitswap expected>=1 actual=576 passed=true`
+- root TTFB p50/p95:
+  - Rust: `622/737ms`
+  - Kubo: `1942/2685ms`
+  - Rust/Kubo ratio: `0.32x/0.27x`
+- asset TTFB p50/p95:
+  - Rust: `211/662ms`
+  - Kubo: `146/636ms`
+  - Rust/Kubo ratio: `1.45x/1.04x`
+- resource max:
+  - RSS: Rust `52900KiB`, Kubo `209756KiB`
+  - FDs: Rust `37`, Kubo `114`
+- Rust block sources: `http_provider=63`, `bitswap=56`
+- Rust delegated provider distribution: `zero=7`, `single=55`,
+  `multi=38`
+
+Artifacts:
+
+- `/tmp/ipfs-tech-zero-http-rust-vs-kubo-r3-20260506.json`
+- `/tmp/ipfs-tech-zero-http-rust-vs-kubo-r3-20260506-trace.jsonl`
+- `/tmp/ipfs-tech-zero-http-rust-vs-kubo-r3-20260506.log`
+
+Conclusion:
+In this gated cold-Bitswap window, Rust is already meaningfully faster than
+fresh Kubo for the page root and far lighter on RSS/FDs. Kubo still wins asset
+p50 and is roughly tied on asset p95, so the next performance work should focus
+on subresource/session behavior rather than root path discovery alone.
