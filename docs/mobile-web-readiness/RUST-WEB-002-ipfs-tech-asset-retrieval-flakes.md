@@ -22225,3 +22225,53 @@ latency, but it self-hedged every single-provider block in the focused page
 sample (`63` self-hedges) and raised traced RSS to `48924KiB`. Keep the env
 override for future longer runs; a later agent can revisit lower delays if it
 adds a stronger per-page duplicate-request budget or provider-score trigger.
+
+## 2026-05-06 Reject: 175ms Single-HTTP Self-Hedge Midpoint
+
+Question:
+After keeping `200ms` and rejecting `150ms`, does a midpoint `175ms` preserve
+most of the 150ms block-tail benefit without self-hedging every single-provider
+block?
+
+Command:
+
+```sh
+rm -f /tmp/ipfs-tech-self-hedge-delay175-trace-r3.json /tmp/ipfs-tech-self-hedge-delay175-trace-r3-trace.jsonl
+
+FREEDOM_IPFS_SINGLE_HTTP_SELF_HEDGE_AFTER_MS=175 timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-self-hedge-delay175-trace-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-self-hedge-delay175-trace-r3.json
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-self-hedge-delay175-trace-r3.json`
+- `/tmp/ipfs-tech-self-hedge-delay175-trace-r3-trace.jsonl`
+
+Result:
+
+- Passed `3/3`.
+- Run total p50/p95/max: `2919/4050/4050ms`.
+- Root TTFB p50/p95/max: `827/1378/1378ms`.
+- Asset TTFB p50/p95/max: `305/964/1093ms`.
+- Max RSS/FD: `53288KiB` / `28`.
+- Trace: `3132` lines, block sources `http_provider=114`, `bitswap=6`.
+- HTTP-provider self-hedges: `49`, `self_hedge_timeout_max=175ms`.
+- Single-provider result p50/p95/max: `270/718/968ms`.
+- HTTP-provider fetch p50/p95/max: `160/623/682ms`.
+- Delegated self-hedges: `1`, max `750ms`.
+
+Decision:
+Reject. In this same-window sample, `175ms` was worse than the kept `200ms`
+trace on run total, root TTFB, asset p50/p95, single-provider result latency,
+and RSS/FD. It also fired more duplicate same-provider requests than `200ms`
+without the block-tail improvement seen at `150ms`. Keep `200ms` as the default
+and move the next optimization effort away from raw self-hedge delay tuning.
