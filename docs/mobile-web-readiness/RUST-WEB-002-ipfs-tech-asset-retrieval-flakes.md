@@ -25610,3 +25610,89 @@ longer r10/r20 alternating run. It should still remain opt-in until a larger
 same-window sample proves the improved `ipfs.tech` asset p50/p95 is stable and
 that the extra racing/cancellation work stays bounded under mobile resource
 budgets.
+
+Focused r10 follow-up:
+
+Default command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/single-http-postlookup-race-default-r10-20260506T224730Z-trace.jsonl \
+  --comparison-output /tmp/single-http-postlookup-race-default-r10-20260506T224730Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/single-http-postlookup-race-default-r10-20260506T224730Z.log 2>&1
+```
+
+Candidate command:
+
+```sh
+FREEDOM_IPFS_ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE=1 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/single-http-postlookup-race-on-r10-20260506T225119Z-trace.jsonl \
+  --comparison-output /tmp/single-http-postlookup-race-on-r10-20260506T225119Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/single-http-postlookup-race-on-r10-20260506T225119Z.log 2>&1
+```
+
+Results:
+
+| Mode | Pass | Root TTFB p50/p95 | Asset TTFB p50/p95 | Kubo asset p50/p95 | Rust max RSS/FD |
+| --- | --- | --- | --- | --- | --- |
+| Default | Rust `10/10`, Kubo `10/10` | `600/1718ms` | `278/824ms` | `159/1297ms` | `54916KiB` / `36` |
+| Race flag | Rust `10/10`, Kubo `10/10` | `593/874ms` | `236/551ms` | `197/726ms` | `55772KiB` / `37` |
+
+Trace comparison:
+
+- The race flag emitted `162` post-lookup race events:
+  - `provider_won=75`
+  - `bitswap_won=87`
+- Race event latency p50/p90/p95/max was `158/222/272/668ms`.
+- `ipfs.tech` asset latency improved versus the default r10:
+  - p50 `278ms -> 236ms`
+  - p95 `824ms -> 551ms`
+- Rust beat Kubo on asset p95 in this window (`551ms` vs `726ms`) but still
+  trailed Kubo on asset p50 (`236ms` vs `197ms`).
+- Root p95 improved materially (`1718ms -> 874ms`) while still beating Kubo.
+- Block fetch totals moved work from serial HTTP-provider paths toward the
+  race:
+  - default HTTP provider: `283` blocks, p50/p95/max `365/507/709ms`
+  - race HTTP provider: `202` blocks, p50/p95/max `255/387/740ms`
+  - default Bitswap: `113` blocks, p50/p95/max `136/565/1225ms`
+  - race Bitswap: `189` blocks, p50/p95/max `155/334/656ms`
+- Post-lookup waits dropped from `314` to `149`. The remaining waits are the
+  multi-provider/zero-provider paths; single-HTTP cases are handled by the
+  race helper under the flag.
+- Canceled Bitswap batch events decreased in this sample (`238 -> 165`), so
+  the duplicate-work risk did not show up as higher cancellation churn here.
+- Resource use stayed essentially flat for Rust (`~55MiB`, `36-37` FDs) and
+  remained far below Kubo (`271-437MiB`, `543-946` FDs in these windows).
+
+Updated decision after r10:
+The focused r10 strengthens the hypothesis enough to continue from this lab
+control. Do not promote the flag blindly yet because Kubo still wins asset p50
+and the live Kubo comparison varies by window. The next useful step is a
+narrower production-shaped policy: keep the immediate single-HTTP race only
+when it is likely to remove tail latency without wasting work, for example by
+gating it on recent single HTTP-provider score, page/subresource context, or a
+small per-session race budget. Validate that candidate against r10/r20 focused
+`ipfs.tech` and the multi-case guardrail before making it default.
