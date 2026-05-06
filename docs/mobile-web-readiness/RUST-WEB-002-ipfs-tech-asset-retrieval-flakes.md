@@ -20700,3 +20700,68 @@ Keep. Future offline replay runs now carry direct cache-only evidence in the
 top-level report and console output. This makes offline/cache-completeness
 experiments easier to audit and reduces the chance that a passing replay hides
 provider lookup, HTTP provider fetch, or Bitswap activity in the trace.
+
+## 2026-05-06 Keep: Full ipfs.tech Page Offline Replay Cache-Only Baseline
+
+Question:
+With the richer offline replay summary, does the full `ipfs-tech-page-assets`
+case show cache-only behavior after one online page-and-assets load?
+
+Command:
+
+```sh
+rm -f /tmp/freedom-ipfs-ipfs-tech-page-offline-summary.db \
+  /tmp/freedom-ipfs-ipfs-tech-page-offline-summary.db-* \
+  /tmp/ipfs-tech-page-offline-summary*.json \
+  /tmp/ipfs-tech-page-offline-summary*.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --gateway-db /tmp/freedom-ipfs-ipfs-tech-page-offline-summary.db \
+  --offline-replay \
+  --case ipfs-tech-page-assets \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-page-offline-summary-trace.jsonl \
+  --output /tmp/ipfs-tech-page-offline-summary.json
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-page-offline-summary.json`
+- `/tmp/ipfs-tech-page-offline-summary-trace-online.jsonl` (`1008` lines)
+- `/tmp/ipfs-tech-page-offline-summary-trace-offline.jsonl` (`397` lines)
+- `/tmp/freedom-ipfs-ipfs-tech-page-offline-summary.db`
+- `/tmp/freedom-ipfs-ipfs-tech-page-offline-summary.db-wal`
+
+Result:
+
+- Online pass: `1/1`; root status `200`; root TTFB/total `1302/1303ms`;
+  root bytes `112239`.
+- Online assets: `32` discovered, `32` fetched, `32` passed, `0` failed,
+  truncated asset crawl `true`; asset TTFB p50/p95/max `245/1194/1260ms`.
+- Online run total `3610ms`, gateway RSS `52600KiB`, FD count `29`, storage
+  `2356456B`.
+- Offline pass: `1/1`; root status `200`; root TTFB/total `15/15ms`; root
+  bytes `112239`.
+- Offline assets: `32` discovered, `32` fetched, `32` passed, `0` failed,
+  truncated asset crawl `true`; asset TTFB p50/p95/max `6/13/19ms`.
+- Offline run total `66ms`, gateway RSS `23656KiB`, FD count `20`, storage
+  `2595416B`.
+- Offline statuses: `200=27`, `206=6`; missing URLs: `0`.
+- Offline cache phases: `name_persistent_cache=33`,
+  `unixfs_metadata_cache=33`, `gateway_direct_body=31`,
+  `gateway_stream_done=2`.
+- Offline network phases: none.
+- Offline block sources: none.
+- Offline non-cache block sources: none.
+- Offline progress phases: `streaming=232`, `name_resolved=66`,
+  `completed=33`, `queued=33`, `started=33`.
+
+Decision:
+Keep as the current full-page cache-only baseline for `ipfs.tech`. One online
+page-and-assets load warmed enough persistent state for the gateway to restart
+offline and serve the root plus all discovered same-site assets in `66ms`
+without provider lookup, HTTP provider fetch, Bitswap activity, or missing URLs.
