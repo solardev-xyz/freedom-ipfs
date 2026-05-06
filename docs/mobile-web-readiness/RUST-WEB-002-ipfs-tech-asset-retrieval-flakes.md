@@ -23049,3 +23049,173 @@ single HTTP provider." Better candidates are request-shape-specific policies,
 such as shorter single-HTTP post-lookup session waits, or a hedge that only
 arms when the current request is a top-level/root path or when trace
 classification predicts the zero-HTTP/cold-Bitswap root shape.
+
+## 2026-05-06 Keep Lab Control: Single-HTTP Post-Lookup Grace Override
+
+The full single-HTTP Bitswap hedge was too broad, but the trace showed another
+possible lever: the selective `250ms` post-lookup wait for recent Bitswap
+session peers when delegated routing returns exactly one HTTP provider. Add an
+opt-in lab knob so future runs can sweep this wait without rebuilding:
+
+```text
+FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS
+```
+
+The default remains `250ms`. Invalid values fall back to the default. Zero is
+accepted as an explicit "do not wait after single-HTTP lookup" experiment.
+Multi-HTTP and zero-HTTP provider sets still use the normal `100ms`
+post-lookup grace.
+
+Validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval single_http_post_lookup_grace
+cargo test -p freedom-ipfs-retrieval
+cargo fmt --all --check
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Focused same-window `ipfs.tech` command shape:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-postlookup-default-r10-trace.jsonl \
+  --output /tmp/ipfs-tech-postlookup-default-r10.json \
+  > /tmp/ipfs-tech-postlookup-default-r10.log 2>&1
+
+FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS=100 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-postlookup-grace100-r10-trace.jsonl \
+  --output /tmp/ipfs-tech-postlookup-grace100-r10.json \
+  > /tmp/ipfs-tech-postlookup-grace100-r10.log 2>&1
+
+FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS=50 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-postlookup-grace50-r10-trace.jsonl \
+  --output /tmp/ipfs-tech-postlookup-grace50-r10.json \
+  > /tmp/ipfs-tech-postlookup-grace50-r10.log 2>&1
+
+FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS=0 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-postlookup-grace0-r10-trace.jsonl \
+  --output /tmp/ipfs-tech-postlookup-grace0-r10.json \
+  > /tmp/ipfs-tech-postlookup-grace0-r10.log 2>&1
+```
+
+Focused result:
+
+| Single-HTTP grace | Pass | Root TTFB p50/p95/max | Asset TTFB p50/p95/max | Post-lookup budgets | Max RSS/FD |
+| --- | --- | --- | --- | --- | --- |
+| Default `250ms` | `10/10` | `662/1453/1453ms` | `225/659/1377ms` | `250=61`, `100=52` | `54120KiB` / `31` |
+| `100ms` | `10/10` | `567/764/764ms` | `237/517/1260ms` | `100=79` | `54400KiB` / `31` |
+| `50ms` | `10/10` | `526/597/597ms` | `239/504/949ms` | `50=55`, `100=37` | `53968KiB` / `31` |
+| `0ms` | `10/10` | `546/717/717ms` | `237/512/729ms` | `0=49`, `100=29` | `53696KiB` / `32` |
+
+Trace notes:
+
+- All four focused runs retained the same request classification shape:
+  `cold_bitswap_peer_expand=10`, `zero_http_provider_bitswap=10`,
+  `zero_http_provider_cold_bitswap=10`.
+- `50ms` was the best focused sample. It kept some single-HTTP session wins
+  (`single_http_hits p50/p95/max=15/45/45ms`) while bounding timeout cost.
+- `0ms` removed single-HTTP post-lookup hits entirely and regressed root p95
+  versus `50ms`, so the useful lower bound is not zero in this window.
+
+Multi-case Kubo guardrail commands:
+
+```sh
+FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS=50 \
+timeout 1500s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/postlookup-grace50-multicase-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/postlookup-grace50-multicase-kubo-r3.json \
+  > /tmp/postlookup-grace50-multicase-kubo-r3.log 2>&1
+
+timeout 1500s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/postlookup-default-multicase-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/postlookup-default-multicase-kubo-r3.json \
+  > /tmp/postlookup-default-multicase-kubo-r3.log 2>&1
+```
+
+Guardrail result:
+
+| Mode | Pass | DAICO root p50/p95 | Vitalik root p50/p95 | IPFS.tech root p50/p95 | IPFS.tech asset p50/p95 | Rust max RSS/FD |
+| --- | --- | --- | --- | --- | --- | --- |
+| `50ms` | Rust `3/3`, Kubo `3/3` | `251/287ms` | `175/221ms` | `521/692ms` | `240/509ms` | `55624KiB` / `31` |
+| Default `250ms` | Rust `3/3`, Kubo `3/3` | `274/298ms` | `98/118ms` | `512/640ms` | `225/546ms` | `53392KiB` / `32` |
+
+Guardrail notes:
+
+- Both Rust modes beat Kubo strongly on root latency and resource use in all
+  three cases.
+- The `50ms` guardrail improved `ipfs.tech` asset p95 (`546ms -> 509ms`) and
+  kept FD max essentially flat.
+- The default guardrail was slightly better for `ipfs.tech` root p50/p95 and
+  materially better for the `vitalik-root-html-range` root sample in this
+  particular live window.
+- The `50ms` run produced many more session shortcut attempts/hits
+  (`31/31`) than default (`7/7`), while bounding single-HTTP timeout cost to
+  about `50-66ms`.
+
+Conclusion:
+Keep the environment knob, but do not change the production default from this
+sample. The focused `ipfs.tech` r10 sweep says `50ms` is a real latency lever,
+but the same-window multi-case guardrail is mixed rather than a clean default
+flip. Future work should use this knob for longer r20/r50 sweeps and for
+request-shape policies, especially root/top-level requests versus page assets.
