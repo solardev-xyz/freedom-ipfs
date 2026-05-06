@@ -101,8 +101,11 @@ replays the same corpus. If `--gateway-db` is omitted, the harness creates a
 temporary DB path and reports it. The JSON report contains separate `online` and
 `offline` run reports plus an offline replay summary with missing root/asset
 URLs, offline cache storage bytes, offline response statuses, trace errors, and
-progress phases. If `--trace-output /tmp/replay.jsonl` is also set, the online
-and offline trace files are written as `/tmp/replay-online.jsonl` and
+progress phases. When trace output is available, the summary also reports
+offline cache phases, offline network phases, block sources, and non-cache
+block sources so cache-only replays can be checked without manually parsing the
+JSONL trace. If `--trace-output /tmp/replay.jsonl` is also set, the online and
+offline trace files are written as `/tmp/replay-online.jsonl` and
 `/tmp/replay-offline.jsonl`. To separate "name not available offline" from
 "content blocks missing", add `--offline-replay-resolved-ipfs`. The online pass
 will use observed successful `name_resolve` trace events to rewrite matching

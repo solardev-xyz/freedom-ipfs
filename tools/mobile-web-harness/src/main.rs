@@ -1292,6 +1292,34 @@ fn print_offline_replay_summary(report: &OfflineReplayReport) {
             format_trace_counts(&report.summary.offline_request_statuses)
         );
     }
+    if !report.summary.offline_network_phases.is_empty() {
+        println!(
+            "  offline network phases: {}",
+            format_trace_counts(&report.summary.offline_network_phases)
+        );
+    } else {
+        println!("  offline network phases: none");
+    }
+    if !report.summary.offline_cache_phases.is_empty() {
+        println!(
+            "  offline cache phases: {}",
+            format_trace_counts(&report.summary.offline_cache_phases)
+        );
+    }
+    if !report.summary.offline_block_sources.is_empty() {
+        println!(
+            "  offline block sources: {}",
+            format_trace_counts(&report.summary.offline_block_sources)
+        );
+    }
+    if !report.summary.offline_non_cache_block_sources.is_empty() {
+        println!(
+            "  offline non-cache block sources: {}",
+            format_trace_counts(&report.summary.offline_non_cache_block_sources)
+        );
+    } else {
+        println!("  offline non-cache block sources: none");
+    }
     if !report.summary.offline_trace_errors.is_empty() {
         println!(
             "  offline trace errors: {}",
@@ -4185,6 +4213,10 @@ struct OfflineReplaySummary {
     missing_urls: Vec<OfflineReplayMissingUrl>,
     offline_storage_bytes: Option<u64>,
     offline_request_statuses: Vec<TraceValueCount>,
+    offline_network_phases: Vec<TraceValueCount>,
+    offline_cache_phases: Vec<TraceValueCount>,
+    offline_block_sources: Vec<TraceValueCount>,
+    offline_non_cache_block_sources: Vec<TraceValueCount>,
     offline_trace_errors: Vec<TraceValueCount>,
     offline_progress_phases: Vec<TraceValueCount>,
 }
@@ -4227,12 +4259,24 @@ impl OfflineReplaySummary {
             }
         }
         let offline_storage_bytes = report.summary.gateway_storage_bytes.max;
-        let (offline_request_statuses, offline_trace_errors, offline_progress_phases) = report
+        let (
+            offline_request_statuses,
+            offline_network_phases,
+            offline_cache_phases,
+            offline_block_sources,
+            offline_non_cache_block_sources,
+            offline_trace_errors,
+            offline_progress_phases,
+        ) = report
             .trace_summary
             .as_ref()
             .map(|trace| {
                 (
                     trace.request_statuses.clone(),
+                    trace_phase_counts_by_name(trace, OFFLINE_NETWORK_TRACE_PHASES),
+                    trace_phase_counts_by_name(trace, OFFLINE_CACHE_TRACE_PHASES),
+                    trace.block_sources.clone(),
+                    non_cache_block_sources(&trace.block_sources),
                     trace.trace_errors.clone(),
                     trace.progress_phases.clone(),
                 )
@@ -4243,10 +4287,93 @@ impl OfflineReplaySummary {
             missing_urls,
             offline_storage_bytes,
             offline_request_statuses,
+            offline_network_phases,
+            offline_cache_phases,
+            offline_block_sources,
+            offline_non_cache_block_sources,
             offline_trace_errors,
             offline_progress_phases,
         }
     }
+}
+
+const OFFLINE_NETWORK_TRACE_PHASES: &[&str] = &[
+    "provider_lookup",
+    "delegated_provider_lookup",
+    "delegated_provider_empty_retry",
+    "delegated_provider_self_hedge",
+    "delegated_provider_self_hedge_result",
+    "dht_provider_lookup",
+    "provider_diversity_low",
+    "provider_fetch_start",
+    "provider_refresh_skipped_empty_provider_set",
+    "provider_retry_after_request_timeout",
+    "provider_retry_after_timeout",
+    "provider_retry_after_connection_timeout",
+    "retry_provider_count",
+    "http_provider_race",
+    "http_provider_hedge",
+    "http_provider_self_hedge",
+    "http_provider_race_result",
+    "http_provider_fetch",
+    "bitswap_provider_candidates_empty",
+    "bitswap_peer_expand",
+    "bad_peer_skipped",
+    "bitswap_fetch",
+    "bitswap_fetch_cancelled",
+    "bitswap_request_timeout",
+    "bitswap_request_timeout_detail",
+    "bitswap_peer_timeout_suppressed",
+    "bitswap_peer_timeout",
+    "bitswap_client_reset",
+    "bitswap_session_shortcut_start",
+    "bitswap_session_shortcut",
+    "bitswap_dns_prefetch",
+    "bitswap_dnsaddr_expand",
+    "bitswap_dns_multiaddr_expand",
+    "bitswap_incoming_batch",
+    "bitswap_batch_failed",
+    "bitswap_peer_attempt_start",
+    "bitswap_peer_attempt",
+    "bitswap_connection_established",
+    "bitswap_connection_closed",
+    "bitswap_connection_error",
+    "bitswap_connection_error_backoff",
+    "bitswap_connection_error_peer_skipped",
+    "bitswap_dial_plan",
+    "bitswap_dial_rejected",
+    "bitswap_dial_waiters_dropped",
+    "bitswap_incoming_stream_read",
+    "bitswap_incoming_block",
+];
+
+const OFFLINE_CACHE_TRACE_PHASES: &[&str] = &[
+    "name_persistent_cache",
+    "name_cache",
+    "provider_cache",
+    "block_store_get",
+    "block_store_get_range",
+    "unixfs_metadata_cache",
+    "gateway_direct_body",
+    "gateway_stream_done",
+];
+
+fn trace_phase_counts_by_name(trace: &TraceSummary, phase_names: &[&str]) -> Vec<TraceValueCount> {
+    let wanted = phase_names.iter().copied().collect::<HashSet<_>>();
+    trace
+        .event_phases
+        .iter()
+        .filter(|phase| wanted.contains(phase.value.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn non_cache_block_sources(block_sources: &[TraceValueCount]) -> Vec<TraceValueCount> {
+    block_sources
+        .iter()
+        .filter(|source| source.value != "cache")
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -4732,6 +4859,7 @@ impl std::fmt::Display for ResourceSummary {
 struct TraceSummary {
     line_count: usize,
     event_count: usize,
+    event_phases: Vec<TraceValueCount>,
     phases: Vec<TracePhaseAggregate>,
     progress_phases: Vec<TraceValueCount>,
     slow_events: Vec<TraceSlowEvent>,
@@ -6257,6 +6385,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         .with_context(|| format!("read trace output {}", path.display()))?;
     let mut line_count = 0usize;
     let mut event_count = 0usize;
+    let mut event_phases = BTreeMap::<String, usize>::new();
     let mut phases = BTreeMap::<String, Vec<u128>>::new();
     let mut progress_phases = BTreeMap::<String, usize>::new();
     let mut slow_events = Vec::<TraceSlowEvent>::new();
@@ -6348,6 +6477,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             continue;
         };
         event_count += 1;
+        *event_phases.entry(phase.to_string()).or_default() += 1;
         let progress_phase = trace_progress_phase(phase, &value);
         *progress_phases
             .entry(progress_phase.to_string())
@@ -7474,6 +7604,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     Ok(TraceSummary {
         line_count,
         event_count,
+        event_phases: sorted_trace_counts(event_phases),
         phases,
         progress_phases: sorted_trace_counts(progress_phases),
         slow_events,
@@ -10498,8 +10629,124 @@ mod tests {
         );
         assert_eq!(summary.missing_urls[1].kind, "script");
         assert!(summary.offline_request_statuses.is_empty());
+        assert!(summary.offline_network_phases.is_empty());
+        assert!(summary.offline_cache_phases.is_empty());
+        assert!(summary.offline_block_sources.is_empty());
+        assert!(summary.offline_non_cache_block_sources.is_empty());
         assert!(summary.offline_trace_errors.is_empty());
         assert!(summary.offline_progress_phases.is_empty());
+    }
+
+    #[test]
+    fn offline_replay_summary_extracts_cache_and_network_trace_phases() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-offline-trace-summary-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"request_done\",\"status\":206,\"elapsed_ms\":1}\n",
+                "{\"phase\":\"delegated_provider_lookup\",\"provider_count\":1,\"elapsed_ms\":10}\n",
+                "{\"phase\":\"http_provider_fetch\",\"ok\":true,\"bytes\":128,\"elapsed_ms\":20}\n",
+                "{\"phase\":\"block_fetch_total\",\"source\":\"http_provider\",\"elapsed_ms\":21}\n",
+                "{\"phase\":\"block_fetch_total\",\"source\":\"cache\",\"elapsed_ms\":0}\n",
+                "{\"phase\":\"name_persistent_cache\",\"cache_hit\":true,\"elapsed_ms\":0}\n",
+                "{\"phase\":\"block_store_get_range\",\"cache_hit\":true,\"elapsed_ms\":0}\n",
+                "{\"phase\":\"unixfs_metadata_cache\",\"path_hits\":1,\"elapsed_ms\":0}\n",
+                "{\"phase\":\"gateway_direct_body\",\"body_len\":4096,\"elapsed_ms\":0}\n",
+            ),
+        )
+        .unwrap();
+
+        let run = run_result(
+            RunPhase::Measured,
+            1,
+            100,
+            Some(40),
+            Some(48),
+            Some(0),
+            Some(4096),
+        );
+        let runs = vec![run];
+        let report = RunReport {
+            gateway_url: None,
+            generated_at_unix_seconds: 0,
+            repeat: 1,
+            warmup_runs: 0,
+            fresh_gateway_per_run: false,
+            asset_concurrency: 1,
+            conditional_revalidate: false,
+            run_timeout_secs: None,
+            engine: HarnessEngine::Rust,
+            gateway_db: Some("/tmp/replay.db".to_string()),
+            gateway_import_car: None,
+            bitswap_seed_car: None,
+            bitswap_seed_connection_setup: None,
+            kubo_repo: None,
+            trace_output: Some(path.display().to_string()),
+            trace_summary: Some(summarize_trace_output(&path).unwrap()),
+            summary: RepeatSummary::from_runs(&runs),
+            runs,
+        };
+
+        let summary = OfflineReplaySummary::from_report(&report);
+
+        assert_eq!(
+            summary
+                .offline_request_statuses
+                .iter()
+                .find(|count| count.value == "206")
+                .map(|count| count.count),
+            Some(1)
+        );
+        assert_eq!(
+            trace_value_count(&summary.offline_network_phases, "delegated_provider_lookup"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.offline_network_phases, "http_provider_fetch"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.offline_cache_phases, "name_persistent_cache"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.offline_cache_phases, "block_store_get_range"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.offline_cache_phases, "unixfs_metadata_cache"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.offline_cache_phases, "gateway_direct_body"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.offline_block_sources, "http_provider"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.offline_block_sources, "cache"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.offline_non_cache_block_sources, "http_provider"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&summary.offline_non_cache_block_sources, "cache"),
+            0
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

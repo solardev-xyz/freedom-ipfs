@@ -20614,3 +20614,89 @@ media slices and HEAD metadata survive a gateway restart and are served
 offline from persistent name, UnixFS metadata, and block/cache state. This gives
 the mobile browser a concrete offline/cache-only expectation for range-heavy
 media workloads without fetching the full media object through the gateway.
+
+## 2026-05-06 Keep: Summarize Offline Replay Cache-Only Evidence
+
+Question:
+Can the offline replay report directly show whether an offline replay stayed
+cache-only, instead of requiring manual JSONL trace parsing?
+
+Implementation:
+
+- Add `event_phases` to `mobile-web-harness` trace summaries so all trace
+  phases are counted, including events without `elapsed_ms`.
+- Add these fields to `OfflineReplaySummary`:
+  - `offline_network_phases`
+  - `offline_cache_phases`
+  - `offline_block_sources`
+  - `offline_non_cache_block_sources`
+- Print the same cache/network/source summaries in offline replay console
+  output.
+- Add focused regression coverage for extracting offline cache and network
+  trace phases and filtering non-cache block sources.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness offline_replay_summary -- --nocapture
+cargo check -p mobile-web-harness --all-targets
+```
+
+Focused result:
+
+- Formatting passed.
+- Focused offline replay summary tests passed: `2 passed`.
+- Harness check passed.
+
+Live validation:
+
+```sh
+rm -f /tmp/freedom-ipfs-media-range-offline-summary.db \
+  /tmp/freedom-ipfs-media-range-offline-summary.db-* \
+  /tmp/ipfs-tech-hero-media-offline-summary*.json \
+  /tmp/ipfs-tech-hero-media-offline-summary*.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --gateway-db /tmp/freedom-ipfs-media-range-offline-summary.db \
+  --offline-replay \
+  --case ipfs-tech-developers-hero-range \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-hero-media-offline-summary-trace.jsonl \
+  --output /tmp/ipfs-tech-hero-media-offline-summary.json
+```
+
+Live result:
+
+- Online pass: `1/1`; offline pass: `1/1`; missing URLs: `0`.
+- Offline storage bytes: `518936B`.
+- Offline statuses: `206=3`, `200=1`.
+- Offline cache phases: `name_persistent_cache=4`,
+  `unixfs_metadata_cache=4`, `gateway_direct_body=3`.
+- Offline network phases: none.
+- Offline block sources: none.
+- Offline non-cache block sources: none.
+- Offline progress phases: `streaming=27`, `name_resolved=8`,
+  `completed=4`, `queued=4`, `started=4`.
+- Offline run total `35ms`, gateway RSS `21704KiB`, FD count `15`.
+- Offline first/middle/suffix/HEAD TTFB: `22/3/3/3ms`.
+
+Artifacts:
+
+- `/tmp/ipfs-tech-hero-media-offline-summary.json`
+- `/tmp/ipfs-tech-hero-media-offline-summary-trace-online.jsonl`
+- `/tmp/ipfs-tech-hero-media-offline-summary-trace-offline.jsonl`
+- `/tmp/freedom-ipfs-media-range-offline-summary.db`
+
+Decision:
+Keep. Future offline replay runs now carry direct cache-only evidence in the
+top-level report and console output. This makes offline/cache-completeness
+experiments easier to audit and reduces the chance that a passing replay hides
+provider lookup, HTTP provider fetch, or Bitswap activity in the trace.
