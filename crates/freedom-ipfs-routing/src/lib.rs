@@ -31,6 +31,7 @@ const MAX_DELEGATED_ROUTING_PROVIDERS: usize = 64;
 const STREAMING_DELEGATED_HTTP_PROVIDER_TARGET: usize = 3;
 const STREAMING_DELEGATED_FIRST_HTTP_PROVIDER_GRACE: Duration = Duration::from_millis(100);
 const STREAMING_DELEGATED_DIRECT_BITSWAP_PROVIDER_TARGET: usize = 4;
+const STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_GRACE: Duration = Duration::from_millis(125);
 const ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_ENV: &str =
     "FREEDOM_IPFS_ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET";
 const SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER: Duration = Duration::from_millis(750);
@@ -1137,11 +1138,17 @@ async fn limited_response_providers_with_direct_bitswap_target(
     let mut first_chunk_elapsed = None;
     let mut first_http_provider_elapsed = None;
     let mut first_http_provider_deadline = None;
+    let mut direct_bitswap_target_elapsed = None;
+    let mut direct_bitswap_target_deadline = None;
     loop {
-        let chunk = if let Some(deadline) = first_http_provider_deadline {
+        let next_deadline =
+            earliest_deadline(first_http_provider_deadline, direct_bitswap_target_deadline);
+        let chunk = if let Some(deadline) = next_deadline {
             match tokio::time::timeout_at(deadline, stream.next()).await {
                 Ok(chunk) => chunk,
                 Err(_) => {
+                    let direct_bitswap_target_ready = direct_bitswap_target_deadline
+                        .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
                     let providers = limit_delegated_providers(providers);
                     return Ok(LimitedProviderResponse {
                         stats: DelegatedResponseStats {
@@ -1149,8 +1156,9 @@ async fn limited_response_providers_with_direct_bitswap_target(
                             line_count,
                             first_chunk_elapsed,
                             first_http_provider_elapsed,
-                            target_met_elapsed: None,
-                            target_kind: None,
+                            target_met_elapsed: direct_bitswap_target_elapsed
+                                .filter(|_| direct_bitswap_target_ready),
+                            target_kind: direct_bitswap_target_ready.then_some("direct_bitswap"),
                             http_provider_count: http_provider_url_count(&providers),
                         },
                         providers,
@@ -1184,6 +1192,7 @@ async fn limited_response_providers_with_direct_bitswap_target(
                 );
             }
             if should_return_streamed_providers(&providers) {
+                let target_kind = streamed_provider_target_kind(&providers);
                 let providers = limit_delegated_providers(providers);
                 return Ok(LimitedProviderResponse {
                     stats: DelegatedResponseStats {
@@ -1192,29 +1201,21 @@ async fn limited_response_providers_with_direct_bitswap_target(
                         first_chunk_elapsed,
                         first_http_provider_elapsed,
                         target_met_elapsed: Some(started.elapsed()),
-                        target_kind: Some("http_provider"),
+                        target_kind,
                         http_provider_count: http_provider_url_count(&providers),
                     },
                     providers,
                 });
             }
             if direct_bitswap_target_enabled
+                && direct_bitswap_target_deadline.is_none()
                 && supported_direct_bitswap_provider_diversity(&providers)
                     >= STREAMING_DELEGATED_DIRECT_BITSWAP_PROVIDER_TARGET
             {
-                let providers = limit_delegated_providers(providers);
-                return Ok(LimitedProviderResponse {
-                    stats: DelegatedResponseStats {
-                        bytes_read,
-                        line_count,
-                        first_chunk_elapsed,
-                        first_http_provider_elapsed,
-                        target_met_elapsed: Some(started.elapsed()),
-                        target_kind: Some("direct_bitswap"),
-                        http_provider_count: http_provider_url_count(&providers),
-                    },
-                    providers,
-                });
+                direct_bitswap_target_elapsed = Some(started.elapsed());
+                direct_bitswap_target_deadline = Some(
+                    tokio::time::Instant::now() + STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_GRACE,
+                );
             }
         }
     }
@@ -1226,6 +1227,7 @@ async fn limited_response_providers_with_direct_bitswap_target(
     if first_http_provider_elapsed.is_none() && http_provider_url_count(&providers) > 0 {
         first_http_provider_elapsed = Some(started.elapsed());
     }
+    let direct_bitswap_target_met = direct_bitswap_target_elapsed.is_some();
     let providers = limit_delegated_providers(providers);
     Ok(LimitedProviderResponse {
         stats: DelegatedResponseStats {
@@ -1233,8 +1235,8 @@ async fn limited_response_providers_with_direct_bitswap_target(
             line_count,
             first_chunk_elapsed,
             first_http_provider_elapsed,
-            target_met_elapsed: None,
-            target_kind: None,
+            target_met_elapsed: direct_bitswap_target_elapsed,
+            target_kind: direct_bitswap_target_met.then_some("direct_bitswap"),
             http_provider_count: http_provider_url_count(&providers),
         },
         providers,
@@ -1266,8 +1268,28 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
 }
 
 fn should_return_streamed_providers(providers: &[Provider]) -> bool {
-    providers.len() >= MAX_DELEGATED_ROUTING_PROVIDERS
-        || http_provider_url_count(providers) >= STREAMING_DELEGATED_HTTP_PROVIDER_TARGET
+    streamed_provider_target_kind(providers).is_some()
+}
+
+fn streamed_provider_target_kind(providers: &[Provider]) -> Option<&'static str> {
+    if http_provider_url_count(providers) >= STREAMING_DELEGATED_HTTP_PROVIDER_TARGET {
+        Some("http_provider")
+    } else if providers.len() >= MAX_DELEGATED_ROUTING_PROVIDERS {
+        Some("max_providers")
+    } else {
+        None
+    }
+}
+
+fn earliest_deadline(
+    first: Option<tokio::time::Instant>,
+    second: Option<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
 }
 
 fn streaming_delegated_direct_bitswap_target_enabled() -> bool {
@@ -2216,6 +2238,66 @@ mod tests {
             .providers
             .iter()
             .any(|provider| provider.id.as_deref() == Some("late-peer")));
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn direct_bitswap_target_waits_for_http_tail_inside_grace() {
+        let fast_head = (0..STREAMING_DELEGATED_DIRECT_BITSWAP_PROVIDER_TARGET)
+            .map(|index| {
+                format!(
+                    r#"{{"ID":"{}","Addrs":["/ip4/127.0.0.{}/tcp/{}"]}}"#,
+                    Keypair::generate_ed25519().public().to_peer_id(),
+                    index + 1,
+                    4100 + index
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let http_tail = (0..STREAMING_DELEGATED_HTTP_PROVIDER_TARGET)
+            .map(|index| {
+                format!(
+                    r#"{{"ID":"http-peer-{index}","Addrs":["/dns4/provider-{index}.example/tcp/443/tls/http"]}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let (endpoint, task) = spawn_streaming_delegated_response(
+            fast_head,
+            http_tail,
+            Duration::from_millis(
+                (STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_GRACE.as_millis() as u64) / 2,
+            ),
+        )
+        .await;
+        let response = reqwest::get(format!("{endpoint}/providers/test"))
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(500),
+            limited_response_providers_with_direct_bitswap_target(
+                response,
+                MAX_DELEGATED_ROUTING_RESPONSE_BYTES,
+                true,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            response.stats.http_provider_count,
+            STREAMING_DELEGATED_HTTP_PROVIDER_TARGET
+        );
+        assert_eq!(response.stats.target_kind, Some("http_provider"));
+        assert!(response
+            .providers
+            .iter()
+            .any(|provider| provider.id.as_deref() == Some("http-peer-0")));
         task.abort();
         let _ = task.await;
     }

@@ -25172,3 +25172,200 @@ when enabled, all delegated lookups reached an explicit early target and
 delegated lookup max stayed bounded at `586ms`, but it shifted more work to
 Bitswap. The next serious evidence should be an alternating baseline/env run,
 or a broader repeat=5 guard, before considering default promotion.
+
+## 2026-05-06 Reject For Default: Direct Bitswap Target A/B And Grace Variant
+
+Hypothesis:
+The env-gated direct Bitswap streamed delegated target might still be useful if
+its previous win was not just public-network drift. The key risk to retest was
+whether stopping delegated streams after a small set of direct Bitswap peers can
+starve the HTTP-provider path or leave retrieval with stale/unusable peers.
+
+Alternating A/B command shape:
+
+```sh
+for iter in 1 2 3; do
+  timeout 1800s cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --repeat 1 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/ipfs-tech-direct-bitswap-ab-off-i${iter}-20260506T221032Z-trace.jsonl \
+    --comparison-output /tmp/ipfs-tech-direct-bitswap-ab-off-i${iter}-20260506T221032Z.json \
+    --require-request-classification zero_http_provider_cold_bitswap=1 \
+    --require-progress-phase fetching_bitswap=1 \
+    > /tmp/ipfs-tech-direct-bitswap-ab-off-i${iter}-20260506T221032Z.log 2>&1
+
+  FREEDOM_IPFS_ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET=1 \
+  timeout 1800s cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --repeat 1 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/ipfs-tech-direct-bitswap-ab-on-i${iter}-20260506T221032Z-trace.jsonl \
+    --comparison-output /tmp/ipfs-tech-direct-bitswap-ab-on-i${iter}-20260506T221032Z.json \
+    --require-request-classification zero_http_provider_cold_bitswap=1 \
+    --require-progress-phase fetching_bitswap=1 \
+    > /tmp/ipfs-tech-direct-bitswap-ab-on-i${iter}-20260506T221032Z.log 2>&1
+done
+```
+
+Alternating A/B result:
+
+- Env-off iteration 1: Rust/Kubo passed `1/1`; asset TTFB Rust/Kubo
+  `395/940ms` vs `93/475ms`.
+- Env-on iteration 1: Rust/Kubo passed `1/1`; asset TTFB Rust/Kubo
+  `224/467ms` vs `153/691ms`.
+- Env-off iteration 2: Rust/Kubo passed `1/1`; asset TTFB Rust/Kubo
+  `244/557ms` vs `234/446ms`.
+- Env-on iteration 2: Rust/Kubo passed `1/1`; asset TTFB Rust/Kubo
+  `233/533ms` vs `185/531ms`.
+- Env-off iteration 3: Rust/Kubo passed `1/1`; asset TTFB Rust/Kubo
+  `219/677ms` vs `115/372ms`.
+- Env-on iteration 3: Rust failed `0/1`; Kubo passed `1/1`.
+
+Failure details:
+
+- Env-on iteration 3 returned a Rust root `504` after `10260ms`.
+- The direct target returned `9` providers, `0` HTTP providers, and only `4`
+  usable direct Bitswap peers for the root CID.
+- All `4` Bitswap peers failed connection readiness. The retry refreshed the
+  same truncated provider set and spent a second `5s` Bitswap round before
+  failing.
+- Kubo loaded the same case successfully in the same iteration.
+
+Interpretation:
+The immediate direct Bitswap target is unsafe. Four usable-looking direct
+Bitswap peers are not enough evidence on the public IPFS network, especially for
+the top-level root block where failing means no subresources are requested at
+all. This reproduced the same class of problem as the earlier rejected generic
+Bitswap-diversity streaming return: early provider diversity can still be stale
+or misleading.
+
+Safety refinement:
+
+- Keep the direct target disabled by default.
+- When the env-gated direct target is enabled, reaching the direct Bitswap
+  provider target now starts a bounded `125ms` grace instead of returning
+  immediately.
+- If enough HTTP providers arrive inside that grace, the HTTP-provider target
+  wins and the response is classified as `response_target_kind="http_provider"`.
+- If the stream ends or the grace expires without an HTTP target, the response
+  can still return as `response_target_kind="direct_bitswap"`.
+- The trace `response_target_kind` now distinguishes the existing max-provider
+  cap from the HTTP-provider target, avoiding misleading `http_provider` labels
+  when the max cap is the reason for returning.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing direct_bitswap -- --nocapture
+cargo test -p freedom-ipfs-routing streamed -- --nocapture
+cargo test -p freedom-ipfs-routing
+cargo clippy -p freedom-ipfs-routing --all-targets -- -D warnings
+```
+
+Validation result:
+
+- Formatting passed.
+- Focused direct Bitswap tests passed: `3 passed`.
+- Streamed delegated routing tests passed: `4 passed`.
+- Full routing tests passed: `28 passed`, `1 ignored`.
+- Routing clippy passed.
+
+Patched env-on command:
+
+```sh
+FREEDOM_IPFS_ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET=1 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-direct-bitswap-grace-r3-20260506T221604Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-direct-bitswap-grace-r3-20260506T221604Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/ipfs-tech-direct-bitswap-grace-r3-20260506T221604Z.log 2>&1
+```
+
+Patched env-on result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Root TTFB p50/p95:
+  - Rust: `1292/1404ms`
+  - Kubo: `2414/3091ms`
+- Asset TTFB p50/p95:
+  - Rust: `236/1048ms`
+  - Kubo: `159/803ms`
+- Resource max:
+  - Rust: `55680KiB` RSS, `31` FDs
+  - Kubo: `257688KiB` RSS, `177` FDs
+- Delegated provider lookup max: `230ms`.
+- Delegated lookup targets: `58` direct Bitswap, `38` HTTP-provider.
+- The previous root `504` class did not recur in this repeat.
+- The asset tail moved back to HTTP-provider latency:
+  - HTTP provider count `76`, p50/p95/max `264/1056/1315ms`
+  - Bitswap count `42`, p50/p95/max `145/254/307ms`
+
+Same-window env-off command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-direct-bitswap-grace-envoff-r3-20260506T221714Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-direct-bitswap-grace-envoff-r3-20260506T221714Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/ipfs-tech-direct-bitswap-grace-envoff-r3-20260506T221714Z.log 2>&1
+```
+
+Same-window env-off result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Root TTFB p50/p95:
+  - Rust: `617/999ms`
+  - Kubo: `2345/3433ms`
+- Asset TTFB p50/p95:
+  - Rust: `213/541ms`
+  - Kubo: `193/456ms`
+- Resource max:
+  - Rust: `54924KiB` RSS, `34` FDs
+  - Kubo: `277508KiB` RSS, `290` FDs
+- Delegated provider lookup max: `208ms`.
+- Delegated lookup targets: `41` HTTP-provider, `0` direct Bitswap.
+- HTTP provider count `82`, p50/p95/max `228/470/954ms`.
+- Bitswap count `38`, p50/p95/max `147/308/313ms`.
+
+Decision:
+Do not promote the direct Bitswap delegated stream target. The 125ms grace makes
+the lab knob safer, but in the same window default/env-off was faster on both
+asset p50 and asset p95. This path is not the next route to beating Kubo. Keep
+the code env-gated as a safer lab tool only; future work should shift back to
+the current residual gap: single-provider HTTP tails, page-session reuse around
+subresource CIDs, and avoiding repeated root/subresource metadata work without
+raising mobile RSS, FDs, or fanout.
