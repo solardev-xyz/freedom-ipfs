@@ -346,7 +346,9 @@ status, MIME type, byte count, and timing.
   correlation; `--trace-span-list` restores the full stack when needed. On the
   CID-direct warm traced repeat=5 sample, omitting `spans` reduced trace output
   from about `2.72MiB` to `1.78MiB` and improved asset TTFB p50/p95 from
-  `4/8ms` to `2/6ms`.
+  `4/8ms` to `2/6ms`. On a production-style no-trace `/ipns/ipfs.tech/`
+  warm comparison, Rust matched Kubo root TTFB p50/p95 at `1/2ms`, beat Kubo
+  asset TTFB p95 `3ms` vs `6ms`, and used about `0.25x` Kubo RSS.
 
 ## Next Scenario Targets
 

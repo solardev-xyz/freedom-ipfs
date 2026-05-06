@@ -21365,3 +21365,58 @@ Keep. The duplicate span-stack field was a material trace payload multiplier,
 and the harness does not need it for normal mobile-web summaries. This does not
 change production/no-trace behavior, keeps request correlation intact for traced
 runs, and leaves an explicit `--trace-span-list` escape hatch for deeper tracing.
+
+## 2026-05-06 Observe: No-Trace Warm `/ipns/ipfs.tech/` vs Kubo
+
+Question:
+After the small-body cache and trace-span-list cleanup, where does the real
+`/ipns/ipfs.tech/` warm same-daemon page workload stand against Kubo when trace
+output is disabled?
+
+Command:
+
+```sh
+rm -f /tmp/freedom-ipfs-ipfs-tech-small-body-cache-kubo-notrace.db \
+  /tmp/freedom-ipfs-ipfs-tech-small-body-cache-kubo-notrace.db-* \
+  /tmp/ipfs-tech-small-body-cache-kubo-notrace-r3.json
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --gateway-db /tmp/freedom-ipfs-ipfs-tech-small-body-cache-kubo-notrace.db \
+  --case ipfs-tech-page-assets \
+  --warmup-runs 1 \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --comparison-output /tmp/ipfs-tech-small-body-cache-kubo-notrace-r3.json
+```
+
+Artifact:
+
+- `/tmp/ipfs-tech-small-body-cache-kubo-notrace-r3.json`
+
+Result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Rust run total p50/p95/max: `27/28/28ms`.
+- Kubo run total p50/p95/max: `22/35/35ms`.
+- Rust root TTFB p50/p95/max: `1/2/2ms`.
+- Kubo root TTFB p50/p95/max: `1/2/2ms`.
+- Rust asset TTFB p50/p95/max: `2/3/5ms`.
+- Kubo asset TTFB p50/p95/max: `1/6/8ms`.
+- Rust asset total p50/p95/max: `2/3/5ms`.
+- Kubo asset total p50/p95/max: `1/6/8ms`.
+- Rust max RSS/FD: `52732KiB` / `32`.
+- Kubo max RSS/FD: `213520KiB` / `103`.
+- Rust used `0.25x` Kubo RSS and `0.31x` Kubo FD count.
+
+Decision:
+Use this as the current production-style warm `ipfs.tech` baseline. The older
+traced comparison made the warm gap look larger than it is. With trace disabled,
+Rust matches Kubo on root TTFB, loses only the asset p50 by `1ms`, beats Kubo's
+asset p95, and keeps a much lower RSS/FD profile. The next speed work should
+focus on cold load reliability/tails, progress API UX, or tracing overhead
+rather than further micro-optimizing this warm same-daemon page path.
