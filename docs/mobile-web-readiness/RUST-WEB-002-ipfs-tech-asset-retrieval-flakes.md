@@ -23763,3 +23763,79 @@ Conclusion:
 Keep. This is diagnostics/harness-only, but it prevents future long-running
 optimization loops from accepting proxy wins when delegated routing no longer
 exercises the targeted cold-Bitswap fallback.
+
+## 2026-05-06 Observe: Current Zero-HTTP Gated Probes Are Non-Evidence
+
+Use the new request-classification gate to look for a live zero-HTTP
+cold-Bitswap target window. Both probes passed the page workload but failed the
+classification gate, which means they should not be used to judge Bitswap-tail
+experiments.
+
+`ipfs.tech` command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 20 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-zero-http-required-r20-trace.jsonl \
+  --output /tmp/ipfs-tech-zero-http-required-r20.json \
+  --require-request-classification zero_http_provider_cold_bitswap=10 \
+  > /tmp/ipfs-tech-zero-http-required-r20.log 2>&1
+```
+
+`ipfs.tech` result:
+
+- page workload passed `20/20`
+- root TTFB p50/p90/p95/max: `526/720/948/1058ms`
+- asset TTFB p50/p90/p95/max: `234/427/505/954ms`
+- block sources: `http_provider=800`
+- delegated provider distribution: `zero=0`, `single=420`, `multi=280`
+- gate failure: `zero_http_provider_cold_bitswap expected>=10 actual=0`
+
+`daicowtf` command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-zero-http-probe-r10-trace.jsonl \
+  --output /tmp/daicowtf-zero-http-probe-r10.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  > /tmp/daicowtf-zero-http-probe-r10.log 2>&1
+```
+
+`daicowtf` result:
+
+- page workload passed `10/10`
+- root TTFB p50/p90/p95/max: `268/289/494/494ms`
+- block sources: `http_provider=30`
+- delegated provider distribution: `zero=0`, `single=30`, `multi=0`
+- gate failure: `zero_http_provider_cold_bitswap expected>=1 actual=0`
+
+Artifacts:
+
+- `/tmp/ipfs-tech-zero-http-required-r20.json`
+- `/tmp/ipfs-tech-zero-http-required-r20-trace.jsonl`
+- `/tmp/ipfs-tech-zero-http-required-r20.log`
+- `/tmp/daicowtf-zero-http-probe-r10.json`
+- `/tmp/daicowtf-zero-http-probe-r10-trace.jsonl`
+- `/tmp/daicowtf-zero-http-probe-r10.log`
+
+Conclusion:
+Current delegated routing is returning HTTP providers consistently for these
+cases. Do not spend the next iteration on Bitswap-tail behavior unless a gated
+sample actually exercises `zero_http_provider_cold_bitswap`. The HTTP-provider
+path is currently fast and resource-light; the next productive work should be
+either another harness/diagnostic improvement or a different roadmap track.
