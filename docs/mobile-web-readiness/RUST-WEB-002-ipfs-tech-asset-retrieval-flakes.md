@@ -23527,3 +23527,106 @@ connection timeouts and raised Bitswap failure/connection noise. Keep the 5s
 default and keep the env var only as a lab control. The next useful experiment
 should target zero-HTTP asset tails by changing peer selection/retry behavior,
 not by globally lowering the connection-ready timeout.
+
+## 2026-05-06 Keep Lab Control: Connection-Error Backoff Threshold
+
+The connection-ready r20 rejection showed repeated concrete connection errors
+inside bad asset tails. The existing peer backoff waits for two same-class
+connection errors before suppressing a peer. Add a lab knob so future runs can
+test whether threshold `1` is useful when the failure shape is active.
+
+Change:
+
+- Add `FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD`.
+- Keep the production default at `2`.
+- Treat `0` and invalid values as the production default.
+- Emit the effective `threshold` on `bitswap_connection_error_backoff` events.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval connection_error_backoff
+cargo test -p freedom-ipfs-retrieval
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Threshold-1 command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD=1 timeout 2400s \
+  cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 20 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-connerr-backoff1-r20-trace.jsonl \
+  --output /tmp/ipfs-tech-connerr-backoff1-r20.json \
+  > /tmp/ipfs-tech-connerr-backoff1-r20.log 2>&1
+```
+
+Same-window default command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 20 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-connerr-default-r20-v3-trace.jsonl \
+  --output /tmp/ipfs-tech-connerr-default-r20-v3.json \
+  > /tmp/ipfs-tech-connerr-default-r20-v3.log 2>&1
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-connerr-backoff1-r20.json`
+- `/tmp/ipfs-tech-connerr-backoff1-r20-trace.jsonl`
+- `/tmp/ipfs-tech-connerr-backoff1-r20.log`
+- `/tmp/ipfs-tech-connerr-default-r20-v3.json`
+- `/tmp/ipfs-tech-connerr-default-r20-v3-trace.jsonl`
+- `/tmp/ipfs-tech-connerr-default-r20-v3.log`
+
+Threshold-1 result:
+
+- pass `20/20`
+- run total p50/p90/p95/max: `1966/2288/2558/3303ms`
+- root TTFB p50/p90/p95/max: `529/741/857/1254ms`
+- asset TTFB p50/p90/p95/max: `233/439/510/1168ms`
+- delegated provider distribution: `zero=1`, `single=419`, `multi=280`
+- request classifications:
+  `cold_bitswap_peer_expand=1`, `zero_http_provider_bitswap=1`,
+  `zero_http_provider_cold_bitswap=1`
+- Bitswap batches failures `0`; peer attempt failures `0`;
+  connection timeouts `0`
+- no connection-error backoff events fired
+- max RSS/FD `51892KiB/30`
+
+Same-window default result:
+
+- pass `20/20`
+- run total p50/p90/p95/max: `1933/2151/2164/2228ms`
+- root TTFB p50/p90/p95/max: `540/695/729/743ms`
+- asset TTFB p50/p90/p95/max: `230/433/488/667ms`
+- delegated provider distribution: `zero=0`, `single=420`, `multi=280`
+- all blocks came from HTTP providers; no zero-HTTP classification appeared
+- max RSS/FD `48188KiB/27`
+
+Conclusion:
+Keep the env knob as a lab control, but do not change the production threshold.
+This window did not exercise the intended mechanism. Delegated routing returned
+HTTP providers for nearly every block, so the threshold-1 run's good latency is
+not evidence that early connection-error backoff improved the zero-HTTP
+cold-Bitswap tail. Future threshold tests need a same-window sample where
+`bitswap_connection_error_backoff` actually fires and the zero-HTTP
+classification latency bucket is non-trivial.

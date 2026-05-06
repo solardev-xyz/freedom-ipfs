@@ -73,6 +73,8 @@ const BITSWAP_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const BITSWAP_SUCCESSFUL_PEER_TTL: Duration = Duration::from_secs(10 * 60);
 const BITSWAP_CONNECTION_ERROR_BACKOFF_TTL: Duration = Duration::from_secs(30);
 const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD: usize = 2;
+const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD";
 const BITSWAP_SESSION_SHORTCUT_GRACE: Duration = Duration::from_millis(0);
 const BITSWAP_SESSION_PRE_LOOKUP_GRACE: Duration = Duration::from_millis(50);
 const BITSWAP_SESSION_POST_LOOKUP_GRACE: Duration = Duration::from_millis(100);
@@ -3336,6 +3338,7 @@ async fn run_shared_bitswap_swarm(
                                     peer = %peer_id,
                                     error_class = backoff.class,
                                     count = backoff.count,
+                                    threshold = bitswap_connection_error_backoff_threshold(),
                                     ttl_ms = BITSWAP_CONNECTION_ERROR_BACKOFF_TTL.as_millis()
                                 );
                             }
@@ -3437,12 +3440,25 @@ fn record_connection_error_backoff<'a>(
     }
     state.count += 1;
     state.last_seen = now;
-    if state.count >= BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD {
+    if state.count >= bitswap_connection_error_backoff_threshold() {
         state.suppress_until = Some(now + BITSWAP_CONNECTION_ERROR_BACKOFF_TTL);
         Some(state)
     } else {
         None
     }
+}
+
+fn bitswap_connection_error_backoff_threshold() -> usize {
+    let override_value = std::env::var_os(BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD_ENV);
+    let override_value = override_value.as_ref().map(|value| value.to_string_lossy());
+    bitswap_connection_error_backoff_threshold_from_env_value(override_value.as_deref())
+}
+
+fn bitswap_connection_error_backoff_threshold_from_env_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threshold| *threshold > 0)
+        .unwrap_or(BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD)
 }
 
 fn bitswap_connection_error_backoff_class(detail: &str) -> Option<&'static str> {
@@ -7546,6 +7562,26 @@ mod bitswap_tests {
             now + Duration::from_millis(20)
         )
         .is_some());
+    }
+
+    #[test]
+    fn connection_error_backoff_threshold_env_value_parses_override() {
+        assert_eq!(
+            bitswap_connection_error_backoff_threshold_from_env_value(None),
+            BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD
+        );
+        assert_eq!(
+            bitswap_connection_error_backoff_threshold_from_env_value(Some("1")),
+            1
+        );
+        assert_eq!(
+            bitswap_connection_error_backoff_threshold_from_env_value(Some("0")),
+            BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD
+        );
+        assert_eq!(
+            bitswap_connection_error_backoff_threshold_from_env_value(Some("not-a-number")),
+            BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD
+        );
     }
 
     #[test]
