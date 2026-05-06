@@ -3045,14 +3045,26 @@ mod tests {
 
             let snapshot = progress_snapshot_json(node);
             let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
-            assert_eq!(value["active_count"].as_u64().unwrap(), 1, "{snapshot}");
+            let active = value["active"].as_array().unwrap();
+            assert!(
+                active.iter().any(|target| target["kind"] == "preload"
+                    && target["id"] == preload_id
+                    && target["status"] == "active"),
+                "{snapshot}"
+            );
 
             assert!(freedom_ipfs_node_enter_background(node));
 
             let snapshot = progress_snapshot_json(node);
             let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+            let active = value["active"].as_array().unwrap();
             let events = value["events"].as_array().unwrap();
-            assert_eq!(value["active_count"].as_u64().unwrap(), 0, "{snapshot}");
+            assert!(
+                !active
+                    .iter()
+                    .any(|target| target["kind"] == "preload" && target["id"] == preload_id),
+                "{snapshot}"
+            );
             assert!(
                 events.iter().any(|event| event["kind"] == "preload"
                     && event["target_id"] == preload_id
