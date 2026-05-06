@@ -85,6 +85,7 @@
       "expect_accept_ranges": "bytes",
       "expect_etag_prefix": "\"fi1:",
       "expect_cache_control": "no-cache",
+      "expect_body_sha256": "777dd08978fe51010bbee6601784d556917d69b70e552cabace991c83a9dc2ef",
       "min_bytes": 4096,
       "max_ttfb_ms": 45000
     },
@@ -101,6 +102,7 @@
       "expect_accept_ranges": "bytes",
       "expect_etag_prefix": "\"fi1:",
       "expect_cache_control": "no-cache",
+      "expect_body_sha256": "ba436a6cea557440db340441ba7ef405a4d8d3bf67abb0d875d403c0053482c3",
       "min_bytes": 4096,
       "max_ttfb_ms": 45000
     },
@@ -117,6 +119,7 @@
       "expect_accept_ranges": "bytes",
       "expect_etag_prefix": "\"fi1:",
       "expect_cache_control": "no-cache",
+      "expect_body_sha256": "40ed68130ba8a0d3204d40ba590a2729056d1251f662343ff59ba84c7bfe8595",
       "min_bytes": 4096,
       "max_ttfb_ms": 45000
     },

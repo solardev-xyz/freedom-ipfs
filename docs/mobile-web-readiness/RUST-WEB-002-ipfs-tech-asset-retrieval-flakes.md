@@ -20434,3 +20434,100 @@ Decision:
 Keep. This is harness/corpus coverage only and makes the browser-facing media
 header checks complete enough to catch regressions in range support, response
 size metadata, and cache validators without changing gateway retrieval behavior.
+
+## 2026-05-06 Keep: Assert Media Range Body Digests In Harness
+
+Question:
+The media range cases now validate browser-facing headers, but a wrong slice
+with the right `Content-Range` and length could still pass. Can the harness
+assert exact small-range bytes without fetching the full media object through
+the gateway?
+
+Implementation:
+
+- Add `sha2` to the `mobile-web-harness` dependencies.
+- Add optional corpus field `expect_body_sha256`.
+- Compute SHA-256 over the received response body when that field is present.
+- Add a focused unit test for the digest helper.
+- Assert body digests for the three 4 KiB `ipfs.tech` developers hero image
+  range cases:
+  - `bytes=0-4095`:
+    `777dd08978fe51010bbee6601784d556917d69b70e552cabace991c83a9dc2ef`
+  - `bytes=65536-69631`:
+    `ba436a6cea557440db340441ba7ef405a4d8d3bf67abb0d875d403c0053482c3`
+  - `bytes=-4096`:
+    `40ed68130ba8a0d3204d40ba590a2729056d1251f662343ff59ba84c7bfe8595`
+
+Digest source:
+
+```sh
+url='https://ipfs.tech/_nuxt/developers-hero.BRuJDQyf.jpg'
+for spec in '0-4095' '65536-69631' '-4096'; do
+  tmp=$(mktemp)
+  curl -fsSL --range "$spec" "$url" -o "$tmp"
+  bytes=$(wc -c < "$tmp")
+  sha=$(sha256sum "$tmp" | awk '{print $1}')
+  printf '%s bytes=%s sha256=%s\n' "$spec" "$bytes" "$sha"
+  rm -f "$tmp"
+done
+```
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo check -p mobile-web-harness --all-targets
+```
+
+Focused result:
+
+- Formatting passed.
+- Full mobile web harness suite passed: `40 passed`.
+- Harness check passed.
+
+Live Rust validation:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --case ipfs-tech-developers-hero-range \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --repeat 3 \
+  --fresh-gateway-per-run \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-hero-body-sha-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-hero-body-sha-r3.json
+```
+
+Live Rust result:
+
+- Passed: `3/3`.
+- Run total p50/p95/max: `914/1089/1089ms`.
+- Gateway max RSS/FD: `33044KiB` / `16`.
+- First range passed with `206`, `Content-Range:
+  bytes 0-4095/184141`, `Content-Length: 4096`, `Accept-Ranges: bytes`,
+  body bytes `4096`, and matching SHA-256; TTFB p50/p95/max
+  `900/1076/1076ms`.
+- Middle range passed with `206`, `Content-Range:
+  bytes 65536-69631/184141`, `Content-Length: 4096`,
+  `Accept-Ranges: bytes`, body bytes `4096`, and matching SHA-256; TTFB
+  p50/p95/max `4/4/4ms`.
+- Suffix range passed with `206`, `Content-Range:
+  bytes 180045-184140/184141`, `Content-Length: 4096`,
+  `Accept-Ranges: bytes`, body bytes `4096`, and matching SHA-256; TTFB
+  p50/p95/max `3/3/3ms`.
+- HEAD passed with `200`, no `Content-Range`, `Content-Length: 184141`,
+  `Accept-Ranges: bytes`, body bytes `0`; TTFB p50/p95/max `3/3/3ms`.
+- Block sources: `http_provider=9`.
+
+Decision:
+Keep. This remains harness/corpus coverage only. The media range cases now
+check not just that the response is shaped like a range response, but that the
+returned bytes are the expected slices, while still avoiding full-media
+gateway fetches in the range assertions.

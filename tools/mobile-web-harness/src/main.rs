@@ -6,6 +6,7 @@ use reqwest::header::{
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -720,6 +721,12 @@ async fn run_case(
                 "body {} bytes, expected exactly {expected}",
                 response.body.len()
             ));
+        }
+    }
+    if let Some(expected) = &entry.expect_body_sha256 {
+        let actual = sha256_hex(&response.body);
+        if !actual.eq_ignore_ascii_case(expected) {
+            failures.push(format!("body sha256 {actual}, expected {expected}"));
         }
     }
     if let Some(min_bytes) = entry.min_bytes {
@@ -2142,6 +2149,16 @@ fn display_option_seed_setup(value: Option<BitswapSeedConnectionSetup>) -> &'sta
     value
         .map(BitswapSeedConnectionSetup::as_str)
         .unwrap_or("n/a")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
 }
 
 fn print_case_result(result: &CaseResult) {
@@ -4057,6 +4074,7 @@ struct CorpusEntry {
     expect_cache_control: Option<String>,
     expect_body_contains: Option<String>,
     expect_body_bytes: Option<usize>,
+    expect_body_sha256: Option<String>,
     min_bytes: Option<usize>,
     max_ttfb_ms: Option<u64>,
 }
@@ -10277,6 +10295,7 @@ mod tests {
                     expect_cache_control: None,
                     expect_body_contains: None,
                     expect_body_bytes: None,
+                    expect_body_sha256: None,
                     min_bytes: None,
                     max_ttfb_ms: None,
                 },
@@ -10297,6 +10316,7 @@ mod tests {
                     expect_cache_control: None,
                     expect_body_contains: None,
                     expect_body_bytes: Some(0),
+                    expect_body_sha256: None,
                     min_bytes: None,
                     max_ttfb_ms: None,
                 },
@@ -10338,6 +10358,7 @@ mod tests {
             expect_cache_control: None,
             expect_body_contains: None,
             expect_body_bytes: None,
+            expect_body_sha256: None,
             min_bytes: None,
             max_ttfb_ms: None,
         };
@@ -10358,6 +10379,7 @@ mod tests {
             expect_cache_control: None,
             expect_body_contains: None,
             expect_body_bytes: None,
+            expect_body_sha256: None,
             min_bytes: None,
             max_ttfb_ms: None,
         };
@@ -10377,6 +10399,14 @@ mod tests {
         assert_eq!(
             labeled_trace_output(&PathBuf::from("/tmp/replay"), "online"),
             PathBuf::from("/tmp/replay-online")
+        );
+    }
+
+    #[test]
+    fn sha256_hex_hashes_response_bodies() {
+        assert_eq!(
+            sha256_hex(b"hello"),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
     }
 
@@ -11254,6 +11284,7 @@ mod tests {
             expect_cache_control: None,
             expect_body_contains: None,
             expect_body_bytes: None,
+            expect_body_sha256: None,
             min_bytes: None,
             max_ttfb_ms: None,
         }
