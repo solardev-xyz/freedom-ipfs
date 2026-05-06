@@ -21988,3 +21988,240 @@ Keep. This is diagnostics-only and does not change gateway behavior. It makes
 future single-provider mitigation experiments easier to judge: a promising run
 should show Bitswap result sources or clearly bounded skip behavior, not only a
 better latency sample in a favorable network window.
+
+## 2026-05-06 Keep: Lower Single-HTTP Self-Hedge Default To 200ms
+
+Question:
+After the 250ms single HTTP-provider self-hedge proved useful and
+resource-light, is 250ms still the right default? The focused `ipfs.tech` page
+still has an HTTP-provider asset tail, and a lower delay may trim that tail
+without adding Bitswap peer pressure.
+
+Implementation:
+
+- Lower `SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER` from `250ms` to `200ms`.
+- Add lab override `FREEDOM_IPFS_SINGLE_HTTP_SELF_HEDGE_AFTER_MS` so future
+  agents can run 150/200/250ms A/B samples without code edits.
+- Keep `FREEDOM_IPFS_DISABLE_SINGLE_HTTP_SELF_HEDGE` as the production kill
+  switch.
+- Keep the hedge scoped to the same single HTTP provider, so it does not add new
+  transport surface or extra providers. Blocks are still verified before serving
+  or caching.
+
+No-trace commands:
+
+```sh
+rm -f /tmp/ipfs-tech-self-hedge-delay250-default-r3.json
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --output /tmp/ipfs-tech-self-hedge-delay250-default-r3.json
+
+rm -f /tmp/ipfs-tech-self-hedge-delay200-r3.json
+
+FREEDOM_IPFS_SINGLE_HTTP_SELF_HEDGE_AFTER_MS=200 timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --output /tmp/ipfs-tech-self-hedge-delay200-r3.json
+
+rm -f /tmp/ipfs-tech-self-hedge-delay150-r3.json
+
+FREEDOM_IPFS_SINGLE_HTTP_SELF_HEDGE_AFTER_MS=150 timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --output /tmp/ipfs-tech-self-hedge-delay150-r3.json
+```
+
+No-trace artifacts:
+
+- `/tmp/ipfs-tech-self-hedge-delay250-default-r3.json`
+- `/tmp/ipfs-tech-self-hedge-delay200-r3.json`
+- `/tmp/ipfs-tech-self-hedge-delay150-r3.json`
+
+No-trace result:
+
+| Delay | Pass | Run total p50/p95/max | Root TTFB p50/p95/max | Asset TTFB p50/p95/max | Max RSS/FD |
+| --- | --- | --- | --- | --- | --- |
+| `250ms` | `3/3` | `2547/5113/5113ms` | `1019/2258/2258ms` | `280/955/1320ms` | `46976KiB` / `26` |
+| `200ms` | `3/3` | `2173/2443/2443ms` | `563/647/647ms` | `240/649/932ms` | `47484KiB` / `24` |
+| `150ms` | `3/3` | `2344/2387/2387ms` | `679/733/733ms` | `272/462/588ms` | `47440KiB` / `24` |
+
+Traced commands:
+
+```sh
+rm -f /tmp/ipfs-tech-self-hedge-delay250-default-trace-r3.json \
+  /tmp/ipfs-tech-self-hedge-delay250-default-trace-r3-trace.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-self-hedge-delay250-default-trace-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-self-hedge-delay250-default-trace-r3.json
+
+rm -f /tmp/ipfs-tech-self-hedge-delay200-trace-r3.json \
+  /tmp/ipfs-tech-self-hedge-delay200-trace-r3-trace.jsonl
+
+FREEDOM_IPFS_SINGLE_HTTP_SELF_HEDGE_AFTER_MS=200 timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-self-hedge-delay200-trace-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-self-hedge-delay200-trace-r3.json
+
+rm -f /tmp/ipfs-tech-self-hedge-delay150-trace-r3.json \
+  /tmp/ipfs-tech-self-hedge-delay150-trace-r3-trace.jsonl
+
+FREEDOM_IPFS_SINGLE_HTTP_SELF_HEDGE_AFTER_MS=150 timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-self-hedge-delay150-trace-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-self-hedge-delay150-trace-r3.json
+```
+
+Traced artifacts:
+
+- `/tmp/ipfs-tech-self-hedge-delay250-default-trace-r3.json`
+- `/tmp/ipfs-tech-self-hedge-delay250-default-trace-r3-trace.jsonl`
+- `/tmp/ipfs-tech-self-hedge-delay200-trace-r3.json`
+- `/tmp/ipfs-tech-self-hedge-delay200-trace-r3-trace.jsonl`
+- `/tmp/ipfs-tech-self-hedge-delay150-trace-r3.json`
+- `/tmp/ipfs-tech-self-hedge-delay150-trace-r3-trace.jsonl`
+
+Traced result:
+
+| Delay | Pass | Run total p50/p95/max | Root TTFB p50/p95/max | Asset TTFB p50/p95/max | Self-hedges | Race result p50/p95/max | Max RSS/FD |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `250ms` | `3/3` | `2160/2410/2410ms` | `718/830/830ms` | `237/565/1104ms` | `25` | `188/400/830ms` | `47144KiB` / `25` |
+| `200ms` | `3/3` | `2264/2457/2457ms` | `764/819/819ms` | `249/522/702ms` | `44` | `190/425/513ms` | `47352KiB` / `27` |
+| `150ms` | `3/3` | `2004/2530/2530ms` | `537/840/840ms` | `260/575/649ms` | `63` | `206/325/426ms` | `48924KiB` / `24` |
+
+Additional trace findings:
+
+- `250ms`: `3005` trace lines, block fetch HTTP-provider p50/p95/max
+  `214/404/879ms`, HTTP provider fetch p50/p95/max `161/296/817ms`,
+  single-provider result p50/p95/max `225/462/830ms`, `attempted_max=3`.
+- `200ms`: `3023` trace lines, block fetch HTTP-provider p50/p95/max
+  `211/453/538ms`, HTTP provider fetch p50/p95/max `161/293/512ms`,
+  single-provider result p50/p95/max `251/453/513ms`, `attempted_max=2`.
+- `150ms`: `3042` trace lines, block fetch HTTP-provider p50/p95/max
+  `231/357/448ms`, HTTP provider fetch p50/p95/max `163/251/311ms`,
+  single-provider result p50/p95/max `248/332/426ms`, `attempted_max=2`.
+
+Guardrail command with the new default `200ms` and no override:
+
+```sh
+rm -f /tmp/self-hedge200-guardrails-r3.json /tmp/self-hedge200-guardrails-r3-trace.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/self-hedge200-guardrails-r3-trace.jsonl \
+  --output /tmp/self-hedge200-guardrails-r3.json
+```
+
+Guardrail artifacts:
+
+- `/tmp/self-hedge200-guardrails-r3.json`
+- `/tmp/self-hedge200-guardrails-r3-trace.jsonl`
+
+Guardrail result:
+
+- Overall: passed `3/3`, run total p50/p95/max `512/620/620ms`, max RSS/FD
+  `34548KiB` / `15`.
+- `daicowtf-page-assets`: passed `3/3`, root TTFB p50/p95/max
+  `357/395/395ms`.
+- `vitalik-root-html-range`: passed `3/3`, root/range TTFB p50/p95/max
+  `211/220/220ms`.
+- Trace: `285` lines, `15` block fetches, all from HTTP providers.
+- Delegated self-hedges: `0`; HTTP-provider self-hedges: `0`.
+
+Same-window Rust/Kubo comparison with the new default `200ms`:
+
+```sh
+rm -f /tmp/ipfs-tech-self-hedge200-kubo-r3.json /tmp/ipfs-tech-self-hedge200-kubo-r3-trace.jsonl
+
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-self-hedge200-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-self-hedge200-kubo-r3.json
+```
+
+Kubo comparison artifacts:
+
+- `/tmp/ipfs-tech-self-hedge200-kubo-r3.json`
+- `/tmp/ipfs-tech-self-hedge200-kubo-r3-trace.jsonl`
+
+Kubo comparison result:
+
+- Rust and Kubo both passed `3/3`.
+- Root TTFB p50/p95: Rust `565/580ms`; Kubo `1487/2558ms`.
+- Asset TTFB p50/p95: Rust `190/576ms`; Kubo `104/670ms`.
+- Max RSS/FD: Rust `53376KiB` / `26`; Kubo `191932KiB` / `114`.
+- Rust/Kubo resource ratios: RSS `0.28x`, FD `0.23x`.
+- Rust trace: `3062` lines; HTTP-provider self-hedges `21` with
+  `self_hedge_timeout_max=200ms`; single-provider result p50/p95/max
+  `189/298/340ms`.
+- Rust block source mix: HTTP-provider `92` blocks, Bitswap `25` blocks, cache
+  `2` blocks. The self-hedge only duplicated the same HTTP provider; the Bitswap
+  blocks came from the normal retrieval/session path.
+
+Decision:
+Keep `200ms` as the new default. It keeps the guardrail cases fast and idle,
+preserves the same-provider-only resource shape, and wins the same-window
+`ipfs.tech` root p50/p95 and asset p95 against Kubo while using far less RSS and
+FDs. Reject `150ms` as the default for now: it improves traced per-block max
+latency, but it self-hedged every single-provider block in the focused page
+sample (`63` self-hedges) and raised traced RSS to `48924KiB`. Keep the env
+override for future longer runs; a later agent can revisit lower delays if it
+adds a stronger per-page duplicate-request budget or provider-score trigger.

@@ -45,12 +45,13 @@ const BAD_BITSWAP_PROVIDER_TTL: Duration = Duration::from_secs(30);
 const HTTP_PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
 const HTTP_PROVIDER_RACE_WIDTH: usize = 2;
 const HTTP_PROVIDER_HEDGE_AFTER: Duration = Duration::from_millis(250);
-const SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER: Duration = Duration::from_millis(250);
+const SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER: Duration = Duration::from_millis(200);
 const SINGLE_HTTP_PROVIDER_BITSWAP_HEDGE_AFTER: Duration = Duration::from_millis(150);
 const HTTP_PROVIDER_SCORE_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_HTTP_PROVIDER_SCORE_ENTRIES: usize = 64;
 const DISABLE_HTTP_PROVIDER_SCORING_ENV: &str = "FREEDOM_IPFS_DISABLE_HTTP_PROVIDER_SCORING";
 const DISABLE_SINGLE_HTTP_SELF_HEDGE_ENV: &str = "FREEDOM_IPFS_DISABLE_SINGLE_HTTP_SELF_HEDGE";
+const SINGLE_HTTP_SELF_HEDGE_AFTER_MS_ENV: &str = "FREEDOM_IPFS_SINGLE_HTTP_SELF_HEDGE_AFTER_MS";
 const ENABLE_SINGLE_HTTP_BITSWAP_HEDGE_ENV: &str = "FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE";
 const SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS";
@@ -1253,7 +1254,8 @@ impl HttpRetriever {
             0,
             candidate.clone(),
         ));
-        let hedge = tokio::time::sleep(SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER);
+        let self_hedge_after = single_http_provider_self_hedge_after();
+        let hedge = tokio::time::sleep(self_hedge_after);
         tokio::pin!(hedge);
         let mut attempted_provider_count = 1usize;
         let mut failed_provider_count = 0usize;
@@ -1303,7 +1305,7 @@ impl HttpRetriever {
                                     phase = "http_provider_self_hedge",
                                     cid = %cid,
                                     provider = %candidate.base,
-                                    timeout_ms = SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER.as_millis(),
+                                    timeout_ms = self_hedge_after.as_millis(),
                                     provider_index = 0,
                                     original_provider_rank = candidate.original_index + 1,
                                     provider_scored = candidate.score_elapsed.is_some(),
@@ -1329,7 +1331,7 @@ impl HttpRetriever {
                         phase = "http_provider_self_hedge",
                         cid = %cid,
                         provider = %candidate.base,
-                        timeout_ms = SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER.as_millis(),
+                        timeout_ms = self_hedge_after.as_millis(),
                         provider_index = 0,
                         original_provider_rank = candidate.original_index + 1,
                         provider_scored = candidate.score_elapsed.is_some(),
@@ -2449,6 +2451,13 @@ fn http_provider_scoring_enabled() -> bool {
 
 fn single_http_provider_self_hedge_enabled() -> bool {
     std::env::var_os(DISABLE_SINGLE_HTTP_SELF_HEDGE_ENV).is_none()
+}
+
+fn single_http_provider_self_hedge_after() -> Duration {
+    std::env::var_os(SINGLE_HTTP_SELF_HEDGE_AFTER_MS_ENV)
+        .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER)
 }
 
 fn single_http_provider_bitswap_hedge_enabled() -> bool {
@@ -6808,11 +6817,12 @@ mod bitswap_tests {
     async fn self_hedges_slow_single_http_provider() {
         let expected = b"verified single HTTP self hedge block";
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, expected);
+        let self_hedge_after = single_http_provider_self_hedge_after();
         let requests = Arc::new(AtomicU64::new(0));
         let (addr, task) = spawn_sequenced_http_provider(
             expected.to_vec(),
             std::collections::VecDeque::from([
-                SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER + Duration::from_millis(300),
+                self_hedge_after + Duration::from_millis(300),
                 Duration::ZERO,
             ]),
             requests.clone(),
@@ -6838,7 +6848,7 @@ mod bitswap_tests {
         assert_eq!(source, RetrievalSource::HttpProvider);
         assert_eq!(block.data(), expected);
         assert!(
-            started.elapsed() < SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER + Duration::from_millis(250),
+            started.elapsed() < self_hedge_after + Duration::from_millis(250),
             "self hedge should return before the first slow request"
         );
         assert_eq!(requests.load(Ordering::Relaxed), 2);
@@ -6931,12 +6941,10 @@ mod bitswap_tests {
         let data = b"shared missing block";
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
         let requests = Arc::new(AtomicU64::new(0));
-        let (addr, server_task) = spawn_counting_http_provider(
-            data.to_vec(),
-            Duration::from_millis(200),
-            requests.clone(),
-        )
-        .await;
+        let provider_delay =
+            single_http_provider_self_hedge_after().saturating_sub(Duration::from_millis(50));
+        let (addr, server_task) =
+            spawn_counting_http_provider(data.to_vec(), provider_delay, requests.clone()).await;
         let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
         store
             .put_provider_records(
