@@ -69,7 +69,12 @@ const BITSWAP_WANT_HAVE_TIMEOUT: Duration = Duration::from_millis(750);
 const BITSWAP_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(6);
 const BITSWAP_SINGLE_UNTRUSTED_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(3);
 const BITSWAP_INCOMING_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(6);
-const BITSWAP_INCOMING_BATCH_PARTIAL_GRACE: Duration = Duration::from_millis(50);
+// Multi-CID range batches should consume immediately adjacent Bitswap response
+// messages, then start bounded fallbacks for any missing CIDs. Longer waits
+// inflated local range TTFB without reducing command count in harness sweeps.
+const BITSWAP_INCOMING_BATCH_PARTIAL_GRACE: Duration = Duration::from_millis(5);
+const BITSWAP_INCOMING_BATCH_PARTIAL_GRACE_MS_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_INCOMING_BATCH_PARTIAL_GRACE_MS";
 const BITSWAP_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const BITSWAP_SUCCESSFUL_PEER_TTL: Duration = Duration::from_secs(10 * 60);
 const BITSWAP_CONNECTION_ERROR_BACKOFF_TTL: Duration = Duration::from_secs(30);
@@ -2835,6 +2840,19 @@ fn bitswap_session_range_batch_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_SESSION_RANGE_BATCH_ENV).is_some()
 }
 
+fn bitswap_incoming_batch_partial_grace() -> Duration {
+    let override_value = std::env::var_os(BITSWAP_INCOMING_BATCH_PARTIAL_GRACE_MS_ENV);
+    let override_value = override_value.as_ref().map(|value| value.to_string_lossy());
+    bitswap_incoming_batch_partial_grace_from_env_value(override_value.as_deref())
+}
+
+fn bitswap_incoming_batch_partial_grace_from_env_value(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(BITSWAP_INCOMING_BATCH_PARTIAL_GRACE)
+}
+
 fn bitswap_connection_ready_timeout() -> Duration {
     let override_value = std::env::var_os(BITSWAP_CONNECTION_READY_TIMEOUT_MS_ENV);
     let override_value = override_value.as_ref().map(|value| value.to_string_lossy());
@@ -4828,6 +4846,7 @@ async fn collect_incoming_bitswap_batch(
     mut incoming_results: mpsc::UnboundedReceiver<BitswapFetchBatchResult>,
 ) -> Result<BitswapFetchBatchResult> {
     let started = Instant::now();
+    let partial_grace = bitswap_incoming_batch_partial_grace();
     let primary_cid = cids[0];
     let cid_count = cids.len();
     let cid_summary = tracing::enabled!(tracing::Level::INFO).then(|| format_cids(&cids));
@@ -4840,13 +4859,15 @@ async fn collect_incoming_bitswap_batch(
     while requested_blocks.len() < wanted.len() {
         let next_result = if requested_blocks.is_empty() {
             incoming_results.recv().await
+        } else if partial_grace.is_zero() {
+            tokio::task::yield_now().await;
+            match incoming_results.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => None,
+            }
         } else {
-            match timeout(
-                BITSWAP_INCOMING_BATCH_PARTIAL_GRACE,
-                incoming_results.recv(),
-            )
-            .await
-            {
+            match timeout(partial_grace, incoming_results.recv()).await {
                 Ok(result) => result,
                 Err(_) => break,
             }
@@ -4885,7 +4906,7 @@ async fn collect_incoming_bitswap_batch(
             source_peer = %source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
             source_transport = source_transport.unwrap_or("unknown"),
             partial = requested_blocks.len() < wanted.len(),
-            partial_grace_ms = BITSWAP_INCOMING_BATCH_PARTIAL_GRACE.as_millis(),
+            partial_grace_ms = partial_grace.as_millis(),
             elapsed_ms = started.elapsed().as_millis()
         );
     }
@@ -8241,6 +8262,26 @@ mod bitswap_tests {
         assert_eq!(
             single_http_post_lookup_grace_from_env_value(Some("not-a-number")),
             BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE
+        );
+    }
+
+    #[test]
+    fn incoming_batch_partial_grace_env_value_parses_override() {
+        assert_eq!(
+            bitswap_incoming_batch_partial_grace_from_env_value(None),
+            BITSWAP_INCOMING_BATCH_PARTIAL_GRACE
+        );
+        assert_eq!(
+            bitswap_incoming_batch_partial_grace_from_env_value(Some("15")),
+            Duration::from_millis(15)
+        );
+        assert_eq!(
+            bitswap_incoming_batch_partial_grace_from_env_value(Some("0")),
+            Duration::from_millis(0)
+        );
+        assert_eq!(
+            bitswap_incoming_batch_partial_grace_from_env_value(Some("not-a-number")),
+            BITSWAP_INCOMING_BATCH_PARTIAL_GRACE
         );
     }
 

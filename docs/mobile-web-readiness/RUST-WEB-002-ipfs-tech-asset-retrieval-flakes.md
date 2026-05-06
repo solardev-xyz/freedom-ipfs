@@ -24797,3 +24797,98 @@ pressure. Kubo is still faster on this single-seed local microbenchmark, so the
 next range task should study whether Kubo avoids the residual root/metadata
 latency or uses a more efficient wantlist/response pattern for the missing two
 range leaves.
+
+## Synthetic Range Batch Partial-Grace Sweep
+
+The follow-up trace showed the residual Rust latency was mostly the 50ms quiet
+grace after Kubo's first partial multi-CID Bitswap response. The local Kubo seed
+sent two useful range leaves in one response message, then stayed quiet. Waiting
+for another incoming message added tail latency before the bounded single-CID
+fallbacks could start.
+
+Implementation change:
+
+- Added `FREEDOM_IPFS_BITSWAP_INCOMING_BATCH_PARTIAL_GRACE_MS` so the partial
+  incoming batch grace can be swept without rebuilding.
+- Changed the default grace from `50ms` to `5ms` for the opt-in
+  `FREEDOM_IPFS_ENABLE_BITSWAP_SESSION_RANGE_BATCH` path.
+- The default policy is now: consume immediately adjacent verified incoming
+  Bitswap response messages for the batch, store those blocks, and quickly fall
+  back for missing CIDs.
+
+Sweep commands used the same fixture and harness shape as above, adding only the
+partial-grace override:
+
+```sh
+FREEDOM_IPFS_ENABLE_BITSWAP_SESSION_RANGE_BATCH=1 \
+FREEDOM_IPFS_BITSWAP_INCOMING_BATCH_PARTIAL_GRACE_MS=<0|5|10|15> \
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --corpus /tmp/freedom-ipfs-range-batch-fixture-20260506/corpus.json \
+  --case synthetic-multiblock-range \
+  --bitswap-seed-car /tmp/freedom-ipfs-range-batch-fixture-20260506/multiblock.car \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 30 \
+  --run-timeout-secs 60 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/synthetic-multiblock-range-batch-grace<0|5|10|15>-r5-20260506-trace.jsonl \
+  --output /tmp/synthetic-multiblock-range-batch-grace<0|5|10|15>-r5-20260506.json \
+  > /tmp/synthetic-multiblock-range-batch-grace<0|5|10|15>-r5-20260506.log 2>&1
+```
+
+Sweep results:
+
+| Grace | Pass | Root TTFB p50/p95/max | Range fetch p50/p95/max | RSS/FD max | Range sources |
+| --- | --- | --- | --- | --- | --- |
+| `0ms` | `5/5` | `121/133/133ms` | `14/24/24ms` | `38016KiB/13` | `bitswap_batch=10`, `bitswap=10` |
+| `5ms` | `5/5` | `130/135/135ms` | `16/27/27ms` | `38016KiB/13` | `bitswap_batch=10`, `bitswap=10` |
+| `10ms` | `5/5` | `134/148/148ms` | `18/33/33ms` | `38016KiB/13` | `bitswap_batch=10`, `bitswap=10` |
+| `15ms` | `5/5` | `145/149/149ms` | `15/39/39ms` | `38016KiB/13` | `bitswap_batch=10`, `bitswap=10` |
+| `50ms` | `5/5` | `170/176/176ms` | `18/75/75ms` | `38016KiB/13` | `bitswap_batch=10`, `bitswap=10` |
+
+The 0ms trace had the same command profile as 50ms: `20` Bitswap dial plans,
+`5` multi-CID commands, `25` incoming blocks, and `2` batch-delivered requested
+blocks per run. It removed the idle wait without adding dial or FD pressure.
+However, `0ms` was too aggressive as a default: the existing real peer unit test
+could return before a sibling incoming block emitted moments later. `5ms`
+preserves that behavior while still removing most of the original 50ms tail.
+
+Same-window Kubo comparison command with the new default:
+
+```sh
+FREEDOM_IPFS_ENABLE_BITSWAP_SESSION_RANGE_BATCH=1 \
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --corpus /tmp/freedom-ipfs-range-batch-fixture-20260506/corpus.json \
+  --case synthetic-multiblock-range \
+  --bitswap-seed-car /tmp/freedom-ipfs-range-batch-fixture-20260506/multiblock.car \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 30 \
+  --run-timeout-secs 60 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/synthetic-multiblock-range-batch-grace5-default-rust-vs-kubo-r5-20260506-trace.jsonl \
+  --comparison-output /tmp/synthetic-multiblock-range-batch-grace5-default-rust-vs-kubo-r5-20260506.json \
+  > /tmp/synthetic-multiblock-range-batch-grace5-default-rust-vs-kubo-r5-20260506.log 2>&1
+```
+
+Same-window result:
+
+- Rust passed `5/5`; Kubo passed `5/5`.
+- Rust root TTFB p50/p95: `126/129ms`.
+- Kubo root TTFB p50/p95: `73/77ms`.
+- Kubo setup-adjusted root TTFB p50/p95: `131/132ms`.
+- Setup-adjusted Rust/Kubo ratios: `0.96x/0.98x`.
+- Rust range fetch p50/p95: `16/26ms`.
+- Resource max: Rust `38144KiB/13` FDs, Kubo `91136KiB/37` FDs.
+
+Decision:
+Keep range batching opt-in, keep the partial-batch env override, and use `5ms`
+as the default partial grace for the opt-in path. On the deterministic local
+multi-block range workload this reaches setup-adjusted Kubo parity while staying
+much lighter on RSS and FDs, without regressing the multi-block incoming peer
+unit behavior that failed with a zero default.
