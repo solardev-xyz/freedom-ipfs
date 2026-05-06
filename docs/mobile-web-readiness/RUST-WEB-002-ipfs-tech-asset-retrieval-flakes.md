@@ -21179,6 +21179,45 @@ No-trace result:
 - Kubo max RSS/FD: `127376KiB` / `85`.
 - Rust used `0.42x` Kubo RSS and `0.41x` Kubo FD count.
 
+Rust-only no-trace warm run:
+
+```sh
+rm -f /tmp/freedom-ipfs-cid-direct-small-body-cache-notrace.db \
+  /tmp/freedom-ipfs-cid-direct-small-body-cache-notrace.db-* \
+  /tmp/ipfs-tech-cid-direct-small-body-cache-notrace-r5.json
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --gateway-db /tmp/freedom-ipfs-cid-direct-small-body-cache-notrace.db \
+  --case ipfs-tech-page-assets-cid-direct \
+  --warmup-runs 1 \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --output /tmp/ipfs-tech-cid-direct-small-body-cache-notrace-r5.json
+```
+
+Artifact:
+
+- `/tmp/ipfs-tech-cid-direct-small-body-cache-notrace-r5.json`
+
+Rust-only no-trace result:
+
+- Rust passed `5/5`.
+- Run total p50/p95/max: `27/32/32ms`.
+- Root TTFB p50/p95/max: `1/2/2ms`.
+- Asset TTFB p50/p95/max: `2/3/4ms` over `160` asset requests.
+- Asset total p50/p95/max: `2/3/5ms`.
+- RSS/FD max: `54608KiB` / `36`.
+
+Observation:
+Compared with the traced enabled-cache run, no-trace asset p50 stayed at `2ms`
+but asset p95 improved from `7ms` to `3ms` and max from `13ms` to `4ms`. The
+remaining production hot-path gap is small; trace overhead and trace-induced
+tail movement are now a first-class measurement concern.
+
 Final validation:
 
 ```sh

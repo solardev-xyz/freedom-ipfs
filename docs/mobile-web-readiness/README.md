@@ -339,7 +339,9 @@ status, MIME type, byte count, and timing.
   with about `200KiB` observed cache occupancy. With trace output disabled,
   the CID-direct warm comparison reached Rust root TTFB p50/p95 `1/2ms` and
   asset TTFB `2/3ms`, versus Kubo root `2/2ms` and asset `2/6ms`, while using
-  less RSS and fewer FDs.
+  less RSS and fewer FDs. A Rust-only no-trace repeat=5 sample kept asset TTFB
+  at `2/3ms`, so future warm-path comparisons should account for trace overhead
+  before adding more gateway cache layers.
 
 ## Next Scenario Targets
 
