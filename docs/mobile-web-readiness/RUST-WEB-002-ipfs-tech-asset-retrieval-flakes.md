@@ -25804,3 +25804,135 @@ still reached `824-924ms`. `175ms` avoided those misses but effectively became
 the broad race in this sample. The next narrowing attempt should probably use
 session/request context or a small per-session race budget rather than only a
 global provider EWMA threshold.
+
+## 2026-05-06 Default Promotion: Single-HTTP Post-Lookup Race
+
+Hypothesis:
+The broad single-HTTP post-lookup race has enough focused and multi-case
+evidence to become the default. Keep an env kill switch for rollback and retain
+the score threshold as a lab/tuning knob.
+
+Promotion change:
+
+- `FREEDOM_IPFS_ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE` is no longer required.
+- Add the rollback knob:
+  `FREEDOM_IPFS_DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE`.
+- `FREEDOM_IPFS_SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS` still narrows the
+  default race when set.
+- Update timing-sensitive tests to assert the new behavior: recent Bitswap can
+  still win, but the single HTTP provider is now started once by default.
+
+Broad-race multi-case r10 command:
+
+```sh
+FREEDOM_IPFS_ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE=1 \
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/single-http-postlookup-race-multicase-r10-20260506T230106Z-trace.jsonl \
+  --comparison-output /tmp/single-http-postlookup-race-multicase-r10-20260506T230106Z.json \
+  > /tmp/single-http-postlookup-race-multicase-r10-20260506T230106Z.log 2>&1
+```
+
+Result:
+
+- Rust passed `10/10`; Kubo passed `10/10`.
+- `daicowtf-page-assets` root TTFB p50/p95:
+  - Rust: `1267/1489ms`
+  - Kubo: `2757/3193ms`
+- `vitalik-root-html-range` root TTFB p50/p95:
+  - Rust: `405/411ms`
+  - Kubo: `1397/2468ms`
+- `ipfs-tech-page-assets` root TTFB p50/p95:
+  - Rust: `791/1481ms`
+  - Kubo: `1191/1487ms`
+- `ipfs-tech-page-assets` asset TTFB p50/p95:
+  - Rust: `248/596ms`
+  - Kubo: `375/804ms`
+- Resource max:
+  - Rust: `58880KiB` RSS, `39` FDs
+  - Kubo: `356336KiB` RSS, `1013` FDs
+
+Trace notes:
+
+- Race events: `186` total, with `provider_won=102`, `bitswap_won=84`.
+- Race event latency p50/p90/p95/max was `164/218/260/482ms`.
+- Remaining post-lookup waits were only multi/zero-provider paths:
+  `post_lookup_http_counts=3=136, 0=30, 2=10`.
+- Canceled Bitswap batches were `233` across the full 30-run guardrail.
+- Block fetch totals:
+  - HTTP provider: `263` blocks, p50/p95/max `261/356/562ms`
+  - Bitswap: `183` blocks, p50/p95/max `157/922/1372ms`
+- The remaining slowest requests were not the single-HTTP race path. They were
+  zero-HTTP/Bitswap-heavy roots and assets, especially:
+  - `ipfs.tech` root or `_nuxt/8Bs0wEmG.js`
+  - the direct DAICO `/ipfs/...` root
+- Bitswap source transports included WSS (`wss=10`), which confirms the
+  previous WSS provider support is being used in live guardrails.
+
+No-env default validation command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/single-http-postlookup-default-on-r3-20260506T230627Z-trace.jsonl \
+  --comparison-output /tmp/single-http-postlookup-default-on-r3-20260506T230627Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/single-http-postlookup-default-on-r3-20260506T230627Z.log 2>&1
+```
+
+Result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Root TTFB p50/p95:
+  - Rust: `918/1001ms`
+  - Kubo: `1667/2212ms`
+- Asset TTFB p50/p95:
+  - Rust: `234/555ms`
+  - Kubo: `258/6625ms`
+- Resource max:
+  - Rust: `55288KiB` RSS, `34` FDs
+  - Kubo: `335888KiB` RSS, `686` FDs
+- Trace confirmed default race activity without the old enable env:
+  - `50` race events, `provider_won=23`, `bitswap_won=27`
+  - race latency p50/p90/p95/max `154/190/200/258ms`
+  - canceled Bitswap batches `49`
+
+Validation after default promotion:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval post_lookup
+cargo test -p freedom-ipfs-retrieval recent_bitswap_peer_can_win_after_fast_provider_lookup
+cargo test -p freedom-ipfs-retrieval
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+All passed after updating the two timing-sensitive tests for the new default.
+
+Decision:
+Promote the single-HTTP post-lookup race to default with
+`FREEDOM_IPFS_DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE` as the rollback switch. This
+closes the previously recurring `ipfs.tech` asset p50/p95 Kubo gap in the
+latest multi-case r10 window while preserving the mobile resource advantage.
+The next remaining gap is no longer this single-HTTP serial wait. Focus next on
+zero-HTTP/Bitswap-heavy roots and assets where provider discovery yields no HTTP
+providers and Bitswap still has occasional `1.3-1.5s` tails.

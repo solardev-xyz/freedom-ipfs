@@ -92,8 +92,8 @@ const BITSWAP_SESSION_POST_LOOKUP_GRACE: Duration = Duration::from_millis(100);
 const BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE: Duration = Duration::from_millis(125);
 const BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS";
-const ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE_ENV: &str =
-    "FREEDOM_IPFS_ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE";
+const DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE_ENV: &str =
+    "FREEDOM_IPFS_DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE";
 const SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS";
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -3111,7 +3111,7 @@ fn single_http_provider_bitswap_hedge_enabled() -> bool {
 }
 
 fn single_http_post_lookup_race_enabled() -> bool {
-    std::env::var_os(ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE_ENV).is_some()
+    std::env::var_os(DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE_ENV).is_none()
 }
 
 fn single_http_post_lookup_race_min_score() -> Option<Duration> {
@@ -8576,7 +8576,7 @@ mod bitswap_tests {
         assert_eq!(source, RetrievalSource::Bitswap);
         assert_eq!(block.data(), data);
         assert_eq!(store.get(&cid).unwrap().unwrap().data(), data);
-        assert_eq!(http_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(http_requests.load(Ordering::Relaxed), 1);
 
         tokio::time::timeout(Duration::from_secs(5), session_stream)
             .await
@@ -8663,7 +8663,7 @@ mod bitswap_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn single_http_provider_gives_recent_bitswap_peer_short_grace() {
+    async fn single_http_provider_races_recent_bitswap_peer_by_default() {
         let data = b"single http gives recent peer short grace";
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
         let (session_peer_id, session_addr, session_swarm, session_stream) =
@@ -8703,7 +8703,7 @@ mod bitswap_tests {
 
         assert_eq!(source, RetrievalSource::Bitswap);
         assert_eq!(block.data(), data);
-        assert_eq!(http_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(http_requests.load(Ordering::Relaxed), 1);
 
         tokio::time::timeout(Duration::from_secs(5), session_stream)
             .await
