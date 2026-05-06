@@ -21420,3 +21420,46 @@ Rust matches Kubo on root TTFB, loses only the asset p50 by `1ms`, beats Kubo's
 asset p95, and keeps a much lower RSS/FD profile. The next speed work should
 focus on cold load reliability/tails, progress API UX, or tracing overhead
 rather than further micro-optimizing this warm same-daemon page path.
+
+## 2026-05-06 Keep: Map Small-Body Cache Events To Stable Progress Phases
+
+Question:
+After adding `gateway_small_body_cache` traces, do mobile progress snapshots and
+harness progress summaries still expose only stable UI-facing phases?
+
+Implementation:
+
+- Map `gateway_small_body_cache cache_hit=true` to `cache_hit` with
+  `source="cache"` in the mobile progress recorder.
+- Map `gateway_small_body_cache cache_hit=false` to `checking_cache`.
+- Map small-body cache insert bookkeeping to `streaming` so the internal
+  `gateway_small_body_cache` raw phase does not leak into UI-facing phase
+  counts.
+- Apply the same mapping in the mobile web harness trace progress summary.
+- Update `docs/mobile-progress-api.md` to document the small-body-cache mapping.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states -- --nocapture
+cargo test -p mobile-web-harness trace_summary_counts_gateway_small_body_cache -- --nocapture
+cargo test -p freedom-ipfs-mobile
+cargo test -p mobile-web-harness
+cargo clippy -p freedom-ipfs-mobile --all-targets -- -D warnings
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+cargo check --workspace --all-targets
+```
+
+Result:
+
+- Focused progress mapping tests passed.
+- Full `freedom-ipfs-mobile` tests passed: `27` tests.
+- Full `mobile-web-harness` tests passed: `43` tests.
+- Clippy and workspace check passed.
+
+Decision:
+Keep. This is small progress API polish tied to the new gateway cache behavior.
+Swift and harness summaries now see cache work as `checking_cache`, `cache_hit`,
+or `streaming` instead of a new internal phase that was not in the stable mobile
+phase list.

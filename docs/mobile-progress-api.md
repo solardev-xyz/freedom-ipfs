@@ -92,6 +92,12 @@ subresources are still loading under the same page/navigation.
 transport when known, such as `tcp` or `quic`. `delivery` preserves lower-level
 Bitswap delivery details such as `incoming` or `outgoing`.
 
+The gateway's small in-memory body cache is exposed through the stable cache
+phases rather than as a UI-facing internal phase: cache hits report
+`phase: "cache_hit"` with `source: "cache"`, misses report
+`phase: "checking_cache"`, and cache insert bookkeeping reports
+`phase: "streaming"`.
+
 For gateway requests, Swift may pass optional correlation headers:
 
 - `X-Freedom-Request-ID`: unsigned integer used as `target_id`

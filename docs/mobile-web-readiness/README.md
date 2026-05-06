@@ -349,6 +349,9 @@ status, MIME type, byte count, and timing.
   `4/8ms` to `2/6ms`. On a production-style no-trace `/ipns/ipfs.tech/`
   warm comparison, Rust matched Kubo root TTFB p50/p95 at `1/2ms`, beat Kubo
   asset TTFB p95 `3ms` vs `6ms`, and used about `0.25x` Kubo RSS.
+  Small-body cache events are mapped back into the stable mobile progress
+  phases (`checking_cache`, `cache_hit`, `streaming`) so UI-facing progress does
+  not expose the internal cache trace name.
 
 ## Next Scenario Targets
 

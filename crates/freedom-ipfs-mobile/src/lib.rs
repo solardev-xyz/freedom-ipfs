@@ -554,6 +554,11 @@ fn progress_source(raw_phase: &str, fields: &ProgressFields) -> Option<String> {
         {
             Some("cache".into())
         }
+        "gateway_small_body_cache"
+            if fields.get("cache_hit").map(String::as_str) == Some("true") =>
+        {
+            Some("cache".into())
+        }
         "http_provider_fetch"
         | "http_provider_hedge"
         | "http_provider_race"
@@ -589,6 +594,17 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
             "cache_hit"
         }
         "block_store_get" => "checking_cache",
+        "gateway_small_body_cache"
+            if fields.get("cache_hit").map(String::as_str) == Some("true") =>
+        {
+            "cache_hit"
+        }
+        "gateway_small_body_cache"
+            if fields.get("cache_inserted").map(String::as_str) == Some("true") =>
+        {
+            "streaming"
+        }
+        "gateway_small_body_cache" => "checking_cache",
         "block_fetch_total" if fields.get("source").map(String::as_str) == Some("cache") => {
             "cache_hit"
         }
@@ -2336,6 +2352,14 @@ mod tests {
             Some("http_provider")
         );
         assert_eq!(
+            progress_source(
+                "gateway_small_body_cache",
+                &progress_fields([("phase", "gateway_small_body_cache"), ("cache_hit", "true")]),
+            )
+            .as_deref(),
+            Some("cache")
+        );
+        assert_eq!(
             progress_phase(
                 "name_cache",
                 &progress_fields([("phase", "name_cache"), ("cache_hit", "false")]),
@@ -2472,6 +2496,40 @@ mod tests {
             progress_phase(
                 "gateway_direct_body",
                 &progress_fields([("phase", "gateway_direct_body"), ("body_len", "4096")]),
+                "active",
+            ),
+            "streaming"
+        );
+        assert_eq!(
+            progress_phase(
+                "gateway_small_body_cache",
+                &progress_fields([
+                    ("phase", "gateway_small_body_cache"),
+                    ("cache_hit", "true"),
+                    ("body_len", "4096")
+                ]),
+                "active",
+            ),
+            "cache_hit"
+        );
+        assert_eq!(
+            progress_phase(
+                "gateway_small_body_cache",
+                &progress_fields([
+                    ("phase", "gateway_small_body_cache"),
+                    ("cache_hit", "false")
+                ]),
+                "active",
+            ),
+            "checking_cache"
+        );
+        assert_eq!(
+            progress_phase(
+                "gateway_small_body_cache",
+                &progress_fields([
+                    ("phase", "gateway_small_body_cache"),
+                    ("cache_inserted", "true")
+                ]),
                 "active",
             ),
             "streaming"

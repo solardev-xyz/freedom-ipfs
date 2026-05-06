@@ -8190,6 +8190,17 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
             Some(true) => "cache_hit",
             _ => "checking_cache",
         },
+        "gateway_small_body_cache" => match value.get("cache_hit").and_then(|hit| hit.as_bool()) {
+            Some(true) => "cache_hit",
+            _ if value
+                .get("cache_inserted")
+                .and_then(|inserted| inserted.as_bool())
+                == Some(true) =>
+            {
+                "streaming"
+            }
+            _ => "checking_cache",
+        },
         "block_fetch_total" => match value.get("source").and_then(|source| source.as_str()) {
             Some("cache") => "cache_hit",
             Some("bitswap") => "fetching_bitswap",
@@ -9898,6 +9909,16 @@ mod tests {
         assert_eq!(summary.gateway_small_body_cache.max_body_len, 512);
         assert_eq!(summary.gateway_small_body_cache.max_cache_len, 2);
         assert_eq!(summary.gateway_small_body_cache.max_cache_bytes, 1536);
+        assert_eq!(trace_value_count(&summary.progress_phases, "cache_hit"), 1);
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "checking_cache"),
+            1
+        );
+        assert_eq!(trace_value_count(&summary.progress_phases, "streaming"), 1);
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "gateway_small_body_cache"),
+            0
+        );
     }
 
     #[test]
