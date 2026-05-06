@@ -23298,3 +23298,69 @@ Reject changing the production single-HTTP post-lookup default to `50ms`. Keep
 `FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS` as a lab
 control. The next production candidate should target the top-level zero-HTTP
 cold-Bitswap shape directly instead of retuning this wait globally.
+
+## 2026-05-06 Keep: Request Classification Latency Summary
+
+The r20 post-lookup sweep showed that request classification counts alone are
+not enough. A run can have similar `top_level_zero_http_provider_bitswap` counts
+while only one policy/window shows multi-second root latency. Add per-request
+classification latency aggregates to the trace summary and JSON so future
+experiments can judge the exact bad shape directly.
+
+Change:
+
+- Add `request_classification_latencies` to `TraceSummary`.
+- Print a `request classification latencies:` block after the existing request
+  classification counts.
+- For each classification, summarize request elapsed latency, max event latency,
+  statuses, paths, and top-level paths.
+
+Validation:
+
+```sh
+cargo test -p mobile-web-harness trace_summary_classifies_zero_http_cold_bitswap_requests
+cargo test -p mobile-web-harness
+cargo fmt --all --check
+cargo check -p mobile-web-harness --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Smoke command:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/request-classification-latency-smoke-trace.jsonl \
+  --output /tmp/request-classification-latency-smoke.json \
+  > /tmp/request-classification-latency-smoke.log 2>&1
+```
+
+Artifacts:
+
+- `/tmp/request-classification-latency-smoke.json`
+- `/tmp/request-classification-latency-smoke-trace.jsonl`
+- `/tmp/request-classification-latency-smoke.log`
+
+Smoke result:
+
+```text
+request classifications: zero_http_provider_bitswap=3, cold_bitswap_peer_expand=2,
+zero_http_provider_cold_bitswap=2, top_level_zero_http_provider_bitswap=1,
+top_level_zero_http_provider_cold_bitswap=1
+
+request classification latencies:
+  zero_http_provider_bitswap: requests=3 elapsed=p50=438ms p90=1276ms p95=1276ms max=1276ms
+  top_level_zero_http_provider_cold_bitswap: requests=1 elapsed=p50=1276ms p90=1276ms p95=1276ms max=1276ms
+```
+
+Conclusion:
+Keep. This does not change retrieval behavior, but it gives future long-running
+experiments a direct scorecard for the top-level zero-HTTP cold-Bitswap shape
+that currently dominates bad root tails.

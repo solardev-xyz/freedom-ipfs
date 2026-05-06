@@ -1591,6 +1591,22 @@ fn print_trace_request_classifications(trace: &TraceSummary) {
         "  request classifications: {}",
         format_trace_counts(&trace.request_classifications)
     );
+    if !trace.request_classification_latencies.is_empty() {
+        println!("  request classification latencies:");
+        for aggregate in trace.request_classification_latencies.iter().take(8) {
+            let statuses = format_trace_counts(&aggregate.statuses);
+            let top_level_paths = format_trace_counts(&aggregate.top_level_paths);
+            println!(
+                "    {}: requests={} elapsed={} max_event={} statuses={} top_level_paths={}",
+                aggregate.classification,
+                aggregate.request_count,
+                aggregate.request_elapsed_ms,
+                aggregate.max_event_ms,
+                statuses,
+                top_level_paths
+            );
+        }
+    }
 }
 
 fn print_trace_unixfs_metadata_cache(trace: &TraceSummary) {
@@ -4994,6 +5010,7 @@ struct TraceSummary {
     bitswap_dial_rejected_transports: Vec<TraceValueCount>,
     bitswap_dns_expansion: TraceBitswapDnsExpansionAggregate,
     request_classifications: Vec<TraceValueCount>,
+    request_classification_latencies: Vec<TraceRequestClassificationAggregate>,
     slow_cids: Vec<TraceCidAggregate>,
     slow_requests: Vec<TraceRequestAggregate>,
     progress_request_groups: Vec<TraceProgressRequestGroupAggregate>,
@@ -5018,6 +5035,17 @@ struct TraceSlowEvent {
 struct TraceValueCount {
     value: String,
     count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct TraceRequestClassificationAggregate {
+    classification: String,
+    request_count: usize,
+    request_elapsed_ms: LatencySummary,
+    max_event_ms: LatencySummary,
+    statuses: Vec<TraceValueCount>,
+    paths: Vec<TraceValueCount>,
+    top_level_paths: Vec<TraceValueCount>,
 }
 
 #[derive(Debug, Serialize)]
@@ -7944,6 +7972,8 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             .map(TraceRequestBuilder::into_aggregate),
     );
     let request_classifications = summarize_request_classifications(&slow_requests);
+    let request_classification_latencies =
+        summarize_request_classification_latencies(&slow_requests);
     let progress_request_groups = summarize_progress_request_groups(&slow_requests);
     slow_requests.sort_by(|left, right| {
         right
@@ -8056,6 +8086,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_dial_rejected_transports: sorted_trace_counts(bitswap_dial_rejected_transports),
         bitswap_dns_expansion,
         request_classifications,
+        request_classification_latencies,
         slow_cids: sorted_trace_cids(slow_cids),
         slow_requests,
         progress_request_groups,
@@ -8070,6 +8101,68 @@ fn summarize_request_classifications(requests: &[TraceRequestAggregate]) -> Vec<
         }
     }
     sorted_trace_counts(counts)
+}
+
+#[derive(Default)]
+struct TraceRequestClassificationBuilder {
+    request_count: usize,
+    request_elapsed_values: Vec<u128>,
+    max_event_values: Vec<u128>,
+    statuses: BTreeMap<String, usize>,
+    paths: BTreeMap<String, usize>,
+    top_level_paths: BTreeMap<String, usize>,
+}
+
+fn summarize_request_classification_latencies(
+    requests: &[TraceRequestAggregate],
+) -> Vec<TraceRequestClassificationAggregate> {
+    let mut builders = BTreeMap::<String, TraceRequestClassificationBuilder>::new();
+    for request in requests {
+        for classification in &request.classifications {
+            let builder = builders.entry(classification.value.clone()).or_default();
+            builder.request_count += 1;
+            builder.request_elapsed_values.push(request.elapsed_ms);
+            builder.max_event_values.push(request.max_event_ms);
+            if let Some(status) = &request.status {
+                *builder.statuses.entry(status.clone()).or_default() += 1;
+            }
+            *builder.paths.entry(request.path.clone()).or_default() += 1;
+            if let Some(top_level_path) = &request.top_level_path {
+                *builder
+                    .top_level_paths
+                    .entry(top_level_path.clone())
+                    .or_default() += 1;
+            }
+        }
+    }
+
+    let mut aggregates = builders
+        .into_iter()
+        .map(
+            |(classification, builder)| TraceRequestClassificationAggregate {
+                classification,
+                request_count: builder.request_count,
+                request_elapsed_ms: LatencySummary::from_values(builder.request_elapsed_values),
+                max_event_ms: LatencySummary::from_values(builder.max_event_values),
+                statuses: sorted_trace_counts(builder.statuses),
+                paths: sorted_trace_counts(builder.paths),
+                top_level_paths: sorted_trace_counts(builder.top_level_paths),
+            },
+        )
+        .collect::<Vec<_>>();
+    aggregates.sort_by(|left, right| {
+        right
+            .request_count
+            .cmp(&left.request_count)
+            .then_with(|| {
+                right
+                    .request_elapsed_ms
+                    .max_ms
+                    .cmp(&left.request_elapsed_ms.max_ms)
+            })
+            .then_with(|| left.classification.cmp(&right.classification))
+    });
+    aggregates
 }
 
 #[derive(Default)]
@@ -10029,6 +10122,19 @@ mod tests {
                 &summary.request_classifications,
                 "top_level_zero_http_provider_cold_bitswap"
             ),
+            1
+        );
+        let classified_latency = summary
+            .request_classification_latencies
+            .iter()
+            .find(|entry| entry.classification == "top_level_zero_http_provider_cold_bitswap")
+            .unwrap();
+        assert_eq!(classified_latency.request_count, 1);
+        assert_eq!(classified_latency.request_elapsed_ms.p50_ms, Some(1888));
+        assert_eq!(classified_latency.max_event_ms.p50_ms, Some(1888));
+        assert_eq!(trace_value_count(&classified_latency.statuses, "200"), 1);
+        assert_eq!(
+            trace_value_count(&classified_latency.top_level_paths, "/ipns/site/"),
             1
         );
         let request = &summary.slow_requests[0];
