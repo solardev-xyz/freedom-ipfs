@@ -20765,3 +20765,60 @@ Keep as the current full-page cache-only baseline for `ipfs.tech`. One online
 page-and-assets load warmed enough persistent state for the gateway to restart
 offline and serve the root plus all discovered same-site assets in `66ms`
 without provider lookup, HTTP provider fetch, Bitswap activity, or missing URLs.
+
+## 2026-05-06 Keep: daicowtf Root Offline Replay Cache-Only Baseline
+
+Question:
+Does `daicowtf-page-assets` replay offline from persistent cache after one
+online load, and does the case actually exercise same-site assets?
+
+Command:
+
+```sh
+rm -f /tmp/freedom-ipfs-daicowtf-page-offline-summary.db \
+  /tmp/freedom-ipfs-daicowtf-page-offline-summary.db-* \
+  /tmp/daicowtf-page-offline-summary*.json \
+  /tmp/daicowtf-page-offline-summary*.jsonl
+
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --gateway-db /tmp/freedom-ipfs-daicowtf-page-offline-summary.db \
+  --offline-replay \
+  --case daicowtf-page-assets \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daicowtf-page-offline-summary-trace.jsonl \
+  --output /tmp/daicowtf-page-offline-summary.json
+```
+
+Artifacts:
+
+- `/tmp/daicowtf-page-offline-summary.json`
+- `/tmp/daicowtf-page-offline-summary-trace-online.jsonl` (`56` lines)
+- `/tmp/daicowtf-page-offline-summary-trace-offline.jsonl` (`11` lines)
+- `/tmp/freedom-ipfs-daicowtf-page-offline-summary.db`
+
+Result:
+
+- Online pass: `1/1`; root status `200`; root TTFB/total `400/403ms`;
+  root bytes `403507`; run total `415ms`; gateway RSS `33056KiB`, FD count
+  `17`, storage `588976B`.
+- Online crawl discovered `0` same-site fetchable assets, fetched `0`, skipped
+  `7` external assets, and was not truncated.
+- Offline pass: `1/1`; root status `200`; root TTFB/total `17/19ms`; root
+  bytes `403507`; run total `31ms`; gateway RSS `21812KiB`, FD count `15`,
+  storage `601336B`.
+- Offline statuses: `200=1`; missing URLs: `0`.
+- Offline cache phases: `gateway_stream_done=1`, `unixfs_metadata_cache=1`.
+- Offline network phases: none.
+- Offline block sources: none.
+- Offline non-cache block sources: none.
+
+Decision:
+Keep, but classify this as a root-only offline/cache baseline. The current
+`daicowtf-page-assets` crawl does not fetch same-site subresources, so it is not
+comparable to the `ipfs-tech-page-assets` full page-and-assets cache-completeness
+baseline. It still proves that the warmed root can restart and serve offline
+without provider lookup or retrieval network activity.
