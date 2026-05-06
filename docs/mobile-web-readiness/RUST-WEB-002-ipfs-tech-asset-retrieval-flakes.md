@@ -23630,3 +23630,62 @@ not evidence that early connection-error backoff improved the zero-HTTP
 cold-Bitswap tail. Future threshold tests need a same-window sample where
 `bitswap_connection_error_backoff` actually fires and the zero-HTTP
 classification latency bucket is non-trivial.
+
+## 2026-05-06 Observe: HTTP-Provider-Heavy Rust-vs-Kubo Baseline
+
+After the connection-error threshold experiment, delegated routing started
+returning HTTP providers for every `ipfs.tech` page-asset block. Capture a
+current Rust-vs-Kubo comparison in that regime so the next optimization pass can
+separate "HTTP-provider path is competitive" from "zero-HTTP Bitswap fallback is
+still the hard case."
+
+Command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --compare-kubo \
+  --kubo-bin /root/codex/freedom-ipfs/target/tools/kubo/kubo/ipfs \
+  --trace-output /tmp/ipfs-tech-http-heavy-rust-vs-kubo-r5-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-http-heavy-rust-vs-kubo-r5.json \
+  > /tmp/ipfs-tech-http-heavy-rust-vs-kubo-r5.log 2>&1
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-http-heavy-rust-vs-kubo-r5.json`
+- `/tmp/ipfs-tech-http-heavy-rust-vs-kubo-r5-trace.jsonl`
+- `/tmp/ipfs-tech-http-heavy-rust-vs-kubo-r5.log`
+
+Result:
+
+- Rust pass `5/5`; Kubo pass `5/5`
+- root TTFB:
+  - Rust p50/p95: `652/772ms`
+  - Kubo p50/p95: `2860/4471ms`
+  - Rust/Kubo ratios: `0.23x/0.17x`
+- asset TTFB:
+  - Rust p50/p95: `226/527ms`
+  - Kubo p50/p95: `219/563ms`
+  - Rust/Kubo ratios: `1.03x/0.94x`
+- resources:
+  - Rust max RSS/FD: `48000KiB/26`
+  - Kubo max RSS/FD: `352520KiB/726`
+  - Rust/Kubo ratios: `0.14x/0.04x`
+- Rust delegated provider distribution:
+  `zero=0`, `single=105`, `multi=70`
+- Rust block sources: all `http_provider`
+
+Conclusion:
+In an HTTP-provider-heavy network window, Rust is already meaningfully faster
+than Kubo for root page loads, roughly tied on asset p95, and much lighter on
+RSS/FD. The remaining high-leverage gap is not the normal HTTP-provider path;
+it is the zero-HTTP cold-Bitswap fallback shape that appears when delegated
+routing returns sparse or stale provider diversity.
