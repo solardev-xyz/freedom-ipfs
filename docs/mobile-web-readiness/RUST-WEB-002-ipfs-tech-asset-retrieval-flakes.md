@@ -22637,6 +22637,46 @@ Trace notes:
 - The default run had more self-hedges (`45`) and more duplicate wins (`7`),
   and it kept the single-provider result tail materially lower.
 
+Additional `150ms` threshold check:
+
+```sh
+rm -f /tmp/ipfs-tech-self-hedge-scoregate150-r3.json \
+  /tmp/ipfs-tech-self-hedge-scoregate150-r3-trace.jsonl
+
+FREEDOM_IPFS_SINGLE_HTTP_SELF_HEDGE_MIN_SCORE_MS=150 timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-self-hedge-scoregate150-r3-trace.jsonl \
+  --output /tmp/ipfs-tech-self-hedge-scoregate150-r3.json
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-self-hedge-scoregate150-r3.json`
+- `/tmp/ipfs-tech-self-hedge-scoregate150-r3-trace.jsonl`
+
+Result:
+
+- Passed `3/3`.
+- Run total p50/p95/max: `2163/2534/2534ms`.
+- Root TTFB p50/p95/max: `594/789/789ms`.
+- Asset TTFB p50/p95/max: `231/526/733ms`.
+- Max RSS/FD: `46780KiB` / `25`.
+- Self-hedges: `40`; self-hedge skips: `0`.
+- Single-provider result p50/p95/max: `226/375/683ms`.
+
+Interpretation:
+Do not treat the `150ms` score-gate sample as evidence for conditional
+self-hedge suppression. It looked good, but the gate did not actually engage:
+`self_hedge_skips=0`. The latency improvement is live-window variance or normal
+default behavior, not a score-gating win.
+
 Decision:
 Keep the opt-in env var and harness/mobile diagnostics as a lab control, but
 reject `250ms` score-gating as a production/default policy. The code path is
