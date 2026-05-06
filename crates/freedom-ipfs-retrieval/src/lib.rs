@@ -61,6 +61,8 @@ const MAX_CONCURRENT_HTTP_PROVIDER_FETCHES: usize = 4;
 const BITSWAP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 // Start provider retry before a full dial timeout can dominate gateway TTFB.
 const BITSWAP_CONNECTION_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const BITSWAP_CONNECTION_READY_TIMEOUT_MS_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_CONNECTION_READY_TIMEOUT_MS";
 // Keep WANT_HAVE as a short peer-selection probe; slow probes otherwise sit
 // directly on the gateway TTFB path before we request the block.
 const BITSWAP_WANT_HAVE_TIMEOUT: Duration = Duration::from_millis(750);
@@ -2585,6 +2587,19 @@ fn single_http_provider_bitswap_hedge_min_score() -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
+fn bitswap_connection_ready_timeout() -> Duration {
+    let override_value = std::env::var_os(BITSWAP_CONNECTION_READY_TIMEOUT_MS_ENV);
+    let override_value = override_value.as_ref().map(|value| value.to_string_lossy());
+    bitswap_connection_ready_timeout_from_env_value(override_value.as_deref())
+}
+
+fn bitswap_connection_ready_timeout_from_env_value(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(BITSWAP_CONNECTION_READY_TIMEOUT)
+}
+
 fn has_bitswap_provider_candidate(providers: &[Provider]) -> bool {
     providers.iter().any(|provider| {
         provider.id.is_some()
@@ -4733,6 +4748,7 @@ async fn request_bitswap_blocks_after_connection(
     let primary_cid = cids[0];
     let cid_count = cids.len();
     let cid_summary = tracing::enabled!(tracing::Level::INFO).then(|| format_cids(&cids));
+    let connection_ready_timeout = bitswap_connection_ready_timeout();
     tracing::info!(
         phase = "bitswap_peer_attempt_start",
         cid = %primary_cid,
@@ -4740,12 +4756,13 @@ async fn request_bitswap_blocks_after_connection(
         cid_count,
         peer = %peer_id,
         prefer_want_have,
+        connection_ready_timeout_ms = connection_ready_timeout.as_millis(),
         want_have_timeout_ms = request_timeouts.want_have.as_millis(),
         stream_read_timeout_ms = request_timeouts.stream_read.as_millis()
     );
 
     if let Some(connection_ready) = connection_ready {
-        match timeout(BITSWAP_CONNECTION_READY_TIMEOUT, connection_ready).await {
+        match timeout(connection_ready_timeout, connection_ready).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 tracing::info!(
@@ -4757,6 +4774,7 @@ async fn request_bitswap_blocks_after_connection(
                     ok = false,
                     failure_kind = "connection_waiter_dropped",
                     prefer_want_have,
+                    connection_ready_timeout_ms = connection_ready_timeout.as_millis(),
                     want_have_timeout_ms = request_timeouts.want_have.as_millis(),
                     stream_read_timeout_ms = request_timeouts.stream_read.as_millis(),
                     elapsed_ms = attempt_started.elapsed().as_millis()
@@ -4781,6 +4799,7 @@ async fn request_bitswap_blocks_after_connection(
                     ok = false,
                     failure_kind = "connection_timeout",
                     prefer_want_have,
+                    connection_ready_timeout_ms = connection_ready_timeout.as_millis(),
                     want_have_timeout_ms = request_timeouts.want_have.as_millis(),
                     stream_read_timeout_ms = request_timeouts.stream_read.as_millis(),
                     elapsed_ms = attempt_started.elapsed().as_millis()
@@ -4791,7 +4810,7 @@ async fn request_bitswap_blocks_after_connection(
                     detail: format!(
                         "{}: bitswap connection was not established within {}ms; addrs={}; recent_dial_errors={}",
                         peer_id,
-                        BITSWAP_CONNECTION_READY_TIMEOUT.as_millis(),
+                        connection_ready_timeout.as_millis(),
                         format_multiaddrs(&addrs),
                         recent_dial_errors
                     ),
@@ -7395,6 +7414,26 @@ mod bitswap_tests {
 
         let err = RetrievalError::Bitswap("all bitswap stream requests failed".to_string());
         assert!(!is_bitswap_connection_ready_failure(&err));
+    }
+
+    #[test]
+    fn bitswap_connection_ready_timeout_env_value_parses_override() {
+        assert_eq!(
+            bitswap_connection_ready_timeout_from_env_value(None),
+            BITSWAP_CONNECTION_READY_TIMEOUT
+        );
+        assert_eq!(
+            bitswap_connection_ready_timeout_from_env_value(Some("3000")),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            bitswap_connection_ready_timeout_from_env_value(Some("0")),
+            Duration::from_millis(0)
+        );
+        assert_eq!(
+            bitswap_connection_ready_timeout_from_env_value(Some("not-a-number")),
+            BITSWAP_CONNECTION_READY_TIMEOUT
+        );
     }
 
     #[test]

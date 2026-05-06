@@ -23364,3 +23364,78 @@ Conclusion:
 Keep. This does not change retrieval behavior, but it gives future long-running
 experiments a direct scorecard for the top-level zero-HTTP cold-Bitswap shape
 that currently dominates bad root tails.
+
+## 2026-05-06 Keep Lab Control: Bitswap Connection-Ready Timeout Override
+
+The r20 post-lookup rejection points back at top-level zero-HTTP cold-Bitswap
+tails. One plausible lever is the per-peer connection-ready wait: a shorter
+wait can move past slow dials sooner, while a longer wait can tell us whether
+the 5s tail is a hard timeout artifact or a true lack of useful peers.
+
+Change:
+
+- Add `FREEDOM_IPFS_BITSWAP_CONNECTION_READY_TIMEOUT_MS`.
+- Keep the production default at `5000ms`.
+- Emit `connection_ready_timeout_ms` on Bitswap peer attempt traces so live runs
+  record the effective lab setting.
+- Invalid values fall back to the production default. `0` is accepted for lab
+  experiments.
+
+Validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval bitswap_connection_ready
+cargo test -p freedom-ipfs-retrieval
+cargo fmt --all --check
+cargo check -p freedom-ipfs-retrieval --all-targets
+```
+
+Live command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_CONNECTION_READY_TIMEOUT_MS=3000 timeout 1800s \
+  cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-connready3000-r10-trace.jsonl \
+  --output /tmp/ipfs-tech-connready3000-r10.json \
+  > /tmp/ipfs-tech-connready3000-r10.log 2>&1
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-connready3000-r10.json`
+- `/tmp/ipfs-tech-connready3000-r10-trace.jsonl`
+- `/tmp/ipfs-tech-connready3000-r10.log`
+
+Result:
+
+- pass `10/10`
+- root TTFB p50/p90/p95/max: `647/1016/1050/1050ms`
+- asset TTFB p50/p90/p95/max: `223/500/587/996ms`
+- request classifications:
+  `zero_http_provider_bitswap=20`, `cold_bitswap_peer_expand=17`,
+  `zero_http_provider_cold_bitswap=17`
+- no top-level zero-HTTP classifications appeared in this sample
+- request classification latency for `zero_http_provider_cold_bitswap`:
+  `376/698/995/995ms`
+- Bitswap peer attempts: starts `224`, failures `0`,
+  connection timeouts `0`
+- Bitswap connections: established `39`, wait elapsed
+  p50/p90/p95/max `96/348/531/542ms`
+- measured max RSS/FD: `54772KiB/36`
+
+Conclusion:
+Keep this as a lab control only. The `3000ms` r10 run was reliable and the
+trace confirmed the override, but it did not exercise the top-level zero-HTTP
+root-tail shape and was not clearly better than the recent default samples.
+Do not change the production `BITSWAP_CONNECTION_READY_TIMEOUT` from `5000ms`
+without a same-window r20/r50 comparison that improves the new
+`top_level_zero_http_provider_cold_bitswap` latency scorecard without raising
+Bitswap failure, connection, RSS, or FD pressure.
