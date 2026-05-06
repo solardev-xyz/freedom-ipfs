@@ -22822,3 +22822,117 @@ Keep this diagnostics-only change. It does not change retrieval behavior, but it
 turns a recurring manual analysis step into a first-class trace summary signal.
 The next behavior experiment can now target root zero-HTTP/cold-Bitswap cases
 with clearer A/B evidence.
+
+## 2026-05-06 Experiment: Single-HTTP Bitswap Hedge On IPFS.tech
+
+Question:
+Does the existing opt-in single-HTTP-provider Bitswap hedge reduce the current
+`ipfs.tech` root and asset tails, and what mobile resource cost does it carry?
+
+Default command:
+
+```sh
+rm -f /tmp/ipfs-tech-zero-http-classify-r10.json \
+  /tmp/ipfs-tech-zero-http-classify-r10-trace.jsonl \
+  /tmp/ipfs-tech-zero-http-classify-r10.log
+
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-zero-http-classify-r10-trace.jsonl \
+  --output /tmp/ipfs-tech-zero-http-classify-r10.json \
+  > /tmp/ipfs-tech-zero-http-classify-r10.log 2>&1
+```
+
+Hedge command:
+
+```sh
+rm -f /tmp/ipfs-tech-bitswap-hedge-r10.json \
+  /tmp/ipfs-tech-bitswap-hedge-r10-trace.jsonl \
+  /tmp/ipfs-tech-bitswap-hedge-r10.log
+
+FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 timeout 1800s \
+  cargo run -p mobile-web-harness -- \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --repeat 10 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/ipfs-tech-bitswap-hedge-r10-trace.jsonl \
+    --output /tmp/ipfs-tech-bitswap-hedge-r10.json \
+    > /tmp/ipfs-tech-bitswap-hedge-r10.log 2>&1
+```
+
+Artifacts:
+
+- `/tmp/ipfs-tech-zero-http-classify-r10.json`
+- `/tmp/ipfs-tech-zero-http-classify-r10-trace.jsonl`
+- `/tmp/ipfs-tech-zero-http-classify-r10.log`
+- `/tmp/ipfs-tech-bitswap-hedge-r10.json`
+- `/tmp/ipfs-tech-bitswap-hedge-r10-trace.jsonl`
+- `/tmp/ipfs-tech-bitswap-hedge-r10.log`
+- `/tmp/ipfs-tech-bitswap-hedge-score250-r10.json`
+- `/tmp/ipfs-tech-bitswap-hedge-score250-r10-trace.jsonl`
+- `/tmp/ipfs-tech-bitswap-hedge-score250-r10.log`
+- `/tmp/ipfs-tech-bitswap-hedge-score200-r10.json`
+- `/tmp/ipfs-tech-bitswap-hedge-score200-r10-trace.jsonl`
+- `/tmp/ipfs-tech-bitswap-hedge-score200-r10.log`
+
+Result:
+
+| Mode | Pass | Run total p50/p95/max | Root TTFB p50/p95/max | Asset TTFB p50/p95/max | Max RSS/FD |
+| --- | --- | --- | --- | --- | --- |
+| Default | `10/10` | `2132/3344/3344ms` | `674/2003/2003ms` | `217/642/1012ms` | `54240KiB` / `31` |
+| Bitswap hedge enabled | `10/10` | `1922/2498/2498ms` | `562/609/609ms` | `207/544/985ms` | `55440KiB` / `48` |
+| Hedge + `250ms` score gate | `10/10` | `2028/2822/2822ms` | `564/879/879ms` | `201/541/991ms` | `53184KiB` / `34` |
+| Hedge + `200ms` score gate | `10/10` | `2138/2558/2558ms` | `521/727/727ms` | `212/538/1010ms` | `54660KiB` / `49` |
+
+Trace notes:
+
+- Default request classifications:
+  `cold_bitswap_peer_expand=10`, `zero_http_provider_bitswap=10`,
+  `zero_http_provider_cold_bitswap=10`,
+  `top_level_zero_http_provider_bitswap=1`,
+  `top_level_zero_http_provider_cold_bitswap=1`.
+- Hedge request classifications:
+  `cold_bitswap_peer_expand=61`, `zero_http_provider_bitswap=10`,
+  `zero_http_provider_cold_bitswap=10`.
+- Default HTTP-provider race result max: `1074ms`; single-provider result max:
+  `1074ms`; self-hedges: `89`; self-hedge wins from duplicate attempt: `6`.
+- Hedge HTTP-provider race result max: `490ms`; single-provider result max:
+  `490ms`; Bitswap hedge starts/results: `142/142`; result sources:
+  `http_provider=137`, `bitswap=5`.
+- Hedge mode raised max FDs from `31` to `48`, increased Bitswap peer attempt
+  starts from `164` to `525`, and introduced `54` connection-limit dial
+  rejections. RSS rose modestly by about `1.2MiB`.
+- `250ms` score-gating skipped all Bitswap hedges:
+  `starts=0`, `skips=144`, skip reasons
+  `provider_score_below_threshold=134`, `provider_unscored=10`.
+- `200ms` score-gating started fewer hedges:
+  `starts=34`, `skips=119`, result sources `http_provider=33`,
+  `bitswap=1`. It reduced median FD use versus full hedge but still hit max FD
+  `49`, so the worst resource spike was not improved.
+
+Interpretation:
+
+The existing opt-in Bitswap hedge is a real latency lever for `ipfs.tech` in
+this window: root p95/max, run p95/max, and asset p95 all improved. It also
+clearly spends more mobile-relevant connection budget. Do not flip it on by
+default from this single workload alone.
+
+The score-gated variants did not produce a clean default policy. `250ms` was too
+conservative and skipped every hedge. `200ms` engaged the hedge sometimes, but
+kept the same worst FD spike as full hedge while giving up part of the root-tail
+win. The next useful experiment is likely not a pure score gate. Better options:
+reduce or parameterize the single-HTTP post-lookup session wait, or run full
+hedge across DAICO/Vitalik and Kubo comparison guardrails to determine whether
+the FD cost is acceptable for the broader workload.
