@@ -25123,3 +25123,52 @@ default yet because it shifts work from HTTP providers to Bitswap, increases
 peer attempts, and exposed one 4s Bitswap timeout tail. Next evidence should be
 an alternating baseline/env/default run or a repeat=5 guard across
 `ipfs-tech-page-assets`, `daicowtf-page-assets`, and `vitalik-root-html-range`.
+
+Follow-up env-off baseline after the lab knob was committed:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-session-baseline-after-direct-target-r3-20260506T220618Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-session-baseline-after-direct-target-r3-20260506T220618Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/ipfs-tech-session-baseline-after-direct-target-r3-20260506T220618Z.log 2>&1
+```
+
+Follow-up result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Root TTFB p50/p95:
+  - Rust: `574/791ms`
+  - Kubo: `1661/1952ms`
+- Asset TTFB p50/p95:
+  - Rust: `235/912ms`
+  - Kubo: `156/1066ms`
+- Resource max:
+  - Rust: `54184KiB` RSS, `35` FDs
+  - Kubo: `389840KiB` RSS, `988` FDs
+- Rust delegated provider lookup max was only `97ms`.
+- Rust block fetch totals:
+  - HTTP provider: `63` blocks, p50/p95/max `361/579/904ms`
+  - Bitswap: `53` blocks, p50/p95/max `157/280/1075ms`
+- Request classifications: `zero_http_provider_bitswap=8`,
+  `zero_http_provider_cold_bitswap=6`.
+
+Attribution update:
+This env-off run also beat Kubo on asset p95 in the same live window, while
+still losing asset p50. That means the env-gated direct-Bitswap target should
+not be treated as proven by the previous A/B pair alone; public provider
+conditions moved substantially. The knob's distinct signal remains useful:
+when enabled, all delegated lookups reached an explicit early target and
+delegated lookup max stayed bounded at `586ms`, but it shifted more work to
+Bitswap. The next serious evidence should be an alternating baseline/env run,
+or a broader repeat=5 guard, before considering default promotion.
