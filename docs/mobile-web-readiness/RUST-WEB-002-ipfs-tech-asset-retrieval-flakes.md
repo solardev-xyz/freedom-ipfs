@@ -25550,3 +25550,63 @@ multi-case guardrails before considering default promotion. The next iteration
 should test this flag across broader same-window samples and look for a
 narrower production policy, for example only page subresources or only
 single-HTTP providers with recent HTTP score above a threshold.
+
+Follow-up multi-case guardrail:
+
+```sh
+FREEDOM_IPFS_ENABLE_SINGLE_HTTP_POST_LOOKUP_RACE=1 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/single-http-postlookup-race-multicase-r3-20260506T224518Z-trace.jsonl \
+  --comparison-output /tmp/single-http-postlookup-race-multicase-r3-20260506T224518Z.json \
+  > /tmp/single-http-postlookup-race-multicase-r3-20260506T224518Z.log 2>&1
+```
+
+Result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- `daicowtf-page-assets` root TTFB p50/p95:
+  - Rust: `1070/1856ms`
+  - Kubo: `2970/3488ms`
+- `vitalik-root-html-range` root TTFB p50/p95:
+  - Rust: `412/421ms`
+  - Kubo: `2688/3046ms`
+- `ipfs-tech-page-assets` root TTFB p50/p95:
+  - Rust: `1214/1348ms`
+  - Kubo: `1401/1506ms`
+- `ipfs-tech-page-assets` asset TTFB p50/p95:
+  - Rust: `234/454ms`
+  - Kubo: `391/847ms`
+- Resource max:
+  - Rust: `59864KiB` RSS, `33` FDs
+  - Kubo: `141164KiB` RSS, `184` FDs
+
+Trace notes:
+
+- Race events: `56` total, with `bitswap_won=37`, `provider_won=19`.
+- Race event latency p50/p90/p95/max was `112/441/477/831ms`.
+- Block fetch totals:
+  - Bitswap: `86` blocks, p50/p95/max `128/446/1174ms`
+  - HTTP provider: `49` blocks, p50/p95/max `265/563/743ms`
+- `bitswap_fetch_cancelled` events were `50`, lower than the focused
+  `ipfs.tech` race run's `77` and comparable to the previous default window's
+  `53`.
+- The flag did not obviously regress the two root-only guardrail cases in this
+  window; Rust still beat Kubo by a wide margin while staying much lighter.
+
+Updated decision:
+The broader guardrail strengthens the signal that the race flag is worth a
+longer r10/r20 alternating run. It should still remain opt-in until a larger
+same-window sample proves the improved `ipfs.tech` asset p50/p95 is stable and
+that the extra racing/cancellation work stays bounded under mobile resource
+budgets.
