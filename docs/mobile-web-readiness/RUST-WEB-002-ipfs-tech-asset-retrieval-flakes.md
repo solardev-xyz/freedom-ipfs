@@ -22683,3 +22683,78 @@ reject `250ms` score-gating as a production/default policy. The code path is
 inactive unless the env var is set, and the skip diagnostics are useful for
 future controlled sweeps. Do not enable this by default without a larger
 same-window A/B showing lower p95/max while preserving rare-tail protection.
+
+## 2026-05-06 Baseline: Current-Head Multi-Case Rust-vs-Kubo
+
+Question:
+After the same-provider HTTP self-hedge diagnostics and opt-in score-gate lab
+control, where does the current branch stand against Kubo across the focused
+page workload plus the two recurring guardrails?
+
+Command:
+
+```sh
+rm -f /tmp/current-head-multicase-kubo-r3.json \
+  /tmp/current-head-multicase-kubo-r3-trace.jsonl
+
+timeout 1500s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --compare-kubo \
+  --kubo-bin target/tools/kubo/kubo/ipfs \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-multicase-kubo-r3-trace.jsonl \
+  --comparison-output /tmp/current-head-multicase-kubo-r3.json
+```
+
+Artifacts:
+
+- `/tmp/current-head-multicase-kubo-r3.json`
+- `/tmp/current-head-multicase-kubo-r3-trace.jsonl`
+
+Result:
+
+- Rust passed `3/3`; Kubo passed `3/3`.
+- Shared max resources: Rust `55764KiB` / `32` FDs, Kubo `270036KiB` /
+  `225` FDs. Rust/Kubo ratios: RSS `0.21x`, FD `0.14x`.
+- `daicowtf-page-assets`: root TTFB Rust p50/p95 `289/305ms`, Kubo
+  `2353/2638ms`; Rust ratio `0.12x` p50 and p95.
+- `vitalik-root-html-range`: root/range TTFB Rust p50/p95 `98/112ms`, Kubo
+  `2379/2669ms`; Rust ratio `0.04x` p50 and p95.
+- `ipfs-tech-page-assets`: root TTFB Rust p50/p95 `585/1890ms`, Kubo
+  `1436/2256ms`; Rust ratio `0.41x` / `0.84x`.
+- `ipfs-tech-page-assets`: asset TTFB Rust p50/p95 `226/821ms`, Kubo
+  `155/1257ms`; Rust ratio `1.46x` / `0.65x`.
+
+Rust trace notes:
+
+- Block sources: HTTP provider `85` blocks, Bitswap `48` blocks.
+- HTTP-provider block fetch elapsed p50/p95/max: `224/817/1035ms`.
+- Bitswap block fetch elapsed p50/p95/max: `103/224/1618ms`.
+- Delegated provider lookup p50/p95/max: `26/115/679ms`.
+- HTTP-provider races: `80` results, all successful; same-provider self-hedges
+  `15`; duplicate winners `4`.
+- HTTP-provider fetch elapsed p50/p95/max: `115/228/316ms`.
+- Bitswap session post-lookup waits: `52`; hits `22`; timeouts `30`.
+- The slowest Rust root request was `/ipns/ipfs.tech/` at `1888ms`, dominated
+  by a Bitswap root block fetch:
+  `block_fetch_total=1618ms`, `bitswap_fetch=1494ms`.
+
+Interpretation:
+
+- Current Rust is still dramatically more resource-efficient than Kubo and
+  materially faster on DAICO and Vitalik range guardrails.
+- On `ipfs.tech`, Rust beats Kubo on root p50/p95 and asset p95, but Kubo still
+  wins asset p50.
+- The current worst Rust root tail was not an HTTP-provider self-hedge issue.
+  It was a cold Bitswap root-block path with no session peers yet.
+- Next behavior work should move away from raw HTTP self-hedge policy and
+  investigate cold root/session Bitswap startup or request-shape classification
+  for when the root block goes Bitswap instead of verified HTTP provider.
