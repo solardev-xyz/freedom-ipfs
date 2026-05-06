@@ -24321,3 +24321,65 @@ short recent-peer opportunity while avoiding the more expensive `250ms` wait
 when the only discovered HTTP provider is ready to race. Continue using the env
 override for larger alternating samples before making any further grace-window
 changes.
+
+## 2026-05-06 Observe: 125ms Default Rust-vs-Kubo
+
+After committing the `125ms` default, rerun the gated Rust-vs-Kubo comparison so
+the branch has a same-window external baseline for the new behavior:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-grace125-default-rust-vs-kubo-r3-20260506-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-grace125-default-rust-vs-kubo-r3-20260506.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/ipfs-tech-grace125-default-rust-vs-kubo-r3-20260506.log 2>&1
+```
+
+Result:
+
+- Rust passed `3/3`
+- Kubo passed `3/3`
+- Rust trace requirements:
+  - `zero_http_provider_cold_bitswap expected>=1 actual=3 passed=true`
+  - `fetching_bitswap expected>=1 actual=550 passed=true`
+- root TTFB p50/p95:
+  - Rust: `760/1421ms`
+  - Kubo: `2101/2659ms`
+  - Rust/Kubo ratio: `0.36x/0.53x`
+- asset TTFB p50/p95:
+  - Rust: `236/826ms`
+  - Kubo: `123/405ms`
+  - Rust/Kubo ratio: `1.92x/2.04x`
+- resource max:
+  - RSS: Rust `53424KiB`, Kubo `200140KiB`
+  - FDs: Rust `29`, Kubo `136`
+- Rust block sources: `http_provider=62`, `bitswap=55`, `cache=1`
+- Rust delegated provider distribution: `zero=3`, `single=56`,
+  `multi=39`
+- Rust session summary showed `post_lookup_budgets=125=39, 100=28`,
+  proving the new single-HTTP grace was active in the run.
+
+Artifacts:
+
+- `/tmp/ipfs-tech-grace125-default-rust-vs-kubo-r3-20260506.json`
+- `/tmp/ipfs-tech-grace125-default-rust-vs-kubo-r3-20260506-trace.jsonl`
+- `/tmp/ipfs-tech-grace125-default-rust-vs-kubo-r3-20260506.log`
+
+Conclusion:
+The `125ms` default preserved the important root/resource wins: Rust root TTFB
+was materially faster than fresh Kubo while using about `27%` of Kubo's max RSS
+and `21%` of Kubo's max FD count. The remaining gap is still asset/session
+behavior. Kubo won asset p50 and p95 in this same-window comparison even though
+Rust passed reliably and exercised zero-HTTP cold Bitswap. Next performance work
+should target small subresource fetches, session reuse, or bounded batching
+rather than root discovery alone.
