@@ -66,6 +66,11 @@ const ENABLE_TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK_ENV: &str =
 const TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS_ENV: &str =
     "FREEDOM_IPFS_TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS";
 const TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS: usize = 32;
+const ENABLE_TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK";
+const TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS_ENV: &str =
+    "FREEDOM_IPFS_TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS";
+const TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS: usize = 32;
 const MAX_CONCURRENT_HTTP_PROVIDER_FETCHES: usize = 8;
 const MAX_CONCURRENT_HTTP_PROVIDER_FETCHES_ENV: &str =
     "FREEDOM_IPFS_MAX_CONCURRENT_HTTP_PROVIDER_FETCHES";
@@ -1177,16 +1182,37 @@ impl HttpRetriever {
                 )
                 .await;
         }
-        if let Some(block) = self
-            .fetch_from_http_provider_candidates(
-                cid,
-                http_provider_bases,
-                options.single_http_5xx_fast_bitswap_fallback
-                    && bitswap_provider_candidate_available,
-            )
-            .await?
-        {
-            return Ok((block, RetrievalSource::HttpProvider));
+        if top_level_multi_http_failed_direct_ip_bitswap_fallback_allows(
+            options.top_level_multi_http_failed_direct_ip_bitswap_fallback,
+            context.as_ref(),
+            http_provider_count,
+            providers.len(),
+            bitswap_provider_candidate_available,
+            has_direct_ip_bitswap_provider_candidate(providers),
+        ) {
+            if let Some((block, source)) = self
+                .fetch_top_level_multi_http_failed_direct_ip_bitswap_race(
+                    cid,
+                    http_provider_bases,
+                    providers,
+                    context.clone(),
+                )
+                .await?
+            {
+                return Ok((block, source));
+            }
+        } else {
+            if let Some(block) = self
+                .fetch_from_http_provider_candidates(
+                    cid,
+                    http_provider_bases,
+                    options.single_http_5xx_fast_bitswap_fallback
+                        && bitswap_provider_candidate_available,
+                )
+                .await?
+            {
+                return Ok((block, RetrievalSource::HttpProvider));
+            }
         }
         if top_level_single_http_failed_direct_ip_bitswap_fallback_allows(
             options.top_level_single_http_failed_direct_ip_bitswap_fallback,
@@ -1341,6 +1367,242 @@ impl HttpRetriever {
             Some(err) => Err(err),
             None => Err(RetrievalError::NoBitswapProviders),
         }
+    }
+
+    async fn fetch_top_level_multi_http_failed_direct_ip_bitswap_race(
+        &self,
+        cid: &Cid,
+        http_provider_bases: Vec<Url>,
+        providers: &[Provider],
+        context: Option<RetrievalRequestContext>,
+    ) -> Result<Option<(Block, RetrievalSource)>> {
+        if http_provider_bases.is_empty() {
+            return Ok(None);
+        }
+
+        let started = Instant::now();
+        let provider_count = providers.len();
+        let candidates = self
+            .scored_http_provider_candidates(http_provider_bases)
+            .await;
+        let http_provider_count = candidates.len();
+        let scored_provider_count = candidates
+            .iter()
+            .filter(|candidate| candidate.score_elapsed.is_some())
+            .count();
+        let scoring_enabled = http_provider_scoring_enabled();
+        tracing::info!(
+            phase = "top_level_multi_http_failed_direct_ip_bitswap_fallback_gate",
+            cid = %cid,
+            provider_count,
+            http_provider_count,
+            min_provider_count = top_level_multi_http_failed_direct_ip_bitswap_min_providers()
+        );
+        tracing::info!(
+            phase = "http_provider_race",
+            cid = %cid,
+            provider_count = http_provider_count,
+            race_width = HTTP_PROVIDER_RACE_WIDTH,
+            scored_provider_count,
+            scoring_enabled,
+            multi_http_failed_direct_ip_bitswap_fallback = true
+        );
+
+        let mut next_bases = candidates.into_iter().enumerate();
+        let mut pending = FuturesUnordered::<
+            BoxFuture<'static, MultiHttpFailedDirectIpBitswapFallbackResult>,
+        >::new();
+        let mut attempted_provider_count = 0usize;
+        let mut failed_provider_count = 0usize;
+        for _ in 0..HTTP_PROVIDER_RACE_WIDTH {
+            let Some((scheduled_index, candidate)) = next_bases.next() else {
+                break;
+            };
+            attempted_provider_count += 1;
+            push_multi_http_provider_candidate(
+                &mut pending,
+                self.clone(),
+                *cid,
+                scheduled_index,
+                candidate,
+                0,
+            );
+        }
+
+        let hedge = tokio::time::sleep(HTTP_PROVIDER_HEDGE_AFTER);
+        tokio::pin!(hedge);
+        let mut completion_seen_before_hedge = false;
+        let mut hedge_fired = false;
+        let mut direct_ip_bitswap_started = false;
+        let mut direct_ip_error = None;
+
+        while !pending.is_empty() {
+            tokio::select! {
+                biased;
+
+                result = pending.next() => {
+                    let Some(result) = result else {
+                        break;
+                    };
+                    match result {
+                        MultiHttpFailedDirectIpBitswapFallbackResult::HttpCandidate(result) => {
+                            completion_seen_before_hedge = true;
+                            match result.result {
+                                Ok(block) => {
+                                    tracing::info!(
+                                        phase = "http_provider_race_result",
+                                        cid = %cid,
+                                        ok = true,
+                                        provider = %result.base,
+                                        winner_provider_index = result.provider_index,
+                                        winner_attempt_index = result.attempt_index,
+                                        winner_provider_rank = result.provider_index + 1,
+                                        winner_original_provider_rank = result.original_provider_index + 1,
+                                        winner_within_initial_width = (result.provider_index < HTTP_PROVIDER_RACE_WIDTH),
+                                        provider_count = http_provider_count,
+                                        race_width = HTTP_PROVIDER_RACE_WIDTH,
+                                        scored_provider_count,
+                                        winner_provider_scored = result.score_elapsed.is_some(),
+                                        winner_provider_score_ms = result
+                                            .score_elapsed
+                                            .map(|elapsed| elapsed.as_millis())
+                                            .unwrap_or_default(),
+                                        attempted_provider_count,
+                                        failed_provider_count,
+                                        hedge_fired,
+                                        multi_http_failed_direct_ip_bitswap_fallback = true,
+                                        direct_ip_bitswap_started,
+                                        elapsed_ms = started.elapsed().as_millis()
+                                    );
+                                    tracing::info!(
+                                        phase = "top_level_multi_http_failed_direct_ip_bitswap_fallback_result",
+                                        cid = %cid,
+                                        ok = true,
+                                        source = "http_provider",
+                                        provider_count,
+                                        http_provider_count,
+                                        attempted_provider_count,
+                                        failed_provider_count,
+                                        direct_ip_bitswap_started,
+                                        elapsed_ms = started.elapsed().as_millis()
+                                    );
+                                    return Ok(Some((block, RetrievalSource::HttpProvider)));
+                                }
+                                Err(_) => {
+                                    failed_provider_count += 1;
+                                    if !direct_ip_bitswap_started {
+                                        direct_ip_bitswap_started = true;
+                                        push_multi_http_failed_direct_ip_bitswap(
+                                            &mut pending,
+                                            self.clone(),
+                                            *cid,
+                                            providers.to_vec(),
+                                            context.clone(),
+                                            MultiHttpFailedDirectIpBitswapTrace {
+                                                provider_count,
+                                                http_provider_count,
+                                                attempted_provider_count,
+                                                failed_provider_count,
+                                                started,
+                                            },
+                                        );
+                                    }
+                                    if let Some((scheduled_index, candidate)) = next_bases.next() {
+                                        attempted_provider_count += 1;
+                                        push_multi_http_provider_candidate(
+                                            &mut pending,
+                                            self.clone(),
+                                            *cid,
+                                            scheduled_index,
+                                            candidate,
+                                            0,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        MultiHttpFailedDirectIpBitswapFallbackResult::DirectIp(Ok(block)) => {
+                            tracing::info!(
+                                phase = "top_level_multi_http_failed_direct_ip_bitswap_fallback_result",
+                                cid = %cid,
+                                ok = true,
+                                source = "direct_ip",
+                                provider_count,
+                                http_provider_count,
+                                attempted_provider_count,
+                                failed_provider_count,
+                                elapsed_ms = started.elapsed().as_millis()
+                            );
+                            return Ok(Some((block, RetrievalSource::Bitswap)));
+                        }
+                        MultiHttpFailedDirectIpBitswapFallbackResult::DirectIp(Err(err)) => {
+                            direct_ip_error = Some(err);
+                        }
+                    }
+                }
+                _ = &mut hedge, if !hedge_fired
+                    && !completion_seen_before_hedge
+                    && next_bases.len() > 0 => {
+                    hedge_fired = true;
+                    if let Some((scheduled_index, candidate)) = next_bases.next() {
+                        tracing::info!(
+                            phase = "http_provider_hedge",
+                            cid = %cid,
+                            provider = %candidate.base,
+                            timeout_ms = HTTP_PROVIDER_HEDGE_AFTER.as_millis(),
+                            provider_index = scheduled_index,
+                            original_provider_rank = candidate.original_index + 1,
+                            provider_scored = candidate.score_elapsed.is_some(),
+                            provider_score_ms = candidate
+                                .score_elapsed
+                                .map(|elapsed| elapsed.as_millis())
+                                .unwrap_or_default(),
+                            pending_count = pending.len(),
+                            remaining_provider_count = next_bases.len(),
+                            multi_http_failed_direct_ip_bitswap_fallback = true
+                        );
+                        attempted_provider_count += 1;
+                        push_multi_http_provider_candidate(
+                            &mut pending,
+                            self.clone(),
+                            *cid,
+                            scheduled_index,
+                            candidate,
+                            0,
+                        );
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            phase = "http_provider_race_result",
+            cid = %cid,
+            ok = false,
+            provider_count = http_provider_count,
+            race_width = HTTP_PROVIDER_RACE_WIDTH,
+            attempted_provider_count,
+            failed_provider_count,
+            hedge_fired,
+            multi_http_failed_direct_ip_bitswap_fallback = true,
+            direct_ip_bitswap_started,
+            elapsed_ms = started.elapsed().as_millis()
+        );
+        if let Some(err) = direct_ip_error {
+            tracing::info!(
+                phase = "top_level_multi_http_failed_direct_ip_bitswap_fallback_result",
+                cid = %cid,
+                ok = false,
+                source = "direct_ip",
+                provider_count,
+                http_provider_count,
+                attempted_provider_count,
+                failed_provider_count,
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis()
+            );
+        }
+        Ok(None)
     }
 
     fn maybe_spawn_top_level_bitswap_provider_preconnect(
@@ -4868,6 +5130,7 @@ struct HttpProviderCandidateResult {
 struct ProviderFetchOptions {
     single_http_5xx_fast_bitswap_fallback: bool,
     top_level_single_http_failed_direct_ip_bitswap_fallback: bool,
+    top_level_multi_http_failed_direct_ip_bitswap_fallback: bool,
 }
 
 impl ProviderFetchOptions {
@@ -4876,6 +5139,8 @@ impl ProviderFetchOptions {
             single_http_5xx_fast_bitswap_fallback: single_http_5xx_fast_bitswap_fallback_enabled(),
             top_level_single_http_failed_direct_ip_bitswap_fallback:
                 top_level_single_http_failed_direct_ip_bitswap_fallback_enabled(),
+            top_level_multi_http_failed_direct_ip_bitswap_fallback:
+                top_level_multi_http_failed_direct_ip_bitswap_fallback_enabled(),
         }
     }
 }
@@ -4923,6 +5188,10 @@ fn top_level_single_http_failed_direct_ip_bitswap_fallback_enabled() -> bool {
     std::env::var_os(ENABLE_TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK_ENV).is_some()
 }
 
+fn top_level_multi_http_failed_direct_ip_bitswap_fallback_enabled() -> bool {
+    std::env::var_os(ENABLE_TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK_ENV).is_some()
+}
+
 fn top_level_single_http_failed_direct_ip_bitswap_min_providers() -> usize {
     top_level_single_http_failed_direct_ip_bitswap_min_providers_from_env_value(
         std::env::var_os(TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS_ENV)
@@ -4938,6 +5207,23 @@ fn top_level_single_http_failed_direct_ip_bitswap_min_providers_from_env_value(
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS)
+}
+
+fn top_level_multi_http_failed_direct_ip_bitswap_min_providers() -> usize {
+    top_level_multi_http_failed_direct_ip_bitswap_min_providers_from_env_value(
+        std::env::var_os(TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn top_level_multi_http_failed_direct_ip_bitswap_min_providers_from_env_value(
+    value: Option<&str>,
+) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS)
 }
 
 fn top_level_single_http_failed_direct_ip_bitswap_fallback_allows(
@@ -4971,6 +5257,42 @@ fn top_level_single_http_failed_direct_ip_bitswap_fallback_allows_from_values(
     enabled
         && context.is_some_and(|context| !context.gateway_subresource())
         && http_provider_count == 1
+        && provider_count >= min_provider_count
+        && bitswap_provider_candidate_available
+        && direct_ip_bitswap_provider_candidate_available
+}
+
+fn top_level_multi_http_failed_direct_ip_bitswap_fallback_allows(
+    enabled: bool,
+    context: Option<&RetrievalRequestContext>,
+    http_provider_count: usize,
+    provider_count: usize,
+    bitswap_provider_candidate_available: bool,
+    direct_ip_bitswap_provider_candidate_available: bool,
+) -> bool {
+    top_level_multi_http_failed_direct_ip_bitswap_fallback_allows_from_values(
+        enabled,
+        context,
+        http_provider_count,
+        provider_count,
+        bitswap_provider_candidate_available,
+        direct_ip_bitswap_provider_candidate_available,
+        top_level_multi_http_failed_direct_ip_bitswap_min_providers(),
+    )
+}
+
+fn top_level_multi_http_failed_direct_ip_bitswap_fallback_allows_from_values(
+    enabled: bool,
+    context: Option<&RetrievalRequestContext>,
+    http_provider_count: usize,
+    provider_count: usize,
+    bitswap_provider_candidate_available: bool,
+    direct_ip_bitswap_provider_candidate_available: bool,
+    min_provider_count: usize,
+) -> bool {
+    enabled
+        && context.is_some_and(|context| !context.gateway_subresource())
+        && http_provider_count > 1
         && provider_count >= min_provider_count
         && bitswap_provider_candidate_available
         && direct_ip_bitswap_provider_candidate_available
@@ -5542,6 +5864,20 @@ enum DirectIpBitswapFallbackResult {
     Normal(Result<Block>),
 }
 
+enum MultiHttpFailedDirectIpBitswapFallbackResult {
+    HttpCandidate(HttpProviderCandidateResult),
+    DirectIp(Result<Block>),
+}
+
+#[derive(Clone, Copy)]
+struct MultiHttpFailedDirectIpBitswapTrace {
+    provider_count: usize,
+    http_provider_count: usize,
+    attempted_provider_count: usize,
+    failed_provider_count: usize,
+    started: Instant,
+}
+
 enum ZeroHttpPostLookupDnsPrefetchOutcome {
     NotAttempted,
     ContinueAfterWait,
@@ -5575,6 +5911,70 @@ fn push_single_http_bitswap_hedge(
             SingleHttpProviderBitswapHedgeResult::Bitswap(
                 retriever
                     .fetch_from_bitswap_providers(&cid, &providers, None)
+                    .await,
+            )
+        }
+        .boxed(),
+    );
+}
+
+fn push_multi_http_provider_candidate(
+    pending: &mut FuturesUnordered<
+        BoxFuture<'static, MultiHttpFailedDirectIpBitswapFallbackResult>,
+    >,
+    retriever: HttpRetriever,
+    cid: Cid,
+    provider_index: usize,
+    candidate: ScoredHttpProviderBase,
+    attempt_index: usize,
+) {
+    pending.push(
+        async move {
+            MultiHttpFailedDirectIpBitswapFallbackResult::HttpCandidate(
+                retriever
+                    .fetch_from_http_provider_candidate_with_index(
+                        cid,
+                        provider_index,
+                        candidate,
+                        attempt_index,
+                    )
+                    .await,
+            )
+        }
+        .boxed(),
+    );
+}
+
+fn push_multi_http_failed_direct_ip_bitswap(
+    pending: &mut FuturesUnordered<
+        BoxFuture<'static, MultiHttpFailedDirectIpBitswapFallbackResult>,
+    >,
+    retriever: HttpRetriever,
+    cid: Cid,
+    providers: Vec<Provider>,
+    context: Option<RetrievalRequestContext>,
+    trace: MultiHttpFailedDirectIpBitswapTrace,
+) {
+    tracing::info!(
+        phase = "top_level_multi_http_failed_direct_ip_bitswap_fallback_start",
+        cid = %cid,
+        provider_count = trace.provider_count,
+        http_provider_count = trace.http_provider_count,
+        attempted_provider_count = trace.attempted_provider_count,
+        failed_provider_count = trace.failed_provider_count,
+        min_provider_count = top_level_multi_http_failed_direct_ip_bitswap_min_providers(),
+        elapsed_ms = trace.started.elapsed().as_millis()
+    );
+    pending.push(
+        async move {
+            MultiHttpFailedDirectIpBitswapFallbackResult::DirectIp(
+                retriever
+                    .fetch_from_bitswap_providers_with_candidate_mode(
+                        &cid,
+                        &providers,
+                        context,
+                        BitswapProviderCandidateMode::DirectIpOnly,
+                    )
                     .await,
             )
         }
@@ -9768,6 +10168,121 @@ mod bitswap_tests {
     }
 
     #[test]
+    fn top_level_multi_http_failed_direct_ip_fallback_gate_is_narrow() {
+        let top_level = RetrievalRequestContext::gateway_request_with_top_level(
+            None,
+            Some("/ipfs/example".to_string()),
+        );
+        let subresource = RetrievalRequestContext::gateway_request_with_top_level(
+            Some(1),
+            Some("/ipfs/example".to_string()),
+        );
+
+        assert!(
+            top_level_multi_http_failed_direct_ip_bitswap_fallback_allows_from_values(
+                true,
+                Some(&top_level),
+                2,
+                4,
+                true,
+                true,
+                4,
+            )
+        );
+        assert!(
+            !top_level_multi_http_failed_direct_ip_bitswap_fallback_allows_from_values(
+                false,
+                Some(&top_level),
+                2,
+                4,
+                true,
+                true,
+                4,
+            )
+        );
+        assert!(
+            !top_level_multi_http_failed_direct_ip_bitswap_fallback_allows_from_values(
+                true, None, 2, 4, true, true, 4,
+            )
+        );
+        assert!(
+            !top_level_multi_http_failed_direct_ip_bitswap_fallback_allows_from_values(
+                true,
+                Some(&subresource),
+                2,
+                4,
+                true,
+                true,
+                4,
+            )
+        );
+        assert!(
+            !top_level_multi_http_failed_direct_ip_bitswap_fallback_allows_from_values(
+                true,
+                Some(&top_level),
+                1,
+                4,
+                true,
+                true,
+                4,
+            )
+        );
+        assert!(
+            !top_level_multi_http_failed_direct_ip_bitswap_fallback_allows_from_values(
+                true,
+                Some(&top_level),
+                2,
+                3,
+                true,
+                true,
+                4,
+            )
+        );
+        assert!(
+            !top_level_multi_http_failed_direct_ip_bitswap_fallback_allows_from_values(
+                true,
+                Some(&top_level),
+                2,
+                4,
+                false,
+                true,
+                4,
+            )
+        );
+        assert!(
+            !top_level_multi_http_failed_direct_ip_bitswap_fallback_allows_from_values(
+                true,
+                Some(&top_level),
+                2,
+                4,
+                true,
+                false,
+                4,
+            )
+        );
+    }
+
+    #[test]
+    fn top_level_multi_http_failed_direct_ip_min_provider_override_is_validated() {
+        assert_eq!(
+            top_level_multi_http_failed_direct_ip_bitswap_min_providers_from_env_value(None),
+            TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS
+        );
+        assert_eq!(
+            top_level_multi_http_failed_direct_ip_bitswap_min_providers_from_env_value(Some("8")),
+            8
+        );
+        assert_eq!(
+            top_level_multi_http_failed_direct_ip_bitswap_min_providers_from_env_value(Some("0")),
+            TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS
+        );
+        assert_eq!(
+            top_level_multi_http_failed_direct_ip_bitswap_min_providers_from_env_value(Some("bad")),
+            TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS
+        );
+    }
+
+    #[test]
     fn zero_http_post_lookup_dns_prefetch_gate_is_narrow() {
         let top_level = RetrievalRequestContext::gateway_request_with_top_level(
             None,
@@ -11615,6 +12130,95 @@ mod bitswap_tests {
             .unwrap();
         bitswap_swarm.abort();
         http_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn top_level_multi_http_failed_direct_ip_fallback_uses_bitswap() {
+        let expected = b"verified top-level multi HTTP failed direct-IP Bitswap fallback block";
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, expected);
+        let failing_http_requests = Arc::new(AtomicU64::new(0));
+        let slow_http_requests = Arc::new(AtomicU64::new(0));
+        let (failing_http_addr, failing_http_task) = spawn_sequenced_status_http_provider(
+            expected.to_vec(),
+            std::collections::VecDeque::from([500]),
+            failing_http_requests.clone(),
+        )
+        .await;
+        let (slow_http_addr, slow_http_task) = spawn_counting_http_provider(
+            expected.to_vec(),
+            Duration::from_secs(5),
+            slow_http_requests.clone(),
+        )
+        .await;
+        let (peer_id, bitswap_addr, bitswap_swarm, bitswap_stream) =
+            spawn_local_bitswap_peer(cid, expected.to_vec()).await;
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let mut providers = vec![
+            Provider::from_parts(
+                None,
+                vec![format!(
+                    "/ip4/{}/tcp/{}/http",
+                    failing_http_addr.ip(),
+                    failing_http_addr.port()
+                )],
+            )
+            .unwrap(),
+            Provider::from_parts(
+                None,
+                vec![format!(
+                    "/ip4/{}/tcp/{}/http",
+                    slow_http_addr.ip(),
+                    slow_http_addr.port()
+                )],
+            )
+            .unwrap(),
+            Provider::from_parts(Some(peer_id.to_string()), vec![bitswap_addr.to_string()])
+                .unwrap(),
+        ];
+        for _ in providers.len()..TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS {
+            let filler_peer = libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id();
+            providers
+                .push(Provider::from_parts(Some(filler_peer.to_string()), Vec::new()).unwrap());
+        }
+
+        let context = RetrievalRequestContext::gateway_request_with_top_level(
+            None,
+            Some("/ipfs/example".to_string()),
+        );
+        let (block, source) = tokio::time::timeout(
+            Duration::from_secs(3),
+            retriever.fetch_from_providers_with_source_with_options(
+                &cid,
+                &providers,
+                Some(context),
+                ProviderFetchOptions {
+                    top_level_multi_http_failed_direct_ip_bitswap_fallback: true,
+                    ..ProviderFetchOptions::default()
+                },
+            ),
+        )
+        .await
+        .expect("multi-HTTP direct-IP fallback should beat the slow HTTP provider")
+        .unwrap();
+
+        assert_eq!(source, RetrievalSource::Bitswap);
+        assert_eq!(block.data(), expected);
+        assert_eq!(failing_http_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(slow_http_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
+        tokio::time::timeout(Duration::from_secs(5), bitswap_stream)
+            .await
+            .unwrap()
+            .unwrap();
+        bitswap_swarm.abort();
+        failing_http_task.abort();
+        slow_http_task.abort();
     }
 
     #[tokio::test]

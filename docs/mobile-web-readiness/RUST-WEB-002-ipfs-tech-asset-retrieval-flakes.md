@@ -37005,3 +37005,192 @@ generic zero-HTTP grace or direct-`WANT_BLOCK` experiment from this evidence.
 The next useful hypothesis should target one of the current shapes directly:
 slow single/multi HTTP-provider leaves after a failing provider, or
 page-scoped source quality for the recurring `ipfs.tech` zero-HTTP child CIDs.
+
+## 2026-05-07 Lab: Top-Level Multi-HTTP Failed Direct-IP Bitswap Fallback
+
+Purpose:
+
+Target the new Wikipedia `/index.html` shape found in the broad corpus: a
+top-level follow-on block with many providers, two HTTP providers,
+`f010479.twinquasar.io` failing quickly with HTTP `500`, and
+`ipfs-bridge.sia.dev` succeeding only after roughly `620ms`. The hypothesis was
+that after the first HTTP provider fails, a narrowly scoped direct-IP Bitswap
+race might beat the remaining slow HTTP provider without changing subresource
+fanout.
+
+Implementation:
+
+- Added an opt-in env gate:
+  `FREEDOM_IPFS_ENABLE_TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK=1`.
+- Added a threshold override:
+  `FREEDOM_IPFS_TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS=<n>`;
+  default is `32`.
+- Gate requires a top-level gateway request, more than one HTTP provider, enough
+  total providers, at least one Bitswap candidate, and at least one direct-IP
+  Bitswap candidate.
+- The fallback is armed before the HTTP race, but direct-IP Bitswap starts only
+  after the first HTTP provider failure. HTTP providers remain in the race.
+- Default behavior is unchanged unless the env var is set.
+- Added trace phases:
+  `top_level_multi_http_failed_direct_ip_bitswap_fallback_gate`,
+  `top_level_multi_http_failed_direct_ip_bitswap_fallback_start`, and
+  `top_level_multi_http_failed_direct_ip_bitswap_fallback_result`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval top_level_multi_http_failed_direct_ip --lib
+cargo test -p freedom-ipfs-retrieval --lib
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Results:
+
+- Focused fallback tests passed: `3 passed`.
+- Full retrieval lib tests passed: `134 passed`, `1 ignored`.
+- Formatting passed.
+- Clippy passed with `-D warnings`.
+
+Baseline command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 360 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/multi-http-failed-direct-ip-baseline-r5-20260507T181358Z-trace.jsonl \
+  --comparison-output /tmp/multi-http-failed-direct-ip-baseline-r5-20260507T181358Z.json
+```
+
+Baseline result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `1277/1426ms`; Kubo `2925/3223ms`.
+- Vitalik range: Rust `111/118ms`; Kubo `1666/3521ms`.
+- `ipfs.tech` root range: Rust `728/1299ms`; Kubo `1156/2336ms`.
+- `ipfs.tech` page assets: root Rust `3/3ms` vs Kubo `2/6ms`; assets Rust
+  `132/442ms` vs Kubo `348/456ms`.
+- Wikipedia root: Rust `417/682ms`; Kubo `706/744ms`.
+- Resource max: Rust `51968KiB` RSS and `40` FDs vs Kubo `208580KiB`
+  RSS and `272` FDs.
+- Trace summary: HTTP provider fetches `122`, successes `120`, failures `2`;
+  HTTP block p50/p95/max `183/556/790ms`; Bitswap block p50/p95/max
+  `99/505/1042ms`.
+- The slowest Rust requests were again mostly zero-HTTP `ipfs.tech` child
+  Bitswap tails, including `_nuxt/DBHrpFkY.js` around `1026-1044ms`.
+
+Opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK=1 \
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 360 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/multi-http-failed-direct-ip-optin-r5-20260507T181358Z-trace.jsonl \
+  --comparison-output /tmp/multi-http-failed-direct-ip-optin-r5-20260507T181358Z.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `1251/1529ms`; Kubo `3142/3286ms`.
+- Vitalik range: Rust `106/122ms`; Kubo `1706/3531ms`.
+- `ipfs.tech` root range: Rust `603/804ms`; Kubo `1061/1256ms`.
+- `ipfs.tech` page assets: root Rust `3/3ms` vs Kubo `2/2ms`; assets Rust
+  `96/266ms` vs Kubo `362/452ms`.
+- Wikipedia root: Rust `387/548ms`; Kubo `729/742ms`.
+- Resource max: Rust `51256KiB` RSS and `36` FDs vs Kubo `157760KiB`
+  RSS and `258` FDs.
+- Trace summary: HTTP provider fetches `95`, successes `94`, failures `1`;
+  HTTP block p50/p95/max `121/575/639ms`; Bitswap block p50/p95/max
+  `80/295/875ms`.
+
+Opt-in trace finding:
+
+- The new gate fired on the intended live shape for process `2389283`,
+  request/progress `185`, path `/ipns/en.wikipedia-on-ipfs.org`, CID
+  `bafkreicr5w6i2f3m664a2fnl4vhtg3s6dhhk6n5hrf3gqzcf7v5bu6b7te`.
+- Delegated routing returned `64` providers and `2` HTTP providers.
+- `f010479.twinquasar.io` failed with HTTP `500` at about `58ms`.
+- `top_level_multi_http_failed_direct_ip_bitswap_fallback_start` fired at
+  about `60ms`.
+- Direct-IP Bitswap provider expansion took about `38ms`; trace reported
+  `direct_ip_candidate_only=true`, `direct_ip_candidate_skipped_addr_count=1174`,
+  and `peer_count=16`.
+- `ipfs-bridge.sia.dev` still won at about `188ms`, before direct-IP Bitswap
+  delivered. The result phase reported `source=http_provider` and
+  `direct_ip_bitswap_started=true`; Bitswap cancellation followed.
+
+Post-control command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 360 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/multi-http-failed-direct-ip-post-control-r5-20260507T181358Z-trace.jsonl \
+  --comparison-output /tmp/multi-http-failed-direct-ip-post-control-r5-20260507T181358Z.json
+```
+
+Post-control result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `1297/1317ms`; Kubo `2831/7000ms`.
+- Vitalik range: Rust `107/119ms`; Kubo `1558/2821ms`.
+- `ipfs.tech` root range: Rust `642/816ms`; Kubo `984/1887ms`.
+- `ipfs.tech` page assets: root Rust `3/6ms` vs Kubo `2/9ms`; assets Rust
+  `48/143ms` vs Kubo `357/601ms`.
+- Wikipedia root: Rust `514/733ms`; Kubo `418/763ms`.
+- Resource max: Rust `52820KiB` RSS and `34` FDs vs Kubo `259268KiB`
+  RSS and `399` FDs.
+- Trace summary: HTTP provider fetches `39`, successes `39`, failures `0`;
+  HTTP block p50/p95/max `234/596/597ms`; Bitswap block p50/p95/max
+  `43/268/1021ms`.
+- No `f010479.twinquasar.io` failure reproduced in this post-control window.
+  The slowest Rust requests were again zero-HTTP `ipfs.tech` child Bitswap
+  requests, especially `_nuxt/DBHrpFkY.js`.
+
+Decision:
+
+Keep as a disabled lab. Do not promote. The unit test proves the mechanism can
+win against a slow remaining HTTP provider after a fast HTTP failure, and the
+live opt-in trace confirms the branch starts on the exact Wikipedia
+`f010479`-failure shape. But in the same live sample, the remaining HTTP
+provider still won at `189ms`, and the post-control shifted enough that the
+opt-in improvement cannot be attributed causally. The current recurring Kubo
+gap is more often the zero-HTTP `ipfs.tech` child Bitswap tail, so the next
+experiment should focus on page-scoped source quality or peer reuse for those
+child CIDs unless fresh same-window traces repeatedly show slow
+`ipfs-bridge.sia.dev` after fast `f010479` failures.
