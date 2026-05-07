@@ -37537,3 +37537,111 @@ the current p95 tail. It adds timeout probe work and still falls back to a slow
 block request from the same peer. Keep the existing env knob as a diagnostic
 only, and do not continue the static trusted-direct width family unless a new
 trace shows a materially different source-selection shape.
+
+### Revert: Zero-HTTP Post-Lookup Session-Peer Demotion Lab
+
+Hypothesis:
+
+The compact meaningful-Kubo-win baseline showed a top-level Wikipedia
+zero-HTTP root block where the zero-HTTP DNS-prefetch path fired, but the
+provider Bitswap fetch still promoted the same recent cross-top-level session
+peer to candidate index `0`; that peer delivered only after about `1.8s`. A
+disabled lab briefly tested whether, after the `100ms` post-lookup shortcut wait
+timed out, provider Bitswap should skip successful-peer/session preference for
+that one zero-HTTP prefetch fetch.
+
+Temporary code:
+
+- Added a disabled env:
+  `FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_DEMOTE_SESSION_PEERS=1`.
+- When enabled, only the zero-HTTP post-lookup DNS-prefetch path after a
+  shortcut wait timeout used provider Bitswap without applying successful
+  Bitswap peer scores or inserting recent session peers.
+- Added a trace marker:
+  `bitswap_successful_peer_preference_skip`.
+- Default behavior was unchanged while the temporary code existed.
+
+Focused unit validation while the temporary code existed:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval zero_http_post_lookup --lib -- --nocapture
+```
+
+Validation result:
+
+- Formatting passed.
+- Focused zero-HTTP tests passed: `4 passed`.
+
+Compact opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_DEMOTE_SESSION_PEERS=1 \
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-page-assets-cid-direct \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/zero-http-demote-session-compact-r5-20260507T185814Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-demote-session-compact-r5-20260507T185814Z.json
+```
+
+Compact opt-in result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `289/494ms`; Kubo `1228/2294ms`.
+- Vitalik range: Rust `108/123ms`; Kubo `3216/3456ms`.
+- `ipfs.tech` page root: Rust `868/1098ms`; Kubo `958/1603ms`.
+- `ipfs.tech` page assets: Rust `180/500ms`; Kubo `394/816ms`.
+- Wikipedia root remained a p95 Kubo win: Rust `248/1233ms`; Kubo `457/753ms`.
+- Resource max: Rust `59684KiB` RSS and `39` FDs vs Kubo `152596KiB`
+  RSS and `123` FDs.
+- The temporary hook did not fire: there were no
+  `zero_http_post_lookup_dns_prefetch_*` or
+  `bitswap_successful_peer_preference_skip` events.
+- The slow Wikipedia shape moved to a different bottleneck: the follow-on
+  `/index.html` block used a slow session shortcut around `1019ms`.
+
+Focused opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_DEMOTE_SESSION_PEERS=1 \
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/zero-http-demote-session-focused-r10-20260507T190016Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-demote-session-focused-r10-20260507T190016Z.json
+```
+
+Focused opt-in result:
+
+- Rust and Kubo passed `10/10`.
+- `ipfs.tech` page root: Rust `614/988ms`; Kubo `1460/7869ms`.
+- `ipfs.tech` page assets: Rust `195/479ms`; Kubo `122/1065ms`.
+- Wikipedia root: Rust `290/705ms`; Kubo `243/727ms`.
+- Resource max: Rust `57860KiB` RSS and `38` FDs vs Kubo `307896KiB`
+  RSS and `350` FDs.
+- `meaningful_kubo_wins` shifted to `ipfs.tech` asset median:
+  Rust `195ms` vs Kubo `122ms`.
+- The temporary hook still did not fire; no zero-HTTP post-lookup DNS-prefetch
+  events appeared in the trace.
+
+Decision:
+
+Revert the temporary code. The idea directly targeted the previous slow trace,
+but two live opt-in runs did not exercise the new gate at all, so keeping
+another disabled lab hook would add future-agent confusion without evidence.
+The remaining actionable signal is that Kubo-win windows are now moving between
+Wikipedia root p95 and `ipfs.tech` asset median depending on public-network
+provider timing. Continue using `meaningful_kubo_wins` and avoid speculative
+session-peer demotion unless a fresh trace repeatedly reproduces the exact
+zero-HTTP prefetch-plus-slow-candidate-0 shape.
