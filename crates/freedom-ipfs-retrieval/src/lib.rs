@@ -81,7 +81,7 @@ const BITSWAP_CONNECTION_READY_TIMEOUT_MS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_CONNECTION_READY_TIMEOUT_MS";
 // Keep WANT_HAVE as a short peer-selection probe; slow probes otherwise sit
 // directly on the gateway TTFB path before we request the block.
-const BITSWAP_WANT_HAVE_TIMEOUT: Duration = Duration::from_millis(750);
+const BITSWAP_WANT_HAVE_TIMEOUT: Duration = Duration::from_millis(500);
 const BITSWAP_WANT_HAVE_TIMEOUT_MS_ENV: &str = "FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS";
 const BITSWAP_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(6);
 const BITSWAP_SINGLE_UNTRUSTED_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(3);

@@ -40106,3 +40106,125 @@ Next agent guidance:
 - Do not use this knob as a broad direct-`WANT_BLOCK` substitute. The useful
   signal was clipping stuck `WANT_HAVE` probes while preserving normal peer
   selection behavior.
+
+## 2026-05-07: Promote 500ms Bitswap WANT_HAVE Default
+
+Branch:
+
+- `codex/kubo-session-performance-20260506`
+- Base before this promotion patch: `b459641`
+
+Question:
+
+The first `250ms` lab result was promising in a focused two-case r10, but the
+guardrail evidence was mixed. A broader sweep should answer whether the default
+`750ms` `WANT_HAVE` timeout is still too long and whether a less aggressive
+`500ms` default closes the active Wikipedia zero-HTTP tail without over-fanning
+Bitswap on mobile.
+
+Change:
+
+- Promote the default Bitswap `WANT_HAVE` timeout from `750ms` to `500ms`.
+- Keep `FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS=<ms>` as the rollback and
+  tuning override. Setting it to `750` restores the previous default behavior.
+
+Common live command shape:
+
+```sh
+FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS=<candidate> timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/<run-id>-trace.jsonl \
+  --comparison-output /tmp/<run-id>.json
+```
+
+For the no-env controls, omit `FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS`.
+
+Sweep artifacts:
+
+| Run | Env | Comparison | Trace |
+| --- | --- | --- | --- |
+| initial control | no env | `/tmp/want-have-sweep-control-r10-20260507T220721Z.json` | `/tmp/want-have-sweep-control-r10-20260507T220721Z-trace.jsonl` |
+| 250ms | `FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS=250` | `/tmp/want-have-sweep-250-r10-20260507T221007Z.json` | `/tmp/want-have-sweep-250-r10-20260507T221007Z-trace.jsonl` |
+| 350ms | `FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS=350` | `/tmp/want-have-sweep-350-r10-20260507T221237Z.json` | `/tmp/want-have-sweep-350-r10-20260507T221237Z-trace.jsonl` |
+| 500ms | `FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS=500` | `/tmp/want-have-sweep-500-r10-20260507T221447Z.json` | `/tmp/want-have-sweep-500-r10-20260507T221447Z-trace.jsonl` |
+| post-control | no env | `/tmp/want-have-sweep-postcontrol-r10-20260507T221747Z.json` | `/tmp/want-have-sweep-postcontrol-r10-20260507T221747Z-trace.jsonl` |
+| 500ms confirmation | `FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS=500` | `/tmp/want-have-sweep-500-confirm-r10-20260507T221950Z.json` | `/tmp/want-have-sweep-500-confirm-r10-20260507T221950Z-trace.jsonl` |
+
+Sweep summary:
+
+| Run | Meaningful Kubo wins | Rust RSS/FD max | `ipfs.tech` root p50/p95 vs Kubo | `ipfs.tech` assets p50/p95 vs Kubo | Wikipedia root p50/p95 vs Kubo | Bitswap p50/p95/max | Zero-HTTP p50/p95/max |
+| --- | ---: | ---: | --- | --- | --- | --- | --- |
+| initial control | `4` | `60624KiB` / `40` | `506/1442ms` vs `1477/2469ms` | `192/478ms` vs `255/711ms` | `2487/2598ms` vs `416/780ms` | `366/2201/2247ms` | `2468/2596/2596ms` |
+| 250ms | `4` | `59356KiB` / `38` | `472/698ms` vs `717/2837ms` | `197/460ms` vs `346/745ms` | `2472/2559ms` vs `662/700ms` | `363/2207/2212ms` | `2470/2558/2558ms` |
+| 350ms | `4` | `60080KiB` / `48` | `526/872ms` vs `1455/1894ms` | `138/388ms` vs `131/693ms` | `428/2464ms` vs `82/718ms` | `126/339/2126ms` | `507/869/2462ms` |
+| 500ms | `0` | `60256KiB` / `50` | `534/566ms` vs `1474/1855ms` | `132/291ms` vs `159/582ms` | `197/671ms` vs `308/1121ms` | `129/281/541ms` | `410/564/669ms` |
+| post-control | `4` | `61112KiB` / `52` | `592/952ms` vs `1421/1939ms` | `144/451ms` vs `121/468ms` | `519/943ms` vs `374/786ms` | `139/438/830ms` | `517/941/950ms` |
+| 500ms confirmation | `2` | `61304KiB` / `53` | `573/652ms` vs `772/1448ms` | `124/291ms` vs `368/798ms` | `208/861ms` vs `482/711ms` | `113/308/1032ms` | `257/650/1035ms` |
+
+Trace interpretation:
+
+- The initial no-env control reproduced the active gap: Wikipedia root clustered
+  around `2.5s`, and zero-HTTP Bitswap requests had p50/p95/max
+  `2468/2596/2596ms`.
+- `250ms` did not help in this broader r10. It still produced the same
+  `~2.5s` Wikipedia and zero-HTTP shape.
+- `350ms` changed the source-selection shape and improved the median, but one
+  Wikipedia tail remained at `2464ms`.
+- The first `500ms` r10 was the strongest run: no meaningful Kubo wins, zero
+  long `WANT_HAVE` tail, zero-HTTP p95 down to `564ms`, and Bitswap p95 down to
+  `281ms`.
+- The no-env post-control showed the network had improved from the initial
+  control, but it still left four Wikipedia Kubo wins and a worse Rust
+  Wikipedia p50/p95 (`519/943ms`) than the preceding 500ms run
+  (`197/671ms`).
+- The immediate 500ms confirmation was not perfect: Wikipedia p95 still lost to
+  Kubo by about `150ms`, and one `ipfs.tech` path-local asset tail hit
+  `1037ms`. It still kept aggregate `ipfs.tech`, DAICO, Vitalik, and Wikipedia
+  median ahead of Kubo, and it improved the Wikipedia median/tail versus the
+  post-control while preserving a large RSS/FD advantage.
+
+Validation after promotion:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval bitswap_want_have_timeout_parses_optional_override -- --nocapture
+cargo test -p freedom-ipfs-retrieval want_have_probe_falls_back_to_want_block_quickly -- --nocapture
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Result:
+
+- Formatting passed.
+- The timeout parser test passed with the new `500ms` default.
+- The `WANT_HAVE` fallback behavior test passed.
+- Retrieval clippy passed with `-D warnings`.
+
+Decision:
+
+Promote `500ms` as the default Bitswap `WANT_HAVE` timeout. This is not the end
+of the Wikipedia work, but it is a better mobile default than `750ms`: the r10
+sweep and confirmation consistently reduced the zero-HTTP/Bitswap tail while
+keeping Rust far below Kubo's RSS and FD footprint.
+
+Next agent guidance:
+
+- Treat `500ms` as the current default, not as proof the remaining gap is
+  solved.
+- Keep watching Wikipedia p95 and path-local `ipfs.tech` asset p95. The
+  remaining failures now look less like a pure probe-timeout issue and more like
+  candidate peer quality, warm session peer choice, and per-CID zero-HTTP
+  fallback scheduling.
+- If this default regresses a future broader corpus, restore the old value with
+  `FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS=750` and compare same-window
+  traces before reverting the code.
