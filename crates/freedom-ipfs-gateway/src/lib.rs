@@ -182,6 +182,7 @@ pub struct GatewayConfig {
     small_body_cache_max_bytes: usize,
     html_prefetch: GatewayHtmlPrefetchConfig,
     html_range_warm: GatewayHtmlRangeWarmConfig,
+    raw_link_tsize_fast_headers: bool,
 }
 
 impl GatewayConfig {
@@ -192,6 +193,7 @@ impl GatewayConfig {
             small_body_cache_max_bytes: DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
             html_prefetch: GatewayHtmlPrefetchConfig::default(),
             html_range_warm: GatewayHtmlRangeWarmConfig::default(),
+            raw_link_tsize_fast_headers: false,
         }
     }
 
@@ -232,6 +234,15 @@ impl GatewayConfig {
 
     pub fn with_html_range_warm(mut self, html_range_warm: GatewayHtmlRangeWarmConfig) -> Self {
         self.html_range_warm = html_range_warm;
+        self
+    }
+
+    pub fn raw_link_tsize_fast_headers(&self) -> bool {
+        self.raw_link_tsize_fast_headers
+    }
+
+    pub fn with_raw_link_tsize_fast_headers(mut self, enabled: bool) -> Self {
+        self.raw_link_tsize_fast_headers = enabled;
         self
     }
 }
@@ -376,6 +387,7 @@ pub struct GatewayState {
     small_body_cache: Arc<SmallBodyCache>,
     html_prefetch: HtmlPrefetchRuntime,
     html_range_warm: HtmlRangeWarmRuntime,
+    raw_link_tsize_fast_headers: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -436,6 +448,7 @@ impl GatewayState {
             small_body_cache: Arc::new(SmallBodyCache::new(config.small_body_cache_max_bytes())),
             html_prefetch: HtmlPrefetchRuntime::new(config.html_prefetch()),
             html_range_warm: HtmlRangeWarmRuntime::new(config.html_range_warm()),
+            raw_link_tsize_fast_headers: config.raw_link_tsize_fast_headers(),
         }
     }
 }
@@ -685,6 +698,7 @@ async fn ipfs_get(
                 headers.get(RANGE),
                 parent_request_id,
             ),
+            raw_link_tsize_fast_headers: state.raw_link_tsize_fast_headers,
         };
         let response = with_retrieval_request_context(retrieval_context, async {
             match serve_ipfs_path(
@@ -784,6 +798,7 @@ async fn ipns_get(
                 headers.get(RANGE),
                 parent_request_id,
             ),
+            raw_link_tsize_fast_headers: state.raw_link_tsize_fast_headers,
         };
         let response = with_retrieval_request_context(retrieval_context, async {
             match serve_ipns_path(
@@ -924,6 +939,7 @@ struct GatewayResponseFeatures {
     small_body_cache: Arc<SmallBodyCache>,
     html_prefetch: Option<HtmlPrefetchRuntime>,
     html_range_warm: Option<HtmlRangeWarmRuntime>,
+    raw_link_tsize_fast_headers: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -985,7 +1001,13 @@ async fn serve_ipfs_path_with_listing_path(
 
     let cache_before = unixfs.metadata_cache_stats();
     let resource_started = Instant::now();
-    let resource = served_resource(&unixfs, provider.as_ref(), &cid, unixfs_path)?;
+    let resource = served_resource(
+        &unixfs,
+        provider.as_ref(),
+        &cid,
+        unixfs_path,
+        features.raw_link_tsize_fast_headers && !request_headers.is_head,
+    )?;
     let resource_elapsed_ms = resource_started.elapsed().as_millis();
     let response = match resource {
         ServedResource::File {
@@ -1923,6 +1945,41 @@ enum ServedResource {
     },
 }
 
+fn resolve_served_path(
+    unixfs: &UnixfsResolver,
+    provider: &dyn BlockProvider,
+    cid: &Cid,
+    unixfs_path: &str,
+    raw_link_tsize_fast_headers: bool,
+) -> Result<(freedom_ipfs_unixfs::ResolvedNode, Option<u64>), GatewayError> {
+    if raw_link_tsize_fast_headers {
+        return unixfs
+            .resolve_path_with_raw_link_tsize_hint(provider, cid, unixfs_path)
+            .map_err(GatewayError::Unixfs);
+    }
+
+    unixfs
+        .resolve_path(provider, cid, unixfs_path)
+        .map(|resolved| (resolved, None))
+        .map_err(GatewayError::Unixfs)
+}
+
+fn file_size_with_optional_hint(
+    unixfs: &UnixfsResolver,
+    provider: &dyn BlockProvider,
+    cid: &Cid,
+    size_hint: Option<u64>,
+) -> Result<(u64, &'static str), GatewayError> {
+    if let Some(size_hint) = size_hint {
+        return Ok((size_hint, "raw_link_tsize"));
+    }
+
+    unixfs
+        .file_size_cid(provider, cid)
+        .map(|size| (size, "unixfs_file_size"))
+        .map_err(GatewayError::Unixfs)
+}
+
 struct DirectoryListingPath {
     display: String,
     href_base: String,
@@ -1956,16 +2013,20 @@ fn served_resource(
     provider: &dyn BlockProvider,
     cid: &Cid,
     unixfs_path: &str,
+    raw_link_tsize_fast_headers: bool,
 ) -> Result<ServedResource, GatewayError> {
     let file_size_started = Instant::now();
-    let resolved = unixfs
-        .resolve_path(provider, cid, unixfs_path)
-        .map_err(GatewayError::Unixfs)?;
+    let (resolved, size_hint) = resolve_served_path(
+        unixfs,
+        provider,
+        cid,
+        unixfs_path,
+        raw_link_tsize_fast_headers,
+    )?;
     match resolved.kind {
         NodeKind::Raw | NodeKind::File => {
-            let len = unixfs
-                .file_size_cid(provider, &resolved.cid)
-                .map_err(GatewayError::Unixfs)?;
+            let (len, size_source) =
+                file_size_with_optional_hint(unixfs, provider, &resolved.cid, size_hint)?;
             tracing::info!(
                 phase = "unixfs_file_size",
                 cid = %cid,
@@ -1973,6 +2034,7 @@ fn served_resource(
                 unixfs_path,
                 outcome = "file",
                 file_len = len,
+                size_source,
                 elapsed_ms = file_size_started.elapsed().as_millis()
             );
             Ok(ServedResource::File {
@@ -1991,13 +2053,22 @@ fn served_resource(
             );
             let index_path = append_path(unixfs_path, "index.html");
             let index_started = Instant::now();
-            match unixfs.resolve_path(provider, cid, &index_path) {
-                Ok(index_resolved)
+            match resolve_served_path(
+                unixfs,
+                provider,
+                cid,
+                &index_path,
+                raw_link_tsize_fast_headers,
+            ) {
+                Ok((index_resolved, index_size_hint))
                     if matches!(index_resolved.kind, NodeKind::Raw | NodeKind::File) =>
                 {
-                    let len = unixfs
-                        .file_size_cid(provider, &index_resolved.cid)
-                        .map_err(GatewayError::Unixfs)?;
+                    let (len, size_source) = file_size_with_optional_hint(
+                        unixfs,
+                        provider,
+                        &index_resolved.cid,
+                        index_size_hint,
+                    )?;
                     tracing::info!(
                         phase = "unixfs_index_lookup",
                         cid = %cid,
@@ -2005,6 +2076,7 @@ fn served_resource(
                         unixfs_path = %index_path,
                         outcome = "file",
                         file_len = len,
+                        size_source,
                         elapsed_ms = index_started.elapsed().as_millis()
                     );
                     Ok(ServedResource::File {
@@ -2014,7 +2086,7 @@ fn served_resource(
                     })
                 }
                 Ok(_) => Err(GatewayError::Unixfs(UnixfsError::IsDirectory)),
-                Err(UnixfsError::PathNotFound(_)) => {
+                Err(GatewayError::Unixfs(UnixfsError::PathNotFound(_))) => {
                     tracing::info!(
                         phase = "unixfs_index_lookup",
                         cid = %cid,
@@ -2038,7 +2110,7 @@ fn served_resource(
                         entries,
                     })
                 }
-                Err(err) => Err(GatewayError::Unixfs(err)),
+                Err(err) => Err(err),
             }
         }
     }
@@ -3528,6 +3600,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ranged.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn raw_link_tsize_fast_headers_skip_pre_response_raw_leaf_fetch() {
+        let leaf_data = vec![b'a'; (GATEWAY_STREAM_CHUNK_SIZE + 17) as usize];
+        let leaf_cid = cid_from_data(CODEC_RAW, &leaf_data);
+        let dir_data = test_pb_directory(vec![TestPbLink {
+            tsize: Some(leaf_data.len() as u64),
+            ..test_link("app.js", &leaf_cid)
+        }]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_data);
+        let provider =
+            MultiCountingProvider::new(HashMap::from([(leaf_cid, leaf_data), (dir_cid, dir_data)]));
+        let unixfs = UnixfsResolver::with_metadata_cache_capacity(8);
+
+        let resource = served_resource(&unixfs, &provider, &dir_cid, "app.js", true).unwrap();
+
+        match resource {
+            ServedResource::File { cid, len, .. } => {
+                assert_eq!(cid, leaf_cid);
+                assert_eq!(len, GATEWAY_STREAM_CHUNK_SIZE + 17);
+            }
+            ServedResource::Directory { .. } => panic!("expected file resource"),
+        }
+        assert_eq!(provider.call_count(&dir_cid), 1);
+        assert_eq!(provider.call_count(&leaf_cid), 0);
+    }
+
+    #[test]
+    fn raw_link_tsize_fast_headers_stay_opt_in() {
+        let leaf_data = vec![b'a'; (GATEWAY_STREAM_CHUNK_SIZE + 17) as usize];
+        let leaf_cid = cid_from_data(CODEC_RAW, &leaf_data);
+        let dir_data = test_pb_directory(vec![TestPbLink {
+            tsize: Some(leaf_data.len() as u64),
+            ..test_link("app.js", &leaf_cid)
+        }]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_data);
+        let provider =
+            MultiCountingProvider::new(HashMap::from([(leaf_cid, leaf_data), (dir_cid, dir_data)]));
+        let unixfs = UnixfsResolver::with_metadata_cache_capacity(8);
+
+        let resource = served_resource(&unixfs, &provider, &dir_cid, "app.js", false).unwrap();
+
+        assert!(matches!(resource, ServedResource::File { .. }));
+        assert_eq!(provider.call_count(&dir_cid), 1);
+        assert_eq!(provider.call_count(&leaf_cid), 2);
     }
 
     #[tokio::test]

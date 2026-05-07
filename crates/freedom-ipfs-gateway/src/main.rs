@@ -32,6 +32,7 @@ const HTML_PREFETCH_MAX_BYTES_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MA
 const HTML_PREFETCH_CONCURRENCY_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_CONCURRENCY";
 const HTML_RANGE_WARM_MAX_BYTES_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_RANGE_WARM_MAX_BYTES";
 const HTML_RANGE_WARM_CONCURRENCY_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_RANGE_WARM_CONCURRENCY";
+const RAW_LINK_TSIZE_FAST_HEADERS_ENV: &str = "FREEDOM_IPFS_ENABLE_RAW_LINK_TSIZE_FAST_HEADERS";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Local Freedom IPFS gateway")]
@@ -111,7 +112,8 @@ async fn main() -> Result<()> {
     let gateway_config = GatewayConfig::new(args.max_concurrent_requests)
         .with_small_body_cache_max_bytes(args.small_body_cache_max_bytes)
         .with_html_prefetch(gateway_html_prefetch_config())
-        .with_html_range_warm(gateway_html_range_warm_config());
+        .with_html_range_warm(gateway_html_range_warm_config())
+        .with_raw_link_tsize_fast_headers(raw_link_tsize_fast_headers_enabled());
     let router = if start_online_gateway {
         let delegated_routers = args.delegated_router.clone();
         let delegated_router_endpoints = delegated_router_endpoints(&delegated_routers);
@@ -217,6 +219,10 @@ fn gateway_html_range_warm_config() -> GatewayHtmlRangeWarmConfig {
     let max_bytes = env_u64(HTML_RANGE_WARM_MAX_BYTES_ENV, 0);
     let concurrency = env_usize(HTML_RANGE_WARM_CONCURRENCY_ENV, 1);
     GatewayHtmlRangeWarmConfig::new(max_bytes, concurrency)
+}
+
+fn raw_link_tsize_fast_headers_enabled() -> bool {
+    std::env::var_os(RAW_LINK_TSIZE_FAST_HEADERS_ENV).is_some()
 }
 
 fn env_usize(name: &str, default: usize) -> usize {

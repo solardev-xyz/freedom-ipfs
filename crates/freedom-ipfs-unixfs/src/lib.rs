@@ -105,6 +105,12 @@ pub struct DirectoryEntry {
     pub size: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LinkTarget {
+    cid: Cid,
+    size: Option<u64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct UnixfsResolver {
     metadata_cache: Arc<UnixfsMetadataCache>,
@@ -140,6 +146,16 @@ impl UnixfsResolver {
         path: &str,
     ) -> Result<ResolvedNode> {
         UnixfsContext::cached(provider, &self.metadata_cache).resolve_path(root, path)
+    }
+
+    pub fn resolve_path_with_raw_link_tsize_hint(
+        &self,
+        provider: &dyn BlockProvider,
+        root: &Cid,
+        path: &str,
+    ) -> Result<(ResolvedNode, Option<u64>)> {
+        UnixfsContext::cached(provider, &self.metadata_cache)
+            .resolve_path_with_raw_link_tsize_hint(root, path)
     }
 
     pub fn read_file(
@@ -533,6 +549,44 @@ impl<'a> UnixfsContext<'a> {
         Ok(resolved)
     }
 
+    fn resolve_path_with_raw_link_tsize_hint(
+        &self,
+        root: &Cid,
+        path: &str,
+    ) -> Result<(ResolvedNode, Option<u64>)> {
+        let mut current = LinkTarget {
+            cid: *root,
+            size: None,
+        };
+        let mut segments = path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .peekable();
+
+        if segments.peek().is_none() {
+            return self.classify_with_raw_link_tsize_hint(&current);
+        }
+
+        for segment in segments {
+            if current.cid.codec() != CODEC_DAG_PB {
+                self.get_block(&current.cid)?;
+                return Err(UnixfsError::NotDirectory);
+            }
+
+            let decoded = self.dag_pb(&current.cid)?;
+            current = match decoded.kind {
+                DataType::Directory => find_link_target(&decoded.node, segment)?
+                    .ok_or_else(|| UnixfsError::PathNotFound(segment.to_string()))?,
+                DataType::HamtShard => self
+                    .find_hamt_link_target(&decoded.node, &decoded.data, segment)?
+                    .ok_or_else(|| UnixfsError::PathNotFound(segment.to_string()))?,
+                _ => return Err(UnixfsError::NotDirectory),
+            };
+        }
+
+        self.classify_with_raw_link_tsize_hint(&current)
+    }
+
     fn resolve_path_uncached(&self, root: &Cid, path: &str) -> Result<ResolvedNode> {
         let mut current = *root;
         let mut segments = path
@@ -856,6 +910,53 @@ impl UnixfsContext<'_> {
         Ok(ResolvedNode { cid: *cid, kind })
     }
 
+    fn classify_with_raw_link_tsize_hint(
+        &self,
+        target: &LinkTarget,
+    ) -> Result<(ResolvedNode, Option<u64>)> {
+        match target.cid.codec() {
+            CODEC_RAW => {
+                if let Some(size) = target.size.filter(|size| *size > 0) {
+                    return Ok((
+                        ResolvedNode {
+                            cid: target.cid,
+                            kind: NodeKind::Raw,
+                        },
+                        Some(size),
+                    ));
+                }
+
+                self.get_block(&target.cid)?;
+                Ok((
+                    ResolvedNode {
+                        cid: target.cid,
+                        kind: NodeKind::Raw,
+                    },
+                    None,
+                ))
+            }
+            CODEC_DAG_PB => {
+                let kind = match self.dag_pb(&target.cid)?.kind {
+                    DataType::Raw | DataType::File => NodeKind::File,
+                    DataType::Directory => NodeKind::Directory,
+                    DataType::HamtShard => NodeKind::HamtShard,
+                    other => return Err(UnixfsError::UnsupportedNodeType(other as i32)),
+                };
+                Ok((
+                    ResolvedNode {
+                        cid: target.cid,
+                        kind,
+                    },
+                    None,
+                ))
+            }
+            _ => {
+                let block = self.get_block(&target.cid)?;
+                Err(UnixfsError::UnsupportedCodec(block.codec()))
+            }
+        }
+    }
+
     fn find_hamt_link(&self, node: &PbNode, data: &UnixfsData, name: &str) -> Result<Option<Cid>> {
         validate_hamt(data)?;
         let mut pending = Vec::new();
@@ -884,6 +985,45 @@ impl UnixfsContext<'_> {
             validate_hamt(&shard.data)?;
             if let Some(cid) = scan_hamt_links(&shard.node.links, name, &mut pending)? {
                 return Ok(Some(cid));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn find_hamt_link_target(
+        &self,
+        node: &PbNode,
+        data: &UnixfsData,
+        name: &str,
+    ) -> Result<Option<LinkTarget>> {
+        validate_hamt(data)?;
+        let mut pending = Vec::new();
+        if let Some(target) = scan_hamt_link_targets(&node.links, name, &mut pending)? {
+            return Ok(Some(target));
+        }
+
+        let mut visited = 0usize;
+        while let Some(cid) = pending.pop() {
+            visited += 1;
+            if visited > HAMT_MAX_SHARDS_VISITED {
+                return Err(UnixfsError::InvalidDagPb(format!(
+                    "HAMT traversal exceeded {HAMT_MAX_SHARDS_VISITED} shards"
+                )));
+            }
+            if cid.codec() != CODEC_DAG_PB {
+                return Err(UnixfsError::NotDirectory);
+            }
+
+            let shard = self.dag_pb(&cid)?;
+            if shard.kind != DataType::HamtShard {
+                return Err(UnixfsError::InvalidDagPb(
+                    "HAMT bucket link did not resolve to a HAMT shard".into(),
+                ));
+            }
+            validate_hamt(&shard.data)?;
+            if let Some(target) = scan_hamt_link_targets(&shard.node.links, name, &mut pending)? {
+                return Ok(Some(target));
             }
         }
 
@@ -982,6 +1122,14 @@ fn find_link(node: &PbNode, name: &str) -> Result<Option<Cid>> {
         .transpose()
 }
 
+fn find_link_target(node: &PbNode, name: &str) -> Result<Option<LinkTarget>> {
+    node.links
+        .iter()
+        .find(|link| link.name.as_deref() == Some(name))
+        .map(link_target)
+        .transpose()
+}
+
 fn validate_hamt(data: &UnixfsData) -> Result<()> {
     if data.hash_type != Some(HAMT_MURMUR3_X64_64) || data.fanout != Some(HAMT_FANOUT_256) {
         return Err(UnixfsError::InvalidDagPb(format!(
@@ -1012,6 +1160,34 @@ fn scan_hamt_links(links: &[PbLink], name: &str, pending: &mut Vec<Cid>) -> Resu
         }
     }
     Ok(None)
+}
+
+fn scan_hamt_link_targets(
+    links: &[PbLink],
+    name: &str,
+    pending: &mut Vec<Cid>,
+) -> Result<Option<LinkTarget>> {
+    for link in links {
+        let Some(link_name) = link.name.as_deref() else {
+            continue;
+        };
+        let link_name = link_name.as_bytes();
+        if link_name.len() == HAMT_LINK_PREFIX_LEN {
+            pending.push(link_cid(link)?);
+        } else if link_name.len() > HAMT_LINK_PREFIX_LEN
+            && &link_name[HAMT_LINK_PREFIX_LEN..] == name.as_bytes()
+        {
+            return link_target(link).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn link_target(link: &PbLink) -> Result<LinkTarget> {
+    Ok(LinkTarget {
+        cid: link_cid(link)?,
+        size: link.tsize,
+    })
 }
 
 fn link_cid(link: &PbLink) -> Result<Cid> {
@@ -1263,6 +1439,39 @@ mod tests {
                 ("beta.txt", beta_cid, Some(5))
             ]
         );
+    }
+
+    #[test]
+    fn raw_link_tsize_hint_resolves_without_reading_raw_leaf() {
+        let leaf_data = b"linked raw leaf";
+        let leaf_cid = cid_from_data(CODEC_RAW, leaf_data);
+        let dir_data = pb_directory(vec![PbLink {
+            tsize: Some(leaf_data.len() as u64),
+            ..link("app.js", &leaf_cid)
+        }]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_data);
+        let provider = CountingProvider::new(HashMap::from([
+            (leaf_cid, leaf_data.to_vec()),
+            (dir_cid, dir_data),
+        ]));
+        let resolver = UnixfsResolver::with_metadata_cache_capacity(8);
+
+        let (resolved, size_hint) = resolver
+            .resolve_path_with_raw_link_tsize_hint(&provider, &dir_cid, "app.js")
+            .unwrap();
+
+        assert_eq!(resolved.cid, leaf_cid);
+        assert_eq!(resolved.kind, NodeKind::Raw);
+        assert_eq!(size_hint, Some(leaf_data.len() as u64));
+        assert_eq!(provider.call_count(&dir_cid), 1);
+        assert_eq!(provider.call_count(&leaf_cid), 0);
+        assert_eq!(
+            resolver
+                .read_file_cid_range(&provider, &leaf_cid, 0, 5)
+                .unwrap(),
+            b"linked"
+        );
+        assert_eq!(provider.range_call_count(&leaf_cid), 1);
     }
 
     #[test]

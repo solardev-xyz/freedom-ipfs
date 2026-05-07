@@ -39071,3 +39071,152 @@ extra background provider work competes with foreground page requests and
 shifts the tail to later script/zero-HTTP paths. Keep HTML prefetch as a
 disabled lab control only; a future version would need a much stronger trigger
 than "first N assets from HTML."
+
+### Lab Control: Raw Link `Tsize` Fast Headers
+
+Hypothesis:
+
+For directory-linked raw assets, UnixFS DAG-PB links often carry `Tsize`.
+The gateway currently resolves the path, classifies the raw leaf, and calls
+`file_size_cid` before response headers can be sent. On large streamed assets,
+that can make TTFB include the full raw block fetch even though the verified
+body bytes are only needed once the response stream is polled. An opt-in gateway
+mode could trust a positive raw-link `Tsize` for `Content-Length`, send headers
+earlier for streamed raw leaves, and still verify bytes through the normal body
+stream/range fetch.
+
+Implementation:
+
+- Add `UnixfsResolver::resolve_path_with_raw_link_tsize_hint`.
+- Preserve the existing `resolve_path` semantics and path cache behavior.
+- The new resolver path reads directory/HAMT metadata, carries the selected
+  link's `Tsize`, and skips raw leaf classification only when the final CID is
+  `raw` and the link size is positive.
+- Add gateway config/env support:
+  `FREEDOM_IPFS_ENABLE_RAW_LINK_TSIZE_FAST_HEADERS=1`.
+- Keep the behavior default-off. HEAD requests still use the old pre-response
+  verification path.
+- Trace `size_source=raw_link_tsize` versus `size_source=unixfs_file_size`.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-unixfs raw_link_tsize_hint -- --nocapture
+cargo test -p freedom-ipfs-gateway raw_link_tsize_fast_headers -- --nocapture
+```
+
+Result:
+
+- Formatting passed.
+- UnixFS focused test passed and confirmed the raw leaf was not read during
+  hinted resolution.
+- Gateway focused tests passed and confirmed the feature is opt-in and skips
+  the pre-response raw leaf fetch only when enabled.
+
+No-env control:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/raw-link-tsize-control-r5-20260507T205949Z-trace.jsonl \
+  --comparison-output /tmp/raw-link-tsize-control-r5-20260507T205949Z.json
+```
+
+Control result:
+
+- Rust/Kubo passed `5/5` for both cases.
+- `ipfs.tech` page root: Rust `1030/1435ms`; Kubo `1744/2903ms`.
+- `ipfs.tech` page assets: Rust `193/489ms`; Kubo `108/364ms`.
+- Wikipedia root: Rust `789/823ms`; Kubo `183/1140ms`.
+- Resource max: Rust `59404KiB` RSS and `32` FDs vs Kubo `155556KiB`
+  RSS and `109` FDs.
+- `meaningful_kubo_wins`: `6`.
+- Trace showed `170` `unixfs_file_size`/`unixfs_index_lookup` events using
+  `size_source=unixfs_file_size`.
+- Largest path-local Kubo asset wins included:
+  - `_nuxt/entry.C4ErMpWu.css` p95 total/TTFB: Rust `1202/1201ms`,
+    Kubo `424/424ms`.
+  - `_nuxt/D9b_q90p.js` p95 total/TTFB: Rust `960/960ms`,
+    Kubo `333/332ms`.
+  - `_nuxt/8Bs0wEmG.js` p95 total/TTFB: Rust `824/824ms`,
+    Kubo `207/207ms`.
+
+Opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_RAW_LINK_TSIZE_FAST_HEADERS=1 \
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/raw-link-tsize-fastheaders-r5-20260507T205949Z-trace.jsonl \
+  --comparison-output /tmp/raw-link-tsize-fastheaders-r5-20260507T205949Z.json
+```
+
+Opt-in result:
+
+- Rust/Kubo passed `5/5` for both cases.
+- `ipfs.tech` page root: Rust `672/884ms`; Kubo `1464/2744ms`.
+- `ipfs.tech` page assets: Rust `197/455ms`; Kubo `108/236ms`.
+- Wikipedia root: Rust `847/879ms`; Kubo `202/408ms`.
+- Resource max: Rust `58844KiB` RSS and `31` FDs vs Kubo `209888KiB`
+  RSS and `144` FDs.
+- `meaningful_kubo_wins`: `8`.
+- Trace showed all `170` file-size/index events used
+  `size_source=raw_link_tsize`; file-size cache misses/inserts dropped to `0`.
+- Path-local Kubo wins got smaller on some former worst tails, but did not
+  disappear:
+  - `_nuxt/D9b_q90p.js` p95 total/TTFB: Rust `538/538ms`,
+    Kubo `208/208ms`.
+  - `_nuxt/ZT0_SuSb.js` p95 total/TTFB: Rust `455/455ms`,
+    Kubo `141/141ms`.
+  - `_nuxt/entry.C4ErMpWu.css` p95 total/TTFB: Rust `651/651ms`,
+    Kubo `365/365ms`.
+
+Immediate no-env post-control:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/raw-link-tsize-post-control-r5-20260507T205949Z-trace.jsonl \
+  --comparison-output /tmp/raw-link-tsize-post-control-r5-20260507T205949Z.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `5/5` for both cases.
+- `ipfs.tech` page root: Rust `1008/1362ms`; Kubo `2437/3047ms`.
+- `ipfs.tech` page assets: Rust `199/542ms`; Kubo `89/494ms`.
+- Wikipedia root: Rust `762/848ms`; Kubo `530/1490ms`.
+- Resource max: Rust `58328KiB` RSS and `31` FDs vs Kubo `271936KiB`
+  RSS and `345` FDs.
+- `meaningful_kubo_wins`: `4`.
+
+Decision:
+
+Keep this as a disabled lab control, not a default. The mechanism works and
+removes pre-response raw leaf size fetches; it improved absolute Rust
+`ipfs.tech` root and asset p95 in this local sample. But it did not close the
+asset median gap, path-local Kubo wins shifted to other provider/body fetches,
+and Wikipedia was direct-body/Bitswap-bound rather than file-size-bound.
+
+The important follow-up signal is that pre-header UnixFS size work is now
+confirmed as one contributor, but not the dominant remaining gap. The remaining
+asset losses are mostly still provider/body latency under page concurrency.
+Future work should target single-provider HTTP tails, source/provider choice
+for small direct bodies, and whether large streamed raw assets can safely send
+early headers without degrading error semantics.
