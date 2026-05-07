@@ -29316,3 +29316,189 @@ while using a fraction of RSS and file descriptors. Range/HEAD work should stay
 in the guardrail set, but the next search for gaps should move to broader
 site/corpus diversity or longer session behavior rather than more hero-image
 single-range tuning.
+
+## 2026-05-07 - Wikipedia Zero-HTTP Broad-Session Kubo Win
+
+Question:
+Does a broader same-daemon page sequence expose a current Kubo win after the
+media/range guardrails were cleared?
+
+Selected broad baseline command:
+
+```sh
+timeout 4800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/broader-selected-baseline-r10-20260507T040959Z-trace.jsonl \
+  --comparison-output /tmp/broader-selected-baseline-r10-20260507T040959Z.json
+```
+
+Selected broad baseline result:
+
+- Rust and Kubo passed `10/10` for every selected case.
+- DAICO root p50/p95: Rust `1224/1432ms`; Kubo `2869/3035ms`.
+- Vitalik range p50/p95: Rust `108/122ms`; Kubo `1459/3371ms`.
+- `ipfs.tech` root range p50/p95: Rust `557/1160ms`; Kubo
+  `1155/1643ms`.
+- `ipfs.tech` page assets p50/p95: Rust `122/304ms`; Kubo `367/446ms`.
+- Hero prefix range p50/p95: Rust `100/300ms`; Kubo `435/457ms`.
+- `wikipedia-on-ipfs-root` p50/p95: Rust `682/1190ms`; Kubo
+  `521/571ms`.
+- Resource max: Rust `50456KiB` RSS and `31` FDs; Kubo `174184KiB`
+  RSS and `301` FDs.
+
+Trace notes:
+
+- The fresh Kubo-relative loss is isolated to `wikipedia-on-ipfs-root`.
+- Wikipedia is a top-level zero-HTTP Bitswap shape in the Rust trace:
+  `top_level_zero_http_provider_bitswap=9` for Wikipedia, with
+  top-level zero-HTTP p50/p95/max `721/1188/1188ms`.
+- Broad sequencing matters. The immediately previous focused Wikipedia-only
+  r20 had Rust beating Kubo:
+  `/tmp/current-head-wikipedia-root-r20-20260507T015946Z.json` recorded Rust
+  `719/1200ms` vs Kubo `2201/2362ms`.
+
+Focused Wikipedia recheck:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --repeat 20 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/focused-wikipedia-root-r20-20260507T041507Z-trace.jsonl \
+  --comparison-output /tmp/focused-wikipedia-root-r20-20260507T041507Z.json
+```
+
+Focused Wikipedia result:
+
+- Rust and Kubo passed `20/20`.
+- Wikipedia p50/p95: Rust `975/1282ms`; Kubo `1982/2588ms`.
+- Resource max: Rust `40576KiB` RSS and `25` FDs; Kubo `167656KiB`
+  RSS and `76` FDs.
+- Focused-only Rust still wins. The broad-run Kubo win appears to come from
+  cross-request/network-warm behavior after prior page/media cases, not from
+  Wikipedia alone.
+
+Direct WANT_BLOCK lab:
+
+```sh
+timeout 3600s env FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=8 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --repeat 20 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/direct8-wikipedia-root-r20-20260507T041759Z-trace.jsonl \
+  --comparison-output /tmp/direct8-wikipedia-root-r20-20260507T041759Z.json
+```
+
+Direct WANT_BLOCK focused result:
+
+- Rust and Kubo passed `20/20`.
+- Wikipedia p50/p95 improved from Rust `975/1282ms` to `853/1047ms`;
+  Kubo in that window was `2188/2403ms`.
+- Resource max stayed similar: Rust `40448KiB` RSS and `26` FDs.
+
+Direct WANT_BLOCK broad result:
+
+- Command was the selected broad baseline with
+  `FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=8`.
+- Artifacts:
+  `/tmp/direct8-broader-selected-r10-20260507T041945Z.json` and
+  `/tmp/direct8-broader-selected-r10-20260507T041945Z-trace.jsonl`.
+- Wikipedia still lost to Kubo: Rust `699/1132ms`; Kubo `518/616ms`.
+- `ipfs.tech` root range regressed from Rust `557/1160ms` to
+  `757/1362ms`.
+- `ipfs.tech` page assets regressed from Rust `122/304ms` to `185/377ms`.
+- Resource max stayed close: Rust `50900KiB` RSS and `31` FDs.
+
+Decision on direct WANT_BLOCK:
+Do not promote. It helps focused Wikipedia, but does not close the broad
+Kubo-win sample and hurts `ipfs.tech` root/assets in the same selected corpus.
+Keep the existing env knob as a diagnostic only.
+
+Zero-HTTP post-lookup race lab:
+
+```sh
+timeout 4800s env FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_RACE=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-race-broader-selected-r10-20260507T042449Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-race-broader-selected-r10-20260507T042449Z.json
+```
+
+Zero-HTTP race result:
+
+- Rust and Kubo passed `10/10` for every selected case.
+- Wikipedia improved from Rust `682/1190ms` to `469/663ms`, but still lost
+  to same-window Kubo `338/393ms`.
+- `ipfs.tech` page assets regressed from Rust `122/304ms` to `157/339ms`,
+  though Rust still beat Kubo `349/569ms`.
+- `ipfs.tech` root range was roughly flat/slightly worse: Rust `586/1240ms`
+  vs baseline `557/1160ms`.
+- Resource max was still light: Rust `50732KiB` RSS and `28` FDs vs Kubo
+  `182960KiB` RSS and `349` FDs.
+- Trace fanout increased materially: Bitswap peer attempts rose from `368`
+  in the no-env broad baseline to `676`; dial-plan events rose from `266` to
+  `363`. This is not a mobile-safe default tradeoff.
+
+Temporary top-level-only zero-HTTP race patch:
+
+- A temporary env-gated patch was tested locally, then reverted:
+  `FREEDOM_IPFS_ENABLE_TOP_LEVEL_ZERO_HTTP_POST_LOOKUP_RACE=1`.
+- It only enabled the zero-HTTP post-lookup race for gateway top-level
+  requests, leaving subresources on the current conservative default.
+- Artifacts:
+  `/tmp/topzero-race-broader-selected-r10-20260507T043107Z.json` and
+  `/tmp/topzero-race-broader-selected-r10-20260507T043107Z-trace.jsonl`.
+- Result:
+  - Wikipedia: Rust `576/1299ms`; Kubo `510/568ms`.
+  - `ipfs.tech` root range p95 badly regressed: Rust `580/2314ms`; Kubo
+    `1009/1414ms`.
+  - `ipfs.tech` page assets were strong: Rust `109/299ms`; Kubo `359/454ms`.
+  - Bitswap peer attempts were `490`, lower than the broad zero-HTTP race but
+    still higher than the no-env baseline `368`.
+
+Decision on zero-HTTP racing:
+Do not promote broad or top-level-only zero-HTTP post-lookup racing. The real
+remaining issue is not just the 100ms post-lookup wait. Kubo's broad-run
+Wikipedia win appears to come from better warmed source/peer choice for a
+small zero-HTTP top-level Bitswap request after previous page cases. Next work
+should focus on source/peer quality and cross-request learned peer selection,
+not more static zero-HTTP racing or wider direct WANT_BLOCK.
