@@ -27407,14 +27407,160 @@ Broader result:
   - Vitalik root/range TTFB p50/p95: `101/110ms`
   - resource max: `57460KiB` RSS, `41` FDs
 
+Follow-up r10 no-env broader control:
+
+```sh
+timeout 6000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-default-post-fastscore-multicase-r10-20260507T010947Z-trace.jsonl \
+  --comparison-output /tmp/current-default-post-fastscore-multicase-r10-20260507T010947Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Follow-up r10 `100ms` score gate:
+
+```sh
+FREEDOM_IPFS_MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS=100 \
+timeout 6000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/fastscore100-post-control-multicase-r10-20260507T011206Z-trace.jsonl \
+  --comparison-output /tmp/fastscore100-post-control-multicase-r10-20260507T011206Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Follow-up r10 result:
+
+- Both runs passed Rust and Kubo `10/10`.
+- No-env Rust:
+  - run total p50/p95: `3547/4542ms`
+  - `ipfs.tech` root TTFB p50/p95: `664/1261ms`
+  - `ipfs.tech` asset TTFB p50/p95: `204/457ms`
+  - DAICO root TTFB p50/p95: `1237/1639ms`
+  - Vitalik root/range TTFB p50/p95: `99/120ms`
+  - resource max: `56480KiB` RSS, `39` FDs
+- `100ms` gate Rust:
+  - run total p50/p95: `3205/4574ms`
+  - `ipfs.tech` root TTFB p50/p95: `673/779ms`
+  - `ipfs.tech` asset TTFB p50/p95: `157/372ms`
+  - DAICO root TTFB p50/p95: `1246/1525ms`
+  - Vitalik root/range TTFB p50/p95: `95/107ms`
+  - resource max: `56600KiB` RSS, `35` FDs
+- The `100ms` gate beat Kubo in its same window on `ipfs.tech` asset p50/p95:
+  Rust `157/372ms`, Kubo `362/846ms`.
+- Trace deltas:
+  - post-lookup waits dropped `150 -> 36`
+  - gate events: `111`
+  - skips: `25` `multi_http_providers_unscored`, `1`
+    `multi_http_provider_score_above_threshold`
+  - gate score p50/p95/max: `59/84/96ms`
+  - block fetch source counts shifted from HTTP/Bitswap `292/151` to `246/196`
+  - HTTP provider fetch p50/p95/max improved `90/389/945ms ->
+    67/422/605ms`
+  - Bitswap fetch p50/p95/max changed `141/319/1260ms -> 147/294/1229ms`
+
 Decision:
-Keep this as a promising opt-in lab control, not a default yet. The `100ms`
-score gate directly targets the observed median tax and improved `ipfs.tech`
-asset p50/p95 in focused and broader samples. Against the post-fastscore no-env
-broader control it also improved run p50/p95 (`4028/4596ms -> 2916/3280ms`) and
-kept FD max flat (`38 -> 38`), while RSS rose modestly (`56672KiB -> 58444KiB`).
-The `50ms` gate is narrower, but it did not preserve the broader result as well
-as `100ms` in this sample and had a higher FD max. Before promotion, repeat
-no-env vs `100ms` with a larger or alternating same-window guardrail and inspect
-whether the remaining RSS cost comes from extra HTTP races, session shortcuts
-left running after provider wins, or public network variance.
+Promote the `100ms` fast-score gate to the default. This is not broad
+multi-HTTP racing: it only skips the post-lookup session-peer wait when a
+multi-HTTP provider set has an already-scored provider at or below the
+threshold. The larger r10 confirmation improved the targeted `ipfs.tech` asset
+p50/p95, improved root p95, did not hurt DAICO/Vitalik, lowered FD max, and
+only raised RSS by `120KiB` in that window. Keep the existing threshold env as a
+tuning override and add `FREEDOM_IPFS_DISABLE_MULTI_HTTP_FAST_POST_LOOKUP_RACE`
+as the rollback switch.
+
+## 2026-05-07 Promote: Fast-Scored Multi-HTTP Post-Lookup Race
+
+Change:
+The fast-scored multi-HTTP post-lookup race is now enabled by default with a
+`100ms` score threshold. The threshold can still be changed with:
+
+```text
+FREEDOM_IPFS_MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS=<ms>
+```
+
+Rollback switch:
+
+```text
+FREEDOM_IPFS_DISABLE_MULTI_HTTP_FAST_POST_LOOKUP_RACE=1
+```
+
+Default validation command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/promoted-fastscore-default-multicase-r5-20260507T011813Z-trace.jsonl \
+  --comparison-output /tmp/promoted-fastscore-default-multicase-r5-20260507T011813Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Result:
+
+- Rust and Kubo both passed `5/5`.
+- Overall run total p50/p95:
+  - Rust: `3753/4198ms`
+  - Kubo: `8094/8668ms`
+- Resource max:
+  - Rust: `55812KiB` RSS, `33` FDs
+  - Kubo: `150580KiB` RSS, `176` FDs
+- DAICO root TTFB p50/p95:
+  - Rust: `1217/1540ms`
+  - Kubo: `2808/3057ms`
+- Vitalik root/range TTFB p50/p95:
+  - Rust: `105/123ms`
+  - Kubo: `1561/1638ms`
+- `ipfs.tech` root TTFB p50/p95:
+  - Rust: `725/1155ms`
+  - Kubo: `1259/1377ms`
+- `ipfs.tech` asset TTFB p50/p95:
+  - Rust: `221/551ms`
+  - Kubo: `391/780ms`
+
+Trace confirmation:
+
+- Default no-env trace emitted `5`
+  `bitswap_session_shortcut_post_lookup_race_gate` events.
+- It emitted `6` skip events:
+  - `2` `multi_http_providers_unscored`
+  - `4` `multi_http_provider_score_above_threshold`
+- Gate score p50/p95/max: `90/90/90ms`.
+
+Decision:
+Keep the promoted default. This fresh no-env run confirms the gate is active
+without the lab env var and preserves the broader same-window Kubo wins. The
+next optimization should move away from static multi-HTTP racing and target
+the remaining slow roots/assets that still involve zero-HTTP Bitswap expansion
+or slow HTTP-provider bodies.

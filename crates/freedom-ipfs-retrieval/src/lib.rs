@@ -109,8 +109,11 @@ const SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS";
 const ENABLE_MULTI_HTTP_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_ENABLE_MULTI_HTTP_POST_LOOKUP_RACE";
+const DISABLE_MULTI_HTTP_FAST_POST_LOOKUP_RACE_ENV: &str =
+    "FREEDOM_IPFS_DISABLE_MULTI_HTTP_FAST_POST_LOOKUP_RACE";
 const MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS";
+const MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE: Duration = Duration::from_millis(100);
 const ENABLE_ZERO_HTTP_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_RACE";
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -3300,9 +3303,28 @@ fn single_http_post_lookup_race_min_score() -> Option<Duration> {
 }
 
 fn multi_http_fast_post_lookup_race_max_score() -> Option<Duration> {
-    std::env::var_os(MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS_ENV)
-        .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
-        .map(Duration::from_millis)
+    multi_http_fast_post_lookup_race_max_score_from_env_value(
+        std::env::var_os(DISABLE_MULTI_HTTP_FAST_POST_LOOKUP_RACE_ENV).is_some(),
+        std::env::var_os(MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS_ENV)
+            .as_ref()
+            .map(|value| value.to_string_lossy()),
+    )
+}
+
+fn multi_http_fast_post_lookup_race_max_score_from_env_value(
+    disabled: bool,
+    value: Option<std::borrow::Cow<'_, str>>,
+) -> Option<Duration> {
+    if disabled {
+        return None;
+    }
+    Some(
+        value
+            .as_deref()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE),
+    )
 }
 
 fn zero_http_post_lookup_race_enabled() -> bool {
@@ -8046,6 +8068,35 @@ mod bitswap_tests {
                 )
                 .await,
             "slow scored multi-HTTP providers should keep the shortcut wait"
+        );
+    }
+
+    #[test]
+    fn multi_http_fast_post_lookup_race_default_is_enabled_with_rollback() {
+        assert_eq!(
+            multi_http_fast_post_lookup_race_max_score_from_env_value(false, None),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            multi_http_fast_post_lookup_race_max_score_from_env_value(
+                false,
+                Some(std::borrow::Cow::Borrowed("50")),
+            ),
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            multi_http_fast_post_lookup_race_max_score_from_env_value(
+                false,
+                Some(std::borrow::Cow::Borrowed("invalid")),
+            ),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            multi_http_fast_post_lookup_race_max_score_from_env_value(
+                true,
+                Some(std::borrow::Cow::Borrowed("50")),
+            ),
+            None
         );
     }
 
