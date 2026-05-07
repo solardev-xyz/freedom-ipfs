@@ -32823,3 +32823,189 @@ peer attempts, and introduced dial rejections. Keep the disabled lab knob and
 trace marker for future controlled source-scheduling comparisons, but do not use
 `16` as a candidate default. The remaining source-quality gap is not solved by
 contacting every retained candidate peer sooner.
+
+## 2026-05-07 - Reject: Four-Peer Zero-HTTP Direct WANT_BLOCK Width
+
+Hypothesis:
+
+The fresh focused no-env trace after the max-dial lab showed Wikipedia's root
+CID repeatedly finding `64` providers and dialing the same first five peers.
+The fourth untrusted candidate,
+`12D3KooWACE5dRw5V9WXuDTcngjE3ZaDSZ4qYJGfuhXZbENnL54y`, was often the fast
+incoming source but was normally contacted through `WANT_HAVE`. Previous
+zero-HTTP direct labs covered `2`, `5`, and `8`, but not exactly `4`. Maybe one
+extra direct untrusted `WANT_BLOCK` would capture the recurring useful peer
+without the broader regressions from `5` or `8`.
+
+Fresh no-env baseline:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-focused-r10-20260507Tafter-maxdial-110123-trace.jsonl \
+  --comparison-output /tmp/current-head-focused-r10-20260507Tafter-maxdial-110123.json
+```
+
+Baseline result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `879/1340ms`, assets `188/292ms`;
+  Kubo root `1633/2956ms`, assets `132/514ms`.
+- Wikipedia root: Rust `656/2644ms` vs Kubo `288/517ms`.
+- Resource max: Rust `50264KiB` RSS and `29` FDs vs Kubo `289312KiB` RSS and
+  `397` FDs.
+- Bitswap blocks: `45`, p50/p95/max `140/765/2064ms`.
+- Slowest Wikipedia sample reused a one-hit trusted session peer and took
+  `2642ms`; the `bitswap_fetch` for the root block was `1703ms`.
+
+Opt-in command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=4 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-direct4-focused-r10-20260507T110538-trace.jsonl \
+  --comparison-output /tmp/zero-http-direct4-focused-r10-20260507T110538.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `650/1015ms`, assets `187/320ms`;
+  Kubo root `1374/2744ms`, assets `62/335ms`.
+- Wikipedia root: Rust `954/2244ms` vs Kubo `114/456ms`.
+- Resource max: Rust `49512KiB` RSS and `29` FDs vs Kubo `215012KiB` RSS and
+  `178` FDs.
+- Bitswap blocks: `48`, p50/p95/max `192/792/1436ms`.
+- Bitswap peer attempts rose from `214` to `234`.
+
+Decision:
+
+Do not promote direct4. It reduced the extreme Wikipedia max versus the
+baseline but regressed Wikipedia median, still lost badly to Kubo, slightly
+regressed `ipfs.tech` asset p95, and raised Bitswap attempts. The direct-width
+family is now covered enough: `2`, `4`, `5`, `8`, and high-provider variants
+all point to the same conclusion. Static extra direct `WANT_BLOCK` pressure is
+not the missing source-quality signal.
+
+## 2026-05-07 - Reject Promotion: Bitswap Session Peer Minimum Successes
+
+Hypothesis:
+
+The fresh no-env baseline's slowest Wikipedia sample showed a one-hit
+successful Bitswap peer being reused as trusted/session state for a later
+zero-HTTP top-level request, then taking `1703ms` to deliver the root block.
+Strict top-level scoping had already been rejected, but a weaker disabled lab
+could require repeated successful deliveries before a peer enters the session
+shortcut set. This might keep useful global reuse while avoiding overtrusting a
+single prior success.
+
+Code:
+
+- Added `FREEDOM_IPFS_BITSWAP_SESSION_PEER_MIN_SUCCESSES=<n>`.
+- Default remains `1`, so runtime behavior is unchanged without the env var.
+- When set above `1`, recent Bitswap session peers are filtered by
+  `success_count >= n`.
+- Added `bitswap_session_peer_min_successes` trace events when the lab gate is
+  active.
+- Added focused unit coverage for env parsing and filtering one-hit session
+  peers out of the shortcut set.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval bitswap_session_peer_min_successes --lib -- --nocapture
+cargo test -p freedom-ipfs-retrieval recent_bitswap_shortcut_peers_can_require_repeated_successes --lib -- --nocapture
+```
+
+Focused validation passed.
+
+Opt-in command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_BITSWAP_SESSION_PEER_MIN_SUCCESSES=2 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/session-min2-focused-r10-20260507T111137-trace.jsonl \
+  --comparison-output /tmp/session-min2-focused-r10-20260507T111137.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `768/1349ms`, assets `185/325ms`;
+  Kubo root `1921/2603ms`, assets `129/478ms`.
+- Wikipedia root: Rust `760/836ms` vs Kubo `245/1103ms`.
+- Resource max: Rust `48552KiB` RSS and `21` FDs vs Kubo `256188KiB` RSS and
+  `319` FDs.
+- Bitswap blocks dropped to `10`, p50/p95/max `524/556/556ms`.
+- Session shortcuts were eliminated in the target path:
+  `with_trusted=0`, `shortcut_starts=0`, and `max_session_peers=0` on the
+  slow Wikipedia requests.
+
+Immediate no-env control:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/session-min2-noenv-control-focused-r10-20260507T111516-trace.jsonl \
+  --comparison-output /tmp/session-min2-noenv-control-focused-r10-20260507T111516.json
+```
+
+Immediate control result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `584/961ms`, assets `188/296ms`;
+  Kubo root `1820/10939ms`, assets `134/515ms`.
+- Wikipedia root: Rust `651/762ms` vs Kubo `87/695ms`.
+- Resource max: Rust `47840KiB` RSS and `21` FDs vs Kubo `249876KiB` RSS and
+  `431` FDs.
+- Bitswap blocks: `14`, p50/p95/max `421/567/567ms`.
+
+Decision:
+
+Do not promote `min_successes=2`. The lab did remove one-hit trusted reuse and
+kept Wikipedia p95 below Kubo in the opt-in window, but the immediate no-env
+control from the same code was better on Rust `ipfs.tech` root p50/p95,
+`ipfs.tech` asset p95, and Wikipedia p50/p95. Keep the env-gated knob and trace
+as a diagnostic because it cleanly isolates one-hit session reuse, but the
+default should remain `1` until a broader same-window sample proves the tradeoff.
+The remaining gap is not simply "trust only repeated peers"; it is picking a
+better first cold source while preserving useful opportunistic session reuse.

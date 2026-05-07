@@ -166,6 +166,9 @@ const BITSWAP_MAX_DIAL_ADDRS_PER_COMMAND_ENV: &str =
 const MAX_BITSWAP_PEERS_PER_BLOCK: usize = 16;
 const MAX_BITSWAP_SESSION_PEERS: usize = 4;
 const BITSWAP_SESSION_PEER_LIMIT_ENV: &str = "FREEDOM_IPFS_BITSWAP_SESSION_PEER_LIMIT";
+const BITSWAP_SESSION_PEER_MIN_SUCCESSES: u64 = 1;
+const BITSWAP_SESSION_PEER_MIN_SUCCESSES_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_SESSION_PEER_MIN_SUCCESSES";
 const BITSWAP_TRUSTED_DIRECT_WANT_BLOCK_PEERS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_TRUSTED_DIRECT_WANT_BLOCK_PEERS";
 const ENABLE_BITSWAP_TOP_LEVEL_SCOPED_SESSION_PEERS_ENV: &str =
@@ -3024,6 +3027,14 @@ impl HttpRetriever {
     }
 
     async fn recent_bitswap_peers(&self) -> Vec<BitswapPeer> {
+        self.recent_bitswap_peers_with_min_successes(bitswap_session_peer_min_successes())
+            .await
+    }
+
+    async fn recent_bitswap_peers_with_min_successes(
+        &self,
+        min_successes: u64,
+    ) -> Vec<BitswapPeer> {
         let now = Instant::now();
         let mut successes = self.successful_bitswap_peers.lock().await;
         successes.retain(|_, success| {
@@ -3031,12 +3042,13 @@ impl HttpRetriever {
                 && !success.addrs.is_empty()
         });
         let scoped_session_peers = bitswap_top_level_scoped_session_peers_enabled();
+        let min_successes = min_successes.max(BITSWAP_SESSION_PEER_MIN_SUCCESSES);
         let current_top_level_path = scoped_session_peers
             .then(current_retrieval_request_context)
             .flatten()
             .and_then(|context| context.top_level_path().map(ToOwned::to_owned));
         let peer_count_before_scope = successes.len();
-        let mut peers = successes
+        let scoped_successes = successes
             .iter()
             .filter(|(_, success)| {
                 successful_peer_matches_top_level_scope(
@@ -3055,13 +3067,27 @@ impl HttpRetriever {
                 )
             })
             .collect::<Vec<_>>();
+        let peer_count_after_scope = scoped_successes.len();
+        let mut peers = scoped_successes
+            .into_iter()
+            .filter(|(_, _, _, _, success_count)| *success_count >= min_successes)
+            .collect::<Vec<_>>();
         if scoped_session_peers {
             tracing::info!(
                 phase = "bitswap_session_peer_scope",
                 top_level_path = %current_top_level_path.as_deref().unwrap_or(""),
                 peer_count_before = peer_count_before_scope,
+                peer_count_after = peer_count_after_scope,
+                skipped_peer_count = peer_count_before_scope.saturating_sub(peer_count_after_scope)
+            );
+        }
+        if min_successes > BITSWAP_SESSION_PEER_MIN_SUCCESSES {
+            tracing::info!(
+                phase = "bitswap_session_peer_min_successes",
+                min_successes,
+                peer_count_before = peer_count_after_scope,
                 peer_count_after = peers.len(),
-                skipped_peer_count = peer_count_before_scope.saturating_sub(peers.len())
+                skipped_peer_count = peer_count_after_scope.saturating_sub(peers.len())
             );
         }
         if let Some(dominant_mode) = bitswap_dominant_session_peer_mode() {
@@ -4492,6 +4518,21 @@ fn bitswap_session_peer_limit_from_env_value(value: Option<&str>) -> usize {
         .filter(|value| *value > 0)
         .map(|value| value.min(MAX_BITSWAP_SESSION_PEERS))
         .unwrap_or(MAX_BITSWAP_SESSION_PEERS)
+}
+
+fn bitswap_session_peer_min_successes() -> u64 {
+    bitswap_session_peer_min_successes_from_env_value(
+        std::env::var_os(BITSWAP_SESSION_PEER_MIN_SUCCESSES_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn bitswap_session_peer_min_successes_from_env_value(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(BITSWAP_SESSION_PEER_MIN_SUCCESSES)
 }
 
 fn bitswap_trusted_direct_want_block_peers() -> Option<usize> {
@@ -10486,6 +10527,26 @@ mod bitswap_tests {
     }
 
     #[test]
+    fn bitswap_session_peer_min_successes_env_value_parses_override() {
+        assert_eq!(
+            bitswap_session_peer_min_successes_from_env_value(None),
+            BITSWAP_SESSION_PEER_MIN_SUCCESSES
+        );
+        assert_eq!(
+            bitswap_session_peer_min_successes_from_env_value(Some("0")),
+            BITSWAP_SESSION_PEER_MIN_SUCCESSES
+        );
+        assert_eq!(
+            bitswap_session_peer_min_successes_from_env_value(Some("bad")),
+            BITSWAP_SESSION_PEER_MIN_SUCCESSES
+        );
+        assert_eq!(
+            bitswap_session_peer_min_successes_from_env_value(Some("2")),
+            2
+        );
+    }
+
+    #[test]
     fn trusted_direct_want_block_peer_limit_parses_optional_override() {
         assert_eq!(
             bitswap_trusted_direct_want_block_peers_from_env_value(None),
@@ -10972,6 +11033,48 @@ mod bitswap_tests {
 
         assert_eq!(peers[0].id, fast);
         assert_eq!(peers[1].id, slow);
+    }
+
+    #[tokio::test]
+    async fn recent_bitswap_shortcut_peers_can_require_repeated_successes() {
+        let one_hit =
+            parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let repeated =
+            parse_peer_id("12D3KooWAtxJkDLacJdK7yZkk2iPp8iMdSVh1bDHzmJ3t8oKUkqA").unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store,
+        );
+        let now = Instant::now();
+        {
+            let mut successes = retriever.successful_bitswap_peers.lock().await;
+            successes.insert(
+                one_hit,
+                SuccessfulBitswapPeer {
+                    seen_at: now,
+                    addrs: vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()],
+                    last_latency: Duration::from_millis(25),
+                    success_count: 1,
+                    top_level_path: None,
+                },
+            );
+            successes.insert(
+                repeated,
+                SuccessfulBitswapPeer {
+                    seen_at: now,
+                    addrs: vec!["/ip4/127.0.0.1/tcp/4002".parse().unwrap()],
+                    last_latency: Duration::from_millis(80),
+                    success_count: 2,
+                    top_level_path: None,
+                },
+            );
+        }
+
+        let peers = retriever.recent_bitswap_peers_with_min_successes(2).await;
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].id, repeated);
     }
 
     #[tokio::test]
