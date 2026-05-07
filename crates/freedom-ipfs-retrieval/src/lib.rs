@@ -7271,6 +7271,7 @@ async fn request_bitswap_blocks(
             match request_bitswap_block_after_want_have(
                 &mut stream,
                 &primary_cid,
+                peer_id,
                 &protocol_name,
                 request_timeouts,
             )
@@ -7358,13 +7359,25 @@ async fn request_bitswap_blocks(
 async fn request_bitswap_block_after_want_have<T>(
     stream: &mut T,
     cid: &Cid,
+    peer_id: PeerId,
     protocol_name: &str,
     request_timeouts: BitswapRequestTimeouts,
 ) -> std::result::Result<BitswapFetchResult, WantHaveFailure>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    let started = Instant::now();
     if let Err(err) = write_bitswap_want_have(stream, cid).await {
+        tracing::info!(
+            phase = "bitswap_want_have_probe",
+            cid = %cid,
+            peer = %peer_id,
+            protocol = protocol_name,
+            ok = false,
+            outcome = "write_failed",
+            error = %err,
+            elapsed_ms = started.elapsed().as_millis()
+        );
         return Err(WantHaveFailure::TryOtherProtocols(
             BitswapProtocolFailure::other(format!(
                 "{protocol_name}: write want-have failed: {err}"
@@ -7374,13 +7387,33 @@ where
     let response = match timeout(request_timeouts.want_have, read_bitswap_response(stream)).await {
         Ok(Ok(response)) => response,
         Ok(Err(err)) => {
+            tracing::info!(
+                phase = "bitswap_want_have_probe",
+                cid = %cid,
+                peer = %peer_id,
+                protocol = protocol_name,
+                ok = false,
+                outcome = "read_failed",
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis()
+            );
             return Err(WantHaveFailure::TryOtherProtocols(
                 BitswapProtocolFailure::other(format!(
                     "{protocol_name}: read want-have failed: {err}"
                 )),
-            ))
+            ));
         }
         Err(_) => {
+            tracing::info!(
+                phase = "bitswap_want_have_probe",
+                cid = %cid,
+                peer = %peer_id,
+                protocol = protocol_name,
+                ok = false,
+                outcome = "timeout_fallback_want_block",
+                timeout_ms = request_timeouts.want_have.as_millis(),
+                elapsed_ms = started.elapsed().as_millis()
+            );
             return request_bitswap_block_on_stream(
                 stream,
                 cid,
@@ -7393,15 +7426,58 @@ where
     };
     let has_dont_have = response.has_presence(cid, BLOCK_PRESENCE_DONT_HAVE);
     let has_have = response.has_presence(cid, BLOCK_PRESENCE_HAVE);
+    let presence_count = response.block_presences.len();
     if let Some(result) = collect_bitswap_result(cid, response.blocks) {
+        tracing::info!(
+            phase = "bitswap_want_have_probe",
+            cid = %cid,
+            peer = %peer_id,
+            protocol = protocol_name,
+            ok = true,
+            outcome = "block",
+            has_have,
+            has_dont_have,
+            presence_count,
+            extra_blocks = result.extra_blocks.len(),
+            bytes = result.requested_block.len(),
+            elapsed_ms = started.elapsed().as_millis()
+        );
         let _ = write_bitswap_cancel(stream, cid).await;
         return Ok(result);
     }
     if has_dont_have {
+        tracing::info!(
+            phase = "bitswap_want_have_probe",
+            cid = %cid,
+            peer = %peer_id,
+            protocol = protocol_name,
+            ok = false,
+            outcome = "dont_have",
+            has_have,
+            has_dont_have,
+            presence_count,
+            elapsed_ms = started.elapsed().as_millis()
+        );
         return Err(WantHaveFailure::PeerDoesNotHave(
             BitswapProtocolFailure::other(format!("{protocol_name}: peer returned DONT_HAVE")),
         ));
     }
+    tracing::info!(
+        phase = "bitswap_want_have_probe",
+        cid = %cid,
+        peer = %peer_id,
+        protocol = protocol_name,
+        ok = true,
+        outcome = if has_have {
+            "have_then_want_block"
+        } else {
+            "no_presence_fallback_want_block"
+        },
+        has_have,
+        has_dont_have,
+        presence_count,
+        elapsed_ms = started.elapsed().as_millis()
+    );
     if !has_have {
         return request_bitswap_block_on_stream(
             stream,

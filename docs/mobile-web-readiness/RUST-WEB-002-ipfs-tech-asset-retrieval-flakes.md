@@ -32050,3 +32050,104 @@ The remaining source-quality work should not spend extra round trips on known
 session peers by default. Better next directions are earlier provider/source
 quality signals, DONT_HAVE/read-timeout suppression with evidence, or learning
 which provider/session peers actually deliver for the current top-level path.
+
+## 2026-05-07 - Keep: Bitswap WANT_HAVE Probe Outcome Trace
+
+Hypothesis:
+Before testing DONT_HAVE/read-timeout suppression, the trace needs to show what
+actually happens on `WANT_HAVE` probes. Previous summaries could show that a
+successful source was contacted through `want_have`, but losing probe outcomes
+were mostly invisible when another incoming/direct path won first. A narrow
+diagnostic event around the `WANT_HAVE` response path should expose whether
+probes see `HAVE`, `DONT_HAVE`, no presence, read errors, or the existing
+`750ms` timeout fallback.
+
+Code:
+
+- Added `phase=bitswap_want_have_probe` trace events inside
+  `request_bitswap_block_after_want_have`.
+- The event includes:
+  - `cid`
+  - `peer`
+  - Bitswap protocol
+  - `ok`
+  - `outcome`
+  - `has_have`
+  - `has_dont_have`
+  - `presence_count`
+  - `timeout_ms` for timeout fallback
+  - `bytes` / `extra_blocks` when the probe response already includes a block
+  - `elapsed_ms`
+- Behavior is unchanged. This is diagnostics-only.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval want_have --lib
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting passed after `cargo fmt --all`.
+- The focused `want_have` test slice passed: `4` passed.
+- Clippy for `freedom-ipfs-retrieval` passed with `-D warnings`.
+- `git diff --check` passed.
+
+No-env trace smoke:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/want-have-probe-trace-smoke-20260507T0932Z.jsonl \
+  --output /tmp/want-have-probe-trace-smoke-20260507T0932Z.json
+```
+
+No-env smoke result:
+
+- Rust passed `1/1`.
+- `ipfs.tech` root `1202ms`; assets p50/p95/max `183/974/1144ms`.
+- This run did not hit a `WANT_HAVE` path; `prefer_want_have=0` in the summary.
+
+Forced-probe trace smoke:
+
+```sh
+timeout 900s env FREEDOM_IPFS_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS=0 \
+  cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/want-have-probe-forced-smoke-20260507T0934Z.jsonl \
+  --output /tmp/want-have-probe-forced-smoke-20260507T0934Z.json
+```
+
+Forced-smoke result:
+
+- Rust passed `1/1`.
+- `ipfs.tech` root `2229ms`; assets p50/p95/max `178/244/306ms`.
+- The trace emitted `2` `bitswap_want_have_probe` events.
+- Both probe events were `ok=false`, `outcome=timeout_fallback_want_block`,
+  and elapsed at the existing `750ms` timeout boundary.
+- The root still eventually loaded via Bitswap incoming delivery, but the slow
+  root path clearly paid the probe time:
+  `bitswap_want_have_probe` p50/p95/max `750/751/751ms`.
+
+Decision:
+Keep. This is diagnostics-only and low volume in default runs. It makes the
+next source-quality iteration sharper: we can now measure whether future
+`WANT_HAVE` or DONT_HAVE-suppression experiments are actually seeing useful
+presence responses, timing out, or learning that a peer does not have the CID.
