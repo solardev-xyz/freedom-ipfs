@@ -33451,3 +33451,83 @@ reuse need to be optimized as a small page-load unit. Future work should either
 batch/prefetch the likely follow-on UnixFS block with the root or make the
 follow-on block avoid slow session shortcuts when the root was won by an
 unproven public Bitswap peer.
+
+## 2026-05-07 - Reject: Top-Level Zero-HTTP Direct-IP Candidate-Only Scope
+
+Hypothesis:
+
+The global direct-IP-only lab improved the focused Wikipedia root window but
+regressed some `ipfs.tech` root/asset metrics. A narrower disabled lab might get
+the useful part by applying direct-IP-only provider candidate construction only
+to top-level, zero-HTTP-provider requests while leaving gateway subresources and
+HTTP-provider-capable CIDs on the normal DNS-expanded path.
+
+Trial code:
+
+- Added an uncommitted env-gated prototype:
+  `FREEDOM_IPFS_ENABLE_TOP_LEVEL_ZERO_HTTP_BITSWAP_DIRECT_IP_PROVIDER_CANDIDATES_ONLY=1`.
+- The prototype enabled direct-IP-only provider candidates when a request had
+  zero HTTP providers and was not marked as a gateway subresource.
+- The global
+  `FREEDOM_IPFS_ENABLE_BITSWAP_DIRECT_IP_PROVIDER_CANDIDATES_ONLY=1` lab
+  remained stronger and would still apply to all provider candidate expansion.
+- Focused unit validation passed while the prototype existed:
+
+```sh
+cargo fmt --all
+cargo test -p freedom-ipfs-retrieval direct_ip_candidate --lib
+```
+
+Opt-in command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_ENABLE_TOP_LEVEL_ZERO_HTTP_BITSWAP_DIRECT_IP_PROVIDER_CANDIDATES_ONLY=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/direct-ip-topzero-focused-r10-20260507Tlive-trace.jsonl \
+  --comparison-output /tmp/direct-ip-topzero-focused-r10-20260507Tlive.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `799/1532ms`, assets `77/350ms`;
+  Kubo root `2367/4050ms`, assets `147/467ms`.
+- Wikipedia root: Rust `413/985ms` vs Kubo `167/384ms`.
+- Resource max: Rust `49252KiB` RSS and `30` FDs vs Kubo `297440KiB` RSS and
+  `726` FDs.
+- Trace scoping worked as intended: `8` `bitswap_peer_expand` events had
+  `direct_ip_candidate_only=true`, while `14` remained on the normal path.
+- Bitswap peer attempts/connections were `371` and `69`.
+
+Immediate comparison point:
+
+- The nearest no-env control from the same focused sequence was:
+  `ipfs.tech` root `578/975ms`, assets `187/301ms`; Wikipedia root
+  `659/910ms`; Rust resource max `49784KiB` RSS and `26` FDs; Bitswap
+  attempts/connections `194` and `55`.
+
+Decision:
+
+Do not keep this scoped direct-IP-only prototype. It improved Wikipedia median
+versus the no-env control (`659ms -> 413ms`) and improved `ipfs.tech` asset
+median (`187ms -> 77ms`), but it still lost badly to Kubo on Wikipedia
+(`413/985ms` vs `167/384ms`), regressed Wikipedia p95 against the no-env
+control (`910ms -> 985ms`), regressed `ipfs.tech` root p50/p95, and increased
+Bitswap fanout. The prototype code was reverted.
+
+The existing global direct-IP-only mode remains as a disabled diagnostic lab.
+Adding a second narrower knob is not justified by this window. The recurring
+lesson matches the direct-fast-wave result: improving the first top-level
+zero-HTTP Bitswap block alone is insufficient when the visible request also
+needs follow-on UnixFS/index blocks. Continue toward page-load/session-level
+multi-block behavior instead.
