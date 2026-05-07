@@ -27564,3 +27564,88 @@ without the lab env var and preserves the broader same-window Kubo wins. The
 next optimization should move away from static multi-HTTP racing and target
 the remaining slow roots/assets that still involve zero-HTTP Bitswap expansion
 or slow HTTP-provider bodies.
+
+## 2026-05-07 Observe: Promoted Default Focused `ipfs.tech` Gap
+
+Question:
+After promoting the fast-scored multi-HTTP post-lookup race, does the focused
+`ipfs.tech` asset median still trail Kubo, and what is the current cause shape?
+
+Command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/promoted-fastscore-default-ipfs-tech-r10-20260507T012321Z-trace.jsonl \
+  --comparison-output /tmp/promoted-fastscore-default-ipfs-tech-r10-20260507T012321Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Result:
+
+- Rust and Kubo both passed `10/10`.
+- Root TTFB p50/p95:
+  - Rust: `634/1106ms`
+  - Kubo: `1531/3495ms`
+- Asset TTFB p50/p95:
+  - Rust: `220/487ms`
+  - Kubo: `139/683ms`
+- Resource max:
+  - Rust: `54608KiB` RSS, `31` FDs
+  - Kubo: `268208KiB` RSS, `254` FDs
+
+Trace summary:
+
+- `block_fetch_total`:
+  - HTTP provider: `359` blocks, p50/p95/max `208/351/718ms`
+  - Bitswap: `41` blocks, p50/p95/max `138/314/1478ms`
+- Delegated lookup:
+  - events `350`, p50/p95/max `21/52/675ms`
+  - HTTP provider distribution: zero `8`, single `202`, multi `140`
+- HTTP-provider races:
+  - single-provider result p50/p95/max `209/354/569ms`
+  - multi-provider result p50/p95/max `81/185/227ms`
+  - provider scoring winner p50/p95/max `176/211/259ms`
+  - same-provider self-hedges `106`; fired `102`; duplicate attempt won `4`
+- Bitswap:
+  - peer attempt starts `110`
+  - dial plans `78`
+  - established connections `13`
+  - source peer for zero-HTTP blocks was repeatedly
+    `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT`
+
+Median request classification:
+
+- The median assets around `239-249ms` are mostly ordinary HTTP-provider
+  fetches, not post-lookup grace waits.
+- They typically spend almost all request time inside
+  `block_fetch_total` / `http_provider_race_result`, with provider response
+  elapsed around `180-227ms`.
+- The current focused asset p50 gap is therefore mostly the single HTTP-provider
+  path, especially when delegated routing only offers the slower Sia bridge.
+
+Tail classification:
+
+- The slowest asset was `_nuxt/mHWTJadT.js` at `1481ms`.
+- It was a zero-HTTP cold Bitswap fetch:
+  `zero_http_provider_bitswap`, `zero_http_provider_cold_bitswap`,
+  `cold_bitswap_peer_expand`.
+- The corresponding `bitswap_fetch` took `1425ms`.
+
+Decision:
+Use this as the promoted-default focused baseline. The remaining focused Kubo
+asset p50 win is not the old static post-lookup grace tax anymore. It is mostly
+single HTTP-provider latency, while the p95/tail work is still zero-HTTP
+Bitswap. Avoid repeating the already-rejected raw self-hedge and single-HTTP
+Bitswap hedge defaults; a useful next candidate needs a stronger signal, such
+as page-scoped provider/source reuse, better provider diversity for single-HTTP
+assets, or a resource-bounded zero-HTTP Bitswap improvement.
