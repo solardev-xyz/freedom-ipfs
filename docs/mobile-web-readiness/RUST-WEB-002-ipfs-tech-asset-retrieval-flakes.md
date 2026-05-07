@@ -27843,3 +27843,71 @@ older traces unless a new same-window sample shows the old failure shape again.
 The next useful work is to find any remaining Kubo-win cases/windows after
 cap-8, especially beyond `ipfs.tech`, or to target specific slow provider/source
 quality cases with fresh evidence.
+
+## 2026-05-07 - Current Head Multi-Case r10 After Cap 8
+
+Question:
+Does the pushed current head still beat Kubo across the main mobile web
+guardrail cases after the HTTP-provider cap promotion and the fresh zero-HTTP
+focused baseline?
+
+Command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case ipfs-tech-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-multicase-r10-20260507T015022Z-trace.jsonl \
+  --comparison-output /tmp/current-head-multicase-r10-20260507T015022Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10`.
+- `daicowtf-page-assets` root p50/p95:
+  - Rust `1291/1458ms`
+  - Kubo `2862/3087ms`
+- `vitalik-root-html-range` root p50/p95:
+  - Rust `104/115ms`
+  - Kubo `1614/1921ms`
+- `ipfs-tech-page-assets`:
+  - root p50/p95: Rust `539/759ms`; Kubo `1401/1649ms`
+  - asset p50/p95: Rust `191/445ms`; Kubo `384/858ms`
+- Resource max across cases:
+  - Rust `56828KiB` RSS, `37` FDs
+  - Kubo `157132KiB` RSS, `197` FDs
+
+Trace notes:
+
+- Request classifications:
+  - `zero_http_provider_cold_bitswap=10`
+- Zero-HTTP cold Bitswap request latency p50/p95/max:
+  `273/565/565ms`
+- Block fetch totals:
+  - HTTP provider: `417` blocks, p50/p95/max `189/401/848ms`
+  - Bitswap: `33` blocks, p50/p95/max `212/364/403ms`
+- HTTP-provider races:
+  - single-provider result p50/p95/max `183/481/834ms`
+  - multi-provider result p50/p95/max `42/82/160ms`
+- Bitswap source peer:
+  `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT=10`
+- Bitswap source request modes: `want_block=33`
+- Bitswap incoming blocks max oldest pending wait: `354ms`
+- Bitswap connections established: `16`, p50/p95/max `111/532/532ms`
+
+Decision:
+Use this as the current broad guardrail baseline. The old focused `ipfs.tech`
+gap and the multi-case gap are both moved in this same-window evidence. The next
+performance work should broaden the search for remaining Kubo-win workloads
+instead of retuning the already-rejected generic Bitswap fanout knobs. Good next
+targets are new page corpora, media/range seeking, IPNS/DNSLink edge cases, or
+long-session resource behavior with the same trace discipline.
