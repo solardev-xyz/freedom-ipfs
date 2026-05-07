@@ -38078,3 +38078,150 @@ the diagnostics, but do not add retrieval behavior from this no-gap window. The
 active repeated shape is zero-HTTP child Bitswap source/peer quality under
 `ipfs.tech`, not the previously suspected single-HTTP provider-branch Bitswap
 fallback.
+
+### Current Single-HTTP Direct-IP Recheck After Diagnostic Reappearance
+
+Purpose:
+
+After the r12 no-gap confirmation, run another compact same-window baseline.
+This time the harness diagnostics did show a small active Wikipedia median Kubo
+win and one `single_http_provider_bitswap_wins` event, which is the condition
+under which the older disabled top-level single-HTTP direct-IP fallback is worth
+rechecking.
+
+Fresh compact command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-page-assets-cid-direct \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/current-fresh-compact-20260507T193827Z-trace.jsonl \
+  --comparison-output /tmp/current-fresh-compact-20260507T193827Z.json
+```
+
+Fresh compact result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `330/555ms`; Kubo `1309/2215ms`.
+- Vitalik range: Rust `110/113ms`; Kubo `2457/3485ms`.
+- `ipfs.tech` page root: Rust `545/668ms`; Kubo `2550/11094ms`.
+- `ipfs.tech` page assets: Rust `190/475ms`; Kubo `371/973ms`.
+- Wikipedia root: Rust `601/784ms`; Kubo `373/1367ms`.
+- Resource max: Rust `59088KiB` RSS and `40` FDs vs Kubo `369700KiB`
+  RSS and `865` FDs.
+- `meaningful_kubo_wins` flagged only Wikipedia root median:
+  Rust `601ms` vs Kubo `373ms`.
+
+Fresh compact trace finding:
+
+- HTTP-provider blocks: `191`, p50/p90/p95/max `182/255/270/389ms`.
+- Bitswap blocks: `44`, p50/p90/p95/max `162/443/499/583ms`.
+- Delegated provider lookup distribution: zero HTTP `6`, single HTTP `116`,
+  multi HTTP `84`.
+- Request classifications: cold Bitswap peer expansion `10`, zero-HTTP
+  provider Bitswap `6`, zero-HTTP provider cold Bitswap `6`.
+- Post-lookup race summary:
+  - events `85`
+  - provider wins `52`
+  - direct Bitswap wins `33`
+  - provider-branch Bitswap wins `1`
+  - single-HTTP provider-branch Bitswap wins `1`
+- The active Wikipedia median gap was the familiar follow-on `/index.html`
+  block. The root directory block came from `ipfs-bridge.sia.dev`; the child
+  block had `64` providers and exactly one HTTP provider,
+  `f010479.twinquasar.io`, which returned HTTP `500`. The provider branch then
+  fell through to Bitswap and delivered at about `439ms`; total child
+  `block_fetch_total` was about `472ms`.
+
+Opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK=1 \
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-page-assets-cid-direct \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/single-http-directip-current-compact-r5-20260507T194050Z-trace.jsonl \
+  --comparison-output /tmp/single-http-directip-current-compact-r5-20260507T194050Z.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `330/344ms`; Kubo `1295/2258ms`.
+- Vitalik range: Rust `116/124ms`; Kubo `3748/4723ms`.
+- `ipfs.tech` page root: Rust `725/771ms`; Kubo `2132/3225ms`.
+- `ipfs.tech` page assets: Rust `189/455ms`; Kubo `183/783ms`.
+- Wikipedia root: Rust `599/645ms`; Kubo `267/595ms`.
+- Resource max: Rust `60016KiB` RSS and `43` FDs vs Kubo `291540KiB`
+  RSS and `271` FDs.
+- `meaningful_kubo_wins` again flagged Wikipedia root median:
+  Rust `599ms` vs Kubo `267ms`.
+
+Opt-in trace finding:
+
+- The disabled fallback fired on the intended Wikipedia follow-on CID:
+  `top_level_single_http_failed_direct_ip_bitswap_fallback_start` appeared `4`
+  times.
+- The direct-IP branch won `2` fallback results, both around `286ms`.
+- Post-lookup race summary still had provider-branch Bitswap wins:
+  `provider_bitswap_wins=2`, `single_http_provider_bitswap_wins=2`.
+- The opt-in run did not clearly improve Wikipedia median versus the fresh
+  no-env control (`599ms` vs `601ms`) and increased max RSS/FDs
+  (`60016KiB`/`43` vs `59088KiB`/`40`).
+
+Immediate no-env post-control command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-page-assets-cid-direct \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/single-http-directip-current-post-control-r5-20260507T194050Z-trace.jsonl \
+  --comparison-output /tmp/single-http-directip-current-post-control-r5-20260507T194050Z.json
+```
+
+Immediate no-env post-control result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `334/369ms`; Kubo `1205/2393ms`.
+- Vitalik range: Rust `116/133ms`; Kubo `3562/4687ms`.
+- `ipfs.tech` page root: Rust `738/922ms`; Kubo `2227/3809ms`.
+- `ipfs.tech` page assets: Rust `189/419ms`; Kubo `188/604ms`.
+- Wikipedia root: Rust `327/565ms`; Kubo `381/750ms`.
+- Resource max: Rust `60588KiB` RSS and `36` FDs vs Kubo `325488KiB`
+  RSS and `410` FDs.
+- `meaningful_kubo_wins`: none.
+- Post-control post-lookup race summary:
+  `provider_bitswap_wins=0`, `single_http_provider_bitswap_wins=0`.
+
+Decision:
+
+Keep `FREEDOM_IPFS_ENABLE_TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK`
+disabled. This fresh window satisfied the recheck trigger because
+`single_http_provider_bitswap_wins` reappeared, but the opt-in fallback did not
+causally close the gap: Wikipedia median stayed effectively unchanged, resources
+rose slightly, and the immediate no-env post-control removed the Kubo win
+without the fallback. The active conclusion remains that this shape is highly
+network-sensitive; do not promote direct-IP fallback unless a future same-window
+run shows repeated direct-IP wins with clear p50/p95 improvement and no
+asset/resource regression.
