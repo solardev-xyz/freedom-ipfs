@@ -32650,3 +32650,176 @@ Use `/tmp/current-head-focused-r10-20260507T1137Z.json` and its trace as the
 next focused no-env baseline. The next experiment should target top-level
 zero-HTTP cold Bitswap source choice or scheduling, while preserving the
 `ipfs.tech` p95/resource wins.
+
+## 2026-05-07 - Reject: Wider Bitswap Dial Address Budget
+
+Hypothesis:
+
+The focused baseline's slow Wikipedia root path retained `16` Bitswap candidate
+peers but only scheduled `5` dial addresses per command. Because later
+candidate peers were mostly contacted with conservative `WANT_HAVE`, a disabled
+lab knob that widens the dial-address budget might improve source discovery
+without increasing the direct `WANT_BLOCK` peer limit.
+
+Code:
+
+- Added `FREEDOM_IPFS_BITSWAP_MAX_DIAL_ADDRS_PER_COMMAND=<n>`.
+- Default remains `5`.
+- The override is bounded to
+  `MAX_BITSWAP_PEERS_PER_BLOCK * MAX_BITSWAP_ADDRS_PER_PEER`.
+- Added `max_dial_addr_count` to `bitswap_dial_plan` traces.
+- Added unit coverage for env parsing and widened interleaved dial ordering.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval bitswap_max_dial --lib -- --nocapture
+cargo test -p freedom-ipfs-retrieval wider_bitswap_dial --lib -- --nocapture
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting passed.
+- Focused retrieval tests passed: `2` filtered test runs, `1` test each.
+- Focused retrieval clippy passed with `-D warnings`.
+
+Public focused opt-in:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_BITSWAP_MAX_DIAL_ADDRS_PER_COMMAND=16 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/maxdial16-focused-r10-20260507T1215Z-trace.jsonl \
+  --comparison-output /tmp/maxdial16-focused-r10-20260507T1215Z.json
+```
+
+Public focused result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `661/1600ms`, assets `186/334ms`;
+  Kubo root `1673/2462ms`, assets `109/701ms`.
+- Wikipedia root: Rust `470/633ms` vs Kubo `264/1025ms`.
+- Resource max: Rust `47432KiB` RSS and `28` FDs vs Kubo `309232KiB` RSS and
+  `412` FDs.
+- Trace confirmed the knob: `max_dial_addr_count=16` on `2`
+  `bitswap_dial_plan` events.
+- But the public window only hit `1` Bitswap block and `1` zero-like cold
+  Bitswap classification, so it could not prove the target behavior improved.
+
+Immediate public no-env control:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/maxdial16-focused-control-r10-20260507T1220Z-trace.jsonl \
+  --comparison-output /tmp/maxdial16-focused-control-r10-20260507T1220Z.json
+```
+
+Immediate public control result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `744/1184ms`, assets `187/295ms`;
+  Kubo root `1476/3109ms`, assets `115/675ms`.
+- Wikipedia root: Rust `463/488ms` vs Kubo `317/1177ms`.
+- Resource max: Rust `43136KiB` RSS and `16` FDs vs Kubo `247324KiB` RSS and
+  `351` FDs.
+- Delegated routing returned no zero-HTTP provider sets in this control
+  (`http_zero=0`), so this public A/B was dominated by provider availability
+  variance rather than the new dial budget.
+
+Controlled Wikipedia opt-in:
+
+```sh
+timeout 2400s env \
+  FREEDOM_IPFS_LAB_DROP_HTTP_PROVIDERS_FOR_CIDS=bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze \
+  FREEDOM_IPFS_BITSWAP_MAX_DIAL_ADDRS_PER_COMMAND=16 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/maxdial16-drop-wikipedia-r10-20260507T1226Z-trace.jsonl \
+  --comparison-output /tmp/maxdial16-drop-wikipedia-r10-20260507T1226Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+This command wrote the comparison report, then exited nonzero because the
+harness classification gate did not see `zero_http_provider_cold_bitswap`; the
+trace still exercised the cold Bitswap path and is usable for this lab result.
+
+Controlled opt-in result:
+
+- Rust and Kubo passed `10/10`.
+- Wikipedia root: Rust `1130/1228ms` vs Kubo `1566/2418ms`.
+- Resource max: Rust `41856KiB` RSS and `36` FDs vs Kubo `143868KiB` RSS and
+  `65` FDs.
+- Bitswap blocks: `19`, p50/p95/max `555/653/653ms`.
+- Bitswap dial plans: `29`; `max_dial_addr_count=16` on every plan.
+- Peer attempts: `314`; established connections: `108`; dial rejections: `44`.
+- Source request modes: mostly `want_have`.
+
+Controlled no-env command:
+
+```sh
+timeout 2400s env \
+  FREEDOM_IPFS_LAB_DROP_HTTP_PROVIDERS_FOR_CIDS=bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/maxdial16-drop-wikipedia-control-r10-20260507T1231Z-trace.jsonl \
+  --comparison-output /tmp/maxdial16-drop-wikipedia-control-r10-20260507T1231Z.json
+```
+
+Controlled no-env result:
+
+- Rust and Kubo passed `10/10`.
+- Wikipedia root: Rust `1009/1139ms` vs Kubo `2166/2333ms`.
+- Resource max: Rust `41216KiB` RSS and `21` FDs vs Kubo `145224KiB` RSS and
+  `115` FDs.
+- Bitswap blocks: `20`, p50/p95/max `488/600/643ms`.
+- Bitswap dial plans: `30`; `max_dial_addr_count=5` on every plan.
+- Peer attempts: `120`; established connections: `40`; dial rejections: `0`.
+
+Decision:
+
+Do not promote a wider Bitswap dial-address budget. The controlled run shows
+the knob broadened conservative peer contact, but it made Wikipedia slower
+(`1130/1228ms` vs `1009/1139ms`), raised FD max (`36` vs `21`), almost tripled
+peer attempts, and introduced dial rejections. Keep the disabled lab knob and
+trace marker for future controlled source-scheduling comparisons, but do not use
+`16` as a candidate default. The remaining source-quality gap is not solved by
+contacting every retained candidate peer sooner.

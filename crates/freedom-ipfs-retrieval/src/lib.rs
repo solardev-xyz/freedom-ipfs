@@ -161,6 +161,8 @@ const BITSWAP_MAX_ESTABLISHED_CONNECTIONS: u32 = 16;
 // often request child blocks immediately after the root, so preserving headroom
 // lets follow-on blocks dial instead of waiting behind stale public providers.
 const MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND: usize = 5;
+const BITSWAP_MAX_DIAL_ADDRS_PER_COMMAND_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_MAX_DIAL_ADDRS_PER_COMMAND";
 const MAX_BITSWAP_PEERS_PER_BLOCK: usize = 16;
 const MAX_BITSWAP_SESSION_PEERS: usize = 4;
 const BITSWAP_SESSION_PEER_LIMIT_ENV: &str = "FREEDOM_IPFS_BITSWAP_SESSION_PEER_LIMIT";
@@ -4451,6 +4453,22 @@ fn bitswap_direct_want_block_untrusted_peer_limit_from_env_value(value: Option<&
         .unwrap_or(MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS)
 }
 
+fn bitswap_max_dial_addrs_per_command() -> usize {
+    bitswap_max_dial_addrs_per_command_from_env_value(
+        std::env::var_os(BITSWAP_MAX_DIAL_ADDRS_PER_COMMAND_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn bitswap_max_dial_addrs_per_command_from_env_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(MAX_BITSWAP_PEERS_PER_BLOCK * MAX_BITSWAP_ADDRS_PER_PEER))
+        .unwrap_or(MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND)
+}
+
 fn successful_peer_matches_top_level_scope(
     success: &SuccessfulBitswapPeer,
     scoped_session_peers: bool,
@@ -4943,8 +4961,12 @@ async fn run_shared_bitswap_swarm(
                     }
                     peer_plans.push((peer, already_connected, already_pending));
                 }
+                let max_dial_addr_count = bitswap_max_dial_addrs_per_command();
                 let (dial_addrs, suppressed_dial_addr_count) =
-                    limited_interleaved_bitswap_dials(&dial_candidates);
+                    limited_interleaved_bitswap_dials_with_limit(
+                        &dial_candidates,
+                        max_dial_addr_count,
+                    );
                 let scheduled_dial_peers = dial_addrs
                     .iter()
                     .map(|(peer, _)| *peer)
@@ -4996,6 +5018,7 @@ async fn run_shared_bitswap_swarm(
                     candidate_dial_peer_count,
                     new_dial_peer_count = scheduled_dial_peers.len(),
                     new_dial_addr_count = dial_addrs.len(),
+                    max_dial_addr_count,
                     suppressed_dial_addr_count,
                     suppressed_dial_peer_count,
                     pending_dial_peer_count,
@@ -6084,16 +6107,14 @@ fn interleaved_bitswap_dials(peers: &[BitswapPeer]) -> Vec<(PeerId, Multiaddr)> 
     dials
 }
 
-fn limited_interleaved_bitswap_dials(peers: &[BitswapPeer]) -> (Vec<(PeerId, Multiaddr)>, usize) {
+fn limited_interleaved_bitswap_dials_with_limit(
+    peers: &[BitswapPeer],
+    limit: usize,
+) -> (Vec<(PeerId, Multiaddr)>, usize) {
     let all_dials = interleaved_bitswap_dials(peers);
-    let suppressed_dial_count = all_dials
-        .len()
-        .saturating_sub(MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND);
+    let suppressed_dial_count = all_dials.len().saturating_sub(limit);
     (
-        all_dials
-            .into_iter()
-            .take(MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND)
-            .collect(),
+        all_dials.into_iter().take(limit).collect(),
         suppressed_dial_count,
     )
 }
@@ -8424,7 +8445,10 @@ mod bitswap_tests {
             })
             .collect::<Vec<_>>();
 
-        let (dials, suppressed) = limited_interleaved_bitswap_dials(&peers);
+        let (dials, suppressed) = limited_interleaved_bitswap_dials_with_limit(
+            &peers,
+            MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND,
+        );
         let addr_order = dials
             .iter()
             .map(|(_, addr)| addr.to_string())
@@ -8441,6 +8465,72 @@ mod bitswap_tests {
                 "/ip4/127.0.0.4/tcp/1001",
                 "/ip4/127.0.0.1/tcp/1002",
             ]
+        );
+    }
+
+    #[test]
+    fn wider_bitswap_dial_address_limit_keeps_interleaved_order() {
+        let peer_ids = [
+            "12D3KooWLSFr3c4K1dxWavx5XFsUjeSXap3VPMuEbe28zeL5B1v3",
+            "12D3KooWGU3fJrHaWtRSWyrrzCpdgFX5bxbS69hqL1MSdKMGez12",
+            "12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP",
+        ];
+        let peers = peer_ids
+            .iter()
+            .enumerate()
+            .map(|(index, peer)| BitswapPeer {
+                id: parse_peer_id(peer).unwrap(),
+                addrs: (1..=3)
+                    .map(|rank| {
+                        format!("/ip4/127.0.0.{}/tcp/{}", index + 1, 1000 + rank)
+                            .parse()
+                            .unwrap()
+                    })
+                    .collect(),
+                skip_want_have: false,
+                force_want_block: false,
+                force_want_have: false,
+            })
+            .collect::<Vec<_>>();
+
+        let (dials, suppressed) = limited_interleaved_bitswap_dials_with_limit(&peers, 6);
+        let addr_order = dials
+            .iter()
+            .map(|(_, addr)| addr.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(dials.len(), 6);
+        assert_eq!(suppressed, 3);
+        assert_eq!(
+            addr_order,
+            vec![
+                "/ip4/127.0.0.1/tcp/1001",
+                "/ip4/127.0.0.2/tcp/1001",
+                "/ip4/127.0.0.3/tcp/1001",
+                "/ip4/127.0.0.1/tcp/1002",
+                "/ip4/127.0.0.2/tcp/1002",
+                "/ip4/127.0.0.3/tcp/1002",
+            ]
+        );
+    }
+
+    #[test]
+    fn bitswap_max_dial_address_limit_env_value_is_bounded() {
+        assert_eq!(
+            bitswap_max_dial_addrs_per_command_from_env_value(None),
+            MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND
+        );
+        assert_eq!(
+            bitswap_max_dial_addrs_per_command_from_env_value(Some("0")),
+            MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND
+        );
+        assert_eq!(
+            bitswap_max_dial_addrs_per_command_from_env_value(Some("8")),
+            8
+        );
+        assert_eq!(
+            bitswap_max_dial_addrs_per_command_from_env_value(Some("999")),
+            MAX_BITSWAP_PEERS_PER_BLOCK * MAX_BITSWAP_ADDRS_PER_PEER
         );
     }
 
