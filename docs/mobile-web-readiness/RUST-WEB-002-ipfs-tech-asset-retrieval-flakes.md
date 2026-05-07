@@ -35506,3 +35506,103 @@ same zero-HTTP child class, but the current preconnect mechanism still creates
 too much connection pressure for the tail benefit. Further preconnect tuning
 should be budget `1-2` or peer-count limited, and should be judged mainly by
 connection count and p95 preservation, not just asset p50.
+
+Peer2/budget4 follow-up command:
+
+```sh
+timeout 3000s env \
+  FREEDOM_IPFS_ENABLE_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT=1 \
+  FREEDOM_IPFS_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_PEERS=2 \
+  FREEDOM_IPFS_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_MAX_REQUESTS=4 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/preconnect2-budget4-guardrail-r10-20260507Tlab-trace.jsonl \
+  --comparison-output /tmp/preconnect2-budget4-guardrail-r10-20260507Tlab.json
+```
+
+Peer2/budget4 result:
+
+- Rust and Kubo passed `10/10`.
+- `daicowtf-page-assets` root p50/p95: Rust `1427/1528ms`; Kubo
+  `2939/3142ms`.
+- `vitalik-root-html-range` root p50/p95: Rust `107/138ms`; Kubo
+  `1521/3356ms`.
+- `ipfs-tech-page-assets`:
+  - root p50/p95: Rust `638/871ms`; Kubo `1039/1768ms`.
+  - asset p50/p95: Rust `119/306ms`; Kubo `354/487ms`.
+- Resource max: Rust `53036KiB` RSS and `32` FDs vs Kubo `202476KiB` RSS and
+  `322` FDs.
+- Trace shape:
+  - HTTP-provider blocks: `264`, p50/p95/max `182/468/873ms`.
+  - Bitswap blocks: `136`, p50/p95/max `92/362/547ms`.
+  - Classified `zero_http_provider_bitswap=19`, with `15` cold peer-expands and
+    `9` top-level zero-HTTP cold requests.
+  - Bitswap connections: `61`.
+
+Immediate no-env control command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/preconnect2-budget4-control-guardrail-r10-20260507Tcontrol-trace.jsonl \
+  --comparison-output /tmp/preconnect2-budget4-control-guardrail-r10-20260507Tcontrol.json
+```
+
+Immediate no-env control result:
+
+- Rust and Kubo passed `10/10`.
+- `daicowtf-page-assets` root p50/p95: Rust `1295/1567ms`; Kubo
+  `2942/3220ms`.
+- `vitalik-root-html-range` root p50/p95: Rust `109/136ms`; Kubo
+  `1559/4038ms`.
+- `ipfs-tech-page-assets`:
+  - root p50/p95: Rust `596/804ms`; Kubo `1148/1805ms`.
+  - asset p50/p95: Rust `61/231ms`; Kubo `351/465ms`.
+- Resource max: Rust `50256KiB` RSS and `26` FDs vs Kubo `224956KiB` RSS and
+  `368` FDs.
+- Trace shape:
+  - HTTP-provider blocks: `116`, p50/p95/max `207/592/890ms`.
+  - Bitswap blocks: `284`, p50/p95/max `49/196/481ms`.
+  - Classified `zero_http_provider_bitswap=18`, with `13` cold peer-expands and
+    `10` top-level zero-HTTP cold requests.
+  - Bitswap connections: `32`.
+
+Decision:
+
+Reject peer2/budget4 as a promotion candidate. It looked plausible against the
+older no-env control, but the immediate same-window control was better on the
+actual target metrics:
+
+- `ipfs.tech` root p50/p95: no-env `596/804ms`, peer2/budget4 `638/871ms`.
+- `ipfs.tech` asset p50/p95: no-env `61/231ms`, peer2/budget4 `119/306ms`.
+- Resource max: no-env `50256KiB`/`26` FDs, peer2/budget4 `53036KiB`/`32` FDs.
+- Bitswap connections: no-env `32`, peer2/budget4 `61`.
+
+This closes the current preconnect tuning sweep. The env-gated preconnect code
+can stay as a diagnostic because it proved that pre-established Bitswap
+connections can change the zero-HTTP block source mix, but no tested budget/peer
+shape beats no-env once same-window controls are used. The next line of work
+should move away from speculative preconnect and toward explaining why the
+current no-env path is now getting excellent zero-HTTP Bitswap latency with only
+`32` connections, then preserving that source-selection behavior across noisier
+windows.
