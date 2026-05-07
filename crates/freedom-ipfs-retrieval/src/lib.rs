@@ -182,6 +182,8 @@ const BITSWAP_DNS_EXPANSION_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_BITSWAP_DNS_EXPANSION_CACHE_ENTRIES: usize = 128;
 const ENABLE_BITSWAP_DNS_EXPANSION_CACHE_ENV: &str =
     "FREEDOM_IPFS_ENABLE_BITSWAP_DNS_EXPANSION_CACHE";
+const ENABLE_BITSWAP_TOP_LEVEL_DNS_EXPANSION_CACHE_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_BITSWAP_TOP_LEVEL_DNS_EXPANSION_CACHE";
 const MAX_BITSWAP_FAILURE_DETAILS: usize = 8;
 const MAX_RECORDED_DIAL_ERRORS_PER_PEER: usize = 6;
 const MAX_INFLIGHT_BLOCK_FETCHES: usize = 256;
@@ -2342,10 +2344,11 @@ impl HttpRetriever {
     async fn bitswap_peers_with_quality(
         &self,
         providers: &[Provider],
+        context: Option<&RetrievalRequestContext>,
     ) -> BitswapProviderCandidates {
-        if !bitswap_dns_expansion_cache_enabled() {
+        let Some(cache_scope) = bitswap_dns_expansion_cache_scope(context) else {
             return bitswap_peers_with_quality(providers).await;
-        }
+        };
 
         let mut dnsaddr_cache = DnsaddrCache::new();
         let mut dns_ip_cache = DnsIpCache::new();
@@ -2362,6 +2365,7 @@ impl HttpRetriever {
             .await;
         tracing::info!(
             phase = "bitswap_dns_expansion_cache",
+            cache_scope,
             provider_count = providers.len(),
             candidate_peer_count = candidates.peers.len(),
             dnsaddr_requested = stats.dnsaddr_requested,
@@ -2477,8 +2481,9 @@ impl HttpRetriever {
         context: Option<RetrievalRequestContext>,
     ) -> Result<Block> {
         let peer_started = Instant::now();
-        let BitswapProviderCandidates { mut peers, quality } =
-            self.bitswap_peers_with_quality(providers).await;
+        let BitswapProviderCandidates { mut peers, quality } = self
+            .bitswap_peers_with_quality(providers, context.as_ref())
+            .await;
         let provider_peer_count = peers.len();
         let provider_addr_score_order = bitswap_provider_addr_score_order_enabled();
         if provider_addr_score_order {
@@ -4005,6 +4010,34 @@ fn bitswap_session_range_batch_enabled() -> bool {
 
 fn bitswap_dns_expansion_cache_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_DNS_EXPANSION_CACHE_ENV).is_some()
+}
+
+fn bitswap_top_level_dns_expansion_cache_enabled() -> bool {
+    std::env::var_os(ENABLE_BITSWAP_TOP_LEVEL_DNS_EXPANSION_CACHE_ENV).is_some()
+}
+
+fn bitswap_dns_expansion_cache_scope(
+    context: Option<&RetrievalRequestContext>,
+) -> Option<&'static str> {
+    bitswap_dns_expansion_cache_scope_from_values(
+        bitswap_dns_expansion_cache_enabled(),
+        bitswap_top_level_dns_expansion_cache_enabled(),
+        context,
+    )
+}
+
+fn bitswap_dns_expansion_cache_scope_from_values(
+    global_enabled: bool,
+    top_level_enabled: bool,
+    context: Option<&RetrievalRequestContext>,
+) -> Option<&'static str> {
+    if global_enabled {
+        return Some("global");
+    }
+    if top_level_enabled && context.is_some_and(|context| !context.gateway_subresource()) {
+        return Some("gateway_top_level");
+    }
+    None
 }
 
 fn bitswap_dns_lookup_timeout() -> Option<Duration> {
@@ -9833,6 +9866,33 @@ mod bitswap_tests {
         assert_eq!(
             bitswap_dns_lookup_timeout_from_env_value(Some("250")),
             Some(Duration::from_millis(250))
+        );
+    }
+
+    #[test]
+    fn bitswap_dns_expansion_cache_scope_can_be_top_level_only() {
+        let top_level = RetrievalRequestContext::gateway_request(None);
+        let subresource = RetrievalRequestContext::gateway_request(Some(42));
+
+        assert_eq!(
+            bitswap_dns_expansion_cache_scope_from_values(false, false, Some(&top_level)),
+            None
+        );
+        assert_eq!(
+            bitswap_dns_expansion_cache_scope_from_values(true, false, Some(&subresource)),
+            Some("global")
+        );
+        assert_eq!(
+            bitswap_dns_expansion_cache_scope_from_values(false, true, Some(&top_level)),
+            Some("gateway_top_level")
+        );
+        assert_eq!(
+            bitswap_dns_expansion_cache_scope_from_values(false, true, Some(&subresource)),
+            None
+        );
+        assert_eq!(
+            bitswap_dns_expansion_cache_scope_from_values(false, true, None),
+            None
         );
     }
 

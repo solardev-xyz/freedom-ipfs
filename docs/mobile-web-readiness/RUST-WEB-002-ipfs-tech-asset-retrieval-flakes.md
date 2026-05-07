@@ -31517,3 +31517,110 @@ peers get the early direct `WANT_BLOCK`, but it does not reliably pick peers
 that actually serve the block quickly. Future source-quality work needs
 delivery evidence, not only dial-address shape: per-CID/root first responders,
 recent DONT_HAVE/read-timeout behavior, and top-level/session delivery history.
+
+## 2026-05-07 - Reject: Top-Level-Only Bitswap DNS Expansion Cache
+
+Hypothesis:
+The global DNS expansion cache lab previously showed an interesting but mixed
+Wikipedia sample. The current no-env control still shows Wikipedia paying
+repeated DNS/provider expansion, while page subresources remain the main
+guardrail. A narrower lab might help only top-level gateway requests, leaving
+page subresources on the current default.
+
+Code:
+
+- Added disabled env flag:
+  `FREEDOM_IPFS_ENABLE_BITSWAP_TOP_LEVEL_DNS_EXPANSION_CACHE=1`.
+- When enabled, the existing bounded shared Bitswap DNSADDR/DNS-IP expansion
+  cache is used only for gateway requests where `gateway_subresource=false`.
+- The existing global flag
+  `FREEDOM_IPFS_ENABLE_BITSWAP_DNS_EXPANSION_CACHE=1` still enables the cache
+  for every Bitswap provider expansion.
+- Added `cache_scope=global|gateway_top_level` to
+  `bitswap_dns_expansion_cache` trace markers.
+- Default behavior is unchanged.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval bitswap_dns_expansion_cache_scope_can_be_top_level_only --lib
+```
+
+Result:
+
+- Focused unit test passed.
+- Formatting passed after applying `cargo fmt --all`.
+
+Opt-in command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_ENABLE_BITSWAP_TOP_LEVEL_DNS_EXPANSION_CACHE=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/toplevel-dnscache-selected-r5-20260507T081254Z-trace.jsonl \
+  --comparison-output /tmp/toplevel-dnscache-selected-r5-20260507T081254Z.json
+```
+
+Same-window no-env reference:
+
+- `/tmp/provider-order-noenv-control-selected-r5-20260507T080447Z.json`
+- `/tmp/provider-order-noenv-control-selected-r5-20260507T080447Z-trace.jsonl`
+
+Opt-in result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1300/1572ms` vs Kubo `2881/2887ms`.
+- Vitalik range: Rust `112/116ms` vs Kubo `1474/2615ms`.
+- `ipfs.tech` root range: Rust `858/1551ms` vs Kubo `1116/1231ms`.
+- `ipfs.tech` page assets: Rust root `3/4ms`, assets `186/371ms`; Kubo root
+  `2/2ms`, assets `349/523ms`.
+- `ipfs.tech` hero range: Rust `136/166ms` vs Kubo `407/665ms`.
+- Wikipedia root: Rust `645/714ms` vs Kubo `491/530ms`.
+- Resource max: Rust `51068KiB` RSS and `27` FDs vs Kubo `325648KiB` RSS and
+  `355` FDs.
+- HTTP provider block fetch p50/p95/max: `185/551/889ms`.
+- Bitswap block fetch p50/p95/max: `114/604/630ms`.
+
+Comparison to the no-env reference:
+
+- Wikipedia improved from Rust `714/993ms` to `645/714ms`, but still lost to
+  Kubo `491/530ms`.
+- `ipfs.tech` root range regressed from `733/957ms` to `858/1551ms`, turning
+  the p95 into a Kubo loss in this window.
+- `ipfs.tech` page-asset p95 regressed from `297ms` to `371ms`, though Rust
+  still beat Kubo asset p95.
+- Vitalik improved slightly; DAICO p95 improved but median regressed.
+- RSS was effectively flat; FD max decreased from `30` to `27`.
+
+Trace interpretation:
+
+- The new scope participated: `3` `bitswap_dns_expansion_cache` events with
+  `cache_scope=gateway_top_level`.
+- All cache events were misses: DNSADDR hits `0`, DNS-IP hits `0`.
+- The opt-in trace had fewer DNS prefetches and DNSADDR expansion events than
+  the no-env reference, but without cache hits this is not evidence that the
+  shared cache caused the Wikipedia improvement.
+- Bitswap block fetch p95 worsened (`604ms` vs `492ms`) and HTTP provider p95
+  also worsened (`551ms` vs `426ms`) versus the no-env reference.
+
+Decision:
+Do not promote top-level-only DNS expansion caching. Keep the scoped flag and
+trace field as a disabled diagnostic because they are useful for future
+controlled runs, but this sample did not produce the causal hit evidence needed
+for a default and regressed important guardrails. The remaining target is still
+source quality and scheduling: get useful peers sooner for top-level
+zero-HTTP/single-failing-HTTP roots without hurting `ipfs.tech` root/assets.
