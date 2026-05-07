@@ -35008,3 +35008,115 @@ narrow filter should apply only in specific cases, such as slow follow-on
 Wikipedia blocks after a failing single HTTP provider. Do not use this smoke to
 justify a blunt cross-top-level ban; in this sample, cross-top-level reuse made
 the Wikipedia root fast.
+
+## 2026-05-07 Focused R10 With Cross-Top-Level Diagnostics
+
+Purpose:
+
+Collect a larger same-window focused sample after adding cross-top-level
+Bitswap session diagnostics. The r3 smoke verified the fields; this run checks
+whether cross-top-level reuse actually correlates with the remaining Kubo wins.
+
+Command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/cross-top-level-diagnostics-focused-r10-20260507Tdiag-trace.jsonl \
+  --comparison-output /tmp/cross-top-level-diagnostics-focused-r10-20260507Tdiag.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10`.
+- `ipfs.tech` page assets:
+  - root TTFB/total p50/p95: Rust `736/1430ms`; Kubo `1722/3765ms`.
+  - asset TTFB/total p50/p95: Rust `184/296ms`; Kubo `134/582ms`.
+- `wikipedia-on-ipfs-root`:
+  - root TTFB/total p50/p95: Rust `258/471ms`; Kubo `162/501ms`.
+- Resource max: Rust `48504KiB` RSS and `21` FDs vs Kubo `283684KiB` RSS and
+  `398` FDs.
+
+Trace shape:
+
+- HTTP-provider blocks: `285`, p50/p95/max `184/359/713ms`.
+- Bitswap blocks: `85`, p50/p95/max `81/247/291ms`.
+- Delegated provider lookup: p50/p95/max `20/58/173ms`.
+- Request classifications:
+  - `cold_bitswap_peer_expand=10`
+  - `zero_http_provider_bitswap=10`
+  - `zero_http_provider_cold_bitswap=10`
+- The classified zero-HTTP/cold requests were all the same `ipfs.tech`
+  subresource: `_nuxt/hfYlCurB.js`.
+  - Request elapsed p50/p95/max: about `247/294/294ms`.
+  - Bitswap source candidate index: `1=10`.
+  - Winning peer: `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT`.
+- Single-provider HTTP remained the main median tax:
+  - `181` single-provider successes, all via `https://ipfs-bridge.sia.dev/`.
+  - p50/p95/max `163/391/654ms`.
+- Multi-provider HTTP remained much faster:
+  - p50/p95/max `50/116/160ms`.
+
+Cross-top-level diagnostics:
+
+- `source_peer_cross_top_level=true`: `7` successful shortcut events.
+- `session_peer_cross_top_level_count=1`: `13` shortcut starts.
+- `source_peer_same_top_level=true`: `69` successful shortcut events.
+- `session_peer_same_top_level_count=1`: `93` shortcut starts.
+- Wikipedia shortcut successes:
+  - Cross-top-level root block reuse: `7` wins, p50/p90/p95/max
+    `50/156/156/156ms`.
+  - Same-top-level follow-on `index.html` reuse: `7` wins, p50/p90/p95/max
+    `94/221/221/221ms`.
+- Wikipedia visible request elapsed values ranged from `95ms` to `469ms`, with
+  p50 `283ms`.
+
+Interpretation:
+
+The diagnostics strongly argue against a blunt cross-top-level session-peer
+ban. In this window, the first Wikipedia root block reused a peer learned under
+`/ipns/ipfs.tech/` and that cross-top-level shortcut was fast. The remaining
+Wikipedia median gap is small and not the current best target.
+
+The repeatable `ipfs.tech` median loss is split between:
+
+- single HTTP-provider JavaScript chunks served through the Sia bridge at about
+  `160-190ms`, where Kubo often has lower median but worse tail; and
+- one recurring zero-HTTP Bitswap chunk, `_nuxt/hfYlCurB.js`, whose own provider
+  lookup returns no HTTP providers and then finds a good Bitswap source around
+  candidate index `1`.
+
+Manual probe:
+
+```sh
+curl -fsS 'https://delegated-ipfs.dev/routing/v1/providers/bafybeierpueybjyyjypd5jfmoellbclf3bcgcrj2oaktwya2o5dlilupaq' |
+  rg -c '12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT'
+
+curl -fsS 'https://delegated-ipfs.dev/routing/v1/providers/bafkreihgstf54ft3x473kvpimavjgmueejn2dmaawckmcetiaa7bzujdkm' |
+  rg -c '12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT'
+```
+
+The winning Bitswap peer appeared in the root provider response and in the
+asset provider response during this check, although the asset delegated response
+was unstable across moments. That makes a narrow page-level Bitswap provider
+preconnect/hint experiment plausible, but only as an env-gated lab because the
+provider set is public-network volatile.
+
+Decision:
+
+Keep cross-top-level reuse as-is. The next behavior lab should not filter
+cross-top-level peers. A more plausible experiment is a tightly scoped,
+env-gated top-level Bitswap preconnect: when a top-level gateway request has
+HTTP providers and Bitswap provider candidates, begin dialing a very small
+number of Bitswap candidates in the background while HTTP fetches proceed. The
+hypothesis is that this can reduce the first zero-HTTP subresource's cold
+connection cost without adding request fanout or delaying the HTTP path.
