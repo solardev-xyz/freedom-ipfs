@@ -118,6 +118,15 @@ const ENABLE_TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE_ENV: &str =
     "FREEDOM_IPFS_ENABLE_TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE";
 const TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE_MS_ENV: &str =
     "FREEDOM_IPFS_TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE_MS";
+const ENABLE_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT";
+const TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_PEERS: usize = 2;
+const TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_PEERS_ENV: &str =
+    "FREEDOM_IPFS_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_PEERS";
+const TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_MAX_REQUESTS: usize = 8;
+const TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_MAX_REQUESTS_ENV: &str =
+    "FREEDOM_IPFS_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_MAX_REQUESTS";
+const MAX_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_TRACKED_PATHS: usize = 64;
 const DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE";
 const SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS_ENV: &str =
@@ -305,6 +314,7 @@ pub struct HttpRetriever {
     http_provider_scores: Arc<tokio::sync::Mutex<HashMap<String, HttpProviderScore>>>,
     bitswap_dnsaddr_cache: Arc<tokio::sync::Mutex<SharedDnsaddrCache>>,
     bitswap_dns_ip_cache: Arc<tokio::sync::Mutex<SharedDnsIpCache>>,
+    top_level_bitswap_provider_preconnect_counts: Arc<tokio::sync::Mutex<HashMap<String, usize>>>,
     http_provider_fetch_limiter: Arc<tokio::sync::Semaphore>,
     http_provider_fetch_limit: usize,
 }
@@ -383,6 +393,9 @@ impl HttpRetriever {
             http_provider_scores: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             bitswap_dnsaddr_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             bitswap_dns_ip_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            top_level_bitswap_provider_preconnect_counts: Arc::new(tokio::sync::Mutex::new(
+                HashMap::new(),
+            )),
             http_provider_fetch_limiter: Arc::new(tokio::sync::Semaphore::new(
                 http_provider_fetch_limit,
             )),
@@ -1167,6 +1180,12 @@ impl HttpRetriever {
             }
         }
         let bitswap_provider_candidate_available = has_bitswap_provider_candidate(providers);
+        self.maybe_spawn_top_level_bitswap_provider_preconnect(
+            providers,
+            context.clone(),
+            http_provider_bases.len(),
+            bitswap_provider_candidate_available,
+        );
         if http_provider_bases.len() == 1
             && single_http_provider_bitswap_hedge_enabled()
             && bitswap_provider_candidate_available
@@ -1206,6 +1225,152 @@ impl HttpRetriever {
             Err(RetrievalError::NoBitswapProviders) => Err(RetrievalError::NoHttpProviders),
             Err(err) => Err(err),
         }
+    }
+
+    fn maybe_spawn_top_level_bitswap_provider_preconnect(
+        &self,
+        providers: &[Provider],
+        context: Option<RetrievalRequestContext>,
+        http_provider_count: usize,
+        bitswap_provider_candidate_available: bool,
+    ) {
+        if !top_level_bitswap_provider_preconnect_enabled()
+            || http_provider_count == 0
+            || !bitswap_provider_candidate_available
+        {
+            return;
+        }
+        let Some(context) = context else {
+            return;
+        };
+        if !context.gateway_subresource() {
+            return;
+        }
+        let Some(top_level_path) = context.top_level_path().map(ToOwned::to_owned) else {
+            return;
+        };
+
+        let retriever = self.clone();
+        let providers = providers.to_vec();
+        tokio::spawn(async move {
+            with_retrieval_request_context(context, async move {
+                let started = Instant::now();
+                let current_context = current_retrieval_request_context();
+                let gateway_subresource = current_context
+                    .as_ref()
+                    .is_some_and(RetrievalRequestContext::gateway_subresource);
+                let Some(preconnect_request_index) = retriever
+                    .reserve_top_level_bitswap_provider_preconnect(&top_level_path)
+                    .await
+                else {
+                    tracing::info!(
+                        phase = "bitswap_provider_preconnect_start",
+                        top_level_path = %top_level_path,
+                        gateway_subresource,
+                        provider_count = providers.len(),
+                        http_provider_count,
+                        peer_count = 0usize,
+                        skipped = true,
+                        reason = "top_level_budget_exhausted",
+                        max_request_count = top_level_bitswap_provider_preconnect_max_requests(),
+                        elapsed_ms = started.elapsed().as_millis()
+                    );
+                    return;
+                };
+                let provider_count = providers.len();
+                let BitswapProviderCandidates { mut peers, quality } = retriever
+                    .bitswap_peers_with_quality(&providers, current_context.as_ref())
+                    .await;
+                let provider_peer_count = peers.len();
+                if provider_peer_count == 0 {
+                    tracing::info!(
+                        phase = "bitswap_provider_preconnect_start",
+                        top_level_path = %top_level_path,
+                        gateway_subresource,
+                        provider_count,
+                        http_provider_count,
+                        provider_peer_count,
+                        peer_count = 0usize,
+                        skipped = true,
+                        reason = "no_bitswap_peers",
+                        preconnect_request_index,
+                        elapsed_ms = started.elapsed().as_millis()
+                    );
+                    return;
+                }
+
+                retriever
+                    .apply_successful_bitswap_peer_scores(&mut peers)
+                    .await;
+                let peer_limit = top_level_bitswap_provider_preconnect_peers();
+                peers.truncate(peer_limit);
+                let peer_count = peers.len();
+                tracing::info!(
+                    phase = "bitswap_provider_preconnect_start",
+                    top_level_path = %top_level_path,
+                    gateway_subresource,
+                    provider_count,
+                    http_provider_count,
+                    provider_peer_count,
+                    peer_count,
+                    peer_limit,
+                    preconnect_request_index,
+                    provider_addr_count = quality.provider_addr_count,
+                    supported_provider_addr_count = quality.supported_addr_count,
+                    rejected_provider_addr_count = quality.rejected_addr_count(),
+                    elapsed_ms = started.elapsed().as_millis()
+                );
+                match retriever.shared_bitswap_client().await {
+                    Ok(client) => {
+                        if let Err(err) = client
+                            .preconnect(
+                                peers,
+                                "top_level_provider_preconnect",
+                                Some(top_level_path),
+                                gateway_subresource,
+                            )
+                            .await
+                        {
+                            tracing::info!(
+                                phase = "bitswap_provider_preconnect_error",
+                                error = %err,
+                                elapsed_ms = started.elapsed().as_millis()
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::info!(
+                            phase = "bitswap_provider_preconnect_error",
+                            error = %err,
+                            elapsed_ms = started.elapsed().as_millis()
+                        );
+                    }
+                }
+            })
+            .await;
+        });
+    }
+
+    async fn reserve_top_level_bitswap_provider_preconnect(
+        &self,
+        top_level_path: &str,
+    ) -> Option<usize> {
+        let max_request_count = top_level_bitswap_provider_preconnect_max_requests();
+        let mut counts = self
+            .top_level_bitswap_provider_preconnect_counts
+            .lock()
+            .await;
+        if !counts.contains_key(top_level_path)
+            && counts.len() >= MAX_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_TRACKED_PATHS
+        {
+            counts.clear();
+        }
+        let count = counts.entry(top_level_path.to_owned()).or_default();
+        if *count >= max_request_count {
+            return None;
+        }
+        *count += 1;
+        Some(*count)
     }
 
     async fn fetch_after_session_shortcut_provider_lookup<F>(
@@ -4591,6 +4756,41 @@ fn bitswap_top_level_scoped_session_peers_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_TOP_LEVEL_SCOPED_SESSION_PEERS_ENV).is_some()
 }
 
+fn top_level_bitswap_provider_preconnect_enabled() -> bool {
+    std::env::var_os(ENABLE_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_ENV).is_some()
+}
+
+fn top_level_bitswap_provider_preconnect_peers() -> usize {
+    top_level_bitswap_provider_preconnect_peers_from_env_value(
+        std::env::var_os(TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_PEERS_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn top_level_bitswap_provider_preconnect_peers_from_env_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(MAX_BITSWAP_PEERS_PER_BLOCK))
+        .unwrap_or(TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_PEERS)
+}
+
+fn top_level_bitswap_provider_preconnect_max_requests() -> usize {
+    top_level_bitswap_provider_preconnect_max_requests_from_env_value(
+        std::env::var_os(TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_MAX_REQUESTS_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn top_level_bitswap_provider_preconnect_max_requests_from_env_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_MAX_REQUESTS)
+}
+
 fn bitswap_early_provider_peer_cap_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP_ENV).is_some()
 }
@@ -4870,12 +5070,20 @@ struct BitswapCommand {
     cids: Vec<Cid>,
     peers: Vec<BitswapPeer>,
     sent_at: Instant,
-    respond: oneshot::Sender<Result<BitswapFetchBatchResult>>,
+    respond: Option<oneshot::Sender<Result<BitswapFetchBatchResult>>>,
+    reason: &'static str,
+    top_level_path: Option<String>,
+    gateway_subresource: bool,
 }
 
 struct PendingIncomingBitswapResult {
     sent_at: Instant,
     sender: mpsc::UnboundedSender<BitswapFetchBatchResult>,
+}
+
+struct HeldPreconnectWaiter {
+    started: Instant,
+    receiver: oneshot::Receiver<()>,
 }
 
 struct IncomingBitswapRead {
@@ -4954,7 +5162,10 @@ impl SharedBitswapClient {
                 cids,
                 peers,
                 sent_at: Instant::now(),
-                respond,
+                respond: Some(respond),
+                reason: "fetch",
+                top_level_path: None,
+                gateway_subresource: false,
             })
             .await
             .map_err(|_| RetrievalError::Bitswap("shared bitswap swarm stopped".into()))?;
@@ -4982,6 +5193,31 @@ impl SharedBitswapClient {
                 Err(RetrievalError::BitswapTimeout)
             }
         }
+    }
+
+    async fn preconnect(
+        &self,
+        peers: Vec<BitswapPeer>,
+        reason: &'static str,
+        top_level_path: Option<String>,
+        gateway_subresource: bool,
+    ) -> Result<()> {
+        if peers.is_empty() {
+            return Ok(());
+        }
+        self.commands
+            .send(BitswapCommand {
+                cids: Vec::new(),
+                peers,
+                sent_at: Instant::now(),
+                respond: None,
+                reason,
+                top_level_path,
+                gateway_subresource,
+            })
+            .await
+            .map_err(|_| RetrievalError::Bitswap("shared bitswap swarm stopped".into()))?;
+        Ok(())
     }
 }
 
@@ -5078,6 +5314,7 @@ async fn run_shared_bitswap_swarm(
     let mut connected_peers = HashMap::<PeerId, usize>::new();
     let mut connection_waiters = HashMap::<PeerId, Vec<oneshot::Sender<()>>>::new();
     let mut connection_wait_started = HashMap::<PeerId, Instant>::new();
+    let mut preconnect_waiters = Vec::<HeldPreconnectWaiter>::new();
     let mut connection_error_backoff = HashMap::<PeerId, ConnectionErrorBackoff>::new();
     let dial_errors = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let peer_transports = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -5089,8 +5326,149 @@ async fn run_shared_bitswap_swarm(
                     break;
                 };
                 let command_queued_ms = command.sent_at.elapsed().as_millis();
+                prune_preconnect_waiters(&mut preconnect_waiters);
                 prune_connection_waiters(&mut connection_waiters, &mut connection_wait_started);
                 prune_connection_error_backoff(&mut connection_error_backoff, Instant::now());
+                if command.cids.is_empty() {
+                    let reason = command.reason;
+                    let top_level_path = command.top_level_path;
+                    let gateway_subresource = command.gateway_subresource;
+                    let mut peer_plans = Vec::new();
+                    let mut dial_candidates = Vec::new();
+                    for peer in command.peers {
+                        if let Some(remaining_ms) = connection_error_backoff_remaining_ms(
+                            &connection_error_backoff,
+                            &peer.id,
+                            Instant::now(),
+                        ) {
+                            tracing::info!(
+                                phase = "bitswap_provider_preconnect_peer_skipped",
+                                reason,
+                                top_level_path = %top_level_path.as_deref().unwrap_or(""),
+                                gateway_subresource,
+                                peer = %peer.id,
+                                remaining_ms
+                            );
+                            continue;
+                        }
+                        tracing::debug!(peer = %peer.id, addrs = ?peer.addrs, "adding bitswap preconnect peer");
+                        let already_connected = connected_peers.contains_key(&peer.id);
+                        let already_pending = !already_connected && connection_waiters.contains_key(&peer.id);
+                        let should_dial = should_start_bitswap_dial(
+                            &peer.id,
+                            &connected_peers,
+                            &connection_waiters,
+                        );
+                        for addr in &peer.addrs {
+                            swarm.add_peer_address(peer.id, addr.clone());
+                        }
+                        if should_dial {
+                            dial_candidates.push(peer.clone());
+                        }
+                        peer_plans.push((peer, already_connected, already_pending));
+                    }
+
+                    let max_dial_addr_count = bitswap_max_dial_addrs_per_command();
+                    let (dial_addrs, suppressed_dial_addr_count) =
+                        limited_interleaved_bitswap_dials_with_limit(
+                            &dial_candidates,
+                            max_dial_addr_count,
+                        );
+                    let scheduled_dial_peers = dial_addrs
+                        .iter()
+                        .map(|(peer, _)| *peer)
+                        .collect::<BTreeSet<_>>();
+                    let candidate_dial_peer_count = dial_candidates.len();
+                    let suppressed_dial_peer_count = dial_candidates
+                        .iter()
+                        .filter(|peer| !scheduled_dial_peers.contains(&peer.id))
+                        .count();
+                    let mut connected_peer_count = 0usize;
+                    let mut pending_dial_peer_count = 0usize;
+                    let mut preconnect_waiter_count = 0usize;
+                    let candidate_peer_count = peer_plans.len();
+                    for (peer, already_connected, already_pending) in peer_plans {
+                        if already_connected {
+                            connected_peer_count += 1;
+                        } else if already_pending {
+                            pending_dial_peer_count += 1;
+                        } else if scheduled_dial_peers.contains(&peer.id) {
+                            let (ready, wait) = oneshot::channel();
+                            connection_wait_started
+                                .entry(peer.id)
+                                .or_insert_with(Instant::now);
+                            connection_waiters.entry(peer.id).or_default().push(ready);
+                            preconnect_waiters.push(HeldPreconnectWaiter {
+                                started: Instant::now(),
+                                receiver: wait,
+                            });
+                            preconnect_waiter_count += 1;
+                        }
+                    }
+                    tracing::info!(
+                        phase = "bitswap_provider_preconnect_plan",
+                        reason,
+                        top_level_path = %top_level_path.as_deref().unwrap_or(""),
+                        gateway_subresource,
+                        peer_count = candidate_peer_count,
+                        candidate_peer_count,
+                        candidate_dial_peer_count,
+                        new_dial_peer_count = scheduled_dial_peers.len(),
+                        new_dial_addr_count = dial_addrs.len(),
+                        max_dial_addr_count,
+                        suppressed_dial_addr_count,
+                        suppressed_dial_peer_count,
+                        pending_dial_peer_count,
+                        connected_peer_count,
+                        preconnect_waiter_count,
+                        command_queued_ms
+                    );
+
+                    let mut started_dial_peers = BTreeSet::new();
+                    for (peer_id, addr) in dial_addrs {
+                        let transport = bitswap_transport_label(&addr);
+                        let dial_addr = addr.with_p2p(peer_id).unwrap_or_else(|addr| addr);
+                        match swarm.dial(dial_addr) {
+                            Ok(()) => {
+                                started_dial_peers.insert(peer_id);
+                            }
+                            Err(err) => {
+                                let error_detail = format_error_detail(&err);
+                                let connection_limit = is_connection_limit_error(&error_detail);
+                                record_dial_error(&dial_errors, peer_id, error_detail.clone()).await;
+                                tracing::info!(
+                                    phase = "bitswap_provider_preconnect_dial_rejected",
+                                    reason,
+                                    top_level_path = %top_level_path.as_deref().unwrap_or(""),
+                                    gateway_subresource,
+                                    peer = %peer_id,
+                                    transport,
+                                    connection_limit,
+                                    error = %err,
+                                    error_debug = ?err
+                                );
+                            }
+                        }
+                    }
+                    let failed_dial_waiter_count = drop_failed_bitswap_dial_waiters(
+                        &scheduled_dial_peers,
+                        &started_dial_peers,
+                        &mut connection_waiters,
+                        &mut connection_wait_started,
+                    );
+                    if failed_dial_waiter_count > 0 {
+                        tracing::info!(
+                            phase = "bitswap_provider_preconnect_dial_waiters_dropped",
+                            reason,
+                            top_level_path = %top_level_path.as_deref().unwrap_or(""),
+                            gateway_subresource,
+                            peer_count = scheduled_dial_peers.len().saturating_sub(started_dial_peers.len()),
+                            waiter_count = failed_dial_waiter_count
+                        );
+                    }
+                    prune_preconnect_waiters(&mut preconnect_waiters);
+                    continue;
+                }
                 let cids = command.cids;
                 let cid_count = cids.len();
                 let primary_cid = cids[0];
@@ -5250,7 +5628,17 @@ async fn run_shared_bitswap_swarm(
 
                 let control = control.clone();
                 let fetch_cids = cids.clone();
-                let mut respond = command.respond;
+                let Some(mut respond) = command.respond else {
+                    tracing::info!(
+                        phase = "bitswap_fetch_cancelled",
+                        cid = %primary_cid,
+                        cids = %format_cids(&fetch_cids),
+                        cid_count = fetch_cids.len(),
+                        command_queued_ms,
+                        reason = "missing_responder"
+                    );
+                    continue;
+                };
                 let dial_errors = dial_errors.clone();
                 let peer_transports = peer_transports.clone();
                 let fetch_started = Instant::now();
@@ -5528,6 +5916,15 @@ fn prune_connection_waiters(
         !peer_waiters.is_empty()
     });
     started.retain(|peer, _| waiters.contains_key(peer));
+}
+
+fn prune_preconnect_waiters(waiters: &mut Vec<HeldPreconnectWaiter>) {
+    let now = Instant::now();
+    let timeout = bitswap_connection_ready_timeout();
+    waiters.retain_mut(|waiter| match waiter.receiver.try_recv() {
+        Ok(()) | Err(oneshot::error::TryRecvError::Closed) => false,
+        Err(oneshot::error::TryRecvError::Empty) => now.duration_since(waiter.started) <= timeout,
+    });
 }
 
 fn drop_failed_bitswap_dial_waiters(
@@ -10772,6 +11169,50 @@ mod bitswap_tests {
     }
 
     #[test]
+    fn top_level_bitswap_provider_preconnect_peer_limit_parses_override() {
+        assert_eq!(
+            top_level_bitswap_provider_preconnect_peers_from_env_value(None),
+            TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_PEERS
+        );
+        assert_eq!(
+            top_level_bitswap_provider_preconnect_peers_from_env_value(Some("0")),
+            TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_PEERS
+        );
+        assert_eq!(
+            top_level_bitswap_provider_preconnect_peers_from_env_value(Some("bad")),
+            TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_PEERS
+        );
+        assert_eq!(
+            top_level_bitswap_provider_preconnect_peers_from_env_value(Some("5")),
+            5.min(MAX_BITSWAP_PEERS_PER_BLOCK)
+        );
+        assert_eq!(
+            top_level_bitswap_provider_preconnect_peers_from_env_value(Some("999")),
+            MAX_BITSWAP_PEERS_PER_BLOCK
+        );
+    }
+
+    #[test]
+    fn top_level_bitswap_provider_preconnect_budget_parses_override() {
+        assert_eq!(
+            top_level_bitswap_provider_preconnect_max_requests_from_env_value(None),
+            TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_MAX_REQUESTS
+        );
+        assert_eq!(
+            top_level_bitswap_provider_preconnect_max_requests_from_env_value(Some("0")),
+            TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_MAX_REQUESTS
+        );
+        assert_eq!(
+            top_level_bitswap_provider_preconnect_max_requests_from_env_value(Some("bad")),
+            TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_MAX_REQUESTS
+        );
+        assert_eq!(
+            top_level_bitswap_provider_preconnect_max_requests_from_env_value(Some("3")),
+            3
+        );
+    }
+
+    #[test]
     fn bitswap_session_peer_min_successes_env_value_parses_override() {
         assert_eq!(
             bitswap_session_peer_min_successes_from_env_value(None),
@@ -11743,6 +12184,41 @@ mod bitswap_tests {
         assert!(waiters.contains_key(&started));
         assert!(wait_started.contains_key(&started));
         assert!(failed_wait.try_recv().is_err());
+    }
+
+    #[test]
+    fn prunes_completed_closed_and_expired_preconnect_waiters() {
+        let (completed_ready, completed_wait) = oneshot::channel();
+        let (closed_ready, closed_wait) = oneshot::channel::<()>();
+        let (_pending_ready, pending_wait) = oneshot::channel::<()>();
+        let (_expired_ready, expired_wait) = oneshot::channel::<()>();
+        let expired_started = Instant::now()
+            .checked_sub(bitswap_connection_ready_timeout() + Duration::from_millis(1))
+            .unwrap_or_else(Instant::now);
+        let mut waiters = vec![
+            HeldPreconnectWaiter {
+                started: Instant::now(),
+                receiver: completed_wait,
+            },
+            HeldPreconnectWaiter {
+                started: Instant::now(),
+                receiver: closed_wait,
+            },
+            HeldPreconnectWaiter {
+                started: Instant::now(),
+                receiver: pending_wait,
+            },
+            HeldPreconnectWaiter {
+                started: expired_started,
+                receiver: expired_wait,
+            },
+        ];
+
+        completed_ready.send(()).unwrap();
+        drop(closed_ready);
+        prune_preconnect_waiters(&mut waiters);
+
+        assert_eq!(waiters.len(), 1);
     }
 
     #[test]

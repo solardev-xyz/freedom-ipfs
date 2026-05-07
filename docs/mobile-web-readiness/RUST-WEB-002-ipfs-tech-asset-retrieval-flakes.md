@@ -35120,3 +35120,229 @@ HTTP providers and Bitswap provider candidates, begin dialing a very small
 number of Bitswap candidates in the background while HTTP fetches proceed. The
 hypothesis is that this can reduce the first zero-HTTP subresource's cold
 connection cost without adding request fanout or delaying the HTTP path.
+
+## 2026-05-07 Env-Gated Page Subresource Bitswap Provider Preconnect
+
+Purpose:
+
+Test the provider-preconnect hypothesis from the focused cross-top-level
+diagnostics without changing default behavior. The candidate is deliberately
+env-gated and page-scoped:
+
+- `FREEDOM_IPFS_ENABLE_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT=1` enables it.
+- `FREEDOM_IPFS_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_PEERS=<n>` caps the
+  number of provider peers considered per preconnect attempt. Default: `2`.
+- `FREEDOM_IPFS_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_MAX_REQUESTS=<n>` caps
+  preconnect attempts per top-level path. Default: `8`.
+
+The implementation only preconnects for gateway subresources with both HTTP
+providers and Bitswap-capable provider candidates. It does not preconnect for
+root-only gateway requests, and it only opens/dials peers; it does not send a
+Bitswap want unless a normal fetch later chooses that peer.
+
+Validation before live runs:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval top_level_bitswap_provider_preconnect -- --nocapture
+cargo test -p freedom-ipfs-retrieval
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Validation result:
+
+- Filtered preconnect tests passed.
+- `cargo fmt --all --check`: passed.
+- `cargo test -p freedom-ipfs-retrieval`: passed, `125` tests, `1`
+  ignored.
+- `cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings`:
+  passed.
+
+No-env control command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/preconnect-control-focused-r5-20260507Tcontrol-trace.jsonl \
+  --comparison-output /tmp/preconnect-control-focused-r5-20260507Tcontrol.json
+```
+
+Control result:
+
+- Rust passed `4/5`; Kubo passed `5/5`.
+- `ipfs.tech` page assets:
+  - root p50/p95: Rust `1363/1523ms`; Kubo `1288/2004ms`.
+  - asset p50/p95: Rust `179/422ms`; Kubo `152/648ms`.
+  - One Rust failure: `_nuxt/hfYlCurB.js` returned `502` after `4385ms`.
+  - The failing request had two delegated empty lookups, a `2010ms` late-peer
+    miss, DHT provider lookup with `0` providers after `4228ms`, and no
+    Bitswap peers to try.
+- `wikipedia-on-ipfs-root`:
+  - root p50/p95: Rust `510/958ms`; Kubo `231/723ms`.
+- Resource max: Rust `55820KiB` RSS and `33` FDs vs Kubo `288416KiB` RSS and
+  `519` FDs.
+
+Rejected broad preconnect shape:
+
+```sh
+timeout 1800s env \
+  FREEDOM_IPFS_ENABLE_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT=1 \
+  FREEDOM_IPFS_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_PEERS=8 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/preconnect8-focused-r5-20260507Tlab-trace.jsonl \
+  --comparison-output /tmp/preconnect8-focused-r5-20260507Tlab.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5`.
+- `ipfs.tech` improved strongly: root `597/943ms` vs Kubo `1891/3856ms`;
+  assets `124/308ms` vs Kubo `241/897ms`.
+- `wikipedia-on-ipfs-root` regressed versus Kubo: Rust `1175/1306ms` vs Kubo
+  `434/630ms`.
+- Trace showed the shape was too broad:
+  - `167` preconnect starts.
+  - `58` Bitswap connections.
+  - Top-level Wikipedia roots also paid the preconnect cost.
+
+Decision: reject broad root+subresource preconnect. It can fix `ipfs.tech`, but
+it is not mobile-conservative enough and hurts unrelated root-only reads.
+
+Rejected uncapped subresource shapes:
+
+- Subresource-only with `8` peers passed `5/5`, but still fired `157`
+  preconnect plans and established `67` Bitswap connections. `ipfs.tech` asset
+  p50/p95 was `188/350ms` vs Kubo `114/371ms`: better tail, worse median.
+  Artifacts:
+  - `/tmp/preconnect8-subresource-focused-r5-20260507Tlab.json`
+  - `/tmp/preconnect8-subresource-focused-r5-20260507Tlab-trace.jsonl`
+- Subresource-only with the default `2` peers passed `5/5`, but established
+  `82` Bitswap connections in that sample and had a severe Wikipedia outlier
+  unrelated to preconnect firing on Wikipedia. `ipfs.tech` assets were only
+  `187/324ms` vs Kubo `165/712ms`. Artifacts:
+  - `/tmp/preconnect2-subresource-focused-r5-20260507Tlab.json`
+  - `/tmp/preconnect2-subresource-focused-r5-20260507Tlab-trace.jsonl`
+
+Decision: reject uncapped subresource preconnect. It makes the right class of
+connections but repeats the work too often across asset blocks.
+
+Candidate shape:
+
+Subresource-only preconnect with `8` peers and the default page budget of `8`
+preconnect requests per top-level path.
+
+R5 command:
+
+```sh
+timeout 1800s env \
+  FREEDOM_IPFS_ENABLE_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT=1 \
+  FREEDOM_IPFS_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_PEERS=8 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/preconnect8-subresource-budget8-focused-r5-20260507Tlab-trace.jsonl \
+  --comparison-output /tmp/preconnect8-subresource-budget8-focused-r5-20260507Tlab.json
+```
+
+R5 result:
+
+- Rust and Kubo passed `5/5`.
+- `ipfs.tech` page assets:
+  - root p50/p95: Rust `651/1228ms`; Kubo `1675/2254ms`.
+  - asset p50/p95: Rust `98/330ms`; Kubo `166/698ms`.
+- `wikipedia-on-ipfs-root`:
+  - root p50/p95: Rust `456/685ms`; Kubo `184/541ms`.
+- Resource max: Rust `51740KiB` RSS and `38` FDs vs Kubo `241236KiB` RSS and
+  `251` FDs.
+- Trace shape:
+  - `146` preconnect starts, but only `40` plans; the rest were budget skips.
+  - `43` Bitswap connections, close to the no-env control's `25` and much
+    lower than the uncapped samples.
+
+R10 confirmation command:
+
+```sh
+timeout 2400s env \
+  FREEDOM_IPFS_ENABLE_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT=1 \
+  FREEDOM_IPFS_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_PEERS=8 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/preconnect8-subresource-budget8-focused-r10-20260507Tlab-trace.jsonl \
+  --comparison-output /tmp/preconnect8-subresource-budget8-focused-r10-20260507Tlab.json
+```
+
+R10 result:
+
+- Rust and Kubo passed `10/10`.
+- `ipfs.tech` page assets:
+  - root p50/p95: Rust `727/856ms`; Kubo `1589/2828ms`.
+  - asset p50/p95: Rust `104/280ms`; Kubo `153/632ms`.
+- `wikipedia-on-ipfs-root`:
+  - root p50/p95: Rust `181/641ms`; Kubo `170/536ms`.
+- Resource max: Rust `52652KiB` RSS and `34` FDs vs Kubo `234520KiB` RSS and
+  `240` FDs.
+- Trace shape:
+  - Bitswap blocks: `220`, p50/p95/max `84/301/585ms`.
+  - HTTP-provider blocks: `150`, p50/p95/max `132/263/548ms`.
+  - `ipfs.tech` zero-HTTP/cold Bitswap requests were all successful, and
+    `hfYlCurB.js` no longer failed.
+  - Bitswap connections: `96` over 10 focused repeats. This is still much less
+    than Kubo's FD footprint, but higher than the no-env r10 baseline and must
+    stay part of the promotion decision.
+
+Decision:
+
+Keep the code as an env-gated lab candidate. Do not promote it to default from
+this evidence alone. The r10 result is promising because it closes the
+`ipfs.tech` asset median gap and preserves a large RSS/FD advantage, but the
+remaining questions are:
+
+- whether `96` Bitswap connections over this focused r10 is acceptable on longer
+  mobile browse sessions;
+- whether the page budget should be lower than `8`, or adaptive based on
+  zero-HTTP/slow-provider observations;
+- whether the preconnect should prefer peers already seen in the page/root
+  provider set instead of blindly taking the first scored provider candidates;
+- whether the same shape holds in the broader multi-case guardrail corpus.
+
+Next step:
+
+Run a no-env r10 control and a preconnect-enabled r10 in the broader guardrail
+set (`ipfs-tech-page-assets`, `daicowtf-page-assets`,
+`vitalik-root-html-range`) before considering any default promotion.
