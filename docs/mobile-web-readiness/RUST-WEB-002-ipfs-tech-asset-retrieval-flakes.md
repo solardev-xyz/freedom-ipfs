@@ -31292,3 +31292,97 @@ mobile browsing corpus. Future work should avoid static global width changes
 and instead decide direct `WANT_BLOCK` targets from source quality: recent
 per-top-level wins, peer latency/availability, provider position, and whether a
 request is a top-level document versus a page subresource.
+
+## 2026-05-07 - Lab: Incoming Bitswap Read-Timeout Peer Backoff
+
+Hypothesis:
+The shared Bitswap swarm logs `bitswap_incoming_stream_read` timeouts when a
+peer opens a stream but sends no usable block within the incoming read timeout.
+Before this lab, that signal did not feed back into peer selection. If another
+peer eventually delivered the requested block, the silent peer could remain in
+the recent-success pool and be retried as a trusted/session peer later. A
+temporary suppression after an incoming read timeout may be a useful escape
+hatch for stale or overloaded peers.
+
+Code:
+
+- Added disabled env flag:
+  `FREEDOM_IPFS_ENABLE_BITSWAP_INCOMING_READ_TIMEOUT_BACKOFF=1`.
+- When enabled, an incoming Bitswap stream read timeout immediately inserts the
+  peer into the shared swarm connection-error backoff table for the existing
+  `30s` TTL.
+- Future Bitswap commands skip peers with active backoff, including peers that
+  would otherwise be selected from recent successful session state.
+- Added `bitswap_incoming_read_timeout_backoff` trace events.
+- Default behavior is unchanged.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval incoming_read_timeout_backoff_suppresses_peer_immediately --lib
+```
+
+Result:
+
+- Focused unit test passed.
+- Formatting passed.
+
+Live command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_ENABLE_BITSWAP_INCOMING_READ_TIMEOUT_BACKOFF=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/incoming-timeout-backoff-selected-r5-20260507T075536Z-trace.jsonl \
+  --comparison-output /tmp/incoming-timeout-backoff-selected-r5-20260507T075536Z.json
+```
+
+Live result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1240/1325ms` vs Kubo `2841/3193ms`.
+- Vitalik range: Rust `113/126ms` vs Kubo `2491/3001ms`.
+- `ipfs.tech` root range: Rust `617/1469ms` vs Kubo `1364/1510ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `116/417ms`; Kubo root
+  `2/7ms`, assets `350/490ms`.
+- `ipfs.tech` hero range: Rust `133/149ms` vs Kubo `446/482ms`.
+- Wikipedia root: Rust `537/870ms` vs Kubo `347/395ms`.
+- Resource max: Rust `51072KiB` RSS and `31` FDs vs Kubo `223396KiB` RSS and
+  `326` FDs.
+- HTTP provider block fetch p50/p95/max: `182/562/870ms`.
+- Bitswap block fetch p50/p95/max: `85/480/675ms`.
+
+Trace interpretation:
+
+- The selected r5 live sample did not exercise the new path:
+  `bitswap_incoming_stream_read=0`,
+  `bitswap_incoming_read_timeout_backoff=0`, and
+  `bitswap_connection_error_peer_skipped=0`.
+- Therefore the performance numbers are only a guardrail for the disabled code,
+  not evidence that incoming-timeout backoff helped.
+- The run still showed the known shape: `ipfs.tech` page assets remained ahead
+  of Kubo, while Wikipedia root lost to Kubo in this window.
+
+Decision:
+Keep this as a disabled diagnostic hook, not a promoted behavior. The prior
+direct-width trace did show a real incoming stream read timeout from a recent
+Bitswap source peer, so the feedback path is worth having available for
+controlled reproductions. This selected r5 run cannot prove benefit because no
+incoming read timeout occurred. Future work should look for traces with
+`bitswap_incoming_stream_read ok=false timed_out=true`; only those runs can
+evaluate whether immediate peer backoff improves tails without harming useful
+session reuse.

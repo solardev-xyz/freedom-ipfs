@@ -89,6 +89,8 @@ const BITSWAP_CONNECTION_ERROR_BACKOFF_TTL: Duration = Duration::from_secs(30);
 const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD: usize = 2;
 const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD";
+const ENABLE_BITSWAP_INCOMING_READ_TIMEOUT_BACKOFF_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_BITSWAP_INCOMING_READ_TIMEOUT_BACKOFF";
 const BITSWAP_SESSION_SHORTCUT_GRACE: Duration = Duration::from_millis(0);
 const BITSWAP_SESSION_SHORTCUT_GRACE_MS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_SESSION_SHORTCUT_GRACE_MS";
@@ -4836,6 +4838,19 @@ async fn run_shared_bitswap_swarm(
                                 timeout_ms = BITSWAP_INCOMING_STREAM_READ_TIMEOUT.as_millis(),
                                 elapsed_ms = incoming_read.elapsed_ms
                             );
+                            if bitswap_incoming_read_timeout_backoff_enabled() {
+                                let backoff = record_incoming_read_timeout_backoff(
+                                    &mut connection_error_backoff,
+                                    incoming_read.peer,
+                                    Instant::now(),
+                                );
+                                tracing::info!(
+                                    phase = "bitswap_incoming_read_timeout_backoff",
+                                    peer = %incoming_read.peer,
+                                    count = backoff.count,
+                                    ttl_ms = BITSWAP_CONNECTION_ERROR_BACKOFF_TTL.as_millis()
+                                );
+                            }
                         } else {
                             tracing::debug!(error = %err, "incoming bitswap stream read failed");
                         }
@@ -5028,6 +5043,37 @@ fn record_connection_error_backoff<'a>(
     } else {
         None
     }
+}
+
+fn record_incoming_read_timeout_backoff(
+    backoff: &mut HashMap<PeerId, ConnectionErrorBackoff>,
+    peer: PeerId,
+    now: Instant,
+) -> &ConnectionErrorBackoff {
+    let class = "incoming_stream_read_timeout";
+    let state = backoff.entry(peer).or_insert(ConnectionErrorBackoff {
+        count: 0,
+        last_seen: now,
+        suppress_until: None,
+        class,
+    });
+    if now.duration_since(state.last_seen) > BITSWAP_CONNECTION_ERROR_BACKOFF_TTL {
+        state.count = 0;
+        state.suppress_until = None;
+    }
+    if state.class != class {
+        state.count = 0;
+        state.suppress_until = None;
+        state.class = class;
+    }
+    state.count += 1;
+    state.last_seen = now;
+    state.suppress_until = Some(now + BITSWAP_CONNECTION_ERROR_BACKOFF_TTL);
+    state
+}
+
+fn bitswap_incoming_read_timeout_backoff_enabled() -> bool {
+    std::env::var_os(ENABLE_BITSWAP_INCOMING_READ_TIMEOUT_BACKOFF_ENV).is_some()
 }
 
 fn bitswap_connection_error_backoff_threshold() -> usize {
@@ -10362,6 +10408,24 @@ mod bitswap_tests {
             &backoff,
             &peer,
             now + Duration::from_millis(20)
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn incoming_read_timeout_backoff_suppresses_peer_immediately() {
+        let peer = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let mut backoff = HashMap::new();
+        let now = Instant::now();
+
+        let state = record_incoming_read_timeout_backoff(&mut backoff, peer, now);
+
+        assert_eq!(state.count, 1);
+        assert_eq!(state.class, "incoming_stream_read_timeout");
+        assert!(connection_error_backoff_remaining_ms(
+            &backoff,
+            &peer,
+            now + Duration::from_millis(1)
         )
         .is_some());
     }
