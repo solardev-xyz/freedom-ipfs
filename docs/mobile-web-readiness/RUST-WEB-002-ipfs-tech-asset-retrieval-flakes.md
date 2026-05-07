@@ -38018,3 +38018,63 @@ variant did not fire. The next behavior experiment should wait for a fresh
 same-window trace where either `single_http_provider_bitswap_wins` reappears
 with a Kubo loss, or a different recurring Kubo win becomes visible in
 `meaningful_kubo_wins`.
+
+Focused r12 confirmation command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 12 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/postlookup-race-summary-focused-r12-20260507T193342Z-trace.jsonl \
+  --comparison-output /tmp/postlookup-race-summary-focused-r12-20260507T193342Z.json
+```
+
+Focused r12 result:
+
+- Rust and Kubo passed `12/12` for both cases.
+- `ipfs.tech` page root: Rust `565/609ms`; Kubo `2791/8273ms`.
+- `ipfs.tech` page assets: Rust `183/508ms`; Kubo `227/751ms`.
+- Wikipedia root: Rust `333/474ms`; Kubo `454/1703ms`.
+- Resource max: Rust `58000KiB` RSS and `39` FDs vs Kubo `368248KiB`
+  RSS and `766` FDs.
+- `meaningful_kubo_wins`: none.
+
+Focused r12 trace finding:
+
+- HTTP-provider blocks: `403`, p50/p90/p95/max `192/264/302/418ms`.
+- Bitswap blocks: `100`, p50/p90/p95/max `135/242/419/880ms`.
+- Delegated provider lookup distribution: zero HTTP `24`, single HTTP `239`,
+  multi HTTP `178`.
+- Request classifications included zero-HTTP provider Bitswap `24`,
+  cold Bitswap peer expansion `20`, and zero-HTTP provider cold Bitswap `20`.
+  All classified top-level paths were `/ipns/ipfs.tech/`.
+- Post-lookup race summary:
+  - events `202`
+  - provider wins `129`
+  - direct Bitswap wins `73`
+  - errors `0`
+  - provider-branch Bitswap wins `0`
+  - single-HTTP provider-branch Bitswap wins `0`
+  - elapsed p50/p90/p95/max `78/187/211/383ms`
+  - provider-result elapsed p50/p90/p95/max `92/196/221/383ms`
+  - outcomes `provider_won=129, bitswap_won=73`
+  - sources `http_provider=129, unknown=73`
+  - HTTP-count distribution `1=100, 3=91, 2=11`
+- HTTP provider fetch failures included `f010479.twinquasar.io` HTTP `500`
+  seven times, but there was no meaningful Kubo win and no provider-branch
+  Bitswap win.
+- The slowest Rust requests were zero-HTTP `ipfs.tech` child Bitswap fetches,
+  especially `_nuxt/mHWTJadT.js` up to `882ms`, but Rust still beat Kubo on
+  `ipfs.tech` asset p95 in the same window.
+
+R12 decision:
+
+This longer focused confirmation supports the same decision as the r5 run: keep
+the diagnostics, but do not add retrieval behavior from this no-gap window. The
+active repeated shape is zero-HTTP child Bitswap source/peer quality under
+`ipfs.tech`, not the previously suspected single-HTTP provider-branch Bitswap
+fallback.
