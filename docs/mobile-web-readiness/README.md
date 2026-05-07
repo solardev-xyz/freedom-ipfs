@@ -156,8 +156,13 @@ correlation ID, parent progress ID, top-level path, status, phases, CIDs, max
 event latency, and total elapsed time; `slow_events` preserves the slowest
 individual events with useful fields such as CID, path, progress correlation,
 source, provider count, peer count, trusted/session peer count, source peer, and
-bounded target summaries. The console output prints both sections so
-optimization runs immediately show which URL/CID/request caused the tail.
+bounded target summaries. The trace summary also keeps bounded per-path request
+summaries in `request_paths`, and Rust-vs-Kubo comparison output attaches the
+matching Rust path summary to each printed per-asset Kubo-win row as
+`rust_trace`. This directly shows block source mix, HTTP provider, HTTP max
+latency, classifications, and dominant request-local phases for a Kubo-winning
+asset path. The console output prints both sections so optimization runs
+immediately show which URL/CID/request caused the tail.
 Reports also include
 `progress_phases`, `block_sources`, and `bitswap_source_peers` counts, which
 help quantify user-visible loading states, cache/Bitswap/HTTP-provider mix, and

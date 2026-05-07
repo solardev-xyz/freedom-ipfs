@@ -28,6 +28,7 @@ const DEFAULT_ASSET_CONCURRENCY: usize = 6;
 const MEANINGFUL_KUBO_WIN_MIN_DELTA_MS: u128 = 50;
 const MEANINGFUL_KUBO_WIN_MIN_RATIO: f64 = 1.10;
 const MAX_PRINTED_ASSET_KUBO_WINS: usize = 8;
+const MAX_TRACE_REQUEST_PATHS: usize = 128;
 const MAX_TRACE_SLOW_EVENTS: usize = 16;
 const SYNTHETIC_MULTIBLOCK_RANGE_ID: &str = "synthetic-multiblock-range";
 const SYNTHETIC_MULTIBLOCK_FILE_BYTES: usize = 512 * 1024;
@@ -1707,8 +1708,9 @@ fn print_case_asset_kubo_wins(case: &ComparisonCase) {
         wins.len().min(MAX_PRINTED_ASSET_KUBO_WINS)
     );
     for (asset, win) in wins.into_iter().take(MAX_PRINTED_ASSET_KUBO_WINS) {
+        let rust_trace_details = format_comparison_asset_trace_details(asset.rust_trace.as_ref());
         println!(
-            "    {} {} kind={} rust={} kubo={} delta={}ms ratio={:.2}x samples=rust:{}/{} kubo:{}/{}",
+            "    {} {} kind={} rust={} kubo={} delta={}ms ratio={:.2}x samples=rust:{}/{} kubo:{}/{}{}",
             asset.path,
             win.metric,
             asset.kind,
@@ -1719,9 +1721,85 @@ fn print_case_asset_kubo_wins(case: &ComparisonCase) {
             asset.rust_pass_count,
             asset.rust_count,
             asset.kubo_pass_count,
-            asset.kubo_count
+            asset.kubo_count,
+            rust_trace_details
         );
     }
+}
+
+fn format_comparison_asset_trace_details(trace: Option<&TraceRequestPathAggregate>) -> String {
+    let Some(trace) = trace else {
+        return String::new();
+    };
+    let statuses = if trace.statuses.is_empty() {
+        "-".to_string()
+    } else {
+        format_trace_counts(&trace.statuses)
+    };
+    let classifications = if trace.classifications.is_empty() {
+        "-".to_string()
+    } else {
+        format_trace_counts(&trace.classifications)
+    };
+    let block_sources = if trace.block_sources.is_empty() {
+        "-".to_string()
+    } else {
+        format_trace_counts(&trace.block_sources)
+    };
+    let http_providers = if trace.http_provider_fetch_providers.is_empty() {
+        "-".to_string()
+    } else {
+        format_trace_counts(&trace.http_provider_fetch_providers)
+    };
+    let phases = if trace.phase_latencies.is_empty() {
+        "-".to_string()
+    } else {
+        trace
+            .phase_latencies
+            .iter()
+            .take(4)
+            .map(|phase| {
+                format!(
+                    "{}:{} total={}ms max={}ms",
+                    phase.phase, phase.count, phase.total_ms, phase.max_ms
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let bitswap_details = if trace.bitswap_source_candidate_indexes.is_empty()
+        && trace.bitswap_source_request_modes.is_empty()
+    {
+        String::new()
+    } else {
+        let source_indexes = if trace.bitswap_source_candidate_indexes.is_empty() {
+            "-".to_string()
+        } else {
+            format_trace_counts(&trace.bitswap_source_candidate_indexes)
+        };
+        let source_modes = if trace.bitswap_source_request_modes.is_empty() {
+            "-".to_string()
+        } else {
+            format_trace_counts(&trace.bitswap_source_request_modes)
+        };
+        format!(" bitswap_indexes={source_indexes} bitswap_modes={source_modes}")
+    };
+    format!(
+        " rust_trace=requests={} elapsed={} max_event={}ms statuses={} classifications={} block_sources={} http_fetches={} ok={} fail={} http_max={}ms http_providers={} phases={}{}",
+        trace.request_count,
+        trace.request_elapsed_ms,
+        trace.max_event_ms,
+        statuses,
+        classifications,
+        block_sources,
+        trace.http_provider_fetches,
+        trace.http_provider_fetch_successes,
+        trace.http_provider_fetch_failures,
+        trace.http_provider_fetch_max_ms,
+        http_providers,
+        phases,
+        bitswap_details
+    )
 }
 
 fn print_meaningful_kubo_wins(report: &ComparisonReport) {
@@ -5155,6 +5233,7 @@ struct ComparisonAsset {
     path: String,
     kind: String,
     source: String,
+    rust_trace: Option<TraceRequestPathAggregate>,
     rust_count: usize,
     kubo_count: usize,
     rust_pass_count: usize,
@@ -5396,6 +5475,11 @@ fn asset_comparisons_for_case(
 ) -> Vec<ComparisonAsset> {
     let rust_assets = asset_samples_for_case(rust, id);
     let kubo_assets = asset_samples_for_case(kubo, id);
+    let rust_trace_paths = rust
+        .trace_summary
+        .as_ref()
+        .map(trace_request_paths_by_path)
+        .unwrap_or_default();
     let mut paths = rust_assets.keys().cloned().collect::<Vec<_>>();
     for path in kubo_assets.keys() {
         if !paths.contains(path) {
@@ -5408,6 +5492,7 @@ fn asset_comparisons_for_case(
         .map(|path| {
             let rust = rust_assets.get(&path);
             let kubo = kubo_assets.get(&path);
+            let rust_trace = rust_trace_paths.get(&path).cloned();
             let rust_ttfb = rust
                 .map(|samples| LatencySummary::from_values(samples.ttfb_ms.clone()))
                 .unwrap_or_default();
@@ -5430,6 +5515,7 @@ fn asset_comparisons_for_case(
                     .or(kubo)
                     .map(|samples| samples.source.clone())
                     .unwrap_or_default(),
+                rust_trace,
                 rust_count: rust.map(|samples| samples.count).unwrap_or_default(),
                 kubo_count: kubo.map(|samples| samples.count).unwrap_or_default(),
                 rust_pass_count: rust.map(|samples| samples.pass_count).unwrap_or_default(),
@@ -5459,6 +5545,17 @@ fn asset_comparisons_for_case(
             .then_with(|| left.path.cmp(&right.path))
     });
     comparisons
+}
+
+fn trace_request_paths_by_path(
+    trace: &TraceSummary,
+) -> BTreeMap<String, TraceRequestPathAggregate> {
+    trace
+        .request_paths
+        .iter()
+        .cloned()
+        .map(|request| (request.path.clone(), request))
+        .collect()
 }
 
 fn asset_samples_for_case(
@@ -5936,6 +6033,7 @@ struct TraceSummary {
     bitswap_dns_expansion: TraceBitswapDnsExpansionAggregate,
     request_classifications: Vec<TraceValueCount>,
     request_classification_latencies: Vec<TraceRequestClassificationAggregate>,
+    request_paths: Vec<TraceRequestPathAggregate>,
     slow_cids: Vec<TraceCidAggregate>,
     slow_requests: Vec<TraceRequestAggregate>,
     progress_request_groups: Vec<TraceProgressRequestGroupAggregate>,
@@ -5974,6 +6072,35 @@ struct TraceRequestClassificationAggregate {
     bitswap_source_candidate_indexes: Vec<TraceValueCount>,
     bitswap_source_request_modes: Vec<TraceValueCount>,
     bitswap_source_peers: Vec<TraceValueCount>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TraceRequestPathAggregate {
+    path: String,
+    request_count: usize,
+    request_elapsed_ms: LatencySummary,
+    max_event_ms: u128,
+    statuses: Vec<TraceValueCount>,
+    classifications: Vec<TraceValueCount>,
+    block_sources: Vec<TraceValueCount>,
+    http_provider_fetches: usize,
+    http_provider_fetch_successes: usize,
+    http_provider_fetch_failures: usize,
+    http_provider_fetch_max_ms: u128,
+    http_provider_fetch_providers: Vec<TraceValueCount>,
+    http_provider_fetch_error_classes: Vec<TraceValueCount>,
+    bitswap_source_candidate_indexes: Vec<TraceValueCount>,
+    bitswap_source_request_modes: Vec<TraceValueCount>,
+    bitswap_source_peers: Vec<TraceValueCount>,
+    phase_latencies: Vec<TraceRequestPathPhaseAggregate>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TraceRequestPathPhaseAggregate {
+    phase: String,
+    count: usize,
+    total_ms: u128,
+    max_ms: u128,
 }
 
 #[derive(Debug, Serialize)]
@@ -7566,6 +7693,114 @@ struct TraceRequestBuilder {
     cold_bitswap_peer_expands: usize,
     max_bitswap_peer_count: u128,
     max_bitswap_session_peer_count: u128,
+}
+
+#[derive(Default)]
+struct TraceRequestPathBuilder {
+    path: String,
+    request_count: usize,
+    request_elapsed_values: Vec<u128>,
+    max_event_ms: u128,
+    statuses: BTreeMap<String, usize>,
+    classifications: BTreeMap<String, usize>,
+    block_sources: BTreeMap<String, usize>,
+    http_provider_fetches: usize,
+    http_provider_fetch_successes: usize,
+    http_provider_fetch_failures: usize,
+    http_provider_fetch_max_ms: u128,
+    http_provider_fetch_providers: BTreeMap<String, usize>,
+    http_provider_fetch_error_classes: BTreeMap<String, usize>,
+    bitswap_source_candidate_indexes: BTreeMap<String, usize>,
+    bitswap_source_request_modes: BTreeMap<String, usize>,
+    bitswap_source_peers: BTreeMap<String, usize>,
+    phase_latencies: BTreeMap<String, TraceRequestPathPhaseBuilder>,
+}
+
+#[derive(Default)]
+struct TraceRequestPathPhaseBuilder {
+    count: usize,
+    total_ms: u128,
+    max_ms: u128,
+}
+
+impl TraceRequestPathBuilder {
+    fn record(&mut self, request: &TraceRequestAggregate) {
+        if self.path.is_empty() {
+            self.path = request.path.clone();
+        }
+        self.request_count += 1;
+        self.request_elapsed_values.push(request.elapsed_ms);
+        self.max_event_ms = self.max_event_ms.max(request.max_event_ms);
+        match &request.status {
+            Some(status) => *self.statuses.entry(status.clone()).or_default() += 1,
+            None => *self.statuses.entry("active".to_string()).or_default() += 1,
+        }
+        merge_trace_counts(&mut self.classifications, &request.classifications);
+        merge_trace_counts(&mut self.block_sources, &request.block_sources);
+        self.http_provider_fetches += request.http_provider_fetches;
+        self.http_provider_fetch_successes += request.http_provider_fetch_successes;
+        self.http_provider_fetch_failures += request.http_provider_fetch_failures;
+        self.http_provider_fetch_max_ms = self.http_provider_fetch_max_ms.max(
+            request
+                .http_provider_fetch_elapsed_ms
+                .max_ms
+                .unwrap_or_default(),
+        );
+        merge_trace_counts(
+            &mut self.http_provider_fetch_providers,
+            &request.http_provider_fetch_providers,
+        );
+        merge_trace_counts(
+            &mut self.http_provider_fetch_error_classes,
+            &request.http_provider_fetch_error_classes,
+        );
+        merge_trace_counts(
+            &mut self.bitswap_source_candidate_indexes,
+            &request.bitswap_source_candidate_indexes,
+        );
+        merge_trace_counts(
+            &mut self.bitswap_source_request_modes,
+            &request.bitswap_source_request_modes,
+        );
+        merge_trace_counts(
+            &mut self.bitswap_source_peers,
+            &request.bitswap_source_peers,
+        );
+        for phase in &request.phase_latencies {
+            let builder = self.phase_latencies.entry(phase.phase.clone()).or_default();
+            builder.count += phase.count;
+            builder.total_ms += phase.total_ms;
+            builder.max_ms = builder
+                .max_ms
+                .max(phase.elapsed_ms.max_ms.unwrap_or_default());
+        }
+    }
+
+    fn into_aggregate(self) -> TraceRequestPathAggregate {
+        TraceRequestPathAggregate {
+            path: self.path,
+            request_count: self.request_count,
+            request_elapsed_ms: LatencySummary::from_values(self.request_elapsed_values),
+            max_event_ms: self.max_event_ms,
+            statuses: sorted_trace_counts(self.statuses),
+            classifications: sorted_trace_counts(self.classifications),
+            block_sources: sorted_trace_counts(self.block_sources),
+            http_provider_fetches: self.http_provider_fetches,
+            http_provider_fetch_successes: self.http_provider_fetch_successes,
+            http_provider_fetch_failures: self.http_provider_fetch_failures,
+            http_provider_fetch_max_ms: self.http_provider_fetch_max_ms,
+            http_provider_fetch_providers: sorted_trace_counts(self.http_provider_fetch_providers),
+            http_provider_fetch_error_classes: sorted_trace_counts(
+                self.http_provider_fetch_error_classes,
+            ),
+            bitswap_source_candidate_indexes: sorted_trace_counts(
+                self.bitswap_source_candidate_indexes,
+            ),
+            bitswap_source_request_modes: sorted_trace_counts(self.bitswap_source_request_modes),
+            bitswap_source_peers: sorted_trace_counts(self.bitswap_source_peers),
+            phase_latencies: sorted_trace_request_path_phase_latencies(self.phase_latencies),
+        }
+    }
 }
 
 impl TraceRequestBuilder {
@@ -9232,19 +9467,22 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             .then_with(|| left.phase.cmp(&right.phase))
     });
     slow_events.truncate(MAX_TRACE_SLOW_EVENTS);
-    let mut slow_requests = completed_requests
+    let all_requests = completed_requests
         .into_values()
         .map(TraceRequestBuilder::into_aggregate)
         .collect::<Vec<_>>();
-    slow_requests.extend(
+    let mut all_requests = all_requests;
+    all_requests.extend(
         active_requests
             .into_values()
             .map(TraceRequestBuilder::into_aggregate),
     );
-    let request_classifications = summarize_request_classifications(&slow_requests);
+    let request_classifications = summarize_request_classifications(&all_requests);
     let request_classification_latencies =
-        summarize_request_classification_latencies(&slow_requests);
-    let progress_request_groups = summarize_progress_request_groups(&slow_requests);
+        summarize_request_classification_latencies(&all_requests);
+    let request_paths = summarize_trace_request_paths(&all_requests);
+    let progress_request_groups = summarize_progress_request_groups(&all_requests);
+    let mut slow_requests = all_requests.clone();
     slow_requests.sort_by(|left, right| {
         right
             .elapsed_ms
@@ -9374,6 +9612,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_dns_expansion,
         request_classifications,
         request_classification_latencies,
+        request_paths,
         slow_cids: sorted_trace_cids(slow_cids),
         slow_requests,
         progress_request_groups,
@@ -9388,6 +9627,35 @@ fn summarize_request_classifications(requests: &[TraceRequestAggregate]) -> Vec<
         }
     }
     sorted_trace_counts(counts)
+}
+
+fn summarize_trace_request_paths(
+    requests: &[TraceRequestAggregate],
+) -> Vec<TraceRequestPathAggregate> {
+    let mut builders = BTreeMap::<String, TraceRequestPathBuilder>::new();
+    for request in requests {
+        builders
+            .entry(request.path.clone())
+            .or_insert_with(|| TraceRequestPathBuilder {
+                path: request.path.clone(),
+                ..TraceRequestPathBuilder::default()
+            })
+            .record(request);
+    }
+    let mut paths = builders
+        .into_values()
+        .map(TraceRequestPathBuilder::into_aggregate)
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| {
+        right
+            .request_elapsed_ms
+            .max_ms
+            .cmp(&left.request_elapsed_ms.max_ms)
+            .then_with(|| right.max_event_ms.cmp(&left.max_event_ms))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    paths.truncate(MAX_TRACE_REQUEST_PATHS);
+    paths
 }
 
 #[derive(Default)]
@@ -9800,6 +10068,29 @@ fn sorted_trace_phase_latencies(values: BTreeMap<String, Vec<u128>>) -> Vec<Trac
     values
 }
 
+fn sorted_trace_request_path_phase_latencies(
+    values: BTreeMap<String, TraceRequestPathPhaseBuilder>,
+) -> Vec<TraceRequestPathPhaseAggregate> {
+    let mut values = values
+        .into_iter()
+        .map(|(phase, builder)| TraceRequestPathPhaseAggregate {
+            phase,
+            count: builder.count,
+            total_ms: builder.total_ms,
+            max_ms: builder.max_ms,
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right
+            .total_ms
+            .cmp(&left.total_ms)
+            .then_with(|| right.max_ms.cmp(&left.max_ms))
+            .then_with(|| left.phase.cmp(&right.phase))
+    });
+    values.truncate(MAX_TRACE_SLOW_EVENTS);
+    values
+}
+
 fn sorted_trace_source_latencies(
     values: BTreeMap<String, Vec<u128>>,
 ) -> Vec<TraceSourceLatencyAggregate> {
@@ -10041,6 +10332,12 @@ fn format_trace_counts(counts: &[TraceValueCount]) -> String {
         .map(|entry| format!("{}={}", entry.value, entry.count))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn merge_trace_counts(target: &mut BTreeMap<String, usize>, counts: &[TraceValueCount]) {
+    for count in counts {
+        *target.entry(count.value.clone()).or_default() += count.count;
+    }
 }
 
 fn print_trace_progress_request_groups(trace: &TraceSummary) {
@@ -11682,6 +11979,41 @@ mod tests {
             1
         );
 
+        assert_eq!(summary.request_paths.len(), 1);
+        let request_path = &summary.request_paths[0];
+        assert_eq!(request_path.path, "/ipns/site/app.js");
+        assert_eq!(request_path.request_count, 1);
+        assert_eq!(request_path.request_elapsed_ms.p50_ms, Some(150));
+        assert_eq!(
+            trace_value_count(&request_path.block_sources, "http_provider"),
+            1
+        );
+        assert_eq!(trace_value_count(&request_path.block_sources, "cache"), 1);
+        assert_eq!(request_path.http_provider_fetches, 2);
+        assert_eq!(request_path.http_provider_fetch_max_ms, 120);
+        assert_eq!(
+            trace_value_count(
+                &request_path.http_provider_fetch_providers,
+                "https://provider-a.example"
+            ),
+            1
+        );
+        assert_eq!(
+            trace_value_count(
+                &request_path.http_provider_fetch_providers,
+                "https://provider-b.example"
+            ),
+            1
+        );
+        let path_http_phase = request_path
+            .phase_latencies
+            .iter()
+            .find(|phase| phase.phase == "http_provider_fetch")
+            .unwrap();
+        assert_eq!(path_http_phase.count, 2);
+        assert_eq!(path_http_phase.total_ms, 160);
+        assert_eq!(path_http_phase.max_ms, 120);
+
         let group = &summary.progress_request_groups[0];
         assert_eq!(group.top_level_path, "/ipns/site/");
         assert_eq!(group.slow_requests[0].path, "/ipns/site/app.js");
@@ -12893,6 +13225,90 @@ mod tests {
             .find(|asset| asset.path == "/ipfs/root/style.css")
             .unwrap();
         assert!(style.meaningful_kubo_wins.is_empty());
+    }
+
+    #[test]
+    fn comparison_case_attaches_rust_trace_to_asset_kubo_wins() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-comparison-asset-trace-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"request_start\",\"request_id\":1,\"path\":\"/ipfs/root/app.js\",\"span\":{\"path\":\"/ipfs/root/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipfs/root\"}}\n",
+                "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":80,\"cid\":\"cid-a\",\"source\":\"http_provider\",\"span\":{\"path\":\"/ipfs/root/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipfs/root\"}}\n",
+                "{\"phase\":\"http_provider_fetch\",\"elapsed_ms\":75,\"cid\":\"cid-a\",\"provider\":\"https://provider-a.example\",\"ok\":true,\"span\":{\"path\":\"/ipfs/root/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipfs/root\"}}\n",
+                "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipfs/root/app.js\",\"status\":200,\"elapsed_ms\":90,\"span\":{\"path\":\"/ipfs/root/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipfs/root\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let trace_summary = summarize_trace_output(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut rust_runs = vec![run_result(
+            RunPhase::Measured,
+            1,
+            200,
+            Some(40),
+            Some(12),
+            Some(0),
+            None,
+        )];
+        rust_runs[0].results[0].assets = vec![script_asset_result_for_path(
+            200,
+            240,
+            8080,
+            "/ipfs/root/app.js",
+        )];
+
+        let mut kubo_runs = vec![run_result(
+            RunPhase::Measured,
+            1,
+            120,
+            Some(100),
+            Some(30),
+            Some(0),
+            None,
+        )];
+        kubo_runs[0].results[0].assets = vec![script_asset_result_for_path(
+            80,
+            90,
+            5001,
+            "/ipfs/root/app.js",
+        )];
+
+        let mut rust = run_report(HarnessEngine::Rust, None, rust_runs);
+        rust.trace_summary = Some(trace_summary);
+        let kubo = run_report(HarnessEngine::Kubo, None, kubo_runs);
+
+        let cases = ComparisonCase::from_reports(&rust, &kubo);
+        let asset = cases[0]
+            .asset_comparisons
+            .iter()
+            .find(|asset| asset.path == "/ipfs/root/app.js")
+            .unwrap();
+        assert!(!asset.meaningful_kubo_wins.is_empty());
+        let rust_trace = asset.rust_trace.as_ref().unwrap();
+        assert_eq!(rust_trace.request_count, 1);
+        assert_eq!(
+            trace_value_count(&rust_trace.block_sources, "http_provider"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(
+                &rust_trace.http_provider_fetch_providers,
+                "https://provider-a.example"
+            ),
+            1
+        );
+        assert_eq!(rust_trace.http_provider_fetch_max_ms, 75);
     }
 
     #[test]

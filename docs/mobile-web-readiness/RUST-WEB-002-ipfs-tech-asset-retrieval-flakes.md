@@ -40916,3 +40916,104 @@ whether `_nuxt` parent-directory latency is causal in a bad window, but the next
 default candidate should not be another HTML-prefetch variant unless a trace
 shows repeated parent-directory fetches are the active bottleneck in that same
 window.
+
+## 2026-05-07: Asset Kubo-Win Trace Link Diagnostics
+
+Branch/head:
+
+- `codex/kubo-session-performance-20260506`
+- Base before this diagnostic patch: `293b25d`
+
+Problem:
+
+The comparison report already prints exact per-asset path/metric pairs where
+Kubo beats Rust, and the trace summary already prints slow requests. In good
+windows where Rust wins the case-level aggregate, the remaining Kubo wins can be
+medium-latency assets that are not always in the top slow-request list. That
+still required manual matching between `asset_kubo_wins` rows and trace request
+paths before deciding whether a candidate should target HTTP-provider latency,
+Bitswap, UnixFS path/file-size work, or gateway overhead.
+
+Change:
+
+- Add bounded per-path request summaries to `TraceSummary` as `request_paths`.
+  Each path summary includes request count, request elapsed summary, status,
+  request classifications, block source mix, HTTP provider fetch counts,
+  provider names, HTTP max latency, Bitswap source modes/indexes, and dominant
+  request-local phase totals.
+- Attach the matching Rust path summary to each `ComparisonAsset` as
+  `rust_trace`.
+- Print `rust_trace=...` inline on each shown `asset_kubo_wins` row.
+- Keep this diagnostics-only; no retrieval behavior changed.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness attaches -- --nocapture
+cargo test -p mobile-web-harness -- --nocapture
+cargo check -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Result:
+
+- `cargo fmt --all --check`: passed.
+- Focused harness tests passed: `2` tests.
+- Full harness package tests passed: `58` tests.
+- `cargo check -p mobile-web-harness`: passed.
+- `cargo clippy -p mobile-web-harness --all-targets -- -D warnings`: passed.
+
+Live diagnostic command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/asset-kubowin-trace-link-ipfs-tech-r3-20260508T000000Z-trace.jsonl \
+  --comparison-output /tmp/asset-kubowin-trace-link-ipfs-tech-r3-20260508T000000Z.json
+```
+
+Live result:
+
+- Rust/Kubo passed `3/3`.
+- Case-level `meaningful_kubo_wins`: none.
+- `ipfs.tech` root: Rust `679/1246ms`; Kubo `1355/2421ms`.
+- `ipfs.tech` assets: Rust `101/207ms`; Kubo `107/712ms`.
+- Resource max: Rust `56652KiB` RSS and `30` FDs vs Kubo `185028KiB`
+  RSS and `117` FDs.
+
+Useful new trace signal:
+
+The printed path-local Kubo wins now explain themselves inline:
+
+- `_nuxt/Duo5E1ke.js` p95: Rust `285ms` vs Kubo `107ms`,
+  `rust_trace=requests=3`, `block_sources=bitswap=3,http_provider=1`,
+  `http_providers=https://ipfs-bridge.sia.dev/=1`, and dominant phases
+  `request_done`, `unixfs_file_size`, `unixfs_resource`, and
+  `block_fetch_total`.
+- `_nuxt/Grid.CfsFuo-l.css` p50/p95: Rust won aggregate asset p95 but lost this
+  path locally; `rust_trace` showed `block_sources=bitswap=3,http_provider=2`,
+  `http_providers=https://dag.w3s.link/=2`, `http_max=60ms`, and dominant
+  `unixfs_file_size` / `unixfs_resource` around block fetches.
+- `_nuxt/entry.C4ErMpWu.css` p50: `rust_trace` showed
+  `block_sources=bitswap=5`, no HTTP provider fetches, and dominant UnixFS
+  file-size/resource phases around `block_fetch_total`.
+
+Decision:
+
+Keep this diagnostic patch. It makes the next optimization target less
+ambiguous: in this window Rust is already ahead case-level, while path-local
+asset wins split across single HTTP-provider, DAG-backed HTTP-provider, and
+pure Bitswap paths. The common shape is not another broad provider-lookup or
+HTML-prefetch gap; it is request-local UnixFS file-size/resource latency sitting
+on top of one or more block fetches. Future candidates should use the
+`rust_trace` rows to target a repeated, same-window path shape before changing a
+default.
