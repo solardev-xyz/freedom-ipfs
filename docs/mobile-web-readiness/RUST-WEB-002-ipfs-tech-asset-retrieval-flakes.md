@@ -35346,3 +35346,103 @@ Next step:
 Run a no-env r10 control and a preconnect-enabled r10 in the broader guardrail
 set (`ipfs-tech-page-assets`, `daicowtf-page-assets`,
 `vitalik-root-html-range`) before considering any default promotion.
+
+Broader no-env guardrail command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/preconnect-budget-control-guardrail-r10-20260507Tcontrol-trace.jsonl \
+  --comparison-output /tmp/preconnect-budget-control-guardrail-r10-20260507Tcontrol.json
+```
+
+Broader no-env result:
+
+- Rust and Kubo passed `10/10`.
+- `daicowtf-page-assets` root p50/p95: Rust `1248/1681ms`; Kubo
+  `3089/4369ms`.
+- `vitalik-root-html-range` root p50/p95: Rust `107/126ms`; Kubo
+  `1839/2879ms`.
+- `ipfs-tech-page-assets`:
+  - root p50/p95: Rust `723/880ms`; Kubo `1154/1378ms`.
+  - asset p50/p95: Rust `189/316ms`; Kubo `362/442ms`.
+- Resource max: Rust `49772KiB` RSS and `31` FDs vs Kubo `162416KiB` RSS and
+  `273` FDs.
+- Trace shape:
+  - HTTP-provider blocks: `364`, p50/p95/max `187/427/965ms`.
+  - Bitswap blocks: `36`, p50/p95/max `151/584/1065ms`.
+  - Classified `cold_bitswap_peer_expand`/`zero_http_provider_bitswap` requests:
+    `12`, all under `/ipns/ipfs.tech/`.
+  - Bitswap connections: `29`.
+
+Broader preconnect-enabled guardrail command:
+
+```sh
+timeout 3000s env \
+  FREEDOM_IPFS_ENABLE_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT=1 \
+  FREEDOM_IPFS_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_PEERS=8 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/preconnect8-budget-guardrail-r10-20260507Tlab-trace.jsonl \
+  --comparison-output /tmp/preconnect8-budget-guardrail-r10-20260507Tlab.json
+```
+
+Broader preconnect-enabled result:
+
+- Rust and Kubo passed `10/10`.
+- `daicowtf-page-assets` root p50/p95: Rust `1237/1590ms`; Kubo
+  `2935/3064ms`.
+- `vitalik-root-html-range` root p50/p95: Rust `106/117ms`; Kubo
+  `2333/3124ms`.
+- `ipfs-tech-page-assets`:
+  - root p50/p95: Rust `538/1064ms`; Kubo `1150/1493ms`.
+  - asset p50/p95: Rust `154/337ms`; Kubo `355/501ms`.
+- Resource max: Rust `53004KiB` RSS and `37` FDs vs Kubo `174812KiB` RSS and
+  `263` FDs.
+- Trace shape:
+  - HTTP-provider blocks: `337`, p50/p95/max `187/418/972ms`.
+  - Bitswap blocks: `63`, p50/p95/max `58/184/588ms`.
+  - Classified `cold_bitswap_peer_expand`/`zero_http_provider_bitswap` requests:
+    `10`, all under `/ipns/ipfs.tech/`.
+  - Bitswap connections: `110`.
+
+Decision:
+
+Keep the page subresource Bitswap provider preconnect behind the env flag. It
+is useful as a lab tool and can improve `ipfs.tech` root/asset medians and
+Bitswap block latency, but this broader same-window guardrail does not justify
+default promotion:
+
+- `ipfs.tech` asset p50 improved from `189ms` to `154ms`, but p95 regressed from
+  `316ms` to `337ms`.
+- `ipfs.tech` root p50 improved from `723ms` to `538ms`, but p95 regressed from
+  `880ms` to `1064ms`.
+- Bitswap block p95 improved from `584ms` to `184ms`, but Bitswap connections
+  rose from `29` to `110`.
+- Rust already beat Kubo on all three broader no-env guardrail cases while using
+  much less RSS/FD budget.
+
+Next follow-up should treat preconnect as a diagnostic/proving tool, not the
+main line. The more promising default path is narrower: reduce the remaining
+zero-HTTP `ipfs.tech` child request tail by improving peer choice/reuse or
+adaptive scheduling without adding broad connection pressure.
