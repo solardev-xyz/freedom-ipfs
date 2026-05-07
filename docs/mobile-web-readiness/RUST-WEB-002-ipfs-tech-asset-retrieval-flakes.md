@@ -27361,9 +27361,37 @@ timeout 3000s cargo run -p mobile-web-harness -- \
   --require-progress-phase fetching_bitswap=1
 ```
 
+Post-fastscore no-env broader control:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-default-post-fastscore-multicase-r5-20260507T010609Z-trace.jsonl \
+  --comparison-output /tmp/current-default-post-fastscore-multicase-r5-20260507T010609Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
 Broader result:
 
 - All Rust and Kubo broader runs passed.
+- Post-fastscore no-env control:
+  - run total p50/p95: `4028/4596ms`
+  - `ipfs.tech` root TTFB p50/p95: `759/899ms`
+  - `ipfs.tech` asset TTFB p50/p95: `228/545ms`
+  - DAICO root TTFB p50/p95: `1364/1454ms`
+  - Vitalik root/range TTFB p50/p95: `99/221ms`
+  - resource max: `56672KiB` RSS, `38` FDs
 - `100ms` gate:
   - run total p50/p95: `2916/3280ms`
   - `ipfs.tech` root TTFB p50/p95: `590/690ms`
@@ -27381,12 +27409,12 @@ Broader result:
 
 Decision:
 Keep this as a promising opt-in lab control, not a default yet. The `100ms`
-score gate directly targets the observed median tax and materially improves
-`ipfs.tech` asset p50/p95 in both focused and broader samples, but it still
-increases RSS/FDs versus the current no-env default and slightly regressed DAICO
-p95 compared with the earlier no-env guardrail. The `50ms` gate is narrower, but
-it did not preserve the broader result as well as `100ms` in this sample and had
-even higher FD max. Before promotion, rerun same-window no-env vs `100ms` on the
-multi-case guardrail and inspect whether the remaining resource cost comes from
-extra HTTP races, Bitswap shortcuts left running after provider wins, or public
-network variance.
+score gate directly targets the observed median tax and improved `ipfs.tech`
+asset p50/p95 in focused and broader samples. Against the post-fastscore no-env
+broader control it also improved run p50/p95 (`4028/4596ms -> 2916/3280ms`) and
+kept FD max flat (`38 -> 38`), while RSS rose modestly (`56672KiB -> 58444KiB`).
+The `50ms` gate is narrower, but it did not preserve the broader result as well
+as `100ms` in this sample and had a higher FD max. Before promotion, repeat
+no-env vs `100ms` with a larger or alternating same-window guardrail and inspect
+whether the remaining RSS cost comes from extra HTTP races, session shortcuts
+left running after provider wins, or public network variance.
