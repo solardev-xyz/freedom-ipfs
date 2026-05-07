@@ -39317,3 +39317,186 @@ is dominating the request. The same-window sample again points at
 single-provider `ipfs-bridge.sia.dev` tails for the worst asset, while some
 medium slow requests have shorter HTTP fetch time and need separate
 gateway/UnixFS investigation.
+
+## 2026-05-07: Current Request-Source Baselines After Diagnostics
+
+Branch:
+
+- `codex/kubo-session-performance-20260506`
+- Head for these runs: `3767cec`
+
+Question:
+
+With request-local source/provider diagnostics available, what remaining
+Rust-vs-Kubo gaps are still visible at current head?
+
+### IPNS plus CID-direct r5
+
+Command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-page-assets-cid-direct \
+  --trace-output /tmp/request-source-current-ipfs-tech-r5-20260507T-trace.jsonl \
+  --comparison-output /tmp/request-source-current-ipfs-tech-r5-20260507T.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5` for both cases.
+- `ipfs.tech` IPNS root: Rust `711/865ms`; Kubo `1851/2650ms`.
+- `ipfs.tech` IPNS assets:
+  - Rust p50/p95 TTFB: `182/474ms`
+  - Kubo p50/p95 TTFB: `114/479ms`
+  - Rust p50/p95 total: `182/475ms`
+  - Kubo p50/p95 total: `114/479ms`
+- Resource max: Rust `57552KiB` RSS and `34` FDs vs Kubo `176336KiB`
+  RSS and `109` FDs.
+- `meaningful_kubo_wins`: `2`, both IPNS asset p50 metrics.
+- The CID-direct case in this two-case command was cache-hot because it ran
+  after the IPNS case in the same fresh gateway. Do not use that half as a
+  cold CID-direct baseline.
+
+Trace interpretation for the IPNS half:
+
+- IPNS name cache was not the median asset cost:
+  cached subresource `name_resolve` was `0ms`.
+- IPNS request-local timing was dominated by UnixFS size/resource work:
+  - `request_done` p50/p95/max: `182/536/862ms`
+  - `unixfs_file_size` p50/p95/max: `180/463/659ms`
+  - `unixfs_resource` p50/p95/max: `181/518/807ms`
+- HTTP-provider summary:
+  - all providers p50/p95/max: `157/258/409ms`
+  - `https://ipfs-bridge.sia.dev/`: `184/315/409ms`
+  - `https://dag.w3s.link/`: `51/93/123ms`
+- Slow request source lines now show the useful classification directly:
+  - `_nuxt/entry.C4ErMpWu.css`: `661ms`,
+    `block_sources=http_provider=2`,
+    `http_elapsed=p50=193ms ... max=396ms`,
+    `http_providers=https://ipfs-bridge.sia.dev/=2`.
+  - `_nuxt/B1ETkkRH.js`: `627ms`,
+    `block_sources=http_provider=2`,
+    `http_elapsed=p50=214ms ... max=315ms`,
+    `http_providers=https://ipfs-bridge.sia.dev/=2`.
+  - `_nuxt/BXkYzPrD.js`: `584ms`,
+    `block_sources=http_provider=2`,
+    `http_elapsed=max=258ms`,
+    `http_providers=https://ipfs-bridge.sia.dev/=1`.
+
+### Cold CID-direct r5
+
+Command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets-cid-direct \
+  --trace-output /tmp/request-source-current-cid-direct-r5-20260507T-trace.jsonl \
+  --comparison-output /tmp/request-source-current-cid-direct-r5-20260507T.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- CID-direct root: Rust `544/1459ms`; Kubo `1661/2721ms`.
+- CID-direct assets:
+  - Rust p50/p95 TTFB: `128/317ms`
+  - Kubo p50/p95 TTFB: `109/339ms`
+  - Rust p50/p95 total: `128/317ms`
+  - Kubo p50/p95 total: `109/339ms`
+- Resource max: Rust `57616KiB` RSS and `31` FDs vs Kubo `214520KiB`
+  RSS and `124` FDs.
+- Case-level `meaningful_kubo_wins`: none.
+- Path-local Kubo wins remain, especially:
+  - `_nuxt/EgmQ2fGv.js` p95 TTFB/total: Rust `446/446ms`;
+    Kubo `192/193ms`.
+  - `_nuxt/8Bs0wEmG.js` p95 TTFB/total: Rust `482/482ms`;
+    Kubo `231/231ms`.
+
+Trace interpretation:
+
+- The old CID-direct aggregate asset median gap is mostly gone at current head.
+- Remaining case-level tail is the known top-level zero-HTTP Bitswap root
+  shape, not a confirmed Kubo win:
+  - `zero_http_provider_cold_bitswap=5`
+  - root request p50/p95/max `541/1455/1455ms`
+  - one root block spent `1207ms` in `block_fetch_total` and `1138ms` in
+    `bitswap_fetch`.
+- HTTP-provider summary:
+  - all providers p50/p95/max: `79/203/242ms`
+  - `https://dag.w3s.link/`: `61/115/242ms`
+  - `https://ipfs-bridge.sia.dev/`: `184/211/241ms`
+- Same-provider HTTP self-hedge was not useful in this window:
+  `8` self-hedges, `4` fired results, all `4` won by the initial request and
+  `0` won by the hedged duplicate.
+
+Decision:
+
+Keep the request-source diagnostics and continue using them. Current head is
+not showing the older CID-direct case-level Kubo gap, but the IPNS page-assets
+sample still has a meaningful asset p50 Kubo win while Rust remains ahead on
+root, asset p95, RSS, and FDs. The common remaining asset shape is not slow
+IPNS name resolution; it is per-subresource UnixFS/file-size/resource latency
+around single-provider HTTP blocks, usually `ipfs-bridge.sia.dev`, plus
+occasional zero-HTTP Bitswap root tails.
+
+## 2026-05-07: Request-local phase latency diagnostics
+
+Branch:
+
+- `codex/kubo-session-performance-20260506`
+- Base before this diagnostic patch: `3767cec`
+
+Problem:
+
+The request-source diagnostics show which source/provider served a slow
+request, but they still do not say which request-local phase consumed the time.
+For example, the current IPNS r5 needed custom parsing to see that asset median
+latency was lining up with `unixfs_file_size` / `unixfs_resource`.
+
+Change:
+
+- Track elapsed values per phase inside each `TraceRequestAggregate`.
+- Print top request-local phase latency summaries on each slow request line.
+- Keep the data bounded by the existing slow-event/report limits.
+- Extend `trace_summary_attaches_sources_to_slow_requests` to verify the
+  per-request phase latency aggregation path.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_attaches_sources_to_slow_requests -- --nocapture
+cargo test -p mobile-web-harness -- --nocapture
+cargo check -p mobile-web-harness
+```
+
+Result:
+
+- Formatting passed after `cargo fmt --all`.
+- Focused request-source test passed.
+- Full harness package test passed: `57` tests.
+- `cargo check -p mobile-web-harness`: passed.
+
+Decision:
+
+Keep. This is diagnostics-only and does not change retrieval behavior. The next
+same-window runs should now show, per slow request, whether the dominant local
+work was `unixfs_file_size`, `http_provider_fetch`, `bitswap_fetch`,
+`unixfs_index_lookup`, or another phase without requiring an external parser.

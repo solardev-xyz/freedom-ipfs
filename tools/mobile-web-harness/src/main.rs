@@ -2078,8 +2078,9 @@ fn print_trace_slow_details(trace: &TraceSummary) {
             let correlation = format_request_correlation(request);
             let classifications = format_request_classification_details(request);
             let source_details = format_request_source_details(request);
+            let latency_details = format_request_phase_latency_details(request);
             println!(
-                "    {}: {}ms status={} request_id={}{}{}{} events={} max_event={}ms phases={} cids={}",
+                "    {}: {}ms status={} request_id={}{}{}{} events={} max_event={}ms{} phases={} cids={}",
                 request.path,
                 request.elapsed_ms,
                 status,
@@ -2089,6 +2090,7 @@ fn print_trace_slow_details(trace: &TraceSummary) {
                 source_details,
                 request.event_count,
                 request.max_event_ms,
+                latency_details,
                 phases,
                 cids
             );
@@ -5939,7 +5941,7 @@ struct TraceSummary {
     progress_request_groups: Vec<TraceProgressRequestGroupAggregate>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct TracePhaseAggregate {
     phase: String,
     count: usize,
@@ -7480,6 +7482,7 @@ struct TraceRequestAggregate {
     max_event_ms: u128,
     event_count: usize,
     phases: Vec<TraceValueCount>,
+    phase_latencies: Vec<TracePhaseAggregate>,
     cids: Vec<TraceValueCount>,
     block_sources: Vec<TraceValueCount>,
     http_provider_fetches: usize,
@@ -7546,6 +7549,7 @@ struct TraceRequestBuilder {
     max_event_ms: u128,
     event_count: usize,
     phases: BTreeMap<String, usize>,
+    phase_elapsed_values: BTreeMap<String, Vec<u128>>,
     cids: BTreeMap<String, usize>,
     block_sources: BTreeMap<String, usize>,
     http_provider_fetches: usize,
@@ -7578,6 +7582,7 @@ impl TraceRequestBuilder {
             max_event_ms: 0,
             event_count: 0,
             phases: BTreeMap::new(),
+            phase_elapsed_values: BTreeMap::new(),
             cids: BTreeMap::new(),
             block_sources: BTreeMap::new(),
             http_provider_fetches: 0,
@@ -7701,6 +7706,10 @@ impl TraceRequestBuilder {
         }
         if let Some(elapsed_ms) = elapsed_ms {
             self.max_event_ms = self.max_event_ms.max(elapsed_ms);
+            self.phase_elapsed_values
+                .entry(phase.to_string())
+                .or_default()
+                .push(elapsed_ms);
         }
     }
 
@@ -7725,6 +7734,7 @@ impl TraceRequestBuilder {
             max_event_ms: self.max_event_ms,
             event_count: self.event_count,
             phases: sorted_trace_counts(self.phases),
+            phase_latencies: sorted_trace_phase_latencies(self.phase_elapsed_values),
             cids: sorted_trace_counts(self.cids),
             block_sources: sorted_trace_counts(self.block_sources),
             http_provider_fetches: self.http_provider_fetches,
@@ -9764,6 +9774,32 @@ fn sorted_trace_counts(counts: BTreeMap<String, usize>) -> Vec<TraceValueCount> 
     values
 }
 
+fn sorted_trace_phase_latencies(values: BTreeMap<String, Vec<u128>>) -> Vec<TracePhaseAggregate> {
+    let mut values = values
+        .into_iter()
+        .map(|(phase, elapsed_values)| {
+            let count = elapsed_values.len();
+            let total_ms = elapsed_values.iter().sum();
+            let elapsed_ms = LatencySummary::from_values(elapsed_values);
+            TracePhaseAggregate {
+                phase,
+                count,
+                total_ms,
+                elapsed_ms,
+            }
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right
+            .total_ms
+            .cmp(&left.total_ms)
+            .then_with(|| right.elapsed_ms.max_ms.cmp(&left.elapsed_ms.max_ms))
+            .then_with(|| left.phase.cmp(&right.phase))
+    });
+    values.truncate(MAX_TRACE_SLOW_EVENTS);
+    values
+}
+
 fn sorted_trace_source_latencies(
     values: BTreeMap<String, Vec<u128>>,
 ) -> Vec<TraceSourceLatencyAggregate> {
@@ -10127,6 +10163,25 @@ fn format_request_source_details(request: &TraceRequestAggregate) -> String {
         http_providers,
         http_errors
     )
+}
+
+fn format_request_phase_latency_details(request: &TraceRequestAggregate) -> String {
+    if request.phase_latencies.is_empty() {
+        return String::new();
+    }
+    let phases = request
+        .phase_latencies
+        .iter()
+        .take(4)
+        .map(|phase| {
+            format!(
+                "{}:{} total={}ms",
+                phase.phase, phase.elapsed_ms, phase.total_ms
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" phase_latencies={phases}")
 }
 
 fn format_progress_request_source_details(request: &TraceProgressRequestAggregate) -> String {
@@ -11593,6 +11648,21 @@ mod tests {
         assert_eq!(request.http_provider_fetch_failures, 1);
         assert_eq!(request.http_provider_fetch_elapsed_ms.count, 2);
         assert_eq!(request.http_provider_fetch_elapsed_ms.max_ms, Some(120));
+        let http_phase = request
+            .phase_latencies
+            .iter()
+            .find(|phase| phase.phase == "http_provider_fetch")
+            .unwrap();
+        assert_eq!(http_phase.count, 2);
+        assert_eq!(http_phase.total_ms, 160);
+        assert_eq!(http_phase.elapsed_ms.max_ms, Some(120));
+        let request_done_phase = request
+            .phase_latencies
+            .iter()
+            .find(|phase| phase.phase == "request_done")
+            .unwrap();
+        assert_eq!(request_done_phase.count, 1);
+        assert_eq!(request_done_phase.total_ms, 150);
         assert_eq!(
             trace_value_count(
                 &request.http_provider_fetch_providers,
