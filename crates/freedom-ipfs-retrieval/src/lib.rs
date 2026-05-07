@@ -143,6 +143,7 @@ const BITSWAP_MAX_ESTABLISHED_CONNECTIONS: u32 = 16;
 const MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND: usize = 5;
 const MAX_BITSWAP_PEERS_PER_BLOCK: usize = 16;
 const MAX_BITSWAP_SESSION_PEERS: usize = 4;
+const BITSWAP_SESSION_PEER_LIMIT_ENV: &str = "FREEDOM_IPFS_BITSWAP_SESSION_PEER_LIMIT";
 const MAX_BITSWAP_ADDRS_PER_PEER: usize = 2;
 const MAX_BITSWAP_SESSION_RANGE_BATCH_CIDS: usize = 4;
 const BITSWAP_SESSION_RANGE_BATCH_TIMEOUT: Duration = Duration::from_millis(750);
@@ -2715,7 +2716,7 @@ impl HttpRetriever {
         peers.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| right.1.cmp(&left.1)));
         peers
             .into_iter()
-            .take(MAX_BITSWAP_SESSION_PEERS)
+            .take(bitswap_session_peer_limit())
             .map(|(id, _seen_at, _last_latency, addrs)| BitswapPeer {
                 id,
                 addrs,
@@ -3701,6 +3702,22 @@ fn bitswap_session_range_batch_enabled() -> bool {
 
 fn bitswap_dns_expansion_cache_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_DNS_EXPANSION_CACHE_ENV).is_some()
+}
+
+fn bitswap_session_peer_limit() -> usize {
+    bitswap_session_peer_limit_from_env_value(
+        std::env::var_os(BITSWAP_SESSION_PEER_LIMIT_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn bitswap_session_peer_limit_from_env_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(MAX_BITSWAP_SESSION_PEERS))
+        .unwrap_or(MAX_BITSWAP_SESSION_PEERS)
 }
 
 fn bitswap_incoming_batch_partial_grace() -> Duration {
@@ -8865,6 +8882,28 @@ mod bitswap_tests {
         assert_eq!(
             max_concurrent_http_provider_fetches_from_env_value(Some("not-a-number")),
             MAX_CONCURRENT_HTTP_PROVIDER_FETCHES
+        );
+    }
+
+    #[test]
+    fn bitswap_session_peer_limit_env_value_parses_capped_override() {
+        assert_eq!(
+            bitswap_session_peer_limit_from_env_value(None),
+            MAX_BITSWAP_SESSION_PEERS
+        );
+        assert_eq!(bitswap_session_peer_limit_from_env_value(Some("1")), 1);
+        assert_eq!(bitswap_session_peer_limit_from_env_value(Some("2")), 2);
+        assert_eq!(
+            bitswap_session_peer_limit_from_env_value(Some("0")),
+            MAX_BITSWAP_SESSION_PEERS
+        );
+        assert_eq!(
+            bitswap_session_peer_limit_from_env_value(Some("bad")),
+            MAX_BITSWAP_SESSION_PEERS
+        );
+        assert_eq!(
+            bitswap_session_peer_limit_from_env_value(Some("999")),
+            MAX_BITSWAP_SESSION_PEERS
         );
     }
 

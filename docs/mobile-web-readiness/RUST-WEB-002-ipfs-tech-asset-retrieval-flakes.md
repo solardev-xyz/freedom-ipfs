@@ -29643,3 +29643,127 @@ regressions. The next promising line is still cross-request learned source-peer
 selection: explain why the env run reused a fast Bitswap source for Wikipedia
 while the no-env control paid DNS/provider expansion and landed on slower
 sources.
+
+## 2026-05-07 - Lab Control: Cap Recent Bitswap Session Peers
+
+Hypothesis:
+The remaining broad-run Wikipedia loss looks tied to source-peer quality and
+shortcut pollution: a fast recent Bitswap peer can make a later zero-HTTP root
+request cheap, while a larger recent-peer set may keep trying slower successful
+peers. Test a disabled cap on how many recent Bitswap session peers are reused
+for the shortcut path.
+
+Implementation:
+
+- Added disabled lab env knob
+  `FREEDOM_IPFS_BITSWAP_SESSION_PEER_LIMIT=<n>`.
+- The knob caps `recent_bitswap_peers()` to `1..=MAX_BITSWAP_SESSION_PEERS`.
+- Invalid, zero, or unset values preserve the existing default cap.
+- Default behavior is unchanged.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval bitswap_session_peer_limit_env_value_parses_capped_override
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo test -p freedom-ipfs-retrieval
+```
+
+All passed. The full retrieval suite reported `94` passed and `1` ignored.
+
+Opt-in command:
+
+```sh
+timeout 4800s env FREEDOM_IPFS_BITSWAP_SESSION_PEER_LIMIT=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/session-peer-limit1-broader-selected-r10-20260507T050655Z-trace.jsonl \
+  --comparison-output /tmp/session-peer-limit1-broader-selected-r10-20260507T050655Z.json
+```
+
+Opt-in result:
+
+- Rust and Kubo had `1.0` pass rates for every selected case.
+- DAICO root: Rust `1227/1487ms` vs Kubo `2884/3290ms`.
+- Vitalik range: Rust `102/124ms` vs Kubo `1622/4221ms`.
+- `ipfs.tech` root range: Rust `631/1045ms` vs Kubo `735/1711ms`.
+- `ipfs.tech` page assets: Rust root `3/4ms`, assets `100/355ms`; Kubo root
+  `2/348ms`, assets `357/458ms`.
+- `ipfs.tech` hero range: Rust `118/152ms` vs Kubo `423/477ms`.
+- Wikipedia root still lost: Rust `710/991ms` vs Kubo `515/546ms`.
+- Resource max stayed light: Rust `51052KiB` RSS and `37` FDs vs Kubo
+  `162388KiB` RSS and `309` FDs.
+- Trace shape: HTTP provider blocks p50/p95/max `178/548/956ms`; Bitswap blocks
+  p50/p95/max `85/486/1059ms`; Bitswap peer attempts `525`; dial plans `388`;
+  connections `55`.
+- Request classification: zero-HTTP provider Bitswap p50/p95 `630/1043ms`;
+  top-level zero-HTTP p50/p95 `708/1043ms`.
+- Session summary: shortcut starts `360`, post-lookup hits `3`,
+  post-lookup timeouts `14`, shortcut attempts `141`.
+
+Same-window no-env control:
+
+```sh
+timeout 4800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/noenv-after-session-limit-broader-selected-r10-20260507T051211Z-trace.jsonl \
+  --comparison-output /tmp/noenv-after-session-limit-broader-selected-r10-20260507T051211Z.json
+```
+
+Same-window no-env result:
+
+- Rust and Kubo had `1.0` pass rates for every selected case.
+- DAICO root: Rust `1230/1511ms` vs Kubo `2826/2899ms`.
+- Vitalik range: Rust `105/116ms` vs Kubo `1430/3360ms`.
+- `ipfs.tech` root range: Rust `677/1378ms` vs Kubo `979/1369ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `107/302ms`; Kubo root
+  `2/151ms`, assets `358/465ms`.
+- `ipfs.tech` hero range: Rust `113/170ms` vs Kubo `429/480ms`.
+- Wikipedia root lost more sharply at p95: Rust `631/1559ms` vs Kubo
+  `516/549ms`.
+- Resource max: Rust `50616KiB` RSS and `33` FDs vs Kubo `171520KiB` RSS and
+  `260` FDs.
+- Trace shape: HTTP provider blocks p50/p95/max `166/394/844ms`; Bitswap blocks
+  p50/p95/max `98/685/1371ms`; Bitswap peer attempts `607`; dial plans `388`;
+  connections `59`.
+- Request classification: zero-HTTP provider Bitswap p50/p95 `676/1557ms`;
+  top-level zero-HTTP p50/p95 `689/1557ms`.
+- Session summary: shortcut starts `360`, post-lookup hits `4`,
+  post-lookup timeouts `14`, shortcut attempts `128`.
+
+Decision:
+Keep the cap as a disabled lab control, but do not promote it. The `1`-peer
+limit reduced same-window Bitswap p95 and cut peer attempts (`525` vs `607`),
+and it improved Wikipedia p95 relative to the immediate no-env control
+(`991ms` vs `1559ms`). It did not close the Wikipedia median gap to Kubo,
+regressed `ipfs.tech` asset p95 (`355ms` vs `302ms`), and increased Rust FDs
+slightly (`37` vs `33`). The useful signal is that peer-source quality matters;
+the next iteration should score or filter recent session peers with page/root
+context instead of statically shrinking the shortcut set.
