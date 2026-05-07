@@ -37832,3 +37832,53 @@ from `122ms` to `197ms` and root p95 from `829ms` to `1241ms`. The useful
 lesson is that preemptively resetting after a fixed `1000ms` is too blunt.
 Future work should look for a stronger stale-connection signal before retrying,
 not a fixed timer on every qualifying top-level zero-HTTP request.
+
+Post-control:
+
+After fully reverting the temporary code, rerun the same focused cases in the
+same network window with no experiment environment enabled.
+
+Command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/mixed-stall-retry-post-control-20260507T190510Z-r10-trace.jsonl \
+  --comparison-output /tmp/mixed-stall-retry-post-control-20260507T190510Z-r10.json
+```
+
+Post-control result:
+
+- Rust and Kubo passed `10/10`.
+- `ipfs.tech` page root: Rust `558/1050ms`; Kubo `1844/2844ms`.
+- `ipfs.tech` page assets: Rust `188/532ms`; Kubo `179/1170ms`.
+- Wikipedia root: Rust `707/784ms`; Kubo `415/2013ms`.
+- Resource max: Rust `59492KiB` RSS and `36` FDs vs Kubo `353300KiB`
+  RSS and `563` FDs.
+- `meaningful_kubo_wins` flagged only Wikipedia root median:
+  Rust `707ms` vs Kubo `415ms`. Rust won Wikipedia p95 by a wide margin:
+  `784ms` vs Kubo `2013ms`.
+
+Trace finding:
+
+- No `bitswap_request_timeout_detail` events occurred in the post-control run.
+- Delegated routing shape shifted materially versus the opt-in run:
+  zero/single/multi HTTP counts were `13/212/139` in post-control versus
+  `38/182/147` in the opt-in run.
+
+Interpretation update:
+
+The fixed-timer retry lab remains rejected, but the reason should be nuanced.
+The poorer opt-in Wikipedia median is not clean causal proof by itself because
+the same-window post-control saw a different public-network/provider
+distribution and did not reproduce the `4s` timeout tail. The lab trace still
+shows the important behavioral flaw: for qualifying zero-HTTP Wikipedia roots,
+the `1000ms` timer forced client resets and converted all fired requests into
+roughly `1.2s` fresh-client retry paths. That is too blunt for default mobile
+behavior. Future work should require a stronger no-progress or stale-connected
+session-peer signal before resetting, instead of using a fixed elapsed timer.
