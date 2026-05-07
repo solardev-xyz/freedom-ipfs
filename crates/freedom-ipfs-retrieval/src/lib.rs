@@ -113,6 +113,11 @@ const BITSWAP_SESSION_MULTI_HTTP_POST_LOOKUP_GRACE_MS_ENV: &str =
 const BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE: Duration = Duration::from_millis(125);
 const BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS";
+const TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE: Duration = Duration::from_millis(150);
+const ENABLE_TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE";
+const TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE_MS_ENV: &str =
+    "FREEDOM_IPFS_TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE_MS";
 const DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE";
 const SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS_ENV: &str =
@@ -1201,7 +1206,7 @@ impl HttpRetriever {
     {
         let post_lookup_grace = bitswap_session_post_lookup_grace(providers);
         let http_provider_count = provider_http_url_count(providers);
-        let provider_fetch = self.fetch_from_providers_with_source(cid, providers, context);
+        let provider_fetch = self.fetch_from_providers_with_source(cid, providers, context.clone());
         tokio::pin!(provider_fetch);
         let race_started = Instant::now();
         let provider_count = providers.len();
@@ -1279,6 +1284,84 @@ impl HttpRetriever {
             provider_result = &mut provider_fetch => {
                 match provider_result {
                     Ok((block, source)) => {
+                        let provider_result_elapsed_ms = race_started.elapsed().as_millis();
+                        let mut provider_win_grace_outcome = "disabled";
+                        if source == RetrievalSource::HttpProvider {
+                            if let Some(provider_win_grace) =
+                                top_level_single_http_provider_win_bitswap_grace(
+                                    context.as_ref(),
+                                    http_provider_count,
+                                )
+                            {
+                                let provider_win_grace_started = Instant::now();
+                                match timeout(provider_win_grace, shortcut.as_mut()).await {
+                                    Ok(Ok(Some(bitswap_block))) => {
+                                        tracing::info!(
+                                            phase = "bitswap_session_shortcut_provider_win_grace",
+                                            cid = %cid,
+                                            outcome = "bitswap_won",
+                                            timeout_ms = provider_win_grace.as_millis(),
+                                            elapsed_ms = provider_win_grace_started.elapsed().as_millis(),
+                                            provider_result_elapsed_ms,
+                                            provider_count,
+                                            http_provider_count
+                                        );
+                                        tracing::info!(
+                                            phase = "bitswap_session_shortcut_post_lookup_race",
+                                            cid = %cid,
+                                            outcome = "bitswap_won_after_provider_win_grace",
+                                            source = RetrievalSource::Bitswap.as_str(),
+                                            timeout_ms = post_lookup_grace.as_millis(),
+                                            elapsed_ms = race_started.elapsed().as_millis(),
+                                            provider_result_elapsed_ms,
+                                            provider_count,
+                                            http_provider_count
+                                        );
+                                        return Ok(Some((bitswap_block, RetrievalSource::Bitswap)));
+                                    }
+                                    Ok(Ok(None)) => {
+                                        provider_win_grace_outcome = "bitswap_miss";
+                                        tracing::info!(
+                                            phase = "bitswap_session_shortcut_provider_win_grace",
+                                            cid = %cid,
+                                            outcome = provider_win_grace_outcome,
+                                            timeout_ms = provider_win_grace.as_millis(),
+                                            elapsed_ms = provider_win_grace_started.elapsed().as_millis(),
+                                            provider_result_elapsed_ms,
+                                            provider_count,
+                                            http_provider_count
+                                        );
+                                    }
+                                    Ok(Err(err)) => {
+                                        provider_win_grace_outcome = "bitswap_error";
+                                        tracing::info!(
+                                            phase = "bitswap_session_shortcut_provider_win_grace",
+                                            cid = %cid,
+                                            outcome = provider_win_grace_outcome,
+                                            timeout_ms = provider_win_grace.as_millis(),
+                                            elapsed_ms = provider_win_grace_started.elapsed().as_millis(),
+                                            provider_result_elapsed_ms,
+                                            provider_count,
+                                            http_provider_count,
+                                            error = %err
+                                        );
+                                    }
+                                    Err(_) => {
+                                        provider_win_grace_outcome = "timeout";
+                                        tracing::info!(
+                                            phase = "bitswap_session_shortcut_provider_win_grace",
+                                            cid = %cid,
+                                            outcome = provider_win_grace_outcome,
+                                            timeout_ms = provider_win_grace.as_millis(),
+                                            elapsed_ms = provider_win_grace_started.elapsed().as_millis(),
+                                            provider_result_elapsed_ms,
+                                            provider_count,
+                                            http_provider_count
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         tracing::info!(
                             phase = "bitswap_session_shortcut_post_lookup_race",
                             cid = %cid,
@@ -1286,6 +1369,8 @@ impl HttpRetriever {
                             source = source.as_str(),
                             timeout_ms = post_lookup_grace.as_millis(),
                             elapsed_ms = race_started.elapsed().as_millis(),
+                            provider_result_elapsed_ms,
+                            provider_win_grace_outcome,
                             provider_count,
                             http_provider_count
                         );
@@ -3450,6 +3535,37 @@ fn bitswap_session_post_lookup_grace_from_env_value(
             post_lookup_grace_from_env_value(multi_http_grace_ms, BITSWAP_SESSION_POST_LOOKUP_GRACE)
         }
     }
+}
+
+fn top_level_single_http_provider_win_bitswap_grace(
+    context: Option<&RetrievalRequestContext>,
+    http_provider_count: usize,
+) -> Option<Duration> {
+    top_level_single_http_provider_win_bitswap_grace_from_values(
+        std::env::var_os(ENABLE_TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE_ENV).is_some(),
+        std::env::var_os(TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE_MS_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+        context.is_some_and(RetrievalRequestContext::gateway_subresource),
+        http_provider_count,
+    )
+}
+
+fn top_level_single_http_provider_win_bitswap_grace_from_values(
+    enabled: bool,
+    grace_ms: Option<&str>,
+    gateway_subresource: bool,
+    http_provider_count: usize,
+) -> Option<Duration> {
+    if !enabled || gateway_subresource || http_provider_count != 1 {
+        return None;
+    }
+    Some(
+        grace_ms
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE),
+    )
 }
 
 fn post_lookup_grace_from_env_value(value: Option<&str>, default: Duration) -> Duration {
@@ -11247,6 +11363,48 @@ mod bitswap_tests {
                 Some("0")
             ),
             BITSWAP_SESSION_POST_LOOKUP_GRACE
+        );
+    }
+
+    #[test]
+    fn top_level_single_http_provider_win_bitswap_grace_is_narrowly_scoped() {
+        assert_eq!(
+            top_level_single_http_provider_win_bitswap_grace_from_values(false, None, false, 1),
+            None
+        );
+        assert_eq!(
+            top_level_single_http_provider_win_bitswap_grace_from_values(true, None, true, 1),
+            None
+        );
+        assert_eq!(
+            top_level_single_http_provider_win_bitswap_grace_from_values(true, None, false, 0),
+            None
+        );
+        assert_eq!(
+            top_level_single_http_provider_win_bitswap_grace_from_values(true, None, false, 2),
+            None
+        );
+        assert_eq!(
+            top_level_single_http_provider_win_bitswap_grace_from_values(true, None, false, 1),
+            Some(TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE)
+        );
+        assert_eq!(
+            top_level_single_http_provider_win_bitswap_grace_from_values(
+                true,
+                Some("75"),
+                false,
+                1,
+            ),
+            Some(Duration::from_millis(75))
+        );
+        assert_eq!(
+            top_level_single_http_provider_win_bitswap_grace_from_values(
+                true,
+                Some("bad"),
+                false,
+                1,
+            ),
+            Some(TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE)
         );
     }
 

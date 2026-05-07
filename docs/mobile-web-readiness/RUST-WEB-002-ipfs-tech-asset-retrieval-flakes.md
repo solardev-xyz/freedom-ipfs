@@ -31798,3 +31798,122 @@ Wikipedia/Kubo tail and regressed important selected-corpus guardrails. Future
 work should use this signal with a stricter source-quality gate, for example
 only for recent low-latency non-candidate sources, or only as one alternate in a
 small top-level zero-HTTP candidate set.
+
+## 2026-05-07 - Reject: Top-Level Single-HTTP Provider-Win Bitswap Grace
+
+Hypothesis:
+The focused r10 baseline still showed a Wikipedia median loss even though Rust
+beat Kubo on `ipfs.tech` root/assets and Wikipedia p95. One observed shape was
+that the top-level Wikipedia directory block sometimes came from the single HTTP
+provider before a recent Bitswap shortcut could finish; the following
+`/index.html` leaf then paid another provider/HTTP/Bitswap path. A very narrow
+lab could wait briefly after a top-level single HTTP provider wins, allowing a
+warmed Bitswap shortcut to take the directory block if it arrives just behind
+HTTP.
+
+Code:
+
+- Added disabled env flag:
+  `FREEDOM_IPFS_ENABLE_TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE=1`.
+- Added optional override:
+  `FREEDOM_IPFS_TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE_MS=<millis>`.
+- The default lab grace is `150ms`.
+- The grace only applies when:
+  - the provider result source is `http_provider`;
+  - the current gateway request is top-level, not a subresource; and
+  - the provider set has exactly one HTTP provider.
+- Default behavior is unchanged when the flag is absent.
+- Added trace marker:
+  `phase=bitswap_session_shortcut_provider_win_grace`, with outcomes
+  `bitswap_won`, `bitswap_miss`, `bitswap_error`, or `timeout`.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval top_level_single_http_provider_win_bitswap_grace --lib
+```
+
+Result:
+
+- Formatting passed.
+- The focused scope/parser test passed.
+
+Fresh same-window no-env focused baseline:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-focused-baseline-r10-20260507T084352Z-trace.jsonl \
+  --comparison-output /tmp/current-head-focused-baseline-r10-20260507T084352Z.json
+```
+
+Baseline result:
+
+- Rust and Kubo passed `10/10` for both focused cases.
+- `ipfs.tech` page assets: Rust root `751/1433ms`, assets `103/385ms`;
+  Kubo root `1859/4723ms`, assets `145/539ms`.
+- Wikipedia root: Rust `247/763ms` vs Kubo `119/1511ms`.
+- Resource max: Rust `48896KiB` RSS and `30` FDs vs Kubo `420972KiB` RSS and
+  `747` FDs.
+- HTTP provider block fetch p50/p95/max: `181/409/812ms`.
+- Bitswap block fetch p50/p95/max: `76/425/1796ms`.
+
+Opt-in command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_ENABLE_TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/top-level-single-http-provider-win-grace-r10-20260507T085147Z-trace.jsonl \
+  --comparison-output /tmp/top-level-single-http-provider-win-grace-r10-20260507T085147Z.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `10/10` for both focused cases.
+- `ipfs.tech` page assets: Rust root `744/1463ms`, assets `187/333ms`;
+  Kubo root `1373/2028ms`, assets `102/698ms`.
+- Wikipedia root regressed and became a p95 loss: Rust `463/914ms` vs Kubo
+  `179/558ms`.
+- Resource max: Rust `48372KiB` RSS and `25` FDs vs Kubo `271932KiB` RSS and
+  `376` FDs.
+- HTTP provider block fetch p50/p95/max: `186/400/859ms`.
+- Bitswap block fetch p50/p95/max: `103/517/624ms`.
+- Provider-win grace events: `5` timeouts and `1` Bitswap win, all on
+  Wikipedia top-level requests.
+
+Trace interpretation:
+The lab proved the exact situation exists, but the timeout side dominated. In
+five Wikipedia samples the HTTP provider won, the lab waited the extra `150ms`,
+and the Bitswap shortcut still did not deliver in time. The single Bitswap win
+was not enough to offset the added top-level latency. The change also moved the
+focused `ipfs.tech` asset median from a Rust win in the no-env baseline to a
+Kubo median win in the opt-in window, while preserving Rust p95.
+
+Decision:
+Do not promote provider-win Bitswap grace. Keep the disabled flag and trace
+marker as a diagnostic because it answers a useful negative question: waiting
+after a top-level single HTTP provider wins is too late unless the peer-quality
+signal is much stronger. The next useful direction remains earlier source
+quality: identify/select a better Bitswap peer before the HTTP provider wins,
+or avoid the root/leaf double-path by learning which providers actually deliver
+for the page session.
