@@ -195,6 +195,8 @@ const BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS";
 const ENABLE_BITSWAP_PROVIDER_ADDR_SCORE_ORDER_ENV: &str =
     "FREEDOM_IPFS_ENABLE_BITSWAP_PROVIDER_ADDR_SCORE_ORDER";
+const ENABLE_BITSWAP_DIRECT_IP_PROVIDER_CANDIDATES_ONLY_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_BITSWAP_DIRECT_IP_PROVIDER_CANDIDATES_ONLY";
 const BITSWAP_DNS_PREFETCH_CONCURRENCY: usize = 8;
 const BITSWAP_DNS_LOOKUP_TIMEOUT_MS_ENV: &str = "FREEDOM_IPFS_BITSWAP_DNS_LOOKUP_TIMEOUT_MS";
 const BITSWAP_DNS_EXPANSION_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -2647,6 +2649,9 @@ impl HttpRetriever {
             early_provider_peer_cap = quality.early_peer_cap,
             early_provider_peer_cap_hit = quality.early_peer_cap_hit,
             provider_addr_score_order,
+            direct_ip_candidate_only = quality.direct_ip_candidate_only,
+            direct_ip_candidate_skipped_addr_count = quality
+                .direct_ip_candidate_skipped_addr_count,
             expanded_provider_addr_count = quality.expanded_addr_count,
             supported_provider_addr_count = quality.supported_addr_count,
             rejected_provider_addr_count = quality.rejected_addr_count(),
@@ -4464,6 +4469,10 @@ fn bitswap_provider_addr_score_order_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_PROVIDER_ADDR_SCORE_ORDER_ENV).is_some()
 }
 
+fn bitswap_direct_ip_provider_candidates_only_enabled() -> bool {
+    std::env::var_os(ENABLE_BITSWAP_DIRECT_IP_PROVIDER_CANDIDATES_ONLY_ENV).is_some()
+}
+
 fn bitswap_direct_want_block_untrusted_peer_limit() -> usize {
     bitswap_direct_want_block_untrusted_peer_limit_from_env_value(
         std::env::var_os(BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS_ENV)
@@ -5881,6 +5890,8 @@ struct BitswapProviderAddrQuality {
     id_only_provider_count: usize,
     invalid_provider_id_count: usize,
     provider_without_supported_bitswap_addr_count: usize,
+    direct_ip_candidate_only: bool,
+    direct_ip_candidate_skipped_addr_count: usize,
     unsupported_relay_addr_count: usize,
     unsupported_webtransport_addr_count: usize,
     unsupported_webrtc_addr_count: usize,
@@ -5989,6 +6000,7 @@ async fn bitswap_peers_with_quality_using_caches(
         dnsaddr_cache,
         dns_ip_cache,
         bitswap_early_provider_peer_cap_enabled(),
+        bitswap_direct_ip_provider_candidates_only_enabled(),
     )
     .await
 }
@@ -5998,13 +6010,15 @@ async fn bitswap_peers_with_quality_using_caches_with_options(
     dnsaddr_cache: &mut DnsaddrCache,
     dns_ip_cache: &mut DnsIpCache,
     early_peer_cap: bool,
+    direct_ip_candidate_only: bool,
 ) -> BitswapProviderCandidates {
     let mut peers = Vec::new();
     let mut quality = BitswapProviderAddrQuality {
         early_peer_cap,
+        direct_ip_candidate_only,
         ..BitswapProviderAddrQuality::default()
     };
-    if !early_peer_cap {
+    if !early_peer_cap && !direct_ip_candidate_only {
         prefetch_bitswap_dns_expansions(providers, dnsaddr_cache, dns_ip_cache).await;
     }
 
@@ -6022,7 +6036,15 @@ async fn bitswap_peers_with_quality_using_caches_with_options(
         let mut peer_id = provider_peer;
         let mut provider_has_supported_addr = false;
 
-        for addr in expand_provider_multiaddrs(&provider.addrs, dnsaddr_cache, dns_ip_cache).await {
+        let expanded_addrs = if direct_ip_candidate_only {
+            let (addrs, skipped) = direct_ip_provider_multiaddrs(&provider.addrs);
+            quality.direct_ip_candidate_skipped_addr_count += skipped;
+            addrs
+        } else {
+            expand_provider_multiaddrs(&provider.addrs, dnsaddr_cache, dns_ip_cache).await
+        };
+
+        for addr in expanded_addrs {
             quality.expanded_addr_count += 1;
             match analyze_bitswap_multiaddr(&addr, provider_peer) {
                 Ok((addr_peer, dial_addr, features)) => {
@@ -6567,6 +6589,37 @@ async fn expand_provider_multiaddrs(
     }
 
     expanded
+}
+
+fn direct_ip_provider_multiaddrs(addrs: &[String]) -> (Vec<String>, usize) {
+    let mut direct = Vec::new();
+    let mut skipped = 0usize;
+    for addr in addrs {
+        if direct_ip_bitswap_multiaddr(addr) {
+            direct.push(addr.clone());
+        } else {
+            skipped += 1;
+        }
+    }
+    (direct, skipped)
+}
+
+fn direct_ip_bitswap_multiaddr(addr: &str) -> bool {
+    let Ok(addr) = Multiaddr::from_str(addr) else {
+        return false;
+    };
+    let mut has_ip = false;
+    let mut has_dns = false;
+    for protocol in addr.iter() {
+        match protocol {
+            Protocol::Ip4(_) | Protocol::Ip6(_) => has_ip = true,
+            Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => {
+                has_dns = true
+            }
+            _ => {}
+        }
+    }
+    has_ip && !has_dns && unsupported_bitswap_addr_reason(&addr).is_none()
 }
 
 fn dnsaddr_records(records: Vec<String>) -> Vec<String> {
@@ -8371,6 +8424,7 @@ mod bitswap_tests {
             &mut dnsaddr_cache,
             &mut dns_ip_cache,
             true,
+            false,
         )
         .await;
 
@@ -8382,6 +8436,67 @@ mod bitswap_tests {
             MAX_BITSWAP_PEERS_PER_BLOCK
         );
         assert_eq!(candidates.quality.skipped_provider_count, 5);
+    }
+
+    #[test]
+    fn direct_ip_bitswap_multiaddr_filters_dns_and_unsupported_addresses() {
+        assert!(direct_ip_bitswap_multiaddr("/ip4/127.0.0.1/tcp/4001"));
+        assert!(direct_ip_bitswap_multiaddr(
+            "/ip6/2001:db8::1/udp/4001/quic-v1"
+        ));
+        assert!(!direct_ip_bitswap_multiaddr(
+            "/dns4/provider.example/tcp/4001"
+        ));
+        assert!(!direct_ip_bitswap_multiaddr(
+            "/ip4/127.0.0.1/tcp/4001/p2p-circuit"
+        ));
+        assert!(!direct_ip_bitswap_multiaddr(
+            "/ip4/127.0.0.1/udp/4001/webrtc-direct"
+        ));
+        assert!(!direct_ip_bitswap_multiaddr(
+            "/ip4/127.0.0.1/udp/4001/quic-v1/webtransport/p2p/12D3KooWJdw4Tux8MAkbsVY6nLNtLnM25jS2EGNC7AFiJRQ6H7Cu"
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_ip_candidate_mode_skips_dns_but_keeps_late_ip_peers() {
+        let first_peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let late_peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let providers = vec![
+            Provider::from_parts(
+                Some(first_peer.to_string()),
+                vec!["/dns4/provider.example/tcp/4001".to_string()],
+            )
+            .unwrap(),
+            Provider::from_parts(
+                Some(late_peer.to_string()),
+                vec!["/ip4/127.0.0.2/tcp/4001".to_string()],
+            )
+            .unwrap(),
+        ];
+        let mut dnsaddr_cache = DnsaddrCache::new();
+        let mut dns_ip_cache = DnsIpCache::new();
+
+        let candidates = bitswap_peers_with_quality_using_caches_with_options(
+            &providers,
+            &mut dnsaddr_cache,
+            &mut dns_ip_cache,
+            false,
+            true,
+        )
+        .await;
+
+        assert_eq!(candidates.peers.len(), 1);
+        assert_eq!(candidates.peers[0].id, late_peer);
+        assert!(candidates.quality.direct_ip_candidate_only);
+        assert_eq!(candidates.quality.processed_provider_count, 2);
+        assert_eq!(candidates.quality.direct_ip_candidate_skipped_addr_count, 1);
+        assert!(dnsaddr_cache.is_empty());
+        assert!(dns_ip_cache.is_empty());
     }
 
     #[tokio::test]

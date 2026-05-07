@@ -33165,3 +33165,117 @@ median. Future DNS/source work should be adaptive, likely starting a small
 direct IP candidate set before full DNS expansion while continuing DNS in the
 background, instead of synchronously waiting on all DNS names or dropping them
 with a fixed timeout.
+
+## 2026-05-07 - Disabled Lab: Direct-IP Bitswap Provider Candidates Only
+
+Hypothesis:
+
+The DNS-heavy recheck showed that some cold zero-HTTP requests can spend more
+than a second expanding DNS provider addresses before Bitswap has a chance to
+try direct peers. A direct-IP-only candidate mode might avoid that synchronous
+DNS tail by preserving only provider addrs that are already direct `/ip4` or
+`/ip6` TCP/QUIC Bitswap candidates.
+
+Trial code:
+
+- Added disabled env knob
+  `FREEDOM_IPFS_ENABLE_BITSWAP_DIRECT_IP_PROVIDER_CANDIDATES_ONLY=1`.
+- In that mode, Bitswap provider candidate construction skips DNS prefetch and
+  DNS/IP expansion, but still scans all returned providers and keeps later
+  direct-IP peers. This differs from the early provider cap, which truncates the
+  provider list.
+- Added `bitswap_peer_expand` trace fields:
+  `direct_ip_candidate_only` and
+  `direct_ip_candidate_skipped_addr_count`.
+- The default path is unchanged when the env var is absent.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval direct_ip_bitswap_multiaddr_filters_dns_and_unsupported_addresses --lib
+cargo test -p freedom-ipfs-retrieval direct_ip_candidate_mode_skips_dns_but_keeps_late_ip_peers --lib
+cargo test -p freedom-ipfs-retrieval early_provider_peer_cap_stops_after_enough_bitswap_peers --lib
+cargo test -p freedom-ipfs-retrieval --lib
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Validation passed.
+
+Opt-in command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_ENABLE_BITSWAP_DIRECT_IP_PROVIDER_CANDIDATES_ONLY=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/direct-ip-candidates-focused-r10-20260507Tlive-trace.jsonl \
+  --comparison-output /tmp/direct-ip-candidates-focused-r10-20260507Tlive.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `565/1424ms`, assets `157/421ms`;
+  Kubo root `1566/2849ms`, assets `174/1066ms`.
+- Wikipedia root: Rust `546/640ms` vs Kubo `352/1196ms`.
+- Resource max: Rust `49048KiB` RSS and `31` FDs vs Kubo `257500KiB` RSS and
+  `449` FDs.
+- Bitswap total p50/p95/max was `122/472/497ms`.
+- Zero-HTTP Bitswap p50/p95/max was `487/893/1421ms`; top-level zero-HTTP
+  Bitswap p50/p95/max was `562/893/1421ms`.
+- Bitswap peer attempts rose to `688`; established connections rose to `91`.
+
+Immediate no-env control command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/direct-ip-noenv-control-focused-r10-20260507Tlive-trace.jsonl \
+  --comparison-output /tmp/direct-ip-noenv-control-focused-r10-20260507Tlive.json
+```
+
+Immediate no-env control result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `605/1288ms`, assets `117/360ms`;
+  Kubo root `1419/3152ms`, assets `170/620ms`.
+- Wikipedia root: Rust `693/1863ms` vs Kubo `214/868ms`.
+- Resource max: Rust `49412KiB` RSS and `31` FDs vs Kubo `334840KiB` RSS and
+  `667` FDs.
+- Bitswap total p50/p95/max was `94/480/1608ms`.
+- Zero-HTTP Bitswap p50/p95/max was `505/1285/1861ms`; top-level zero-HTTP
+  Bitswap p50/p95/max was `700/1861/1861ms`.
+- Bitswap peer attempts were `597`; established connections were `87`.
+
+Decision:
+
+Keep the direct-IP-only path as a disabled lab, not a default. It improved the
+focused Wikipedia median and p95 (`693/1863ms -> 546/640ms`) and removed the
+giant DNS-expansion tail in that window, while still beating Kubo on
+`ipfs.tech` root and asset p95. It also regressed the no-env `ipfs.tech` asset
+median/p95 (`117/360ms -> 157/421ms`), regressed `ipfs.tech` root p95
+(`1288ms -> 1424ms`), and raised Bitswap attempts/connections.
+
+The useful next direction is not to replace full provider expansion with
+direct-IP-only. Instead, use direct IP candidates as a fast first wave while
+full DNS/provider expansion continues in the background. If the direct wave
+wins quickly, return; if not, broaden to DNS-expanded candidates without
+discarding them.
