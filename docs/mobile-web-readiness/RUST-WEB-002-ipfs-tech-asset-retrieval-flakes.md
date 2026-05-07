@@ -37194,3 +37194,158 @@ gap is more often the zero-HTTP `ipfs.tech` child Bitswap tail, so the next
 experiment should focus on page-scoped source quality or peer reuse for those
 child CIDs unless fresh same-window traces repeatedly show slow
 `ipfs-bridge.sia.dev` after fast `f010479` failures.
+
+## 2026-05-07 Recheck: Current Zero-HTTP Child And Wikipedia Shapes
+
+Purpose:
+
+After adding the disabled top-level multi-HTTP direct-IP fallback lab, rerun
+fresh no-env same-window baselines to identify whether the current live network
+still has a Rust-vs-Kubo gap or mainly Rust-internal tails.
+
+### `ipfs.tech` Page Assets Baseline
+
+Command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 12 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 900 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/ipfs-tech-zero-http-child-baseline-r12-20260507T182656Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-zero-http-child-baseline-r12-20260507T182656Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `12/12`.
+- Root TTFB/total p50/p95: Rust `654/1138ms`; Kubo `2100/7182ms`.
+- Asset TTFB/total p50/p95: Rust `91/244ms`; Kubo `171/457ms`.
+- Resource max: Rust `49592KiB` RSS and `24` FDs vs Kubo `263092KiB`
+  RSS and `401` FDs.
+- Bitswap block p50/p90/p95/max: `60/180/293/1131ms`.
+- HTTP-provider block p50/p90/p95/max: `140/262/299/698ms`.
+- Zero-HTTP classifications were still present:
+  `zero_http_provider_bitswap=22`, `zero_http_provider_cold_bitswap=15`,
+  `top_level_zero_http_provider_bitswap=12`.
+- Top-level zero-HTTP request latency p50/p95/max was `650/1135/1135ms`.
+- The slowest child asset was `_nuxt/BfUTpfA9.js` at `1134ms`, CID
+  `bafkreieabwhrl4vd2qrviisl5smx4lfgibi76db2ppmtogd2476pj5o2fe`.
+
+Trace finding:
+
+The slow `_nuxt/BfUTpfA9.js` request had one same-top-level session peer with
+previous latency around `140ms`. The post-lookup zero-HTTP grace waited `100ms`
+and timed out. Provider-expanded Bitswap then tried `6` peers; the winner was a
+new candidate at index `3` after about `967ms`. This is not an active Kubo win
+in this window, but it remains the clearest Rust-internal tail shape.
+
+### Wikipedia Baseline And Direct-IP Lab Recheck
+
+No-env baseline command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --repeat 12 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 900 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/wikipedia-root-index-baseline-r12-20260507T183404Z-trace.jsonl \
+  --comparison-output /tmp/wikipedia-root-index-baseline-r12-20260507T183404Z.json
+```
+
+No-env baseline result:
+
+- Rust and Kubo passed `12/12`.
+- Root TTFB/total p50/p95: Rust `589/1025ms`; Kubo `1278/2535ms`.
+- Resource max: Rust `42112KiB` RSS and `22` FDs vs Kubo `158316KiB`
+  RSS and `74` FDs.
+- HTTP-provider block p50/p90/p95/max: `265/500/683/703ms`.
+- Bitswap block p50/p95/max: `455/498/498ms`, only `2` Bitswap blocks.
+- `f010479.twinquasar.io` failed with HTTP `500` `13` times.
+- `ipfs-bridge.sia.dev` was the useful HTTP provider: p50/p95/max
+  `191/603/622ms`.
+
+Opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_TOP_LEVEL_MULTI_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK=1 \
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --repeat 12 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 900 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/wikipedia-multi-http-direct-ip-optin-r12-20260507T183506Z-trace.jsonl \
+  --comparison-output /tmp/wikipedia-multi-http-direct-ip-optin-r12-20260507T183506Z.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `12/12`.
+- Root TTFB/total p50/p95: Rust `574/681ms`; Kubo `2228/2383ms`.
+- Resource max: Rust `41336KiB` RSS and `19` FDs vs Kubo `206032KiB`
+  RSS and `117` FDs.
+- The fallback gate fired `12` times on the intended CID
+  `bafkreicr5w6i2f3m664a2fnl4vhtg3s6dhhk6n5hrf3gqzcf7v5bu6b7te`.
+- Direct-IP Bitswap started after the `f010479` failure in all `12` samples,
+  but HTTP won every result. There were `12` canceled Bitswap fallback batches.
+- `ipfs-bridge.sia.dev` was faster in this window: p50/p95/max
+  `197/223/251ms`.
+
+Immediate no-env post-control command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --repeat 12 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 900 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/wikipedia-multi-http-direct-ip-post-control-r12-20260507T183605Z-trace.jsonl \
+  --comparison-output /tmp/wikipedia-multi-http-direct-ip-post-control-r12-20260507T183605Z.json
+```
+
+Post-control result:
+
+- Rust and Kubo passed `12/12`.
+- Root TTFB/total p50/p95: Rust `560/1040ms`; Kubo `1891/2403ms`.
+- Resource max: Rust `36160KiB` RSS and `15` FDs vs Kubo `154084KiB`
+  RSS and `104` FDs.
+- HTTP-provider block p50/p90/p95/max: `260/296/679/707ms`.
+- `ipfs-bridge.sia.dev` returned to the slower shape: p50/p95/max
+  `188/605/626ms`.
+
+Decision:
+
+Do not promote the direct-IP lab from this recheck. It is correctly aimed at the
+`f010479` fast-failure shape and it fired in every opt-in sample, but it did not
+win a single block. The apparent opt-in p95 improvement tracks the public
+`ipfs-bridge.sia.dev` latency shift, not a direct-IP Bitswap win, and the lab
+adds canceled Bitswap work while HTTP still wins.
+
+Current standing from these two rechecks: neither focused `ipfs.tech` nor
+isolated Wikipedia is a same-window Kubo gap right now. Rust wins both while
+using far less RSS and fewer FDs. The remaining useful work is to keep reducing
+Rust's own tails, especially zero-HTTP `ipfs.tech` child Bitswap requests where
+the session shortcut waits `100ms`, then provider-expanded Bitswap may still
+land on a slow new peer.
