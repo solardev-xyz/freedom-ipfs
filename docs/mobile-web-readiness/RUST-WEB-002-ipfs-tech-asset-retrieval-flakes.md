@@ -29050,3 +29050,68 @@ diagnostic lever for proving delegated-stream tails, but it is not robust enough
 as default behavior on top-level roots. Keep looking for a safer policy that
 uses stronger page/session evidence or provider quality rather than raw early
 direct-peer count.
+
+## 2026-05-07 - Current Default Multi-Case R10 Refresh
+
+Question:
+After the CID-scoped HTTP-drop and direct-target lab controls, where does the
+current no-env default stand against Kubo across the core same-window guardrail?
+
+Command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case ipfs-tech-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-default-multicase-r10-20260507T035600Z-trace.jsonl \
+  --comparison-output /tmp/current-default-multicase-r10-20260507T035600Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10` for all three cases.
+- `daicowtf-page-assets` root p50/p95:
+  - Rust `1213/1841ms`
+  - Kubo `2933/3203ms`
+- `vitalik-root-html-range` root/range p50/p95:
+  - Rust `101/226ms`
+  - Kubo `1345/2633ms`
+- `ipfs-tech-page-assets` root p50/p95:
+  - Rust `575/628ms`
+  - Kubo `1140/1506ms`
+- `ipfs-tech-page-assets` asset p50/p95:
+  - Rust `192/455ms`
+  - Kubo `385/803ms`
+- Resource max across the run: Rust `57244KiB` RSS and `47` FDs; Kubo
+  `207612KiB` RSS and `273` FDs.
+
+Trace notes:
+
+- HTTP-provider block fetch p50/p95/max: `184/321/915ms`.
+- Bitswap block fetch p50/p95/max: `198/513/604ms`.
+- Delegated provider lookup p50/p95/max: `20/85/115ms`; self-hedges `0`.
+- HTTP provider distribution: `zero=30`, `single=210`, `multi=160`.
+- Zero-HTTP cold Bitswap request p50/p95/max: `516/626/799ms`.
+- Top-level zero-HTTP cold Bitswap p50/p95/max: `573/626/626ms`.
+- Slowest requests were the DAICO direct `/ipfs/...` root, driven by
+  HTTP-provider block fetch and MIME sniffing, but Rust still beat Kubo there
+  by a wide margin.
+- The slowest `ipfs.tech` subresource was `_nuxt/8Bs0wEmG.js` at `799ms`,
+  but Rust still beat Kubo on asset p50 and p95.
+
+Decision:
+Current default has no Kubo-relative loss in the core r10 guardrail in this
+window. Do not promote any direct Bitswap target or other lab knob from the
+recent controlled experiments. The next useful work should broaden workload
+discovery beyond these three cases, stress longer page sessions, or search for
+new Kubo-win corpora; retuning the already-rejected direct target is not the
+best next step while the default guardrail is green.
