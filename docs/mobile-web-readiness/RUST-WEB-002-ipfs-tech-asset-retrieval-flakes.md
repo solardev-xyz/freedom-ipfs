@@ -28524,3 +28524,201 @@ blunt to promote. Next work should either try a smaller zero-HTTP-only direct
 limit, add peer-quality gating before forcing direct `WANT_BLOCK`, or use the
 new trace fields to find when a `WANT_HAVE` source is likely to be a slow
 fallback rather than a useful conservative probe.
+
+## 2026-05-07 - Lab Control: Smaller Zero-HTTP Direct WANT_BLOCK Limit
+
+Question:
+Does forcing a smaller number of zero-HTTP provider peers directly to
+`WANT_BLOCK` keep the p95 improvements from the `5`-peer lab run without the
+extra root median and peer-attempt cost?
+
+Focused opt-in command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=2 timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-direct2-ipfs-tech-r10-20260507T030111Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-direct2-ipfs-tech-r10-20260507T030111Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Focused opt-in result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `675/1594ms`; Kubo `1876/2765ms`.
+- Asset p50/p95: Rust `141/490ms`; Kubo `228/853ms`.
+- Zero-HTTP cold Bitswap p50/p95/max: `495/1217/1591ms`.
+- Top-level zero-HTTP cold Bitswap p50/p95/max: `672/1500/1591ms`.
+- Bitswap fetch p50/p95/max: `136/511/1409ms`.
+- Source modes: `want_block=155`, `want_have=1`.
+- Peer attempts: `604`.
+- Trace shape: `force_want_block=true` on `76` peer attempts.
+
+Same-window no-env control:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-post-direct2-control-ipfs-tech-r10-20260507T030259Z-trace.jsonl \
+  --comparison-output /tmp/current-head-post-direct2-control-ipfs-tech-r10-20260507T030259Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Same-window no-env result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `2305/2721ms`; Kubo `2644/3518ms`.
+- Asset p50/p95: Rust `186/991ms`; Kubo `144/911ms`.
+- Bitswap p50/p95/max: `551/2011/2059ms`.
+- Zero-HTTP cold Bitswap p50/p95/max: `1034/2457/2719ms`.
+- Top-level zero-HTTP cold Bitswap p50/p95/max: `2302/2719/2719ms`.
+- Source modes: `want_block=42`, `want_have=21`.
+- Peer attempts: `674`.
+
+Multi-case opt-in command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=2 timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case ipfs-tech-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-direct2-multicase-r10-20260507T030729Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-direct2-multicase-r10-20260507T030729Z.json
+```
+
+Multi-case opt-in result:
+
+- Rust and Kubo passed `10/10`.
+- DAICO root p50/p95: Rust `1238/1649ms`; Kubo `1917/3353ms`.
+- Vitalik root/range p50/p95: Rust `101/113ms`; Kubo `698/2666ms`.
+- `ipfs.tech` root p50/p95: Rust `686/3053ms`; Kubo `741/2021ms`.
+- `ipfs.tech` asset p50/p95: Rust `140/455ms`; Kubo `345/735ms`.
+- Resource max: Rust `55220KiB` RSS, `40` FDs; Kubo `243488KiB`,
+  `318` FDs.
+- Zero-HTTP cold Bitswap p50/p95/max: `667/3051/3051ms`.
+- Top-level zero-HTTP cold Bitswap p50/p95/max: `683/3051/3051ms`.
+- Bitswap p95: `1224ms`.
+
+Decision:
+Do not promote the all-request `2`-peer limit. It is strong in the focused
+same-window sample and helps the `ipfs.tech` asset median in the r10 guardrail,
+but it also produces a severe `ipfs.tech` root p95 loss versus Kubo in the
+multi-case run. The common shape is not "all zero-HTTP requests need direct
+`WANT_BLOCK`"; it is narrower and depends on whether the block is a top-level
+root, a subresource, and whether the peer set has prior page-session evidence.
+
+## 2026-05-07 - Lab Control: Gateway Subresource Zero-HTTP Direct WANT_BLOCK
+
+Hypothesis:
+The all-request direct `WANT_BLOCK` limit is too blunt because it also affects
+top-level roots. The gateway already receives `X-Freedom-Parent-Request-ID` for
+subresource requests, so thread a small retrieval request context through the
+gateway and retrieval layers. Use that context to test direct `WANT_BLOCK` only
+for zero-HTTP gateway subresources while keeping top-level roots on the existing
+conservative path.
+
+Implementation:
+
+- Added an internal `RetrievalRequestContext` task-local.
+- Gateway `/ipfs` and `/ipns` handlers scope retrieval work with
+  `RetrievalRequestContext::gateway_request(parent_request_id)`.
+- Retrieval traces `gateway_subresource` on `bitswap_peer_expand`.
+- A new opt-in lab flag,
+  `FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK=1`, forces up to
+  `2` zero-HTTP gateway subresource peers to direct `WANT_BLOCK`.
+- The existing broader lab flag,
+  `FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=<n>`, still forces up
+  to `n` zero-HTTP peers for all request contexts.
+- Default behavior remains unchanged unless one of the lab flags is set.
+
+Focused opt-in/default-prototype result:
+
+- Artifact:
+  `/tmp/subresource-direct2-default-ipfs-tech-r10-20260507T031712Z.json`
+  with trace
+  `/tmp/subresource-direct2-default-ipfs-tech-r10-20260507T031712Z-trace.jsonl`.
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `686/2463ms`; Kubo `2484/4413ms`.
+- Asset p50/p95: Rust `172/611ms`; Kubo `174/836ms`.
+- Resource max: Rust `56392KiB` RSS, `49` FDs; Kubo `296732KiB`,
+  `529` FDs.
+- Zero-HTTP cold Bitswap p50/p95/max: `553/1103/2460ms`.
+- Top-level zero-HTTP cold Bitswap p50/p95/max: `683/2460/2460ms`.
+- Bitswap fetch p50/p95/max: `161/558/1650ms`.
+- Trace validation:
+  - `force_want_block=true` on `56` peer attempts.
+  - `bitswap_peer_expand` with `gateway_subresource=true`: `28`.
+  - `bitswap_peer_expand` with `gateway_subresource=false`: `10`.
+  - Root expansions had `zero_http_direct_want_block_peer_count=0`.
+  - Child expansions had `zero_http_direct_want_block_peer_count=2`.
+
+Multi-case opt-in/default-prototype result:
+
+- Artifact:
+  `/tmp/subresource-direct2-default-multicase-r5-20260507T031917Z.json`
+  with trace
+  `/tmp/subresource-direct2-default-multicase-r5-20260507T031917Z-trace.jsonl`.
+- Rust and Kubo passed `5/5`.
+- DAICO root p50/p95: Rust `1306/2341ms`; Kubo `3044/3168ms`.
+- Vitalik root/range p50/p95: Rust `106/117ms`; Kubo `817/897ms`.
+- `ipfs.tech` root p50/p95: Rust `1011/2456ms`; Kubo `885/1639ms`.
+- `ipfs.tech` asset p50/p95: Rust `169/492ms`; Kubo `362/925ms`.
+- Resource max: Rust `56780KiB` RSS, `51` FDs; Kubo `309808KiB`,
+  `592` FDs.
+- Zero-HTTP cold Bitswap p50/p95/max: `489/1515/2454ms`.
+- Top-level zero-HTTP cold Bitswap p50/p95/max: `1008/2454/2454ms`.
+- Bitswap p50/p95/max: `195/1032/2049ms`.
+
+Same-window disabled/default-off focused control:
+
+- Artifact:
+  `/tmp/subresource-direct2-disabled-control-ipfs-tech-r10-20260507T032051Z.json`
+  with trace
+  `/tmp/subresource-direct2-disabled-control-ipfs-tech-r10-20260507T032051Z-trace.jsonl`.
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `589/1067ms`; Kubo `2578/7748ms`.
+- Asset p50/p95: Rust `143/489ms`; Kubo `344/819ms`.
+- Resource max: Rust `54960KiB` RSS, `46` FDs; Kubo `358900KiB`,
+  `766` FDs.
+- Zero-HTTP cold Bitswap p50/p95/max: `518/1063/1593ms`.
+- Top-level zero-HTTP cold Bitswap p50/p95/max: `586/1063/1063ms`.
+- Bitswap fetch p50/p95/max: `167/485/1399ms`.
+
+Decision:
+Do not promote subresource direct `WANT_BLOCK` as a default yet. The request
+context and trace fields are useful infrastructure for later page-scoped
+experiments, and the opt-in subresource-only behavior validates that top-level
+roots can be excluded. But the same-window disabled/default-off control was as
+good or better on focused root and asset p95 in the later public-network window,
+and the multi-case subresource run still showed an `ipfs.tech` root loss versus
+Kubo even though top-level roots were not forced direct. Keep the behavior behind
+`FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK=1`; the next
+experiment should use the new `gateway_subresource` trace field for
+peer-quality/session gating instead of applying direct `WANT_BLOCK` solely from
+request kind.

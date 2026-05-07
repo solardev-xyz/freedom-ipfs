@@ -120,6 +120,9 @@ const MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS_ENV: &str =
 const MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE: Duration = Duration::from_millis(100);
 const ENABLE_ZERO_HTTP_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_RACE";
+const BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS: usize = 2;
+const ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK";
 const BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS";
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -264,6 +267,41 @@ struct MissingBlockRange {
     end: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetrievalRequestContext {
+    gateway_subresource: bool,
+}
+
+impl RetrievalRequestContext {
+    pub fn gateway_request(parent_request_id: Option<u64>) -> Self {
+        Self {
+            gateway_subresource: parent_request_id.is_some(),
+        }
+    }
+
+    pub fn gateway_subresource(&self) -> bool {
+        self.gateway_subresource
+    }
+}
+
+tokio::task_local! {
+    static RETRIEVAL_REQUEST_CONTEXT: RetrievalRequestContext;
+}
+
+pub async fn with_retrieval_request_context<F>(
+    context: RetrievalRequestContext,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    RETRIEVAL_REQUEST_CONTEXT.scope(context, future).await
+}
+
+fn current_retrieval_request_context() -> Option<RetrievalRequestContext> {
+    RETRIEVAL_REQUEST_CONTEXT.try_with(|context| *context).ok()
+}
+
 impl HttpRetriever {
     pub fn new(routing: impl Into<ProviderRoutingClient>, store: SqliteBlockStore) -> Self {
         let http_provider_fetch_limit = max_concurrent_http_provider_fetches();
@@ -289,6 +327,14 @@ impl HttpRetriever {
     }
 
     pub async fn fetch_block_with_source(&self, cid: &Cid) -> Result<(Block, RetrievalSource)> {
+        self.fetch_block_with_source_with_context(cid, None).await
+    }
+
+    async fn fetch_block_with_source_with_context(
+        &self,
+        cid: &Cid,
+        context: Option<RetrievalRequestContext>,
+    ) -> Result<(Block, RetrievalSource)> {
         let fetch_started = Instant::now();
         let cache_started = Instant::now();
         if let Some(block) = self.store.get(cid)? {
@@ -313,7 +359,7 @@ impl HttpRetriever {
             elapsed_ms = cache_started.elapsed().as_millis()
         );
 
-        let (block, source) = self.fetch_block_uncached_coalesced(*cid).await?;
+        let (block, source) = self.fetch_block_uncached_coalesced(*cid, context).await?;
         tracing::info!(
             phase = "block_fetch_total",
             cid = %cid,
@@ -323,7 +369,11 @@ impl HttpRetriever {
         Ok((block, source))
     }
 
-    async fn fetch_block_uncached_coalesced(&self, cid: Cid) -> Result<(Block, RetrievalSource)> {
+    async fn fetch_block_uncached_coalesced(
+        &self,
+        cid: Cid,
+        context: Option<RetrievalRequestContext>,
+    ) -> Result<(Block, RetrievalSource)> {
         let wait_started = Instant::now();
         let mut inflight = self.inflight.lock().await;
         if let Some(fetch) = inflight.get(&cid).cloned() {
@@ -347,7 +397,7 @@ impl HttpRetriever {
                         hedged = true,
                         elapsed_ms = wait_started.elapsed().as_millis()
                     );
-                    self.fetch_block_uncached_with_source(&cid).await
+                    self.fetch_block_uncached_with_source(&cid, context).await
                 }
             };
         }
@@ -362,14 +412,14 @@ impl HttpRetriever {
                 inflight_count = MAX_INFLIGHT_BLOCK_FETCHES,
                 elapsed_ms = wait_started.elapsed().as_millis()
             );
-            return self.fetch_block_uncached_with_source(&cid).await;
+            return self.fetch_block_uncached_with_source(&cid, context).await;
         }
 
         let retriever = self.clone();
         let fetch = async move {
             Arc::new(
                 retriever
-                    .fetch_block_uncached_with_source(&cid)
+                    .fetch_block_uncached_with_source(&cid, context)
                     .await
                     .map_err(|err| err.to_string()),
             )
@@ -398,6 +448,7 @@ impl HttpRetriever {
     async fn fetch_block_uncached_with_source(
         &self,
         cid: &Cid,
+        context: Option<RetrievalRequestContext>,
     ) -> Result<(Block, RetrievalSource)> {
         let provider_cache_started = Instant::now();
         let providers = match self.cached_providers(cid)? {
@@ -542,6 +593,7 @@ impl HttpRetriever {
                                                             .fetch_after_session_shortcut_provider_lookup(
                                                                 cid,
                                                                 &providers,
+                                                                context,
                                                                 shortcut.as_mut(),
                                                             )
                                                             .await?
@@ -746,6 +798,7 @@ impl HttpRetriever {
                                                         .fetch_after_session_shortcut_provider_lookup(
                                                             cid,
                                                             &providers,
+                                                            context,
                                                             shortcut.as_mut(),
                                                         )
                                                         .await?
@@ -841,7 +894,10 @@ impl HttpRetriever {
         if let Some(block) = self.recheck_block_store(cid)? {
             return Ok((block, RetrievalSource::Cache));
         }
-        match self.fetch_from_providers_with_source(cid, &providers).await {
+        match self
+            .fetch_from_providers_with_source(cid, &providers, context)
+            .await
+        {
             Ok((block, source)) => Ok((block, source)),
             Err(err) if providers.is_empty() && is_no_provider_error(&err) => {
                 tracing::info!(
@@ -927,7 +983,10 @@ impl HttpRetriever {
                             request_timeout,
                             initial_error = %err
                         );
-                        return match self.fetch_from_providers_with_source(cid, &providers).await {
+                        return match self
+                            .fetch_from_providers_with_source(cid, &providers, context)
+                            .await
+                        {
                             Ok((block, source)) => Ok((block, source)),
                             Err(retry_err) => Err(RetrievalError::Bitswap(format!(
                                 "initial provider retrieval failed ({err}); same-provider retry after timeout failed ({retry_err})"
@@ -941,7 +1000,10 @@ impl HttpRetriever {
                             provider_count = providers.len(),
                             initial_error = %err
                         );
-                        return match self.fetch_from_providers_with_source(cid, &providers).await {
+                        return match self
+                            .fetch_from_providers_with_source(cid, &providers, context)
+                            .await
+                        {
                             Ok((block, source)) => Ok((block, source)),
                             Err(retry_err) => Err(RetrievalError::Bitswap(format!(
                                 "initial provider retrieval failed ({err}); same-provider retry failed ({retry_err})"
@@ -951,7 +1013,10 @@ impl HttpRetriever {
                     return Err(err);
                 }
                 self.cache_providers(cid, &refreshed)?;
-                match self.fetch_from_providers_with_source(cid, &refreshed).await {
+                match self
+                    .fetch_from_providers_with_source(cid, &refreshed, context)
+                    .await
+                {
                     Ok((block, source)) => Ok((block, source)),
                     Err(refresh_err) => Err(RetrievalError::Bitswap(format!(
                         "initial provider retrieval failed ({err}); refreshed provider retrieval failed ({refresh_err})"
@@ -989,7 +1054,7 @@ impl HttpRetriever {
     }
 
     pub async fn fetch_from_providers(&self, cid: &Cid, providers: &[Provider]) -> Result<Block> {
-        self.fetch_from_providers_with_source(cid, providers)
+        self.fetch_from_providers_with_source(cid, providers, None)
             .await
             .map(|(block, _source)| block)
     }
@@ -998,6 +1063,7 @@ impl HttpRetriever {
         &self,
         cid: &Cid,
         providers: &[Provider],
+        context: Option<RetrievalRequestContext>,
     ) -> Result<(Block, RetrievalSource)> {
         tracing::info!(
             phase = "provider_fetch_start",
@@ -1040,7 +1106,10 @@ impl HttpRetriever {
         {
             return Ok((block, RetrievalSource::HttpProvider));
         }
-        match self.fetch_from_bitswap_providers(cid, providers).await {
+        match self
+            .fetch_from_bitswap_providers(cid, providers, context)
+            .await
+        {
             Ok(block) => Ok((block, RetrievalSource::Bitswap)),
             Err(RetrievalError::NoBitswapProviders) => Err(RetrievalError::NoHttpProviders),
             Err(err) => Err(err),
@@ -1051,6 +1120,7 @@ impl HttpRetriever {
         &self,
         cid: &Cid,
         providers: &[Provider],
+        context: Option<RetrievalRequestContext>,
         mut shortcut: Pin<&mut F>,
     ) -> Result<Option<(Block, RetrievalSource)>>
     where
@@ -1058,7 +1128,7 @@ impl HttpRetriever {
     {
         let post_lookup_grace = bitswap_session_post_lookup_grace(providers);
         let http_provider_count = provider_http_url_count(providers);
-        let provider_fetch = self.fetch_from_providers_with_source(cid, providers);
+        let provider_fetch = self.fetch_from_providers_with_source(cid, providers, context);
         tokio::pin!(provider_fetch);
         let race_started = Instant::now();
         let provider_count = providers.len();
@@ -2175,6 +2245,7 @@ impl HttpRetriever {
         &self,
         cid: &Cid,
         providers: &[Provider],
+        context: Option<RetrievalRequestContext>,
     ) -> Result<Block> {
         let peer_started = Instant::now();
         let BitswapProviderCandidates { mut peers, quality } =
@@ -2189,8 +2260,11 @@ impl HttpRetriever {
         }
         self.apply_successful_bitswap_peer_scores(&mut peers).await;
         let session_peer_count = self.insert_recent_bitswap_session_peers(&mut peers).await;
+        let gateway_subresource = context
+            .as_ref()
+            .is_some_and(RetrievalRequestContext::gateway_subresource);
         let zero_http_direct_want_block_peer_count =
-            maybe_force_zero_http_direct_want_block_peers(providers, &mut peers);
+            maybe_force_zero_http_direct_want_block_peers(providers, &mut peers, context);
         let addr_stats = bitswap_peer_addr_stats(&peers);
         let trusted_peer_count = peers.iter().filter(|peer| peer.skip_want_have).count();
         tracing::info!(
@@ -2201,6 +2275,7 @@ impl HttpRetriever {
             provider_peer_count,
             session_peer_count,
             trusted_peer_count,
+            gateway_subresource,
             zero_http_direct_want_block_peer_count,
             tcp_addr_count = addr_stats.tcp,
             quic_addr_count = addr_stats.quic,
@@ -3076,6 +3151,7 @@ impl FetchingBlockProvider {
         }
 
         let mut fetches = Vec::new();
+        let context = current_retrieval_request_context();
         for MissingBlockRange {
             index,
             cid,
@@ -3086,7 +3162,9 @@ impl FetchingBlockProvider {
             let retriever = self.retriever.clone();
             fetches.push(async move {
                 let fetch_started = Instant::now();
-                let fetched = retriever.fetch_block_with_source(&cid).await;
+                let fetched = retriever
+                    .fetch_block_with_source_with_context(&cid, context)
+                    .await;
                 (
                     index,
                     cid,
@@ -3147,16 +3225,23 @@ impl BlockProvider for FetchingBlockProvider {
             elapsed_ms = cache_started.elapsed().as_millis()
         );
 
+        let context = current_retrieval_request_context();
         let fetched = match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(self.retriever.fetch_block_with_source(cid))
+                handle.block_on(
+                    self.retriever
+                        .fetch_block_with_source_with_context(cid, context),
+                )
             }),
             Err(_) => {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|err| CoreError::Storage(err.to_string()))?;
-                runtime.block_on(self.retriever.fetch_block_with_source(cid))
+                runtime.block_on(
+                    self.retriever
+                        .fetch_block_with_source_with_context(cid, context),
+                )
             }
         };
 
@@ -3192,16 +3277,23 @@ impl BlockProvider for FetchingBlockProvider {
             elapsed_ms = cache_started.elapsed().as_millis()
         );
 
+        let context = current_retrieval_request_context();
         let fetched = match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(self.retriever.fetch_block_with_source(cid))
+                handle.block_on(
+                    self.retriever
+                        .fetch_block_with_source_with_context(cid, context),
+                )
             }),
             Err(_) => {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|err| CoreError::Storage(err.to_string()))?;
-                runtime.block_on(self.retriever.fetch_block_with_source(cid))
+                runtime.block_on(
+                    self.retriever
+                        .fetch_block_with_source_with_context(cid, context),
+                )
             }
         };
 
@@ -3391,10 +3483,15 @@ fn zero_http_post_lookup_race_enabled() -> bool {
     std::env::var_os(ENABLE_ZERO_HTTP_POST_LOOKUP_RACE_ENV).is_some()
 }
 
-fn bitswap_zero_http_direct_want_block_peers() -> Option<usize> {
-    let override_value = std::env::var_os(BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS_ENV);
-    bitswap_zero_http_direct_want_block_peers_from_env_value(
-        override_value.as_deref().and_then(|value| value.to_str()),
+fn bitswap_zero_http_direct_want_block_peers(
+    context: Option<RetrievalRequestContext>,
+) -> Option<usize> {
+    bitswap_zero_http_direct_want_block_peers_from_values(
+        std::env::var_os(ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_ENV).is_some(),
+        std::env::var_os(BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+        context,
     )
 }
 
@@ -3402,6 +3499,21 @@ fn bitswap_zero_http_direct_want_block_peers_from_env_value(value: Option<&str>)
     value
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
+}
+
+fn bitswap_zero_http_direct_want_block_peers_from_values(
+    subresource_enabled: bool,
+    override_value: Option<&str>,
+    context: Option<RetrievalRequestContext>,
+) -> Option<usize> {
+    bitswap_zero_http_direct_want_block_peers_from_env_value(override_value).or_else(|| {
+        if !subresource_enabled {
+            return None;
+        }
+        context
+            .filter(RetrievalRequestContext::gateway_subresource)
+            .map(|_| BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS)
+    })
 }
 
 fn bitswap_session_shortcut_grace() -> Duration {
@@ -3510,7 +3622,7 @@ fn push_single_http_bitswap_hedge(
         async move {
             SingleHttpProviderBitswapHedgeResult::Bitswap(
                 retriever
-                    .fetch_from_bitswap_providers(&cid, &providers)
+                    .fetch_from_bitswap_providers(&cid, &providers, None)
                     .await,
             )
         }
@@ -4752,11 +4864,12 @@ async fn bitswap_peers_with_quality(providers: &[Provider]) -> BitswapProviderCa
 fn maybe_force_zero_http_direct_want_block_peers(
     providers: &[Provider],
     peers: &mut [BitswapPeer],
+    context: Option<RetrievalRequestContext>,
 ) -> usize {
     maybe_force_zero_http_direct_want_block_peers_with_limit(
         providers,
         peers,
-        bitswap_zero_http_direct_want_block_peers(),
+        bitswap_zero_http_direct_want_block_peers(context),
     )
 }
 
@@ -7316,7 +7429,7 @@ mod bitswap_tests {
             Provider::from_parts(Some(peer_id.to_string()), vec![addr.to_string()]).unwrap();
 
         let (block, source) = retriever
-            .fetch_from_providers_with_source(&cid, &[provider])
+            .fetch_from_providers_with_source(&cid, &[provider], None)
             .await
             .unwrap();
 
@@ -7353,7 +7466,7 @@ mod bitswap_tests {
             Provider::from_parts(Some(peer_id.to_string()), vec![addr.to_string()]).unwrap();
 
         let (block, source) = retriever
-            .fetch_from_providers_with_source(&requested, &[provider])
+            .fetch_from_providers_with_source(&requested, &[provider], None)
             .await
             .unwrap();
         assert_eq!(source, RetrievalSource::Bitswap);
@@ -7421,11 +7534,11 @@ mod bitswap_tests {
         );
 
         let first = retriever
-            .fetch_block_uncached_with_source(&cid)
+            .fetch_block_uncached_with_source(&cid, None)
             .await
             .unwrap_err();
         let second = retriever
-            .fetch_block_uncached_with_source(&cid)
+            .fetch_block_uncached_with_source(&cid, None)
             .await
             .unwrap_err();
 
@@ -7462,14 +7575,14 @@ mod bitswap_tests {
             Provider::from_parts(Some(peer_id.to_string()), vec![addr.to_string()]).unwrap();
 
         let (block, source) = retriever
-            .fetch_from_providers_with_source(&first_cid, std::slice::from_ref(&provider))
+            .fetch_from_providers_with_source(&first_cid, std::slice::from_ref(&provider), None)
             .await
             .unwrap();
         assert_eq!(source, RetrievalSource::Bitswap);
         assert_eq!(block.data(), first);
 
         let (block, source) = retriever
-            .fetch_from_providers_with_source(&second_cid, &[provider])
+            .fetch_from_providers_with_source(&second_cid, &[provider], None)
             .await
             .unwrap();
         assert_eq!(source, RetrievalSource::Bitswap);
@@ -7570,7 +7683,7 @@ mod bitswap_tests {
         let provider = Provider::from_parts(Some(id.id), vec![addr]).unwrap();
 
         let (block, source) = retriever
-            .fetch_from_providers_with_source(&cid, &[provider])
+            .fetch_from_providers_with_source(&cid, &[provider], None)
             .await
             .unwrap();
 
@@ -7631,7 +7744,7 @@ mod bitswap_tests {
         ];
 
         let (block, source) = retriever
-            .fetch_from_providers_with_source(&cid, &providers)
+            .fetch_from_providers_with_source(&cid, &providers, None)
             .await
             .unwrap();
 
@@ -7709,7 +7822,7 @@ mod bitswap_tests {
 
         let started = Instant::now();
         let (block, source) = retriever
-            .fetch_from_providers_with_source(&cid, &providers)
+            .fetch_from_providers_with_source(&cid, &providers, None)
             .await
             .unwrap();
 
@@ -7763,7 +7876,7 @@ mod bitswap_tests {
         .unwrap_or_else(|_| panic!("failed to build HTTP provider for {addr}"));
 
         let err = retriever
-            .fetch_from_providers_with_source(&cid, &[provider])
+            .fetch_from_providers_with_source(&cid, &[provider], None)
             .await
             .unwrap_err();
 
@@ -7791,7 +7904,7 @@ mod bitswap_tests {
         .unwrap_or_else(|_| panic!("failed to build HTTP provider for {addr}"));
 
         let err = retriever
-            .fetch_from_providers_with_source(&cid, &[provider])
+            .fetch_from_providers_with_source(&cid, &[provider], None)
             .await
             .unwrap_err();
 
@@ -7820,7 +7933,7 @@ mod bitswap_tests {
         .unwrap_or_else(|_| panic!("failed to build HTTP provider for {addr}"));
 
         let err = retriever
-            .fetch_from_providers_with_source(&cid, &[provider])
+            .fetch_from_providers_with_source(&cid, &[provider], None)
             .await
             .unwrap_err();
 
@@ -7862,7 +7975,7 @@ mod bitswap_tests {
 
         let started = Instant::now();
         let (block, source) = retriever
-            .fetch_from_providers_with_source(&cid, &[provider])
+            .fetch_from_providers_with_source(&cid, &[provider], None)
             .await
             .unwrap();
 
@@ -7908,7 +8021,7 @@ mod bitswap_tests {
         let started = Instant::now();
         let (block, source) = tokio::time::timeout(
             Duration::from_secs(2),
-            retriever.fetch_from_providers_with_source(&cid, &[provider]),
+            retriever.fetch_from_providers_with_source(&cid, &[provider], None),
         )
         .await
         .expect("hedged HTTP provider fetch timed out")
@@ -7955,7 +8068,7 @@ mod bitswap_tests {
         .unwrap_or_else(|_| panic!("failed to build fast HTTP provider"));
 
         let (_block, source) = retriever
-            .fetch_from_providers_with_source(&cid, &[fast_only_provider])
+            .fetch_from_providers_with_source(&cid, &[fast_only_provider], None)
             .await
             .unwrap();
         assert_eq!(source, RetrievalSource::HttpProvider);
@@ -7973,7 +8086,7 @@ mod bitswap_tests {
         let started = Instant::now();
         let (block, source) = tokio::time::timeout(
             Duration::from_secs(2),
-            retriever.fetch_from_providers_with_source(&cid, &[mixed_provider]),
+            retriever.fetch_from_providers_with_source(&cid, &[mixed_provider], None),
         )
         .await
         .expect("scored HTTP provider fetch timed out")
@@ -8021,7 +8134,7 @@ mod bitswap_tests {
 
         let started = Instant::now();
         let (block, source) = retriever
-            .fetch_from_providers_with_source(&cid, &[provider])
+            .fetch_from_providers_with_source(&cid, &[provider], None)
             .await
             .unwrap();
 
@@ -8236,6 +8349,50 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_env_value(Some("5")),
+            Some(5)
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(false, None, None),
+            None
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                false,
+                None,
+                Some(RetrievalRequestContext::gateway_request(Some(1))),
+            ),
+            None
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                true,
+                None,
+                Some(RetrievalRequestContext::gateway_request(Some(1))),
+            ),
+            Some(BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS)
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                true,
+                None,
+                Some(RetrievalRequestContext::gateway_request(None)),
+            ),
+            None
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                false,
+                Some("5"),
+                Some(RetrievalRequestContext::gateway_request(None)),
+            ),
+            Some(5)
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                true,
+                Some("5"),
+                Some(RetrievalRequestContext::gateway_request(Some(1))),
+            ),
             Some(5)
         );
     }
@@ -8953,7 +9110,7 @@ mod bitswap_tests {
             Provider::from_parts(Some(peer_id.to_string()), vec![addr.to_string()]).unwrap();
 
         let (block, source) = retriever
-            .fetch_from_providers_with_source(&first_cid, &[provider])
+            .fetch_from_providers_with_source(&first_cid, &[provider], None)
             .await
             .unwrap();
         assert_eq!(source, RetrievalSource::Bitswap);
@@ -9001,7 +9158,7 @@ mod bitswap_tests {
             Provider::from_parts(Some(peer_id.to_string()), vec![addr.to_string()]).unwrap();
 
         retriever
-            .fetch_from_providers_with_source(&first_cid, &[provider])
+            .fetch_from_providers_with_source(&first_cid, &[provider], None)
             .await
             .unwrap();
 
@@ -9094,7 +9251,7 @@ mod bitswap_tests {
             Provider::from_parts(Some(peer_id.to_string()), vec![addr.to_string()]).unwrap();
 
         retriever
-            .fetch_from_providers_with_source(&first_cid, &[provider])
+            .fetch_from_providers_with_source(&first_cid, &[provider], None)
             .await
             .unwrap();
 
@@ -9439,7 +9596,7 @@ mod bitswap_tests {
         .unwrap();
 
         let (block, source) = retriever
-            .fetch_from_providers_with_source(&cid, &[provider])
+            .fetch_from_providers_with_source(&cid, &[provider], None)
             .await
             .unwrap();
 

@@ -12,6 +12,7 @@ use bytes::Bytes;
 use cid::Cid;
 use freedom_ipfs_core::{parse_cid, BlockProvider};
 use freedom_ipfs_namesys::{NameResolver, NamesysError, ResolvedName};
+use freedom_ipfs_retrieval::{with_retrieval_request_context, RetrievalRequestContext};
 use freedom_ipfs_store::SqliteBlockStore;
 use freedom_ipfs_unixfs::{
     DirectoryEntry, NodeKind, UnixfsError, UnixfsMetadataCacheStats, UnixfsResolver,
@@ -586,28 +587,32 @@ async fn ipfs_get(
             return response;
         };
 
-        let response = match serve_ipfs_path(
-            state.provider.clone(),
-            state.unixfs.clone(),
-            state.small_body_cache.clone(),
-            html_prefetch_runtime(
-                &state,
-                method == Method::HEAD,
-                headers.get(RANGE),
-                parent_request_id,
-            ),
-            &path,
-            GatewayRequestHeaders {
-                range: headers.get(RANGE),
-                if_none_match: headers.get(IF_NONE_MATCH),
-                is_head: method == Method::HEAD,
-            },
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(err) => gateway_error(err),
-        };
+        let retrieval_context = RetrievalRequestContext::gateway_request(parent_request_id);
+        let response = with_retrieval_request_context(retrieval_context, async {
+            match serve_ipfs_path(
+                state.provider.clone(),
+                state.unixfs.clone(),
+                state.small_body_cache.clone(),
+                html_prefetch_runtime(
+                    &state,
+                    method == Method::HEAD,
+                    headers.get(RANGE),
+                    parent_request_id,
+                ),
+                &path,
+                GatewayRequestHeaders {
+                    range: headers.get(RANGE),
+                    if_none_match: headers.get(IF_NONE_MATCH),
+                    is_head: method == Method::HEAD,
+                },
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => gateway_error(err),
+            }
+        })
+        .await;
         tracing::info!(
             phase = "request_done",
             request_id,
@@ -664,29 +669,33 @@ async fn ipns_get(
             return response;
         };
 
-        let response = match serve_ipns_path(
-            state.provider.clone(),
-            state.unixfs.clone(),
-            state.small_body_cache.clone(),
-            html_prefetch_runtime(
-                &state,
-                method == Method::HEAD,
-                headers.get(RANGE),
-                parent_request_id,
-            ),
-            state.name_resolver.as_ref(),
-            &path,
-            GatewayRequestHeaders {
-                range: headers.get(RANGE),
-                if_none_match: headers.get(IF_NONE_MATCH),
-                is_head: method == Method::HEAD,
-            },
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(err) => gateway_error(err),
-        };
+        let retrieval_context = RetrievalRequestContext::gateway_request(parent_request_id);
+        let response = with_retrieval_request_context(retrieval_context, async {
+            match serve_ipns_path(
+                state.provider.clone(),
+                state.unixfs.clone(),
+                state.small_body_cache.clone(),
+                html_prefetch_runtime(
+                    &state,
+                    method == Method::HEAD,
+                    headers.get(RANGE),
+                    parent_request_id,
+                ),
+                state.name_resolver.as_ref(),
+                &path,
+                GatewayRequestHeaders {
+                    range: headers.get(RANGE),
+                    if_none_match: headers.get(IF_NONE_MATCH),
+                    is_head: method == Method::HEAD,
+                },
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => gateway_error(err),
+            }
+        })
+        .await;
         tracing::info!(
             phase = "request_done",
             request_id,
