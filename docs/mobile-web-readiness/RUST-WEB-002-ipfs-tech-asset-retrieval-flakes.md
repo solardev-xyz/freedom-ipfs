@@ -41123,3 +41123,118 @@ single-provider, zero-HTTP, WSS-only/mostly-WSS Bitswap requests and their
 low-diversity DHT fallback tax without manual trace greps. A future behavioral
 candidate can then target only repeated instances of that shape instead of
 repeating broad DHT-cap, HTML-prefetch, or provider-race sweeps.
+
+## 2026-05-07: Sparse WSS DHT-Empty Classification Diagnostics
+
+Branch/head:
+
+- `codex/kubo-session-performance-20260506`
+- Base before this diagnostic patch: `238a734`
+
+Problem:
+
+The previous guardrail identified a real residual shape, but only after manual
+trace inspection: zero-HTTP provider lookup, one Bitswap provider, WSS source
+transport, and a low-diversity DHT fallback that found no alternate providers.
+The normal request/path summaries only said `zero_http_provider_bitswap` and
+`cold_bitswap_peer_expand`, which is too broad for a future behavior change.
+
+Change:
+
+- Extend request and per-path trace aggregation with Bitswap source transport
+  counts.
+- Extend request and per-path trace aggregation with low-diversity fallback and
+  DHT-provider lookup counters: events, failures, provider totals, max DHT
+  elapsed, and timeout caps.
+- Add request classifications:
+  - `zero_http_single_bitswap_provider`
+  - `zero_http_single_wss_bitswap`
+  - `low_diversity_dht_fallback`
+  - `low_diversity_dht_fallback_empty`
+  - `zero_http_single_wss_bitswap_dht_empty`
+  - `top_level_zero_http_single_wss_bitswap`
+  - `top_level_zero_http_single_wss_bitswap_dht_empty`
+- Print Bitswap source transports in classification latency summaries.
+- Include low-diversity/DHT fallback details in slow-request details and
+  per-asset `rust_trace` rows.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness -- --nocapture
+cargo check -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Result:
+
+- `cargo fmt --all --check`: passed.
+- Full harness package tests passed: `59` tests.
+- `cargo check -p mobile-web-harness`: passed.
+- `cargo clippy -p mobile-web-harness --all-targets -- -D warnings`: passed.
+
+Live command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --trace-output /tmp/sparse-wss-classification-daico-r3-20260508T001500Z-trace.jsonl \
+  --comparison-output /tmp/sparse-wss-classification-daico-r3-20260508T001500Z.json
+```
+
+Live result:
+
+- Rust/Kubo passed `3/3`.
+- `meaningful_kubo_wins`: `2`, both DAICO root p95:
+  - root TTFB p95: Rust `1508ms`; Kubo `1251ms`; delta `257ms`;
+    ratio `1.21x`.
+  - root total p95: Rust `1511ms`; Kubo `1253ms`; delta `258ms`;
+    ratio `1.21x`.
+- DAICO root p50 still favored Rust: Rust `1018/1020ms`; Kubo
+  `1221/1223ms`.
+- Resource max stayed much lighter than Kubo: Rust `44612KiB` RSS and `17` FDs
+  vs Kubo `96456KiB` RSS and `50` FDs.
+
+Useful new trace signal:
+
+- The run classified all three Rust DAICO root requests as:
+  - `low_diversity_dht_fallback=3`
+  - `low_diversity_dht_fallback_empty=3`
+  - `top_level_zero_http_single_wss_bitswap=3`
+  - `top_level_zero_http_single_wss_bitswap_dht_empty=3`
+- The classification latency summary showed the common source:
+  - peer `Qmdv6yNikmUWUWXufLJLRNkv6Y9sY5cmgeX5RVWA4WNMz4=3`
+  - source transport `wss=3`
+  - candidate index `0=3`
+  - request mode `want_block=3`
+- DHT provider lookup events were all empty failures:
+  - `events=3`, `failures=3`, `providers=0`
+  - max elapsed `252ms`
+  - max timeout `250ms`
+- Provider-diversity-low events were `6`, with `3` failure events and
+  `max_bitswap_provider_count=1`.
+- Bitswap peer fetches against the WSS peer totaled `1757ms`, max `793ms`.
+- The slow leaf CID remained
+  `bafkreibvhjyqywfmbw7srwl2673dxjt73ere2j4uyzhi2kojsjzql5g2ci`.
+
+Decision:
+
+Keep this diagnostics patch. It turns the manual DAICO residual into an explicit
+same-window signal and can be required with
+`--require-request-classification=top_level_zero_http_single_wss_bitswap_dht_empty=1`
+for focused future experiments.
+
+Do not promote a behavior change from this run alone. The evidence says the next
+candidate should be targeted at this exact shape: a sparse zero-HTTP root or
+subresource where the only useful provider is WSS and the 250ms DHT fallback is
+empty. Broad DHT fallback changes are still risky because earlier sweeps showed
+longer DHT caps often added tail without finding providers.

@@ -160,9 +160,12 @@ bounded target summaries. The trace summary also keeps bounded per-path request
 summaries in `request_paths`, and Rust-vs-Kubo comparison output attaches the
 matching Rust path summary to each printed per-asset Kubo-win row as
 `rust_trace`. This directly shows block source mix, HTTP provider, HTTP max
-latency, classifications, and dominant request-local phases for a Kubo-winning
-asset path. The console output prints both sections so optimization runs
-immediately show which URL/CID/request caused the tail.
+latency, Bitswap source transport, low-diversity DHT fallback cost,
+classifications, and dominant request-local phases for a Kubo-winning asset
+path. The console output prints both sections so optimization runs immediately
+show which URL/CID/request caused the tail. Sparse public-network residuals are
+classified explicitly, including zero-HTTP single Bitswap-provider WSS requests
+where the low-diversity DHT fallback found no alternate providers.
 Reports also include
 `progress_phases`, `block_sources`, and `bitswap_source_peers` counts, which
 help quantify user-visible loading states, cache/Bitswap/HTTP-provider mix, and
