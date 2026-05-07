@@ -41017,3 +41017,109 @@ HTML-prefetch gap; it is request-local UnixFS file-size/resource latency sitting
 on top of one or more block fetches. Future candidates should use the
 `rust_trace` rows to target a repeated, same-window path shape before changing a
 default.
+
+## 2026-05-07: Current-Head Trace-Linked Guardrail Refresh
+
+Branch/head:
+
+- `codex/kubo-session-performance-20260506`
+- `58443c3`
+
+Purpose:
+
+Run the current diagnostics-enabled default against the broader same-window
+guardrail before making the next behavior change. This is the first multi-case
+refresh after adding `request_paths` and inline `rust_trace` summaries.
+
+Command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/current-head-tracelink-guardrail-r5-20260507T233000Z-trace.jsonl \
+  --comparison-output /tmp/current-head-tracelink-guardrail-r5-20260507T233000Z.json
+```
+
+Result:
+
+- Rust/Kubo passed all cases: `5/5` for both engines.
+- `meaningful_kubo_wins`: none.
+- DAICO root: Rust `935/1336ms`; Kubo `1187/1237ms`. Rust p95 was `99ms`
+  slower, but only `1.08x`, below the meaningful-win threshold.
+- Vitalik range: Rust `105/125ms`; Kubo `2521/4334ms`.
+- `ipfs.tech` root: Rust `669/676ms`; Kubo `1227/1591ms`.
+- `ipfs.tech` assets: Rust `99/179ms`; Kubo `339/761ms`.
+- Wikipedia root: Rust `292/432ms`; Kubo `412/463ms`.
+- Resource max: Rust `60616KiB` RSS and `38` FDs vs Kubo `170016KiB`
+  RSS and `149` FDs.
+- No path-local `asset_kubo_wins` printed in this window.
+
+Trace findings:
+
+- Block fetch totals:
+  - Bitswap: `156` events, total `19018ms`, p50/p90/p95/max
+    `91/180/377/1126ms`.
+  - HTTP provider: `76` events, total `7582ms`, p50/p90/p95/max
+    `83/131/236/547ms`.
+- Delegated lookup stayed cheap: `208` events, `208` successes, `2970`
+  providers, `353` HTTP providers, p50/p95/max `20/48/55ms`.
+- Low-diversity DHT fallback still found nothing useful in this window:
+  `5` DHT provider lookup events, all failures, `0` providers, max elapsed
+  `251ms`.
+- Provider-diversity-low emitted `10` events, `5` failures.
+- Top request classifications included
+  `top_level_zero_http_provider_bitswap=15`,
+  `zero_http_provider_bitswap=15`, `cold_bitswap_peer_expand=5`,
+  `top_level_zero_http_provider_cold_bitswap=5`, and
+  `zero_http_provider_cold_bitswap=5`.
+- Gateway responses were healthy: statuses `200=145,206=35`, p50/p95/max
+  `100/290/673ms`.
+- HTTP provider racing was active but bounded: `193` race events, `108` single
+  provider, `85` multi-provider, `76` `result_ok`; same-provider self-hedge
+  fired only `2` results.
+- HTTP provider fetches were mostly `dag.w3s.link=49`,
+  `gateway-v3.pinata.cloud=10`, `trustless.filebase.io=10`, and
+  `ipfs-bridge.sia.dev=7`.
+- Bitswap provider expansion was small: `14` events, p50/p95/max
+  `44/51/51ms`, with DNS expansion `46` events (`28` cached, `18`
+  uncached, `21` failed).
+- Bitswap source transports were `tcp=9`, `wss=5`.
+- The residual DAICO p95 tax came from sparse zero-HTTP single-provider WSS:
+  the streamed leaf CID
+  `bafkreibvhjyqywfmbw7srwl2673dxjt73ere2j4uyzhi2kojsjzql5g2ci` had `70`
+  trace events, total `12762ms`, max `1126ms`, and source peer
+  `Qmdv6yNikmUWUWXufLJLRNkv6Y9sY5cmgeX5RVWA4WNMz4` over WSS. Delegated lookup
+  returned one provider and no HTTP providers; the `250ms` low-diversity DHT
+  fallback found zero additional providers.
+- The slow `ipfs.tech` root and `_nuxt/BXkYzPrD.js` examples still beat Kubo at
+  the case/path aggregate in this sample. The root requests were
+  `top_level_zero_http_provider_bitswap` with mixed Bitswap plus
+  `ipfs-bridge.sia.dev` HTTP-provider fetches around `177-189ms`; the slowest
+  `_nuxt/BXkYzPrD.js` request was `595ms` with mixed Bitswap plus a
+  `303ms` `ipfs-bridge.sia.dev` fetch.
+
+Decision:
+
+Do not make a broad default behavior change from this run. Current defaults are
+ahead of Kubo on the tracked case-level guardrail and produced no path-local
+asset Kubo wins in this window. The closest residual shape is DAICO root p95,
+but it is not a meaningful Kubo win and is explained by sparse single-provider
+WSS with a low-diversity DHT fallback that finds no alternate providers.
+
+The next useful work is to improve trace classification for this residual shape
+before tuning behavior again: make same-window reports identify
+single-provider, zero-HTTP, WSS-only/mostly-WSS Bitswap requests and their
+low-diversity DHT fallback tax without manual trace greps. A future behavioral
+candidate can then target only repeated instances of that shape instead of
+repeating broad DHT-cap, HTML-prefetch, or provider-race sweeps.
