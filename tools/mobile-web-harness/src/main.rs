@@ -1995,6 +1995,12 @@ fn print_trace_request_classifications(trace: &TraceSummary) {
                 statuses,
                 top_level_paths
             );
+            if !aggregate.bitswap_source_candidate_indexes.is_empty() {
+                println!(
+                    "      bitswap_source_candidate_indexes={}",
+                    format_trace_counts(&aggregate.bitswap_source_candidate_indexes)
+                );
+            }
         }
     }
 }
@@ -5513,6 +5519,7 @@ struct TraceRequestClassificationAggregate {
     statuses: Vec<TraceValueCount>,
     paths: Vec<TraceValueCount>,
     top_level_paths: Vec<TraceValueCount>,
+    bitswap_source_candidate_indexes: Vec<TraceValueCount>,
 }
 
 #[derive(Debug, Serialize)]
@@ -6974,6 +6981,7 @@ struct TraceRequestAggregate {
     event_count: usize,
     phases: Vec<TraceValueCount>,
     cids: Vec<TraceValueCount>,
+    bitswap_source_candidate_indexes: Vec<TraceValueCount>,
     classifications: Vec<TraceValueCount>,
     delegated_zero_http_provider_lookups: usize,
     bitswap_block_fetches: usize,
@@ -7028,6 +7036,7 @@ struct TraceRequestBuilder {
     event_count: usize,
     phases: BTreeMap<String, usize>,
     cids: BTreeMap<String, usize>,
+    bitswap_source_candidate_indexes: BTreeMap<String, usize>,
     delegated_zero_http_provider_lookups: usize,
     bitswap_block_fetches: usize,
     cold_bitswap_peer_expands: usize,
@@ -7050,6 +7059,7 @@ impl TraceRequestBuilder {
             event_count: 0,
             phases: BTreeMap::new(),
             cids: BTreeMap::new(),
+            bitswap_source_candidate_indexes: BTreeMap::new(),
             delegated_zero_http_provider_lookups: 0,
             bitswap_block_fetches: 0,
             cold_bitswap_peer_expands: 0,
@@ -7082,6 +7092,16 @@ impl TraceRequestBuilder {
             && value.get("source").and_then(|source| source.as_str()) == Some("bitswap")
         {
             self.bitswap_block_fetches += 1;
+        }
+        if phase == "bitswap_fetch" && value.get("ok").and_then(|ok| ok.as_bool()) == Some(true) {
+            if let Some(index) = json_detail_string(value.get("source_peer_candidate_index")) {
+                if index != "-1" {
+                    *self
+                        .bitswap_source_candidate_indexes
+                        .entry(index)
+                        .or_default() += 1;
+                }
+            }
         }
         if phase == "bitswap_peer_expand" {
             let peer_count = value
@@ -7135,6 +7155,9 @@ impl TraceRequestBuilder {
             event_count: self.event_count,
             phases: sorted_trace_counts(self.phases),
             cids: sorted_trace_counts(self.cids),
+            bitswap_source_candidate_indexes: sorted_trace_counts(
+                self.bitswap_source_candidate_indexes,
+            ),
             classifications,
             delegated_zero_http_provider_lookups: self.delegated_zero_http_provider_lookups,
             bitswap_block_fetches: self.bitswap_block_fetches,
@@ -8699,6 +8722,7 @@ struct TraceRequestClassificationBuilder {
     statuses: BTreeMap<String, usize>,
     paths: BTreeMap<String, usize>,
     top_level_paths: BTreeMap<String, usize>,
+    bitswap_source_candidate_indexes: BTreeMap<String, usize>,
 }
 
 fn summarize_request_classification_latencies(
@@ -8721,6 +8745,12 @@ fn summarize_request_classification_latencies(
                     .entry(top_level_path.clone())
                     .or_default() += 1;
             }
+            for index in &request.bitswap_source_candidate_indexes {
+                *builder
+                    .bitswap_source_candidate_indexes
+                    .entry(index.value.clone())
+                    .or_default() += index.count;
+            }
         }
     }
 
@@ -8735,6 +8765,9 @@ fn summarize_request_classification_latencies(
                 statuses: sorted_trace_counts(builder.statuses),
                 paths: sorted_trace_counts(builder.paths),
                 top_level_paths: sorted_trace_counts(builder.top_level_paths),
+                bitswap_source_candidate_indexes: sorted_trace_counts(
+                    builder.bitswap_source_candidate_indexes,
+                ),
             },
         )
         .collect::<Vec<_>>();
@@ -10767,7 +10800,7 @@ mod tests {
                 "{\"phase\":\"request_start\",\"request_id\":1,\"path\":\"/ipns/site/\",\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"delegated_provider_lookup\",\"elapsed_ms\":5,\"cid\":\"cid-root\",\"provider_count\":19,\"http_provider_count\":0,\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"bitswap_peer_expand\",\"elapsed_ms\":6,\"cid\":\"cid-root\",\"peer_count\":5,\"session_peer_count\":0,\"supported_provider_addr_count\":41,\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
-                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":1494,\"cid\":\"cid-root\",\"ok\":true,\"bytes\":1362,\"source_peer\":\"peer-root\",\"source_transport\":\"tcp\",\"source_peer_trusted\":false,\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":1494,\"cid\":\"cid-root\",\"ok\":true,\"bytes\":1362,\"source_peer\":\"peer-root\",\"source_transport\":\"tcp\",\"source_peer_trusted\":false,\"source_peer_candidate_index\":4,\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":1618,\"cid\":\"cid-root\",\"source\":\"bitswap\",\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipns/site/\",\"status\":200,\"elapsed_ms\":1888,\"span\":{\"path\":\"/ipns/site/\",\"request_id\":1,\"progress_request_id\":100,\"parent_request_id\":0,\"top_level_path\":\"/ipns/site/\"}}\n",
             ),
@@ -10811,6 +10844,10 @@ mod tests {
             trace_value_count(&classified_latency.top_level_paths, "/ipns/site/"),
             1
         );
+        assert_eq!(
+            trace_value_count(&classified_latency.bitswap_source_candidate_indexes, "4"),
+            1
+        );
         let request = &summary.slow_requests[0];
         assert_eq!(request.path, "/ipns/site/");
         assert_eq!(request.delegated_zero_http_provider_lookups, 1);
@@ -10820,6 +10857,10 @@ mod tests {
         assert_eq!(request.max_bitswap_session_peer_count, 0);
         assert_eq!(
             trace_value_count(&request.classifications, "cold_bitswap_peer_expand"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&request.bitswap_source_candidate_indexes, "4"),
             1
         );
         let requirements = vec!["top_level_zero_http_provider_cold_bitswap=1".to_string()];

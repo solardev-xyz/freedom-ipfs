@@ -33831,3 +33831,44 @@ all fail to close the target without guardrail regressions. Future work should
 not keep sweeping static direct/probe widths; it needs source-quality signals
 that choose which peers to ask directly or probe based on delivery evidence and
 request shape.
+
+## 2026-05-07 Keep: Request-Classified Bitswap Source Candidate Indexes
+
+The global `bitswap_source_candidate_indexes` summary is useful, but the
+focused runs mix different request shapes. In particular, top-level zero-HTTP
+Bitswap roots and `ipfs.tech` asset/subresource fetches can produce different
+source-index distributions. That makes it harder to decide whether a later
+candidate-rank signal applies to the remaining Wikipedia root gap, the
+`ipfs.tech` asset guardrail, or both.
+
+Change:
+
+- Record successful `bitswap_fetch` `source_peer_candidate_index` counts on each
+  traced gateway request.
+- Roll those counts into `request_classification_latencies`, so classifications
+  like `top_level_zero_http_provider_cold_bitswap` now expose their own
+  `bitswap_source_candidate_indexes`.
+- Print the scoped candidate-index counts under each request classification
+  latency row when present.
+- Extend the zero-HTTP cold Bitswap classification test to assert that candidate
+  index `4` is preserved on both the request and the classification aggregate.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_classifies_zero_http_cold_bitswap_requests -- --nocapture
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details -- --nocapture
+cargo test -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+git diff --check
+```
+
+Validation passed.
+
+Decision:
+
+Keep. This is diagnostics-only and changes no retrieval behavior. The next live
+same-window focused run should use this field to separate top-level zero-HTTP
+Bitswap source quality from asset/subresource source quality before attempting
+another adaptive source-selection change.
