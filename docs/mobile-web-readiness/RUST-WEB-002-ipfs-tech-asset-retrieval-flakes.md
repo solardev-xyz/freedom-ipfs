@@ -30299,3 +30299,117 @@ Kubo gap and appears to increase Bitswap pressure in the selected r5 window.
 Future work should focus on why Kubo gets to useful Bitswap source peers faster
 for these root/leaf paths, and on adaptive source quality or session-peer reuse,
 not on this isolated single-provider `5xx` shortcut.
+
+## 2026-05-07 - Top-Level Dominant Peer R10 Recheck
+
+Question:
+The top-level dominant Bitswap session peer lab had an encouraging r5 sample,
+but not enough evidence for a default candidate. Re-run it at r10 in the current
+branch/window and compare against an immediate no-env r10 control.
+
+Opt-in command:
+
+```sh
+timeout 4800s env FREEDOM_IPFS_ENABLE_BITSWAP_TOP_LEVEL_DOMINANT_SESSION_PEER=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/topdominant-current-selected-r10-20260507T0635Z-trace.jsonl \
+  --comparison-output /tmp/topdominant-current-selected-r10-20260507T0635Z.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `10/10` for every selected case.
+- DAICO root: Rust `1225/1628ms` vs Kubo `2858/3194ms`.
+- Vitalik range: Rust `101/146ms` vs Kubo `2074/3381ms`.
+- `ipfs.tech` root range: Rust `768/1322ms` vs Kubo `1058/1548ms`.
+- `ipfs.tech` page assets: Rust root `3/4ms`, assets `95/399ms`; Kubo root
+  `2/274ms`, assets `360/450ms`.
+- `ipfs.tech` hero range: Rust `109/132ms` vs Kubo `440/701ms`.
+- Wikipedia root still lost badly at p95: Rust `616/1940ms` vs Kubo
+  `515/681ms`.
+- Resource max: Rust `51976KiB` RSS and `37` FDs vs Kubo `254444KiB` RSS and
+  `403` FDs.
+- Bitswap block fetch p50/p95/max: `67/557/1432ms`.
+- Bitswap peer attempts: `434`.
+- Top-level zero-HTTP provider Bitswap p50/p95/max:
+  `881/1939/1939ms`.
+
+Immediate no-env control command:
+
+```sh
+timeout 4800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/noenv-after-topdominant-current-selected-r10-20260507T0645Z-trace.jsonl \
+  --comparison-output /tmp/noenv-after-topdominant-current-selected-r10-20260507T0645Z.json
+```
+
+Immediate no-env result:
+
+- Rust and Kubo passed `10/10` for every selected case.
+- DAICO root: Rust `1240/1567ms` vs Kubo `2843/3199ms`.
+- Vitalik range: Rust `101/113ms` vs Kubo `2067/2797ms`.
+- `ipfs.tech` root range: Rust `614/995ms` vs Kubo `734/1781ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `99/312ms`; Kubo root
+  `2/2ms`, assets `354/427ms`.
+- `ipfs.tech` hero range: Rust `124/186ms` vs Kubo `422/439ms`.
+- Wikipedia root lost even more sharply: Rust `586/4125ms` vs Kubo
+  `504/541ms`.
+- Resource max: Rust `52088KiB` RSS and `35` FDs vs Kubo `163816KiB` RSS and
+  `315` FDs.
+- Bitswap block fetch p50/p95/max: `82/620/3540ms`.
+- Bitswap peer attempts: `603`.
+- Top-level zero-HTTP provider Bitswap p50/p95/max:
+  `613/4123/4123ms`.
+
+Interpretation:
+Top-level dominant peer selection did help the bad same-window Wikipedia tail
+relative to no-env (`1940ms` vs `4125ms`) and reduced Bitswap peer attempts
+substantially (`434` vs `603`). That confirms the source-quality hypothesis is
+real. It still did not beat Kubo, and it regressed `ipfs.tech` p95s in the same
+window: root range p95 `1322ms` vs `995ms`, page assets p95 `399ms` vs
+`312ms`.
+
+The slowest opt-in Wikipedia sample shows the risk of over-collapsing to a
+single peer: the leaf block spent `1428ms` in
+`bitswap_session_shortcut` with `peer_count=1`. The no-env tail was worse, but
+also exposed the underlying problem more clearly: the slowest leaf paid
+`3126ms` in `bitswap_peer_expand` and `3056ms` in `bitswap_dns_prefetch`.
+
+Decision:
+Keep top-level dominant peer selection as a disabled diagnostic. Do not promote
+it, and do not simply lower its thresholds. The next source-quality iteration
+should avoid both extremes:
+
+- do not collapse to one peer without a short escape hatch;
+- do not fall back to full provider DNS expansion when a warmed source peer is
+  slow or wrong;
+- prefer a small top-level candidate set that includes the dominant recent peer
+  plus one or two low-latency alternates, then broadens quickly if none produce
+  the block.
