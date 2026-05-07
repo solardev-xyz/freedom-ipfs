@@ -150,6 +150,8 @@ const ENABLE_BITSWAP_DOMINANT_SESSION_PEER_ENV: &str =
     "FREEDOM_IPFS_ENABLE_BITSWAP_DOMINANT_SESSION_PEER";
 const ENABLE_BITSWAP_TOP_LEVEL_DOMINANT_SESSION_PEER_ENV: &str =
     "FREEDOM_IPFS_ENABLE_BITSWAP_TOP_LEVEL_DOMINANT_SESSION_PEER";
+const BITSWAP_DOMINANT_SESSION_PEER_ALTERNATES_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_DOMINANT_SESSION_PEER_ALTERNATES";
 const BITSWAP_DOMINANT_SESSION_PEER_MIN_SUCCESSES: u64 = 8;
 const BITSWAP_DOMINANT_SESSION_PEER_RATIO: u64 = 4;
 const MAX_BITSWAP_ADDRS_PER_PEER: usize = 2;
@@ -2780,23 +2782,24 @@ impl HttpRetriever {
             })
             .collect::<Vec<_>>();
         if let Some(dominant_mode) = bitswap_dominant_session_peer_mode() {
-            if let Some(dominant_index) = dominant_recent_bitswap_peer_index(&peers) {
-                let (id, seen_at, last_latency, addrs, success_count) =
-                    peers.swap_remove(dominant_index);
-                let next_success_count = peers.iter().map(|peer| peer.4).max().unwrap_or_default();
+            if let Some(selection) = select_dominant_recent_bitswap_peers(
+                &mut peers,
+                bitswap_dominant_session_peer_alternates(),
+            ) {
                 tracing::info!(
                     phase = "bitswap_dominant_session_peer",
-                    peer = %id,
-                    peer_count = peers.len() + 1,
-                    success_count,
-                    next_success_count,
-                    latency_ms = last_latency.as_millis(),
+                    peer = %selection.peer,
+                    peer_count = selection.peer_count,
+                    selected_peer_count = selection.selected_peer_count,
+                    alternate_count = selection.alternate_count,
+                    alternate_limit = selection.alternate_limit,
+                    success_count = selection.success_count,
+                    next_success_count = selection.next_success_count,
+                    latency_ms = selection.latency.as_millis(),
                     mode = dominant_mode.as_str(),
                     min_success_count = BITSWAP_DOMINANT_SESSION_PEER_MIN_SUCCESSES,
                     dominance_ratio = BITSWAP_DOMINANT_SESSION_PEER_RATIO
                 );
-                peers.clear();
-                peers.push((id, seen_at, last_latency, addrs, success_count));
             }
         }
         peers.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| right.1.cmp(&left.1)));
@@ -3594,6 +3597,18 @@ impl DominantSessionPeerMode {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DominantSessionPeerSelection {
+    peer: PeerId,
+    peer_count: usize,
+    selected_peer_count: usize,
+    alternate_count: usize,
+    alternate_limit: usize,
+    success_count: u64,
+    next_success_count: u64,
+    latency: Duration,
+}
+
 struct HttpProviderScore {
     ewma_elapsed: Duration,
     successes: u64,
@@ -3897,6 +3912,47 @@ fn dominant_recent_bitswap_peer_index<T>(
         return None;
     }
     Some(dominant_index)
+}
+
+fn select_dominant_recent_bitswap_peers<T>(
+    peers: &mut Vec<(PeerId, Instant, Duration, T, u64)>,
+    alternate_limit: usize,
+) -> Option<DominantSessionPeerSelection> {
+    let dominant_index = dominant_recent_bitswap_peer_index(peers)?;
+    let peer_count = peers.len();
+    let (id, seen_at, last_latency, addrs, success_count) = peers.swap_remove(dominant_index);
+    let next_success_count = peers.iter().map(|peer| peer.4).max().unwrap_or_default();
+    let alternate_limit = alternate_limit.min(MAX_BITSWAP_SESSION_PEERS.saturating_sub(1));
+    peers.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| right.1.cmp(&left.1)));
+    peers.truncate(alternate_limit);
+    let alternate_count = peers.len();
+    peers.push((id, seen_at, last_latency, addrs, success_count));
+
+    Some(DominantSessionPeerSelection {
+        peer: id,
+        peer_count,
+        selected_peer_count: alternate_count + 1,
+        alternate_count,
+        alternate_limit,
+        success_count,
+        next_success_count,
+        latency: last_latency,
+    })
+}
+
+fn bitswap_dominant_session_peer_alternates() -> usize {
+    bitswap_dominant_session_peer_alternates_from_env_value(
+        std::env::var_os(BITSWAP_DOMINANT_SESSION_PEER_ALTERNATES_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn bitswap_dominant_session_peer_alternates_from_env_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_default()
+        .min(MAX_BITSWAP_SESSION_PEERS.saturating_sub(1))
 }
 
 fn bitswap_session_peer_limit() -> usize {
@@ -9229,6 +9285,26 @@ mod bitswap_tests {
     }
 
     #[test]
+    fn dominant_session_peer_alternates_env_value_parses_capped_override() {
+        assert_eq!(
+            bitswap_dominant_session_peer_alternates_from_env_value(None),
+            0
+        );
+        assert_eq!(
+            bitswap_dominant_session_peer_alternates_from_env_value(Some("bad")),
+            0
+        );
+        assert_eq!(
+            bitswap_dominant_session_peer_alternates_from_env_value(Some("2")),
+            2
+        );
+        assert_eq!(
+            bitswap_dominant_session_peer_alternates_from_env_value(Some("999")),
+            MAX_BITSWAP_SESSION_PEERS - 1
+        );
+    }
+
+    #[test]
     fn bitswap_dns_lookup_timeout_env_value_parses_optional_override() {
         assert_eq!(bitswap_dns_lookup_timeout_from_env_value(None), None);
         assert_eq!(bitswap_dns_lookup_timeout_from_env_value(Some("0")), None);
@@ -9263,6 +9339,33 @@ mod bitswap_tests {
             (second, now, Duration::from_millis(25), (), 4),
         ];
         assert_eq!(dominant_recent_bitswap_peer_index(&clear_lead), Some(0));
+    }
+
+    #[test]
+    fn dominant_session_peer_selection_can_keep_low_latency_alternates() {
+        let dominant =
+            parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let fast = parse_peer_id("12D3KooWAtxJkDLacJdK7yZkk2iPp8iMdSVh1bDHzmJ3t8oKUkqA").unwrap();
+        let slow = parse_peer_id("12D3KooWAC7ALVECw2xQHccT3hSUcQU7pJ3hvwV77w1kEevC5kKG").unwrap();
+        let now = Instant::now();
+        let mut peers = vec![
+            (dominant, now, Duration::from_millis(80), "dominant", 16),
+            (fast, now, Duration::from_millis(20), "fast", 4),
+            (slow, now, Duration::from_millis(200), "slow", 1),
+        ];
+
+        let selection = select_dominant_recent_bitswap_peers(&mut peers, 1)
+            .expect("dominant peer should be selected");
+
+        assert_eq!(selection.peer, dominant);
+        assert_eq!(selection.peer_count, 3);
+        assert_eq!(selection.selected_peer_count, 2);
+        assert_eq!(selection.alternate_count, 1);
+        assert_eq!(selection.next_success_count, 4);
+        assert_eq!(peers.len(), 2);
+        assert!(peers.iter().any(|peer| peer.0 == dominant));
+        assert!(peers.iter().any(|peer| peer.0 == fast));
+        assert!(!peers.iter().any(|peer| peer.0 == slow));
     }
 
     #[test]

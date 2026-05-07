@@ -30576,3 +30576,101 @@ promote a default cap from this evidence. It is useful as a guardrail when
 probing DNS-prefetch tails, but a default would need larger r10+ same-window
 coverage and a clear answer for lost providers before it can be considered
 mobile-safe.
+
+## 2026-05-07 - Reject: Top-Level Dominant Peer Alternates Lab
+
+Question:
+The top-level dominant-peer r10 recheck showed both sides of the source-quality
+tradeoff: dominant peer selection improved the worst Wikipedia tail relative to
+no-env, but sometimes collapsed the request to a single peer for too long. Can
+the same lab keep the dominant recent peer plus one or two low-latency recent
+alternates, preserving the fanout reduction while avoiding single-peer
+over-collapse?
+
+Code:
+
+- Added disabled env flag:
+  `FREEDOM_IPFS_BITSWAP_DOMINANT_SESSION_PEER_ALTERNATES=<count>`.
+- The flag only has an effect when one of the existing dominant-peer lab flags
+  is enabled:
+  - `FREEDOM_IPFS_ENABLE_BITSWAP_DOMINANT_SESSION_PEER=1`, or
+  - `FREEDOM_IPFS_ENABLE_BITSWAP_TOP_LEVEL_DOMINANT_SESSION_PEER=1`.
+- Default behavior is unchanged: the alternate count defaults to `0`, so the
+  existing dominant-peer lab still selects only the dominant peer.
+- When the alternate count is positive, dominant selection keeps the dominant
+  peer plus up to that many latency-ordered recent successful alternates, capped
+  by `MAX_BITSWAP_SESSION_PEERS - 1`.
+- The `bitswap_dominant_session_peer` trace marker now includes
+  `selected_peer_count`, `alternate_count`, and `alternate_limit`.
+
+Unit validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval dominant_session_peer --lib
+```
+
+Result:
+
+- `3` focused dominant-peer tests passed, including alternate env parsing and a
+  pure selection test that keeps the dominant peer plus the fastest alternate.
+
+Live command:
+
+```sh
+timeout 3000s env \
+  FREEDOM_IPFS_ENABLE_BITSWAP_TOP_LEVEL_DOMINANT_SESSION_PEER=1 \
+  FREEDOM_IPFS_BITSWAP_DOMINANT_SESSION_PEER_ALTERNATES=2 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/topdominant-alt2-selected-r5-20260507T0825Z-trace.jsonl \
+  --comparison-output /tmp/topdominant-alt2-selected-r5-20260507T0825Z.json
+```
+
+Live result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1228/1362ms` vs Kubo `2995/3091ms`.
+- Vitalik range: Rust `93/132ms` vs Kubo `2606/2713ms`.
+- `ipfs.tech` root range: Rust `779/1126ms` vs Kubo `884/1456ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `146/529ms`; Kubo root
+  `2/2ms`, assets `351/481ms`.
+- `ipfs.tech` hero range: Rust `114/117ms` vs Kubo `427/491ms`.
+- Wikipedia root still lost: Rust `754/779ms` vs Kubo `494/558ms`.
+- Resource max: Rust `51244KiB` RSS and `30` FDs vs Kubo `155432KiB` RSS and
+  `250` FDs.
+- HTTP provider block fetch p50/p95/max: `181/561/853ms`.
+- Bitswap block fetch p50/p95/max: `126/525/1803ms`.
+- Bitswap peer attempts: `274`.
+- `bitswap_dominant_session_peer` markers: `11`.
+- The selector usually had no alternate available:
+  `10` markers selected only `1` peer with `alternate_count=0`; only `1`
+  marker selected `2` peers with `alternate_count=1`.
+
+Trace interpretation:
+The lab did not deliver the intended effect because the recent-success set was
+usually still a single dominant source. The run regressed the target
+`ipfs.tech` page-asset p95 relative to Kubo in the same window (`529ms` vs
+`481ms`), and Wikipedia remained behind Kubo. The slowest `ipfs.tech` asset
+still came from a zero-HTTP Bitswap path with `session_peer_count=0`, meaning
+the alternate selector was not on the critical path for that tail.
+
+Decision:
+Keep the alternate selector as a disabled diagnostic extension of the dominant
+peer lab, but do not promote it. The useful finding is negative: preserving
+recent alternates is not enough when the session has not learned diverse good
+sources. The next source-quality experiment should seed a small candidate set
+from provider lookup quality itself, not only from prior successful session
+peers.
