@@ -41360,3 +41360,137 @@ that the skip improves or at least does not regress p95/reliability for
 `top_level_zero_http_single_wss_bitswap_dht_empty` requests. The next better
 behavior target may be WSS connection reuse/variance for the repeated Pinata
 Bitswap peer, not the DHT skip by itself.
+
+Broad opt-in guardrail command:
+
+```sh
+timeout 2400s env \
+  FREEDOM_IPFS_LAB_SKIP_LOW_DIVERSITY_DHT_FOR_SINGLE_WSS=1 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --repeat 5 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --case daicowtf-page-assets \
+    --case vitalik-root-html-range \
+    --case ipfs-tech-page-assets \
+    --case wikipedia-on-ipfs-root \
+    --trace-output /tmp/skip-single-dns-wss-dht-guardrail-r5-20260508T005000Z-trace.jsonl \
+    --comparison-output /tmp/skip-single-dns-wss-dht-guardrail-r5-20260508T005000Z.json
+```
+
+Broad opt-in guardrail result:
+
+- Rust/Kubo passed `5/5` for all four cases.
+- DAICO root: Rust `894/1012ms`; Kubo `1189/1221ms`.
+- Vitalik range root: Rust `106/122ms`; Kubo `2970/4839ms`.
+- ipfs.tech root: Rust `678/958ms`; Kubo `1057/1375ms`.
+- ipfs.tech assets: Rust `102/386ms`; Kubo `346/749ms`.
+- Wikipedia root: Rust `156/840ms`; Kubo `356/692ms`.
+- Resource max: Rust `58604KiB` RSS and `39` FDs vs Kubo `182432KiB`
+  RSS and `139` FDs.
+- `meaningful_kubo_wins`: `2`, both Wikipedia root p95:
+  `840ms` Rust vs `692ms` Kubo.
+- ipfs.tech still had `4` path-local asset Kubo wins:
+  `_nuxt/DzK6mLCt.js` p95 `936ms` Rust vs `380/381ms` Kubo, and
+  `_nuxt/BXkYzPrD.js` p95 `767/768ms` Rust vs `547/548ms` Kubo.
+
+Broad opt-in trace:
+
+- The lab gate fired for the DAICO single-WSS shape: there were no
+  `dht_provider_lookup` events, and the DHT-empty request classifications
+  disappeared.
+- Provider-diversity-low events remained as non-failures:
+  `events=10`, `failures=0`, `max_bitswap_provider_count=1`.
+- The DAICO shape remained visible as
+  `top_level_zero_http_single_wss_bitswap=5`, with source peer
+  `Qmdv6yNikmUWUWXufLJLRNkv6Y9sY5cmgeX5RVWA4WNMz4=5`.
+- Bitswap totals: `count=124`, `total=16187ms`, p50 `91ms`,
+  p90 `238ms`, p95 `397ms`, max `789ms`.
+- HTTP-provider totals: `count=107`, `total=15120ms`, p50 `87ms`,
+  p90 `239ms`, p95 `278ms`, max `934ms`.
+- The remaining ipfs.tech asset wins were dominated by mixed Bitswap and
+  `https://ipfs-bridge.sia.dev/` HTTP-provider fetches; the slowest trace row
+  for `_nuxt/DzK6mLCt.js` had `block_sources=bitswap=5,http_provider=2` and
+  HTTP max `934ms`.
+
+Immediate no-env broad post-control command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/skip-single-dns-wss-dht-post-control-guardrail-r5-20260508T010000Z-trace.jsonl \
+  --comparison-output /tmp/skip-single-dns-wss-dht-post-control-guardrail-r5-20260508T010000Z.json
+```
+
+Immediate no-env broad post-control result:
+
+- Rust/Kubo passed `5/5` for all four cases.
+- DAICO root: Rust `907/1024ms`; Kubo `1423/2451ms`.
+- Vitalik range root: Rust `109/125ms`; Kubo `2298/4698ms`.
+- ipfs.tech root: Rust `672/1082ms`; Kubo `1224/1574ms`.
+- ipfs.tech assets: Rust `110/249ms`; Kubo `146/661ms`.
+- Wikipedia root: Rust `134/1301ms`; Kubo `85/665ms`.
+- Resource max: Rust `61712KiB` RSS and `38` FDs vs Kubo `179160KiB`
+  RSS and `162` FDs.
+- `meaningful_kubo_wins`: `2`, both Wikipedia root p95:
+  `1301ms` Rust vs `665ms` Kubo.
+- ipfs.tech had `12` path-local asset Kubo wins despite stronger aggregate
+  asset p95. The top rows were `_nuxt/BXkYzPrD.js` p95 `655ms` Rust vs
+  `420ms` Kubo, `_nuxt/D9b_q90p.js` p50/p95 wins, and
+  `_nuxt/DBHrpFkY.js` p95 wins.
+
+Immediate no-env broad post-control trace:
+
+- Default behavior still performed the empty low-diversity DHT fallback:
+  `dht_provider_lookup events=5`, `failures=5`, `providers=0`,
+  `max_elapsed_ms=252`, `max_timeout_ms=250`.
+- DHT-empty classifications returned for the DAICO shape:
+  `top_level_zero_http_single_wss_bitswap_dht_empty=5`.
+- Provider-diversity-low events were `10`, with `5` failure events.
+- The Wikipedia p95 win was not the single-WSS DAICO shape. The slow request
+  used TCP Bitswap, two HTTP-provider `500` failures from
+  `https://f010479.twinquasar.io/`, and a slow incoming Bitswap delivery for
+  `bafkreicr5w6i2f3m664a2fnl4vhtg3s6dhhk6n5hrf3gqzcf7v5bu6b7te`.
+- The slow ipfs.tech asset rows were mixed HTTP-provider/Bitswap resource
+  fetches. `_nuxt/BXkYzPrD.js` p95 was a single
+  `https://ipfs-bridge.sia.dev/` HTTP-provider result with HTTP elapsed
+  `394ms` and total resource/request time `651/652ms`.
+
+Broad guardrail decision:
+
+Keep `FREEDOM_IPFS_LAB_SKIP_LOW_DIVERSITY_DHT_FOR_SINGLE_WSS` disabled. The
+lab removes an objectively empty DAICO DHT fallback and does not obviously hurt
+the broad r5 aggregate, but the no-env control was also strong on DAICO, and the
+dominant remaining Kubo wins are not explained by that DHT fallback. Promotion
+would be premature.
+
+Next work should pivot to the remaining path-local tails:
+
+- Wikipedia root p95: TCP Bitswap after HTTP-provider `500`s, not the single-WSS
+  path.
+- ipfs.tech asset p50/p95 rows: mixed Bitswap/HTTP-provider subresource fetches,
+  often involving `https://ipfs-bridge.sia.dev/`, where aggregate p95 is good
+  but individual assets still lose to Kubo.
+
+Before changing behavior again, add or use per-path trace detail that separates
+HTTP-provider limiter wait, header wait, first byte/chunk, body read, and
+Bitswap race outcome for asset Kubo-win rows. The current asset `rust_trace=`
+summary identifies source/provider and total fetch latency, but it is still too
+coarse to know whether the next safe lever is provider scoring, self-hedge
+timing, Bitswap-vs-HTTP race policy, or UnixFS/resource scheduling.
