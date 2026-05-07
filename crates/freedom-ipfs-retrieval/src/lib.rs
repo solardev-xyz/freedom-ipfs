@@ -101,6 +101,11 @@ const ENABLE_ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION_ENV: &str =
     "FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION";
 const ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION_MS_ENV: &str =
     "FREEDOM_IPFS_ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION_MS";
+const ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION: Duration = Duration::from_millis(750);
+const ENABLE_ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION";
+const ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION_MS_ENV: &str =
+    "FREEDOM_IPFS_ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION_MS";
 const BITSWAP_CONNECTION_ERROR_BACKOFF_TTL: Duration = Duration::from_secs(30);
 const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD: usize = 2;
 const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD_ENV: &str =
@@ -3521,9 +3526,12 @@ impl HttpRetriever {
         let session_peer_count = self.insert_recent_bitswap_session_peers(&mut peers).await;
         let zero_http_subresource_peer_rotation =
             maybe_rotate_zero_http_subresource_peers(providers, context.as_ref(), cid, &mut peers);
-        let gateway_subresource = context
-            .as_ref()
-            .is_some_and(RetrievalRequestContext::gateway_subresource);
+        let gateway_context = GatewayBitswapSourceContext {
+            gateway_request: context.is_some(),
+            gateway_subresource: context
+                .as_ref()
+                .is_some_and(RetrievalRequestContext::gateway_subresource),
+        };
         let zero_http_direct_want_block_limit =
             bitswap_zero_http_direct_want_block_peers(providers.len(), context);
         let zero_http_direct_want_block_peer_count =
@@ -3544,7 +3552,7 @@ impl HttpRetriever {
             provider_peer_count,
             session_peer_count,
             trusted_peer_count,
-            gateway_subresource,
+            gateway_subresource = gateway_context.gateway_subresource,
             zero_http_direct_want_block_peer_count,
             zero_http_direct_want_block_limit = zero_http_direct_want_block_limit
                 .map(|limit| limit as i64)
@@ -3714,10 +3722,10 @@ impl HttpRetriever {
             elapsed_ms = elapsed.as_millis()
         );
         if let Some(peer) = source_peer {
-            self.maybe_mark_slow_zero_http_subresource_source_peer(
+            self.maybe_mark_slow_zero_http_source_peer(
                 cid,
                 providers,
-                gateway_subresource,
+                gateway_context,
                 source_peer,
                 &source_trace,
                 elapsed,
@@ -3768,47 +3776,70 @@ impl HttpRetriever {
         }
     }
 
-    fn maybe_mark_slow_zero_http_subresource_source_peer(
+    fn maybe_mark_slow_zero_http_source_peer(
         &self,
         cid: &Cid,
         providers: &[Provider],
-        gateway_subresource: bool,
+        gateway_context: GatewayBitswapSourceContext,
         source_peer: Option<PeerId>,
         source_trace: &BitswapSourcePeerTrace,
         elapsed: Duration,
     ) -> bool {
-        if !gateway_subresource
-            || source_peer.is_none()
+        if source_peer.is_none()
             || source_trace.skip_want_have
             || source_trace.candidate_index.is_none()
         {
             return false;
         }
+        if let Some(threshold) = zero_http_gateway_slow_source_suppression_threshold() {
+            if self.maybe_mark_slow_zero_http_source_peer_with_threshold(
+                cid,
+                SlowZeroHttpSourcePeer {
+                    gateway_request: gateway_context.gateway_request,
+                    gateway_subresource: gateway_context.gateway_subresource,
+                    http_provider_count: provider_http_url_count(providers),
+                    source_peer,
+                    source_trace,
+                    elapsed,
+                    threshold,
+                    trace_phase: "bitswap_slow_zero_http_gateway_source_suppressed",
+                    bad_provider_reason: "slow zero-http gateway bitswap source",
+                },
+            ) {
+                return true;
+            }
+        }
+        if !gateway_context.gateway_subresource {
+            return false;
+        }
         let Some(threshold) = zero_http_subresource_slow_source_suppression_threshold() else {
             return false;
         };
-        self.maybe_mark_slow_zero_http_subresource_source_peer_with_threshold(
+        self.maybe_mark_slow_zero_http_source_peer_with_threshold(
             cid,
-            SlowZeroHttpSubresourceSourcePeer {
-                gateway_subresource,
+            SlowZeroHttpSourcePeer {
+                gateway_request: gateway_context.gateway_request,
+                gateway_subresource: gateway_context.gateway_subresource,
                 http_provider_count: provider_http_url_count(providers),
                 source_peer,
                 source_trace,
                 elapsed,
                 threshold,
+                trace_phase: "bitswap_slow_zero_http_subresource_source_suppressed",
+                bad_provider_reason: "slow zero-http subresource bitswap source",
             },
         )
     }
 
-    fn maybe_mark_slow_zero_http_subresource_source_peer_with_threshold(
+    fn maybe_mark_slow_zero_http_source_peer_with_threshold(
         &self,
         cid: &Cid,
-        candidate: SlowZeroHttpSubresourceSourcePeer<'_>,
+        candidate: SlowZeroHttpSourcePeer<'_>,
     ) -> bool {
         let Some(peer) = candidate.source_peer else {
             return false;
         };
-        if !candidate.gateway_subresource
+        if !candidate.gateway_request
             || candidate.http_provider_count != 0
             || candidate.elapsed <= candidate.threshold
             || candidate.source_trace.skip_want_have
@@ -3817,9 +3848,10 @@ impl HttpRetriever {
             return false;
         }
         tracing::info!(
-            phase = "bitswap_slow_zero_http_subresource_source_suppressed",
+            phase = candidate.trace_phase,
             cid = %cid,
             peer = %peer,
+            gateway_subresource = candidate.gateway_subresource,
             latency_ms = candidate.elapsed.as_millis(),
             threshold_ms = candidate.threshold.as_millis(),
             source_peer_candidate_index = candidate.source_trace
@@ -3831,7 +3863,7 @@ impl HttpRetriever {
         );
         let _ = self.store.mark_bad_provider(
             &peer.to_string(),
-            "slow zero-http subresource bitswap source",
+            candidate.bad_provider_reason,
             BAD_BITSWAP_PROVIDER_TTL,
         );
         true
@@ -5140,13 +5172,22 @@ struct BitswapSourcePeerTrace {
     unknown_top_level: bool,
 }
 
-struct SlowZeroHttpSubresourceSourcePeer<'a> {
+#[derive(Clone, Copy)]
+struct GatewayBitswapSourceContext {
+    gateway_request: bool,
+    gateway_subresource: bool,
+}
+
+struct SlowZeroHttpSourcePeer<'a> {
+    gateway_request: bool,
     gateway_subresource: bool,
     http_provider_count: usize,
     source_peer: Option<PeerId>,
     source_trace: &'a BitswapSourcePeerTrace,
     elapsed: Duration,
     threshold: Duration,
+    trace_phase: &'static str,
+    bad_provider_reason: &'static str,
 }
 
 impl Default for BitswapSourcePeerTrace {
@@ -5696,6 +5737,31 @@ fn zero_http_subresource_slow_source_suppression_threshold_from_values(
             .filter(|value| *value > 0)
             .map(Duration::from_millis)
             .unwrap_or(ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION),
+    )
+}
+
+fn zero_http_gateway_slow_source_suppression_threshold() -> Option<Duration> {
+    zero_http_gateway_slow_source_suppression_threshold_from_values(
+        std::env::var_os(ENABLE_ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION_ENV).is_some(),
+        std::env::var_os(ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION_MS_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn zero_http_gateway_slow_source_suppression_threshold_from_values(
+    enabled: bool,
+    override_value: Option<&str>,
+) -> Option<Duration> {
+    if !enabled {
+        return None;
+    }
+    Some(
+        override_value
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION),
     )
 }
 
@@ -13879,6 +13945,30 @@ mod bitswap_tests {
         );
     }
 
+    #[test]
+    fn zero_http_gateway_slow_source_suppression_threshold_is_opt_in() {
+        assert_eq!(
+            zero_http_gateway_slow_source_suppression_threshold_from_values(false, None),
+            None
+        );
+        assert_eq!(
+            zero_http_gateway_slow_source_suppression_threshold_from_values(true, None),
+            Some(ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION)
+        );
+        assert_eq!(
+            zero_http_gateway_slow_source_suppression_threshold_from_values(true, Some("500")),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            zero_http_gateway_slow_source_suppression_threshold_from_values(true, Some("0")),
+            Some(ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION)
+        );
+        assert_eq!(
+            zero_http_gateway_slow_source_suppression_threshold_from_values(true, Some("bad")),
+            Some(ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION)
+        );
+    }
+
     #[tokio::test]
     async fn slow_zero_http_subresource_source_suppression_can_be_temporarily_suppressed() {
         let peer = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
@@ -13896,20 +13986,95 @@ mod bitswap_tests {
             ..BitswapSourcePeerTrace::default()
         };
 
-        let marked = retriever.maybe_mark_slow_zero_http_subresource_source_peer_with_threshold(
+        let marked = retriever.maybe_mark_slow_zero_http_source_peer_with_threshold(
             &cid,
-            SlowZeroHttpSubresourceSourcePeer {
+            SlowZeroHttpSourcePeer {
+                gateway_request: true,
                 gateway_subresource: true,
                 http_provider_count: 0,
                 source_peer: Some(peer),
                 source_trace: &source_trace,
                 elapsed: Duration::from_millis(900),
                 threshold: Duration::from_millis(750),
+                trace_phase: "bitswap_slow_zero_http_subresource_source_suppressed",
+                bad_provider_reason: "slow zero-http subresource bitswap source",
             },
         );
 
         assert!(marked);
         assert!(store.is_bad_provider(&peer.to_string()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn slow_zero_http_gateway_root_source_suppression_can_be_temporarily_suppressed() {
+        let peer = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let cid = "bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u"
+            .parse::<Cid>()
+            .unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let source_trace = BitswapSourcePeerTrace {
+            candidate_index: Some(2),
+            request_mode: "want_block",
+            ..BitswapSourcePeerTrace::default()
+        };
+
+        let marked = retriever.maybe_mark_slow_zero_http_source_peer_with_threshold(
+            &cid,
+            SlowZeroHttpSourcePeer {
+                gateway_request: true,
+                gateway_subresource: false,
+                http_provider_count: 0,
+                source_peer: Some(peer),
+                source_trace: &source_trace,
+                elapsed: Duration::from_millis(1400),
+                threshold: Duration::from_millis(750),
+                trace_phase: "bitswap_slow_zero_http_gateway_source_suppressed",
+                bad_provider_reason: "slow zero-http gateway bitswap source",
+            },
+        );
+
+        assert!(marked);
+        assert!(store.is_bad_provider(&peer.to_string()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn slow_source_suppression_ignores_non_gateway_context() {
+        let peer = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let cid = "bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u"
+            .parse::<Cid>()
+            .unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let source_trace = BitswapSourcePeerTrace {
+            candidate_index: Some(0),
+            request_mode: "want_block",
+            ..BitswapSourcePeerTrace::default()
+        };
+
+        assert!(
+            !retriever.maybe_mark_slow_zero_http_source_peer_with_threshold(
+                &cid,
+                SlowZeroHttpSourcePeer {
+                    gateway_request: false,
+                    gateway_subresource: false,
+                    http_provider_count: 0,
+                    source_peer: Some(peer),
+                    source_trace: &source_trace,
+                    elapsed: Duration::from_millis(900),
+                    threshold: Duration::from_millis(750),
+                    trace_phase: "bitswap_slow_zero_http_gateway_source_suppressed",
+                    bad_provider_reason: "slow zero-http gateway bitswap source",
+                },
+            )
+        );
+        assert!(!store.is_bad_provider(&peer.to_string()).unwrap());
     }
 
     #[tokio::test]
@@ -13937,54 +14102,50 @@ mod bitswap_tests {
         let threshold = Duration::from_millis(750);
 
         assert!(
-            !retriever.maybe_mark_slow_zero_http_subresource_source_peer_with_threshold(
+            !retriever.maybe_mark_slow_zero_http_source_peer_with_threshold(
                 &cid,
-                SlowZeroHttpSubresourceSourcePeer {
+                SlowZeroHttpSourcePeer {
+                    gateway_request: true,
                     gateway_subresource: true,
                     http_provider_count: 0,
                     source_peer: Some(peer),
                     source_trace: &untrusted_source,
                     elapsed: Duration::from_millis(700),
                     threshold,
+                    trace_phase: "bitswap_slow_zero_http_subresource_source_suppressed",
+                    bad_provider_reason: "slow zero-http subresource bitswap source",
                 },
             )
         );
         assert!(
-            !retriever.maybe_mark_slow_zero_http_subresource_source_peer_with_threshold(
+            !retriever.maybe_mark_slow_zero_http_source_peer_with_threshold(
                 &cid,
-                SlowZeroHttpSubresourceSourcePeer {
+                SlowZeroHttpSourcePeer {
+                    gateway_request: true,
                     gateway_subresource: true,
                     http_provider_count: 1,
                     source_peer: Some(peer),
                     source_trace: &untrusted_source,
                     elapsed: Duration::from_millis(900),
                     threshold,
+                    trace_phase: "bitswap_slow_zero_http_subresource_source_suppressed",
+                    bad_provider_reason: "slow zero-http subresource bitswap source",
                 },
             )
         );
         assert!(
-            !retriever.maybe_mark_slow_zero_http_subresource_source_peer_with_threshold(
+            !retriever.maybe_mark_slow_zero_http_source_peer_with_threshold(
                 &cid,
-                SlowZeroHttpSubresourceSourcePeer {
+                SlowZeroHttpSourcePeer {
+                    gateway_request: true,
                     gateway_subresource: true,
                     http_provider_count: 0,
                     source_peer: Some(peer),
                     source_trace: &trusted_source,
                     elapsed: Duration::from_millis(900),
                     threshold,
-                },
-            )
-        );
-        assert!(
-            !retriever.maybe_mark_slow_zero_http_subresource_source_peer_with_threshold(
-                &cid,
-                SlowZeroHttpSubresourceSourcePeer {
-                    gateway_subresource: false,
-                    http_provider_count: 0,
-                    source_peer: Some(peer),
-                    source_trace: &untrusted_source,
-                    elapsed: Duration::from_millis(900),
-                    threshold,
+                    trace_phase: "bitswap_slow_zero_http_subresource_source_suppressed",
+                    bad_provider_reason: "slow zero-http subresource bitswap source",
                 },
             )
         );

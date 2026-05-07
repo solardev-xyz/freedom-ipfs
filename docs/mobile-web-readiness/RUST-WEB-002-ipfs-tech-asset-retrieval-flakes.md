@@ -40446,3 +40446,160 @@ source peer `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT` after about
 `1403ms`. The next useful target is still page-scoped source quality and escape
 hatches for slow zero-HTTP `ipfs.tech` root/child Bitswap sources, not another
 direct-IP fallback promotion.
+
+## 2026-05-07: Gateway-Wide Zero-HTTP Slow Source Suppression Lab
+
+Branch/head before change:
+
+- `codex/kubo-session-performance-20260506`
+- `5131fb8`
+
+Hypothesis:
+
+The previous no-env post-control showed a top-level `ipfs.tech` zero-HTTP
+Bitswap root block taking about `1403ms`, followed by slower same-page child
+requests from the same source peer. The existing slow-source suppression lab
+only covered gateway subresources, so it could not mark the slow root source
+before later child requests.
+
+Code change:
+
+- Added disabled-by-default
+  `FREEDOM_IPFS_ENABLE_ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION=1`.
+- Added optional threshold override
+  `FREEDOM_IPFS_ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION_MS=<ms>`.
+- Default threshold is `750ms`.
+- When enabled, both gateway roots and gateway subresources may temporarily
+  suppress an untrusted zero-HTTP Bitswap source peer if the winning source
+  exceeds the threshold.
+- The existing subresource-only lab knob remains available for comparison:
+  `FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION=1`.
+- The new trace phase is
+  `bitswap_slow_zero_http_gateway_source_suppressed`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval source_suppression --lib -- --nocapture
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Results:
+
+- Formatting passed.
+- Focused retrieval tests passed: `6 passed`.
+- Retrieval clippy passed with `-D warnings`.
+
+Default-threshold opt-in command:
+
+```sh
+timeout 2400s env \
+  FREEDOM_IPFS_ENABLE_ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION=1 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --repeat 10 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --case ipfs-tech-page-assets \
+    --trace-output /tmp/zero-http-gateway-slow-source-suppress-ipfs-tech-r10-20260507T225013Z-trace.jsonl \
+    --comparison-output /tmp/zero-http-gateway-slow-source-suppress-ipfs-tech-r10-20260507T225013Z.json
+```
+
+Default-threshold opt-in result:
+
+- Rust/Kubo passed `10/10`.
+- `ipfs.tech` root: Rust `728/1769ms`; Kubo `1601/1986ms`.
+- `ipfs.tech` assets: Rust `188/457ms`; Kubo `148/612ms`.
+- Resource max: Rust `58600KiB` RSS and `31` FDs vs Kubo `202500KiB`
+  RSS and `142` FDs.
+- `meaningful_kubo_wins`: none.
+- Delegated provider lookup had `5` zero-HTTP provider events.
+- Request classifications:
+  `zero_http_provider_bitswap=5`, `top_level_zero_http_provider_bitswap=1`,
+  `cold_bitswap_peer_expand=2`.
+- Bitswap block fetches were already quick: `44` blocks, p50/p95/max
+  `129/241/268ms`.
+- The new suppression trace phase did not appear. The zero-HTTP Bitswap source
+  latencies did not exceed the default `750ms` threshold in this window.
+
+Immediate no-env post-control command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/zero-http-gateway-slow-source-suppress-post-control-ipfs-tech-r10-20260507T225013Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-gateway-slow-source-suppress-post-control-ipfs-tech-r10-20260507T225013Z.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `10/10`.
+- `ipfs.tech` root: Rust `614/1242ms`; Kubo `1413/1917ms`.
+- `ipfs.tech` assets: Rust `194/468ms`; Kubo `110/1050ms`.
+- Resource max: Rust `53376KiB` RSS and `30` FDs vs Kubo `285664KiB`
+  RSS and `239` FDs.
+- `meaningful_kubo_wins`: `2`, both asset p50 TTFB/total.
+- Delegated provider lookup had `0` zero-HTTP provider events. All requests had
+  HTTP providers, so this was not a causal control for the new Bitswap source
+  suppression path.
+- HTTP provider blocks dominated: `399` blocks, p50/p95/max `189/280/499ms`.
+
+Aggressive threshold stress command:
+
+```sh
+timeout 2400s env \
+  FREEDOM_IPFS_ENABLE_ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION=1 \
+  FREEDOM_IPFS_ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION_MS=150 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --repeat 10 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --case ipfs-tech-page-assets \
+    --trace-output /tmp/zero-http-gateway-slow-source-suppress150-ipfs-tech-r10-20260507T225319Z-trace.jsonl \
+    --comparison-output /tmp/zero-http-gateway-slow-source-suppress150-ipfs-tech-r10-20260507T225319Z.json
+```
+
+Aggressive threshold result:
+
+- Rust/Kubo passed `10/10`.
+- `ipfs.tech` root: Rust `540/1400ms`; Kubo `1641/2536ms`.
+- `ipfs.tech` assets: Rust `189/435ms`; Kubo `121/486ms`.
+- Resource max: Rust `53632KiB` RSS and `31` FDs vs Kubo `187332KiB`
+  RSS and `127` FDs.
+- `meaningful_kubo_wins`: `2`, both asset p50 TTFB/total.
+- Delegated provider lookup again had `0` zero-HTTP provider events. The
+  aggressive threshold still did not exercise the new suppression path.
+- HTTP provider blocks dominated: `400` blocks, p50/p95/max `184/262/438ms`.
+
+Decision:
+
+Keep the gateway-wide slow-source suppression as a disabled lab control, but do
+not promote it. It directly covers the previous zero-HTTP root/child failure
+shape and has focused tests, but the live `ipfs.tech` windows after the change
+mostly had HTTP providers, so the new path did not fire and has no causal
+performance evidence yet.
+
+The active `ipfs.tech` gap in the current same-window samples is different:
+Kubo wins some asset medians while Rust still wins root p50/p95, asset p95, and
+RSS/FDs. The post-control traces show `0` zero-HTTP lookups and HTTP provider
+fetch p50 around `189ms`; the next iteration should inspect HTTP-provider asset
+median latency and UnixFS/root metadata timing rather than continuing to tune
+zero-HTTP source suppression in windows where zero-HTTP does not occur.
