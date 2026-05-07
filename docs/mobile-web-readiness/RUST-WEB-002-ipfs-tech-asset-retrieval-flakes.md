@@ -33677,3 +33677,55 @@ Keep. This is a harness/diagnostics improvement only; it changes no retrieval
 behavior. Future performance candidates should be judged with both TTFB and
 total latency so body-delay regressions are visible in the same-window
 Rust-vs-Kubo summary.
+
+## 2026-05-07 Fresh Focused Baseline With Total Metrics
+
+After adding total-latency comparison fields, refresh the focused no-env
+same-window baseline.
+
+Command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-totalmetrics-focused-r10-20260507Tbaseline-trace.jsonl \
+  --comparison-output /tmp/current-totalmetrics-focused-r10-20260507Tbaseline.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10`.
+- `ipfs.tech` page assets:
+  - root TTFB/total p50/p95: Rust `816/1642ms` and `816/1643ms`; Kubo
+    `2020/4415ms` and `2021/4416ms`.
+  - asset TTFB/total p50/p95: Rust `184/396ms` and `184/398ms`; Kubo
+    `142/426ms` and `142/427ms`.
+- `wikipedia-on-ipfs-root`:
+  - root TTFB/total p50/p95: Rust `494/808ms`; Kubo `143/716ms`.
+- Resource max: Rust `49200KiB` RSS and `25` FDs vs Kubo `277920KiB` RSS and
+  `329` FDs.
+- Trace shape: HTTP-provider blocks `296` with p50/p95/max `184/447/965ms`;
+  Bitswap blocks `74` with p50/p95/max `90/552/612ms`; delegated provider
+  lookup p50/p95/max `20/57/447ms`.
+- Request classifications: `zero_http_provider_bitswap=17`,
+  `cold_bitswap_peer_expand=10`, `top_level_zero_http_provider_bitswap=7`.
+  Top-level zero-HTTP Bitswap latency was p50/p95/max `662/806/806ms`.
+
+Interpretation:
+
+The harness now confirms that TTFB and total latency are effectively the same
+for these current guardrail paths, so the remaining gap is not hidden body
+streaming. Rust is still much faster for `ipfs.tech` root startup and much
+lighter on resources. The live gaps in this window are `ipfs.tech` asset median
+and Wikipedia root p50/p95. The Wikipedia gap continues to look like top-level
+zero-HTTP provider Bitswap/source selection rather than HTTP-provider body
+streaming.
