@@ -27129,3 +27129,72 @@ providers, regressing asset p50/p95, root p95, run p95, RSS, and FDs. The
 remaining policy work should not be a static midpoint. It needs a selective gate
 based on source confidence, recent peer quality, request type, or provider
 score.
+
+## 2026-05-07 Current-Head Multi-Case Guardrail
+
+Purpose:
+After rejecting naive HTML prefetch and static `50ms` multi-HTTP grace, rerun a
+broader no-env guardrail from current head to make sure the branch still wins
+outside a single focused `ipfs.tech` window.
+
+Command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-multicase-r5-20260507T004513Z-trace.jsonl \
+  --comparison-output /tmp/current-head-multicase-r5-20260507T004513Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Result:
+
+- Rust and Kubo both passed `5/5`.
+- Overall run total p50/p95:
+  - Rust: `3622/3794ms`
+  - Kubo: `7431/9866ms`
+- Resource max:
+  - Rust: `55776KiB` RSS, `33` FDs
+  - Kubo: `181056KiB` RSS, `202` FDs
+
+Per-case:
+
+- `daicowtf-page-assets` root TTFB p50/p95:
+  - Rust: `1183/1432ms`
+  - Kubo: `2470/4451ms`
+- `vitalik-root-html-range` root/range TTFB p50/p95:
+  - Rust: `102/307ms`
+  - Kubo: `1691/2503ms`
+- `ipfs-tech-page-assets` root TTFB p50/p95:
+  - Rust: `742/1075ms`
+  - Kubo: `1283/1506ms`
+- `ipfs-tech-page-assets` asset TTFB p50/p95/max:
+  - Rust: `230/486/678ms`
+  - Kubo: `369/762/833ms`
+
+Trace findings:
+
+- `block_fetch_total`: `224`
+- `http_provider_fetch`: `174`
+- `bitswap_fetch`: `6`
+- `bitswap_dial_plan`: `122`
+- `bitswap_peer_attempt_start`: `152`
+- `gateway_html_prefetch_schedule`: `0`, confirming the lab control is inert
+  by default.
+
+Decision:
+Keep the current defaults. The branch now wins this broader r5 guardrail while
+using a fraction of Kubo RSS/FDs. Future work should be very selective: the main
+remaining opportunity is focused-window `ipfs.tech` asset p50 when Kubo has a
+favorable public-network sample, not broad page-load behavior.
