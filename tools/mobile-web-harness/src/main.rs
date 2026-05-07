@@ -1430,6 +1430,27 @@ fn print_summary(report: &RunReport) {
                     session.session_shortcut_post_lookup_single_http_timeout_elapsed_ms
                 );
             }
+            if session.session_shortcut_post_lookup_races > 0 {
+                println!(
+                    "    post-lookup race: events={} provider_wins={} bitswap_wins={} errors={} provider_bitswap_wins={} single_http_provider_bitswap_wins={} elapsed={} provider_result_elapsed={} single_http_provider_bitswap_elapsed={} outcomes={} sources={} http_counts={}",
+                    session.session_shortcut_post_lookup_races,
+                    session.session_shortcut_post_lookup_race_provider_wins,
+                    session.session_shortcut_post_lookup_race_bitswap_wins,
+                    session.session_shortcut_post_lookup_race_errors,
+                    session.session_shortcut_post_lookup_race_provider_bitswap_wins,
+                    session
+                        .session_shortcut_post_lookup_race_single_http_provider_bitswap_wins,
+                    session.session_shortcut_post_lookup_race_elapsed_ms,
+                    session.session_shortcut_post_lookup_race_provider_result_elapsed_ms,
+                    session
+                        .session_shortcut_post_lookup_race_single_http_provider_bitswap_elapsed_ms,
+                    format_trace_counts(&session.session_shortcut_post_lookup_race_outcomes),
+                    format_trace_counts(&session.session_shortcut_post_lookup_race_sources),
+                    format_trace_counts(
+                        &session.session_shortcut_post_lookup_race_http_provider_counts
+                    )
+                );
+            }
             if session.session_late_peer_waits > 0 {
                 println!(
                     "    late-peer latency: elapsed={} hits={} misses={}",
@@ -1901,6 +1922,23 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
                 session.session_shortcut_post_lookup_single_http_elapsed_ms,
                 session.session_shortcut_post_lookup_single_http_hit_elapsed_ms,
                 session.session_shortcut_post_lookup_single_http_timeout_elapsed_ms
+            );
+        }
+        if session.session_shortcut_post_lookup_races > 0 {
+            println!(
+                "    post-lookup race: events={} provider_wins={} bitswap_wins={} errors={} provider_bitswap_wins={} single_http_provider_bitswap_wins={} elapsed={} provider_result_elapsed={} single_http_provider_bitswap_elapsed={} outcomes={} sources={} http_counts={}",
+                session.session_shortcut_post_lookup_races,
+                session.session_shortcut_post_lookup_race_provider_wins,
+                session.session_shortcut_post_lookup_race_bitswap_wins,
+                session.session_shortcut_post_lookup_race_errors,
+                session.session_shortcut_post_lookup_race_provider_bitswap_wins,
+                session.session_shortcut_post_lookup_race_single_http_provider_bitswap_wins,
+                session.session_shortcut_post_lookup_race_elapsed_ms,
+                session.session_shortcut_post_lookup_race_provider_result_elapsed_ms,
+                session.session_shortcut_post_lookup_race_single_http_provider_bitswap_elapsed_ms,
+                format_trace_counts(&session.session_shortcut_post_lookup_race_outcomes),
+                format_trace_counts(&session.session_shortcut_post_lookup_race_sources),
+                format_trace_counts(&session.session_shortcut_post_lookup_race_http_provider_counts)
             );
         }
         if session.session_late_peer_waits > 0 {
@@ -6799,6 +6837,18 @@ struct TraceBitswapSessionAggregate {
     session_shortcut_post_lookup_budgets: BTreeMap<String, usize>,
     session_shortcut_post_lookup_timeout_budgets: BTreeMap<String, usize>,
     session_shortcut_post_lookup_http_provider_counts: BTreeMap<String, usize>,
+    session_shortcut_post_lookup_races: usize,
+    session_shortcut_post_lookup_race_provider_wins: usize,
+    session_shortcut_post_lookup_race_bitswap_wins: usize,
+    session_shortcut_post_lookup_race_errors: usize,
+    session_shortcut_post_lookup_race_provider_bitswap_wins: usize,
+    session_shortcut_post_lookup_race_single_http_provider_bitswap_wins: usize,
+    session_shortcut_post_lookup_race_elapsed_ms: LatencySummary,
+    session_shortcut_post_lookup_race_provider_result_elapsed_ms: LatencySummary,
+    session_shortcut_post_lookup_race_single_http_provider_bitswap_elapsed_ms: LatencySummary,
+    session_shortcut_post_lookup_race_outcomes: Vec<TraceValueCount>,
+    session_shortcut_post_lookup_race_sources: Vec<TraceValueCount>,
+    session_shortcut_post_lookup_race_http_provider_counts: Vec<TraceValueCount>,
     session_shortcut_attempts: usize,
     session_shortcut_hits: usize,
     session_shortcut_misses: usize,
@@ -6830,6 +6880,18 @@ struct TraceBitswapSessionAggregate {
     #[serde(skip)]
     session_shortcut_post_lookup_single_http_timeout_elapsed_values: Vec<u128>,
     #[serde(skip)]
+    session_shortcut_post_lookup_race_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    session_shortcut_post_lookup_race_provider_result_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    session_shortcut_post_lookup_race_single_http_provider_bitswap_elapsed_values: Vec<u128>,
+    #[serde(skip)]
+    session_shortcut_post_lookup_race_outcome_counts: BTreeMap<String, usize>,
+    #[serde(skip)]
+    session_shortcut_post_lookup_race_source_counts: BTreeMap<String, usize>,
+    #[serde(skip)]
+    session_shortcut_post_lookup_race_http_provider_count_counts: BTreeMap<String, usize>,
+    #[serde(skip)]
     session_late_peer_elapsed_values: Vec<u128>,
     #[serde(skip)]
     session_late_peer_hit_elapsed_values: Vec<u128>,
@@ -6843,6 +6905,7 @@ impl TraceBitswapSessionAggregate {
             || self.session_shortcut_starts > 0
             || self.session_shortcut_pre_lookup_waits > 0
             || self.session_shortcut_post_lookup_waits > 0
+            || self.session_shortcut_post_lookup_races > 0
             || self.session_shortcut_attempts > 0
             || self.session_late_peer_waits > 0
     }
@@ -6879,6 +6942,27 @@ impl TraceBitswapSessionAggregate {
             LatencySummary::from_values(std::mem::take(
                 &mut self.session_shortcut_post_lookup_single_http_timeout_elapsed_values,
             ));
+        self.session_shortcut_post_lookup_race_elapsed_ms = LatencySummary::from_values(
+            std::mem::take(&mut self.session_shortcut_post_lookup_race_elapsed_values),
+        );
+        self.session_shortcut_post_lookup_race_provider_result_elapsed_ms =
+            LatencySummary::from_values(std::mem::take(
+                &mut self.session_shortcut_post_lookup_race_provider_result_elapsed_values,
+            ));
+        self.session_shortcut_post_lookup_race_single_http_provider_bitswap_elapsed_ms =
+            LatencySummary::from_values(std::mem::take(
+                &mut self
+                    .session_shortcut_post_lookup_race_single_http_provider_bitswap_elapsed_values,
+            ));
+        self.session_shortcut_post_lookup_race_outcomes = sorted_trace_counts(std::mem::take(
+            &mut self.session_shortcut_post_lookup_race_outcome_counts,
+        ));
+        self.session_shortcut_post_lookup_race_sources = sorted_trace_counts(std::mem::take(
+            &mut self.session_shortcut_post_lookup_race_source_counts,
+        ));
+        self.session_shortcut_post_lookup_race_http_provider_counts = sorted_trace_counts(
+            std::mem::take(&mut self.session_shortcut_post_lookup_race_http_provider_count_counts),
+        );
         self.session_late_peer_elapsed_ms =
             LatencySummary::from_values(std::mem::take(&mut self.session_late_peer_elapsed_values));
         self.session_late_peer_hit_elapsed_ms = LatencySummary::from_values(std::mem::take(
@@ -8165,6 +8249,71 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                             }
                         }
                         _ => {}
+                    }
+                }
+            }
+        }
+        if phase == "bitswap_session_shortcut_post_lookup_race" {
+            bitswap_session.session_shortcut_post_lookup_races += 1;
+            let elapsed_ms = value.get("elapsed_ms").and_then(json_u128);
+            if let Some(elapsed_ms) = elapsed_ms {
+                bitswap_session
+                    .session_shortcut_post_lookup_race_elapsed_values
+                    .push(elapsed_ms);
+            }
+            let provider_result_elapsed_ms =
+                value.get("provider_result_elapsed_ms").and_then(json_u128);
+            if let Some(elapsed_ms) = provider_result_elapsed_ms {
+                bitswap_session
+                    .session_shortcut_post_lookup_race_provider_result_elapsed_values
+                    .push(elapsed_ms);
+            }
+            let outcome = value
+                .get("outcome")
+                .and_then(|outcome| outcome.as_str())
+                .unwrap_or("unknown");
+            *bitswap_session
+                .session_shortcut_post_lookup_race_outcome_counts
+                .entry(outcome.to_string())
+                .or_default() += 1;
+            if outcome.starts_with("provider_") {
+                if outcome.contains("error") {
+                    bitswap_session.session_shortcut_post_lookup_race_errors += 1;
+                } else {
+                    bitswap_session.session_shortcut_post_lookup_race_provider_wins += 1;
+                }
+            } else if outcome.starts_with("bitswap_won") {
+                bitswap_session.session_shortcut_post_lookup_race_bitswap_wins += 1;
+            } else if outcome.contains("error") {
+                bitswap_session.session_shortcut_post_lookup_race_errors += 1;
+            }
+
+            let source = value
+                .get("source")
+                .and_then(|source| source.as_str())
+                .unwrap_or("unknown");
+            *bitswap_session
+                .session_shortcut_post_lookup_race_source_counts
+                .entry(source.to_string())
+                .or_default() += 1;
+
+            let http_provider_count = value.get("http_provider_count").and_then(json_u128);
+            if let Some(http_provider_count) = http_provider_count {
+                *bitswap_session
+                    .session_shortcut_post_lookup_race_http_provider_count_counts
+                    .entry(http_provider_count.to_string())
+                    .or_default() += 1;
+            }
+
+            if outcome.starts_with("provider_") && source == "bitswap" {
+                bitswap_session.session_shortcut_post_lookup_race_provider_bitswap_wins += 1;
+                if http_provider_count == Some(1) {
+                    bitswap_session
+                        .session_shortcut_post_lookup_race_single_http_provider_bitswap_wins += 1;
+                    if let Some(elapsed_ms) = elapsed_ms {
+                        bitswap_session
+                            .session_shortcut_post_lookup_race_single_http_provider_bitswap_elapsed_values
+                            .push(elapsed_ms);
                     }
                 }
             }
@@ -13272,6 +13421,119 @@ mod tests {
                 .session_shortcut_post_lookup_http_provider_counts
                 .get("3"),
             Some(&1)
+        );
+        assert_eq!(
+            trace_value_count(&summary.progress_phases, "fetching_bitswap"),
+            4
+        );
+    }
+
+    #[test]
+    fn trace_summary_counts_post_lookup_race_outcomes() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-post-lookup-race-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"bitswap_session_shortcut_post_lookup_race\",\"cid\":\"cid-a\",\"outcome\":\"provider_won\",\"source\":\"bitswap\",\"timeout_ms\":125,\"elapsed_ms\":460,\"provider_result_elapsed_ms\":460,\"provider_count\":64,\"http_provider_count\":1}\n",
+                "{\"phase\":\"bitswap_session_shortcut_post_lookup_race\",\"cid\":\"cid-b\",\"outcome\":\"provider_won\",\"source\":\"http_provider\",\"timeout_ms\":125,\"elapsed_ms\":120,\"provider_result_elapsed_ms\":120,\"provider_count\":12,\"http_provider_count\":2}\n",
+                "{\"phase\":\"bitswap_session_shortcut_post_lookup_race\",\"cid\":\"cid-c\",\"outcome\":\"bitswap_won\",\"timeout_ms\":100,\"elapsed_ms\":80,\"provider_count\":8,\"http_provider_count\":0}\n",
+                "{\"phase\":\"bitswap_session_shortcut_post_lookup_race\",\"cid\":\"cid-d\",\"outcome\":\"provider_error\",\"timeout_ms\":125,\"elapsed_ms\":333,\"provider_count\":64,\"http_provider_count\":1}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            summary.bitswap_session.session_shortcut_post_lookup_races,
+            4
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_race_provider_wins,
+            2
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_race_bitswap_wins,
+            1
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_race_errors,
+            1
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_race_provider_bitswap_wins,
+            1
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_race_single_http_provider_bitswap_wins,
+            1
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_race_elapsed_ms
+                .p50_ms,
+            Some(120)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_race_provider_result_elapsed_ms
+                .p95_ms,
+            Some(460)
+        );
+        assert_eq!(
+            summary
+                .bitswap_session
+                .session_shortcut_post_lookup_race_single_http_provider_bitswap_elapsed_ms
+                .p50_ms,
+            Some(460)
+        );
+        assert_eq!(
+            trace_value_count(
+                &summary
+                    .bitswap_session
+                    .session_shortcut_post_lookup_race_outcomes,
+                "provider_won"
+            ),
+            2
+        );
+        assert_eq!(
+            trace_value_count(
+                &summary
+                    .bitswap_session
+                    .session_shortcut_post_lookup_race_sources,
+                "bitswap"
+            ),
+            1
+        );
+        assert_eq!(
+            trace_value_count(
+                &summary
+                    .bitswap_session
+                    .session_shortcut_post_lookup_race_http_provider_counts,
+                "1"
+            ),
+            2
         );
         assert_eq!(
             trace_value_count(&summary.progress_phases, "fetching_bitswap"),

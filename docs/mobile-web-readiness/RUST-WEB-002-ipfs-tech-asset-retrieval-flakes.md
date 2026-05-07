@@ -37882,3 +37882,139 @@ the `1000ms` timer forced client resets and converted all fired requests into
 roughly `1.2s` fresh-client retry paths. That is too blunt for default mobile
 behavior. Future work should require a stronger no-progress or stale-connected
 session-peer signal before resetting, instead of using a fixed elapsed timer.
+
+### Current Fresh Compact Baseline And Post-Lookup Race Diagnostics
+
+Purpose:
+
+Re-establish the current branch's Rust-vs-Kubo baseline after reverting the
+mixed-stall retry lab and then add a diagnostics-only harness summary for the
+post-lookup race path. The new summary is meant to distinguish:
+
+- direct post-lookup Bitswap wins
+- provider-branch wins from HTTP providers
+- provider-branch wins whose source is actually Bitswap after HTTP provider
+  failure
+- the single-HTTP provider variant of that provider-branch Bitswap path
+
+Fresh compact command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-page-assets-cid-direct \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/current-fresh-compact-20260507T192416Z-trace.jsonl \
+  --comparison-output /tmp/current-fresh-compact-20260507T192416Z.json
+```
+
+Fresh compact result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `284/384ms`; Kubo `1259/1284ms`.
+- Vitalik range: Rust `102/108ms`; Kubo `2814/4000ms`.
+- `ipfs.tech` page root: Rust `707/859ms`; Kubo `1367/11240ms`.
+- `ipfs.tech` page assets: Rust `199/466ms`; Kubo `375/784ms`.
+- Wikipedia root: Rust `830/909ms`; Kubo `705/1279ms`.
+- Resource max: Rust `60212KiB` RSS and `39` FDs vs Kubo `342136KiB`
+  RSS and `677` FDs.
+- `meaningful_kubo_wins` flagged only Wikipedia root median:
+  Rust `830ms` vs Kubo `705ms`.
+
+Fresh compact trace finding:
+
+- HTTP-provider blocks: `225`, p50/p90/p95/max `189/260/326/565ms`.
+- Bitswap blocks: `10`, p50/p90/p95/max `374/511/603/603ms`.
+- Delegated provider lookup distribution: zero HTTP `5`, single HTTP `120`,
+  multi HTTP `85`.
+- No `bitswap_request_timeout_detail` events occurred.
+- The active Kubo win was again the Wikipedia follow-on `/index.html` block:
+  `f010479.twinquasar.io` returned HTTP `500` twice, then normal Bitswap
+  provider expansion/fetch delivered. In this sample the single-provider HTTP
+  failure cost only about `80-90ms`; the larger cost was subsequent Bitswap
+  DNS/provider expansion and connection/fetch time.
+
+Diagnostics change:
+
+- Added harness aggregation for `bitswap_session_shortcut_post_lookup_race`.
+- The printed and JSON summary now reports:
+  - race event count
+  - provider wins
+  - direct Bitswap wins
+  - errors
+  - provider-branch wins where `source=bitswap`
+  - single-HTTP provider-branch Bitswap wins
+  - race elapsed summaries
+  - provider-result elapsed summaries
+  - outcome/source/http-count distributions
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Validation result:
+
+- Formatting passed.
+- Harness tests passed: `55` passed.
+- Harness clippy passed with `-D warnings`.
+
+Focused live command after the diagnostics change:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/postlookup-race-summary-focused-20260507T193045Z-trace.jsonl \
+  --comparison-output /tmp/postlookup-race-summary-focused-20260507T193045Z.json
+```
+
+Focused live result:
+
+- Rust and Kubo passed `5/5` for both cases.
+- `ipfs.tech` page root: Rust `911/1524ms`; Kubo `2244/2887ms`.
+- `ipfs.tech` page assets: Rust `188/560ms`; Kubo `219/831ms`.
+- Wikipedia root: Rust `319/404ms`; Kubo `340/717ms`.
+- Resource max: Rust `57992KiB` RSS and `35` FDs vs Kubo `324292KiB`
+  RSS and `529` FDs.
+- `meaningful_kubo_wins`: none.
+
+Focused trace finding:
+
+- Post-lookup race summary:
+  - events `68`
+  - provider wins `44`
+  - direct Bitswap wins `24`
+  - errors `0`
+  - provider-branch Bitswap wins `0`
+  - single-HTTP provider-branch Bitswap wins `0`
+  - outcomes `provider_won=44, bitswap_won=24`
+  - sources `http_provider=44, unknown=24`
+  - HTTP-count distribution `1=33, 3=31, 2=4`
+- The earlier Wikipedia `f010479` failure reproduced as HTTP `500` events, but
+  not as a meaningful Kubo win in this window.
+- The slowest Rust requests were `ipfs.tech` root/asset paths, while Rust still
+  beat Kubo on both `ipfs.tech` root/assets and Wikipedia root.
+
+Decision:
+
+Keep the harness diagnostics. Do not promote or reintroduce a retrieval
+behavior change from this window: the current focused same-window run has no
+meaningful Kubo wins, and the diagnostic shows the provider-branch Bitswap
+variant did not fire. The next behavior experiment should wait for a fresh
+same-window trace where either `single_http_provider_bitswap_wins` reappears
+with a Kubo loss, or a different recurring Kubo win becomes visible in
+`meaningful_kubo_wins`.
