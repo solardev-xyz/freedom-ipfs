@@ -26730,3 +26730,62 @@ Do not promote multi-HTTP grace `0ms`. It reduces some wait and connection
 churn, but the focused p95 regression is worse than the multi-race result and
 it lost to Kubo in that same-window asset p50/p95. Keep the env override as a
 disabled lab control for future selective heuristics.
+
+## 2026-05-07 Reject: Multi-HTTP Race Plus 300ms Successful-Peer Cap
+
+Hypothesis:
+The multi-HTTP race improved medians but had mixed p95/resource results in the
+multi-case r10. Maybe the bad tail/resource cases come from keeping slow recent
+Bitswap peers in the session shortcut set. Combine the multi-HTTP race with the
+existing successful-peer cap and only record recent Bitswap peers whose previous
+success latency is at most `300ms`.
+
+Command:
+
+```sh
+FREEDOM_IPFS_ENABLE_MULTI_HTTP_POST_LOOKUP_RACE=1 \
+FREEDOM_IPFS_BITSWAP_SUCCESSFUL_PEER_MAX_LATENCY_MS=300 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/multi-http-race-peermax300-ipfs-tech-r10-20260507T000643Z-trace.jsonl \
+  --comparison-output /tmp/multi-http-race-peermax300-ipfs-tech-r10-20260507T000643Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/multi-http-race-peermax300-ipfs-tech-r10-20260507T000643Z.log 2>&1
+```
+
+Result:
+
+- Rust and Kubo passed `10/10`.
+- `ipfs.tech` root TTFB p50/p95:
+  - `0ms` default control: `600/898ms`
+  - multi-HTTP race: `591/796ms`
+  - race plus `300ms` peer cap: `751/1466ms`
+- `ipfs.tech` asset TTFB p50/p95:
+  - `0ms` default control: `201/461ms`
+  - multi-HTTP race: `182/421ms`
+  - race plus `300ms` peer cap: `223/590ms`
+  - Kubo same-window: `191/1114ms`
+- Resource max:
+  - race plus `300ms` peer cap: `54364KiB` RSS, `31` FDs
+- Trace shift versus multi-HTTP race:
+  - post-lookup races: `326 -> 87`
+  - Bitswap dial plans: `340 -> 102`
+  - Bitswap connections: `20 -> 25`
+  - successful peer skips: only `1` at `311ms`
+
+Decision:
+Reject this combination. The cap removes too many useful recent-peer shortcut
+opportunities and regresses both root and asset latency. The trace also shows
+only one actual successful-peer skip, so the regression is mostly from losing
+session continuity rather than filtering many bad peers. Future selective work
+should gate the race itself using provider/source confidence, not globally cap
+successful peer recording at `300ms`.
