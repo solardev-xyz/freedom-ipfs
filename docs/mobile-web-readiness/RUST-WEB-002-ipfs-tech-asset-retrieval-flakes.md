@@ -38533,3 +38533,113 @@ already rejected earlier. The next promising line is source-quality feedback:
 identify slow direct candidate-0 sources quickly enough to hedge, retry, or
 deprioritize them without turning every zero-HTTP child request into broad
 desktop-style fanout.
+
+### Zero-HTTP Slow Source Suppression Lab Control
+
+Purpose:
+
+Test a narrower source-quality feedback loop than blind peer rotation: when an
+untrusted zero-HTTP gateway subresource Bitswap source is slow, mark that source
+peer as temporarily bad so later requests can avoid immediately reusing it.
+
+Code change:
+
+- Added disabled-by-default
+  `FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION=1`.
+- Added optional threshold override
+  `FREEDOM_IPFS_ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION_MS=<ms>`.
+- The default threshold is `750ms`.
+- When enabled, only gateway subresource Bitswap successes with zero HTTP
+  providers can suppress a source peer, and only if the source was an untrusted
+  candidate and elapsed above the threshold.
+- Suppression uses the existing bad-provider TTL path with the normal
+  `30s` bad Bitswap provider TTL.
+- The trace emits
+  `bitswap_slow_zero_http_subresource_source_suppressed` when the lab control
+  fires.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval source_suppression --lib
+```
+
+The focused tests passed after renaming the temporary-suppression test so this
+filter covers the opt-in parser, positive suppression case, and guardrails for
+fast/trusted/HTTP-backed requests.
+
+Opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION=1 \
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/zero-http-slow-source-suppress-r10-20260507Tnext-trace.jsonl \
+  --comparison-output /tmp/zero-http-slow-source-suppress-r10-20260507Tnext.json
+```
+
+Opt-in result:
+
+- Rust/Kubo passed `10/10`.
+- Root: Rust `560/1525ms`; Kubo `2318/4479ms`.
+- Assets: Rust `196/512ms`; Kubo `182/608ms`.
+- Resource max: Rust `53984KiB` RSS and `30` FDs vs Kubo `359596KiB`
+  RSS and `1162` FDs.
+- `meaningful_kubo_wins`: none.
+- Only one zero-HTTP child classification appeared:
+  `cold_bitswap_peer_expand=1`,
+  `zero_http_provider_bitswap=1`,
+  `zero_http_provider_cold_bitswap=1`.
+- That request was `/ipns/ipfs.tech/_nuxt/hfYlCurB.js`, elapsed `1045ms`,
+  and came from candidate index `3`, request mode `want_have`, source peer
+  `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT`.
+- The trace showed one `bitswap_want_have_probe` timeout/fallback at `752ms`,
+  followed by a successful Bitswap fetch in `974ms` and one
+  `bitswap_slow_zero_http_subresource_source_suppressed` event.
+
+Post-control command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/zero-http-slow-source-suppress-post-control-r5-20260507Tnext-trace.jsonl \
+  --comparison-output /tmp/zero-http-slow-source-suppress-post-control-r5-20260507Tnext.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `5/5`.
+- Root: Rust `704/817ms`; Kubo `2547/11910ms`.
+- Assets: Rust `198/485ms`; Kubo `318/834ms`.
+- Resource max: Rust `51968KiB` RSS and `30` FDs vs Kubo `347168KiB`
+  RSS and `717` FDs.
+- `meaningful_kubo_wins`: none.
+- The control had no zero-HTTP provider requests:
+  delegated provider lookup `http_zero=0`, `http_single=105`,
+  `http_multi=70`.
+- HTTP-provider blocks dominated: `200` blocks, p50/p90/p95/max
+  `199/263/411/552ms`. No classified zero-HTTP child Bitswap tail appeared in
+  this network window.
+
+Decision:
+
+Do not promote slow-source suppression to default. The opt-in run proved the
+event fires on the intended slow zero-HTTP/WANT_HAVE shape, but it fired only
+once, so it did not prove a repeated-request benefit. The immediate no-env
+post-control had no zero-HTTP child requests and no meaningful Kubo wins,
+which makes this experiment inconclusive as an optimization.
+
+Keep the behavior disabled as a lab control for targeted future session tests.
+The next useful version should use a harness/corpus that reliably produces
+multiple zero-HTTP child Bitswap requests in one long-lived gateway process, or
+should combine this signal with an immediate hedge/retry path instead of only
+affecting future provider selection.

@@ -95,6 +95,11 @@ const BITSWAP_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const BITSWAP_SUCCESSFUL_PEER_TTL: Duration = Duration::from_secs(10 * 60);
 const BITSWAP_SUCCESSFUL_PEER_MAX_LATENCY_MS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_SUCCESSFUL_PEER_MAX_LATENCY_MS";
+const ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION: Duration = Duration::from_millis(750);
+const ENABLE_ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION";
+const ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION_MS_ENV: &str =
+    "FREEDOM_IPFS_ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION_MS";
 const BITSWAP_CONNECTION_ERROR_BACKOFF_TTL: Duration = Duration::from_secs(30);
 const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD: usize = 2;
 const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD_ENV: &str =
@@ -3708,6 +3713,14 @@ impl HttpRetriever {
             elapsed_ms = elapsed.as_millis()
         );
         if let Some(peer) = source_peer {
+            self.maybe_mark_slow_zero_http_subresource_source_peer(
+                cid,
+                providers,
+                gateway_subresource,
+                source_peer,
+                &source_trace,
+                elapsed,
+            );
             self.record_successful_bitswap_peer_from_fetch_source(
                 peer,
                 &peers_for_record,
@@ -3752,6 +3765,78 @@ impl HttpRetriever {
                 BAD_BITSWAP_PROVIDER_TTL,
             );
         }
+    }
+
+    fn maybe_mark_slow_zero_http_subresource_source_peer(
+        &self,
+        cid: &Cid,
+        providers: &[Provider],
+        gateway_subresource: bool,
+        source_peer: Option<PeerId>,
+        source_trace: &BitswapSourcePeerTrace,
+        elapsed: Duration,
+    ) -> bool {
+        if !gateway_subresource
+            || source_peer.is_none()
+            || source_trace.skip_want_have
+            || source_trace.candidate_index.is_none()
+        {
+            return false;
+        }
+        let Some(threshold) = zero_http_subresource_slow_source_suppression_threshold() else {
+            return false;
+        };
+        self.maybe_mark_slow_zero_http_subresource_source_peer_with_threshold(
+            cid,
+            gateway_subresource,
+            provider_http_url_count(providers),
+            source_peer,
+            source_trace,
+            elapsed,
+            threshold,
+        )
+    }
+
+    fn maybe_mark_slow_zero_http_subresource_source_peer_with_threshold(
+        &self,
+        cid: &Cid,
+        gateway_subresource: bool,
+        http_provider_count: usize,
+        source_peer: Option<PeerId>,
+        source_trace: &BitswapSourcePeerTrace,
+        elapsed: Duration,
+        threshold: Duration,
+    ) -> bool {
+        let Some(peer) = source_peer else {
+            return false;
+        };
+        if !gateway_subresource
+            || http_provider_count != 0
+            || elapsed <= threshold
+            || source_trace.skip_want_have
+            || source_trace.candidate_index.is_none()
+        {
+            return false;
+        }
+        tracing::info!(
+            phase = "bitswap_slow_zero_http_subresource_source_suppressed",
+            cid = %cid,
+            peer = %peer,
+            latency_ms = elapsed.as_millis(),
+            threshold_ms = threshold.as_millis(),
+            source_peer_candidate_index = source_trace
+                .candidate_index
+                .map(|index| index as i64)
+                .unwrap_or(-1),
+            source_peer_request_mode = source_trace.request_mode,
+            ttl_secs = BAD_BITSWAP_PROVIDER_TTL.as_secs()
+        );
+        let _ = self.store.mark_bad_provider(
+            &peer.to_string(),
+            "slow zero-http subresource bitswap source",
+            BAD_BITSWAP_PROVIDER_TTL,
+        );
+        true
     }
 
     async fn shared_bitswap_client(&self) -> Result<SharedBitswapClient> {
@@ -5580,6 +5665,31 @@ fn bitswap_successful_peer_max_latency() -> Option<Duration> {
     std::env::var_os(BITSWAP_SUCCESSFUL_PEER_MAX_LATENCY_MS_ENV)
         .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
         .map(Duration::from_millis)
+}
+
+fn zero_http_subresource_slow_source_suppression_threshold() -> Option<Duration> {
+    zero_http_subresource_slow_source_suppression_threshold_from_values(
+        std::env::var_os(ENABLE_ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION_ENV).is_some(),
+        std::env::var_os(ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION_MS_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn zero_http_subresource_slow_source_suppression_threshold_from_values(
+    enabled: bool,
+    override_value: Option<&str>,
+) -> Option<Duration> {
+    if !enabled {
+        return None;
+    }
+    Some(
+        override_value
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION),
+    )
 }
 
 fn single_http_provider_bitswap_hedge_min_score() -> Option<Duration> {
@@ -13700,6 +13810,132 @@ mod bitswap_tests {
 
         assert!(!store.is_bad_provider(&first.to_string()).unwrap());
         assert!(!store.is_bad_provider(&second.to_string()).unwrap());
+    }
+
+    #[test]
+    fn zero_http_subresource_slow_source_suppression_threshold_is_opt_in() {
+        assert_eq!(
+            zero_http_subresource_slow_source_suppression_threshold_from_values(false, None),
+            None
+        );
+        assert_eq!(
+            zero_http_subresource_slow_source_suppression_threshold_from_values(true, None),
+            Some(ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION)
+        );
+        assert_eq!(
+            zero_http_subresource_slow_source_suppression_threshold_from_values(true, Some("500")),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            zero_http_subresource_slow_source_suppression_threshold_from_values(true, Some("0")),
+            Some(ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION)
+        );
+        assert_eq!(
+            zero_http_subresource_slow_source_suppression_threshold_from_values(true, Some("bad")),
+            Some(ZERO_HTTP_SUBRESOURCE_SLOW_SOURCE_SUPPRESSION)
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_zero_http_subresource_source_suppression_can_be_temporarily_suppressed() {
+        let peer = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let cid = "bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u"
+            .parse::<Cid>()
+            .unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let source_trace = BitswapSourcePeerTrace {
+            candidate_index: Some(0),
+            request_mode: "want_block",
+            ..BitswapSourcePeerTrace::default()
+        };
+
+        let marked = retriever.maybe_mark_slow_zero_http_subresource_source_peer_with_threshold(
+            &cid,
+            true,
+            0,
+            Some(peer),
+            &source_trace,
+            Duration::from_millis(900),
+            Duration::from_millis(750),
+        );
+
+        assert!(marked);
+        assert!(store.is_bad_provider(&peer.to_string()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn slow_source_suppression_ignores_fast_trusted_or_http_sources() {
+        let peer = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let cid = "bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u"
+            .parse::<Cid>()
+            .unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let untrusted_source = BitswapSourcePeerTrace {
+            candidate_index: Some(0),
+            request_mode: "want_block",
+            ..BitswapSourcePeerTrace::default()
+        };
+        let trusted_source = BitswapSourcePeerTrace {
+            candidate_index: Some(0),
+            request_mode: "want_block",
+            skip_want_have: true,
+            ..BitswapSourcePeerTrace::default()
+        };
+        let threshold = Duration::from_millis(750);
+
+        assert!(
+            !retriever.maybe_mark_slow_zero_http_subresource_source_peer_with_threshold(
+                &cid,
+                true,
+                0,
+                Some(peer),
+                &untrusted_source,
+                Duration::from_millis(700),
+                threshold,
+            )
+        );
+        assert!(
+            !retriever.maybe_mark_slow_zero_http_subresource_source_peer_with_threshold(
+                &cid,
+                true,
+                1,
+                Some(peer),
+                &untrusted_source,
+                Duration::from_millis(900),
+                threshold,
+            )
+        );
+        assert!(
+            !retriever.maybe_mark_slow_zero_http_subresource_source_peer_with_threshold(
+                &cid,
+                true,
+                0,
+                Some(peer),
+                &trusted_source,
+                Duration::from_millis(900),
+                threshold,
+            )
+        );
+        assert!(
+            !retriever.maybe_mark_slow_zero_http_subresource_source_peer_with_threshold(
+                &cid,
+                false,
+                0,
+                Some(peer),
+                &untrusted_source,
+                Duration::from_millis(900),
+                threshold,
+            )
+        );
+        assert!(!store.is_bad_provider(&peer.to_string()).unwrap());
     }
 
     #[test]
