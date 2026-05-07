@@ -3177,12 +3177,20 @@ impl HttpRetriever {
         let trusted_want_have_probe_count =
             maybe_force_trusted_bitswap_want_have_probes(&mut peers);
         let peer_count = peers.len();
+        let peer_quality = self.bitswap_session_peer_quality(&peers).await;
         tracing::info!(
             phase = "bitswap_session_shortcut_start",
             cid = %cid,
             peer_count,
             trusted_peer_count = peer_count,
             trusted_want_have_probe_count,
+            session_peer_scored_count = peer_quality.scored_count,
+            session_peer_success_count_min = peer_quality.success_count_min,
+            session_peer_success_count_max = peer_quality.success_count_max,
+            session_peer_latency_ms_min = peer_quality.latency_ms_min,
+            session_peer_latency_ms_max = peer_quality.latency_ms_max,
+            session_peer_seen_age_ms_min = peer_quality.seen_age_ms_min,
+            session_peer_seen_age_ms_max = peer_quality.seen_age_ms_max,
             trusted_direct_want_block_limit = bitswap_trusted_direct_want_block_peers()
                 .map(|limit| limit as i64)
                 .unwrap_or(-1)
@@ -3278,6 +3286,14 @@ impl HttpRetriever {
             .await;
         }
         self.store_bitswap_result(cid, result).await.map(Some)
+    }
+
+    async fn bitswap_session_peer_quality(
+        &self,
+        peers: &[BitswapPeer],
+    ) -> BitswapSessionPeerQuality {
+        let successes = self.successful_bitswap_peers.lock().await;
+        bitswap_session_peer_quality_from_successes(peers, &successes, Instant::now())
     }
 
     async fn fetch_many_from_recent_bitswap_peers(
@@ -3997,6 +4013,49 @@ struct SuccessfulBitswapPeer {
     last_latency: Duration,
     success_count: u64,
     top_level_path: Option<String>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BitswapSessionPeerQuality {
+    scored_count: usize,
+    success_count_min: u64,
+    success_count_max: u64,
+    latency_ms_min: u128,
+    latency_ms_max: u128,
+    seen_age_ms_min: u128,
+    seen_age_ms_max: u128,
+}
+
+fn bitswap_session_peer_quality_from_successes(
+    peers: &[BitswapPeer],
+    successes: &HashMap<PeerId, SuccessfulBitswapPeer>,
+    now: Instant,
+) -> BitswapSessionPeerQuality {
+    let mut quality = BitswapSessionPeerQuality::default();
+    for peer in peers {
+        let Some(success) = successes.get(&peer.id) else {
+            continue;
+        };
+        let latency_ms = success.last_latency.as_millis();
+        let seen_age_ms = now.saturating_duration_since(success.seen_at).as_millis();
+        if quality.scored_count == 0 {
+            quality.success_count_min = success.success_count;
+            quality.success_count_max = success.success_count;
+            quality.latency_ms_min = latency_ms;
+            quality.latency_ms_max = latency_ms;
+            quality.seen_age_ms_min = seen_age_ms;
+            quality.seen_age_ms_max = seen_age_ms;
+        } else {
+            quality.success_count_min = quality.success_count_min.min(success.success_count);
+            quality.success_count_max = quality.success_count_max.max(success.success_count);
+            quality.latency_ms_min = quality.latency_ms_min.min(latency_ms);
+            quality.latency_ms_max = quality.latency_ms_max.max(latency_ms);
+            quality.seen_age_ms_min = quality.seen_age_ms_min.min(seen_age_ms);
+            quality.seen_age_ms_max = quality.seen_age_ms_max.max(seen_age_ms);
+        }
+        quality.scored_count += 1;
+    }
+    quality
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -10846,6 +10905,75 @@ mod bitswap_tests {
         assert!(successful_peer_matches_top_level_scope(
             &success, true, None
         ));
+    }
+
+    #[test]
+    fn bitswap_session_peer_quality_summarizes_recent_peer_state() {
+        let first = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let second = parse_peer_id("12D3KooWAtxJkDLacJdK7yZkk2iPp8iMdSVh1bDHzmJ3t8oKUkqA").unwrap();
+        let missing =
+            parse_peer_id("12D3KooWAC7ALVECw2xQHccT3hSUcQU7pJ3hvwV77w1kEevC5kKG").unwrap();
+        let now = Instant::now();
+        let peers = vec![
+            BitswapPeer {
+                id: first,
+                addrs: Vec::new(),
+                skip_want_have: true,
+                force_want_block: false,
+                force_want_have: false,
+            },
+            BitswapPeer {
+                id: second,
+                addrs: Vec::new(),
+                skip_want_have: true,
+                force_want_block: false,
+                force_want_have: false,
+            },
+            BitswapPeer {
+                id: missing,
+                addrs: Vec::new(),
+                skip_want_have: true,
+                force_want_block: false,
+                force_want_have: false,
+            },
+        ];
+        let successes = HashMap::from([
+            (
+                first,
+                SuccessfulBitswapPeer {
+                    seen_at: now - Duration::from_millis(250),
+                    addrs: Vec::new(),
+                    last_latency: Duration::from_millis(40),
+                    success_count: 1,
+                    top_level_path: None,
+                },
+            ),
+            (
+                second,
+                SuccessfulBitswapPeer {
+                    seen_at: now - Duration::from_millis(25),
+                    addrs: Vec::new(),
+                    last_latency: Duration::from_millis(120),
+                    success_count: 3,
+                    top_level_path: None,
+                },
+            ),
+        ]);
+
+        let quality = bitswap_session_peer_quality_from_successes(&peers, &successes, now);
+
+        assert_eq!(
+            quality,
+            BitswapSessionPeerQuality {
+                scored_count: 2,
+                success_count_min: 1,
+                success_count_max: 3,
+                latency_ms_min: 40,
+                latency_ms_max: 120,
+                seen_age_ms_min: 25,
+                seen_age_ms_max: 250,
+            }
+        );
     }
 
     #[test]

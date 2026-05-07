@@ -34390,3 +34390,96 @@ Revert the temporary code. The broad `50ms` result remains a useful negative
 data point; the top-level-only variant did not get enough target coverage to
 justify keeping another lab knob. Future adaptive work needs better
 session-peer quality diagnostics before adding more grace controls.
+
+## 2026-05-07 Keep: Session Shortcut Peer Quality Diagnostics
+
+Hypothesis:
+
+The rejected static grace and session-threshold experiments need a sharper
+signal before another behavior change. The trace already showed when
+`bitswap_session_shortcut_start` happened, but it did not show whether the
+shortcut was betting on a genuinely good recent peer or on a stale/one-hit peer.
+
+Implementation:
+
+- Add a behavior-neutral `BitswapSessionPeerQuality` summary for the recent
+  session peers selected by `fetch_from_recent_bitswap_peers`.
+- Add these fields to `bitswap_session_shortcut_start` trace events:
+  - `session_peer_scored_count`
+  - `session_peer_success_count_min`
+  - `session_peer_success_count_max`
+  - `session_peer_latency_ms_min`
+  - `session_peer_latency_ms_max`
+  - `session_peer_seen_age_ms_min`
+  - `session_peer_seen_age_ms_max`
+- Add a focused unit test for min/max success count, latency, and seen-age
+  summary behavior.
+
+Validation:
+
+```sh
+cargo fmt --all
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval bitswap_session_peer_quality_summarizes_recent_peer_state --lib -- --nocapture
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Focused live Wikipedia comparison:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --repeat 3 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/session-peer-quality-wikipedia-r3-20260507Tdiag-trace.jsonl \
+  --comparison-output /tmp/session-peer-quality-wikipedia-r3-20260507Tdiag.json
+```
+
+Result:
+
+- Rust and Kubo passed `3/3`.
+- Wikipedia root TTFB/total p50/p95: Rust `1730/1874ms`; Kubo
+  `1182/1340ms`.
+- Resource max: Rust `40560KiB` RSS and `19` FDs vs Kubo `126260KiB` RSS and
+  `57` FDs.
+- This run had `session_shortcut_starts=0`, so it did not exercise the new
+  fields live.
+
+Focused live `ipfs.tech` run to exercise shortcuts:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/session-peer-quality-ipfs-tech-r1-20260507Tdiag-trace.jsonl \
+  --output /tmp/session-peer-quality-ipfs-tech-r1-20260507Tdiag.json
+```
+
+Result:
+
+- Rust passed `1/1`.
+- `ipfs.tech` root TTFB/total: `1321/1323ms`.
+- `ipfs.tech` asset TTFB/total p50/p95/max: `194/445/526ms`.
+- Resource max: `47888KiB` RSS and `19` FDs.
+- Trace showed `17` `bitswap_session_shortcut_start` events and all `17`
+  included the new peer-quality fields.
+- Harness summary showed `session_shortcut_starts=17`,
+  `session_shortcut_attempts=11`, and `session_shortcut_hits=11`.
+
+Decision:
+
+Keep. This is diagnostics-only and changes no retrieval behavior. It gives the
+next adaptive experiment direct evidence about whether a shortcut wait/race is
+using one-hit, slow, or stale session peers versus a strong repeated peer.
