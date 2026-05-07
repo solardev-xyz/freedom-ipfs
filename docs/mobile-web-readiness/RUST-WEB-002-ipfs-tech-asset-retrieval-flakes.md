@@ -27044,3 +27044,88 @@ asset p95, run total p95, and RSS. Keep it disabled as a lab control for future
 selective experiments only. A viable version would need a much tighter gate,
 for example prefetching only assets with known high reuse/value, only when the
 provider source is already fast, or only under low foreground request pressure.
+
+## 2026-05-07 Reject: Multi-HTTP Post-Lookup Grace 50ms
+
+Hypothesis:
+The current no-env trace still had `126` multi-HTTP post-lookup waits, with
+`103` timeouts at the default `100ms`. A prior `0ms` run improved some medians
+but hurt p95. Try the midpoint (`50ms`) using the existing lab knob to reduce
+the common wait tax without fully removing the Bitswap session shortcut window.
+
+Same-code no-env control:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-code-default-ipfs-tech-r10-20260507T003532Z-trace.jsonl \
+  --comparison-output /tmp/current-code-default-ipfs-tech-r10-20260507T003532Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Experiment:
+
+```sh
+FREEDOM_IPFS_BITSWAP_SESSION_MULTI_HTTP_POST_LOOKUP_GRACE_MS=50 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/multi-http-grace50-ipfs-tech-r10-20260507T004216Z-trace.jsonl \
+  --comparison-output /tmp/multi-http-grace50-ipfs-tech-r10-20260507T004216Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Result:
+
+- Both Rust and Kubo passed `10/10` in both runs.
+- No-env Rust:
+  - root TTFB p50/p95: `702/1030ms`
+  - asset TTFB p50/p95/max: `204/436/962ms`
+  - run total p50/p95: `2038/2463ms`
+  - resource max: `53976KiB` RSS, `29` FDs
+- `50ms` grace Rust:
+  - root TTFB p50/p95: `566/1423ms`
+  - asset TTFB p50/p95/max: `233/570/855ms`
+  - run total p50/p95: `2023/3629ms`
+  - resource max: `54644KiB` RSS, `31` FDs
+- Kubo in the no-env control:
+  - root TTFB p50/p95: `2215/3648ms`
+  - asset TTFB p50/p95/max: `189/818/2710ms`
+- Kubo in the `50ms` window:
+  - root TTFB p50/p95: `1724/2773ms`
+  - asset TTFB p50/p95/max: `139/804/4045ms`
+
+Trace findings:
+
+- Post-lookup waits: `126 -> 64`
+- Post-lookup timeouts: `103 -> 61`
+- Post-lookup hits: `23 -> 3`
+- Wait p50/p95/max: `101/101/110ms -> 51/57/105ms`
+- HTTP provider fetches: `224 -> 314`
+- Bitswap dial plans: `309 -> 146`
+- Bitswap peer attempt starts: `349 -> 186`
+
+Decision:
+Reject `50ms` as a default. It does reduce wait and Bitswap dial pressure, but
+it loses too many useful post-lookup Bitswap hits and shifts work to HTTP
+providers, regressing asset p50/p95, root p95, run p95, RSS, and FDs. The
+remaining policy work should not be a static midpoint. It needs a selective gate
+based on source confidence, recent peer quality, request type, or provider
+score.
