@@ -35446,3 +35446,63 @@ Next follow-up should treat preconnect as a diagnostic/proving tool, not the
 main line. The more promising default path is narrower: reduce the remaining
 zero-HTTP `ipfs.tech` child request tail by improving peer choice/reuse or
 adaptive scheduling without adding broad connection pressure.
+
+Budget-4 follow-up command:
+
+```sh
+timeout 3000s env \
+  FREEDOM_IPFS_ENABLE_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT=1 \
+  FREEDOM_IPFS_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_PEERS=8 \
+  FREEDOM_IPFS_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_MAX_REQUESTS=4 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/preconnect8-budget4-guardrail-r10-20260507Tlab-trace.jsonl \
+  --comparison-output /tmp/preconnect8-budget4-guardrail-r10-20260507Tlab.json
+```
+
+Budget-4 result:
+
+- Rust and Kubo passed `10/10`.
+- `daicowtf-page-assets` root p50/p95: Rust `1262/1475ms`; Kubo
+  `2828/3282ms`.
+- `vitalik-root-html-range` root p50/p95: Rust `108/123ms`; Kubo
+  `1904/2724ms`.
+- `ipfs-tech-page-assets`:
+  - root p50/p95: Rust `621/1036ms`; Kubo `1181/1537ms`.
+  - asset p50/p95: Rust `131/326ms`; Kubo `364/536ms`.
+- Resource max: Rust `52972KiB` RSS and `33` FDs vs Kubo `254764KiB` RSS and
+  `329` FDs.
+- Trace shape:
+  - HTTP-provider blocks: `291`, p50/p95/max `192/478/941ms`.
+  - Bitswap blocks: `109`, p50/p95/max `45/133/404ms`.
+  - Classified `cold_bitswap_peer_expand`/`zero_http_provider_bitswap` requests:
+    `10`, all under `/ipns/ipfs.tech/`.
+  - Bitswap connections: `99`.
+
+Decision:
+
+Budget `4` is also not a default candidate. It produced the best
+`ipfs.tech` asset p50 in this preconnect sweep (`131ms` vs no-env `189ms` and
+budget-8 `154ms`), and the Bitswap block p95 was excellent (`133ms`). But it
+did not materially fix the mobile tradeoff:
+
+- `ipfs.tech` root p95 remained worse than no-env (`1036ms` vs `880ms`).
+- `ipfs.tech` asset p95 remained slightly worse than no-env (`326ms` vs
+  `316ms`).
+- Bitswap connections stayed high (`99` vs no-env `29` and budget-8 `110`).
+
+The useful signal is that fewer budgeted preconnect requests can improve the
+same zero-HTTP child class, but the current preconnect mechanism still creates
+too much connection pressure for the tail benefit. Further preconnect tuning
+should be budget `1-2` or peer-count limited, and should be judged mainly by
+connection count and p95 preservation, not just asset p50.
