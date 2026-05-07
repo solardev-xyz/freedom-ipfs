@@ -38477,3 +38477,59 @@ Decision:
 Keep. This does not alter gateway/retrieval behavior, but it reduces future
 analysis friction and should make the next candidate-quality experiment easier
 to judge without bespoke trace scripts.
+
+### Current Source-Mode Diagnostic Sample
+
+Purpose:
+
+Run a short no-env `ipfs.tech` page-assets sample after the harness source-mode
+diagnostics landed, to capture a clean current-head example of the remaining
+asset-median gap.
+
+Command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/source-mode-summary-ipfs-tech-r5-20260507Tnext-trace.jsonl \
+  --comparison-output /tmp/source-mode-summary-ipfs-tech-r5-20260507Tnext.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Root: Rust `589/790ms`; Kubo `2622/2686ms`.
+- Assets: Rust `204/487ms`; Kubo `122/536ms`.
+- Resource max: Rust `56904KiB` RSS and `37` FDs vs Kubo `277504KiB`
+  RSS and `210` FDs.
+- `meaningful_kubo_wins` flagged only the `ipfs.tech` asset p50
+  TTFB/total gap: `204ms` vs `122ms`.
+
+Trace finding:
+
+- Zero-HTTP child classifications:
+  `cold_bitswap_peer_expand=5`,
+  `zero_http_provider_bitswap=5`,
+  `zero_http_provider_cold_bitswap=5`.
+- Zero-HTTP child latency: p50/p90/p95/max `938/941/941/941ms`.
+- All classified zero-HTTP child Bitswap successes came from candidate index
+  `0` with request mode `want_block`.
+- Source peers:
+  - `12D3KooWKosAkdeGoRQVT5cAGRcFvBexq3q4joZG4amDWhxZzt2p`: `4`
+  - `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT`: `1`
+- The repeated slow child in this sample was `_nuxt/hfYlCurB.js`, served via
+  direct `WANT_BLOCK` from candidate `0`, not a `WANT_HAVE` timeout. That is a
+  different failure shape than the rejected rotation opt-in.
+
+Decision:
+
+Use this sample as the next diagnostic baseline. The remaining tail is not
+just "avoid WANT_HAVE" and not solved by wider static dial/direct budgets
+already rejected earlier. The next promising line is source-quality feedback:
+identify slow direct candidate-0 sources quickly enough to hedge, retry, or
+deprioritize them without turning every zero-HTTP child request into broad
+desktop-style fanout.
