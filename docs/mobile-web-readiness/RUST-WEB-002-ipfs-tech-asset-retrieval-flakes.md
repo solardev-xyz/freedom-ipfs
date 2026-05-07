@@ -31624,3 +31624,177 @@ controlled runs, but this sample did not produce the causal hit evidence needed
 for a default and regressed important guardrails. The remaining target is still
 source quality and scheduling: get useful peers sooner for top-level
 zero-HTTP/single-failing-HTTP roots without hurting `ipfs.tech` root/assets.
+
+## 2026-05-07 - Reject: Incoming Source-Address Session Peer Reuse
+
+Hypothesis:
+Some useful incoming Bitswap blocks are delivered by peers that were not in the
+current candidate list. Those successful peers show up with
+`source_peer_candidate_index=-1`, so the normal successful-peer recorder cannot
+reuse them because it only has addresses for the candidate peers. If the shared
+Bitswap swarm records the connected remote address for the incoming source, a
+small opt-in lab could turn those otherwise-lost incoming winners into session
+peers.
+
+Code:
+
+- Added `source_peer_remote_addr` to successful `bitswap_fetch`,
+  `bitswap_session_shortcut`, `bitswap_session_range_batch`, incoming-block, and
+  incoming-batch traces.
+- Extended the shared Bitswap peer connection tracker to retain the current
+  remote multiaddr as well as the transport label.
+- Added disabled env flag:
+  `FREEDOM_IPFS_ENABLE_BITSWAP_INCOMING_SOURCE_ADDR_SESSION_PEERS=1`.
+- When the flag is enabled and a successful incoming source peer is not in the
+  request candidate list, the retriever records that peer as a recent session
+  peer using the connected remote address. Terminal `/p2p/...` is stripped before
+  storing the address for later dials.
+- Default behavior is unchanged. No-env runs only emit
+  `bitswap_successful_peer_source_addr recorded=false reason=flag_disabled`.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval incoming_source_addr --lib
+cargo test -p freedom-ipfs-retrieval tracks_current_bitswap_peer_transport --lib
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Result:
+
+- Formatting passed.
+- Focused source-address tests passed.
+- Focused peer-transport tracking test passed.
+- Retrieval clippy passed with `-D warnings`.
+
+Opt-in selected-corpus command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_ENABLE_BITSWAP_INCOMING_SOURCE_ADDR_SESSION_PEERS=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/incoming-source-addr-selected-r5-20260507T082943-trace.jsonl \
+  --comparison-output /tmp/incoming-source-addr-selected-r5-20260507T082943.json
+```
+
+Immediate no-env control:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/incoming-source-addr-noenv-selected-r5-20260507T083232-trace.jsonl \
+  --comparison-output /tmp/incoming-source-addr-noenv-selected-r5-20260507T083232.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1303/1691ms` vs Kubo `2941/2994ms`.
+- Vitalik range: Rust `107/138ms` vs Kubo `1444/3336ms`.
+- `ipfs.tech` root range: Rust `990/1353ms` vs Kubo `1953/2542ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `187/391ms`; Kubo root
+  `5/136ms`, assets `223/592ms`.
+- `ipfs.tech` hero range: Rust `118/205ms` vs Kubo `397/719ms`.
+- Wikipedia root: Rust `935/1274ms` vs Kubo `390/942ms`.
+- Resource max: Rust `51568KiB` RSS and `31` FDs vs Kubo `266156KiB` RSS and
+  `455` FDs.
+- HTTP provider block fetch p50/p95/max: `184/578/994ms`.
+- Bitswap block fetch p50/p95/max: `349/719/719ms`.
+
+Same-window no-env result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1259/1326ms` vs Kubo `3001/3249ms`.
+- Vitalik range: Rust `100/106ms` vs Kubo `2608/3137ms`.
+- `ipfs.tech` root range: Rust `753/980ms` vs Kubo `1366/2783ms`.
+- `ipfs.tech` page assets: Rust root `4/4ms`, assets `187/292ms`; Kubo root
+  `2/77ms`, assets `352/945ms`.
+- `ipfs.tech` hero range: Rust `122/128ms` vs Kubo `440/526ms`.
+- Wikipedia root: Rust `1004/1053ms` vs Kubo `384/430ms`.
+- Resource max: Rust `50432KiB` RSS and `27` FDs vs Kubo `407120KiB` RSS and
+  `949` FDs.
+- HTTP provider block fetch p50/p95/max: `185/447/804ms`.
+- Bitswap block fetch p50/p95/max: `492/608/608ms`.
+
+Trace interpretation:
+
+- The opt-in path participated: `5` non-candidate incoming source peers were
+  recorded with `bitswap_successful_peer_source_addr recorded=true`.
+- The no-env control saw the same class of opportunity but skipped it:
+  `5` events with `recorded=false reason=flag_disabled`.
+- Both traces had `5` successful Bitswap events with
+  `source_peer_candidate_index=-1`.
+- Opt-in improved Wikipedia median slightly versus the immediate no-env control
+  (`935ms` vs `1004ms`), but worsened Wikipedia p95 (`1274ms` vs `1053ms`),
+  `ipfs.tech` root p50/p95, and `ipfs.tech` asset p95.
+- The recorded non-candidate Wikipedia sources were often not fast enough to be
+  trusted blindly. In the opt-in selected run, recorded source latencies were
+  around the `513-715ms` range.
+
+After the selected-corpus run, the code normalized stored remote addresses by
+stripping terminal `/p2p/...`. A focused current-code opt-in check confirmed the
+normalized path:
+
+```sh
+timeout 1800s env FREEDOM_IPFS_ENABLE_BITSWAP_INCOMING_SOURCE_ADDR_SESSION_PEERS=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/incoming-source-addr-normalized-focused-r5-20260507T083716-trace.jsonl \
+  --comparison-output /tmp/incoming-source-addr-normalized-focused-r5-20260507T083716.json
+```
+
+Focused normalized opt-in result:
+
+- `ipfs.tech` page assets: Rust root `565/758ms`, assets `183/417ms`; Kubo root
+  `1535/2544ms`, assets `58/568ms`.
+- Wikipedia root: Rust `553/947ms` vs Kubo `41/501ms`.
+- Resource max: Rust `48008KiB` RSS and `24` FDs vs Kubo `410056KiB` RSS and
+  `1233` FDs.
+- Trace recorded `3` source-address session peers with stripped addresses such
+  as `/ip4/77.247.225.234/tcp/4001`.
+
+Decision:
+Do not promote incoming source-address session peer reuse. Keep the remote-address
+trace and the disabled lab flag because the signal is real: incoming winners can
+come from outside the candidate set, and we can recover usable dial addresses for
+them. But blindly adding those peers to the session set did not close the
+Wikipedia/Kubo tail and regressed important selected-corpus guardrails. Future
+work should use this signal with a stricter source-quality gate, for example
+only for recent low-latency non-candidate sources, or only as one alternate in a
+small top-level zero-HTTP candidate set.

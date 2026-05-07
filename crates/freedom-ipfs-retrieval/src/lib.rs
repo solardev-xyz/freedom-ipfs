@@ -91,6 +91,8 @@ const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD";
 const ENABLE_BITSWAP_INCOMING_READ_TIMEOUT_BACKOFF_ENV: &str =
     "FREEDOM_IPFS_ENABLE_BITSWAP_INCOMING_READ_TIMEOUT_BACKOFF";
+const ENABLE_BITSWAP_INCOMING_SOURCE_ADDR_SESSION_PEERS_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_BITSWAP_INCOMING_SOURCE_ADDR_SESSION_PEERS";
 const BITSWAP_SESSION_SHORTCUT_GRACE: Duration = Duration::from_millis(0);
 const BITSWAP_SESSION_SHORTCUT_GRACE_MS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_SESSION_SHORTCUT_GRACE_MS";
@@ -2623,6 +2625,7 @@ impl HttpRetriever {
         };
         let elapsed = bitswap_started.elapsed();
         let source_peer = result.source_peer;
+        let source_addr = result.source_addr.clone();
         let source_trace = self
             .bitswap_source_peer_trace(source_peer, &peers_for_record)
             .await;
@@ -2636,6 +2639,10 @@ impl HttpRetriever {
             ok = true,
             source_peer = source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
             source_transport = result.source_transport.unwrap_or("unknown"),
+            source_peer_remote_addr = %source_addr
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
             bitswap_delivery = result.delivery,
             source_peer_trusted = source_trace.skip_want_have,
             source_peer_candidate_index = source_trace
@@ -2653,8 +2660,13 @@ impl HttpRetriever {
             elapsed_ms = elapsed.as_millis()
         );
         if let Some(peer) = source_peer {
-            self.record_successful_bitswap_peer_from_peers(peer, &peers_for_record, elapsed)
-                .await;
+            self.record_successful_bitswap_peer_from_fetch_source(
+                peer,
+                &peers_for_record,
+                source_addr.as_ref(),
+                elapsed,
+            )
+            .await;
         }
         self.store_bitswap_result(cid, result).await
     }
@@ -2810,16 +2822,74 @@ impl HttpRetriever {
         );
     }
 
-    async fn record_successful_bitswap_peer_from_peers(
+    async fn record_successful_bitswap_peer_from_fetch_source(
         &self,
         peer: PeerId,
         peers: &[BitswapPeer],
+        source_addr: Option<&Multiaddr>,
         last_latency: Duration,
+    ) {
+        self.record_successful_bitswap_peer_from_fetch_source_with_enabled(
+            peer,
+            peers,
+            source_addr,
+            last_latency,
+            bitswap_incoming_source_addr_session_peers_enabled(),
+        )
+        .await;
+    }
+
+    async fn record_successful_bitswap_peer_from_fetch_source_with_enabled(
+        &self,
+        peer: PeerId,
+        peers: &[BitswapPeer],
+        source_addr: Option<&Multiaddr>,
+        last_latency: Duration,
+        allow_source_addr: bool,
     ) {
         if let Some(candidate) = peers.iter().find(|candidate| candidate.id == peer) {
             self.record_successful_bitswap_peer(peer, candidate.addrs.clone(), last_latency)
                 .await;
+            return;
         }
+
+        let Some(source_addr) = source_addr else {
+            tracing::info!(
+                phase = "bitswap_successful_peer_source_addr",
+                peer = %peer,
+                recorded = false,
+                enabled = allow_source_addr,
+                reason = "source_addr_unavailable",
+                latency_ms = last_latency.as_millis()
+            );
+            return;
+        };
+
+        let session_addr = bitswap_session_addr_from_remote_addr(source_addr);
+
+        if !allow_source_addr {
+            tracing::info!(
+                phase = "bitswap_successful_peer_source_addr",
+                peer = %peer,
+                source_addr = %session_addr,
+                recorded = false,
+                enabled = false,
+                reason = "flag_disabled",
+                latency_ms = last_latency.as_millis()
+            );
+            return;
+        }
+
+        tracing::info!(
+            phase = "bitswap_successful_peer_source_addr",
+            peer = %peer,
+            source_addr = %session_addr,
+            recorded = true,
+            enabled = true,
+            latency_ms = last_latency.as_millis()
+        );
+        self.record_successful_bitswap_peer(peer, vec![session_addr], last_latency)
+            .await;
     }
 
     async fn bitswap_source_peer_trace(
@@ -3013,6 +3083,7 @@ impl HttpRetriever {
         };
 
         let elapsed = started.elapsed();
+        let source_addr = result.source_addr.clone();
         let source_trace = self
             .bitswap_source_peer_trace(result.source_peer, &peers_for_record)
             .await;
@@ -3024,6 +3095,10 @@ impl HttpRetriever {
             ok = true,
             source_peer = result.source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
             source_transport = result.source_transport.unwrap_or("unknown"),
+            source_peer_remote_addr = %source_addr
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
             bitswap_delivery = result.delivery,
             source_peer_trusted = source_trace.skip_want_have,
             source_peer_candidate_index = source_trace
@@ -3041,8 +3116,13 @@ impl HttpRetriever {
             elapsed_ms = elapsed.as_millis()
         );
         if let Some(peer) = result.source_peer {
-            self.record_successful_bitswap_peer_from_peers(peer, &peers_for_record, elapsed)
-                .await;
+            self.record_successful_bitswap_peer_from_fetch_source(
+                peer,
+                &peers_for_record,
+                source_addr.as_ref(),
+                elapsed,
+            )
+            .await;
         }
         self.store_bitswap_result(cid, result).await.map(Some)
     }
@@ -3131,12 +3211,18 @@ impl HttpRetriever {
         };
 
         let elapsed = started.elapsed();
+        let source_addr = result.source_addr.clone();
         let source_trace = self
             .bitswap_source_peer_trace(result.source_peer, &peers_for_record)
             .await;
         if let Some(peer) = result.source_peer {
-            self.record_successful_bitswap_peer_from_peers(peer, &peers_for_record, elapsed)
-                .await;
+            self.record_successful_bitswap_peer_from_fetch_source(
+                peer,
+                &peers_for_record,
+                source_addr.as_ref(),
+                elapsed,
+            )
+            .await;
         }
         let requested_block_count = result.requested_blocks.len();
         let extra_block_count = result.extra_blocks.len();
@@ -3153,6 +3239,10 @@ impl HttpRetriever {
             ok = true,
             source_peer = %source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
             source_transport = source_transport.unwrap_or("unknown"),
+            source_peer_remote_addr = %source_addr
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
             bitswap_delivery = delivery,
             source_peer_trusted = source_trace.skip_want_have,
             source_peer_candidate_index = source_trace
@@ -4350,6 +4440,7 @@ struct BitswapFetchResult {
     extra_blocks: Vec<(Cid, Vec<u8>)>,
     source_peer: Option<PeerId>,
     source_transport: Option<&'static str>,
+    source_addr: Option<Multiaddr>,
     delivery: &'static str,
 }
 
@@ -4359,6 +4450,7 @@ struct BitswapFetchBatchResult {
     extra_blocks: Vec<(Cid, Vec<u8>)>,
     source_peer: Option<PeerId>,
     source_transport: Option<&'static str>,
+    source_addr: Option<Multiaddr>,
     delivery: &'static str,
 }
 
@@ -4399,6 +4491,7 @@ type PeerTransportLog = Arc<tokio::sync::Mutex<HashMap<PeerId, PeerTransportStat
 struct PeerTransportState {
     counts: BTreeMap<&'static str, usize>,
     current: Option<&'static str>,
+    current_addr: Option<Multiaddr>,
 }
 
 struct ConnectionErrorBackoff {
@@ -4428,6 +4521,7 @@ impl SharedBitswapClient {
             extra_blocks: result.extra_blocks,
             source_peer: result.source_peer,
             source_transport: result.source_transport,
+            source_addr: result.source_addr,
             delivery: result.delivery,
         }))
     }
@@ -4809,12 +4903,13 @@ async fn run_shared_bitswap_swarm(
                 match incoming_read.result {
                     Ok(blocks) => {
                         let mut matched = false;
-                        let source_transport =
-                            current_peer_transport(&peer_transports, incoming_read.peer).await;
+                        let (source_transport, source_addr) =
+                            current_peer_connection(&peer_transports, incoming_read.peer).await;
                         for cid in pending_incoming.keys().copied().collect::<Vec<_>>() {
                             if let Some(mut result) = collect_bitswap_result(&cid, blocks.clone()) {
                                 result.source_peer = Some(incoming_read.peer);
                                 result.source_transport = source_transport;
+                                result.source_addr = source_addr.clone();
                                 result.delivery = "incoming";
                                 let block_len = result.requested_block.len();
                                 let batch_result = BitswapFetchBatchResult {
@@ -4822,6 +4917,7 @@ async fn run_shared_bitswap_swarm(
                                     extra_blocks: result.extra_blocks,
                                     source_peer: result.source_peer,
                                     source_transport: result.source_transport,
+                                    source_addr: result.source_addr,
                                     delivery: result.delivery,
                                 };
                                 matched = true;
@@ -4857,6 +4953,10 @@ async fn run_shared_bitswap_swarm(
                                     cid = %cid,
                                     peer = %incoming_read.peer,
                                     source_transport = source_transport.unwrap_or("unknown"),
+                                    source_peer_remote_addr = %source_addr
+                                        .as_ref()
+                                        .map(ToString::to_string)
+                                        .unwrap_or_default(),
                                     block_count = blocks.len(),
                                     bytes = block_len,
                                     pending_waiter_count,
@@ -4920,8 +5020,13 @@ async fn run_shared_bitswap_swarm(
                             concurrent_dial_errors.as_ref().map_or(0, Vec::len);
                         let remote_addr = endpoint.get_remote_address();
                         let transport = bitswap_transport_label(remote_addr);
-                        record_peer_transport_established(&peer_transports, peer_id, transport)
-                            .await;
+                        record_peer_transport_established(
+                            &peer_transports,
+                            peer_id,
+                            transport,
+                            remote_addr.clone(),
+                        )
+                        .await;
                         tracing::info!(
                             phase = "bitswap_connection_established",
                             peer = %peer_id,
@@ -4948,7 +5053,13 @@ async fn run_shared_bitswap_swarm(
                     } => {
                         let remote_addr = endpoint.get_remote_address();
                         let transport = bitswap_transport_label(remote_addr);
-                        record_peer_transport_closed(&peer_transports, peer_id, transport).await;
+                        record_peer_transport_closed(
+                            &peer_transports,
+                            peer_id,
+                            transport,
+                            remote_addr,
+                        )
+                        .await;
                         tracing::debug!(
                             phase = "bitswap_connection_closed",
                             peer = %peer_id,
@@ -5120,6 +5231,10 @@ fn bitswap_incoming_read_timeout_backoff_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_INCOMING_READ_TIMEOUT_BACKOFF_ENV).is_some()
 }
 
+fn bitswap_incoming_source_addr_session_peers_enabled() -> bool {
+    std::env::var_os(ENABLE_BITSWAP_INCOMING_SOURCE_ADDR_SESSION_PEERS_ENV).is_some()
+}
+
 fn bitswap_connection_error_backoff_threshold() -> usize {
     let override_value = std::env::var_os(BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD_ENV);
     let override_value = override_value.as_ref().map(|value| value.to_string_lossy());
@@ -5169,17 +5284,20 @@ async fn record_peer_transport_established(
     transports: &PeerTransportLog,
     peer: PeerId,
     transport: &'static str,
+    remote_addr: Multiaddr,
 ) {
     let mut transports = transports.lock().await;
     let state = transports.entry(peer).or_default();
     *state.counts.entry(transport).or_default() += 1;
     state.current = Some(transport);
+    state.current_addr = Some(remote_addr);
 }
 
 async fn record_peer_transport_closed(
     transports: &PeerTransportLog,
     peer: PeerId,
     transport: &'static str,
+    remote_addr: &Multiaddr,
 ) {
     let mut transports = transports.lock().await;
     let Some(state) = transports.get_mut(&peer) else {
@@ -5195,18 +5313,30 @@ async fn record_peer_transport_closed(
         transports.remove(&peer);
     } else if state.current == Some(transport) {
         state.current = state.counts.keys().next().copied();
+        if state.current_addr.as_ref() == Some(remote_addr) {
+            state.current_addr = None;
+        }
     }
 }
 
-async fn current_peer_transport(
+async fn current_peer_connection(
     transports: &PeerTransportLog,
     peer: PeerId,
-) -> Option<&'static str> {
+) -> (Option<&'static str>, Option<Multiaddr>) {
     transports
         .lock()
         .await
         .get(&peer)
-        .and_then(|state| state.current)
+        .map(|state| (state.current, state.current_addr.clone()))
+        .unwrap_or((None, None))
+}
+
+fn bitswap_session_addr_from_remote_addr(addr: &Multiaddr) -> Multiaddr {
+    let mut addr = addr.clone();
+    if matches!(addr.iter().last(), Some(Protocol::P2p(_))) {
+        addr.pop();
+    }
+    addr
 }
 
 fn format_bitswap_peers(peers: &[BitswapPeer]) -> String {
@@ -6531,6 +6661,7 @@ async fn collect_incoming_bitswap_batch(
     let mut extra_blocks = Vec::new();
     let mut source_peer = None;
     let mut source_transport = None;
+    let mut source_addr = None;
 
     while requested_blocks.len() < wanted.len() {
         let next_result = if requested_blocks.is_empty() {
@@ -6559,6 +6690,7 @@ async fn collect_incoming_bitswap_batch(
         if source_peer.is_none() {
             source_peer = result.source_peer;
             source_transport = result.source_transport;
+            source_addr = result.source_addr;
         }
         for (cid, data) in result.requested_blocks {
             if wanted.contains(&cid) {
@@ -6581,6 +6713,10 @@ async fn collect_incoming_bitswap_batch(
             extra_blocks = extra_blocks.len(),
             source_peer = %source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
             source_transport = source_transport.unwrap_or("unknown"),
+            source_peer_remote_addr = %source_addr
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
             partial = requested_blocks.len() < wanted.len(),
             partial_grace_ms = partial_grace.as_millis(),
             elapsed_ms = started.elapsed().as_millis()
@@ -6591,6 +6727,7 @@ async fn collect_incoming_bitswap_batch(
         extra_blocks,
         source_peer,
         source_transport,
+        source_addr,
         delivery: "incoming",
     })
 }
@@ -6931,11 +7068,14 @@ async fn request_bitswap_blocks(
             .await
             {
                 Ok(result) => {
+                    let (source_transport, source_addr) =
+                        current_peer_connection(&peer_transports, peer_id).await;
                     return Ok(BitswapFetchBatchResult {
                         requested_blocks: HashMap::from([(primary_cid, result.requested_block)]),
                         extra_blocks: result.extra_blocks,
                         source_peer: Some(peer_id),
-                        source_transport: current_peer_transport(&peer_transports, peer_id).await,
+                        source_transport,
+                        source_addr,
                         delivery: result.delivery,
                     });
                 }
@@ -6963,11 +7103,14 @@ async fn request_bitswap_blocks(
         .await
         {
             Ok(result) => {
+                let (source_transport, source_addr) =
+                    current_peer_connection(&peer_transports, peer_id).await;
                 return Ok(BitswapFetchBatchResult {
                     requested_blocks: result.requested_blocks,
                     extra_blocks: result.extra_blocks,
                     source_peer: Some(peer_id),
-                    source_transport: current_peer_transport(&peer_transports, peer_id).await,
+                    source_transport,
+                    source_addr,
                     delivery: "outgoing",
                 });
             }
@@ -7087,6 +7230,7 @@ where
         extra_blocks: results.extra_blocks,
         source_peer: None,
         source_transport: None,
+        source_addr: None,
         delivery: "outgoing",
     })
 }
@@ -7286,6 +7430,7 @@ fn collect_bitswap_result(
         extra_blocks: results.extra_blocks,
         source_peer: None,
         source_transport: None,
+        source_addr: None,
         delivery: "outgoing",
     })
 }
@@ -8300,23 +8445,41 @@ mod bitswap_tests {
     async fn tracks_current_bitswap_peer_transport() {
         let transports = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let peer = PeerId::random();
+        let tcp = Multiaddr::from_str("/ip4/127.0.0.1/tcp/4001").unwrap();
+        let quic = Multiaddr::from_str("/ip4/127.0.0.1/udp/4001/quic-v1").unwrap();
 
-        assert_eq!(current_peer_transport(&transports, peer).await, None);
+        assert_eq!(current_peer_connection(&transports, peer).await.0, None);
 
-        record_peer_transport_established(&transports, peer, "tcp").await;
-        assert_eq!(current_peer_transport(&transports, peer).await, Some("tcp"));
-
-        record_peer_transport_established(&transports, peer, "quic").await;
+        record_peer_transport_established(&transports, peer, "tcp", tcp.clone()).await;
         assert_eq!(
-            current_peer_transport(&transports, peer).await,
-            Some("quic")
+            current_peer_connection(&transports, peer).await.0,
+            Some("tcp")
+        );
+        assert_eq!(
+            current_peer_connection(&transports, peer).await.1,
+            Some(tcp.clone())
         );
 
-        record_peer_transport_closed(&transports, peer, "quic").await;
-        assert_eq!(current_peer_transport(&transports, peer).await, Some("tcp"));
+        record_peer_transport_established(&transports, peer, "quic", quic.clone()).await;
+        assert_eq!(
+            current_peer_connection(&transports, peer).await.0,
+            Some("quic")
+        );
+        assert_eq!(
+            current_peer_connection(&transports, peer).await.1,
+            Some(quic.clone())
+        );
 
-        record_peer_transport_closed(&transports, peer, "tcp").await;
-        assert_eq!(current_peer_transport(&transports, peer).await, None);
+        record_peer_transport_closed(&transports, peer, "quic", &quic).await;
+        assert_eq!(
+            current_peer_connection(&transports, peer).await.0,
+            Some("tcp")
+        );
+        assert_eq!(current_peer_connection(&transports, peer).await.1, None);
+
+        record_peer_transport_closed(&transports, peer, "tcp", &tcp).await;
+        assert_eq!(current_peer_connection(&transports, peer).await.0, None);
+        assert_eq!(current_peer_connection(&transports, peer).await.1, None);
     }
 
     #[tokio::test]
@@ -8524,6 +8687,7 @@ mod bitswap_tests {
                 extra_blocks: Vec::new(),
                 source_peer: None,
                 source_transport: None,
+                source_addr: None,
                 delivery: "incoming",
             })
             .unwrap();
@@ -10311,6 +10475,62 @@ mod bitswap_tests {
         assert!(peers[0].skip_want_have);
         assert_eq!(peers[1].id, provider_peer);
         assert!(!peers[1].skip_want_have);
+    }
+
+    #[tokio::test]
+    async fn incoming_source_addr_can_seed_session_peer_when_enabled() {
+        let incoming_peer =
+            parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let source_addr = Multiaddr::from_str(
+            "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP",
+        )
+        .unwrap();
+        let session_addr = Multiaddr::from_str("/ip4/127.0.0.1/tcp/4001").unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store,
+        );
+
+        retriever
+            .record_successful_bitswap_peer_from_fetch_source_with_enabled(
+                incoming_peer,
+                &[],
+                Some(&source_addr),
+                Duration::from_millis(75),
+                true,
+            )
+            .await;
+
+        let peers = retriever.recent_bitswap_peers().await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].id, incoming_peer);
+        assert_eq!(peers[0].addrs, vec![session_addr]);
+        assert!(peers[0].skip_want_have);
+    }
+
+    #[tokio::test]
+    async fn incoming_source_addr_is_not_session_peer_by_default() {
+        let incoming_peer =
+            parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let source_addr = Multiaddr::from_str("/ip4/127.0.0.1/tcp/4001").unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store,
+        );
+
+        retriever
+            .record_successful_bitswap_peer_from_fetch_source_with_enabled(
+                incoming_peer,
+                &[],
+                Some(&source_addr),
+                Duration::from_millis(75),
+                false,
+            )
+            .await;
+
+        assert!(retriever.recent_bitswap_peers().await.is_empty());
     }
 
     #[tokio::test]
