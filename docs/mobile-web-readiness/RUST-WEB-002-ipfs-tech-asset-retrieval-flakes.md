@@ -32374,3 +32374,93 @@ specific rejected discriminator. Do not use
 the default `32` provider threshold as a tuning candidate. The next useful work
 should focus on source quality from actual delivery evidence rather than
 increasing direct `WANT_BLOCK` fanout.
+
+## 2026-05-07 - Reject: UnixFS Full-File Raw Child Batching
+
+Hypothesis:
+
+Full UnixFS file reads still fetched linked raw children sequentially, while
+range reads already batched adjacent raw child ranges. Bounded batching for
+full-file reads might reduce multi-block asset latency without increasing the
+global Bitswap session fanout knobs.
+
+Experiment:
+
+- Changed `UnixfsContext::read_file_cid` to collect adjacent raw child links
+  with known `blocksizes` and flush them through `get_block_ranges` in batches
+  of `UNIXFS_RANGE_BATCH_MAX_BLOCKS`.
+- Flushed before recursive DAG-PB children to preserve output order.
+- Added focused UnixFS tests proving adjacent raw children used
+  `get_block_ranges` instead of per-child `get_block` and that recursive
+  children split batches correctly.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+git diff --check
+cargo test -p freedom-ipfs-unixfs read_file_batches -- --nocapture
+cargo test -p freedom-ipfs-unixfs read_file_flushes -- --nocapture
+cargo test -p freedom-ipfs-unixfs
+cargo test -p freedom-ipfs-gateway gateway_reuses -- --nocapture
+```
+
+Result:
+
+- Formatting and whitespace checks passed.
+- Focused UnixFS batching tests passed.
+- Full `freedom-ipfs-unixfs` tests passed: `17` passed.
+- Focused gateway reuse tests passed.
+
+Live same-window run:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/unixfs-full-read-raw-batch-focused-r10-20260507T1037Z-trace.jsonl \
+  --comparison-output /tmp/unixfs-full-read-raw-batch-focused-r10-20260507T1037Z.json
+```
+
+Live result:
+
+- Rust and Kubo passed `10/10` for both focused cases.
+- `ipfs.tech` page assets: Rust root `715/1751ms`, assets `186/434ms`;
+  Kubo root `2734/15919ms`, assets `197/415ms`.
+- Wikipedia root: Rust `751/1060ms` vs Kubo `484/738ms`.
+- Resource max: Rust `50028KiB` RSS and `31` FDs vs Kubo `362052KiB` RSS and
+  `736` FDs.
+
+Immediate no-env focused control for comparison:
+
+- `ipfs.tech` page assets: Rust root `601/825ms`, assets `118/310ms`;
+  Kubo root `1679/6165ms`, assets `113/570ms`.
+- Wikipedia root: Rust `306/791ms` vs Kubo `148/507ms`.
+- Resource max: Rust `49088KiB` RSS and `28` FDs vs Kubo `313620KiB` RSS and
+  `711` FDs.
+
+Trace interpretation:
+
+- `block_range_batch_fetches` stayed at `0` in the live run, so the target
+  corpus did not exercise the retrieval-level batch fetch path.
+- The run showed `block_store_get_range` events, but those were cache range
+  checks rather than uncached batched network fetches.
+- The same-window sample was worse than the nearby control on Rust root,
+  assets, Wikipedia root, RSS, and FDs. Public network variance is likely part
+  of this, but there was no trace evidence that the new default behavior helped
+  the target cases.
+
+Decision:
+
+Do not promote. Revert the UnixFS batching code and tests. This may be worth
+revisiting with a synthetic or live corpus that demonstrably performs uncached
+full-file reads of multi-block raw-child UnixFS files, but it is not evidence
+for closing the current `ipfs.tech`/Wikipedia Kubo gap.
