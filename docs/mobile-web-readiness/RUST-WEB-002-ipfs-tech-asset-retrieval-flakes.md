@@ -37406,3 +37406,134 @@ hot-cache noise. Near-term work should either run a longer corpus to catch rare
 Kubo-win windows or focus on reducing Rust's own remaining tail classes:
 slow single-provider HTTP leaves and occasional zero-HTTP Bitswap roots/assets,
 while preserving the `~0.34x` RSS and `~0.12x` FD profile seen here.
+
+### Compact Guardrail Recheck With Meaningful Kubo-Win Summary
+
+Purpose:
+
+After adding the harness `meaningful_kubo_wins` summary, rerun the compact
+same-window Rust-vs-Kubo guardrail with the normal harness browser pressure
+defaults. This run intentionally did not pass `--asset-concurrency 1`, so it
+exercised the default `6` concurrent page-asset fetches.
+
+Command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-page-assets-cid-direct \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/current-compact-meaningful-20260507T184802Z-trace.jsonl \
+  --comparison-output /tmp/current-compact-meaningful-20260507T184802Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `328/837ms`; Kubo `2192/2581ms`.
+- Vitalik range: Rust `113/261ms`; Kubo `3435/4781ms`.
+- `ipfs.tech` page root: Rust `730/1365ms`; Kubo `1204/2348ms`.
+- `ipfs.tech` page assets: Rust `174/580ms`; Kubo `371/1046ms`.
+- `ipfs.tech` CID-direct hot-cache root/assets were only millisecond-level Kubo
+  wins.
+- Wikipedia root was the only meaningful Kubo win:
+  - root TTFB p50/p95: Rust `993/2204ms`; Kubo `675/772ms`.
+  - root total p50/p95: Rust `993/2205ms`; Kubo `675/772ms`.
+- Resource max: Rust `59508KiB` RSS and `43` FDs vs Kubo `199180KiB`
+  RSS and `175` FDs.
+
+Trace summary:
+
+- HTTP-provider blocks: `185`, p50/p90/p95/max `190/330/596/909ms`.
+- Bitswap blocks: `49`, p50/p90/p95/max `131/399/726/2014ms`.
+- Delegated provider lookup: zero HTTP `17`, single HTTP `102`, multi HTTP
+  `90`.
+- Request classifications:
+  - `zero_http_provider_bitswap=17`
+  - `cold_bitswap_peer_expand=10`
+  - `zero_http_provider_cold_bitswap=10`
+  - `top_level_zero_http_provider_bitswap=4`
+- The slowest Wikipedia request was a top-level zero-HTTP root block:
+  `bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze`.
+  Delegated routing returned `64` providers and zero HTTP providers. The
+  promoted zero-HTTP DNS-prefetch path fired, but the resulting Bitswap fetch
+  from the recent cross-top-level peer
+  `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT` still took about
+  `1769ms`; root `block_fetch_total` was `2014ms`.
+- The follow-on `/index.html` block was not the slow part in that sample:
+  `f010479.twinquasar.io` failed with HTTP `500`, while
+  `ipfs-bridge.sia.dev` delivered the block in about `188ms`.
+
+Interpretation:
+
+The new harness summary correctly filters out the CID-direct hot-cache noise and
+points at one real same-window Kubo edge: Wikipedia top-level zero-HTTP Bitswap
+root p95 under default page-asset concurrency. This is not the older DNS
+prefetch shape, because prefetch already fired. The remaining tail is the
+actual Bitswap source selection/delivery path for the zero-HTTP root block.
+
+### Reject: Trusted Direct WANT_BLOCK Limit 0
+
+Hypothesis:
+
+The prior trusted/session `WANT_HAVE` probe-width lab used
+`FREEDOM_IPFS_BITSWAP_TRUSTED_DIRECT_WANT_BLOCK_PEERS=1`, which still leaves a
+single cross-top-level trusted peer on direct `WANT_BLOCK`. The fresh compact
+baseline's slow Wikipedia root had exactly that shape. Try `0` to force even the
+first trusted/session peer through `WANT_HAVE`, allowing untrusted provider
+direct requests or faster probes to win instead.
+
+Command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_TRUSTED_DIRECT_WANT_BLOCK_PEERS=0 \
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-page-assets-cid-direct \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/trusted-direct0-compact-r5-20260507T185310Z-trace.jsonl \
+  --comparison-output /tmp/trusted-direct0-compact-r5-20260507T185310Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `330/486ms`; Kubo `2163/2277ms`.
+- Vitalik range: Rust `106/130ms`; Kubo `2250/4257ms`.
+- `ipfs.tech` page root: Rust `653/662ms`; Kubo `1058/2122ms`.
+- `ipfs.tech` page assets: Rust `206/534ms`; Kubo `362/784ms`.
+- Wikipedia root:
+  - p50 moved to a Rust win: Rust `517ms`; Kubo `674ms`.
+  - p95 remained a large Kubo win: Rust `2107ms`; Kubo `676ms`.
+- Resource max: Rust `58384KiB` RSS and `40` FDs vs Kubo `198808KiB`
+  RSS and `192` FDs.
+
+Trace summary:
+
+- HTTP-provider blocks: `207`, p50/p95/max `192/362/864ms`.
+- Bitswap blocks: `28`, p50/p95/max `92/673/2010ms`.
+- `bitswap_want_have_probe` fired `5` times; every probe timed out at about
+  `751-752ms` and then fell back to `WANT_BLOCK`.
+- The slowest Wikipedia request still used the same peer
+  `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT`; the root block's
+  Bitswap fetch took about `1798ms`, and the visible request took `2105ms`.
+
+Decision:
+
+Reject. Forcing the first trusted/session peer through `WANT_HAVE` does not fix
+the current p95 tail. It adds timeout probe work and still falls back to a slow
+block request from the same peer. Keep the existing env knob as a diagnostic
+only, and do not continue the static trusted-direct width family unless a new
+trace shows a materially different source-selection shape.
