@@ -40820,3 +40820,99 @@ inside otherwise winning page loads, especially repeated `_nuxt` leaf blocks
 served through `ipfs-bridge.sia.dev` or mixed HTTP/Bitswap races. The next
 experiment should target provider/source quality for those leaf blocks, not a
 broad default change to roots, DHT fallback, or HTML prefetch.
+
+## 2026-05-07: HTML Directory-Only Prefetch Multi-Case Recheck
+
+Branch/head:
+
+- `codex/kubo-session-performance-20260506`
+- `93dcf94`
+
+Purpose:
+
+The focused `ipfs.tech` directory-only prefetch sample was promising but not
+causal enough to promote. Re-run it against the broader r5 guardrail and compare
+with an immediate no-env post-control.
+
+Opt-in command:
+
+```sh
+timeout 2400s env \
+  FREEDOM_IPFS_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_DIRS=1 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --repeat 5 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --case daicowtf-page-assets \
+    --case vitalik-root-html-range \
+    --case ipfs-tech-page-assets \
+    --case wikipedia-on-ipfs-root \
+    --trace-output /tmp/html-dir-prefetch1-guardrail-r5-20260507T231555Z-trace.jsonl \
+    --comparison-output /tmp/html-dir-prefetch1-guardrail-r5-20260507T231555Z.json
+```
+
+Opt-in result:
+
+- Rust/Kubo passed all cases: `5/5` for both engines.
+- `meaningful_kubo_wins`: none.
+- DAICO root: Rust `1009/1320ms`; Kubo `1248/2212ms`.
+- Vitalik range: Rust `98/107ms`; Kubo `3193/4643ms`.
+- `ipfs.tech` root: Rust `667/871ms`; Kubo `1351/1367ms`.
+- `ipfs.tech` assets: Rust `101/202ms`; Kubo `352/829ms`.
+- Wikipedia root: Rust `391/409ms`; Kubo `354/663ms`.
+- Resource max: Rust `62452KiB` RSS and `39` FDs vs Kubo `127236KiB`
+  RSS and `121` FDs.
+- Path-local `ipfs.tech` wins dropped to four printed path/metric pairs, all
+  on `_nuxt/DlAUqK2U.js`, with Rust p95 `160ms` vs Kubo `30ms`.
+
+Immediate no-env post-control command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/html-dir-prefetch1-post-control-guardrail-r5-20260507T231555Z-trace.jsonl \
+  --comparison-output /tmp/html-dir-prefetch1-post-control-guardrail-r5-20260507T231555Z.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed all cases: `5/5` for both engines.
+- `meaningful_kubo_wins`: `2`, both Wikipedia root median
+  (`384/385ms` Rust vs `324ms` Kubo).
+- DAICO root: Rust `1012/1304ms`; Kubo `1232/2142ms`.
+- Vitalik range: Rust `104/134ms`; Kubo `3328/4537ms`.
+- `ipfs.tech` root: Rust `653/982ms`; Kubo `976/1673ms`.
+- `ipfs.tech` assets: Rust `98/206ms`; Kubo `353/740ms`.
+- Wikipedia root: Rust `384/393ms`; Kubo `324/671ms`.
+- Resource max: Rust `60916KiB` RSS and `38` FDs vs Kubo `146408KiB`
+  RSS and `176` FDs.
+
+Decision:
+
+Do not promote HTML directory-only prefetch from this evidence. The opt-in
+guardrail looked excellent and did not create a case-level Kubo win, but the
+immediate no-env post-control reproduced essentially the same `ipfs.tech` asset
+p50/p95 (`98/206ms` vs opt-in `101/202ms`). That means the asset improvement was
+mostly the network/window, not the directory warmer.
+
+Keep the disabled lab control and focused test. It is still useful for probing
+whether `_nuxt` parent-directory latency is causal in a bad window, but the next
+default candidate should not be another HTML-prefetch variant unless a trace
+shows repeated parent-directory fetches are the active bottleneck in that same
+window.
