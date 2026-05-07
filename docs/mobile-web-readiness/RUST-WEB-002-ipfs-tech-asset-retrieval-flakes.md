@@ -36226,3 +36226,139 @@ The useful evidence is diagnostic, not a default change:
   failing fast, high provider count, and expensive DNS expansion. A candidate
   should start a tiny direct-IP/provider-quality probe only for that fallback
   shape while preserving the normal path for `ipfs.tech` assets and DAICO.
+
+## 2026-05-07 Top-Level Single-HTTP Failed Direct-IP Bitswap Lab
+
+Purpose:
+
+Turn the previous diagnostic conclusion into a disabled retrieval lab: when a
+top-level gateway request has exactly one HTTP provider, that provider fails,
+there are many total providers, and at least one direct-IP Bitswap candidate is
+present, race a direct-IP-only Bitswap provider fetch against the normal
+DNS-expanded Bitswap fetch. This targets the 16:42 Wikipedia `/index.html`
+shape where the HTTP provider returned `500`, the full Bitswap fetch delivered
+the block quickly once started, but DNS/provider expansion delayed that start by
+about a second.
+
+Implementation:
+
+- Added disabled env knob
+  `FREEDOM_IPFS_ENABLE_TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK=1`.
+- Added provider threshold override
+  `FREEDOM_IPFS_TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS=<n>`
+  with default `32`.
+- Added a per-call `BitswapProviderCandidateMode::DirectIpOnly` so this lab does
+  not reuse the old global direct-IP-only switch.
+- The gate is deliberately narrow:
+  - opt-in flag enabled
+  - top-level gateway request, not subresource
+  - exactly one HTTP provider after bad-provider filtering
+  - HTTP provider fetch returned no block
+  - provider count above the threshold
+  - normal Bitswap and direct-IP Bitswap candidates both exist
+- The normal Bitswap path is raced, not replaced, so the lab should not strand a
+  request if direct-IP candidates are stale.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval top_level_single_http_failed_direct_ip --lib
+cargo test -p freedom-ipfs-retrieval direct_ip_candidate --lib
+cargo test -p freedom-ipfs-retrieval --lib
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Results:
+
+- Focused new tests passed.
+- Full retrieval lib tests passed: `128 passed`, `1 ignored`.
+- Retrieval clippy passed with `-D warnings`.
+
+Opt-in live command:
+
+```sh
+FREEDOM_IPFS_ENABLE_TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK=1 \
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/top-level-single-http-failed-direct-ip-race-guardrail-r5-20260507T170608Z-trace.jsonl \
+  --comparison-output /tmp/top-level-single-http-failed-direct-ip-race-guardrail-r5-20260507T170608Z.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `1268/1529ms`; Kubo `2951/3062ms`.
+- Vitalik range: Rust `101/103ms`; Kubo `1572/2118ms`.
+- `ipfs.tech` page assets:
+  - root p50/p95: Rust `692/1231ms`; Kubo `1082/1590ms`.
+  - asset p50/p95: Rust `97/244ms`; Kubo `354/482ms`.
+- Wikipedia root: Rust `320/389ms`; Kubo `508/711ms`.
+- Resource max: Rust `50804KiB` RSS and `22` FDs vs Kubo `147952KiB` RSS
+  and `188` FDs.
+- Trace blocks: HTTP provider `104`, p50/p95/max `184/478/793ms`; Bitswap
+  `106`, p50/p95/max `62/269/341ms`.
+- The new fallback phase did **not** appear in the trace.
+
+Immediate no-env post-control command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/top-level-single-http-failed-direct-ip-race-post-control-r5-20260507T170940Z-trace.jsonl \
+  --comparison-output /tmp/top-level-single-http-failed-direct-ip-race-post-control-r5-20260507T170940Z.json
+```
+
+Immediate post-control result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `1161/1516ms`; Kubo `2857/3096ms`.
+- Vitalik range: Rust `105/124ms`; Kubo `1448/3463ms`.
+- `ipfs.tech` page assets:
+  - root p50/p95: Rust `616/990ms`; Kubo `749/1255ms`.
+  - asset p50/p95: Rust `155/319ms`; Kubo `363/454ms`.
+- Wikipedia root: Rust `447/483ms`; Kubo `547/563ms`.
+- Resource max: Rust `49844KiB` RSS and `23` FDs vs Kubo `177128KiB` RSS
+  and `342` FDs.
+- Trace blocks: HTTP provider `171`, p50/p95/max `186/404/780ms`; Bitswap
+  `39`, p50/p95/max `95/357/476ms`.
+
+Trace finding:
+
+The live opt-in run did not exercise the new gate. The public network had moved
+away from the exact 16:42 failing-single-HTTP shape: the Wikipedia follow-on
+block either came from an already-good session peer quickly or had two HTTP
+providers, with `ipfs-bridge.sia.dev` succeeding while
+`f010479.twinquasar.io` returned `500`. That makes the opt-in run useful as a
+guardrail but not proof of the new fallback's value.
+
+Decision:
+
+Keep the fallback as a disabled lab hook only. Do not promote it to default on
+this evidence. The unit/integration coverage proves the targeted path works,
+and the live guardrail shows no obvious default regression when enabled in a
+window where it does not fire, but the key missing evidence is a live same-window
+sample where `top_level_single_http_failed_direct_ip_bitswap_fallback_*` events
+actually fire and improve the failing-single-HTTP tail versus a no-env control.
