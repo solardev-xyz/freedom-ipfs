@@ -38643,3 +38643,258 @@ The next useful version should use a harness/corpus that reliably produces
 multiple zero-HTTP child Bitswap requests in one long-lived gateway process, or
 should combine this signal with an immediate hedge/retry path instead of only
 affecting future provider selection.
+
+### Current-Head Wide Sweep After Slow-Source Lab
+
+Purpose:
+
+Re-establish current-head Rust-vs-Kubo evidence after adding the disabled
+slow-source suppression lab. This run keeps all new lab behavior off and uses
+the broader performance corpus to find the next active gap.
+
+Command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --case daicowtf-root-html-range \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-page-assets-cid-direct \
+  --case ipfs-tech-developers-hero-range \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/current-head-wide-r5-90c5aca-20260507Tnext-trace.jsonl \
+  --comparison-output /tmp/current-head-wide-r5-90c5aca-20260507Tnext.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO range: Rust `235/313ms`; Kubo `1234/2966ms`.
+- DAICO page root: Rust `78/82ms`; Kubo `2/3ms`.
+- Vitalik range: Rust `114/117ms`; Kubo `3344/4232ms`.
+- `ipfs.tech` root range: Rust `605/1185ms`; Kubo `990/1356ms`.
+- `ipfs.tech` page root: Rust `3/4ms`; Kubo `2/3ms`.
+- `ipfs.tech` page assets: Rust `202/600ms`; Kubo `386/762ms`.
+- CID-direct `ipfs.tech` root/assets were only millisecond-level Kubo wins.
+- `ipfs.tech` hero prefix range: Rust `104/166ms`; Kubo `391/433ms`.
+- Wikipedia root: Rust `729/803ms`; Kubo `346/372ms`.
+- Resource max: Rust `61288KiB` RSS and `43` FDs vs Kubo `143832KiB`
+  RSS and `144` FDs.
+- `meaningful_kubo_wins` flagged DAICO page-root p50/p95 and Wikipedia root
+  p50/p95.
+
+Trace finding:
+
+- DAICO page root is the known range-then-full warm-order artifact. Do not
+  chase it as a cold-load optimization.
+- `ipfs.tech` assets beat Kubo in this wide window.
+- Wikipedia was the only plausible active gap, with top-level zero-HTTP
+  Bitswap requests p50/p90/p95/max `716/739/739/739ms`.
+- Request classifications:
+  `zero_http_provider_bitswap=12`, `cold_bitswap_peer_expand=9`,
+  `zero_http_provider_cold_bitswap=8`,
+  `top_level_zero_http_provider_bitswap=4`.
+- Bitswap block fetches: `22`, p50/p90/p95/max `261/612/766/798ms`.
+
+Decision:
+
+Do not act on the wide-sweep Wikipedia gap without a focused reproduction. The
+wide run says where to look, but prior samples showed this case is highly
+network- and order-sensitive.
+
+### Focused Wikipedia Reproduction Check
+
+Purpose:
+
+Check whether the wide-sweep Wikipedia Kubo win reproduces when
+`wikipedia-on-ipfs-root` is run alone with fresh gateways.
+
+Command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/wikipedia-current-head-r10-90c5aca-20260507Tnext-trace.jsonl \
+  --comparison-output /tmp/wikipedia-current-head-r10-90c5aca-20260507Tnext.json
+```
+
+Result:
+
+- Rust/Kubo passed `10/10`.
+- Wikipedia root: Rust `713/889ms`; Kubo `1232/2264ms`.
+- Resource max: Rust `41216KiB` RSS and `20` FDs vs Kubo `156300KiB`
+  RSS and `70` FDs.
+- `meaningful_kubo_wins`: none.
+
+Trace finding:
+
+- Every request was classified as top-level zero-HTTP provider Bitswap:
+  `cold_bitswap_peer_expand=10`,
+  `top_level_zero_http_provider_bitswap=10`,
+  `top_level_zero_http_provider_cold_bitswap=10`,
+  `zero_http_provider_bitswap=10`,
+  `zero_http_provider_cold_bitswap=10`.
+- Request latency p50/p90/p95/max was `711/864/887/887ms`.
+- Source modes were mostly `want_have`: `8` from candidate index `4`, plus
+  `2` `want_block` from candidate index `2`.
+- Kubo was slower in this standalone window, so the wide-sweep Wikipedia win is
+  not a stable standalone cold-root gap.
+
+Decision:
+
+Do not optimize specifically for standalone Wikipedia from this sample. The
+remaining signal, if real, is order/session-window dependent rather than a
+simple cold single-request issue.
+
+### Two-Case Sequence: ipfs.tech Then Wikipedia
+
+Purpose:
+
+Test whether the Wikipedia gap only appears after prior page activity, and
+re-check the current `ipfs.tech` asset median against Kubo in the same run.
+
+Command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/ipfs-tech-then-wikipedia-r10-90c5aca-20260507Tnext-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-then-wikipedia-r10-90c5aca-20260507Tnext.json
+```
+
+Result:
+
+- Rust/Kubo passed `10/10` for both cases.
+- `ipfs.tech` page root: Rust `587/845ms`; Kubo `1639/2428ms`.
+- `ipfs.tech` page assets: Rust `188/497ms`; Kubo `113/451ms`.
+- Wikipedia root: Rust `640/781ms`; Kubo `672/1243ms`.
+- Resource max: Rust `57712KiB` RSS and `43` FDs vs Kubo `234924KiB`
+  RSS and `276` FDs.
+- `meaningful_kubo_wins` flagged only `ipfs.tech` asset median:
+  TTFB/total `188ms` vs `113ms`.
+
+Trace finding:
+
+- Wikipedia no longer showed a meaningful Kubo win.
+- The active gap moved back to `ipfs.tech` asset median.
+- HTTP-provider blocks: `351`, p50/p90/p95/max `197/273/308/540ms`.
+- Bitswap blocks: `69`, p50/p90/p95/max `196/548/592/676ms`.
+- Delegated provider distribution: zero HTTP `30`, single HTTP `190`,
+  multi HTTP `150`.
+- `zero_http_provider_bitswap=30` with p50/p90/p95/max
+  `459/698/759/780ms`; `ipfs.tech` contributed `20` of those.
+- Single-provider HTTP results were again mostly `ipfs-bridge.sia.dev`,
+  p50/p90/p95/max `192/255/335/517ms`.
+
+Decision:
+
+The next likely lever is still conditional handling of single-HTTP median and
+zero-HTTP child Bitswap tails, not Wikipedia-specific work.
+
+### Disabled Same-Provider HTTP Self-Hedge Recheck
+
+Purpose:
+
+The current two-case gap is asset median, and previous self-hedge diagnostics
+showed that duplicate same-provider requests can sometimes hurt median while
+protecting tails. Recheck the existing rollback knob before changing code.
+
+Opt-out command:
+
+```sh
+FREEDOM_IPFS_DISABLE_SINGLE_HTTP_SELF_HEDGE=1 \
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/ipfs-tech-then-wikipedia-no-self-hedge-r10-90c5aca-20260507Tnext-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-then-wikipedia-no-self-hedge-r10-90c5aca-20260507Tnext.json
+```
+
+Opt-out result:
+
+- Rust/Kubo passed `10/10` for both cases.
+- `ipfs.tech` page root: Rust `636/786ms`; Kubo `1983/4413ms`.
+- `ipfs.tech` page assets: Rust `150/489ms`; Kubo `193/655ms`.
+- Wikipedia root: Rust `631/789ms`; Kubo `580/1699ms`.
+- Resource max: Rust `57560KiB` RSS and `47` FDs vs Kubo `319220KiB`
+  RSS and `515` FDs.
+- `meaningful_kubo_wins`: none.
+
+Opt-out trace finding:
+
+- Disabling same-provider self-hedge removed all HTTP-provider self-hedges and
+  shifted more work to Bitswap: HTTP-provider blocks `250`, Bitswap blocks
+  `167`.
+- HTTP-provider block p50/p95/max improved to `133/292/493ms`.
+- Bitswap block p50/p95/max was `169/480/1440ms`.
+- A large zero-HTTP Bitswap tail remained:
+  `/ipns/ipfs.tech/_nuxt/entry.C4ErMpWu.css` at `1442ms`, source peer
+  `12D3KooWD8ysVqMtKMHv37CtMSffGBfkvWLrm9L58MEhSGMyzw59`.
+- FD max rose from the prior no-env two-case run's `43` to `47`.
+
+Immediate no-env post-control command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/ipfs-tech-then-wikipedia-post-self-hedge-control-r5-90c5aca-20260507Tnext-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-then-wikipedia-post-self-hedge-control-r5-90c5aca-20260507Tnext.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `5/5` for both cases.
+- `ipfs.tech` page root: Rust `692/741ms`; Kubo `1517/2306ms`.
+- `ipfs.tech` page assets: Rust `143/344ms`; Kubo `128/463ms`.
+- Wikipedia root: Rust `502/748ms`; Kubo `256/1296ms`.
+- Resource max: Rust `58792KiB` RSS and `46` FDs vs Kubo `238248KiB`
+  RSS and `291` FDs.
+- `meaningful_kubo_wins` flagged only Wikipedia root median. The
+  `ipfs.tech` asset median gap was only `15ms`, below the meaningful-win
+  threshold.
+
+Post-control trace finding:
+
+- Same-provider self-hedge fired only `10` times, with `0` duplicate winners.
+- HTTP-provider blocks were `89`, p50/p90/p95/max `113/242/276/388ms`.
+- Bitswap blocks were `118`, p50/p90/p95/max `136/281/370/540ms`.
+- The post-control also removed the asset median gap without disabling
+  self-hedge, so the opt-out run is not causal proof.
+
+Decision:
+
+Do not disable same-provider HTTP self-hedge by default from this evidence. The
+opt-out run looked good and removed the Kubo asset median win, but the immediate
+post-control also removed that asset gap while keeping the default behavior.
+The opt-out run increased Bitswap work and FD max and exposed a large zero-HTTP
+Bitswap tail. Keep the default `200ms` self-hedge and the rollback knob. A
+future policy change needs a stronger condition, such as dynamically reducing
+same-provider duplicate requests only after a low duplicate-win rate while also
+checking that zero-HTTP Bitswap tails do not grow.
