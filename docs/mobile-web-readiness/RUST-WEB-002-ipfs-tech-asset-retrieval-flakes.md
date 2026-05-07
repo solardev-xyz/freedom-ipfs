@@ -38985,3 +38985,89 @@ sample argues against broad zero-HTTP work as the immediate next step; the
 active asset deltas are mostly single-HTTP/provider-score/path-traversal
 shapes under page concurrency, while Rust still wins roots, Wikipedia, RSS, and
 FDs in the same window.
+
+### Reject Retest: Narrow HTML Prefetch 2 Assets / Concurrency 1
+
+Hypothesis:
+
+The earlier HTML subresource prefetch lab was too broad (`8` assets,
+concurrency `2`) and regressed p50/p95. With per-asset diagnostics, retest a
+much narrower shape: only prefetch the first two same-root HTML-discovered
+assets at concurrency `1`, capped to small bodies. This might warm the recurring
+stylesheet/path metadata without broadly competing with foreground asset
+requests.
+
+Opt-in command:
+
+```sh
+FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_ASSETS=2 \
+FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_BYTES=65536 \
+FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_CONCURRENCY=1 \
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/html-prefetch2c1-focused-r10-2a7e50a-20260507Tdiagnostic-trace.jsonl \
+  --comparison-output /tmp/html-prefetch2c1-focused-r10-2a7e50a-20260507Tdiagnostic.json
+```
+
+Opt-in result:
+
+- Rust/Kubo passed `10/10` for both cases.
+- `ipfs.tech` page root: Rust `593/1057ms`; Kubo `1283/3170ms`.
+- `ipfs.tech` page assets: Rust `183/471ms`; Kubo `103/374ms`.
+- Wikipedia root: Rust `353/1182ms`; Kubo `340/703ms`.
+- Resource max: Rust `58428KiB` RSS and `39` FDs vs Kubo `255580KiB`
+  RSS and `222` FDs.
+- `meaningful_kubo_wins`: `6`, including `ipfs.tech` asset p50/p95 and
+  Wikipedia root p95.
+
+Opt-in trace findings:
+
+- HTTP-provider blocks rose to `378`, p50/p95/max `191/289/997ms`.
+- Bitswap blocks dropped to `69`, p50/p95/max `151/448/1054ms`.
+- The UnixFS metadata cache did show some warmed entries:
+  `path_hits=18`, `file_size_hits=47`.
+- But the slow assets moved rather than disappeared:
+  - `_nuxt/B1ETkkRH.js` p95 total/TTFB: Rust `1221/1220ms`, Kubo `354ms`.
+  - `_nuxt/mHWTJadT.js` p95 total/TTFB: Rust `1059ms`, Kubo `386ms`.
+  - `_nuxt/8Bs0wEmG.js` p95 total/TTFB: Rust `564ms`, Kubo `259ms`.
+- Slowest request examples included a `1216ms` `_nuxt/B1ETkkRH.js` path and
+  a `1057ms` `_nuxt/mHWTJadT.js` zero-HTTP Bitswap child.
+
+Immediate no-env post-control:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/html-prefetch2c1-post-control-r5-2a7e50a-20260507Tdiagnostic-trace.jsonl \
+  --comparison-output /tmp/html-prefetch2c1-post-control-r5-2a7e50a-20260507Tdiagnostic.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `5/5` for both cases.
+- `ipfs.tech` page root: Rust `654/829ms`; Kubo `1831/2635ms`.
+- `ipfs.tech` page assets: Rust `139/458ms`; Kubo `145/419ms`.
+- Wikipedia root: Rust `179/215ms`; Kubo `246/709ms`.
+- Resource max: Rust `57580KiB` RSS and `29` FDs vs Kubo `205764KiB`
+  RSS and `148` FDs.
+- `meaningful_kubo_wins`: none.
+
+Decision:
+
+Reject narrow HTML prefetch as a default candidate. Even at only two assets and
+concurrency one, it created case-level Kubo wins that disappeared in the
+immediate no-env control. The cache hits prove the mechanism is active, but the
+extra background provider work competes with foreground page requests and
+shifts the tail to later script/zero-HTTP paths. Keep HTML prefetch as a
+disabled lab control only; a future version would need a much stronger trigger
+than "first N assets from HTML."
