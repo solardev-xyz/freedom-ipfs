@@ -8541,7 +8541,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             if let Some(path) = trace_event_path(&value) {
                 *entry.paths.entry(path).or_default() += 1;
             }
-            if successful_bitswap_fetch {
+            if successful_bitswap_delivery {
                 if let Some(index) = json_detail_string(value.get("source_peer_candidate_index")) {
                     if index != "-1" {
                         *entry
@@ -10699,6 +10699,12 @@ mod tests {
             1
         );
         assert_eq!(trace_value_count(&cid1.bitswap_source_peers, "peer1"), 1);
+        let cid8 = summary
+            .slow_cids
+            .iter()
+            .find(|cid| cid.cid == "cid8")
+            .unwrap();
+        assert_eq!(trace_value_count(&cid8.bitswap_source_peers, "peer1"), 1);
         assert_eq!(summary.slow_requests.len(), 1);
         assert_eq!(summary.slow_requests[0].path, "/ipns/site/asset.js");
         assert_eq!(summary.slow_requests[0].request_id, "9");

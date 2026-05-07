@@ -33976,3 +33976,79 @@ Keep. This is diagnostics-only and changes no retrieval behavior. Future live
 runs should show the root-vs-index source split directly in harness output,
 which should make the next page-level source-selection experiment easier to
 validate without custom trace scripts.
+
+## 2026-05-07 Wikipedia-Only Isolation And Session Shortcut Source Accounting
+
+The focused two-case baseline runs `ipfs.tech` and Wikipedia in the same fresh
+gateway repeat. Since Bitswap session peers are retriever-wide by default, run
+Wikipedia alone to check whether the bad Wikipedia window depends on prior
+`ipfs.tech` session state.
+
+Command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-wikipedia-only-r10-20260507Tisolated-trace.jsonl \
+  --comparison-output /tmp/current-wikipedia-only-r10-20260507Tisolated.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10`.
+- Wikipedia root TTFB/total p50/p95: Rust `978/1951ms`; Kubo `1273/2384ms`.
+- Resource max: Rust `41344KiB` RSS and `22` FDs vs Kubo `156904KiB` RSS and
+  `82` FDs.
+- Bitswap blocks: `20`, p50/p95/max `485/637/1312ms`.
+- Request classifications: every request was
+  `top_level_zero_http_provider_cold_bitswap`.
+- Scoped source indexes: `4=17`, `3=1`, `5=1`.
+- Slow CIDs:
+  - Directory/root CID
+    `bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze`:
+    source indexes `4=9`, `3=1`.
+  - Follow-on `index.html` CID
+    `bafkreicr5w6i2f3m664a2fnl4vhtg3s6dhhk6n5hrf3gqzcf7v5bu6b7te`:
+    source indexes `4=8`, `5=1`.
+
+Interpretation:
+
+The latest isolated window does not prove Wikipedia is currently a Kubo gap;
+Rust beat Kubo on both p50 and p95 while staying much lighter. But the slowest
+Rust sample still shows the local target shape: the visible top-level request is
+root block plus `index.html` block, and the `index.html` block can sit behind a
+slow Bitswap session shortcut after the failing `f010479` HTTP provider path.
+
+Diagnostic correction:
+
+The first slow-CID source diagnostic counted only successful `bitswap_fetch`
+events. That missed successful `bitswap_session_shortcut` events, including the
+slowest isolated `index.html` sample. Update slow-CID source accounting to count
+all successful Bitswap deliveries for the CID (`bitswap_fetch` and
+`bitswap_session_shortcut`) while still omitting unknown `-1` candidate indexes.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details -- --nocapture
+cargo test -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Validation passed.
+
+Decision:
+
+Keep the diagnostic correction. The next behavior experiment should not assume
+the remaining Wikipedia issue is cross-site contamination from `ipfs.tech`;
+instead, continue targeting page-level root-plus-index scheduling and session
+shortcut selection for the follow-on block.
