@@ -82,6 +82,7 @@ const BITSWAP_CONNECTION_READY_TIMEOUT_MS_ENV: &str =
 // Keep WANT_HAVE as a short peer-selection probe; slow probes otherwise sit
 // directly on the gateway TTFB path before we request the block.
 const BITSWAP_WANT_HAVE_TIMEOUT: Duration = Duration::from_millis(750);
+const BITSWAP_WANT_HAVE_TIMEOUT_MS_ENV: &str = "FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS";
 const BITSWAP_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(6);
 const BITSWAP_SINGLE_UNTRUSTED_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(3);
 const BITSWAP_INCOMING_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(6);
@@ -6467,6 +6468,22 @@ fn bitswap_stream_read_timeout(peer_count: usize, trusted_peer_count: usize) -> 
     }
 }
 
+fn bitswap_want_have_timeout() -> Duration {
+    bitswap_want_have_timeout_from_env_value(
+        std::env::var_os(BITSWAP_WANT_HAVE_TIMEOUT_MS_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn bitswap_want_have_timeout_from_env_value(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(BITSWAP_WANT_HAVE_TIMEOUT)
+}
+
 #[derive(Clone, Copy)]
 struct BitswapRequestTimeouts {
     want_have: Duration,
@@ -8827,7 +8844,7 @@ async fn fetch_bitswap_batch_over_outgoing_streams(
         peers.iter().filter(|peer| peer.skip_want_have).count(),
     );
     let request_timeouts = BitswapRequestTimeouts {
-        want_have: BITSWAP_WANT_HAVE_TIMEOUT,
+        want_have: bitswap_want_have_timeout(),
         stream_read: stream_read_timeout,
     };
     let target_summary = format_bitswap_targets(&peers);
@@ -12725,6 +12742,26 @@ mod bitswap_tests {
         assert_eq!(
             bitswap_direct_want_block_untrusted_peer_limit_from_env_value(Some("999")),
             MAX_BITSWAP_PEERS_PER_BLOCK
+        );
+    }
+
+    #[test]
+    fn bitswap_want_have_timeout_parses_optional_override() {
+        assert_eq!(
+            bitswap_want_have_timeout_from_env_value(None),
+            BITSWAP_WANT_HAVE_TIMEOUT
+        );
+        assert_eq!(
+            bitswap_want_have_timeout_from_env_value(Some("bad")),
+            BITSWAP_WANT_HAVE_TIMEOUT
+        );
+        assert_eq!(
+            bitswap_want_have_timeout_from_env_value(Some("0")),
+            BITSWAP_WANT_HAVE_TIMEOUT
+        );
+        assert_eq!(
+            bitswap_want_have_timeout_from_env_value(Some("250")),
+            Duration::from_millis(250)
         );
     }
 

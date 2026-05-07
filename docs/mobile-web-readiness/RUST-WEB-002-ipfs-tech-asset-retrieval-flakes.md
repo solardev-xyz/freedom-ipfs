@@ -39870,3 +39870,239 @@ TTFB/total, added two meaningful `ipfs.tech` median asset losses, raised FD
 usage, and exposed worse zero-HTTP Bitswap tails. The remaining work is still
 provider/peer/session selection for zero-HTTP Bitswap subresources and the
 Wikipedia median root path, not small-body response-header timing.
+
+## 2026-05-07: Bitswap WANT_HAVE Timeout Lab
+
+Branch:
+
+- `codex/kubo-session-performance-20260506`
+- Base before this lab patch: `74ab055`
+
+Question:
+
+The current fixed `750ms` Bitswap `WANT_HAVE` probe can sit directly on the
+gateway TTFB path for zero-HTTP cold blocks before the retriever escalates to
+`WANT_BLOCK`. Can a shorter optional probe timeout clip those root and asset
+tails without broadly switching unknown peers to direct `WANT_BLOCK` and without
+giving up the mobile RSS/FD advantage?
+
+Change:
+
+- Keep defaults unchanged.
+- Add disabled/env-gated retrieval config:
+  `FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS=<ms>`.
+- Positive integer values override the `WANT_HAVE` timeout in milliseconds.
+  Missing, invalid, or zero values keep the current `750ms` default.
+- The existing Bitswap trace already records `want_have_timeout_ms`, so live
+  runs can confirm which timeout shaped each request.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval bitswap_want_have_timeout_parses_optional_override -- --nocapture
+cargo test -p freedom-ipfs-retrieval want_have_probe_falls_back_to_want_block_quickly -- --nocapture
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Result:
+
+- Formatting passed.
+- New timeout parser test passed.
+- Existing `WANT_HAVE` fallback behavior test passed.
+- Retrieval clippy passed with `-D warnings`.
+
+Focused opt-in command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS=250 timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/want-have-timeout250-focused-r10-20260507T214718Z-trace.jsonl \
+  --comparison-output /tmp/want-have-timeout250-focused-r10-20260507T214718Z.json
+```
+
+Focused opt-in result:
+
+- Rust and Kubo passed `10/10` for both focused cases.
+- `ipfs.tech` root: Rust `575/1809ms`; Kubo `1672/2632ms`.
+- `ipfs.tech` assets: Rust `118/350ms`; Kubo `107/414ms`.
+- `wikipedia-on-ipfs-root`: Rust `138/271ms`; Kubo `217/753ms`.
+- Resource max: Rust `58784KiB` RSS and `32` FDs vs Kubo `195752KiB`
+  RSS and `203` FDs.
+- `meaningful_kubo_wins`: none.
+- Block fetch totals:
+  - Bitswap: `233` blocks, p50/p90/p95/max `113/201/262/1509ms`.
+  - HTTP provider: `183` blocks, p50/p90/p95/max `92/240/247/929ms`.
+- Delegated provider lookup p50/p90/p95/max: `24/48/53/160ms`.
+- Request classifications: `zero_http_provider_bitswap=31`,
+  `top_level_zero_http_provider_bitswap=19`,
+  `cold_bitswap_peer_expand=14`,
+  `zero_http_provider_cold_bitswap=14`, and
+  `top_level_zero_http_provider_cold_bitswap=9`.
+- `WANT_HAVE` probes: `1` event, max timeout `250ms`, elapsed `251ms`.
+- Bitswap source modes: `want_block=204`; only one `WANT_HAVE` probe.
+- Bitswap peer attempts/connections: `416` attempts and `29`
+  connections.
+- Slowest request: `/ipns/ipfs.tech/` at `1805ms`, caused by a zero-HTTP
+  Bitswap root block with `1464ms` Bitswap fetch time and a `192ms` HTTP
+  provider fetch elsewhere in the request. Kubo's root p95 was still slower in
+  this same opt-in window.
+
+Immediate no-env focused control command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/want-have-timeout250-post-control-focused-r10-20260507T214718Z-trace.jsonl \
+  --comparison-output /tmp/want-have-timeout250-post-control-focused-r10-20260507T214718Z.json
+```
+
+Immediate no-env focused control result:
+
+- Rust and Kubo passed `10/10` for both focused cases.
+- `ipfs.tech` root: Rust `600/2588ms`; Kubo `1655/2021ms`.
+- `ipfs.tech` assets: Rust `125/424ms`; Kubo `164/456ms`.
+- `wikipedia-on-ipfs-root`: Rust `412/966ms`; Kubo `222/708ms`.
+- Resource max: Rust `59556KiB` RSS and `45` FDs vs Kubo `209988KiB`
+  RSS and `212` FDs.
+- `meaningful_kubo_wins`: `6`:
+  - `ipfs-tech-page-assets` root p95 TTFB/total.
+  - `wikipedia-on-ipfs-root` root p50/p95 TTFB/total.
+- Block fetch totals:
+  - Bitswap: `180` blocks, p50/p90/p95/max `113/299/351/2168ms`.
+  - HTTP provider: `236` blocks, p50/p90/p95/max `128/250/270/505ms`.
+- `WANT_HAVE` probes: `6`, all `timeout_fallback_want_block`, max timeout
+  `750ms`, elapsed p50/max `751/752ms`.
+- `zero_http_provider_bitswap` p50/p90/p95/max:
+  `547/2323/2534/2585ms`.
+- `top_level_zero_http_provider_bitswap` p50/p90/p95/max:
+  `570/2455/2534/2585ms`.
+- Slow root tails were `ipfs.tech` zero-HTTP roots using source mode
+  `want_have` at candidate index `4`, with request totals in the
+  `2323-2585ms` range.
+
+Focused interpretation:
+
+The same-window r10 evidence strongly favored the shorter timeout: it removed
+all meaningful Kubo wins, clipped the long `750ms` `WANT_HAVE` timeout tails,
+improved Wikipedia root p50/p95, kept `ipfs.tech` aggregate assets ahead on
+total p95, and reduced max FDs from `45` to `32`.
+
+Guardrail opt-in command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS=250 timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/want-have-timeout250-guardrail-r5-20260507T214718Z-trace.jsonl \
+  --comparison-output /tmp/want-have-timeout250-guardrail-r5-20260507T214718Z.json
+```
+
+Guardrail opt-in result:
+
+- Rust and Kubo passed `5/5` for all four guardrail cases.
+- DAICO root: Rust `300/444ms`; Kubo `2346/2450ms`.
+- Vitalik range: Rust `314/510ms`; Kubo `1376/1526ms`.
+- `ipfs.tech` root: Rust `542/586ms`; Kubo `1469/1859ms`.
+- `ipfs.tech` assets: Rust `120/294ms`; Kubo `171/707ms`.
+- `wikipedia-on-ipfs-root`: Rust `456/913ms`; Kubo `159/711ms`.
+- Resource max: Rust `59452KiB` RSS and `41` FDs vs Kubo `225080KiB`
+  RSS and `173` FDs.
+- `meaningful_kubo_wins`: `4`, all Wikipedia root p50/p95 TTFB/total.
+- Block fetch totals:
+  - Bitswap: `134` blocks, p50/p90/p95/max `112/224/305/565ms`.
+  - HTTP provider: `97` blocks, p50/p90/p95/max `97/224/242/370ms`.
+- `zero_http_provider_bitswap` p50/p90/p95/max: `454/605/911/911ms`.
+- Zero-HTTP Bitswap source modes: `want_have=1`, `want_block=12`.
+- Bitswap peer attempts/connections: `260` attempts and `23`
+  connections.
+
+Immediate no-env guardrail control command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/want-have-timeout250-guardrail-control-r5-20260507T214718Z-trace.jsonl \
+  --comparison-output /tmp/want-have-timeout250-guardrail-control-r5-20260507T214718Z.json
+```
+
+Immediate no-env guardrail control result:
+
+- Rust and Kubo passed `5/5` for all four guardrail cases.
+- DAICO root: Rust `283/376ms`; Kubo `2132/2333ms`.
+- Vitalik range: Rust `297/331ms`; Kubo `1509/2418ms`.
+- `ipfs.tech` root: Rust `520/557ms`; Kubo `1280/1600ms`.
+- `ipfs.tech` assets: Rust `126/295ms`; Kubo `184/775ms`.
+- `wikipedia-on-ipfs-root`: Rust `540/996ms`; Kubo `610/705ms`.
+- Resource max: Rust `59140KiB` RSS and `46` FDs vs Kubo `152924KiB`
+  RSS and `146` FDs.
+- `meaningful_kubo_wins`: `2`, both Wikipedia p95 TTFB/total.
+- Block fetch totals:
+  - Bitswap: `126` blocks, p50/p90/p95/max `113/225/286/638ms`.
+  - HTTP provider: `107` blocks, p50/p90/p95/max `100/221/243/345ms`.
+- `zero_http_provider_bitswap` p50/p90/p95/max: `515/611/994/994ms`.
+- Zero-HTTP Bitswap source modes: `want_have=1`, `want_block=11`.
+- Bitswap peer attempts/connections: `262` attempts and `22`
+  connections.
+
+Decision:
+
+Keep `FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS=250` as a disabled lab knob,
+but do not promote it yet. The focused same-window r10 result is the strongest
+evidence in favor of the shorter timeout: it removed all meaningful Kubo wins
+and clipped obvious `750ms` probe tails. The r5 guardrail also kept DAICO,
+Vitalik, and `ipfs.tech` ahead while reducing the Wikipedia Rust p50/p95 versus
+its no-env control, but Wikipedia still produced Kubo-relative wins in that
+network window. That is not enough evidence to change the default globally.
+
+Next agent guidance:
+
+- Re-test `250ms`, `350ms`, and `500ms` in same-window r10 guardrails before
+  promoting a new default.
+- Prefer an adaptive timeout over a global default if broader runs show mixed
+  results. Candidate shapes: shorter timeout only for top-level/gateway
+  zero-HTTP requests, high-provider requests, untrusted candidates after an HTTP
+  provider miss, or page-session subresources with already warm fallback
+  options.
+- Do not use this knob as a broad direct-`WANT_BLOCK` substitute. The useful
+  signal was clipping stuck `WANT_HAVE` probes while preserving normal peer
+  selection behavior.
