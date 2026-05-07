@@ -147,6 +147,11 @@ const MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS_ENV: &str =
 const MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE: Duration = Duration::from_millis(100);
 const ENABLE_ZERO_HTTP_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_RACE";
+const ENABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH";
+const ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS_ENV: &str =
+    "FREEDOM_IPFS_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS";
+const ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS: usize = 32;
 const BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS: usize = 2;
 const ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_ENV: &str =
     "FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK";
@@ -652,8 +657,6 @@ impl HttpRetriever {
                                                         }
                                                     }
                                                 } else {
-                                                    let post_lookup_grace =
-                                                        bitswap_session_post_lookup_grace(&providers);
                                                     let http_provider_count =
                                                         provider_http_url_count(&providers);
                                                     let mut post_lookup_race_allowed =
@@ -689,58 +692,39 @@ impl HttpRetriever {
                                                             return Ok((block, source));
                                                         }
                                                     } else {
-                                                        let post_lookup_started = Instant::now();
-                                                        match timeout(post_lookup_grace, &mut shortcut).await {
-                                                        Ok(shortcut_result) => match shortcut_result {
-                                                            Ok(Some(block)) => {
-                                                                tracing::info!(
-                                                                    phase = "bitswap_session_shortcut_post_lookup_wait",
-                                                                    cid = %cid,
-                                                                    outcome = "hit",
-                                                                    timeout_ms = post_lookup_grace.as_millis(),
-                                                                    elapsed_ms = post_lookup_started.elapsed().as_millis(),
-                                                                    provider_count = providers.len(),
-                                                                    http_provider_count
-                                                                );
-                                                                return Ok((block, RetrievalSource::Bitswap));
+                                                        match self
+                                                            .fetch_after_zero_http_post_lookup_dns_prefetch(
+                                                                cid,
+                                                                &providers,
+                                                                context.clone(),
+                                                                shortcut.as_mut(),
+                                                            )
+                                                            .await?
+                                                        {
+                                                            ZeroHttpPostLookupDnsPrefetchOutcome::Fetched(
+                                                                block,
+                                                                source,
+                                                            ) => {
+                                                                return Ok((block, source));
                                                             }
-                                                            Ok(None) => {
-                                                                tracing::info!(
-                                                                    phase = "bitswap_session_shortcut_post_lookup_wait",
-                                                                    cid = %cid,
-                                                                    outcome = "miss",
-                                                                    timeout_ms = post_lookup_grace.as_millis(),
-                                                                    elapsed_ms = post_lookup_started.elapsed().as_millis(),
-                                                                    provider_count = providers.len(),
-                                                                    http_provider_count
-                                                                );
+                                                            ZeroHttpPostLookupDnsPrefetchOutcome::ContinueAfterWait => {}
+                                                            ZeroHttpPostLookupDnsPrefetchOutcome::NotAttempted => {
+                                                                if let Some(block) = self
+                                                                    .wait_for_session_shortcut_post_lookup(
+                                                                        cid,
+                                                                        &providers,
+                                                                        http_provider_count,
+                                                                        shortcut.as_mut(),
+                                                                    )
+                                                                    .await?
+                                                                {
+                                                                    return Ok((
+                                                                        block,
+                                                                        RetrievalSource::Bitswap,
+                                                                    ));
+                                                                }
                                                             }
-                                                            Err(err) => {
-                                                                tracing::info!(
-                                                                    phase = "bitswap_session_shortcut_post_lookup_wait",
-                                                                    cid = %cid,
-                                                                    outcome = "error",
-                                                                    timeout_ms = post_lookup_grace.as_millis(),
-                                                                    elapsed_ms = post_lookup_started.elapsed().as_millis(),
-                                                                    provider_count = providers.len(),
-                                                                    http_provider_count,
-                                                                    error = %err
-                                                                );
-                                                                return Err(err);
-                                                            }
-                                                        },
-                                                        Err(_) => {
-                                                            tracing::info!(
-                                                                phase = "bitswap_session_shortcut_post_lookup_wait",
-                                                                cid = %cid,
-                                                                outcome = "timeout",
-                                                                timeout_ms = post_lookup_grace.as_millis(),
-                                                                elapsed_ms = post_lookup_started.elapsed().as_millis(),
-                                                                provider_count = providers.len(),
-                                                                http_provider_count
-                                                            );
                                                         }
-                                                    }
                                                     }
                                                 }
                                                 providers
@@ -857,8 +841,6 @@ impl HttpRetriever {
                                                     }
                                                 }
                                             } else {
-                                                let post_lookup_grace =
-                                                    bitswap_session_post_lookup_grace(&providers);
                                                 let http_provider_count =
                                                     provider_http_url_count(&providers);
                                                 let mut post_lookup_race_allowed =
@@ -894,58 +876,39 @@ impl HttpRetriever {
                                                         return Ok((block, source));
                                                     }
                                                 } else {
-                                                    let post_lookup_started = Instant::now();
-                                                    match timeout(post_lookup_grace, &mut shortcut).await {
-                                                    Ok(shortcut_result) => match shortcut_result {
-                                                        Ok(Some(block)) => {
-                                                            tracing::info!(
-                                                                phase = "bitswap_session_shortcut_post_lookup_wait",
-                                                                cid = %cid,
-                                                                outcome = "hit",
-                                                                timeout_ms = post_lookup_grace.as_millis(),
-                                                                elapsed_ms = post_lookup_started.elapsed().as_millis(),
-                                                                provider_count = providers.len(),
-                                                                http_provider_count
-                                                            );
-                                                            return Ok((block, RetrievalSource::Bitswap));
+                                                    match self
+                                                        .fetch_after_zero_http_post_lookup_dns_prefetch(
+                                                            cid,
+                                                            &providers,
+                                                            context.clone(),
+                                                            shortcut.as_mut(),
+                                                        )
+                                                        .await?
+                                                    {
+                                                        ZeroHttpPostLookupDnsPrefetchOutcome::Fetched(
+                                                            block,
+                                                            source,
+                                                        ) => {
+                                                            return Ok((block, source));
                                                         }
-                                                        Ok(None) => {
-                                                            tracing::info!(
-                                                                phase = "bitswap_session_shortcut_post_lookup_wait",
-                                                                cid = %cid,
-                                                                outcome = "miss",
-                                                                timeout_ms = post_lookup_grace.as_millis(),
-                                                                elapsed_ms = post_lookup_started.elapsed().as_millis(),
-                                                                provider_count = providers.len(),
-                                                                http_provider_count
-                                                            );
+                                                        ZeroHttpPostLookupDnsPrefetchOutcome::ContinueAfterWait => {}
+                                                        ZeroHttpPostLookupDnsPrefetchOutcome::NotAttempted => {
+                                                            if let Some(block) = self
+                                                                .wait_for_session_shortcut_post_lookup(
+                                                                    cid,
+                                                                    &providers,
+                                                                    http_provider_count,
+                                                                    shortcut.as_mut(),
+                                                                )
+                                                                .await?
+                                                            {
+                                                                return Ok((
+                                                                    block,
+                                                                    RetrievalSource::Bitswap,
+                                                                ));
+                                                            }
                                                         }
-                                                        Err(err) => {
-                                                            tracing::info!(
-                                                                phase = "bitswap_session_shortcut_post_lookup_wait",
-                                                                cid = %cid,
-                                                                outcome = "error",
-                                                                timeout_ms = post_lookup_grace.as_millis(),
-                                                                elapsed_ms = post_lookup_started.elapsed().as_millis(),
-                                                                provider_count = providers.len(),
-                                                                http_provider_count,
-                                                                error = %err
-                                                            );
-                                                            return Err(err);
-                                                        }
-                                                    },
-                                                    Err(_) => {
-                                                        tracing::info!(
-                                                            phase = "bitswap_session_shortcut_post_lookup_wait",
-                                                            cid = %cid,
-                                                            outcome = "timeout",
-                                                            timeout_ms = post_lookup_grace.as_millis(),
-                                                            elapsed_ms = post_lookup_started.elapsed().as_millis(),
-                                                            provider_count = providers.len(),
-                                                            http_provider_count
-                                                        );
                                                     }
-                                                }
                                                 }
                                             }
                                             providers
@@ -1720,6 +1683,242 @@ impl HttpRetriever {
                         Ok(None)
                     }
                 }
+            }
+        }
+    }
+
+    async fn wait_for_session_shortcut_post_lookup<F>(
+        &self,
+        cid: &Cid,
+        providers: &[Provider],
+        http_provider_count: usize,
+        mut shortcut: Pin<&mut F>,
+    ) -> Result<Option<Block>>
+    where
+        F: Future<Output = Result<Option<Block>>>,
+    {
+        let post_lookup_grace = bitswap_session_post_lookup_grace(providers);
+        let post_lookup_started = Instant::now();
+        match timeout(post_lookup_grace, &mut shortcut).await {
+            Ok(shortcut_result) => match shortcut_result {
+                Ok(Some(block)) => {
+                    tracing::info!(
+                        phase = "bitswap_session_shortcut_post_lookup_wait",
+                        cid = %cid,
+                        outcome = "hit",
+                        timeout_ms = post_lookup_grace.as_millis(),
+                        elapsed_ms = post_lookup_started.elapsed().as_millis(),
+                        provider_count = providers.len(),
+                        http_provider_count
+                    );
+                    Ok(Some(block))
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        phase = "bitswap_session_shortcut_post_lookup_wait",
+                        cid = %cid,
+                        outcome = "miss",
+                        timeout_ms = post_lookup_grace.as_millis(),
+                        elapsed_ms = post_lookup_started.elapsed().as_millis(),
+                        provider_count = providers.len(),
+                        http_provider_count
+                    );
+                    Ok(None)
+                }
+                Err(err) => {
+                    tracing::info!(
+                        phase = "bitswap_session_shortcut_post_lookup_wait",
+                        cid = %cid,
+                        outcome = "error",
+                        timeout_ms = post_lookup_grace.as_millis(),
+                        elapsed_ms = post_lookup_started.elapsed().as_millis(),
+                        provider_count = providers.len(),
+                        http_provider_count,
+                        error = %err
+                    );
+                    Err(err)
+                }
+            },
+            Err(_) => {
+                tracing::info!(
+                    phase = "bitswap_session_shortcut_post_lookup_wait",
+                    cid = %cid,
+                    outcome = "timeout",
+                    timeout_ms = post_lookup_grace.as_millis(),
+                    elapsed_ms = post_lookup_started.elapsed().as_millis(),
+                    provider_count = providers.len(),
+                    http_provider_count
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    async fn fetch_after_zero_http_post_lookup_dns_prefetch<F>(
+        &self,
+        cid: &Cid,
+        providers: &[Provider],
+        context: Option<RetrievalRequestContext>,
+        mut shortcut: Pin<&mut F>,
+    ) -> Result<ZeroHttpPostLookupDnsPrefetchOutcome>
+    where
+        F: Future<Output = Result<Option<Block>>>,
+    {
+        let post_lookup_grace = bitswap_session_post_lookup_grace(providers);
+        let http_provider_count = provider_http_url_count(providers);
+        let provider_count = providers.len();
+        if !zero_http_post_lookup_dns_prefetch_enabled() {
+            return Ok(ZeroHttpPostLookupDnsPrefetchOutcome::NotAttempted);
+        }
+        if !zero_http_post_lookup_dns_prefetch_allows_from_values(
+            true,
+            context.as_ref(),
+            http_provider_count,
+            provider_count,
+            has_bitswap_provider_candidate(providers),
+            zero_http_post_lookup_dns_prefetch_min_providers(),
+        ) {
+            return Ok(ZeroHttpPostLookupDnsPrefetchOutcome::NotAttempted);
+        }
+
+        let started = Instant::now();
+        tracing::info!(
+            phase = "zero_http_post_lookup_dns_prefetch_start",
+            cid = %cid,
+            provider_count,
+            http_provider_count,
+            timeout_ms = post_lookup_grace.as_millis(),
+            min_provider_count = zero_http_post_lookup_dns_prefetch_min_providers()
+        );
+
+        let dns_prefetch = self.prefetch_bitswap_dns_expansion_caches(providers);
+        tokio::pin!(dns_prefetch);
+        let post_lookup_wait = tokio::time::sleep(post_lookup_grace);
+        tokio::pin!(post_lookup_wait);
+        let mut dns_caches = None;
+        let mut wait_timed_out = false;
+
+        loop {
+            tokio::select! {
+                shortcut_result = shortcut.as_mut() => {
+                    match shortcut_result {
+                        Ok(Some(block)) => {
+                            tracing::info!(
+                                phase = "bitswap_session_shortcut_post_lookup_wait",
+                                cid = %cid,
+                                outcome = "hit",
+                                timeout_ms = post_lookup_grace.as_millis(),
+                                elapsed_ms = started.elapsed().as_millis(),
+                                provider_count,
+                                http_provider_count
+                            );
+                            return Ok(ZeroHttpPostLookupDnsPrefetchOutcome::Fetched(
+                                block,
+                                RetrievalSource::Bitswap,
+                            ));
+                        }
+                        Ok(None) => {
+                            tracing::info!(
+                                phase = "bitswap_session_shortcut_post_lookup_wait",
+                                cid = %cid,
+                                outcome = "miss",
+                                timeout_ms = post_lookup_grace.as_millis(),
+                                elapsed_ms = started.elapsed().as_millis(),
+                                provider_count,
+                                http_provider_count
+                            );
+                            break;
+                        }
+                        Err(err) => {
+                            tracing::info!(
+                                phase = "bitswap_session_shortcut_post_lookup_wait",
+                                cid = %cid,
+                                outcome = "error",
+                                timeout_ms = post_lookup_grace.as_millis(),
+                                elapsed_ms = started.elapsed().as_millis(),
+                                provider_count,
+                                http_provider_count,
+                                error = %err
+                            );
+                            return Err(err);
+                        }
+                    }
+                }
+                prefetch_result = &mut dns_prefetch, if dns_caches.is_none() => {
+                    let dnsaddr_cache_len = prefetch_result.dnsaddr_cache.len();
+                    let dns_ip_cache_len = prefetch_result.dns_ip_cache.len();
+                    dns_caches = Some(prefetch_result);
+                    tracing::info!(
+                        phase = "zero_http_post_lookup_dns_prefetch_ready",
+                        cid = %cid,
+                        provider_count,
+                        http_provider_count,
+                        timeout_ms = post_lookup_grace.as_millis(),
+                        dnsaddr_cache_len,
+                        dns_ip_cache_len,
+                        elapsed_ms = started.elapsed().as_millis()
+                    );
+                }
+                _ = &mut post_lookup_wait, if !wait_timed_out => {
+                    wait_timed_out = true;
+                    tracing::info!(
+                        phase = "bitswap_session_shortcut_post_lookup_wait",
+                        cid = %cid,
+                        outcome = "timeout",
+                        timeout_ms = post_lookup_grace.as_millis(),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        provider_count,
+                        http_provider_count
+                    );
+                    break;
+                }
+            }
+        }
+
+        let dns_caches = match dns_caches {
+            Some(dns_caches) => dns_caches,
+            None => dns_prefetch.await,
+        };
+        let fetch_started = Instant::now();
+        match self
+            .fetch_from_bitswap_providers_with_candidate_mode_and_dns_caches(
+                cid,
+                providers,
+                context,
+                BitswapProviderCandidateMode::Default,
+                Some(dns_caches),
+            )
+            .await
+        {
+            Ok(block) => {
+                tracing::info!(
+                    phase = "zero_http_post_lookup_dns_prefetch_result",
+                    cid = %cid,
+                    ok = true,
+                    provider_count,
+                    http_provider_count,
+                    wait_timed_out,
+                    fetch_elapsed_ms = fetch_started.elapsed().as_millis(),
+                    elapsed_ms = started.elapsed().as_millis()
+                );
+                Ok(ZeroHttpPostLookupDnsPrefetchOutcome::Fetched(
+                    block,
+                    RetrievalSource::Bitswap,
+                ))
+            }
+            Err(err) => {
+                tracing::info!(
+                    phase = "zero_http_post_lookup_dns_prefetch_result",
+                    cid = %cid,
+                    ok = false,
+                    provider_count,
+                    http_provider_count,
+                    wait_timed_out,
+                    error = %err,
+                    fetch_elapsed_ms = fetch_started.elapsed().as_millis(),
+                    elapsed_ms = started.elapsed().as_millis()
+                );
+                Ok(ZeroHttpPostLookupDnsPrefetchOutcome::ContinueAfterWait)
             }
         }
     }
@@ -2826,6 +3025,60 @@ impl HttpRetriever {
         candidates
     }
 
+    async fn bitswap_peers_with_quality_with_candidate_mode_and_dns_caches(
+        &self,
+        providers: &[Provider],
+        context: Option<&RetrievalRequestContext>,
+        candidate_mode: BitswapProviderCandidateMode,
+        mut dns_caches: BitswapDnsExpansionCaches,
+    ) -> BitswapProviderCandidates {
+        if candidate_mode.direct_ip_candidate_only()
+            || bitswap_direct_ip_provider_candidates_only_enabled()
+        {
+            return self
+                .bitswap_peers_with_quality_with_candidate_mode(providers, context, candidate_mode)
+                .await;
+        }
+
+        let candidates = bitswap_peers_with_quality_using_caches(
+            providers,
+            &mut dns_caches.dnsaddr_cache,
+            &mut dns_caches.dns_ip_cache,
+        )
+        .await;
+        self.record_bitswap_dns_expansion_caches(
+            &dns_caches.dnsaddr_cache,
+            &dns_caches.dns_ip_cache,
+        )
+        .await;
+        tracing::info!(
+            phase = "bitswap_dns_expansion_cache",
+            cache_scope = "zero_http_post_lookup_prefetch",
+            provider_count = providers.len(),
+            candidate_peer_count = candidates.peers.len(),
+            dnsaddr_cache_len = dns_caches.dnsaddr_cache.len(),
+            dns_ip_cache_len = dns_caches.dns_ip_cache.len()
+        );
+        candidates
+    }
+
+    async fn prefetch_bitswap_dns_expansion_caches(
+        &self,
+        providers: &[Provider],
+    ) -> BitswapDnsExpansionCaches {
+        let mut dnsaddr_cache = DnsaddrCache::new();
+        let mut dns_ip_cache = DnsIpCache::new();
+        self.seed_bitswap_dns_expansion_caches(providers, &mut dnsaddr_cache, &mut dns_ip_cache)
+            .await;
+        prefetch_bitswap_dns_expansions(providers, &mut dnsaddr_cache, &mut dns_ip_cache).await;
+        self.record_bitswap_dns_expansion_caches(&dnsaddr_cache, &dns_ip_cache)
+            .await;
+        BitswapDnsExpansionCaches {
+            dnsaddr_cache,
+            dns_ip_cache,
+        }
+    }
+
     async fn seed_bitswap_dns_expansion_caches(
         &self,
         providers: &[Provider],
@@ -2942,14 +3195,44 @@ impl HttpRetriever {
         context: Option<RetrievalRequestContext>,
         candidate_mode: BitswapProviderCandidateMode,
     ) -> Result<Block> {
+        self.fetch_from_bitswap_providers_with_candidate_mode_and_dns_caches(
+            cid,
+            providers,
+            context,
+            candidate_mode,
+            None,
+        )
+        .await
+    }
+
+    async fn fetch_from_bitswap_providers_with_candidate_mode_and_dns_caches(
+        &self,
+        cid: &Cid,
+        providers: &[Provider],
+        context: Option<RetrievalRequestContext>,
+        candidate_mode: BitswapProviderCandidateMode,
+        dns_caches: Option<BitswapDnsExpansionCaches>,
+    ) -> Result<Block> {
         let peer_started = Instant::now();
-        let BitswapProviderCandidates { mut peers, quality } = self
-            .bitswap_peers_with_quality_with_candidate_mode(
-                providers,
-                context.as_ref(),
-                candidate_mode,
-            )
-            .await;
+        let BitswapProviderCandidates { mut peers, quality } = match dns_caches {
+            Some(dns_caches) => {
+                self.bitswap_peers_with_quality_with_candidate_mode_and_dns_caches(
+                    providers,
+                    context.as_ref(),
+                    candidate_mode,
+                    dns_caches,
+                )
+                .await
+            }
+            None => {
+                self.bitswap_peers_with_quality_with_candidate_mode(
+                    providers,
+                    context.as_ref(),
+                    candidate_mode,
+                )
+                .await
+            }
+        };
         let provider_peer_count = peers.len();
         let provider_addr_score_order = bitswap_provider_addr_score_order_enabled();
         if provider_addr_score_order {
@@ -4770,6 +5053,40 @@ fn zero_http_post_lookup_race_enabled() -> bool {
     std::env::var_os(ENABLE_ZERO_HTTP_POST_LOOKUP_RACE_ENV).is_some()
 }
 
+fn zero_http_post_lookup_dns_prefetch_enabled() -> bool {
+    std::env::var_os(ENABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_ENV).is_some()
+}
+
+fn zero_http_post_lookup_dns_prefetch_min_providers() -> usize {
+    zero_http_post_lookup_dns_prefetch_min_providers_from_env_value(
+        std::env::var_os(ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn zero_http_post_lookup_dns_prefetch_min_providers_from_env_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS)
+}
+
+fn zero_http_post_lookup_dns_prefetch_allows_from_values(
+    enabled: bool,
+    context: Option<&RetrievalRequestContext>,
+    http_provider_count: usize,
+    provider_count: usize,
+    bitswap_provider_candidate_available: bool,
+    min_provider_count: usize,
+) -> bool {
+    enabled
+        && context.is_some_and(|context| !context.gateway_subresource())
+        && http_provider_count == 0
+        && provider_count >= min_provider_count
+        && bitswap_provider_candidate_available
+}
+
 fn bitswap_zero_http_direct_want_block_peers(
     provider_count: usize,
     context: Option<RetrievalRequestContext>,
@@ -5214,6 +5531,17 @@ enum SingleHttpProviderBitswapHedgeResult {
 enum DirectIpBitswapFallbackResult {
     DirectIp(Result<Block>),
     Normal(Result<Block>),
+}
+
+enum ZeroHttpPostLookupDnsPrefetchOutcome {
+    NotAttempted,
+    ContinueAfterWait,
+    Fetched(Block, RetrievalSource),
+}
+
+struct BitswapDnsExpansionCaches {
+    dnsaddr_cache: DnsaddrCache,
+    dns_ip_cache: DnsIpCache,
 }
 
 fn push_single_http_bitswap_hedge(
@@ -9427,6 +9755,90 @@ mod bitswap_tests {
                 "bad"
             )),
             TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_MIN_PROVIDERS
+        );
+    }
+
+    #[test]
+    fn zero_http_post_lookup_dns_prefetch_gate_is_narrow() {
+        let top_level = RetrievalRequestContext::gateway_request_with_top_level(
+            None,
+            Some("/ipfs/example".to_string()),
+        );
+        let subresource = RetrievalRequestContext::gateway_request_with_top_level(
+            Some(1),
+            Some("/ipfs/example".to_string()),
+        );
+
+        assert!(zero_http_post_lookup_dns_prefetch_allows_from_values(
+            true,
+            Some(&top_level),
+            0,
+            4,
+            true,
+            4,
+        ));
+        assert!(!zero_http_post_lookup_dns_prefetch_allows_from_values(
+            false,
+            Some(&top_level),
+            0,
+            4,
+            true,
+            4,
+        ));
+        assert!(!zero_http_post_lookup_dns_prefetch_allows_from_values(
+            true, None, 0, 4, true, 4,
+        ));
+        assert!(!zero_http_post_lookup_dns_prefetch_allows_from_values(
+            true,
+            Some(&subresource),
+            0,
+            4,
+            true,
+            4,
+        ));
+        assert!(!zero_http_post_lookup_dns_prefetch_allows_from_values(
+            true,
+            Some(&top_level),
+            1,
+            4,
+            true,
+            4,
+        ));
+        assert!(!zero_http_post_lookup_dns_prefetch_allows_from_values(
+            true,
+            Some(&top_level),
+            0,
+            3,
+            true,
+            4,
+        ));
+        assert!(!zero_http_post_lookup_dns_prefetch_allows_from_values(
+            true,
+            Some(&top_level),
+            0,
+            4,
+            false,
+            4,
+        ));
+    }
+
+    #[test]
+    fn zero_http_post_lookup_dns_prefetch_min_provider_override_is_validated() {
+        assert_eq!(
+            zero_http_post_lookup_dns_prefetch_min_providers_from_env_value(None),
+            ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS
+        );
+        assert_eq!(
+            zero_http_post_lookup_dns_prefetch_min_providers_from_env_value(Some("8")),
+            8
+        );
+        assert_eq!(
+            zero_http_post_lookup_dns_prefetch_min_providers_from_env_value(Some("0")),
+            ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS
+        );
+        assert_eq!(
+            zero_http_post_lookup_dns_prefetch_min_providers_from_env_value(Some("bad")),
+            ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS
         );
     }
 

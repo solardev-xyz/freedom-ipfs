@@ -36362,3 +36362,251 @@ and the live guardrail shows no obvious default regression when enabled in a
 window where it does not fire, but the key missing evidence is a live same-window
 sample where `top_level_single_http_failed_direct_ip_bitswap_fallback_*` events
 actually fire and improve the failing-single-HTTP tail versus a no-env control.
+
+## 2026-05-07 Current-Head Full-Corpus Baseline
+
+Purpose:
+
+Refresh the broad Rust-vs-Kubo picture after the latest disabled lab hooks and
+identify the next real Kubo win before starting another experiment.
+
+Command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 420 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-full-corpus-r5-20260507T171541Z-trace.jsonl \
+  --comparison-output /tmp/current-head-full-corpus-r5-20260507T171541Z.json
+```
+
+Result:
+
+The harness exited non-zero because Kubo failed the
+`daicowtf-dot-eth-is-not-ipns` negative/ENS case, which is not a Rust
+performance regression. The emitted comparison and trace artifacts are still
+valid for the successful performance cases.
+
+- Rust passed every measured run.
+- Kubo failed `daicowtf-dot-eth-is-not-ipns` in all 5 repeats.
+- Resource max: Rust `51188KiB` RSS and `31` FDs vs Kubo `158036KiB` RSS and
+  `222` FDs.
+- `vitalik-root-html-range`: Rust `147/329ms`; Kubo `4016/4460ms`.
+- `ipfs-tech-root-html-range`: Rust `714/1070ms`; Kubo `1104/1141ms`.
+- `ipfs-tech-page-assets`:
+  - root p50/p95: Rust `3/4ms`; Kubo `2/64ms`.
+  - asset p50/p95: Rust `102/241ms`; Kubo `348/422ms`.
+- `ipfs-tech-developers-hero-range`: Rust `145/191ms`; Kubo `320/433ms`.
+- `wikipedia-on-ipfs-root`: Rust `544/898ms`; Kubo `522/721ms`.
+- `daicowtf-dot-eth-is-not-ipns`: Rust `13/14ms`; Kubo `2228/3320ms`, but Kubo
+  did not pass the case.
+
+Trace summary:
+
+- Bitswap blocks: count `118`, p50/p90/p95/max `83/256/313/787ms`.
+- HTTP-provider blocks: count `82`, p50/p90/p95/max `131/237/286/734ms`.
+- Delegated provider lookups: `190` events; zero HTTP `15`, single HTTP `88`,
+  multi HTTP `87`.
+- Classifications:
+  - `zero_http_provider_bitswap=15`
+  - `cold_bitswap_peer_expand=10`
+  - `zero_http_provider_cold_bitswap=10`
+  - `top_level_zero_http_provider_bitswap=8`
+  - `top_level_zero_http_provider_cold_bitswap=5`
+- Zero-HTTP Bitswap latency p50/p90/p95/max: `543/909/1068/1068ms`.
+- Top-level zero-HTTP Bitswap latency p50/p90/p95/max:
+  `712/1068/1068/1068ms`.
+- Bitswap provider expansion: `13` events, p50/p90/p95/max
+  `28/191/411/411ms`; provider addrs `4477`, expanded `4756`, supported
+  `1260`, rejected `3496`, DNS events `36`, cached `21`, uncached `15`, failed
+  `18`.
+- Bitswap source candidate indexes: `0=8`, `1=4`, `3=1`.
+- Bitswap connections established: `32`, p50/p90/p95/max
+  `273/568/587/644ms`.
+
+Slow Wikipedia diagnosis:
+
+The remaining Kubo win in this window is `wikipedia-on-ipfs-root`, with Rust
+`544/898ms` vs Kubo `522/721ms`.
+
+The slowest Rust Wikipedia request resolved DNSLink quickly, found `64`
+providers for the root CID, but had zero HTTP providers. A recent cross
+top-level session peer existed and the post-lookup zero-HTTP grace waited
+`100ms`, then timed out. Only after that did provider fetch begin. The root then
+spent `354ms` in `bitswap_dns_prefetch` / `411ms` total in
+`bitswap_peer_expand`, followed by a `197ms` Bitswap fetch from candidate index
+`3`. The root `block_fetch_total` was `787ms`; total request was `897ms`.
+
+The follow-on `/index.html` block was not the slow part in this sample: provider
+lookup found two HTTP providers, and a session shortcut with two trusted peers
+delivered the block in `89ms` before HTTP mattered.
+
+Decision:
+
+The next useful experiment should target top-level zero-HTTP provider expansion
+latency around the post-lookup session grace. Repeating global direct-IP
+candidate changes is unlikely to be useful: the earlier direct-IP-only and
+direct fast-wave labs already showed mixed results and guardrail regressions.
+The narrower hypothesis is that, for top-level zero-HTTP provider sets, we can
+begin DNS/provider expansion while the session shortcut grace is still pending,
+so a missed shortcut does not add a full grace window before the expensive
+expansion starts.
+
+## 2026-05-07 Zero-HTTP Post-Lookup DNS Prefetch Lab
+
+Purpose:
+
+Turn the current-head full-corpus diagnosis into a disabled lab hook. The slow
+Wikipedia sample had a top-level zero-HTTP provider set, a recent session peer,
+a `100ms` post-lookup shortcut grace that timed out, and then expensive
+Bitswap DNS/provider expansion. The hypothesis is that DNS/provider expansion
+can begin while the shortcut grace is pending, so a shortcut miss does not pay
+both the full grace window and the full DNS expansion cost serially.
+
+Implementation:
+
+- Added disabled env knob:
+  `FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH=1`.
+- Added provider threshold override:
+  `FREEDOM_IPFS_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS=<n>`, default
+  `32`.
+- The gate is deliberately narrow:
+  - opt-in flag enabled
+  - top-level gateway request, not a subresource
+  - zero HTTP providers
+  - provider count above the threshold
+  - at least one Bitswap provider candidate
+  - only on the non-racing post-lookup shortcut path
+- When enabled, the retriever starts Bitswap DNS expansion while waiting for
+  the post-lookup session shortcut. If the shortcut hits, the DNS work is
+  dropped. If the shortcut misses or times out, the warmed DNS caches are reused
+  for the immediate Bitswap provider fetch.
+- Added trace phases:
+  - `zero_http_post_lookup_dns_prefetch_start`
+  - `zero_http_post_lookup_dns_prefetch_ready`
+  - `zero_http_post_lookup_dns_prefetch_result`
+- Added focused gate/override tests.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval zero_http_post_lookup_dns_prefetch --lib
+cargo test -p freedom-ipfs-retrieval --lib
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Results:
+
+- Focused new tests passed: `2 passed`.
+- Full retrieval lib tests passed: `130 passed`, `1 ignored`.
+- Retrieval clippy passed with `-D warnings`.
+
+Default-threshold opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH=1 \
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-postlookup-dns-prefetch-focused-r5-20260507T183000Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-postlookup-dns-prefetch-focused-r5-20260507T183000Z.json
+```
+
+Default-threshold opt-in result:
+
+- Rust and Kubo passed `5/5` for every case.
+- `ipfs-tech-root-html-range`: Rust `762/949ms`; Kubo `1335/3470ms`.
+- `ipfs-tech-page-assets`:
+  - root p50/p95: Rust `3/3ms`; Kubo `2/64ms`.
+  - asset p50/p95: Rust `119/320ms`; Kubo `129/755ms`.
+- Wikipedia root: Rust `114/241ms`; Kubo `258/334ms`.
+- Resource max: Rust `49044KiB` RSS and `25` FDs vs Kubo `238796KiB` RSS
+  and `395` FDs.
+- Trace classifications still had only one top-level zero-HTTP request, and
+  `zero_http_post_lookup_dns_prefetch_*` did **not** appear in the trace.
+
+Immediate no-env post-control command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-postlookup-dns-prefetch-post-control-r5-20260507T183400Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-postlookup-dns-prefetch-post-control-r5-20260507T183400Z.json
+```
+
+Immediate post-control result:
+
+- Rust and Kubo passed `5/5` for every case.
+- `ipfs-tech-root-html-range`: Rust `848/1100ms`; Kubo `1512/1729ms`.
+- `ipfs-tech-page-assets`:
+  - root p50/p95: Rust `4/4ms`; Kubo `2/2ms`.
+  - asset p50/p95: Rust `129/299ms`; Kubo `110/454ms`.
+- Wikipedia root: Rust `269/297ms`; Kubo `390/1071ms`.
+- Resource max: Rust `48732KiB` RSS and `25` FDs vs Kubo `283740KiB` RSS
+  and `406` FDs.
+
+Widened smoke command:
+
+```sh
+FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH=1 \
+FREEDOM_IPFS_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS=1 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --case ipfs-tech-root-html-range \
+  --repeat 3 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-postlookup-dns-prefetch-min1-smoke-r3-20260507T184000Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-postlookup-dns-prefetch-min1-smoke-r3-20260507T184000Z.json
+```
+
+Widened smoke result:
+
+- Rust and Kubo passed `3/3` for both cases.
+- The run still did not exercise the new zero-HTTP gate: delegated lookup
+  distribution was zero HTTP `0`, single HTTP `12`, multi HTTP `0`.
+- The visible Wikipedia slowdown in this widened smoke was a different
+  single-HTTP failure shape: `f010479.twinquasar.io` returned `500` for the
+  follow-on block, then normal Bitswap DNS expansion and fetch took about
+  `2.2s`. That is not the top-level zero-HTTP post-lookup grace shape targeted
+  by this lab.
+
+Decision:
+
+Keep this as a disabled lab hook only. The code path is unit-covered and the
+default-threshold opt-in guardrail did not show obvious regressions, but the
+public network did not reproduce the qualifying top-level zero-HTTP shape in
+this window. Do not promote this by default without a same-window sample where
+`zero_http_post_lookup_dns_prefetch_*` events actually fire and improve the
+top-level zero-HTTP tail versus a no-env control.
