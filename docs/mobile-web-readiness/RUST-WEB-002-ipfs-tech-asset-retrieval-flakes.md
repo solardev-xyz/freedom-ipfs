@@ -35606,3 +35606,90 @@ should move away from speculative preconnect and toward explaining why the
 current no-env path is now getting excellent zero-HTTP Bitswap latency with only
 `32` connections, then preserving that source-selection behavior across noisier
 windows.
+
+## 2026-05-07 Broad No-Env Corpus After Preconnect Sweep
+
+Question:
+
+After rejecting the preconnect sweep, where are the current no-env Kubo wins if
+we broaden beyond the three-case guardrail?
+
+Command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-root-html-range \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-page-assets-cid-direct \
+  --case ipfs-tech-developers-hero-range \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 360 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-broad-corpus-r5-20260507Tpostpreconnect-trace.jsonl \
+  --comparison-output /tmp/current-head-broad-corpus-r5-20260507Tpostpreconnect.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- Rust wins the cold/network-bound cases:
+  - DAICO root range: Rust `869/1142ms`; Kubo `3141/3271ms`.
+  - Vitalik range: Rust `106/129ms`; Kubo `1689/3396ms`.
+  - `ipfs.tech` root range: Rust `574/623ms`; Kubo `1024/1158ms`.
+  - `ipfs.tech` page assets: Rust root `2/3ms` and assets `47/89ms`; Kubo
+    root `2/6ms` and assets `366/433ms`.
+  - `ipfs.tech` hero prefix range: Rust `86/89ms`; Kubo `385/398ms`.
+  - Wikipedia root: Rust `722/736ms`; Kubo `732/834ms`.
+- Kubo wins/ties only the already-hot/local-style cases:
+  - DAICO page assets after the DAICO root range: Rust root `432/473ms`; Kubo
+    root `2/2ms`.
+  - `ipfs.tech` CID-direct page assets: Rust root `3/3ms`, assets `2/3ms`;
+    Kubo root `1/1ms`, assets `1/2ms`.
+  - `ipfs.tech` hero middle/suffix/HEAD were all `2-4ms` for both engines, with
+    ratios dominated by millisecond-level noise.
+- Resource max stayed strongly in Rust's favor: Rust `50272KiB` RSS and `25`
+  FDs vs Kubo `162968KiB` RSS and `194` FDs.
+- Trace shape:
+  - Bitswap blocks: `185`, p50/p95/max `43/253/681ms`.
+  - HTTP-provider blocks: `30`, p50/p95/max `249/651/821ms`.
+  - Classified zero-HTTP Bitswap requests: `10`, split between
+    `/ipns/ipfs.tech/` range roots and `/ipns/en.wikipedia-on-ipfs.org`.
+  - Bitswap connections: `26`.
+
+Interpretation:
+
+The remaining broad Kubo win is not the original cold page-asset problem.
+`daicowtf-page-assets` only loses here because it runs immediately after
+`daicowtf-root-html-range` against the same fresh gateway process. Kubo appears
+to make the following full-page read effectively hot after serving the small
+range, while Rust's efficient range path still leaves later full-file blocks to
+fetch. In the page-first guardrail, DAICO remains a Rust win.
+
+Do not "fix" this by blindly fetching whole files for every range request; that
+would trade away mobile efficiency for an artificial ordered-corpus win. The
+useful follow-up is narrower:
+
+- isolate DAICO range-then-full behavior;
+- identify whether Kubo warms full UnixFS files during small ranges or whether
+  Rust is missing a cheap metadata/index cache hit;
+- consider any warm-after-range optimization only if it can be gated to HTML or
+  tiny/likely-followed reads without expanding media-range bandwidth.
+
+Current no-env status after this sweep:
+
+- Cold roots, IPNS page assets, media prefix range, Wikipedia, and resource use
+  are all at parity or better than Kubo.
+- Remaining actionable work has shifted to warm-session semantics and
+  range-then-full reuse, not broad preconnect or static Bitswap fanout.
