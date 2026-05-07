@@ -170,6 +170,8 @@ const MAX_PENDING_INCOMING_BITSWAP_READS: usize = 32;
 // back to conservative WANT_HAVE probes for the rest. This lowers page-asset
 // tails without requesting every block from every provider candidate.
 const MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS: usize = 3;
+const BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS";
 const BITSWAP_DNS_PREFETCH_CONCURRENCY: usize = 8;
 const BITSWAP_DNS_LOOKUP_TIMEOUT_MS_ENV: &str = "FREEDOM_IPFS_BITSWAP_DNS_LOOKUP_TIMEOUT_MS";
 const BITSWAP_DNS_EXPANSION_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -2500,6 +2502,7 @@ impl HttpRetriever {
             trusted_peer_count,
             gateway_subresource,
             zero_http_direct_want_block_peer_count,
+            direct_untrusted_want_block_limit = bitswap_direct_want_block_untrusted_peer_limit(),
             tcp_addr_count = addr_stats.tcp,
             quic_addr_count = addr_stats.quic,
             ws_addr_count = addr_stats.ws,
@@ -4108,6 +4111,21 @@ fn bitswap_early_provider_peer_cap_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP_ENV).is_some()
 }
 
+fn bitswap_direct_want_block_untrusted_peer_limit() -> usize {
+    bitswap_direct_want_block_untrusted_peer_limit_from_env_value(
+        std::env::var_os(BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn bitswap_direct_want_block_untrusted_peer_limit_from_env_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.min(MAX_BITSWAP_PEERS_PER_BLOCK))
+        .unwrap_or(MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS)
+}
+
 fn successful_peer_matches_top_level_scope(
     success: &SuccessfulBitswapPeer,
     scoped_session_peers: bool,
@@ -4637,6 +4655,7 @@ async fn run_shared_bitswap_swarm(
                     pending_dial_peer_count,
                     connected_peer_count,
                     command_queued_ms,
+                    direct_untrusted_want_block_limit = bitswap_direct_want_block_untrusted_peer_limit(),
                     targets = %target_summary.as_deref().unwrap_or("")
                 );
 
@@ -6579,9 +6598,25 @@ fn bitswap_prefer_want_have(
     force_want_block: bool,
     direct_untrusted_want_block_count: &mut usize,
 ) -> bool {
+    bitswap_prefer_want_have_with_direct_limit(
+        has_multiple_peers,
+        skip_want_have,
+        force_want_block,
+        direct_untrusted_want_block_count,
+        bitswap_direct_want_block_untrusted_peer_limit(),
+    )
+}
+
+fn bitswap_prefer_want_have_with_direct_limit(
+    has_multiple_peers: bool,
+    skip_want_have: bool,
+    force_want_block: bool,
+    direct_untrusted_want_block_count: &mut usize,
+    direct_untrusted_want_block_limit: usize,
+) -> bool {
     if !skip_want_have
         && (force_want_block
-            || *direct_untrusted_want_block_count < MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS)
+            || *direct_untrusted_want_block_count < direct_untrusted_want_block_limit)
     {
         *direct_untrusted_want_block_count += 1;
         return false;
@@ -9498,6 +9533,51 @@ mod bitswap_tests {
                 Some(RetrievalRequestContext::gateway_request(Some(1))),
             ),
             Some(5)
+        );
+    }
+
+    #[test]
+    fn direct_untrusted_want_block_peer_limit_parses_override() {
+        assert_eq!(
+            bitswap_direct_want_block_untrusted_peer_limit_from_env_value(None),
+            MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS
+        );
+        assert_eq!(
+            bitswap_direct_want_block_untrusted_peer_limit_from_env_value(Some("bad")),
+            MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS
+        );
+        assert_eq!(
+            bitswap_direct_want_block_untrusted_peer_limit_from_env_value(Some("0")),
+            0
+        );
+        assert_eq!(
+            bitswap_direct_want_block_untrusted_peer_limit_from_env_value(Some("1")),
+            1
+        );
+        assert_eq!(
+            bitswap_direct_want_block_untrusted_peer_limit_from_env_value(Some("999")),
+            MAX_BITSWAP_PEERS_PER_BLOCK
+        );
+    }
+
+    #[test]
+    fn direct_untrusted_want_block_peer_limit_controls_request_modes() {
+        let mut direct = 0;
+        assert!(
+            !bitswap_prefer_want_have_with_direct_limit(true, false, false, &mut direct, 1),
+            "first untrusted peer should get the optimistic want-block"
+        );
+        assert!(
+            bitswap_prefer_want_have_with_direct_limit(true, false, false, &mut direct, 1),
+            "later untrusted peers should use want-have after the limit"
+        );
+        assert!(
+            !bitswap_prefer_want_have_with_direct_limit(true, true, false, &mut direct, 1),
+            "trusted/session peers still bypass want-have"
+        );
+        assert!(
+            !bitswap_prefer_want_have_with_direct_limit(true, false, true, &mut direct, 0),
+            "forced peers still get want-block even when the generic direct limit is zero"
         );
     }
 

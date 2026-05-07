@@ -31203,3 +31203,92 @@ zero-HTTP/Bitswap tails. The new evidence suggests the next behavior lab should
 test Kubo-like optimistic direct width: fewer untrusted direct `want-block`
 targets plus broader `want-have` probing, rather than simply capping providers
 or globally trusting/distrusting recent successful peers.
+
+## 2026-05-07 - Reject: Static One-Untrusted Bitswap Direct WANT_BLOCK Width
+
+Purpose:
+Test a Kubo-like Bitswap request shape where only one generic untrusted provider
+gets an optimistic direct `WANT_BLOCK`, while later untrusted candidates receive
+`WANT_HAVE` probes. Trusted/session peers still get direct `WANT_BLOCK`
+requests. This was tested as a disabled lab control with
+`FREEDOM_IPFS_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS=1`; the default remains
+`3`.
+
+Code:
+
+- Added `FREEDOM_IPFS_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS=<n>` as a
+  lab-only override for the generic untrusted direct `WANT_BLOCK` width.
+- The override is capped at `MAX_BITSWAP_PEERS_PER_BLOCK`.
+- Added unit coverage for parsing and request-mode selection.
+- Added `direct_untrusted_want_block_limit` to `bitswap_peer_expand` and
+  `bitswap_dial_plan` traces so future runs can confirm which width was active.
+
+Command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/direct1-selected-r5-20260507T074625Z-trace.jsonl \
+  --comparison-output /tmp/direct1-selected-r5-20260507T074625Z.json
+```
+
+Same-window baseline for comparison:
+
+- `/tmp/current-head-selected-r5-20260507T073414Z.json`
+- `/tmp/current-head-selected-r5-20260507T073414Z-trace.jsonl`
+
+Result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root moved from Rust `1179/1287ms` to `1297/1320ms`; still faster than
+  Kubo `2934/3201ms`, but worse than control.
+- Vitalik range moved from Rust `102/118ms` to `111/123ms`; still much faster
+  than Kubo.
+- `ipfs.tech` root range moved from Rust `604/1021ms` to `730/835ms`; median
+  regressed, p95 improved.
+- `ipfs.tech` page assets moved from Rust `94/420ms` to `178/439ms`; still
+  faster than Kubo median `345ms`, but only tied Kubo p95 `441ms`.
+- `ipfs.tech` hero range moved from Rust `118/143ms` to `118/173ms`.
+- Wikipedia root moved from Rust `246/721ms` to `646/1228ms`; this lost to Kubo
+  `489/679ms` on both median and p95.
+- Resource max stayed light: Rust `51444KiB` RSS and `36` FDs vs Kubo
+  `136136KiB` RSS and `138` FDs. Compared with the same-window control, RSS was
+  basically unchanged and FDs rose by `5`.
+
+Trace:
+
+- `direct_untrusted_want_block_limit=1` was present on `153` Bitswap planning
+  events.
+- Bitswap block fetches moved from control `73/498/1285ms` p50/p95/max to
+  `126/531/1267ms`.
+- HTTP provider block fetches were `180/444/782ms`, so the regression was
+  concentrated in Bitswap-heavy/zero-HTTP paths, not HTTP-provider racing.
+- The slowest `ipfs.tech` child was `_nuxt/hfYlCurB.js` at `1270ms`; it was a
+  zero-HTTP cold Bitswap peer expansion. The slowest Wikipedia root sample was
+  `1226ms`, also zero-HTTP Bitswap.
+- Successful Bitswap source modes in this run were mostly `want_block`
+  (`46`) with a few `want_have` deliveries (`5`), so narrower direct width did
+  not eliminate slow peers and did not produce a clear useful HAVE-driven win.
+
+Decision:
+Do not promote a static width of one generic untrusted direct `WANT_BLOCK`. Keep
+the env-gated lab control and trace fields because they are useful for future
+comparisons, but the default width of `3` remains better for the selected
+mobile browsing corpus. Future work should avoid static global width changes
+and instead decide direct `WANT_BLOCK` targets from source quality: recent
+per-top-level wins, peer latency/availability, provider position, and whether a
+request is a top-level document versus a page subresource.
