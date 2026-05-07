@@ -174,6 +174,8 @@ const MAX_PENDING_INCOMING_BITSWAP_READS: usize = 32;
 const MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS: usize = 3;
 const BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS";
+const ENABLE_BITSWAP_PROVIDER_ADDR_SCORE_ORDER_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_BITSWAP_PROVIDER_ADDR_SCORE_ORDER";
 const BITSWAP_DNS_PREFETCH_CONCURRENCY: usize = 8;
 const BITSWAP_DNS_LOOKUP_TIMEOUT_MS_ENV: &str = "FREEDOM_IPFS_BITSWAP_DNS_LOOKUP_TIMEOUT_MS";
 const BITSWAP_DNS_EXPANSION_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -2478,6 +2480,10 @@ impl HttpRetriever {
         let BitswapProviderCandidates { mut peers, quality } =
             self.bitswap_peers_with_quality(providers).await;
         let provider_peer_count = peers.len();
+        let provider_addr_score_order = bitswap_provider_addr_score_order_enabled();
+        if provider_addr_score_order {
+            sort_bitswap_peers_by_addr_score(&mut peers);
+        }
         if provider_peer_count == 0 && !providers.is_empty() {
             tracing::info!(
                 phase = "bitswap_provider_candidates_empty",
@@ -2517,6 +2523,7 @@ impl HttpRetriever {
             skipped_provider_count = quality.skipped_provider_count,
             early_provider_peer_cap = quality.early_peer_cap,
             early_provider_peer_cap_hit = quality.early_peer_cap_hit,
+            provider_addr_score_order,
             expanded_provider_addr_count = quality.expanded_addr_count,
             supported_provider_addr_count = quality.supported_addr_count,
             rejected_provider_addr_count = quality.rejected_addr_count(),
@@ -4111,6 +4118,10 @@ fn bitswap_top_level_scoped_session_peers_enabled() -> bool {
 
 fn bitswap_early_provider_peer_cap_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP_ENV).is_some()
+}
+
+fn bitswap_provider_addr_score_order_enabled() -> bool {
+    std::env::var_os(ENABLE_BITSWAP_PROVIDER_ADDR_SCORE_ORDER_ENV).is_some()
 }
 
 fn bitswap_direct_want_block_untrusted_peer_limit() -> usize {
@@ -6299,6 +6310,18 @@ fn bitswap_addr_score(addr: &Multiaddr) -> u8 {
     }
 }
 
+fn bitswap_peer_min_addr_score(peer: &BitswapPeer) -> u8 {
+    peer.addrs.iter().map(bitswap_addr_score).min().unwrap_or(9)
+}
+
+fn sort_bitswap_peers_by_addr_score(peers: &mut [BitswapPeer]) {
+    peers.sort_by(|left, right| {
+        bitswap_peer_min_addr_score(left)
+            .cmp(&bitswap_peer_min_addr_score(right))
+            .then_with(|| right.addrs.len().cmp(&left.addrs.len()))
+    });
+}
+
 fn should_refresh_providers_after_failure(err: &RetrievalError) -> bool {
     matches!(
         err,
@@ -7720,6 +7743,47 @@ mod bitswap_tests {
         assert_eq!(quality.addr_with_webtransport_count, 1);
         assert_eq!(quality.addr_with_webrtc_count, 0);
         assert_eq!(quality.addr_with_certhash_count, 1);
+    }
+
+    #[test]
+    fn provider_addr_score_order_prefers_direct_dial_addresses() {
+        let dns_peer = PeerId::random();
+        let tcp_peer = PeerId::random();
+        let quic_peer = PeerId::random();
+        let ws_peer = PeerId::random();
+        let mut peers = vec![
+            BitswapPeer {
+                id: ws_peer,
+                addrs: vec!["/ip4/127.0.0.4/tcp/4001/ws".parse().unwrap()],
+                skip_want_have: false,
+                force_want_block: false,
+            },
+            BitswapPeer {
+                id: dns_peer,
+                addrs: vec!["/dns4/provider.example/tcp/4001".parse().unwrap()],
+                skip_want_have: false,
+                force_want_block: false,
+            },
+            BitswapPeer {
+                id: quic_peer,
+                addrs: vec!["/ip4/127.0.0.3/udp/4001/quic-v1".parse().unwrap()],
+                skip_want_have: false,
+                force_want_block: false,
+            },
+            BitswapPeer {
+                id: tcp_peer,
+                addrs: vec!["/ip4/127.0.0.2/tcp/4001".parse().unwrap()],
+                skip_want_have: false,
+                force_want_block: false,
+            },
+        ];
+
+        sort_bitswap_peers_by_addr_score(&mut peers);
+
+        assert_eq!(peers[0].id, tcp_peer);
+        assert_eq!(peers[1].id, quic_peer);
+        assert_eq!(peers[2].id, dns_peer);
+        assert_eq!(peers[3].id, ws_peer);
     }
 
     #[tokio::test]

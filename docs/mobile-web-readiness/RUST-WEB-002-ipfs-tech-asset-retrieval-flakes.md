@@ -31386,3 +31386,134 @@ incoming read timeout occurred. Future work should look for traces with
 `bitswap_incoming_stream_read ok=false timed_out=true`; only those runs can
 evaluate whether immediate peer backoff improves tails without harming useful
 session reuse.
+
+## 2026-05-07 - Reject: Cold Bitswap Provider Address-Score Ordering
+
+Hypothesis:
+Cold Bitswap provider peers keep delegated/provider order, while only addresses
+inside each peer are scored. A lightweight provider-peer ordering by best dial
+address quality might put direct TCP/IP peers into the first direct
+`WANT_BLOCK` slots without dropping provider diversity. This is a narrower
+alternative to the rejected early provider peer cap.
+
+Code:
+
+- Added disabled env flag:
+  `FREEDOM_IPFS_ENABLE_BITSWAP_PROVIDER_ADDR_SCORE_ORDER=1`.
+- When enabled, cold provider peers are sorted by their best `bitswap_addr_score`
+  before successful/session peer scoring and before the direct
+  `WANT_BLOCK`/`WANT_HAVE` split.
+- Added `provider_addr_score_order` to `bitswap_peer_expand` traces.
+- Added unit coverage that direct `/ip4/.../tcp` peers sort ahead of QUIC, DNS,
+  and WebSocket-shaped peers.
+- Default behavior is unchanged.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval provider_addr_score_order_prefers_direct_dial_addresses --lib
+```
+
+Result:
+
+- Focused unit test passed.
+- Formatting passed after applying `cargo fmt --all`.
+
+Opt-in command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_ENABLE_BITSWAP_PROVIDER_ADDR_SCORE_ORDER=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/provider-addr-score-order-selected-r5-20260507T080159Z-trace.jsonl \
+  --comparison-output /tmp/provider-addr-score-order-selected-r5-20260507T080159Z.json
+```
+
+Immediate no-env control:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/provider-order-noenv-control-selected-r5-20260507T080447Z-trace.jsonl \
+  --comparison-output /tmp/provider-order-noenv-control-selected-r5-20260507T080447Z.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1311/1496ms` vs Kubo `2438/2828ms`.
+- Vitalik range: Rust `105/144ms` vs Kubo `2446/3249ms`.
+- `ipfs.tech` root range: Rust `709/1102ms` vs Kubo `1038/1332ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `167/340ms`; Kubo root
+  `2/2ms`, assets `348/508ms`.
+- `ipfs.tech` hero range: Rust `111/165ms` vs Kubo `423/488ms`.
+- Wikipedia root: Rust `564/1050ms` vs Kubo `513/623ms`.
+- Resource max: Rust `50344KiB` RSS and `29` FDs vs Kubo `175180KiB` RSS and
+  `230` FDs.
+- HTTP provider block fetch p50/p95/max: `186/573/859ms`.
+- Bitswap block fetch p50/p95/max: `85/556/641ms`.
+
+Same-window no-env control:
+
+- DAICO root: Rust `1238/1717ms` vs Kubo `2898/3103ms`.
+- Vitalik range: Rust `114/126ms` vs Kubo `2596/3389ms`.
+- `ipfs.tech` root range: Rust `733/957ms` vs Kubo `1122/2375ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `185/297ms`; Kubo root
+  `2/66ms`, assets `350/447ms`.
+- `ipfs.tech` hero range: Rust `103/133ms` vs Kubo `408/434ms`.
+- Wikipedia root: Rust `714/993ms` vs Kubo `483/521ms`.
+- Resource max: Rust `50624KiB` RSS and `30` FDs vs Kubo `302100KiB` RSS and
+  `365` FDs.
+- HTTP provider block fetch p50/p95/max: `184/426/764ms`.
+- Bitswap block fetch p50/p95/max: `169/492/519ms`.
+
+Trace interpretation:
+
+- The opt-in flag participated: `provider_addr_score_order=true` on all `9`
+  `bitswap_peer_expand` events in the opt-in trace.
+- Opt-in had fewer zero-HTTP/cold classifications in this sample, but more
+  Bitswap block fetches (`54` vs `29`) and more Bitswap peer attempts
+  (`158` vs `132`).
+- Opt-in delivered most successful Bitswap blocks from candidate index `0`,
+  which proves the sort changed the direct target shape. That did not translate
+  into a better selected-corpus p95.
+- Versus no-env, opt-in improved DAICO p95, Vitalik median, `ipfs.tech` root
+  median, `ipfs.tech` page-asset median, and Wikipedia median. It regressed
+  Vitalik p95, `ipfs.tech` root p95, `ipfs.tech` page-asset p95, hero p50/p95,
+  and Wikipedia p95.
+
+Decision:
+Do not promote provider address-score ordering. Keep it as a disabled lab
+control because it is useful for source-order comparisons, but the same-window
+control shows the static transport/address score is too blunt. It changes which
+peers get the early direct `WANT_BLOCK`, but it does not reliably pick peers
+that actually serve the block quickly. Future source-quality work needs
+delivery evidence, not only dial-address shape: per-CID/root first responders,
+recent DONT_HAVE/read-timeout behavior, and top-level/session delivery history.
