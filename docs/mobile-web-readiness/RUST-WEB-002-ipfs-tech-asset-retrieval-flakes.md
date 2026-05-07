@@ -30742,3 +30742,103 @@ successful peers is too blunt. The next useful source-quality work should be
 request-shape-specific, especially for zero-HTTP top-level/page-session cases
 where Kubo finds a better warmed source without sacrificing our lower RSS/FD
 profile.
+
+## 2026-05-07 - Reject: Top-Level Scoped Bitswap Session Peers
+
+Question:
+Could cross-page contamination in the recent successful Bitswap peer pool be
+hurting later requests? The selected corpus often warms peers through DAICO,
+Vitalik, and `ipfs.tech` before reaching Wikipedia. If those earlier successful
+peers are poor sources for Wikipedia, strict top-level scoping might prevent a
+bad shortcut and improve the remaining Kubo-loss case.
+
+Code:
+
+- Added disabled env flag:
+  `FREEDOM_IPFS_ENABLE_BITSWAP_TOP_LEVEL_SCOPED_SESSION_PEERS=1`.
+- Gateway retrieval contexts now carry a top-level path. If
+  `X-Freedom-Top-Level-Path` is present, the context uses that value; otherwise
+  it falls back to the current request path.
+- Successful Bitswap peer records store the top-level path from the current
+  gateway context.
+- When the flag is set, recent session peers are filtered to the current
+  top-level path before racing trusted/session peers.
+- The trace emits `bitswap_session_peer_scope` with `top_level_path`,
+  `peer_count_before`, `peer_count_after`, and `skipped_peer_count`.
+- Default behavior is unchanged when the flag is absent.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval session_peer --lib
+cargo test -p freedom-ipfs-retrieval successful_peer_scope --lib
+cargo check -p freedom-ipfs-gateway --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo clippy -p freedom-ipfs-gateway --all-targets -- -D warnings
+```
+
+Result:
+
+- `5` focused session-peer tests passed.
+- `1` focused successful-peer-scope test passed.
+- Gateway check passed.
+- Focused retrieval and gateway clippy passed.
+
+Live command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_ENABLE_BITSWAP_TOP_LEVEL_SCOPED_SESSION_PEERS=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/scoped-session-peers-selected-r5-20260507T0910Z-trace.jsonl \
+  --comparison-output /tmp/scoped-session-peers-selected-r5-20260507T0910Z.json
+```
+
+Live result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1240/1520ms` vs Kubo `2881/2922ms`.
+- Vitalik range: Rust `109/114ms` vs Kubo `1439/1806ms`.
+- `ipfs.tech` root range: Rust `908/1427ms` vs Kubo `1361/1786ms`.
+- `ipfs.tech` page assets: Rust root `3/4ms`, assets `111/421ms`; Kubo root
+  `2/3ms`, assets `357/574ms`.
+- `ipfs.tech` hero range: Rust `125/158ms` vs Kubo `452/527ms`.
+- Wikipedia root regressed badly: Rust `1002/2361ms` vs Kubo `359/374ms`.
+- Resource max: Rust `51264KiB` RSS and `35` FDs vs Kubo `155340KiB` RSS and
+  `258` FDs.
+- HTTP provider block fetch p50/p95/max: `181/590/643ms`.
+- Bitswap block fetch p50/p95/max: `88/583/1964ms`.
+- Bitswap peer attempts: `259`.
+- Trace had `310` `bitswap_session_peer_scope` markers.
+
+Trace interpretation:
+Strict top-level scoping did not close the remaining Kubo gap. It preserved the
+`ipfs.tech` asset win, but Wikipedia became the worst selected-case regression.
+The slowest Wikipedia request took `2359ms`; its `bitswap_session_shortcut`
+held on one trusted peer for `1961ms` before returning the block, and the
+post-lookup shortcut race for CID `bafkreicr5...` took `1903ms`. That means the
+bad path is not simply "an earlier page polluted the session pool". A
+top-level-scoped trusted peer can still be slow, and strict scoping may remove
+useful cross-request continuity without adding better source quality.
+
+Decision:
+Do not promote top-level scoped session peers. Keep the flag only as a disabled
+diagnostic for proving whether a future source-quality change depends on global
+or top-level session peer reuse. The next useful work should keep the global
+pool available but add better escape hatches for slow trusted shortcuts, or seed
+candidate peers from provider/source quality rather than siloing the session by
+top-level path.

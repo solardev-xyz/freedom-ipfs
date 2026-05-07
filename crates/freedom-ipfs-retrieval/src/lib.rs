@@ -146,6 +146,8 @@ const MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND: usize = 5;
 const MAX_BITSWAP_PEERS_PER_BLOCK: usize = 16;
 const MAX_BITSWAP_SESSION_PEERS: usize = 4;
 const BITSWAP_SESSION_PEER_LIMIT_ENV: &str = "FREEDOM_IPFS_BITSWAP_SESSION_PEER_LIMIT";
+const ENABLE_BITSWAP_TOP_LEVEL_SCOPED_SESSION_PEERS_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_BITSWAP_TOP_LEVEL_SCOPED_SESSION_PEERS";
 const ENABLE_BITSWAP_DOMINANT_SESSION_PEER_ENV: &str =
     "FREEDOM_IPFS_ENABLE_BITSWAP_DOMINANT_SESSION_PEER";
 const ENABLE_BITSWAP_TOP_LEVEL_DOMINANT_SESSION_PEER_ENV: &str =
@@ -285,20 +287,33 @@ struct MissingBlockRange {
     end: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RetrievalRequestContext {
     gateway_subresource: bool,
+    top_level_path: Option<String>,
 }
 
 impl RetrievalRequestContext {
     pub fn gateway_request(parent_request_id: Option<u64>) -> Self {
+        Self::gateway_request_with_top_level(parent_request_id, None)
+    }
+
+    pub fn gateway_request_with_top_level(
+        parent_request_id: Option<u64>,
+        top_level_path: Option<String>,
+    ) -> Self {
         Self {
             gateway_subresource: parent_request_id.is_some(),
+            top_level_path,
         }
     }
 
     pub fn gateway_subresource(&self) -> bool {
         self.gateway_subresource
+    }
+
+    pub fn top_level_path(&self) -> Option<&str> {
+        self.top_level_path.as_deref()
     }
 }
 
@@ -317,7 +332,9 @@ where
 }
 
 fn current_retrieval_request_context() -> Option<RetrievalRequestContext> {
-    RETRIEVAL_REQUEST_CONTEXT.try_with(|context| *context).ok()
+    RETRIEVAL_REQUEST_CONTEXT
+        .try_with(|context| context.clone())
+        .ok()
 }
 
 impl HttpRetriever {
@@ -613,7 +630,7 @@ impl HttpRetriever {
                                                             .fetch_after_session_shortcut_provider_lookup(
                                                                 cid,
                                                                 &providers,
-                                                                context,
+                                                                context.clone(),
                                                                 shortcut.as_mut(),
                                                             )
                                                             .await?
@@ -818,7 +835,7 @@ impl HttpRetriever {
                                                         .fetch_after_session_shortcut_provider_lookup(
                                                             cid,
                                                             &providers,
-                                                            context,
+                                                            context.clone(),
                                                             shortcut.as_mut(),
                                                         )
                                                         .await?
@@ -915,7 +932,7 @@ impl HttpRetriever {
             return Ok((block, RetrievalSource::Cache));
         }
         match self
-            .fetch_from_providers_with_source(cid, &providers, context)
+            .fetch_from_providers_with_source(cid, &providers, context.clone())
             .await
         {
             Ok((block, source)) => Ok((block, source)),
@@ -1004,7 +1021,7 @@ impl HttpRetriever {
                             initial_error = %err
                         );
                         return match self
-                            .fetch_from_providers_with_source(cid, &providers, context)
+                            .fetch_from_providers_with_source(cid, &providers, context.clone())
                             .await
                         {
                             Ok((block, source)) => Ok((block, source)),
@@ -1021,7 +1038,7 @@ impl HttpRetriever {
                             initial_error = %err
                         );
                         return match self
-                            .fetch_from_providers_with_source(cid, &providers, context)
+                            .fetch_from_providers_with_source(cid, &providers, context.clone())
                             .await
                         {
                             Ok((block, source)) => Ok((block, source)),
@@ -1034,7 +1051,7 @@ impl HttpRetriever {
                 }
                 self.cache_providers(cid, &refreshed)?;
                 match self
-                    .fetch_from_providers_with_source(cid, &refreshed, context)
+                    .fetch_from_providers_with_source(cid, &refreshed, context.clone())
                     .await
                 {
                     Ok((block, source)) => Ok((block, source)),
@@ -2746,6 +2763,8 @@ impl HttpRetriever {
                 addrs,
                 last_latency,
                 success_count,
+                top_level_path: current_retrieval_request_context()
+                    .and_then(|context| context.top_level_path().map(ToOwned::to_owned)),
             },
         );
     }
@@ -2769,8 +2788,21 @@ impl HttpRetriever {
             now.duration_since(success.seen_at) <= BITSWAP_SUCCESSFUL_PEER_TTL
                 && !success.addrs.is_empty()
         });
+        let scoped_session_peers = bitswap_top_level_scoped_session_peers_enabled();
+        let current_top_level_path = scoped_session_peers
+            .then(current_retrieval_request_context)
+            .flatten()
+            .and_then(|context| context.top_level_path().map(ToOwned::to_owned));
+        let peer_count_before_scope = successes.len();
         let mut peers = successes
             .iter()
+            .filter(|(_, success)| {
+                successful_peer_matches_top_level_scope(
+                    success,
+                    scoped_session_peers,
+                    current_top_level_path.as_deref(),
+                )
+            })
             .map(|(id, success)| {
                 (
                     *id,
@@ -2781,6 +2813,15 @@ impl HttpRetriever {
                 )
             })
             .collect::<Vec<_>>();
+        if scoped_session_peers {
+            tracing::info!(
+                phase = "bitswap_session_peer_scope",
+                top_level_path = %current_top_level_path.as_deref().unwrap_or(""),
+                peer_count_before = peer_count_before_scope,
+                peer_count_after = peers.len(),
+                skipped_peer_count = peer_count_before_scope.saturating_sub(peers.len())
+            );
+        }
         if let Some(dominant_mode) = bitswap_dominant_session_peer_mode() {
             if let Some(selection) = select_dominant_recent_bitswap_peers(
                 &mut peers,
@@ -3391,6 +3432,7 @@ impl FetchingBlockProvider {
         } in remaining
         {
             let retriever = self.retriever.clone();
+            let context = context.clone();
             fetches.push(async move {
                 let fetch_started = Instant::now();
                 let fetched = retriever
@@ -3580,6 +3622,7 @@ struct SuccessfulBitswapPeer {
     addrs: Vec<Multiaddr>,
     last_latency: Duration,
     success_count: u64,
+    top_level_path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3953,6 +3996,19 @@ fn bitswap_dominant_session_peer_alternates_from_env_value(value: Option<&str>) 
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_default()
         .min(MAX_BITSWAP_SESSION_PEERS.saturating_sub(1))
+}
+
+fn bitswap_top_level_scoped_session_peers_enabled() -> bool {
+    std::env::var_os(ENABLE_BITSWAP_TOP_LEVEL_SCOPED_SESSION_PEERS_ENV).is_some()
+}
+
+fn successful_peer_matches_top_level_scope(
+    success: &SuccessfulBitswapPeer,
+    scoped_session_peers: bool,
+    current_top_level_path: Option<&str>,
+) -> bool {
+    !scoped_session_peers
+        || current_top_level_path.is_none_or(|path| success.top_level_path.as_deref() == Some(path))
 }
 
 fn bitswap_session_peer_limit() -> usize {
@@ -9369,6 +9425,36 @@ mod bitswap_tests {
     }
 
     #[test]
+    fn successful_peer_scope_matches_current_top_level_path_when_enabled() {
+        let success = SuccessfulBitswapPeer {
+            seen_at: Instant::now(),
+            addrs: Vec::new(),
+            last_latency: Duration::from_millis(25),
+            success_count: 1,
+            top_level_path: Some("/ipns/ipfs.tech/".to_string()),
+        };
+
+        assert!(successful_peer_matches_top_level_scope(
+            &success,
+            false,
+            Some("/ipns/en.wikipedia-on-ipfs.org")
+        ));
+        assert!(successful_peer_matches_top_level_scope(
+            &success,
+            true,
+            Some("/ipns/ipfs.tech/")
+        ));
+        assert!(!successful_peer_matches_top_level_scope(
+            &success,
+            true,
+            Some("/ipns/en.wikipedia-on-ipfs.org")
+        ));
+        assert!(successful_peer_matches_top_level_scope(
+            &success, true, None
+        ));
+    }
+
+    #[test]
     fn dominant_session_peer_mode_can_be_scoped_to_top_level_gateway_requests() {
         assert_eq!(
             dominant_session_peer_mode_for_context(false, false, None),
@@ -9587,6 +9673,7 @@ mod bitswap_tests {
                     addrs: Vec::new(),
                     last_latency: Duration::from_secs(2),
                     success_count: 1,
+                    top_level_path: None,
                 },
             );
             successes.insert(
@@ -9596,6 +9683,7 @@ mod bitswap_tests {
                     addrs: Vec::new(),
                     last_latency: Duration::from_millis(80),
                     success_count: 1,
+                    top_level_path: None,
                 },
             );
         }
@@ -9643,6 +9731,7 @@ mod bitswap_tests {
                     addrs: vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()],
                     last_latency: Duration::from_secs(2),
                     success_count: 1,
+                    top_level_path: None,
                 },
             );
             successes.insert(
@@ -9652,6 +9741,7 @@ mod bitswap_tests {
                     addrs: vec!["/ip4/127.0.0.1/tcp/4002".parse().unwrap()],
                     last_latency: Duration::from_millis(80),
                     success_count: 1,
+                    top_level_path: None,
                 },
             );
         }

@@ -587,7 +587,15 @@ async fn ipfs_get(
             return response;
         };
 
-        let retrieval_context = RetrievalRequestContext::gateway_request(parent_request_id);
+        let context_top_level_path = if top_level_path.is_empty() {
+            request_path.clone()
+        } else {
+            top_level_path.clone()
+        };
+        let retrieval_context = RetrievalRequestContext::gateway_request_with_top_level(
+            parent_request_id,
+            Some(context_top_level_path),
+        );
         let response = with_retrieval_request_context(retrieval_context, async {
             match serve_ipfs_path(
                 state.provider.clone(),
@@ -669,7 +677,15 @@ async fn ipns_get(
             return response;
         };
 
-        let retrieval_context = RetrievalRequestContext::gateway_request(parent_request_id);
+        let context_top_level_path = if top_level_path.is_empty() {
+            request_path.clone()
+        } else {
+            top_level_path.clone()
+        };
+        let retrieval_context = RetrievalRequestContext::gateway_request_with_top_level(
+            parent_request_id,
+            Some(context_top_level_path),
+        );
         let response = with_retrieval_request_context(retrieval_context, async {
             match serve_ipns_path(
                 state.provider.clone(),
