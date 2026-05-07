@@ -1440,6 +1440,7 @@ fn print_summary(report: &RunReport) {
         print_trace_timeout_recovery(trace);
         print_trace_bitswap_peer_attempts(trace);
         print_trace_bitswap_dial_plans(trace);
+        print_trace_bitswap_provider_expansion(trace);
         if trace.bitswap_incoming_blocks.matches > 0 {
             let incoming = &trace.bitswap_incoming_blocks;
             println!(
@@ -1791,6 +1792,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_bitswap_peer_attempts(trace);
     print_trace_bitswap_want_have_probes(trace);
     print_trace_bitswap_dial_plans(trace);
+    print_trace_bitswap_provider_expansion(trace);
     print_trace_bitswap_sources(trace);
     print_trace_bitswap_batches(trace);
     print_trace_bitswap_incoming_batches(trace);
@@ -2604,6 +2606,33 @@ fn print_trace_bitswap_dial_plans(trace: &TraceSummary) {
         plans.pending_dial_peers,
         plans.connected_peers,
         plans.max_command_queued_ms
+    );
+}
+
+fn print_trace_bitswap_provider_expansion(trace: &TraceSummary) {
+    let Some(peer_expand) = trace
+        .phases
+        .iter()
+        .find(|phase| phase.phase == "bitswap_peer_expand")
+    else {
+        return;
+    };
+    let quality = &trace.bitswap_provider_quality;
+    let dns = &trace.bitswap_dns_expansion;
+    println!(
+        "  bitswap provider expansion: events={} elapsed={} provider_addrs={} expanded={} supported={} rejected={} dns_events={} dns_cached={} dns_uncached={} dns_failed={} dns_records={} dns_ips={}",
+        peer_expand.count,
+        peer_expand.elapsed_ms,
+        quality.provider_addr_count,
+        quality.expanded_provider_addr_count,
+        quality.supported_provider_addr_count,
+        quality.rejected_provider_addr_count,
+        dns.events,
+        dns.cached,
+        dns.uncached,
+        dns.failed,
+        dns.records,
+        dns.ips
     );
 }
 
