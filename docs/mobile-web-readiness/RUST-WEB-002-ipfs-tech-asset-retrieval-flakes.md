@@ -35859,3 +35859,61 @@ it targets a real user pause/delay case or can prove a net page-session win
 without increasing mobile background bytes. The important product view remains
 that Rust's combined range-then-full sequence is still much faster than Kubo's
 slow range followed by hot full read.
+
+## 2026-05-07 Fresh Focused `ipfs.tech` Baseline After Range-Warm Lab
+
+Question:
+
+After rejecting the HTML prefix range warm lab as a default candidate, is there
+still a current same-window Kubo win on the focused `ipfs.tech` page-asset case?
+
+Command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-ipfs-tech-r10-20260507T162341Z-trace.jsonl \
+  --comparison-output /tmp/current-head-ipfs-tech-r10-20260507T162341Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10`.
+- `ipfs.tech` root p50/p95: Rust `599/869ms`; Kubo `1324/3522ms`.
+- `ipfs.tech` asset p50/p95: Rust `53/219ms`; Kubo `109/546ms`.
+- Resource max: Rust `48476KiB` RSS and `24` FDs vs Kubo `281684KiB` RSS and
+  `467` FDs.
+
+Trace shape:
+
+- Bitswap blocks: `287`, p50/p95/max `47/263/777ms`.
+- HTTP-provider blocks: `63`, p50/p95/max `192/265/993ms`.
+- Request classifications:
+  - `zero_http_provider_bitswap=16`.
+  - `cold_bitswap_peer_expand=13`.
+  - `zero_http_provider_cold_bitswap=13`.
+  - `top_level_zero_http_provider_cold_bitswap=10`.
+- Top-level zero-HTTP cold Bitswap latency: p50/p95/max `596/866/866ms`.
+- Bitswap connections: `37`.
+- Slowest request was `_nuxt/DzK6mLCt.js` at `996ms`, where the winning source
+  was ultimately HTTP-provider and a Bitswap fetch was cancelled near the same
+  time.
+
+Decision:
+
+Do not reopen broad HTTP-provider median work from this window. The focused
+`ipfs.tech` page-asset case is currently a Rust win on root p50/p95, asset
+p50/p95, RSS, and FDs. The remaining useful work is narrower:
+
+- reduce top-level zero-HTTP cold Bitswap root tails without increasing fanout;
+- understand occasional coalesced HTTP-provider/Bitswap races like
+  `_nuxt/DzK6mLCt.js`;
+- preserve the current low resource profile and fast asset median.
