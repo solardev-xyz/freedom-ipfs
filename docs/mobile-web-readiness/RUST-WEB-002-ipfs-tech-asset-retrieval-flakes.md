@@ -28345,3 +28345,83 @@ root-block outliers, and longer r10/r20 guardrails rather than multi-HTTP siblin
 asset median latency. Future experiments should focus on peer quality,
 Bitswap-session source selection, and page-scoped learning for blocks that have
 no useful HTTP provider path.
+
+## 2026-05-07 - Promoted Multi-HTTP r10 Guardrail
+
+Question:
+Does the promoted broad multi-HTTP post-lookup race still hold up at `repeat=10`
+across the main mobile web guardrail cases, and is the DAICO/root p95 movement
+from the r5 sample a real regression?
+
+Command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case ipfs-tech-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/promoted-multi-http-race-multicase-r10-20260507T024018Z-trace.jsonl \
+  --comparison-output /tmp/promoted-multi-http-race-multicase-r10-20260507T024018Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10`.
+- `daicowtf-page-assets` root p50/p95: Rust `1038/1810ms`;
+  Kubo `2734/2934ms`.
+- `vitalik-root-html-range` root p50/p95: Rust `101/142ms`;
+  Kubo `1559/2504ms`.
+- `ipfs-tech-page-assets` root p50/p95: Rust `885/1100ms`;
+  Kubo `1377/2068ms`.
+- `ipfs-tech-page-assets` asset p50/p95: Rust `175/534ms`;
+  Kubo `346/780ms`.
+- Resource max: Rust `56548KiB` RSS, `44` FDs; Kubo `237444KiB`, `214` FDs.
+
+Trace notes:
+
+- HTTP provider race events: `371` total; `212` single-provider,
+  `159` multi-provider.
+- HTTP provider race results: `290` successes, `0` failures.
+- Multi-provider winner elapsed p50/p95/max: `42/94/137ms`.
+- HTTP provider fetch p50/p95/max: `86/419/666ms`.
+- Provider distribution:
+  - `https://dag.w3s.link/`: `136` successes, p50/p95/max `45/93/136ms`.
+  - `https://ipfs-bridge.sia.dev/`: `104` successes, p50/p95/max
+    `184/333/666ms`.
+  - `https://gateway-v3.pinata.cloud/`: `30` successes, p50/p95/max
+    `331/554/556ms`.
+  - `https://trustless.filebase.io/`: `20` successes, p50/p95/max
+    `21/36/66ms`.
+- Request classifications:
+  - `zero_http_provider_cold_bitswap=27`
+  - `top_level_zero_http_provider_cold_bitswap=10`
+- Zero-HTTP cold Bitswap request latency p50/p95/max: `581/1098/1240ms`.
+- Top-level zero-HTTP cold Bitswap request latency p50/p95/max:
+  `882/1098/1098ms`.
+- Bitswap block fetches: `117` total, p50/p95/max `188/582/1239ms`.
+- HTTP provider block fetches: `330` total, p50/p95/max `177/456/946ms`.
+- Remaining `bitswap_session_shortcut_post_lookup_wait` events were only
+  zero-HTTP provider sets: `18` waits at the normal `100ms` budget. This is not
+  the multi-HTTP wait tax that the promotion targeted.
+- Slowest requests were zero-HTTP/Bitswap `ipfs.tech` root/assets, especially
+  `_nuxt/DBHrpFkY.js` at `1240ms`, `_nuxt/mHWTJadT.js` at `1067ms`, and
+  top-level `/ipns/ipfs.tech/` roots around `980-1098ms`.
+
+Decision:
+Keep the broad multi-HTTP post-lookup race promoted. The r10 guardrail confirms
+the r5 DAICO p95 movement is not a Kubo-relative regression: Rust still wins
+DAICO p50/p95 by a large margin, wins `ipfs.tech` root/assets, wins Vitalik
+range, and remains far lighter on RSS/FDs. The remaining work is confirmed as
+zero-HTTP/Bitswap behavior, especially source/peer quality and top-level root
+or sibling asset tails. Do not repeat generic zero-HTTP post-lookup racing based
+on these `18` waits; that experiment already removed the wait but hurt the
+page-level signal. A better next experiment needs to improve the actual Bitswap
+path after provider discovery yields no HTTP providers.
