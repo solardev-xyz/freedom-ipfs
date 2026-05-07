@@ -36079,3 +36079,150 @@ increased Bitswap connections, and produced a worse Bitswap p95/max. The
 earlier focused global direct2 win was not simply "direct wants for
 subresources"; it depended on a broader source-selection shift that did not
 survive guardrails.
+
+## 2026-05-07 Fresh Guardrail Baseline And Direct-IP Recheck
+
+Purpose:
+
+Resume from the latest clean branch head after the direct-WANT and range-warm
+rejections, refresh the same-window Rust-vs-Kubo guardrail, and recheck the
+existing direct-IP provider-candidate lab only if the trace shows the old
+DNS-heavy provider-expansion shape again.
+
+Fresh no-env guardrail command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-focused-guardrail-r5-20260507T164245Z-trace.jsonl \
+  --comparison-output /tmp/current-head-focused-guardrail-r5-20260507T164245Z.json
+```
+
+Fresh no-env result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `1330/1650ms`; Kubo `3096/3493ms`.
+- Vitalik range: Rust `107/127ms`; Kubo `1352/3525ms`.
+- `ipfs.tech` page assets:
+  - root p50/p95: Rust `847/1778ms`; Kubo `1019/1581ms`.
+  - asset p50/p95: Rust `187/382ms`; Kubo `350/441ms`.
+- Wikipedia root: Rust `721/1642ms`; Kubo `546/755ms`.
+- Resource max: Rust `50340KiB` RSS and `29` FDs vs Kubo `174484KiB` RSS
+  and `260` FDs.
+
+Trace finding:
+
+The slowest Wikipedia request was the familiar single-failing-HTTP plus
+DNS-heavy Bitswap fallback shape. The directory root block came from
+`https://ipfs-bridge.sia.dev/` in `163ms`, then the `/index.html` child block
+hit `https://f010479.twinquasar.io/` HTTP `500`s. The winning Bitswap provider
+fetch itself took only about `240ms`, but it did not start until after about
+`1010ms` of provider/DNS expansion (`bitswap_dns_prefetch` about `921ms`).
+
+That made the already-kept direct-IP provider-candidate lab worth rechecking in
+this specific public-network window.
+
+Direct-IP lab command:
+
+```sh
+FREEDOM_IPFS_ENABLE_BITSWAP_DIRECT_IP_PROVIDER_CANDIDATES_ONLY=1 \
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/direct-ip-candidates-guardrail-r5-20260507T164613Z-trace.jsonl \
+  --comparison-output /tmp/direct-ip-candidates-guardrail-r5-20260507T164613Z.json
+```
+
+Direct-IP lab result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `1330/1587ms`; Kubo `2816/3248ms`.
+- Vitalik range: Rust `108/130ms`; Kubo `2731/3396ms`.
+- `ipfs.tech` page assets:
+  - root p50/p95: Rust `571/732ms`; Kubo `1108/1230ms`.
+  - asset p50/p95: Rust `175/287ms`; Kubo `352/611ms`.
+- Wikipedia root: Rust `445/695ms`; Kubo `362/577ms`.
+- Resource max: Rust `50420KiB` RSS and `30` FDs vs Kubo `264320KiB` RSS
+  and `642` FDs.
+- Bitswap blocks: `37`, p50/p95/max `94/469/604ms`.
+- Bitswap peer attempts/connections: `154` attempts and `28` established
+  connections.
+
+Immediate no-env post-control command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/direct-ip-post-control-guardrail-r5-20260507T164840Z-trace.jsonl \
+  --comparison-output /tmp/direct-ip-post-control-guardrail-r5-20260507T164840Z.json
+```
+
+Immediate post-control result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `1307/1642ms`; Kubo `2789/2953ms`.
+- Vitalik range: Rust `118/121ms`; Kubo `2954/3468ms`.
+- `ipfs.tech` page assets:
+  - root p50/p95: Rust `580/711ms`; Kubo `1491/1680ms`.
+  - asset p50/p95: Rust `53/247ms`; Kubo `345/553ms`.
+- Wikipedia root: Rust `309/455ms`; Kubo `380/424ms`.
+- Resource max: Rust `50132KiB` RSS and `25` FDs vs Kubo `210432KiB` RSS
+  and `354` FDs.
+- Bitswap blocks: `130`, p50/p95/max `44/265/766ms`.
+- Bitswap peer attempts/connections: `197` attempts and `18` established
+  connections.
+
+Decision:
+
+Do not promote direct-IP-only provider candidates. The direct-IP run looked
+better than the initial no-env control, but the immediate no-env post-control
+was better on the key mobile browsing metrics: `ipfs.tech` asset median
+(`53ms` vs direct-IP `175ms`), Wikipedia median (`309ms` vs `445ms`), FD max
+(`25` vs `30`), and it nearly tied Kubo's Wikipedia p95 while keeping the
+normal provider expansion path.
+
+The useful evidence is diagnostic, not a default change:
+
+- The branch can still hit a real DNS-heavy fallback window where a single
+  failing HTTP provider and synchronous Bitswap DNS expansion dominate a
+  Wikipedia follow-on `index.html` block.
+- Direct-IP-only can remove that tail in some windows, but the post-control
+  proves the win is not stable enough to justify discarding DNS-expanded
+  candidates globally.
+- Future behavior work should target only the narrow shape that the first
+  control exposed: top-level UnixFS follow-on blocks with one HTTP provider
+  failing fast, high provider count, and expensive DNS expansion. A candidate
+  should start a tiny direct-IP/provider-quality probe only for that fallback
+  shape while preserving the normal path for `ipfs.tech` assets and DAICO.
