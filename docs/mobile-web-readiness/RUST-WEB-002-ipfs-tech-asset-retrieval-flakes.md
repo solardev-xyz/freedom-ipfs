@@ -34052,3 +34052,191 @@ Keep the diagnostic correction. The next behavior experiment should not assume
 the remaining Wikipedia issue is cross-site contamination from `ipfs.tech`;
 instead, continue targeting page-level root-plus-index scheduling and session
 shortcut selection for the follow-on block.
+
+## 2026-05-07 Lab: Isolated Wikipedia With Repeated-Session Threshold
+
+The isolated Wikipedia baseline above showed one slow `index.html` sample where
+a one-hit Bitswap session shortcut stretched the follow-on block to `1309ms`.
+Rerun the isolated case with the existing global session-peer threshold override
+to see whether requiring repeated peer success removes that tail.
+
+Command:
+
+```sh
+timeout 1800s env FREEDOM_IPFS_BITSWAP_SESSION_PEER_MIN_SUCCESSES=2 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case wikipedia-on-ipfs-root \
+    --repeat 10 \
+    --asset-concurrency 1 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/session-min2-wikipedia-only-r10-20260507Tisolated-trace.jsonl \
+    --comparison-output /tmp/session-min2-wikipedia-only-r10-20260507Tisolated.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10`.
+- Wikipedia root TTFB/total p50/p95: Rust `984/1133ms`; Kubo
+  `2210/2525ms`.
+- Resource max: Rust `41600KiB` RSS and `21` FDs vs Kubo `119216KiB` RSS and
+  `75` FDs.
+- Bitswap blocks: `20`, p50/p95/max `471/588/699ms`.
+- Every request was classified as `top_level_zero_http_provider_cold_bitswap`.
+- Scoped source indexes: `3=13`, `4=7`.
+- Session shortcuts were eliminated in this isolated case:
+  `shortcut_starts=0`, `shortcut_attempts=0`, `with_trusted=0`, and
+  `max_session_peers=0` on slow requests.
+- Bitswap peer attempts were `100` vs `114` in the no-env isolated baseline;
+  established connections were similar (`33` vs `31`).
+- Slow CIDs:
+  - Directory/root CID
+    `bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze`:
+    source indexes `4=7`, `3=3`.
+  - Follow-on `index.html` CID
+    `bafkreicr5w6i2f3m664a2fnl4vhtg3s6dhhk6n5hrf3gqzcf7v5bu6b7te`:
+    source indexes `3=10`.
+
+Interpretation:
+
+The repeated-success threshold removed the slow one-hit session shortcut tail in
+this isolated Wikipedia window and improved Rust total p95 from `1951ms` to
+`1133ms`, while preserving the resource advantage over Kubo.
+
+Do not promote the global override as-is. Earlier focused and multicase controls
+rejected `FREEDOM_IPFS_BITSWAP_SESSION_PEER_MIN_SUCCESSES=2` as a default
+because it hurt broader `ipfs.tech`/Wikipedia windows. The useful signal here is
+narrower: top-level root-plus-index work may benefit from avoiding one-hit
+session shortcuts, while normal page subresource requests may still need the
+current one-success shortcut behavior.
+
+Decision:
+
+Keep as evidence, not as default behavior. Prototype a narrower env-gated
+threshold scoped to top-level gateway requests so the next live run can test
+whether it keeps the Wikipedia root-plus-index p95 improvement without
+regressing `ipfs.tech` asset sessions.
+
+## 2026-05-07 Reject: Top-Level Repeated-Session Threshold
+
+Hypothesis:
+
+The global repeated-session threshold was too blunt because it affected normal
+page subresources. A top-level-only threshold might preserve the Wikipedia
+root-plus-index improvement while leaving child asset session shortcuts alone.
+
+Change:
+
+Temporarily added a disabled lab env,
+`FREEDOM_IPFS_BITSWAP_TOP_LEVEL_SESSION_PEER_MIN_SUCCESSES=2`, that raised the
+recent Bitswap session peer threshold only when the current retrieval context was
+a top-level gateway request.
+
+Isolated Wikipedia command:
+
+```sh
+timeout 1800s env FREEDOM_IPFS_BITSWAP_TOP_LEVEL_SESSION_PEER_MIN_SUCCESSES=2 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case wikipedia-on-ipfs-root \
+    --repeat 10 \
+    --asset-concurrency 1 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/top-level-session-min2-wikipedia-only-r10-20260507Tlab-trace.jsonl \
+    --comparison-output /tmp/top-level-session-min2-wikipedia-only-r10-20260507Tlab.json
+```
+
+Isolated Wikipedia result:
+
+- Rust and Kubo passed `10/10`.
+- Wikipedia root TTFB/total p50/p95: Rust `1104/1162ms`; Kubo
+  `1802/2434ms`.
+- Resource max: Rust `41088KiB` RSS and `21` FDs vs Kubo `136864KiB` RSS and
+  `85` FDs.
+- Session shortcuts were eliminated: `shortcut_starts=0`,
+  `shortcut_attempts=0`.
+- Bitswap blocks: `11`, p50/p95/max `382/467/467ms`.
+
+Focused same-window command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_BITSWAP_TOP_LEVEL_SESSION_PEER_MIN_SUCCESSES=2 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --case wikipedia-on-ipfs-root \
+    --repeat 10 \
+    --asset-concurrency 1 \
+    --timeout-secs 120 \
+    --run-timeout-secs 300 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/top-level-session-min2-focused-r10-20260507Tlab-trace.jsonl \
+    --comparison-output /tmp/top-level-session-min2-focused-r10-20260507Tlab.json
+```
+
+Focused result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` root TTFB/total p50/p95: Rust `768/1283ms`; Kubo
+  `1402/2625ms`.
+- `ipfs.tech` asset TTFB/total p50/p95: Rust `186/330ms`; Kubo `82/417ms`.
+- Wikipedia root TTFB/total p50/p95: Rust `600/785ms`; Kubo `78/301ms`.
+- Resource max: Rust `48852KiB` RSS and `25` FDs vs Kubo `235108KiB` RSS and
+  `218` FDs.
+- Child asset session shortcuts still ran:
+  `shortcut_starts=95`, `shortcut_attempts=19`, `shortcut_hits=19`.
+
+Same-code no-env control:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-focused-control-r10-20260507Tafter-topmin-trace.jsonl \
+  --comparison-output /tmp/current-focused-control-r10-20260507Tafter-topmin.json
+```
+
+Control result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` root TTFB/total p50/p95: Rust `765/984ms`; Kubo
+  `1938/8763ms`.
+- `ipfs.tech` asset TTFB/total p50/p95: Rust `185/298ms`; Kubo `160/598ms`.
+- Wikipedia root TTFB/total p50/p95: Rust `365/789ms`; Kubo `276/481ms`.
+- Resource max: Rust `48888KiB` RSS and `25` FDs vs Kubo `292464KiB` RSS and
+  `556` FDs.
+
+Interpretation:
+
+The top-level threshold did well in isolated Wikipedia, but the same-code
+focused control was better or equal for Rust on the metrics that matter:
+
+- `ipfs.tech` root p95: control `984ms` vs threshold `1283ms`.
+- `ipfs.tech` asset p95: control `298ms` vs threshold `330ms`.
+- Wikipedia p50: control `365ms` vs threshold `600ms`.
+- Wikipedia p95 was essentially tied: control `789ms` vs threshold `785ms`.
+
+Decision:
+
+Reject and revert the lab code. The result confirms that blindly suppressing
+one-hit top-level session shortcuts is not enough. Future work should target a
+more specific condition, such as the follow-on UnixFS/index block after a
+failing single HTTP provider, instead of all top-level gateway block fetches.
