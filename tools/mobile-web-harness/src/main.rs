@@ -1596,6 +1596,15 @@ fn print_comparison_summary(report: &ComparisonReport) {
             display_option_ms(case.kubo_root_ttfb_p95_ms),
             display_option_f64(case.root_ttfb_p95_ratio)
         );
+        println!(
+            "  root_total: rust_p50={} kubo_p50={} p50_ratio={} rust_p95={} kubo_p95={} p95_ratio={}",
+            display_option_ms(case.rust_root_total_p50_ms),
+            display_option_ms(case.kubo_root_total_p50_ms),
+            display_option_f64(case.root_total_p50_ratio),
+            display_option_ms(case.rust_root_total_p95_ms),
+            display_option_ms(case.kubo_root_total_p95_ms),
+            display_option_f64(case.root_total_p95_ratio)
+        );
         if case.kubo_setup_adjusted_root_ttfb_p50_ms.is_some()
             || case.kubo_setup_adjusted_root_ttfb_p95_ms.is_some()
         {
@@ -1617,6 +1626,15 @@ fn print_comparison_summary(report: &ComparisonReport) {
             display_option_ms(case.rust_asset_ttfb_p95_ms),
             display_option_ms(case.kubo_asset_ttfb_p95_ms),
             display_option_f64(case.asset_ttfb_p95_ratio)
+        );
+        println!(
+            "  asset_total: rust_p50={} kubo_p50={} p50_ratio={} rust_p95={} kubo_p95={} p95_ratio={}",
+            display_option_ms(case.rust_asset_total_p50_ms),
+            display_option_ms(case.kubo_asset_total_p50_ms),
+            display_option_f64(case.asset_total_p50_ratio),
+            display_option_ms(case.rust_asset_total_p95_ms),
+            display_option_ms(case.kubo_asset_total_p95_ms),
+            display_option_f64(case.asset_total_p95_ratio)
         );
         println!(
             "  resources: rust_rss_max={} kubo_rss_max={} rss_ratio={} rust_fd_max={} kubo_fd_max={} fd_ratio={} rust_storage_max={} kubo_storage_max={} storage_ratio={}",
@@ -4894,6 +4912,12 @@ struct ComparisonCase {
     rust_root_ttfb_p95_ms: Option<u128>,
     kubo_root_ttfb_p95_ms: Option<u128>,
     root_ttfb_p95_ratio: Option<f64>,
+    rust_root_total_p50_ms: Option<u128>,
+    kubo_root_total_p50_ms: Option<u128>,
+    root_total_p50_ratio: Option<f64>,
+    rust_root_total_p95_ms: Option<u128>,
+    kubo_root_total_p95_ms: Option<u128>,
+    root_total_p95_ratio: Option<f64>,
     kubo_setup_adjusted_root_ttfb_p50_ms: Option<u128>,
     setup_adjusted_root_ttfb_p50_ratio: Option<f64>,
     kubo_setup_adjusted_root_ttfb_p95_ms: Option<u128>,
@@ -4904,6 +4928,12 @@ struct ComparisonCase {
     rust_asset_ttfb_p95_ms: Option<u128>,
     kubo_asset_ttfb_p95_ms: Option<u128>,
     asset_ttfb_p95_ratio: Option<f64>,
+    rust_asset_total_p50_ms: Option<u128>,
+    kubo_asset_total_p50_ms: Option<u128>,
+    asset_total_p50_ratio: Option<f64>,
+    rust_asset_total_p95_ms: Option<u128>,
+    kubo_asset_total_p95_ms: Option<u128>,
+    asset_total_p95_ratio: Option<f64>,
     rust_max_rss_kib: Option<u64>,
     kubo_max_rss_kib: Option<u64>,
     rss_ratio: Option<f64>,
@@ -4968,6 +4998,18 @@ impl ComparisonCase {
                         rust_case.root_ttfb_ms.p95_ms,
                         kubo_case.root_ttfb_ms.p95_ms,
                     ),
+                    rust_root_total_p50_ms: rust_case.root_total_ms.p50_ms,
+                    kubo_root_total_p50_ms: kubo_case.root_total_ms.p50_ms,
+                    root_total_p50_ratio: ratio(
+                        rust_case.root_total_ms.p50_ms,
+                        kubo_case.root_total_ms.p50_ms,
+                    ),
+                    rust_root_total_p95_ms: rust_case.root_total_ms.p95_ms,
+                    kubo_root_total_p95_ms: kubo_case.root_total_ms.p95_ms,
+                    root_total_p95_ratio: ratio(
+                        rust_case.root_total_ms.p95_ms,
+                        kubo_case.root_total_ms.p95_ms,
+                    ),
                     kubo_setup_adjusted_root_ttfb_p50_ms: kubo_setup_adjusted_root_ttfb.p50_ms,
                     setup_adjusted_root_ttfb_p50_ratio: ratio(
                         rust_case.root_ttfb_ms.p50_ms,
@@ -4989,6 +5031,18 @@ impl ComparisonCase {
                     asset_ttfb_p95_ratio: ratio(
                         rust_case.asset_ttfb_ms.p95_ms,
                         kubo_case.asset_ttfb_ms.p95_ms,
+                    ),
+                    rust_asset_total_p50_ms: rust_case.asset_total_ms.p50_ms,
+                    kubo_asset_total_p50_ms: kubo_case.asset_total_ms.p50_ms,
+                    asset_total_p50_ratio: ratio(
+                        rust_case.asset_total_ms.p50_ms,
+                        kubo_case.asset_total_ms.p50_ms,
+                    ),
+                    rust_asset_total_p95_ms: rust_case.asset_total_ms.p95_ms,
+                    kubo_asset_total_p95_ms: kubo_case.asset_total_ms.p95_ms,
+                    asset_total_p95_ratio: ratio(
+                        rust_case.asset_total_ms.p95_ms,
+                        kubo_case.asset_total_ms.p95_ms,
                     ),
                     rust_max_rss_kib,
                     kubo_max_rss_kib,
@@ -11681,11 +11735,83 @@ mod tests {
         assert_eq!(case.rust_root_ttfb_p95_ms, Some(200));
         assert_eq!(case.kubo_root_ttfb_p50_ms, Some(40));
         assert_eq!(case.kubo_root_ttfb_p95_ms, Some(50));
+        assert_eq!(case.rust_root_total_p50_ms, Some(200));
+        assert_eq!(case.rust_root_total_p95_ms, Some(400));
+        assert_eq!(case.kubo_root_total_p50_ms, Some(80));
+        assert_eq!(case.kubo_root_total_p95_ms, Some(100));
+        assert_eq!(case.root_total_p50_ratio, Some(2.5));
+        assert_eq!(case.root_total_p95_ratio, Some(4.0));
         assert_eq!(case.kubo_setup_adjusted_root_ttfb_p50_ms, Some(100));
         assert_eq!(case.kubo_setup_adjusted_root_ttfb_p95_ms, Some(120));
         assert_eq!(case.setup_adjusted_root_ttfb_p50_ratio, Some(1.0));
         let p95_ratio = case.setup_adjusted_root_ttfb_p95_ratio.unwrap();
         assert!((p95_ratio - (200.0 / 120.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn comparison_case_reports_asset_total_latency() {
+        let mut rust_runs = vec![
+            run_result(
+                RunPhase::Measured,
+                1,
+                200,
+                Some(40),
+                Some(12),
+                Some(0),
+                None,
+            ),
+            run_result(
+                RunPhase::Measured,
+                2,
+                400,
+                Some(41),
+                Some(12),
+                Some(0),
+                None,
+            ),
+        ];
+        rust_runs[0].results[0].assets = vec![script_asset_result(10, 30)];
+        rust_runs[1].results[0].assets = vec![script_asset_result(20, 60)];
+
+        let mut kubo_runs = vec![
+            run_result(
+                RunPhase::Measured,
+                1,
+                100,
+                Some(100),
+                Some(30),
+                Some(0),
+                None,
+            ),
+            run_result(
+                RunPhase::Measured,
+                2,
+                120,
+                Some(101),
+                Some(31),
+                Some(0),
+                None,
+            ),
+        ];
+        kubo_runs[0].results[0].assets = vec![script_asset_result(5, 10)];
+        kubo_runs[1].results[0].assets = vec![script_asset_result(10, 20)];
+
+        let rust = run_report(HarnessEngine::Rust, None, rust_runs);
+        let kubo = run_report(HarnessEngine::Kubo, None, kubo_runs);
+
+        let cases = ComparisonCase::from_reports(&rust, &kubo);
+        let case = &cases[0];
+
+        assert_eq!(case.rust_asset_ttfb_p50_ms, Some(10));
+        assert_eq!(case.rust_asset_ttfb_p95_ms, Some(20));
+        assert_eq!(case.kubo_asset_ttfb_p50_ms, Some(5));
+        assert_eq!(case.kubo_asset_ttfb_p95_ms, Some(10));
+        assert_eq!(case.rust_asset_total_p50_ms, Some(30));
+        assert_eq!(case.rust_asset_total_p95_ms, Some(60));
+        assert_eq!(case.kubo_asset_total_p50_ms, Some(10));
+        assert_eq!(case.kubo_asset_total_p95_ms, Some(20));
+        assert_eq!(case.asset_total_p50_ratio, Some(3.0));
+        assert_eq!(case.asset_total_p95_ratio, Some(3.0));
     }
 
     #[test]
@@ -12991,6 +13117,28 @@ mod tests {
                 passed: true,
                 failures: Vec::new(),
             }],
+        }
+    }
+
+    fn script_asset_result(ttfb_ms: u128, total_ms: u128) -> AssetResult {
+        AssetResult {
+            kind: AssetKind::Script,
+            source: "app.js".to_string(),
+            url: "http://127.0.0.1:8080/ipfs/root/app.js".to_string(),
+            status: Some(200),
+            content_type: Some("text/javascript".to_string()),
+            content_range: None,
+            content_length: Some(128),
+            accept_ranges: None,
+            etag: None,
+            cache_control: None,
+            body_bytes: 128,
+            ttfb_ms,
+            total_ms,
+            body_preview: String::new(),
+            revalidation: None,
+            passed: true,
+            failures: Vec::new(),
         }
     }
 

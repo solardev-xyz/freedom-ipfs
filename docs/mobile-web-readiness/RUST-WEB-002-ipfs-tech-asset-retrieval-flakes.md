@@ -33643,3 +33643,37 @@ Future gateway work should treat header-only latency wins skeptically and
 compare total/body timing as well as TTFB. The remaining useful direction is
 still retrieval/source quality for the Wikipedia root/leaf fetches, not serving
 headers earlier while the body waits on the same block.
+
+## 2026-05-07 Harness Comparison Total Latency Metrics
+
+The raw-link `Tsize` lab showed a harness reporting blind spot: comparison
+output highlighted root and asset TTFB, while the experiment moved work from the
+pre-header path into the response body. `CaseAggregate` already recorded
+`root_total_ms` and `asset_total_ms`, but `ComparisonCase` and the terminal
+Rust-vs-Kubo summary did not expose those fields.
+
+Change:
+
+- Add root total p50/p95 and Rust/Kubo ratios to comparison JSON.
+- Add asset total p50/p95 and Rust/Kubo ratios to comparison JSON.
+- Print `root_total` and `asset_total` lines in the comparison summary beside
+  the existing TTFB lines.
+- Add focused tests for root total and asset total comparison fields.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness comparison_case_reports -- --nocapture
+cargo test -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Validation passed.
+
+Decision:
+
+Keep. This is a harness/diagnostics improvement only; it changes no retrieval
+behavior. Future performance candidates should be judged with both TTFB and
+total latency so body-delay regressions are visible in the same-window
+Rust-vs-Kubo summary.
