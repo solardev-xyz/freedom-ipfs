@@ -40742,3 +40742,81 @@ Future work should either re-run this lab across a broader multi-case guardrail
 or combine it with a stricter trigger, such as only warming a directory when the
 HTML contains several same-directory assets and the top-level root is already
 successfully streaming.
+
+## 2026-05-07: Current Head Post-Directory-Prefetch Guardrail
+
+Branch/head:
+
+- `codex/kubo-session-performance-20260506`
+- `164b3d8`
+
+Purpose:
+
+Refresh the no-env multi-case guardrail after adding the disabled
+HTML-directory-prefetch lab. The lab is default-off, so this verifies current
+default behavior and identifies the next real Kubo gap before making another
+retrieval change.
+
+Command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/current-head-post-dirprefetch-guardrail-r5-20260507T231338Z-trace.jsonl \
+  --comparison-output /tmp/current-head-post-dirprefetch-guardrail-r5-20260507T231338Z.json
+```
+
+Result:
+
+- Rust/Kubo passed all cases: `5/5` for both engines.
+- `meaningful_kubo_wins`: none.
+- DAICO root: Rust `1053/1397ms`; Kubo `1175/2136ms`.
+- Vitalik range: Rust `100/216ms`; Kubo `2545/4463ms`.
+- `ipfs.tech` root: Rust `663/1054ms`; Kubo `1350/2512ms`.
+- `ipfs.tech` assets: Rust `106/357ms`; Kubo `154/831ms`.
+- Wikipedia root: Rust `369/435ms`; Kubo `436/505ms`.
+- Resource max: Rust `61180KiB` RSS and `39` FDs vs Kubo `185164KiB`
+  RSS and `196` FDs.
+
+Trace finding:
+
+- Case-level aggregate behavior is currently ahead of Kubo across the tracked
+  guardrail.
+- `ipfs.tech` still has path-local Kubo wins despite Rust winning aggregate
+  asset p50/p95. The largest printed path-local wins were:
+  - `_nuxt/BXkYzPrD.js` p95 total/TTFB: Rust `746/745ms`, Kubo `407ms`.
+  - `_nuxt/CFmqYC7r.js` p95 total/TTFB: Rust `639ms`, Kubo `362ms`.
+  - `_nuxt/ZT0_SuSb.js` p50 total/TTFB: Rust `224ms`, Kubo `154ms`.
+  - `_nuxt/BXkYzPrD.js` p50 total/TTFB: Rust `190/189ms`, Kubo
+    `124/123ms`.
+- The slowest `ipfs.tech` child examples were not dominated by delegated
+  provider lookup. They were mostly single-HTTP-provider
+  `https://ipfs-bridge.sia.dev/` fetches, or HTTP/Bitswap race overlap on
+  blocks under the `_nuxt` directory.
+- Zero-HTTP events remained present but did not create a case-level Kubo win:
+  `zero_http_provider_bitswap=15`, p50/p90/p95/max request elapsed
+  `367/1048/1051/1051ms`; source modes were `want_block=12`,
+  `want_have=3`.
+- The slowest non-`ipfs.tech` event was the DAICO root stream leaf block
+  `bafkreibvhjyqywfmbw7srwl2673dxjt73ere2j4uyzhi2kojsjzql5g2ci` at
+  `1122ms`, but DAICO still beat Kubo on root p50/p95.
+
+Decision:
+
+Treat current default behavior as case-level ahead of Kubo for the tracked
+guardrail. The remaining work is narrower: path-local `ipfs.tech` asset wins
+inside otherwise winning page loads, especially repeated `_nuxt` leaf blocks
+served through `ipfs-bridge.sia.dev` or mixed HTTP/Bitswap races. The next
+experiment should target provider/source quality for those leaf blocks, not a
+broad default change to roots, DHT fallback, or HTML prefetch.
