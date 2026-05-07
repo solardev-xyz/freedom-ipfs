@@ -159,6 +159,8 @@ const MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND: usize = 5;
 const MAX_BITSWAP_PEERS_PER_BLOCK: usize = 16;
 const MAX_BITSWAP_SESSION_PEERS: usize = 4;
 const BITSWAP_SESSION_PEER_LIMIT_ENV: &str = "FREEDOM_IPFS_BITSWAP_SESSION_PEER_LIMIT";
+const BITSWAP_TRUSTED_DIRECT_WANT_BLOCK_PEERS_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_TRUSTED_DIRECT_WANT_BLOCK_PEERS";
 const ENABLE_BITSWAP_TOP_LEVEL_SCOPED_SESSION_PEERS_ENV: &str =
     "FREEDOM_IPFS_ENABLE_BITSWAP_TOP_LEVEL_SCOPED_SESSION_PEERS";
 const ENABLE_BITSWAP_DOMINANT_SESSION_PEER_ENV: &str =
@@ -2590,6 +2592,8 @@ impl HttpRetriever {
             .is_some_and(RetrievalRequestContext::gateway_subresource);
         let zero_http_direct_want_block_peer_count =
             maybe_force_zero_http_direct_want_block_peers(providers, &mut peers, context);
+        let trusted_want_have_probe_count =
+            maybe_force_trusted_bitswap_want_have_probes(&mut peers);
         let addr_stats = bitswap_peer_addr_stats(&peers);
         let trusted_peer_count = peers.iter().filter(|peer| peer.skip_want_have).count();
         tracing::info!(
@@ -2602,6 +2606,10 @@ impl HttpRetriever {
             trusted_peer_count,
             gateway_subresource,
             zero_http_direct_want_block_peer_count,
+            trusted_want_have_probe_count,
+            trusted_direct_want_block_limit = bitswap_trusted_direct_want_block_peers()
+                .map(|limit| limit as i64)
+                .unwrap_or(-1),
             direct_untrusted_want_block_limit = bitswap_direct_want_block_untrusted_peer_limit(),
             tcp_addr_count = addr_stats.tcp,
             quic_addr_count = addr_stats.quic,
@@ -2736,6 +2744,7 @@ impl HttpRetriever {
                 .unwrap_or(-1),
             source_peer_request_mode = source_trace.request_mode,
             source_peer_force_want_block = source_trace.force_want_block,
+            source_peer_force_want_have = source_trace.force_want_have,
             source_peer_addr_count = source_trace.addr_count,
             source_peer_previous_success_count = source_trace.previous_success_count,
             source_peer_previous_latency_ms = source_trace.previous_latency_ms,
@@ -3066,6 +3075,7 @@ impl HttpRetriever {
                     addrs,
                     skip_want_have: true,
                     force_want_block: false,
+                    force_want_have: false,
                 },
             )
             .collect()
@@ -3107,18 +3117,24 @@ impl HttpRetriever {
     async fn fetch_from_recent_bitswap_peers(
         &self,
         cid: &Cid,
-        peers: Vec<BitswapPeer>,
+        mut peers: Vec<BitswapPeer>,
     ) -> Result<Option<Block>> {
         if peers.is_empty() {
             return Ok(None);
         }
 
+        let trusted_want_have_probe_count =
+            maybe_force_trusted_bitswap_want_have_probes(&mut peers);
         let peer_count = peers.len();
         tracing::info!(
             phase = "bitswap_session_shortcut_start",
             cid = %cid,
             peer_count,
-            trusted_peer_count = peer_count
+            trusted_peer_count = peer_count,
+            trusted_want_have_probe_count,
+            trusted_direct_want_block_limit = bitswap_trusted_direct_want_block_peers()
+                .map(|limit| limit as i64)
+                .unwrap_or(-1)
         );
         let peers_for_record = peers.clone();
         let started = Instant::now();
@@ -3192,6 +3208,7 @@ impl HttpRetriever {
                 .unwrap_or(-1),
             source_peer_request_mode = source_trace.request_mode,
             source_peer_force_want_block = source_trace.force_want_block,
+            source_peer_force_want_have = source_trace.force_want_have,
             source_peer_addr_count = source_trace.addr_count,
             source_peer_previous_success_count = source_trace.previous_success_count,
             source_peer_previous_latency_ms = source_trace.previous_latency_ms,
@@ -3220,7 +3237,7 @@ impl HttpRetriever {
             return Ok(None);
         }
 
-        let peers = self.recent_bitswap_peers_for_fetch().await;
+        let mut peers = self.recent_bitswap_peers_for_fetch().await;
         if peers.is_empty() {
             tracing::info!(
                 phase = "bitswap_session_range_batch",
@@ -3233,6 +3250,8 @@ impl HttpRetriever {
             return Ok(None);
         }
 
+        let trusted_want_have_probe_count =
+            maybe_force_trusted_bitswap_want_have_probes(&mut peers);
         let peer_count = peers.len();
         let peers_for_record = peers.clone();
         let started = Instant::now();
@@ -3242,6 +3261,10 @@ impl HttpRetriever {
             cid_count = cids.len(),
             peer_count,
             trusted_peer_count = peer_count,
+            trusted_want_have_probe_count,
+            trusted_direct_want_block_limit = bitswap_trusted_direct_want_block_peers()
+                .map(|limit| limit as i64)
+                .unwrap_or(-1),
             timeout_ms = BITSWAP_SESSION_RANGE_BATCH_TIMEOUT.as_millis()
         );
 
@@ -3336,6 +3359,7 @@ impl HttpRetriever {
                 .unwrap_or(-1),
             source_peer_request_mode = source_trace.request_mode,
             source_peer_force_want_block = source_trace.force_want_block,
+            source_peer_force_want_have = source_trace.force_want_have,
             source_peer_addr_count = source_trace.addr_count,
             source_peer_previous_success_count = source_trace.previous_success_count,
             source_peer_previous_latency_ms = source_trace.previous_latency_ms,
@@ -3913,6 +3937,7 @@ struct BitswapPeer {
     addrs: Vec<Multiaddr>,
     skip_want_have: bool,
     force_want_block: bool,
+    force_want_have: bool,
 }
 
 struct SuccessfulBitswapPeer {
@@ -3929,6 +3954,7 @@ struct BitswapSourcePeerTrace {
     request_mode: &'static str,
     skip_want_have: bool,
     force_want_block: bool,
+    force_want_have: bool,
     addr_count: usize,
     previous_success_count: u64,
     previous_latency_ms: u128,
@@ -3942,6 +3968,7 @@ impl Default for BitswapSourcePeerTrace {
             request_mode: "unknown",
             skip_want_have: false,
             force_want_block: false,
+            force_want_have: false,
             addr_count: 0,
             previous_success_count: 0,
             previous_latency_ms: 0,
@@ -4403,6 +4430,20 @@ fn bitswap_session_peer_limit_from_env_value(value: Option<&str>) -> usize {
         .unwrap_or(MAX_BITSWAP_SESSION_PEERS)
 }
 
+fn bitswap_trusted_direct_want_block_peers() -> Option<usize> {
+    bitswap_trusted_direct_want_block_peers_from_env_value(
+        std::env::var_os(BITSWAP_TRUSTED_DIRECT_WANT_BLOCK_PEERS_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn bitswap_trusted_direct_want_block_peers_from_env_value(value: Option<&str>) -> Option<usize> {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.min(MAX_BITSWAP_SESSION_PEERS))
+}
+
 fn bitswap_incoming_batch_partial_grace() -> Duration {
     let override_value = std::env::var_os(BITSWAP_INCOMING_BATCH_PARTIAL_GRACE_MS_ENV);
     let override_value = override_value.as_ref().map(|value| value.to_string_lossy());
@@ -4511,6 +4552,7 @@ struct BitswapPeerTarget {
     addrs: Vec<Multiaddr>,
     skip_want_have: bool,
     force_want_block: bool,
+    force_want_have: bool,
     connection_ready: Option<oneshot::Receiver<()>>,
 }
 
@@ -4709,6 +4751,7 @@ fn bitswap_request_target_mode_counts(peers: &[BitswapPeer]) -> (usize, usize) {
             has_multiple_peers,
             peer.skip_want_have,
             peer.force_want_block,
+            peer.force_want_have,
             &mut direct_untrusted_want_block_count,
         ) {
             want_have_count += 1;
@@ -4891,6 +4934,7 @@ async fn run_shared_bitswap_swarm(
                         addrs: peer.addrs,
                         skip_want_have: peer.skip_want_have,
                         force_want_block: peer.force_want_block,
+                        force_want_have: peer.force_want_have,
                         connection_ready,
                     });
                 }
@@ -5466,6 +5510,7 @@ fn format_bitswap_peers(peers: &[BitswapPeer]) -> String {
                 has_multiple_peers,
                 peer.skip_want_have,
                 peer.force_want_block,
+                peer.force_want_have,
                 &mut direct_untrusted_want_block_count,
             );
             let mode = if prefer_want_have {
@@ -5493,6 +5538,7 @@ fn bitswap_source_peer_trace_from_peers(
             has_multiple_peers,
             peer.skip_want_have,
             peer.force_want_block,
+            peer.force_want_have,
             &mut direct_untrusted_want_block_count,
         );
         if peer.id == source_peer {
@@ -5505,6 +5551,7 @@ fn bitswap_source_peer_trace_from_peers(
                 },
                 skip_want_have: peer.skip_want_have,
                 force_want_block: peer.force_want_block,
+                force_want_have: peer.force_want_have,
                 addr_count: peer.addrs.len(),
                 ..BitswapSourcePeerTrace::default()
             };
@@ -5532,6 +5579,7 @@ fn format_bitswap_targets(peers: &[BitswapPeerTarget]) -> String {
                 has_multiple_peers,
                 peer.skip_want_have,
                 peer.force_want_block,
+                peer.force_want_have,
                 &mut direct_untrusted_want_block_count,
             );
             let mode = if prefer_want_have {
@@ -5940,6 +5988,34 @@ fn maybe_force_zero_http_direct_want_block_peers_with_limit(
     marked
 }
 
+fn maybe_force_trusted_bitswap_want_have_probes(peers: &mut [BitswapPeer]) -> usize {
+    maybe_force_trusted_bitswap_want_have_probes_with_limit(
+        peers,
+        bitswap_trusted_direct_want_block_peers(),
+    )
+}
+
+fn maybe_force_trusted_bitswap_want_have_probes_with_limit(
+    peers: &mut [BitswapPeer],
+    limit: Option<usize>,
+) -> usize {
+    let Some(limit) = limit else {
+        return 0;
+    };
+
+    let mut direct_trusted = 0usize;
+    let mut probed = 0usize;
+    for peer in peers.iter_mut().filter(|peer| peer.skip_want_have) {
+        if direct_trusted < limit {
+            direct_trusted += 1;
+        } else {
+            peer.force_want_have = true;
+            probed += 1;
+        }
+    }
+    probed
+}
+
 fn merge_bitswap_peer(peers: &mut Vec<BitswapPeer>, id: PeerId, addrs: Vec<Multiaddr>) {
     if let Some(peer) = peers.iter_mut().find(|peer| peer.id == id) {
         peer.addrs.extend(addrs);
@@ -5952,6 +6028,7 @@ fn merge_bitswap_peer(peers: &mut Vec<BitswapPeer>, id: PeerId, addrs: Vec<Multi
             addrs,
             skip_want_have: false,
             force_want_block: false,
+            force_want_have: false,
         });
     }
 }
@@ -6875,6 +6952,7 @@ async fn fetch_bitswap_batch_over_outgoing_streams(
             has_multiple_peers,
             peer.skip_want_have,
             peer.force_want_block,
+            peer.force_want_have,
             &mut direct_untrusted_want_block_count,
         );
         attempts.push(request_bitswap_blocks_after_connection(
@@ -6951,12 +7029,14 @@ fn bitswap_prefer_want_have(
     has_multiple_peers: bool,
     skip_want_have: bool,
     force_want_block: bool,
+    force_want_have: bool,
     direct_untrusted_want_block_count: &mut usize,
 ) -> bool {
     bitswap_prefer_want_have_with_direct_limit(
         has_multiple_peers,
         skip_want_have,
         force_want_block,
+        force_want_have,
         direct_untrusted_want_block_count,
         bitswap_direct_want_block_untrusted_peer_limit(),
     )
@@ -6966,13 +7046,20 @@ fn bitswap_prefer_want_have_with_direct_limit(
     has_multiple_peers: bool,
     skip_want_have: bool,
     force_want_block: bool,
+    force_want_have: bool,
     direct_untrusted_want_block_count: &mut usize,
     direct_untrusted_want_block_limit: usize,
 ) -> bool {
-    if !skip_want_have
-        && (force_want_block
-            || *direct_untrusted_want_block_count < direct_untrusted_want_block_limit)
-    {
+    if force_want_block {
+        if !skip_want_have {
+            *direct_untrusted_want_block_count += 1;
+        }
+        return false;
+    }
+    if force_want_have {
+        return true;
+    }
+    if !skip_want_have && *direct_untrusted_want_block_count < direct_untrusted_want_block_limit {
         *direct_untrusted_want_block_count += 1;
         return false;
     }
@@ -6993,6 +7080,7 @@ async fn request_bitswap_blocks_after_connection(
         addrs,
         connection_ready,
         force_want_block,
+        force_want_have,
         ..
     } = peer;
 
@@ -7009,6 +7097,7 @@ async fn request_bitswap_blocks_after_connection(
         peer = %peer_id,
         prefer_want_have,
         force_want_block,
+        force_want_have,
         connection_ready_timeout_ms = connection_ready_timeout.as_millis(),
         want_have_timeout_ms = request_timeouts.want_have.as_millis(),
         stream_read_timeout_ms = request_timeouts.stream_read.as_millis()
@@ -7028,6 +7117,7 @@ async fn request_bitswap_blocks_after_connection(
                     failure_kind = "connection_waiter_dropped",
                     prefer_want_have,
                     force_want_block,
+                    force_want_have,
                     connection_ready_timeout_ms = connection_ready_timeout.as_millis(),
                     want_have_timeout_ms = request_timeouts.want_have.as_millis(),
                     stream_read_timeout_ms = request_timeouts.stream_read.as_millis(),
@@ -7053,6 +7143,7 @@ async fn request_bitswap_blocks_after_connection(
                     failure_kind = "connection_timeout",
                     prefer_want_have,
                     force_want_block,
+                    force_want_have,
                     connection_ready_timeout_ms = connection_ready_timeout.as_millis(),
                     want_have_timeout_ms = request_timeouts.want_have.as_millis(),
                     stream_read_timeout_ms = request_timeouts.stream_read.as_millis(),
@@ -7098,6 +7189,7 @@ async fn request_bitswap_blocks_after_connection(
                 ok = true,
                 prefer_want_have,
                 force_want_block,
+                force_want_have,
                 want_have_timeout_ms = request_timeouts.want_have.as_millis(),
                 stream_read_timeout_ms = request_timeouts.stream_read.as_millis(),
                 source_transport = result.source_transport.unwrap_or("unknown"),
@@ -7118,6 +7210,7 @@ async fn request_bitswap_blocks_after_connection(
                 failure_kind = bitswap_peer_failure_kind_label(err.kind),
                 prefer_want_have,
                 force_want_block,
+                force_want_have,
                 want_have_timeout_ms = request_timeouts.want_have.as_millis(),
                 stream_read_timeout_ms = request_timeouts.stream_read.as_millis(),
                 error = %err.detail,
@@ -8051,24 +8144,28 @@ mod bitswap_tests {
                 addrs: vec!["/ip4/127.0.0.4/tcp/4001/ws".parse().unwrap()],
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
             BitswapPeer {
                 id: dns_peer,
                 addrs: vec!["/dns4/provider.example/tcp/4001".parse().unwrap()],
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
             BitswapPeer {
                 id: quic_peer,
                 addrs: vec!["/ip4/127.0.0.3/udp/4001/quic-v1".parse().unwrap()],
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
             BitswapPeer {
                 id: tcp_peer,
                 addrs: vec!["/ip4/127.0.0.2/tcp/4001".parse().unwrap()],
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
         ];
 
@@ -8158,6 +8255,7 @@ mod bitswap_tests {
                 ],
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
             BitswapPeer {
                 id: second,
@@ -8167,6 +8265,7 @@ mod bitswap_tests {
                 ],
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
         ];
 
@@ -8211,6 +8310,7 @@ mod bitswap_tests {
                     .collect(),
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             })
             .collect::<Vec<_>>();
 
@@ -8253,30 +8353,35 @@ mod bitswap_tests {
                 ],
                 skip_want_have: true,
                 force_want_block: false,
+                force_want_have: false,
             },
             BitswapPeer {
                 id: second,
                 addrs: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
             BitswapPeer {
                 id: third,
                 addrs: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
             BitswapPeer {
                 id: fourth,
                 addrs: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
             BitswapPeer {
                 id: fifth,
                 addrs: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
         ];
 
@@ -8301,24 +8406,28 @@ mod bitswap_tests {
                 addrs: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
             BitswapPeer {
                 id: second,
                 addrs: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
             BitswapPeer {
                 id: third,
                 addrs: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
             BitswapPeer {
                 id: fourth,
                 addrs: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
         ];
 
@@ -8389,6 +8498,7 @@ mod bitswap_tests {
                         addrs: vec![addr],
                         skip_want_have: true,
                         force_want_block: false,
+                        force_want_have: false,
                     }],
                 )
                 .await
@@ -8732,6 +8842,7 @@ mod bitswap_tests {
                     addrs: vec![addr],
                     skip_want_have: true,
                     force_want_block: false,
+                    force_want_have: false,
                 }],
             )
             .await
@@ -8772,6 +8883,7 @@ mod bitswap_tests {
                     addrs: vec![addr],
                     skip_want_have: true,
                     force_want_block: false,
+                    force_want_have: false,
                 }],
             )
             .await
@@ -9987,20 +10099,24 @@ mod bitswap_tests {
     fn direct_untrusted_want_block_peer_limit_controls_request_modes() {
         let mut direct = 0;
         assert!(
-            !bitswap_prefer_want_have_with_direct_limit(true, false, false, &mut direct, 1),
+            !bitswap_prefer_want_have_with_direct_limit(true, false, false, false, &mut direct, 1),
             "first untrusted peer should get the optimistic want-block"
         );
         assert!(
-            bitswap_prefer_want_have_with_direct_limit(true, false, false, &mut direct, 1),
+            bitswap_prefer_want_have_with_direct_limit(true, false, false, false, &mut direct, 1),
             "later untrusted peers should use want-have after the limit"
         );
         assert!(
-            !bitswap_prefer_want_have_with_direct_limit(true, true, false, &mut direct, 1),
+            !bitswap_prefer_want_have_with_direct_limit(true, true, false, false, &mut direct, 1),
             "trusted/session peers still bypass want-have"
         );
         assert!(
-            !bitswap_prefer_want_have_with_direct_limit(true, false, true, &mut direct, 0),
+            !bitswap_prefer_want_have_with_direct_limit(true, false, true, false, &mut direct, 0),
             "forced peers still get want-block even when the generic direct limit is zero"
+        );
+        assert!(
+            bitswap_prefer_want_have_with_direct_limit(true, true, false, true, &mut direct, 1),
+            "trusted/session peers can be forced to use want-have as a lab control"
         );
     }
 
@@ -10017,6 +10133,7 @@ mod bitswap_tests {
                 addrs: Vec::new(),
                 skip_want_have: index == 0,
                 force_want_block: false,
+                force_want_have: false,
             })
             .collect::<Vec<_>>();
 
@@ -10116,6 +10233,52 @@ mod bitswap_tests {
             bitswap_session_peer_limit_from_env_value(Some("999")),
             MAX_BITSWAP_SESSION_PEERS
         );
+    }
+
+    #[test]
+    fn trusted_direct_want_block_peer_limit_parses_optional_override() {
+        assert_eq!(
+            bitswap_trusted_direct_want_block_peers_from_env_value(None),
+            None
+        );
+        assert_eq!(
+            bitswap_trusted_direct_want_block_peers_from_env_value(Some("bad")),
+            None
+        );
+        assert_eq!(
+            bitswap_trusted_direct_want_block_peers_from_env_value(Some("0")),
+            Some(0)
+        );
+        assert_eq!(
+            bitswap_trusted_direct_want_block_peers_from_env_value(Some("1")),
+            Some(1)
+        );
+        assert_eq!(
+            bitswap_trusted_direct_want_block_peers_from_env_value(Some("999")),
+            Some(MAX_BITSWAP_SESSION_PEERS)
+        );
+    }
+
+    #[test]
+    fn trusted_direct_want_block_peer_limit_marks_extra_trusted_peers_as_probes() {
+        let mut peers = (0..5)
+            .map(|index| BitswapPeer {
+                id: PeerId::random(),
+                addrs: Vec::new(),
+                skip_want_have: index < 3,
+                force_want_block: false,
+                force_want_have: false,
+            })
+            .collect::<Vec<_>>();
+
+        let marked = maybe_force_trusted_bitswap_want_have_probes_with_limit(&mut peers, Some(1));
+
+        assert_eq!(marked, 2);
+        assert!(!peers[0].force_want_have);
+        assert!(peers[1].force_want_have);
+        assert!(peers[2].force_want_have);
+        assert!(!peers[3].force_want_have);
+        assert!(!peers[4].force_want_have);
     }
 
     #[test]
@@ -10440,12 +10603,14 @@ mod bitswap_tests {
                 addrs: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
             BitswapPeer {
                 id: preferred,
                 addrs: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
         ];
 
@@ -10498,12 +10663,14 @@ mod bitswap_tests {
                 addrs: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
             BitswapPeer {
                 id: fast,
                 addrs: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
+                force_want_have: false,
             },
         ];
 
@@ -10580,6 +10747,7 @@ mod bitswap_tests {
             addrs: Vec::new(),
             skip_want_have: false,
             force_want_block: false,
+            force_want_have: false,
         }];
 
         let inserted = retriever
@@ -10666,6 +10834,7 @@ mod bitswap_tests {
             addrs: vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()],
             skip_want_have: true,
             force_want_block: false,
+            force_want_have: false,
         };
 
         retriever.mark_single_session_shortcut_timeout_peer(&cid, &[peer]);
@@ -10691,12 +10860,14 @@ mod bitswap_tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()],
                 skip_want_have: true,
                 force_want_block: false,
+                force_want_have: false,
             },
             BitswapPeer {
                 id: second,
                 addrs: vec!["/ip4/127.0.0.2/tcp/4001".parse().unwrap()],
                 skip_want_have: true,
                 force_want_block: false,
+                force_want_have: false,
             },
         ];
 
@@ -10964,6 +11135,7 @@ mod bitswap_tests {
             ],
             skip_want_have: false,
             force_want_block: false,
+            force_want_have: false,
         }];
 
         let stats = bitswap_peer_addr_stats(&peers);

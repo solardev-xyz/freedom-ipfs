@@ -31917,3 +31917,136 @@ signal is much stronger. The next useful direction remains earlier source
 quality: identify/select a better Bitswap peer before the HTTP provider wins,
 or avoid the root/leaf double-path by learning which providers actually deliver
 for the page session.
+
+## 2026-05-07 - Reject: Trusted/Session WANT_HAVE Probe Width
+
+Hypothesis:
+Boxo/Kubo Bitswap sessions send one optimistic `want-block` to a session peer
+and probe the rest with `want-have`, using first-responder history to choose the
+optimistic peer. Our Rust path already splits untrusted provider peers between
+direct `WANT_BLOCK` and `WANT_HAVE`, but trusted/recent session peers still all
+bypass `WANT_HAVE`. A disabled lab that keeps only the first trusted/session
+peer direct and forces later trusted peers through `WANT_HAVE` might reduce
+duplicate trusted-peer work without changing provider discovery or connection
+caps.
+
+Code:
+
+- Added optional lab env knob
+  `FREEDOM_IPFS_BITSWAP_TRUSTED_DIRECT_WANT_BLOCK_PEERS=<n>`.
+- When absent, default behavior is unchanged: all trusted/session peers still
+  use direct `WANT_BLOCK`.
+- When set, only the first `n` trusted/session peers keep direct `WANT_BLOCK`;
+  later trusted peers are marked `force_want_have=true`.
+- The lab applies to:
+  - provider-fetch Bitswap candidate sets;
+  - recent-session shortcut fetches; and
+  - recent-session range-batch fetches.
+- Added trace fields:
+  - `trusted_want_have_probe_count`
+  - `trusted_direct_want_block_limit`
+  - `source_peer_force_want_have`
+  - per-peer attempt `force_want_have`
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval trusted_direct_want_block --lib
+cargo test -p freedom-ipfs-retrieval direct_untrusted_want_block_peer_limit_controls_request_modes --lib
+cargo test -p freedom-ipfs-retrieval bitswap --lib
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Result:
+
+- Formatting passed after `cargo fmt --all`.
+- The focused trusted-direct tests passed.
+- The direct-width request-mode regression test passed.
+- The full `bitswap` retrieval test slice passed: `114` passed, `1` ignored.
+- Clippy for `freedom-ipfs-retrieval` passed with `-D warnings`.
+
+Opt-in command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_BITSWAP_TRUSTED_DIRECT_WANT_BLOCK_PEERS=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/trusted-direct1-focused-r10-20260507T0915Z-trace.jsonl \
+  --comparison-output /tmp/trusted-direct1-focused-r10-20260507T0915Z.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `10/10` for both focused cases.
+- `ipfs.tech` page assets: Rust root `634/1659ms`, assets `115/388ms`;
+  Kubo root `1498/2780ms`, assets `113/582ms`.
+- Wikipedia root: Rust `623/1520ms` vs Kubo `445/924ms`.
+- Resource max: Rust `49280KiB` RSS and `35` FDs vs Kubo `439272KiB` RSS and
+  `847` FDs.
+- HTTP provider block fetch p50/p95/max: `180/416/927ms`.
+- Bitswap block fetch p50/p95/max: `86/455/1286ms`.
+
+Same-window no-env control:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/trusted-direct1-noenv-focused-r10-20260507T0921Z-trace.jsonl \
+  --comparison-output /tmp/trusted-direct1-noenv-focused-r10-20260507T0921Z.json
+```
+
+No-env result:
+
+- Rust and Kubo passed `10/10` for both focused cases.
+- `ipfs.tech` page assets: Rust root `625/956ms`, assets `117/314ms`;
+  Kubo root `1503/6459ms`, assets `99/421ms`.
+- Wikipedia root: Rust `761/873ms` vs Kubo `197/598ms`.
+- Resource max: Rust `49088KiB` RSS and `35` FDs vs Kubo `342632KiB` RSS and
+  `723` FDs.
+- HTTP provider block fetch p50/p95/max: `137/271/508ms`.
+- Bitswap block fetch p50/p95/max: `110/498/635ms`.
+
+Trace interpretation:
+
+- The opt-in lab participated:
+  - `bitswap_session_shortcut_start` probe counts: `32` events with `1` forced
+    probe, `5` with `2`, and `1` with `3`.
+  - `bitswap_peer_expand` probe counts: `5` events with `1` forced probe and
+    `1` with `2`.
+  - Total forced trusted probes: `45` on shortcut starts and `7` on provider
+    expansions.
+- No successful source had `source_peer_force_want_have=true`; all successful
+  forced-probe opportunities still delivered from direct `WANT_BLOCK` peers.
+- Opt-in improved Wikipedia p50 versus the immediate control (`623ms` vs
+  `761ms`) but worsened Wikipedia p95 (`1520ms` vs `873ms`), `ipfs.tech` root
+  p95 (`1659ms` vs `956ms`), and `ipfs.tech` asset p95 (`388ms` vs `314ms`).
+- Both modes preserved Rust's large RSS/FD advantage over Kubo.
+
+Decision:
+Do not promote trusted/session `WANT_HAVE` probe width. Keep the disabled knob
+and trace fields as a diagnostic because they answer a specific Boxo-inspired
+question: forcing already-trusted session peers through `WANT_HAVE` did not
+produce winning sources in this focused run, and it regressed p95 guardrails.
+The remaining source-quality work should not spend extra round trips on known
+session peers by default. Better next directions are earlier provider/source
+quality signals, DONT_HAVE/read-timeout suppression with evidence, or learning
+which provider/session peers actually deliver for the current top-level path.
