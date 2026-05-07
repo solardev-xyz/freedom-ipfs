@@ -95,6 +95,8 @@ const BITSWAP_SESSION_PRE_LOOKUP_GRACE: Duration = Duration::from_millis(0);
 const BITSWAP_SESSION_PRE_LOOKUP_GRACE_MS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_SESSION_PRE_LOOKUP_GRACE_MS";
 const BITSWAP_SESSION_POST_LOOKUP_GRACE: Duration = Duration::from_millis(100);
+const BITSWAP_SESSION_MULTI_HTTP_POST_LOOKUP_GRACE_MS_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_SESSION_MULTI_HTTP_POST_LOOKUP_GRACE_MS";
 // Give a recent Bitswap session peer a short chance to win before falling back
 // to the only HTTP provider. Longer waits inflated page-asset tails on mobile
 // browsing workloads without enough reliability benefit.
@@ -105,6 +107,8 @@ const DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE";
 const SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS";
+const ENABLE_MULTI_HTTP_POST_LOOKUP_RACE_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_MULTI_HTTP_POST_LOOKUP_RACE";
 const ENABLE_ZERO_HTTP_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_RACE";
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -500,18 +504,15 @@ impl HttpRetriever {
                                                     let http_provider_count =
                                                         provider_http_url_count(&providers);
                                                     let post_lookup_race_allowed =
-                                                        if zero_http_post_lookup_race_enabled()
-                                                            && http_provider_count == 0
-                                                        {
-                                                            true
-                                                        } else {
-                                                            self.single_http_post_lookup_race_allows(
+                                                        explicit_post_lookup_race_enabled_for_width(
+                                                            http_provider_count,
+                                                        ) || self
+                                                            .single_http_post_lookup_race_allows(
                                                             cid,
                                                             &providers,
                                                             http_provider_count,
                                                         )
-                                                            .await
-                                                        };
+                                                            .await;
                                                     if post_lookup_race_allowed
                                                     {
                                                         if let Some((block, source)) = self
@@ -698,18 +699,15 @@ impl HttpRetriever {
                                                 let http_provider_count =
                                                     provider_http_url_count(&providers);
                                                 let post_lookup_race_allowed =
-                                                    if zero_http_post_lookup_race_enabled()
-                                                        && http_provider_count == 0
-                                                    {
-                                                        true
-                                                    } else {
-                                                        self.single_http_post_lookup_race_allows(
+                                                    explicit_post_lookup_race_enabled_for_width(
+                                                        http_provider_count,
+                                                    ) || self
+                                                        .single_http_post_lookup_race_allows(
                                                         cid,
                                                         &providers,
                                                         http_provider_count,
                                                     )
-                                                        .await
-                                                    };
+                                                        .await;
                                                 if post_lookup_race_allowed
                                                 {
                                                     if let Some((block, source)) = self
@@ -1028,7 +1026,6 @@ impl HttpRetriever {
     {
         let post_lookup_grace = bitswap_session_post_lookup_grace(providers);
         let http_provider_count = provider_http_url_count(providers);
-        debug_assert!(http_provider_count <= 1);
         let provider_fetch = self.fetch_from_providers_with_source(cid, providers);
         tokio::pin!(provider_fetch);
         let race_started = Instant::now();
@@ -2733,28 +2730,45 @@ fn single_http_provider_base(providers: &[Provider]) -> Option<&Url> {
 }
 
 fn bitswap_session_post_lookup_grace(providers: &[Provider]) -> Duration {
-    let override_value = std::env::var_os(BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS_ENV);
-    let override_value = override_value.as_ref().map(|value| value.to_string_lossy());
+    let single_http_override =
+        std::env::var_os(BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS_ENV);
+    let single_http_override = single_http_override
+        .as_ref()
+        .map(|value| value.to_string_lossy());
+    let multi_http_override = std::env::var_os(BITSWAP_SESSION_MULTI_HTTP_POST_LOOKUP_GRACE_MS_ENV);
+    let multi_http_override = multi_http_override
+        .as_ref()
+        .map(|value| value.to_string_lossy());
 
-    bitswap_session_post_lookup_grace_from_env_value(providers, override_value.as_deref())
+    bitswap_session_post_lookup_grace_from_env_value(
+        providers,
+        single_http_override.as_deref(),
+        multi_http_override.as_deref(),
+    )
 }
 
 fn bitswap_session_post_lookup_grace_from_env_value(
     providers: &[Provider],
     single_http_grace_ms: Option<&str>,
+    multi_http_grace_ms: Option<&str>,
 ) -> Duration {
-    if provider_http_url_count(providers) == 1 {
-        single_http_post_lookup_grace_from_env_value(single_http_grace_ms)
-    } else {
-        BITSWAP_SESSION_POST_LOOKUP_GRACE
+    match provider_http_url_count(providers) {
+        0 => BITSWAP_SESSION_POST_LOOKUP_GRACE,
+        1 => post_lookup_grace_from_env_value(
+            single_http_grace_ms,
+            BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE,
+        ),
+        _ => {
+            post_lookup_grace_from_env_value(multi_http_grace_ms, BITSWAP_SESSION_POST_LOOKUP_GRACE)
+        }
     }
 }
 
-fn single_http_post_lookup_grace_from_env_value(value: Option<&str>) -> Duration {
+fn post_lookup_grace_from_env_value(value: Option<&str>, default: Duration) -> Duration {
     value
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
-        .unwrap_or(BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE)
+        .unwrap_or(default)
 }
 
 fn shared_block_fetch_result(
@@ -3150,6 +3164,15 @@ fn single_http_provider_bitswap_hedge_enabled() -> bool {
 
 fn single_http_post_lookup_race_enabled() -> bool {
     std::env::var_os(DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE_ENV).is_none()
+}
+
+fn multi_http_post_lookup_race_enabled() -> bool {
+    std::env::var_os(ENABLE_MULTI_HTTP_POST_LOOKUP_RACE_ENV).is_some()
+}
+
+fn explicit_post_lookup_race_enabled_for_width(http_provider_count: usize) -> bool {
+    (http_provider_count == 0 && zero_http_post_lookup_race_enabled())
+        || (http_provider_count > 1 && multi_http_post_lookup_race_enabled())
 }
 
 fn single_http_post_lookup_race_min_score() -> Option<Duration> {
@@ -8664,21 +8687,30 @@ mod bitswap_tests {
     }
 
     #[test]
-    fn single_http_post_lookup_grace_env_value_parses_override() {
+    fn post_lookup_grace_env_value_parses_override() {
         assert_eq!(
-            single_http_post_lookup_grace_from_env_value(None),
+            post_lookup_grace_from_env_value(None, BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE),
             BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE
         );
         assert_eq!(
-            single_http_post_lookup_grace_from_env_value(Some("125")),
+            post_lookup_grace_from_env_value(
+                Some("125"),
+                BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE
+            ),
             Duration::from_millis(125)
         );
         assert_eq!(
-            single_http_post_lookup_grace_from_env_value(Some("0")),
+            post_lookup_grace_from_env_value(
+                Some("0"),
+                BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE
+            ),
             Duration::from_millis(0)
         );
         assert_eq!(
-            single_http_post_lookup_grace_from_env_value(Some("not-a-number")),
+            post_lookup_grace_from_env_value(
+                Some("not-a-number"),
+                BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE
+            ),
             BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE
         );
     }
@@ -8744,7 +8776,7 @@ mod bitswap_tests {
     }
 
     #[test]
-    fn single_http_post_lookup_grace_override_is_single_http_only() {
+    fn post_lookup_grace_overrides_are_http_width_scoped() {
         let single_http = vec![Provider::from_parts(
             Some("single-http".into()),
             vec!["/ip4/127.0.0.1/tcp/8080/http".into()],
@@ -8765,15 +8797,19 @@ mod bitswap_tests {
         .unwrap()];
 
         assert_eq!(
-            bitswap_session_post_lookup_grace_from_env_value(&single_http, Some("125")),
+            bitswap_session_post_lookup_grace_from_env_value(&single_http, Some("125"), Some("0")),
             Duration::from_millis(125)
         );
         assert_eq!(
-            bitswap_session_post_lookup_grace_from_env_value(&multi_http, Some("125")),
+            bitswap_session_post_lookup_grace_from_env_value(&multi_http, Some("125"), None),
             BITSWAP_SESSION_POST_LOOKUP_GRACE
         );
         assert_eq!(
-            bitswap_session_post_lookup_grace_from_env_value(&bitswap_only, Some("125")),
+            bitswap_session_post_lookup_grace_from_env_value(&multi_http, Some("125"), Some("0")),
+            Duration::from_millis(0)
+        );
+        assert_eq!(
+            bitswap_session_post_lookup_grace_from_env_value(&bitswap_only, Some("125"), Some("0")),
             BITSWAP_SESSION_POST_LOOKUP_GRACE
         );
     }

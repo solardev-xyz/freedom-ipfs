@@ -26513,3 +26513,220 @@ as a disabled lab control, but the current production default should remain
 `0ms`. The next resource-efficiency attempt should be more selective than a
 blanket shortcut delay, for example based on provider-set shape, recent peer
 quality, or per-request source confidence.
+
+## 2026-05-06 Lab: Multi-HTTP Post-Lookup Provider Race
+
+Hypothesis:
+After the `0ms` pre-lookup change, provider lookup starts immediately but
+multi-HTTP-provider results still pay the generic `100ms` post-lookup wait for
+a recent Bitswap peer. In current traces those waits often time out despite
+having multiple HTTP providers available. Racing recent Bitswap peers against
+provider fetches for multi-HTTP results may remove that repeated wait without
+hurting resource use.
+
+Implementation:
+
+- Add opt-in env flag:
+  `FREEDOM_IPFS_ENABLE_MULTI_HTTP_POST_LOOKUP_RACE`.
+- Default behavior is unchanged.
+- When enabled and provider lookup returns more than one HTTP provider, reuse
+  the existing post-lookup race path instead of waiting the generic `100ms`
+  multi-provider grace.
+
+Focused r10 command:
+
+```sh
+FREEDOM_IPFS_ENABLE_MULTI_HTTP_POST_LOOKUP_RACE=1 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/multi-http-postlookup-race-ipfs-tech-r10-20260506T234808Z-trace.jsonl \
+  --comparison-output /tmp/multi-http-postlookup-race-ipfs-tech-r10-20260506T234808Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/multi-http-postlookup-race-ipfs-tech-r10-20260506T234808Z.log 2>&1
+```
+
+Focused result:
+
+- Rust and Kubo passed `10/10`.
+- `ipfs.tech` root TTFB p50/p95:
+  - `0ms` default control: `600/898ms`
+  - multi-HTTP race: `591/796ms`
+- `ipfs.tech` asset TTFB p50/p95:
+  - `0ms` default control: `201/461ms`
+  - multi-HTTP race: `182/421ms`
+- Resource max:
+  - `0ms` default control: `54292KiB` RSS, `39` FDs
+  - multi-HTTP race: `54020KiB` RSS, `29` FDs
+- Trace shift:
+  - post-lookup waits: `160 -> 1`
+  - multi-HTTP post-lookup races: `0 -> 138`
+  - Bitswap connections: `54 -> 20`
+
+Multi-case r3 command:
+
+```sh
+FREEDOM_IPFS_ENABLE_MULTI_HTTP_POST_LOOKUP_RACE=1 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/multi-http-postlookup-race-multicase-r3-20260506T235248Z-trace.jsonl \
+  --comparison-output /tmp/multi-http-postlookup-race-multicase-r3-20260506T235248Z.json \
+  > /tmp/multi-http-postlookup-race-multicase-r3-20260506T235248Z.log 2>&1
+```
+
+Multi-case r3 result:
+
+- Rust and Kubo passed `3/3` on all three cases.
+- `ipfs.tech` asset TTFB p50/p95:
+  - `0ms` default r3: `208/508ms`
+  - multi-HTTP race r3: `191/511ms`
+  - Kubo same-window: `386/824ms`
+- `ipfs.tech` root TTFB p50/p95:
+  - `0ms` default r3: `719/728ms`
+  - multi-HTTP race r3: `678/686ms`
+- Resource max:
+  - `0ms` default r3: `61772KiB` RSS, `37` FDs
+  - multi-HTTP race r3: `56796KiB` RSS, `32` FDs
+- Trace shift:
+  - post-lookup waits: `53 -> 3`
+  - post-lookup races: `58 -> 111`
+  - Bitswap connections: `21 -> 9`
+
+Multi-case r10 command:
+
+```sh
+FREEDOM_IPFS_ENABLE_MULTI_HTTP_POST_LOOKUP_RACE=1 \
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/multi-http-postlookup-race-multicase-r10-20260506T235418Z-trace.jsonl \
+  --comparison-output /tmp/multi-http-postlookup-race-multicase-r10-20260506T235418Z.json \
+  > /tmp/multi-http-postlookup-race-multicase-r10-20260506T235418Z.log 2>&1
+```
+
+Multi-case r10 result:
+
+- Rust and Kubo passed `10/10` on all three cases.
+- `ipfs.tech` asset TTFB p50/p95:
+  - `0ms` default r10: `207/478ms`
+  - multi-HTTP race r10: `176/500ms`
+  - Kubo same-window: `365/740ms`
+- `ipfs.tech` root TTFB p50/p95:
+  - `0ms` default r10: `688/1091ms`
+  - multi-HTTP race r10: `672/1081ms`
+- DAICO root TTFB p50/p95:
+  - `0ms` default r10: `1232/1521ms`
+  - multi-HTTP race r10: `1178/1580ms`
+- Resource max:
+  - `0ms` default r10: `57652KiB` RSS, `39` FDs
+  - multi-HTTP race r10: `60872KiB` RSS, `38` FDs
+- Trace shift:
+  - post-lookup waits: `180 -> 19`
+  - post-lookup races: `200 -> 359`
+  - Bitswap connections: `64 -> 72`
+
+Decision:
+Keep the multi-HTTP race as a disabled lab control for now. It reliably removes
+the repeated `100ms` multi-provider wait and improves `ipfs.tech` asset median,
+but the multi-case r10 slightly regressed asset p95 (`478 -> 500ms`) and DAICO
+root p95 (`1521 -> 1580ms`) while adding about `3MiB` RSS. This is promising
+enough to revisit with a more selective gate, but not clean enough to promote
+as the default.
+
+## 2026-05-06 Reject: Multi-HTTP Post-Lookup Grace Zero Without Race
+
+Hypothesis:
+The multi-HTTP race median win may come mostly from starting HTTP providers
+immediately, not from keeping the recent Bitswap shortcut alive. Test a cheaper
+variant that sets multi-HTTP post-lookup grace to `0ms` but does not enable the
+multi-provider race.
+
+Implementation:
+
+- Add env override:
+  `FREEDOM_IPFS_BITSWAP_SESSION_MULTI_HTTP_POST_LOOKUP_GRACE_MS`.
+- Default behavior is unchanged at `100ms` for multi-HTTP and zero-HTTP
+  provider sets.
+- The existing single-HTTP override remains scoped to single-HTTP provider
+  sets.
+
+Validation before live run:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval post_lookup_grace -- --nocapture
+cargo check -p freedom-ipfs-retrieval --all-targets
+```
+
+All passed.
+
+Focused command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_SESSION_MULTI_HTTP_POST_LOOKUP_GRACE_MS=0 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/multi-http-grace0-ipfs-tech-r10-20260506T235929Z-trace.jsonl \
+  --comparison-output /tmp/multi-http-grace0-ipfs-tech-r10-20260506T235929Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/multi-http-grace0-ipfs-tech-r10-20260506T235929Z.log 2>&1
+```
+
+Focused result:
+
+- Rust and Kubo passed `10/10`.
+- `ipfs.tech` root TTFB p50/p95:
+  - `0ms` default control: `600/898ms`
+  - grace-zero variant: `647/913ms`
+- `ipfs.tech` asset TTFB p50/p95:
+  - `0ms` default control: `201/461ms`
+  - grace-zero variant: `187/509ms`
+  - Kubo same-window: `167/492ms`
+- Resource max:
+  - `0ms` default control: `54292KiB` RSS, `39` FDs
+  - grace-zero variant: `54248KiB` RSS, `35` FDs
+- Trace shift:
+  - post-lookup waits: `160 -> 73`
+  - Bitswap connections: `54 -> 41`
+
+Decision:
+Do not promote multi-HTTP grace `0ms`. It reduces some wait and connection
+churn, but the focused p95 regression is worse than the multi-race result and
+it lost to Kubo in that same-window asset p50/p95. Keep the env override as a
+disabled lab control for future selective heuristics.
