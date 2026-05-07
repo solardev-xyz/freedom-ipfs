@@ -37645,3 +37645,190 @@ Wikipedia root p95 and `ipfs.tech` asset median depending on public-network
 provider timing. Continue using `meaningful_kubo_wins` and avoid speculative
 session-peer demotion unless a fresh trace repeatedly reproduces the exact
 zero-HTTP prefetch-plus-slow-candidate-0 shape.
+
+### Current Compact Same-Window Baseline With Meaningful Kubo Wins
+
+Purpose:
+
+After reverting the zero-HTTP session-peer demotion lab, refresh the compact
+same-window Rust-vs-Kubo picture using the current default code and default
+asset concurrency.
+
+Command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-page-assets-cid-direct \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/current-compact-baseline-20260507T190510Z-trace.jsonl \
+  --comparison-output /tmp/current-compact-baseline-20260507T190510Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `346/391ms`; Kubo `1250/2461ms`.
+- Vitalik range: Rust `114/237ms`; Kubo `3283/4345ms`.
+- `ipfs.tech` page root: Rust `649/892ms`; Kubo `1160/1452ms`.
+- `ipfs.tech` page assets: Rust `155/502ms`; Kubo `380/825ms`.
+- CID-direct hot-cache wins for Kubo were only small millisecond noise.
+- Wikipedia root: Rust `543/857ms`; Kubo `666/711ms`.
+- Resource max: Rust `59788KiB` RSS and `37` FDs vs Kubo `182016KiB`
+  RSS and `175` FDs.
+- `meaningful_kubo_wins` only flagged Wikipedia root p95:
+  Rust `857ms` vs Kubo `711ms`.
+
+Trace finding:
+
+- HTTP-provider blocks: `148`, p50/p90/p95/max `134/272/329/950ms`.
+- Bitswap blocks: `85`, p50/p90/p95/max `138/309/400/654ms`.
+- Delegated routing distribution: zero HTTP `9`, single HTTP `117`, multi
+  HTTP `84`.
+- The slowest Wikipedia request was a mixed shape: the root directory block came
+  from `ipfs-bridge.sia.dev` in about `188ms`; the follow-on `/index.html`
+  block saw a single `f010479.twinquasar.io` HTTP provider return `500`, then
+  Bitswap delivered after provider expansion. This is the known failing-single
+  HTTP family, but previous direct-IP fallback labs already showed that direct
+  Bitswap did not win those blocks reliably.
+
+### Focused Moving-Shape Baseline: Wikipedia Mixed-Trusted Timeout
+
+Purpose:
+
+Run a focused same-window repeat on the two moving shapes, `ipfs.tech` assets
+and Wikipedia root, before starting another code experiment.
+
+Command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/current-focused-moving-shapes-20260507T190510Z-r10-trace.jsonl \
+  --comparison-output /tmp/current-focused-moving-shapes-20260507T190510Z-r10.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10`.
+- `ipfs.tech` page root: Rust `636/829ms`; Kubo `1696/3991ms`.
+- `ipfs.tech` page assets: Rust `122/221ms`; Kubo `220/522ms`.
+- Wikipedia root: Rust `180/5229ms`; Kubo `468/726ms`.
+- Resource max: Rust `57272KiB` RSS and `38` FDs vs Kubo `281232KiB`
+  RSS and `446` FDs.
+- `meaningful_kubo_wins` flagged only Wikipedia root p95:
+  Rust `5229ms` vs Kubo `726ms`.
+
+Trace finding:
+
+- `ipfs.tech` was not an active Kubo gap in this window.
+- The Wikipedia p95 was one top-level zero-HTTP root request for CID
+  `bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze`.
+- Delegated routing returned `64` providers and `0` HTTP providers.
+- The zero-HTTP DNS-prefetch path fired. Provider expansion found `16` Bitswap
+  candidates with one recent cross-top-level trusted/session peer.
+- The first Bitswap command had `4` `WANT_BLOCK` targets and `12` `WANT_HAVE`
+  targets, then hit the `4000ms` mixed-trusted request timeout. It reset the
+  shared client.
+- The same-provider retry then succeeded quickly: the previous session peer
+  reconnected and delivered the root block in about `232ms`.
+
+Interpretation:
+
+This is the current clearest Kubo gap: not provider discovery, not HTTP
+provider latency, and not missing retry recovery. The costly part is waiting the
+full `4s` mixed-trusted request timeout before the reset/retry path that then
+works. Earlier attempts to simply reduce that timeout or keep the old shared
+client alive were rejected, so future work should avoid repeating those exact
+changes. The useful target is stale connected/session-peer detection or a more
+selective way to recover from a stalled mixed-trusted command before the full
+timeout without making every Wikipedia zero-HTTP root pay an extra retry tax.
+
+### Revert: Mixed-Trusted Stall Retry Lab
+
+Hypothesis:
+
+The focused baseline had a stale connected session peer in a top-level
+zero-HTTP, high-provider, mixed trusted/provider Bitswap command. A disabled lab
+tested whether starting a fresh shared-client retry after `1000ms` would avoid
+the `4000ms` wait while keeping the original command alive.
+
+Temporary code:
+
+- Added disabled env:
+  `FREEDOM_IPFS_ENABLE_BITSWAP_MIXED_STALL_RETRY=1`.
+- Added optional knobs:
+  `FREEDOM_IPFS_BITSWAP_MIXED_STALL_RETRY_AFTER_MS=<ms>` and
+  `FREEDOM_IPFS_BITSWAP_MIXED_STALL_RETRY_MIN_PROVIDERS=<n>`.
+- Gate was intentionally narrow:
+  - opt-in only
+  - top-level gateway request, not subresource
+  - zero HTTP providers
+  - provider count at least `32`
+  - mixed trusted/provider Bitswap candidates
+- On the gate, the lab waited `1000ms`, reset the shared Bitswap client, and
+  raced a fresh retry against the original command.
+- Added trace phases:
+  `bitswap_mixed_stall_retry_start` and
+  `bitswap_mixed_stall_retry_result`.
+
+Focused validation while temporary code existed:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval mixed_stall_retry --lib -- --nocapture
+```
+
+Validation result:
+
+- Formatting passed.
+- Focused gate test passed.
+
+Opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_BITSWAP_MIXED_STALL_RETRY=1 \
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/mixed-stall-retry-focused-20260507T190510Z-r10-trace.jsonl \
+  --comparison-output /tmp/mixed-stall-retry-focused-20260507T190510Z-r10.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `10/10`.
+- `ipfs.tech` page root: Rust `669/1241ms`; Kubo `1817/3122ms`.
+- `ipfs.tech` page assets: Rust `197/625ms`; Kubo `179/905ms`.
+- Wikipedia root: Rust `1684/1996ms`; Kubo `420/1229ms`.
+- Resource max: Rust `58124KiB` RSS and `39` FDs vs Kubo `353212KiB`
+  RSS and `433` FDs.
+- The lab eliminated `bitswap_request_timeout_detail` events in this run, but
+  `bitswap_mixed_stall_retry_start` fired on `8` Wikipedia roots and every
+  fired retry won after roughly `1173-1254ms` total elapsed.
+- Client resets rose to `8`.
+
+Decision:
+
+Revert the temporary code. It did remove the single `4s` timeout tail, but it
+made the normal Wikipedia zero-HTTP root path consistently slow: median
+regressed from `180ms` to `1684ms`. It also regressed `ipfs.tech` asset median
+from `122ms` to `197ms` and root p95 from `829ms` to `1241ms`. The useful
+lesson is that preemptively resetting after a fixed `1000ms` is too blunt.
+Future work should look for a stronger stale-connection signal before retrying,
+not a fixed timer on every qualifying top-level zero-HTTP request.
