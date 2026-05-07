@@ -146,6 +146,8 @@ const MAX_BITSWAP_SESSION_PEERS: usize = 4;
 const BITSWAP_SESSION_PEER_LIMIT_ENV: &str = "FREEDOM_IPFS_BITSWAP_SESSION_PEER_LIMIT";
 const ENABLE_BITSWAP_DOMINANT_SESSION_PEER_ENV: &str =
     "FREEDOM_IPFS_ENABLE_BITSWAP_DOMINANT_SESSION_PEER";
+const ENABLE_BITSWAP_TOP_LEVEL_DOMINANT_SESSION_PEER_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_BITSWAP_TOP_LEVEL_DOMINANT_SESSION_PEER";
 const BITSWAP_DOMINANT_SESSION_PEER_MIN_SUCCESSES: u64 = 8;
 const BITSWAP_DOMINANT_SESSION_PEER_RATIO: u64 = 4;
 const MAX_BITSWAP_ADDRS_PER_PEER: usize = 2;
@@ -2723,7 +2725,7 @@ impl HttpRetriever {
                 )
             })
             .collect::<Vec<_>>();
-        if bitswap_dominant_session_peer_enabled() {
+        if let Some(dominant_mode) = bitswap_dominant_session_peer_mode() {
             if let Some(dominant_index) = dominant_recent_bitswap_peer_index(&peers) {
                 let (id, seen_at, last_latency, addrs, success_count) =
                     peers.swap_remove(dominant_index);
@@ -2735,6 +2737,7 @@ impl HttpRetriever {
                     success_count,
                     next_success_count,
                     latency_ms = last_latency.as_millis(),
+                    mode = dominant_mode.as_str(),
                     min_success_count = BITSWAP_DOMINANT_SESSION_PEER_MIN_SUCCESSES,
                     dominance_ratio = BITSWAP_DOMINANT_SESSION_PEER_RATIO
                 );
@@ -3522,6 +3525,21 @@ struct SuccessfulBitswapPeer {
     success_count: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DominantSessionPeerMode {
+    Global,
+    GatewayTopLevel,
+}
+
+impl DominantSessionPeerMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::GatewayTopLevel => "gateway_top_level",
+        }
+    }
+}
+
 struct HttpProviderScore {
     ewma_elapsed: Duration,
     successes: u64,
@@ -3736,8 +3754,26 @@ fn bitswap_dns_expansion_cache_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_DNS_EXPANSION_CACHE_ENV).is_some()
 }
 
-fn bitswap_dominant_session_peer_enabled() -> bool {
-    std::env::var_os(ENABLE_BITSWAP_DOMINANT_SESSION_PEER_ENV).is_some()
+fn bitswap_dominant_session_peer_mode() -> Option<DominantSessionPeerMode> {
+    dominant_session_peer_mode_for_context(
+        std::env::var_os(ENABLE_BITSWAP_DOMINANT_SESSION_PEER_ENV).is_some(),
+        std::env::var_os(ENABLE_BITSWAP_TOP_LEVEL_DOMINANT_SESSION_PEER_ENV).is_some(),
+        current_retrieval_request_context(),
+    )
+}
+
+fn dominant_session_peer_mode_for_context(
+    global_enabled: bool,
+    top_level_enabled: bool,
+    context: Option<RetrievalRequestContext>,
+) -> Option<DominantSessionPeerMode> {
+    if global_enabled {
+        return Some(DominantSessionPeerMode::Global);
+    }
+    if top_level_enabled && context.is_some_and(|context| !context.gateway_subresource()) {
+        return Some(DominantSessionPeerMode::GatewayTopLevel);
+    }
+    None
 }
 
 fn dominant_recent_bitswap_peer_index<T>(
@@ -8994,6 +9030,42 @@ mod bitswap_tests {
             (second, now, Duration::from_millis(25), (), 4),
         ];
         assert_eq!(dominant_recent_bitswap_peer_index(&clear_lead), Some(0));
+    }
+
+    #[test]
+    fn dominant_session_peer_mode_can_be_scoped_to_top_level_gateway_requests() {
+        assert_eq!(
+            dominant_session_peer_mode_for_context(false, false, None),
+            None
+        );
+        assert_eq!(
+            dominant_session_peer_mode_for_context(
+                true,
+                false,
+                Some(RetrievalRequestContext::gateway_request(Some(1)))
+            ),
+            Some(DominantSessionPeerMode::Global)
+        );
+        assert_eq!(
+            dominant_session_peer_mode_for_context(
+                false,
+                true,
+                Some(RetrievalRequestContext::gateway_request(None))
+            ),
+            Some(DominantSessionPeerMode::GatewayTopLevel)
+        );
+        assert_eq!(
+            dominant_session_peer_mode_for_context(
+                false,
+                true,
+                Some(RetrievalRequestContext::gateway_request(Some(1)))
+            ),
+            None
+        );
+        assert_eq!(
+            dominant_session_peer_mode_for_context(false, true, None),
+            None
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

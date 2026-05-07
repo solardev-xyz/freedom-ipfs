@@ -29890,3 +29890,103 @@ signal is narrower: peer dominance can reduce fanout and help unrelated
 zero-HTTP roots, but using global session dominance for page assets is too
 blunt. Future work should combine source quality with page/root or request-class
 context instead of applying one global dominant peer to every shortcut.
+
+## 2026-05-07 - Lab Control: Top-Level Dominant Bitswap Session Peer
+
+Hypothesis:
+The global dominant-peer gate helped Wikipedia and reduced Bitswap attempts, but
+it also touched subresource shortcut paths. A narrower top-level-only gate may
+keep the useful zero-HTTP root behavior while avoiding page-asset shortcut
+regressions.
+
+Implementation:
+
+- Added disabled lab env knob
+  `FREEDOM_IPFS_ENABLE_BITSWAP_TOP_LEVEL_DOMINANT_SESSION_PEER=1`.
+- The existing global knob
+  `FREEDOM_IPFS_ENABLE_BITSWAP_DOMINANT_SESSION_PEER=1` still applies the gate
+  to all recent-peer shortcut calls.
+- The top-level knob only enables the dominant-peer gate when the current
+  retrieval context is a gateway request without
+  `X-Freedom-Parent-Request-ID`.
+- `bitswap_dominant_session_peer` now includes `mode=global` or
+  `mode=gateway_top_level`.
+- Default behavior is unchanged when both flags are unset.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval dominant_session_peer_mode_can_be_scoped_to_top_level_gateway_requests
+cargo test -p freedom-ipfs-retrieval dominant_recent_bitswap_peer_requires_clear_success_lead
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+All passed.
+
+Opt-in command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_ENABLE_BITSWAP_TOP_LEVEL_DOMINANT_SESSION_PEER=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/topdominant-session-peer-broader-selected-r5-20260507T053631Z-trace.jsonl \
+  --comparison-output /tmp/topdominant-session-peer-broader-selected-r5-20260507T053631Z.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1181/1336ms` vs Kubo `3098/3262ms`.
+- Vitalik range: Rust `100/113ms` vs Kubo `1762/2491ms`.
+- `ipfs.tech` root range: Rust `755/1400ms` vs Kubo `1153/1940ms`.
+- `ipfs.tech` page assets: Rust root `3/4ms`, assets `120/441ms`; Kubo root
+  `2/210ms`, assets `348/437ms`.
+- `ipfs.tech` hero range: Rust `108/118ms` vs Kubo `415/442ms`.
+- Wikipedia root still lost: Rust `638/775ms` vs Kubo `507/554ms`.
+- Resource max: Rust `50500KiB` RSS and `26` FDs vs Kubo `183996KiB` RSS and
+  `304` FDs.
+- The top-level dominant-peer gate fired only `6` times:
+  `4` for `/ipns/en.wikipedia-on-ipfs.org` and `2` for the developers hero
+  top-level range.
+- Bitswap peer attempts dropped to `179`, compared with `360` in the immediate
+  no-env control and `287` in the global dominant-peer run.
+- Block fetch totals: HTTP provider p50/p95/max `181/533/997ms`; Bitswap
+  p50/p95/max `71/549/607ms`.
+
+Immediate no-env comparison reference:
+
+- `/tmp/noenv-after-dominant-session-peer-broader-selected-r5-20260507T053018Z.json`
+- `/tmp/noenv-after-dominant-session-peer-broader-selected-r5-20260507T053018Z-trace.jsonl`
+
+Reference no-env result:
+
+- `ipfs.tech` root range: Rust `674/1256ms` vs Kubo `997/1663ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `150/350ms`; Kubo root
+  `2/290ms`, assets `349/443ms`.
+- Wikipedia root: Rust `776/1150ms` vs Kubo `486/552ms`.
+- Resource max: Rust `50508KiB` RSS and `36` FDs.
+- Block fetch totals: HTTP provider p50/p95/max `177/451/898ms`; Bitswap
+  p50/p95/max `145/854/1262ms`.
+
+Decision:
+Keep as a disabled, more selective lab control, but do not promote yet. This is
+cleaner than the global dominant-peer gate: it only fired on top-level requests,
+cut Bitswap attempts in half versus the immediate control, and improved
+Wikipedia p50/p95 (`638/775ms` vs `776/1150ms`). It still did not beat Kubo on
+Wikipedia, and the r5 sample is too small to treat as a default candidate. The
+next useful variant should keep this request-class scoping and add page/root
+source evidence, rather than allowing global dominance to steer subresources.
