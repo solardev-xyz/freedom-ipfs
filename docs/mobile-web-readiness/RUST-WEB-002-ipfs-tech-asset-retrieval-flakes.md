@@ -32464,3 +32464,114 @@ Do not promote. Revert the UnixFS batching code and tests. This may be worth
 revisiting with a synthetic or live corpus that demonstrably performs uncached
 full-file reads of multi-block raw-child UnixFS files, but it is not evidence
 for closing the current `ipfs.tech`/Wikipedia Kubo gap.
+
+## 2026-05-07 - Reject: Zero-HTTP Scored HTTP Fallback
+
+Hypothesis:
+
+Some zero-HTTP provider sets are still reachable through a recently successful
+CID-verifying HTTP provider even when delegated routing does not advertise an
+HTTP provider for the specific block. A disabled lab could race one recently
+fast scored HTTP provider against Bitswap only for zero-HTTP provider sets,
+possibly rescuing Wikipedia-style top-level zero-HTTP tails without using a
+static hard-coded gateway.
+
+Pre-check:
+
+Manual probes showed the idea can be true for individual CIDs:
+
+- `https://ipfs-bridge.sia.dev/` returned `200` for the Wikipedia root CID
+  `bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze`, the
+  Wikipedia `/index.html` leaf CID, and the `ipfs.tech` root CID.
+- `https://dag.w3s.link/` returned `404` or `410` for the same probe set.
+- `https://f010479.twinquasar.io/` returned `404` or `500`.
+
+Code:
+
+- Added a disabled env flag:
+  `FREEDOM_IPFS_ENABLE_ZERO_HTTP_SCORED_HTTP_FALLBACK=1`.
+- Added optional lab knobs:
+  - `FREEDOM_IPFS_ZERO_HTTP_SCORED_HTTP_FALLBACK_MAX_SCORE_MS=<millis>`
+  - `FREEDOM_IPFS_ZERO_HTTP_SCORED_HTTP_FALLBACK_LIMIT=<count>`
+- When enabled, zero-HTTP provider fetches selected recently scored HTTP
+  providers under the score threshold and raced them against normal Bitswap.
+- Fallback HTTP misses were deliberately not allowed to mark a provider bad,
+  because an unadvertised fallback miss is not equivalent to an advertised
+  provider failure.
+- Added trace phases:
+  - `zero_http_scored_http_fallback`
+  - `zero_http_scored_http_fallback_race`
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval zero_http_scored_http_fallback --lib -- --nocapture
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Focused fallback parser/selection tests passed: `2` passed.
+- Retrieval clippy passed with `-D warnings`.
+- Formatting and whitespace checks passed.
+
+Live command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_ENABLE_ZERO_HTTP_SCORED_HTTP_FALLBACK=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-scored-http-fallback-focused-r10-20260507T1118Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-scored-http-fallback-focused-r10-20260507T1118Z.json
+```
+
+Live result:
+
+- Rust and Kubo passed `10/10` for both focused cases.
+- `ipfs.tech` page assets: Rust root `869/1944ms`, assets `187/322ms`;
+  Kubo root `1677/4572ms`, assets `178/358ms`.
+- Wikipedia root: Rust `695/1026ms` vs Kubo `336/572ms`.
+- Resource max: Rust `49504KiB` RSS and `28` FDs vs Kubo `291092KiB` RSS and
+  `487` FDs.
+
+Immediate no-env focused control for comparison:
+
+- `ipfs.tech` page assets: Rust root `601/825ms`, assets `118/310ms`;
+  Kubo root `1679/6165ms`, assets `113/570ms`.
+- Wikipedia root: Rust `306/791ms` vs Kubo `148/507ms`.
+- Resource max: Rust `49088KiB` RSS and `28` FDs vs Kubo `313620KiB` RSS and
+  `711` FDs.
+
+Trace interpretation:
+
+- The fallback selector fired `15` times.
+- Race outcomes were:
+  - `10` `bitswap_won`
+  - `5` `bitswap_after_http_miss`
+  - `0` HTTP wins
+- The fallback added `5` `dag.w3s.link` `404` responses.
+- Bitswap peer attempts dropped from `442` in the control to `201`, but the
+  latency moved the wrong way: fewer peer attempts did not mean better source
+  quality.
+- The selected HTTP provider was often the wrong recently fast provider for the
+  zero-HTTP CID. HTTP-provider speed on one block does not imply block
+  availability for another block, even inside the same browser run.
+
+Decision:
+
+Do not promote. Revert the code instead of leaving another disabled lab in the
+runtime. The useful result is negative: zero-HTTP rescue cannot be based only
+on recent HTTP provider speed. Any future HTTP fallback must learn
+availability/scope, not just latency, before it is worth racing against
+Bitswap.
