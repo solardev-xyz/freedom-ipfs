@@ -34,6 +34,8 @@ const STREAMING_DELEGATED_DIRECT_BITSWAP_PROVIDER_TARGET: usize = 4;
 const STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_GRACE: Duration = Duration::from_millis(125);
 const ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_ENV: &str =
     "FREEDOM_IPFS_ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET";
+const STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_MIN_ELAPSED_ENV: &str =
+    "FREEDOM_IPFS_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_MIN_ELAPSED_MS";
 const LAB_DROP_HTTP_PROVIDERS_FOR_CIDS_ENV: &str = "FREEDOM_IPFS_LAB_DROP_HTTP_PROVIDERS_FOR_CIDS";
 const SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER: Duration = Duration::from_millis(750);
 const DISABLE_SINGLE_DELEGATED_SELF_HEDGE_ENV: &str =
@@ -561,6 +563,7 @@ impl DelegatedRoutingClient {
                     .unwrap_or_default(),
                 response_target_met = response.stats.target_met_elapsed.is_some(),
                 response_target_kind = response.stats.target_kind.unwrap_or("none"),
+                response_target_returned_early = response.stats.target_returned_early,
                 response_target_met_elapsed_ms = response
                     .stats
                     .target_met_elapsed
@@ -1139,6 +1142,7 @@ struct DelegatedResponseStats {
     first_http_provider_elapsed: Option<Duration>,
     target_met_elapsed: Option<Duration>,
     target_kind: Option<&'static str>,
+    target_returned_early: bool,
     http_provider_count: usize,
 }
 
@@ -1150,6 +1154,7 @@ async fn limited_response_providers(
         response,
         max_bytes,
         streaming_delegated_direct_bitswap_target_enabled(),
+        streaming_delegated_direct_bitswap_target_min_elapsed(),
     )
     .await
 }
@@ -1158,8 +1163,10 @@ async fn limited_response_providers_with_direct_bitswap_target(
     response: reqwest::Response,
     max_bytes: usize,
     direct_bitswap_target_enabled: bool,
+    direct_bitswap_target_min_elapsed: Duration,
 ) -> Result<LimitedProviderResponse> {
     let started = Instant::now();
+    let started_tokio = tokio::time::Instant::now();
     let is_ndjson = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1209,6 +1216,7 @@ async fn limited_response_providers_with_direct_bitswap_target(
                             target_met_elapsed: direct_bitswap_target_elapsed
                                 .filter(|_| direct_bitswap_target_ready),
                             target_kind: direct_bitswap_target_ready.then_some("direct_bitswap"),
+                            target_returned_early: direct_bitswap_target_ready,
                             http_provider_count: http_provider_url_count(&providers),
                         },
                         providers,
@@ -1252,6 +1260,7 @@ async fn limited_response_providers_with_direct_bitswap_target(
                         first_http_provider_elapsed,
                         target_met_elapsed: Some(started.elapsed()),
                         target_kind,
+                        target_returned_early: true,
                         http_provider_count: http_provider_url_count(&providers),
                     },
                     providers,
@@ -1263,9 +1272,10 @@ async fn limited_response_providers_with_direct_bitswap_target(
                     >= STREAMING_DELEGATED_DIRECT_BITSWAP_PROVIDER_TARGET
             {
                 direct_bitswap_target_elapsed = Some(started.elapsed());
-                direct_bitswap_target_deadline = Some(
-                    tokio::time::Instant::now() + STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_GRACE,
-                );
+                let grace_deadline =
+                    tokio::time::Instant::now() + STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_GRACE;
+                let min_elapsed_deadline = started_tokio + direct_bitswap_target_min_elapsed;
+                direct_bitswap_target_deadline = Some(grace_deadline.max(min_elapsed_deadline));
             }
         }
     }
@@ -1287,6 +1297,7 @@ async fn limited_response_providers_with_direct_bitswap_target(
             first_http_provider_elapsed,
             target_met_elapsed: direct_bitswap_target_elapsed,
             target_kind: direct_bitswap_target_met.then_some("direct_bitswap"),
+            target_returned_early: false,
             http_provider_count: http_provider_url_count(&providers),
         },
         providers,
@@ -1344,6 +1355,23 @@ fn earliest_deadline(
 
 fn streaming_delegated_direct_bitswap_target_enabled() -> bool {
     std::env::var_os(ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_ENV).is_some()
+}
+
+fn streaming_delegated_direct_bitswap_target_min_elapsed() -> Duration {
+    streaming_delegated_direct_bitswap_target_min_elapsed_from_env_value(
+        std::env::var_os(STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_MIN_ELAPSED_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn streaming_delegated_direct_bitswap_target_min_elapsed_from_env_value(
+    value: Option<&str>,
+) -> Duration {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::ZERO)
 }
 
 fn supported_direct_bitswap_provider_diversity(providers: &[Provider]) -> usize {
@@ -2251,6 +2279,7 @@ mod tests {
         assert!(response.stats.first_chunk_elapsed.is_some());
         assert!(response.stats.first_http_provider_elapsed.is_some());
         assert!(response.stats.target_met_elapsed.is_some());
+        assert!(response.stats.target_returned_early);
         task.abort();
         let _ = task.await;
     }
@@ -2282,6 +2311,7 @@ mod tests {
         assert_eq!(response.stats.line_count, 1);
         assert!(response.stats.first_http_provider_elapsed.is_some());
         assert!(response.stats.target_met_elapsed.is_none());
+        assert!(!response.stats.target_returned_early);
         assert!(!response
             .providers
             .iter()
@@ -2318,6 +2348,7 @@ mod tests {
                 response,
                 MAX_DELEGATED_ROUTING_RESPONSE_BYTES,
                 true,
+                Duration::ZERO,
             ),
         )
         .await
@@ -2330,6 +2361,7 @@ mod tests {
         );
         assert_eq!(response.stats.target_kind, Some("direct_bitswap"));
         assert!(response.stats.target_met_elapsed.is_some());
+        assert!(response.stats.target_returned_early);
         assert_eq!(response.stats.http_provider_count, 0);
         assert!(!response
             .providers
@@ -2380,6 +2412,7 @@ mod tests {
                 response,
                 MAX_DELEGATED_ROUTING_RESPONSE_BYTES,
                 true,
+                Duration::ZERO,
             ),
         )
         .await
@@ -2391,10 +2424,62 @@ mod tests {
             STREAMING_DELEGATED_HTTP_PROVIDER_TARGET
         );
         assert_eq!(response.stats.target_kind, Some("http_provider"));
+        assert!(response.stats.target_returned_early);
         assert!(response
             .providers
             .iter()
             .any(|provider| provider.id.as_deref() == Some("http-peer-0")));
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn direct_bitswap_target_can_wait_for_min_elapsed_floor() {
+        let fast_head = (0..STREAMING_DELEGATED_DIRECT_BITSWAP_PROVIDER_TARGET)
+            .map(|index| {
+                format!(
+                    r#"{{"ID":"{}","Addrs":["/ip4/127.0.0.{}/tcp/{}"]}}"#,
+                    Keypair::generate_ed25519().public().to_peer_id(),
+                    index + 1,
+                    4100 + index
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let slow_tail = r#"{"ID":"late-peer","Addrs":["/dns4/late.example/tcp/443/tls/http"]}"#;
+        let (endpoint, task) =
+            spawn_streaming_delegated_response(fast_head, slow_tail.into(), Duration::from_secs(1))
+                .await;
+        let response = reqwest::get(format!("{endpoint}/providers/test"))
+            .await
+            .unwrap();
+
+        let min_elapsed = Duration::from_millis(250);
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_millis(700),
+            limited_response_providers_with_direct_bitswap_target(
+                response,
+                MAX_DELEGATED_ROUTING_RESPONSE_BYTES,
+                true,
+                min_elapsed,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "direct Bitswap target should wait for the configured floor before returning"
+        );
+        assert_eq!(response.stats.target_kind, Some("direct_bitswap"));
+        assert!(response.stats.target_returned_early);
+        assert!(!response
+            .providers
+            .iter()
+            .any(|provider| provider.id.as_deref() == Some("late-peer")));
         task.abort();
         let _ = task.await;
     }
@@ -2417,6 +2502,22 @@ mod tests {
         ];
 
         assert_eq!(supported_direct_bitswap_provider_diversity(&providers), 1);
+    }
+
+    #[test]
+    fn direct_bitswap_target_min_elapsed_parses_override() {
+        assert_eq!(
+            streaming_delegated_direct_bitswap_target_min_elapsed_from_env_value(None),
+            Duration::ZERO
+        );
+        assert_eq!(
+            streaming_delegated_direct_bitswap_target_min_elapsed_from_env_value(Some("250")),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            streaming_delegated_direct_bitswap_target_min_elapsed_from_env_value(Some("bad")),
+            Duration::ZERO
+        );
     }
 
     #[tokio::test]

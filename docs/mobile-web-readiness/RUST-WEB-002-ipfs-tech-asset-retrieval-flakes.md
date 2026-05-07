@@ -39500,3 +39500,208 @@ Keep. This is diagnostics-only and does not change retrieval behavior. The next
 same-window runs should now show, per slow request, whether the dominant local
 work was `unixfs_file_size`, `http_provider_fetch`, `bitswap_fetch`,
 `unixfs_index_lookup`, or another phase without requiring an external parser.
+
+## 2026-05-07: Delayed Streaming Direct-Bitswap Delegated Target Lab
+
+Branch:
+
+- `codex/kubo-session-performance-20260506`
+- Base before this lab patch: `2d1cc68`
+
+Question:
+
+The existing
+`FREEDOM_IPFS_ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET=1` lab was
+already rejected as a default because returning as soon as enough direct
+Bitswap providers were seen could reduce provider quality/diversity and regress
+normal runs. A recent short IPNS sample showed a different failure shape: a
+delegated response body tail around `3.4s` / provider lookup around `4.2s`.
+
+Would a safer variant help if it only allows the direct-Bitswap target to return
+after a minimum elapsed floor, leaving fast complete delegated responses alone?
+
+Change:
+
+- Keep defaults unchanged.
+- Add optional env knob:
+  `FREEDOM_IPFS_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_MIN_ELAPSED_MS=<ms>`.
+- The knob only has an effect when
+  `FREEDOM_IPFS_ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET=1` is also
+  set.
+- When enough direct Bitswap providers are streamed, the early-return deadline
+  is now:
+  `max(now + 125ms direct-target grace, response_start + min_elapsed)`.
+- Add `response_target_returned_early` to delegated-provider lookup traces so
+  future runs can distinguish "target condition was observed" from "the target
+  actually returned before the full response ended".
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing direct_bitswap -- --nocapture
+cargo test -p freedom-ipfs-routing streamed_delegated_response -- --nocapture
+```
+
+Result:
+
+- Formatting passed.
+- Direct-Bitswap routing tests passed: `5 passed`.
+- Streamed delegated-response routing tests passed: `3 passed`.
+
+Natural IPNS control command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/delayed-direct-target-control-ipfs-tech-r3-20260507T220000Z-trace.jsonl \
+  --comparison-output /tmp/delayed-direct-target-control-ipfs-tech-r3-20260507T220000Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Natural IPNS control result:
+
+- Rust and Kubo passed `3/3`.
+- `ipfs.tech` root: Rust `1198/1290ms`; Kubo `2339/2584ms`.
+- `ipfs.tech` assets: Rust `139/490ms`; Kubo `186/595ms`.
+- Resource max: Rust `55600KiB` RSS and `30` FDs vs Kubo `161280KiB`
+  RSS and `77` FDs.
+- `meaningful_kubo_wins`: none.
+- Delegated provider lookup p50/p95/max: `22/47/96ms`.
+- Only one zero-HTTP cold Bitswap request occurred, and the aggregate was
+  already green. This window did not reproduce the slow delegated-body tail.
+
+Natural IPNS opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET=1 \
+FREEDOM_IPFS_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_MIN_ELAPSED_MS=500 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/delayed-direct-target-min500-ipfs-tech-r3-20260507T220000Z-trace.jsonl \
+  --comparison-output /tmp/delayed-direct-target-min500-ipfs-tech-r3-20260507T220000Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Natural IPNS opt-in result:
+
+- Rust and Kubo passed `3/3`.
+- The command exited nonzero only because the shape requirements were too
+  strict for this public-network window: `zero_http_provider_cold_bitswap=0`
+  and no `fetching_bitswap` progress phase. The comparison and trace artifacts
+  were still written.
+- `ipfs.tech` root: Rust `627/743ms`; Kubo `1857/3497ms`.
+- `ipfs.tech` assets: Rust `218/479ms`; Kubo `207/917ms`.
+- Resource max: Rust `52112KiB` RSS and `29` FDs vs Kubo `292824KiB`
+  RSS and `284` FDs.
+- `meaningful_kubo_wins`: none.
+- Delegated provider lookup p50/p95/max: `35/72/90ms`.
+- This opt-in run did not test the intended zero-HTTP/delegated-tail shape
+  because every delegated lookup found HTTP providers.
+
+CID-scoped HTTP-drop opt-in command:
+
+```sh
+FREEDOM_IPFS_LAB_DROP_HTTP_PROVIDERS_FOR_CIDS=bafkreibnzgajg3gsyn5c4p5e2h7racpy6dy7tnhwe5l4v4vx5e32qmn4bi \
+FREEDOM_IPFS_ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET=1 \
+FREEDOM_IPFS_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_MIN_ELAPSED_MS=500 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/lab-drop-delayed-direct-min500-ipfs-tech-r5-20260507T220000Z-trace.jsonl \
+  --comparison-output /tmp/lab-drop-delayed-direct-min500-ipfs-tech-r5-20260507T220000Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+CID-scoped HTTP-drop opt-in result:
+
+- Rust and Kubo passed `5/5`.
+- The command exited nonzero only because the old exact
+  `zero_http_provider_cold_bitswap` classifier did not fire; the run did
+  exercise `fetching_bitswap` and `cold_bitswap_peer_expand=5`.
+- `ipfs.tech` root: Rust `744/769ms`; Kubo `2405/2659ms`.
+- `ipfs.tech` assets: Rust `141/424ms`; Kubo `206/413ms`.
+- Resource max: Rust `57604KiB` RSS and `35` FDs vs Kubo `259476KiB`
+  RSS and `286` FDs.
+- `meaningful_kubo_wins`: none.
+- Delegated provider lookup p50/p95/max: `34/76/101ms`.
+- Bitswap block fetch p50/p95/max: `154/404/437ms`.
+- Root slow requests were bounded around `724-766ms`.
+
+Immediate CID-scoped HTTP-drop no-env control command:
+
+```sh
+FREEDOM_IPFS_LAB_DROP_HTTP_PROVIDERS_FOR_CIDS=bafkreibnzgajg3gsyn5c4p5e2h7racpy6dy7tnhwe5l4v4vx5e32qmn4bi \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/lab-drop-delayed-direct-control-ipfs-tech-r5-20260507T220000Z-trace.jsonl \
+  --comparison-output /tmp/lab-drop-delayed-direct-control-ipfs-tech-r5-20260507T220000Z.json \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Immediate CID-scoped HTTP-drop no-env control result:
+
+- Rust and Kubo passed `5/5`.
+- `ipfs.tech` root: Rust `709/1746ms`; Kubo `2645/12133ms`.
+- `ipfs.tech` assets: Rust `176/410ms`; Kubo `215/672ms`.
+- Resource max: Rust `56052KiB` RSS and `35` FDs vs Kubo `283476KiB`
+  RSS and `500` FDs.
+- `meaningful_kubo_wins`: none.
+- Delegated provider lookup p50/p95/max: `24/53/63ms`.
+- Bitswap block fetch p50/p95/max: `162/379/1445ms`.
+- Two roots hit `~1.7s` tails because the dropped CID was delivered by a
+  slower Bitswap peer at candidate index `2`; the opt-in run's roots stayed
+  under `~0.77s`.
+
+Decision:
+
+Keep the delayed direct-target floor as an env-gated lab knob, but do not
+promote it. The controlled run is promising for clipping one root-child Bitswap
+tail family, but neither the natural nor controlled window had a current
+aggregate Kubo loss. The no-env control also had faster delegated lookup stats,
+so the observed improvement is likely from downstream Bitswap source selection
+after provider composition changed, not simply delegated-body clipping.
+
+Next agent guidance:
+
+- Do not enable this by default from the r5 evidence above.
+- Re-test only when a fresh same-window trace reproduces a delegated-response
+  body tail or repeated root-child Bitswap tails.
+- If re-testing, use the new `response_target_returned_early` trace field to
+  confirm whether the delayed target actually returned early. Do not rely only
+  on `response_target_met`, which also records target conditions seen before a
+  full response ends.
