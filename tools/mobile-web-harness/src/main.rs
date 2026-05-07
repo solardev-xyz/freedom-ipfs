@@ -787,6 +787,7 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             &gateway_url,
             corpus,
             timeout,
+            args.engine,
             args.asset_concurrency,
             args.conditional_revalidate,
             &args.cases,
@@ -927,6 +928,7 @@ async fn run_corpus_once(
     gateway_url: &str,
     corpus: &Corpus,
     timeout: Duration,
+    engine: HarnessEngine,
     asset_concurrency: usize,
     conditional_revalidate: bool,
     cases: &[String],
@@ -945,6 +947,7 @@ async fn run_corpus_once(
                 &client,
                 gateway_url,
                 entry,
+                engine,
                 asset_concurrency,
                 conditional_revalidate,
             )
@@ -993,6 +996,7 @@ async fn run_case(
     client: &reqwest::Client,
     gateway_url: &str,
     entry: &CorpusEntry,
+    engine: HarnessEngine,
     asset_concurrency: usize,
     conditional_revalidate: bool,
 ) -> CaseResult {
@@ -1065,16 +1069,20 @@ async fn run_case(
             actual => failures.push(format!("accept-ranges {actual:?}, expected {expected:?}")),
         }
     }
-    if let Some(expected) = &entry.expect_etag_prefix {
-        match response.etag.as_deref() {
-            Some(actual) if actual.starts_with(expected) => {}
-            actual => failures.push(format!("etag {actual:?}, expected prefix {expected:?}")),
+    if gateway_specific_header_expectations_enabled(engine) {
+        if let Some(expected) = &entry.expect_etag_prefix {
+            match response.etag.as_deref() {
+                Some(actual) if actual.starts_with(expected) => {}
+                actual => failures.push(format!("etag {actual:?}, expected prefix {expected:?}")),
+            }
         }
-    }
-    if let Some(expected) = &entry.expect_cache_control {
-        match response.cache_control.as_deref() {
-            Some(actual) if actual.eq_ignore_ascii_case(expected) => {}
-            actual => failures.push(format!("cache-control {actual:?}, expected {expected:?}")),
+        if let Some(expected) = &entry.expect_cache_control {
+            match response.cache_control.as_deref() {
+                Some(actual) if actual.eq_ignore_ascii_case(expected) => {}
+                actual => {
+                    failures.push(format!("cache-control {actual:?}, expected {expected:?}"));
+                }
+            }
         }
     }
     if let Some(expected) = &entry.expect_body_contains {
@@ -1174,6 +1182,10 @@ async fn run_case(
         passed: failures.is_empty(),
         failures,
     }
+}
+
+fn gateway_specific_header_expectations_enabled(engine: HarnessEngine) -> bool {
+    matches!(engine, HarnessEngine::Rust)
 }
 
 fn print_summary(report: &RunReport) {
@@ -9600,6 +9612,16 @@ impl ParsedTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_specific_header_expectations_apply_only_to_rust() {
+        assert!(gateway_specific_header_expectations_enabled(
+            HarnessEngine::Rust
+        ));
+        assert!(!gateway_specific_header_expectations_enabled(
+            HarnessEngine::Kubo
+        ));
+    }
 
     #[test]
     fn args_accept_delegated_router_endpoint_list() {

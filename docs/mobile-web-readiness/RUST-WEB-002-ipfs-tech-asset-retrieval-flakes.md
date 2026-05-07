@@ -29115,3 +29115,114 @@ recent controlled experiments. The next useful work should broaden workload
 discovery beyond these three cases, stress longer page sessions, or search for
 new Kubo-win corpora; retuning the already-rejected direct target is not the
 best next step while the default guardrail is green.
+
+## 2026-05-07 - Media Range, HEAD, And Wikipedia Kubo Comparison
+
+Question:
+The core page-asset guardrail is green. Do opt-in media range/HEAD cases and a
+non-IPFS-project DNSLink root expose remaining Kubo-relative gaps?
+
+Initial command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-developers-hero-range \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/media-head-wikipedia-r10-20260507T040200Z-trace.jsonl \
+  --comparison-output /tmp/media-head-wikipedia-r10-20260507T040200Z.json
+```
+
+Initial finding:
+Rust passed `10/10`, but Kubo failed all four `developers-hero` media cases
+despite returning `206`. The failures were not retrieval failures: the corpus
+expected freedom-ipfs-specific headers (`ETag` prefix `"fi1:` and
+`Cache-Control: no-cache`), while Kubo returned CID ETags and no
+`Cache-Control`. That made Kubo comparison pass rates noisy for corpus entries
+that intentionally validate Rust gateway headers.
+
+Harness fix:
+Keep `expect_etag_prefix` and `expect_cache_control` enforced for Rust harness
+runs, but skip those gateway-specific header expectations when the engine is
+Kubo. Status, content type, range headers, content length, body hash, body
+bytes, and latency thresholds are still checked for Kubo.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness gateway_specific_header_expectations_apply_only_to_rust
+cargo check -p mobile-web-harness --all-targets
+```
+
+All passed.
+
+Rerun command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-developers-hero-range \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/media-head-wikipedia-r10-after-kubo-header-skip-20260507T040700Z-trace.jsonl \
+  --comparison-output /tmp/media-head-wikipedia-r10-after-kubo-header-skip-20260507T040700Z.json
+```
+
+Rerun result:
+
+- Rust and Kubo passed `10/10` for all five cases.
+- `ipfs-tech-developers-hero-range` p50/p95:
+  - Rust `693/1092ms`
+  - Kubo `2334/6704ms`
+- `ipfs-tech-developers-hero-middle-range` p50/p95:
+  - Rust `3/4ms`
+  - Kubo `3/5ms`
+- `ipfs-tech-developers-hero-suffix-range` p50/p95:
+  - Rust `2/3ms`
+  - Kubo `2/7ms`
+- `ipfs-tech-developers-hero-head` p50/p95:
+  - Rust `2/2ms`
+  - Kubo `2/3ms`
+- `wikipedia-on-ipfs-root` p50/p95:
+  - Rust `540/746ms`
+  - Kubo `700/1487ms`
+- Resource max: Rust `41768KiB` RSS and `20` FDs; Kubo `323884KiB` RSS and
+  `498` FDs.
+
+Trace notes:
+
+- HTTP-provider block fetch p50/p95/max: `193/341/688ms`.
+- Bitswap block fetch p50/p95/max: `414/524/524ms`.
+- Delegated provider lookup p50/p95/max: `48/61/89ms`.
+- Zero-HTTP cold Bitswap requests all came from `wikipedia-on-ipfs-root`:
+  p50/p95/max `538/744/744ms`.
+- The media prefix range remains the only slow media shape; middle range,
+  suffix range, and HEAD are hot after the prefix range warms metadata/block
+  state in each fresh daemon run.
+
+Decision:
+Keep the harness Kubo-header comparison fix. The media/HEAD/DNSLink sweep does
+not expose a new Kubo performance win; it confirms Rust is especially strong on
+first media prefix ranges and remains resource-light. Future corpus sweeps can
+now include Rust-specific header-checking cases in Kubo comparisons without
+incorrectly counting Kubo as failed for expected gateway-header differences.
