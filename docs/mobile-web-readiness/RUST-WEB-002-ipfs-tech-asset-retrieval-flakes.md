@@ -28888,3 +28888,77 @@ not actually exercise the target failure mode. Keep the existing direct peer
 count knob as a lab tool only. A useful next experiment needs either a naturally
 occurring zero-HTTP window or a controlled harness/routing mode that can
 reproduce zero-HTTP provider sets without changing unrelated page behavior.
+
+## 2026-05-07 - CID-Scoped HTTP Provider Drop Lab
+
+Question:
+Can we reproduce the remaining `ipfs.tech` zero-HTTP root shape in a controlled
+same-window run by stripping HTTP provider URLs only for the slow UnixFS
+`/index.html` leaf CID, while leaving the rest of the page and provider records
+unchanged?
+
+Implementation:
+Add a lab-only routing switch:
+`FREEDOM_IPFS_LAB_DROP_HTTP_PROVIDERS_FOR_CIDS`. When the env contains a CID
+or `*`, delegated/DHT provider results for matching CIDs keep their Bitswap
+multiaddrs but clear parsed HTTP provider URLs. The switch is default-off and
+emits `lab_http_provider_drop` when it changes a provider set.
+
+Command:
+
+```sh
+FREEDOM_IPFS_LAB_DROP_HTTP_PROVIDERS_FOR_CIDS=bafkreibnzgajg3gsyn5c4p5e2h7racpy6dy7tnhwe5l4v4vx5e32qmn4bi timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/lab-drop-http-indexleaf-ipfs-tech-r10-20260507T034350Z-trace.jsonl \
+  --comparison-output /tmp/lab-drop-http-indexleaf-ipfs-tech-r10-20260507T034350Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `698/3947ms`; Kubo `2722/3296ms`.
+- Asset p50/p95: Rust `136/467ms`; Kubo `135/750ms`.
+- Resource max: Rust `55372KiB` RSS, `36` FDs; Kubo `257272KiB`,
+  `253` FDs.
+- Trace lines/phases: `12072` lines, `34` phases.
+- `lab_http_provider_drop` events: `1`.
+- HTTP-provider block fetch p50/p95/max: `122/273/863ms`.
+- Bitswap block fetch p50/p95/max: `175/380/3216ms`.
+- Delegated provider lookup events: `346`; HTTP provider distribution
+  `zero=17`, `single=192`, `multi=137`.
+- Request classifications:
+  - `zero_http_provider_bitswap=17`
+  - `cold_bitswap_peer_expand=16`
+  - `zero_http_provider_cold_bitswap=15`
+  - `top_level_zero_http_provider_bitswap=9`
+  - `top_level_zero_http_provider_cold_bitswap=9`
+- Top-level zero-HTTP cold Bitswap p50/p95/max: `695/3944/3944ms`.
+
+Trace finding:
+The controlled filter reproduced the desired failure shape, but the slowest
+root was not primarily blocked on direct `WANT_BLOCK` policy. The slowest
+`/ipns/ipfs.tech/` request spent about `3944ms` total. Its UnixFS
+`/index.html` lookup spent `3217ms` fetching the filtered leaf CID
+`bafkreibnzgajg3gsyn5c4p5e2h7racpy6dy7tnhwe5l4v4vx5e32qmn4bi`, but the trace
+shows most of that delay was before Bitswap delivery: `delegated_provider_lookup`
+reached `2181ms`, `delegated_provider_self_hedge_result` reached `2933ms`, then
+the Bitswap block fetch completed at `3216ms`. Bitswap source mode was already
+`want_block=136` and `prefer_want_have=0`, so simply increasing direct
+`WANT_BLOCK` pressure is not the next obvious fix for this sample.
+
+Decision:
+Keep the CID-scoped HTTP-provider drop switch as a controlled lab tool, not as
+runtime behavior. The next experiment should target delegated-provider lookup
+tail latency for zero-HTTP root CIDs, especially the single-endpoint self-hedge
+path and streaming parser return conditions, then re-run this same controlled
+case against a same-window no-env control.

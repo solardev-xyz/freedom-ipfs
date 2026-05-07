@@ -34,6 +34,7 @@ const STREAMING_DELEGATED_DIRECT_BITSWAP_PROVIDER_TARGET: usize = 4;
 const STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_GRACE: Duration = Duration::from_millis(125);
 const ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_ENV: &str =
     "FREEDOM_IPFS_ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET";
+const LAB_DROP_HTTP_PROVIDERS_FOR_CIDS_ENV: &str = "FREEDOM_IPFS_LAB_DROP_HTTP_PROVIDERS_FOR_CIDS";
 const SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER: Duration = Duration::from_millis(750);
 const DISABLE_SINGLE_DELEGATED_SELF_HEDGE_ENV: &str =
     "FREEDOM_IPFS_DISABLE_SINGLE_DELEGATED_SELF_HEDGE";
@@ -88,6 +89,54 @@ impl Provider {
             http_urls,
         })
     }
+}
+
+fn lab_drop_http_providers_for_cid(cid: &Cid, providers: Vec<Provider>) -> Vec<Provider> {
+    let env_value = std::env::var_os(LAB_DROP_HTTP_PROVIDERS_FOR_CIDS_ENV);
+    lab_drop_http_providers_for_cid_with_env_value(
+        cid,
+        providers,
+        env_value.as_deref().and_then(|value| value.to_str()),
+    )
+}
+
+fn lab_drop_http_providers_for_cid_with_env_value(
+    cid: &Cid,
+    mut providers: Vec<Provider>,
+    env_value: Option<&str>,
+) -> Vec<Provider> {
+    if !lab_drop_http_providers_for_cid_from_env_value(cid, env_value) {
+        return providers;
+    }
+    let dropped_http_provider_count: usize = providers
+        .iter()
+        .map(|provider| provider.http_urls.len())
+        .sum();
+    if dropped_http_provider_count == 0 {
+        return providers;
+    }
+    for provider in &mut providers {
+        provider.http_urls.clear();
+    }
+    tracing::info!(
+        phase = "lab_http_provider_drop",
+        cid = %cid,
+        provider_count = providers.len(),
+        dropped_http_provider_count,
+        env = LAB_DROP_HTTP_PROVIDERS_FOR_CIDS_ENV
+    );
+    providers
+}
+
+fn lab_drop_http_providers_for_cid_from_env_value(cid: &Cid, env_value: Option<&str>) -> bool {
+    let cid = cid.to_string();
+    env_value
+        .into_iter()
+        .flat_map(|value| value.split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace()))
+        .any(|value| {
+            let value = value.trim();
+            value == "*" || value == cid
+        })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -184,13 +233,14 @@ pub enum ProviderRoutingClient {
 
 impl ProviderRoutingClient {
     pub async fn providers(&self, cid: &Cid) -> Result<Vec<Provider>> {
-        match self {
+        let providers = match self {
             Self::Offline => Ok(Vec::new()),
             Self::Delegated(client) => client.providers(cid).await,
             Self::Auto(client) => client.providers(cid).await,
             Self::LightDht(client) => client.providers(cid).await,
             Self::Observed { inner, stats } => inner.providers_with_stats(cid, stats).await,
-        }
+        }?;
+        Ok(lab_drop_http_providers_for_cid(cid, providers))
     }
 
     pub fn with_stats(self, stats: RoutingStatsHandle) -> Self {
@@ -1656,6 +1706,53 @@ mod tests {
         let providers = parse_provider_response(body).unwrap();
         assert_eq!(providers[0].id.as_deref(), Some("peer"));
         assert_eq!(providers[0].http_urls[0].as_str(), "https://example.com/");
+    }
+
+    #[test]
+    fn lab_drop_http_providers_for_cid_clears_only_matching_http_urls() {
+        let cid = Cid::new_v1(0x55, Multihash::<64>::wrap(0x12, &[1; 32]).unwrap());
+        let other = Cid::new_v1(0x55, Multihash::<64>::wrap(0x12, &[2; 32]).unwrap());
+        let providers = vec![
+            Provider::from_parts(
+                Some("http-peer".into()),
+                vec!["/dns4/example.com/tcp/443/tls/http".into()],
+            )
+            .unwrap(),
+            Provider::from_parts(
+                Some("bitswap-peer".into()),
+                vec!["/ip4/127.0.0.1/tcp/4001".into()],
+            )
+            .unwrap(),
+        ];
+
+        assert!(!lab_drop_http_providers_for_cid_from_env_value(&cid, None));
+        assert!(!lab_drop_http_providers_for_cid_from_env_value(
+            &cid,
+            Some(&other.to_string())
+        ));
+        assert!(lab_drop_http_providers_for_cid_from_env_value(
+            &cid,
+            Some(&format!("  {other}, {}  ", cid))
+        ));
+        assert!(lab_drop_http_providers_for_cid_from_env_value(
+            &cid,
+            Some("*")
+        ));
+
+        let unchanged = lab_drop_http_providers_for_cid_with_env_value(
+            &cid,
+            providers.clone(),
+            Some(&other.to_string()),
+        );
+        assert_eq!(unchanged[0].http_urls.len(), 1);
+        assert_eq!(unchanged[0].addrs.len(), 1);
+
+        let filtered =
+            lab_drop_http_providers_for_cid_with_env_value(&cid, providers, Some(&cid.to_string()));
+        assert!(filtered[0].http_urls.is_empty());
+        assert_eq!(filtered[0].addrs[0], "/dns4/example.com/tcp/443/tls/http");
+        assert!(filtered[1].http_urls.is_empty());
+        assert_eq!(filtered[1].addrs[0], "/ip4/127.0.0.1/tcp/4001");
     }
 
     #[test]
