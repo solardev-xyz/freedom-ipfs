@@ -35917,3 +35917,113 @@ p50/p95, RSS, and FDs. The remaining useful work is narrower:
 - understand occasional coalesced HTTP-provider/Bitswap races like
   `_nuxt/DzK6mLCt.js`;
 - preserve the current low resource profile and fast asset median.
+
+## 2026-05-07 Zero-HTTP Direct WANT_BLOCK Peer Limit `2`
+
+Question:
+
+The previous zero-HTTP direct `WANT_BLOCK` lab with `5` peers improved some
+Bitswap tails but was too blunt for a default. Does a smaller
+`FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=2` keep the tail win
+without hurting page/root metrics or mobile resources?
+
+Focused command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=2 \
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-direct2-ipfs-tech-r10-20260507T162341Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-direct2-ipfs-tech-r10-20260507T162341Z.json
+```
+
+Focused result compared with the immediate no-env focused control above:
+
+- Rust and Kubo passed `10/10`.
+- `ipfs.tech` root p50/p95: control `599/869ms`; direct2 `583/840ms`.
+- `ipfs.tech` asset p50/p95: control `53/219ms`; direct2 `47/99ms`.
+- Rust resource max: control `48476KiB` RSS and `24` FDs; direct2
+  `48264KiB` RSS and `19` FDs.
+- Bitswap blocks: control `287`, p50/p95/max `47/263/777ms`; direct2 `337`,
+  p50/p95/max `43/102/287ms`.
+- HTTP-provider blocks: control `63`; direct2 `13`.
+- Bitswap connections: control `37`; direct2 `30`.
+
+This focused window looked promising: direct2 improved asset p95, Bitswap p95,
+and FD max.
+
+Guardrail command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=2 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-direct2-multicase-r5-20260507T162341Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-direct2-multicase-r5-20260507T162341Z.json
+```
+
+Immediate no-env guardrail control:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-direct2-control-multicase-r5-20260507T162341Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-direct2-control-multicase-r5-20260507T162341Z.json
+```
+
+Guardrail result:
+
+- Rust and Kubo passed `5/5` in both samples.
+- DAICO root p50/p95: control `1288/1470ms`; direct2 `1395/1483ms`.
+- Vitalik range p50/p95: control `110/149ms`; direct2 `104/143ms`.
+- `ipfs.tech` root p50/p95: control `739/773ms`; direct2 `553/994ms`.
+- `ipfs.tech` asset p50/p95: control `189/298ms`; direct2 `123/250ms`.
+- Rust resource max: control `43948KiB` RSS and `18` FDs; direct2
+  `49780KiB` RSS and `19` FDs.
+- Control trace had no zero-HTTP provider Bitswap classifications in this
+  window.
+- Direct2 trace had `1` top-level zero-HTTP cold Bitswap request at `581ms`.
+- Direct2 reduced HTTP-provider blocks from `200` to `166` and added `34`
+  Bitswap blocks, p50/p95/max `44/169/284ms`.
+
+Decision:
+
+Reject direct2 as a default candidate for now. It improved focused
+`ipfs.tech` asset p50/p95 and Bitswap p95, but the same-window three-case
+guardrail traded that for worse DAICO p50, worse `ipfs.tech` root p95, and
+higher RSS. The current no-env default remains the better balanced mobile
+profile.
+
+Keep the existing direct-WANT knob as a lab tool. A future attempt should be
+more selective than a static peer count: apply only when provider lookup returns
+zero HTTP providers repeatedly for the same top-level root, or when recent
+session peer quality is already known, rather than forcing direct wants for
+every zero-HTTP shape.
