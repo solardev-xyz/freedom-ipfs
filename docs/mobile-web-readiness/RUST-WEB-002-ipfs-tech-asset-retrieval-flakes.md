@@ -34317,3 +34317,76 @@ knob only. The useful signal is that hit timing is clustered and observable, but
 a static shorter grace still shifts work into slower Bitswap tails elsewhere.
 Future work should make the wait adaptive to session-peer quality or current
 request shape rather than choosing another fixed zero-HTTP grace.
+
+## 2026-05-07 Revert: Top-Level-Only Zero-HTTP Grace 50ms Lab
+
+Hypothesis:
+
+The broad `50ms` zero-HTTP grace mostly hurt zero-HTTP `ipfs.tech` child assets.
+A temporary top-level-only zero-HTTP grace override might keep the possible
+Wikipedia benefit without touching subresource waits.
+
+Temporary code:
+
+- Added uncommitted lab env
+  `FREEDOM_IPFS_BITSWAP_SESSION_TOP_LEVEL_ZERO_HTTP_POST_LOOKUP_GRACE_MS=50`.
+- The override applied only when the current retrieval context was a top-level
+  gateway request and the provider set had zero HTTP providers.
+- Added a focused unit test proving top-level/subresource scoping.
+
+Focused validation while the temporary code existed:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval post_lookup_grace --lib -- --nocapture
+```
+
+Validation passed.
+
+Live command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_BITSWAP_SESSION_TOP_LEVEL_ZERO_HTTP_POST_LOOKUP_GRACE_MS=50 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --case wikipedia-on-ipfs-root \
+    --repeat 10 \
+    --asset-concurrency 1 \
+    --timeout-secs 120 \
+    --run-timeout-secs 300 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/topzero-http-grace50-focused-r10-20260507Tlab-trace.jsonl \
+    --comparison-output /tmp/topzero-http-grace50-focused-r10-20260507Tlab.json
+```
+
+Live result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` root TTFB/total p50/p95: Rust `718/1061ms`; Kubo
+  `1799/4186ms`.
+- `ipfs.tech` asset TTFB/total p50/p95: Rust `185/384ms`; Kubo `170/704ms`.
+- Wikipedia root TTFB/total p50/p95: Rust `380/799ms`; Kubo `277/1966ms`.
+- Resource max: Rust `49136KiB` RSS and `26` FDs vs Kubo `376964KiB` RSS and
+  `743` FDs.
+- Trace showed the lab barely participated in the target shape:
+  `shortcut_post_lookup_waits=1`, `post_lookup_budgets=100=1`, and no useful
+  `50ms` top-level zero-HTTP wait bucket.
+
+Interpretation:
+
+The focused outcome was fine, but it does not validate the new behavior. In this
+network window Wikipedia did not meaningfully exercise a top-level zero-HTTP
+post-lookup wait, so the apparent Wikipedia p95 win against Kubo cannot be
+attributed to the temporary env. The remaining slow request was instead an
+`ipfs.tech` child asset Bitswap block at `1781ms`, which this top-level-only
+knob intentionally would not address.
+
+Decision:
+
+Revert the temporary code. The broad `50ms` result remains a useful negative
+data point; the top-level-only variant did not get enough target coverage to
+justify keeping another lab knob. Future adaptive work needs better
+session-peer quality diagnostics before adding more grace controls.
