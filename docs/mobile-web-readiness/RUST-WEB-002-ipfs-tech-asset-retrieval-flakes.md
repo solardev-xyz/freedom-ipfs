@@ -28123,3 +28123,225 @@ spending roughly `20-40ms` in provider lookup and `160-190ms` in a single
 advertised HTTP provider fetch. Future work should target scoped page-session
 provider/source reuse, earlier provider-set sharing among sibling CIDs, or
 better first-use provider choice without cross-root opportunistic fallbacks.
+
+## 2026-05-07 - Promote Multi-HTTP Post-Lookup Race With Rollback
+
+Question:
+Can the previously lab-only multi-HTTP post-lookup race be promoted after the
+current branch's fast-scored race default and HTTP provider cap increase, without
+giving up the mobile RSS/FD advantage?
+
+Why retest:
+The broadened sweep above found the current clearest Kubo-win sample in
+`ipfs-tech-page-assets-cid-direct` asset p50. In that workload, many cold sibling
+asset blocks have multiple HTTP providers, and the fastest source is usually
+`https://dag.w3s.link/` at roughly `40-90ms`, while single-provider
+`https://ipfs-bridge.sia.dev/` reads sit around `180-290ms`. The earlier
+multi-HTTP experiment was rejected before the latest cap/fast-score defaults and
+before the CID-direct gap was isolated.
+
+Focused opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_MULTI_HTTP_POST_LOOKUP_RACE=1 timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets-cid-direct \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/multi-http-race-cid-direct-r10-20260507T022157Z-trace.jsonl \
+  --comparison-output /tmp/multi-http-race-cid-direct-r10-20260507T022157Z.json
+```
+
+Focused opt-in result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `563/4176ms`; Kubo `3060/4740ms`.
+- Asset p50/p95: Rust `160/490ms`; Kubo `233/1086ms`.
+- Resource max: Rust `55156KiB` RSS, `45` FDs; Kubo `326856KiB`, `464` FDs.
+- Trace shape: no repeated multi-provider post-lookup wait tax; HTTP provider
+  fetch p50 fell to roughly `65ms`, with `dag.w3s.link` still around `41ms`.
+- Note: root p95 had a bad delegated/Bitswap outlier in this window, but still
+  beat same-window Kubo.
+
+Same-window no-env control:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets-cid-direct \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-cid-direct-control-r10-20260507T022350Z-trace.jsonl \
+  --comparison-output /tmp/current-head-cid-direct-control-r10-20260507T022350Z.json
+```
+
+Same-window no-env result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `561/2518ms`; Kubo `2005/5550ms`.
+- Asset p50/p95: Rust `182/501ms`; Kubo `155/1918ms`.
+- Resource max: Rust `54024KiB` RSS, `48` FDs; Kubo `400252KiB`, `1172` FDs.
+- Trace shape: `51` `bitswap_session_shortcut_post_lookup_wait` events remained.
+  This confirms the previous default still paid repeated post-lookup wait tax on
+  multi-HTTP sibling blocks.
+
+Guardrail opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_MULTI_HTTP_POST_LOOKUP_RACE=1 timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case ipfs-tech-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/multi-http-race-current-multicase-r5-20260507T022606Z-trace.jsonl \
+  --comparison-output /tmp/multi-http-race-current-multicase-r5-20260507T022606Z.json
+```
+
+Guardrail opt-in result:
+
+- Rust and Kubo passed `5/5`.
+- `daicowtf-page-assets` root p50/p95: Rust `1168/1325ms`;
+  Kubo `2516/3039ms`.
+- `vitalik-root-html-range` root p50/p95: Rust `119/437ms`;
+  Kubo `1705/3417ms`.
+- `ipfs-tech-page-assets` root p50/p95: Rust `595/608ms`;
+  Kubo `1480/1755ms`.
+- `ipfs-tech-page-assets` asset p50/p95: Rust `152/421ms`;
+  Kubo `383/916ms`.
+- Resource max: Rust `56856KiB` RSS, `47` FDs; Kubo `340224KiB`, `804` FDs.
+
+Same-window no-env guardrail control:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case ipfs-tech-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-multicase-control-r5-20260507T022724Z-trace.jsonl \
+  --comparison-output /tmp/current-head-multicase-control-r5-20260507T022724Z.json
+```
+
+Same-window no-env guardrail result:
+
+- Rust and Kubo passed `5/5`.
+- `daicowtf-page-assets` root p50/p95: Rust `1263/1439ms`;
+  Kubo `2757/3213ms`.
+- `vitalik-root-html-range` root p50/p95: Rust `97/99ms`;
+  Kubo `1600/1634ms`.
+- `ipfs-tech-page-assets` root p50/p95: Rust `601/630ms`;
+  Kubo `1289/1391ms`.
+- `ipfs-tech-page-assets` asset p50/p95: Rust `204/480ms`;
+  Kubo `381/774ms`.
+- Resource max: Rust `56756KiB` RSS, `45` FDs; Kubo `494588KiB`, `1691` FDs.
+
+Code change:
+Promote multi-HTTP post-lookup racing to default and keep a rollback knob:
+
+- `FREEDOM_IPFS_DISABLE_MULTI_HTTP_POST_LOOKUP_RACE=1` disables the broad
+  multi-HTTP post-lookup race.
+- The old `FREEDOM_IPFS_ENABLE_MULTI_HTTP_POST_LOOKUP_RACE=1` env is now only a
+  backward-compatible no-op because the behavior is default-on.
+
+Focused promoted-default validation:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets-cid-direct \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/promoted-multi-http-race-cid-direct-r10-20260507T022951Z-trace.jsonl \
+  --comparison-output /tmp/promoted-multi-http-race-cid-direct-r10-20260507T022951Z.json
+```
+
+Focused promoted-default result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `547/1334ms`; Kubo `2369/4020ms`.
+- Asset p50/p95: Rust `153/410ms`; Kubo `171/1380ms`.
+- Resource max: Rust `54416KiB` RSS, `34` FDs; Kubo `405348KiB`, `416` FDs.
+- Trace shape: `0` `bitswap_session_shortcut_post_lookup_wait` events. HTTP
+  provider race results were `125` single-provider and `136` multi-provider.
+  `dag.w3s.link` successful fetch p50/p95/max was `44/80/99ms`;
+  `ipfs-bridge.sia.dev` was `184/290/373ms`.
+
+Guardrail promoted-default validation:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case ipfs-tech-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/promoted-multi-http-race-multicase-r5-20260507T023140Z-trace.jsonl \
+  --comparison-output /tmp/promoted-multi-http-race-multicase-r5-20260507T023140Z.json
+```
+
+Guardrail promoted-default result:
+
+- Rust and Kubo passed `5/5`.
+- `daicowtf-page-assets` root p50/p95: Rust `1244/1761ms`;
+  Kubo `2812/3008ms`.
+- `vitalik-root-html-range` root p50/p95: Rust `110/119ms`;
+  Kubo `1711/2673ms`.
+- `ipfs-tech-page-assets` root p50/p95: Rust `792/908ms`;
+  Kubo `1379/2217ms`.
+- `ipfs-tech-page-assets` asset p50/p95: Rust `184/336ms`;
+  Kubo `342/746ms`.
+- Resource max: Rust `55620KiB` RSS, `38` FDs; Kubo `250532KiB`, `313` FDs.
+- Trace shape: `0` `bitswap_session_shortcut_post_lookup_wait` events. HTTP
+  provider race results were `67` single-provider and `76` multi-provider.
+
+Decision:
+Promote the broad multi-HTTP post-lookup race to default with the rollback env.
+This directly targets the isolated CID-direct p50 gap and, in the promoted
+default sample, moves Rust from losing asset p50 in the no-env same-window
+control (`182ms` Rust vs `155ms` Kubo) to winning asset p50 (`153ms` Rust vs
+`171ms` Kubo), while also improving asset p95 and keeping RSS/FDs dramatically
+below Kubo. The guardrail r5 still wins all tracked cases and keeps the mobile
+resource profile. Continue to watch DAICO/root p95 in longer r10 guardrails, but
+this is no longer the highest-confidence Kubo-win gap.
+
+Next gap:
+After this promotion, the remaining work shifts back to zero-HTTP/Bitswap tails,
+root-block outliers, and longer r10/r20 guardrails rather than multi-HTTP sibling
+asset median latency. Future experiments should focus on peer quality,
+Bitswap-session source selection, and page-scoped learning for blocks that have
+no useful HTTP provider path.

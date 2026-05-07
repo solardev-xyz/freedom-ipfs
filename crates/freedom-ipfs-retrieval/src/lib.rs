@@ -111,6 +111,8 @@ const SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS";
 const ENABLE_MULTI_HTTP_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_ENABLE_MULTI_HTTP_POST_LOOKUP_RACE";
+const DISABLE_MULTI_HTTP_POST_LOOKUP_RACE_ENV: &str =
+    "FREEDOM_IPFS_DISABLE_MULTI_HTTP_POST_LOOKUP_RACE";
 const DISABLE_MULTI_HTTP_FAST_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_DISABLE_MULTI_HTTP_FAST_POST_LOOKUP_RACE";
 const MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS_ENV: &str =
@@ -3332,7 +3334,14 @@ fn single_http_post_lookup_race_enabled() -> bool {
 }
 
 fn multi_http_post_lookup_race_enabled() -> bool {
-    std::env::var_os(ENABLE_MULTI_HTTP_POST_LOOKUP_RACE_ENV).is_some()
+    multi_http_post_lookup_race_enabled_from_env_value(
+        std::env::var_os(DISABLE_MULTI_HTTP_POST_LOOKUP_RACE_ENV).is_some(),
+        std::env::var_os(ENABLE_MULTI_HTTP_POST_LOOKUP_RACE_ENV).is_some(),
+    )
+}
+
+fn multi_http_post_lookup_race_enabled_from_env_value(disabled: bool, _enabled: bool) -> bool {
+    !disabled
 }
 
 fn explicit_post_lookup_race_enabled_for_width(http_provider_count: usize) -> bool {
@@ -8113,6 +8122,22 @@ mod bitswap_tests {
                 .await,
             "slow scored multi-HTTP providers should keep the shortcut wait"
         );
+    }
+
+    #[test]
+    fn multi_http_post_lookup_race_default_is_enabled_with_rollback() {
+        assert!(multi_http_post_lookup_race_enabled_from_env_value(
+            false, false
+        ));
+        assert!(multi_http_post_lookup_race_enabled_from_env_value(
+            false, true
+        ));
+        assert!(!multi_http_post_lookup_race_enabled_from_env_value(
+            true, false
+        ));
+        assert!(!multi_http_post_lookup_race_enabled_from_env_value(
+            true, true
+        ));
     }
 
     #[test]
