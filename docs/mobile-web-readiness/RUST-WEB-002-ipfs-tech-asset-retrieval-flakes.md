@@ -36610,3 +36610,85 @@ public network did not reproduce the qualifying top-level zero-HTTP shape in
 this window. Do not promote this by default without a same-window sample where
 `zero_http_post_lookup_dns_prefetch_*` events actually fire and improve the
 top-level zero-HTTP tail versus a no-env control.
+
+## 2026-05-07 Single-HTTP Failed Direct-IP Fallback Recheck
+
+Purpose:
+
+The widened zero-HTTP DNS-prefetch smoke did not exercise the new zero-HTTP
+hook, but it did expose the older Wikipedia single-HTTP failure shape again:
+`f010479.twinquasar.io` returned `500` for the follow-on
+`bafkreicr5w6i2f3m664a2fnl4vhtg3s6dhhk6n5hrf3gqzcf7v5bu6b7te` block, and the
+normal Bitswap path then paid expensive DNS/provider expansion. Recheck the
+existing disabled single-HTTP failed direct-IP fallback in the same network
+window.
+
+Opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK=1 \
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --case ipfs-tech-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/single-http-failed-direct-ip-recheck-r5-20260507T185000Z-trace.jsonl \
+  --comparison-output /tmp/single-http-failed-direct-ip-recheck-r5-20260507T185000Z.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `5/5` for both cases.
+- `ipfs-tech-root-html-range`: Rust `746/778ms`; Kubo `1570/4074ms`.
+- Wikipedia root: Rust `753/1034ms`; Kubo `149/332ms`.
+- Resource max: Rust `43776KiB` RSS and `29` FDs vs Kubo `321396KiB` RSS
+  and `383` FDs.
+- The fallback fired for all 5 Wikipedia follow-on blocks:
+  `top_level_single_http_failed_direct_ip_bitswap_fallback_start` /
+  `result`.
+- The `direct_ip` branch won every fallback race, with result elapsed
+  `618ms`, `244ms`, `266ms`, `261ms`, and `232ms`.
+
+Immediate no-env post-control command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --case ipfs-tech-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/single-http-failed-direct-ip-post-control-r5-20260507T185500Z-trace.jsonl \
+  --comparison-output /tmp/single-http-failed-direct-ip-post-control-r5-20260507T185500Z.json
+```
+
+Immediate post-control result:
+
+- Rust and Kubo passed `5/5` for both cases.
+- `ipfs-tech-root-html-range`: Rust `787/832ms`; Kubo `1580/2637ms`.
+- Wikipedia root: Rust `857/923ms`; Kubo `181/419ms`.
+- Resource max: Rust `43264KiB` RSS and `25` FDs vs Kubo `203108KiB` RSS
+  and `140` FDs.
+
+Decision:
+
+Keep the single-HTTP failed direct-IP fallback disabled. This recheck is useful
+because it finally exercised the hook on the intended live shape, and the direct
+IP branch won every fallback race. It improved Wikipedia median versus the
+immediate no-env control (`753ms` vs `857ms`) and was much better than the
+earlier widened smoke where the same shape took about `2.4s`, but p95 did not
+improve (`1034ms` opt-in vs `923ms` control) and Kubo still won Wikipedia
+decisively. The remaining work is not just "use direct IP for the failed
+follow-on block"; it is the broader page-load shape around the Wikipedia root,
+index block, provider expansion, and session reuse.
