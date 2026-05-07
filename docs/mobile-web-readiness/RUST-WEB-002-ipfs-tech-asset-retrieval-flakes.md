@@ -36692,3 +36692,202 @@ improve (`1034ms` opt-in vs `923ms` control) and Kubo still won Wikipedia
 decisively. The remaining work is not just "use direct IP for the failed
 follow-on block"; it is the broader page-load shape around the Wikipedia root,
 index block, provider expansion, and session reuse.
+
+## 2026-05-07 Promote: Zero-HTTP Post-Lookup DNS Prefetch Default
+
+Purpose:
+
+Revisit the disabled zero-HTTP post-lookup DNS prefetch lab after a fresh
+same-window guardrail reproduced the exact shape it was built for: a top-level
+Wikipedia root block with `64` providers, zero HTTP providers, a recent
+cross-top-level session peer, a `100ms` post-lookup wait that timed out, and
+then Bitswap provider expansion/fetch on the visible TTFB path.
+
+Fresh no-env guardrail command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 360 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-refresh-guardrail-r5-20260507T174508Z-trace.jsonl \
+  --comparison-output /tmp/current-head-refresh-guardrail-r5-20260507T174508Z.json
+```
+
+Fresh no-env result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `1477/1701ms`; Kubo `3126/3577ms`.
+- Vitalik range: Rust `105/117ms`; Kubo `1990/2216ms`.
+- `ipfs.tech` root range: Rust `584/744ms`; Kubo `1176/1324ms`.
+- `ipfs.tech` page assets: root Rust `3/3ms` vs Kubo `2/2ms`; assets Rust
+  `48/217ms` vs Kubo `358/424ms`.
+- Wikipedia root: Rust `697/1363ms`; Kubo `725/811ms`.
+- Resource max: Rust `51160KiB` RSS and `32` FDs vs Kubo `159976KiB` RSS and
+  `228` FDs.
+
+Trace finding:
+
+The slowest Wikipedia request was the desired target shape. The root CID
+`bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze` had zero HTTP
+providers, waited the full `100ms` post-lookup session grace, then spent
+`200ms` in `bitswap_peer_expand` and `921ms` in the Bitswap fetch from candidate
+index `1`; the root `block_fetch_total` was `1300ms`. The follow-on
+`index.html` block was fast in that sample (`47ms`) via a session shortcut.
+
+Opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH=1 \
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 360 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-postlookup-dns-prefetch-guardrail-r5-20260507T174508Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-postlookup-dns-prefetch-guardrail-r5-20260507T174508Z.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `1279/1451ms`; Kubo `2869/2977ms`.
+- Vitalik range: Rust `104/134ms`; Kubo `2610/3797ms`.
+- `ipfs.tech` root range: Rust `575/610ms`; Kubo `1497/1690ms`.
+- `ipfs.tech` page assets: root Rust `3/3ms` vs Kubo `2/3ms`; assets Rust
+  `48/96ms` vs Kubo `363/435ms`.
+- Wikipedia root: Rust `499/565ms`; Kubo `587/784ms`.
+- Resource max: Rust `50992KiB` RSS and `25` FDs vs Kubo `165128KiB` RSS and
+  `306` FDs.
+- The prefetch hook fired on all five Wikipedia root requests:
+  `5` `zero_http_post_lookup_dns_prefetch_start` events and `5`
+  `zero_http_post_lookup_dns_prefetch_result ok=true` events.
+- Each result followed a post-lookup timeout and then fetched successfully with
+  total prefetch path elapsed `359-446ms`.
+
+Immediate no-env post-control command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 360 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-postlookup-dns-prefetch-post-control-guardrail-r5-20260507T174508Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-postlookup-dns-prefetch-post-control-guardrail-r5-20260507T174508Z.json
+```
+
+Immediate post-control result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `1241/1466ms`; Kubo `2888/3011ms`.
+- Vitalik range: Rust `108/115ms`; Kubo `2696/3407ms`.
+- `ipfs.tech` root range: Rust `779/851ms`; Kubo `1036/1177ms`.
+- `ipfs.tech` page assets: root Rust `3/4ms` vs Kubo `2/3ms`; assets Rust
+  `80/299ms` vs Kubo `353/415ms`.
+- Wikipedia root: Rust `607/839ms`; Kubo `523/742ms`.
+- Resource max: Rust `51440KiB` RSS and `28` FDs vs Kubo `175824KiB` RSS and
+  `292` FDs.
+
+Promotion change:
+
+- Promoted zero-HTTP post-lookup DNS prefetch to default-on.
+- Added rollback env:
+  `FREEDOM_IPFS_DISABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH=1`.
+- Kept the old `FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH=1` env
+  accepted as a backward-compatible no-op.
+- Kept the existing provider threshold override:
+  `FREEDOM_IPFS_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS=<n>`.
+
+Promoted-default no-env command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 360 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/promoted-zero-http-postlookup-dns-prefetch-guardrail-r5-20260507T174508Z-trace.jsonl \
+  --comparison-output /tmp/promoted-zero-http-postlookup-dns-prefetch-guardrail-r5-20260507T174508Z.json
+```
+
+Promoted-default result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `1297/1321ms`; Kubo `2988/3219ms`.
+- Vitalik range: Rust `109/123ms`; Kubo `2710/3035ms`.
+- `ipfs.tech` root range: Rust `534/741ms`; Kubo `1204/1914ms`.
+- `ipfs.tech` page assets: root Rust `3/3ms` vs Kubo `2/4ms`; assets Rust
+  `187/297ms` vs Kubo `351/453ms`.
+- Wikipedia root: Rust `220/351ms`; Kubo `404/757ms`.
+- Resource max: Rust `50484KiB` RSS and `26` FDs vs Kubo `182852KiB` RSS and
+  `239` FDs.
+- Default trace activation was visible without env:
+  `3` `zero_http_post_lookup_dns_prefetch_start` events and `1`
+  `zero_http_post_lookup_dns_prefetch_result ok=true`; the other two top-level
+  zero-HTTP Wikipedia requests were won by the session shortcut before the
+  prefetch result was needed.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval zero_http_post_lookup_dns_prefetch --lib
+cargo test -p freedom-ipfs-retrieval --lib
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Results:
+
+- Formatting passed.
+- Focused zero-HTTP DNS-prefetch tests passed: `3 passed`.
+- Full retrieval lib tests passed: `131 passed`, `1 ignored`.
+- Retrieval clippy passed with `-D warnings`.
+
+Decision:
+
+Promote. This is the first same-window sample where the disabled
+`zero_http_post_lookup_dns_prefetch_*` path fired on the intended live shape and
+closed the active Wikipedia p95 gap while preserving or improving the broader
+mobile guardrail profile. The scope is narrow enough for default behavior:
+top-level gateway request only, zero HTTP providers only, high provider count,
+Bitswap candidates present, and only around the non-racing post-lookup shortcut
+wait. Keep the rollback env documented for fast reversal if a longer corpus
+finds a top-level zero-HTTP regression.

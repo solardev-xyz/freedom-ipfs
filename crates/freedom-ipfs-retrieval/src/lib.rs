@@ -149,6 +149,8 @@ const ENABLE_ZERO_HTTP_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_RACE";
 const ENABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_ENV: &str =
     "FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH";
+const DISABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_ENV: &str =
+    "FREEDOM_IPFS_DISABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH";
 const ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS_ENV: &str =
     "FREEDOM_IPFS_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS";
 const ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS: usize = 32;
@@ -5054,7 +5056,14 @@ fn zero_http_post_lookup_race_enabled() -> bool {
 }
 
 fn zero_http_post_lookup_dns_prefetch_enabled() -> bool {
-    std::env::var_os(ENABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_ENV).is_some()
+    zero_http_post_lookup_dns_prefetch_enabled_from_values(
+        std::env::var_os(DISABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_ENV).is_some(),
+        std::env::var_os(ENABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_ENV).is_some(),
+    )
+}
+
+fn zero_http_post_lookup_dns_prefetch_enabled_from_values(disabled: bool, _enabled: bool) -> bool {
+    !disabled
 }
 
 fn zero_http_post_lookup_dns_prefetch_min_providers() -> usize {
@@ -9840,6 +9849,22 @@ mod bitswap_tests {
             zero_http_post_lookup_dns_prefetch_min_providers_from_env_value(Some("bad")),
             ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS
         );
+    }
+
+    #[test]
+    fn zero_http_post_lookup_dns_prefetch_default_is_enabled_with_rollback() {
+        assert!(zero_http_post_lookup_dns_prefetch_enabled_from_values(
+            false, false
+        ));
+        assert!(zero_http_post_lookup_dns_prefetch_enabled_from_values(
+            false, true
+        ));
+        assert!(!zero_http_post_lookup_dns_prefetch_enabled_from_values(
+            true, false
+        ));
+        assert!(!zero_http_post_lookup_dns_prefetch_enabled_from_values(
+            true, true
+        ));
     }
 
     #[tokio::test]
