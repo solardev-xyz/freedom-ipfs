@@ -40228,3 +40228,46 @@ Next agent guidance:
 - If this default regresses a future broader corpus, restore the old value with
   `FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS=750` and compare same-window
   traces before reverting the code.
+
+Post-promotion no-env guardrail:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/promoted-want-have500-default-guardrail-r5-20260507T222440Z-trace.jsonl \
+  --comparison-output /tmp/promoted-want-have500-default-guardrail-r5-20260507T222440Z.json
+```
+
+Post-promotion no-env result:
+
+- Rust and Kubo passed `5/5` for all four guardrail cases.
+- DAICO root: Rust `1102/1209ms`; Kubo `1261/4742ms`.
+- Vitalik range: Rust `111/286ms`; Kubo `4327/4710ms`.
+- `ipfs.tech` root: Rust `670/986ms`; Kubo `761/2606ms`.
+- `ipfs.tech` assets: Rust `119/314ms`; Kubo `359/730ms`.
+- `wikipedia-on-ipfs-root`: Rust `480/656ms`; Kubo `511/712ms`.
+- Resource max: Rust `66556KiB` RSS and `39` FDs vs Kubo `204600KiB`
+  RSS and `165` FDs.
+- `meaningful_kubo_wins`: none.
+- Block fetch totals:
+  - Bitswap: `122` blocks, p50/p90/p95/max `107/326/401/943ms`.
+  - HTTP provider: `110` blocks, p50/p90/p95/max `96/227/238/324ms`.
+- Zero-HTTP classification:
+  - `zero_http_provider_bitswap=20`, p50/p90/p95/max
+    `260/668/765/984ms`.
+  - `top_level_zero_http_provider_bitswap=14`, p50/p90/p95/max
+    `478/765/984/984ms`.
+- The slowest events were no longer Wikipedia root. They were a streamed
+  direct-CID workload and `ipfs.tech` root tails under `1s`; Wikipedia's slowest
+  request in this run was `654ms`.
