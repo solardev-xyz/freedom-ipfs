@@ -38225,3 +38225,86 @@ without the fallback. The active conclusion remains that this shape is highly
 network-sensitive; do not promote direct-IP fallback unless a future same-window
 run shows repeated direct-IP wins with clear p50/p95 improvement and no
 asset/resource regression.
+
+### Current Wide Performance Sweep
+
+Purpose:
+
+After the single-HTTP direct-IP post-control removed the active Kubo win, widen
+the no-env search across the performance corpus, including media range and HEAD
+cases, while excluding the `.eth is not IPNS` negative control that Kubo can fail
+for non-performance reasons.
+
+Command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case daicowtf-root-html-range \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-page-assets-cid-direct \
+  --case ipfs-tech-developers-hero-range \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/current-wide-performance-r5-20260507T194605Z-trace.jsonl \
+  --comparison-output /tmp/current-wide-performance-r5-20260507T194605Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO range: Rust `227/262ms`; Kubo `2257/2509ms`.
+- DAICO page root: Rust `78/94ms`; Kubo `2/2ms`.
+- Vitalik range: Rust `115/131ms`; Kubo `2315/2423ms`.
+- `ipfs.tech` root range: Rust `555/753ms`; Kubo `1645/7088ms`.
+- `ipfs.tech` page root: Rust `3/3ms`; Kubo `2/53ms`.
+- `ipfs.tech` page assets: Rust `179/695ms`; Kubo `132/892ms`.
+- CID-direct `ipfs.tech` root/assets were only millisecond-level Kubo wins.
+- `ipfs.tech` hero prefix range: Rust `107/147ms`; Kubo `90/1201ms`.
+- `ipfs.tech` hero middle/suffix ranges and HEAD were all millisecond-level.
+- Wikipedia root: Rust `319/850ms`; Kubo `290/1241ms`.
+- Resource max: Rust `60848KiB` RSS and `40` FDs vs Kubo `334648KiB`
+  RSS and `594` FDs.
+- `meaningful_kubo_wins` flagged only DAICO page root p50/p95 TTFB/total.
+
+Trace finding:
+
+- HTTP-provider blocks: `191`, p50/p90/p95/max `181/288/418/966ms`.
+- Bitswap blocks: `49`, p50/p90/p95/max `132/706/983/1376ms`.
+- Delegated provider lookup distribution: zero HTTP `13`, single HTTP `112`,
+  multi HTTP `90`.
+- Request classifications were all `ipfs.tech` zero-HTTP child Bitswap:
+  `cold_bitswap_peer_expand=13`, `zero_http_provider_bitswap=13`,
+  `zero_http_provider_cold_bitswap=13`.
+- Slowest requests were `ipfs.tech` child assets:
+  - `_nuxt/D9b_q90p.js` at `1389ms`
+  - `_nuxt/mHWTJadT.js` at `1379ms`
+  - `_nuxt/DBHrpFkY.js` at `1264ms`
+- Those slow child requests had zero HTTP providers and provider counts around
+  `14`, `28`, and `37`; provider expansion itself was short, but final Bitswap
+  delivery landed on slow provider candidates.
+- DAICO page root was not a cold network gap. The preceding
+  `daicowtf-root-html-range` case warmed the same CID in the same fresh gateway
+  run. Kubo then served the later full root in `2-4ms`, while Rust streamed the
+  remaining full body in roughly `67-91ms` after cache hits for the first block
+  and one HTTP-provider fetch for the next block.
+
+Decision:
+
+Do not chase the DAICO page-root `meaningful_kubo_wins` as the next cold-load
+optimization. It is a range-then-full warm-order artifact, and prefetching full
+large bodies for every range request would be the wrong mobile tradeoff without
+a much narrower signal. The useful live tail remains `ipfs.tech` zero-HTTP
+child Bitswap source quality. Do not repeat static direct-WANT experiments:
+global `direct2` and subresource-only `direct2` were already rejected earlier in
+this document. A future improvement should be more selective, likely based on
+per-page repeated zero-HTTP child CIDs, known source peer quality, or adaptive
+peer ordering rather than fixed direct-WANT fanout.
