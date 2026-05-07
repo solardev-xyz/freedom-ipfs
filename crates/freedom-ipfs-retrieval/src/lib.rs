@@ -144,6 +144,10 @@ const MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND: usize = 5;
 const MAX_BITSWAP_PEERS_PER_BLOCK: usize = 16;
 const MAX_BITSWAP_SESSION_PEERS: usize = 4;
 const BITSWAP_SESSION_PEER_LIMIT_ENV: &str = "FREEDOM_IPFS_BITSWAP_SESSION_PEER_LIMIT";
+const ENABLE_BITSWAP_DOMINANT_SESSION_PEER_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_BITSWAP_DOMINANT_SESSION_PEER";
+const BITSWAP_DOMINANT_SESSION_PEER_MIN_SUCCESSES: u64 = 8;
+const BITSWAP_DOMINANT_SESSION_PEER_RATIO: u64 = 4;
 const MAX_BITSWAP_ADDRS_PER_PEER: usize = 2;
 const MAX_BITSWAP_SESSION_RANGE_BATCH_CIDS: usize = 4;
 const BITSWAP_SESSION_RANGE_BATCH_TIMEOUT: Duration = Duration::from_millis(750);
@@ -2673,12 +2677,17 @@ impl HttpRetriever {
             }
         }
         let mut successes = self.successful_bitswap_peers.lock().await;
+        let success_count = successes
+            .get(&peer)
+            .map(|success| success.success_count.saturating_add(1))
+            .unwrap_or(1);
         successes.insert(
             peer,
             SuccessfulBitswapPeer {
                 seen_at: Instant::now(),
                 addrs,
                 last_latency,
+                success_count,
             },
         );
     }
@@ -2710,19 +2719,41 @@ impl HttpRetriever {
                     success.seen_at,
                     success.last_latency,
                     success.addrs.clone(),
+                    success.success_count,
                 )
             })
             .collect::<Vec<_>>();
+        if bitswap_dominant_session_peer_enabled() {
+            if let Some(dominant_index) = dominant_recent_bitswap_peer_index(&peers) {
+                let (id, seen_at, last_latency, addrs, success_count) =
+                    peers.swap_remove(dominant_index);
+                let next_success_count = peers.iter().map(|peer| peer.4).max().unwrap_or_default();
+                tracing::info!(
+                    phase = "bitswap_dominant_session_peer",
+                    peer = %id,
+                    peer_count = peers.len() + 1,
+                    success_count,
+                    next_success_count,
+                    latency_ms = last_latency.as_millis(),
+                    min_success_count = BITSWAP_DOMINANT_SESSION_PEER_MIN_SUCCESSES,
+                    dominance_ratio = BITSWAP_DOMINANT_SESSION_PEER_RATIO
+                );
+                peers.clear();
+                peers.push((id, seen_at, last_latency, addrs, success_count));
+            }
+        }
         peers.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| right.1.cmp(&left.1)));
         peers
             .into_iter()
             .take(bitswap_session_peer_limit())
-            .map(|(id, _seen_at, _last_latency, addrs)| BitswapPeer {
-                id,
-                addrs,
-                skip_want_have: true,
-                force_want_block: false,
-            })
+            .map(
+                |(id, _seen_at, _last_latency, addrs, _success_count)| BitswapPeer {
+                    id,
+                    addrs,
+                    skip_want_have: true,
+                    force_want_block: false,
+                },
+            )
             .collect()
     }
 
@@ -3488,6 +3519,7 @@ struct SuccessfulBitswapPeer {
     seen_at: Instant,
     addrs: Vec<Multiaddr>,
     last_latency: Duration,
+    success_count: u64,
 }
 
 struct HttpProviderScore {
@@ -3702,6 +3734,37 @@ fn bitswap_session_range_batch_enabled() -> bool {
 
 fn bitswap_dns_expansion_cache_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_DNS_EXPANSION_CACHE_ENV).is_some()
+}
+
+fn bitswap_dominant_session_peer_enabled() -> bool {
+    std::env::var_os(ENABLE_BITSWAP_DOMINANT_SESSION_PEER_ENV).is_some()
+}
+
+fn dominant_recent_bitswap_peer_index<T>(
+    peers: &[(PeerId, Instant, Duration, T, u64)],
+) -> Option<usize> {
+    let (dominant_index, dominant_success_count) = peers
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, peer)| peer.4)
+        .map(|(index, peer)| (index, peer.4))?;
+    if dominant_success_count < BITSWAP_DOMINANT_SESSION_PEER_MIN_SUCCESSES {
+        return None;
+    }
+    let next_success_count = peers
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != dominant_index)
+        .map(|(_, peer)| peer.4)
+        .max()
+        .unwrap_or_default();
+    if next_success_count > 0
+        && dominant_success_count
+            < next_success_count.saturating_mul(BITSWAP_DOMINANT_SESSION_PEER_RATIO)
+    {
+        return None;
+    }
+    Some(dominant_index)
 }
 
 fn bitswap_session_peer_limit() -> usize {
@@ -8907,6 +8970,32 @@ mod bitswap_tests {
         );
     }
 
+    #[test]
+    fn dominant_recent_bitswap_peer_requires_clear_success_lead() {
+        let dominant =
+            parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let second = parse_peer_id("12D3KooWAtxJkDLacJdK7yZkk2iPp8iMdSVh1bDHzmJ3t8oKUkqA").unwrap();
+        let now = Instant::now();
+
+        let below_threshold = vec![
+            (dominant, now, Duration::from_millis(50), (), 7),
+            (second, now, Duration::from_millis(25), (), 1),
+        ];
+        assert_eq!(dominant_recent_bitswap_peer_index(&below_threshold), None);
+
+        let not_dominant = vec![
+            (dominant, now, Duration::from_millis(50), (), 8),
+            (second, now, Duration::from_millis(25), (), 3),
+        ];
+        assert_eq!(dominant_recent_bitswap_peer_index(&not_dominant), None);
+
+        let clear_lead = vec![
+            (dominant, now, Duration::from_millis(50), (), 16),
+            (second, now, Duration::from_millis(25), (), 4),
+        ];
+        assert_eq!(dominant_recent_bitswap_peer_index(&clear_lead), Some(0));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn bitswap_hedge_can_win_against_slow_single_http_provider() {
         let expected = b"verified single HTTP bitswap hedge block";
@@ -9089,6 +9178,7 @@ mod bitswap_tests {
                     seen_at: now,
                     addrs: Vec::new(),
                     last_latency: Duration::from_secs(2),
+                    success_count: 1,
                 },
             );
             successes.insert(
@@ -9097,6 +9187,7 @@ mod bitswap_tests {
                     seen_at: now - Duration::from_secs(1),
                     addrs: Vec::new(),
                     last_latency: Duration::from_millis(80),
+                    success_count: 1,
                 },
             );
         }
@@ -9143,6 +9234,7 @@ mod bitswap_tests {
                     seen_at: now,
                     addrs: vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()],
                     last_latency: Duration::from_secs(2),
+                    success_count: 1,
                 },
             );
             successes.insert(
@@ -9151,6 +9243,7 @@ mod bitswap_tests {
                     seen_at: now - Duration::from_secs(1),
                     addrs: vec!["/ip4/127.0.0.1/tcp/4002".parse().unwrap()],
                     last_latency: Duration::from_millis(80),
+                    success_count: 1,
                 },
             );
         }

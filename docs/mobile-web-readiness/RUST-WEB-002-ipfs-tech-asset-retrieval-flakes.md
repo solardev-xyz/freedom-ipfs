@@ -29767,3 +29767,126 @@ regressed `ipfs.tech` asset p95 (`355ms` vs `302ms`), and increased Rust FDs
 slightly (`37` vs `33`). The useful signal is that peer-source quality matters;
 the next iteration should score or filter recent session peers with page/root
 context instead of statically shrinking the shortcut set.
+
+## 2026-05-07 - Lab Control: Dominant Bitswap Session Peer
+
+Hypothesis:
+The static `1`-peer cap improved some Wikipedia tails but hurt other page
+metrics because it blindly shrank the shortcut set. Test a narrower opt-in rule:
+if one recent Bitswap peer has clearly dominated the current retriever session,
+reuse only that peer on the recent-peer shortcut path. This tests whether source
+quality can beat a mixed recent-peer set without changing default behavior.
+
+Implementation:
+
+- Added disabled lab env knob
+  `FREEDOM_IPFS_ENABLE_BITSWAP_DOMINANT_SESSION_PEER=1`.
+- Track an in-memory `success_count` for each successful Bitswap peer.
+- When the flag is set, the recent-peer shortcut set collapses to one peer only
+  if that peer has at least `8` successes and at least a `4x` lead over the next
+  successful peer.
+- Emit `bitswap_dominant_session_peer` with peer count, success count,
+  next-success count, latency, and gate thresholds.
+- Default behavior is unchanged when the flag is unset.
+
+Validation:
+
+```sh
+cargo fmt --all
+cargo test -p freedom-ipfs-retrieval dominant_recent_bitswap_peer_requires_clear_success_lead
+cargo test -p freedom-ipfs-retrieval lower_latency_successful_bitswap_peers_are_preferred
+cargo test -p freedom-ipfs-retrieval recent_bitswap_shortcut_peers_are_latency_ordered
+cargo test -p freedom-ipfs-retrieval bitswap_session_peer_limit_env_value_parses_capped_override
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+All passed.
+
+Opt-in command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_ENABLE_BITSWAP_DOMINANT_SESSION_PEER=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/dominant-session-peer-broader-selected-r5-20260507T052739Z-trace.jsonl \
+  --comparison-output /tmp/dominant-session-peer-broader-selected-r5-20260507T052739Z.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1214/1437ms` vs Kubo `2459/3083ms`.
+- Vitalik range: Rust `102/140ms` vs Kubo `2025/2678ms`.
+- `ipfs.tech` root range: Rust `685/1615ms` vs Kubo `1043/1720ms`.
+- `ipfs.tech` page assets: Rust root `3/58ms`, assets `116/544ms`; Kubo root
+  `2/600ms`, assets `364/601ms`.
+- `ipfs.tech` hero range: Rust `126/254ms` vs Kubo `452/668ms`.
+- Wikipedia root still lost: Rust `610/796ms` vs Kubo `347/517ms`.
+- Resource max: Rust `50852KiB` RSS and `35` FDs vs Kubo `380848KiB` RSS and
+  `788` FDs.
+- The dominant-peer gate fired `73` times. It reduced Bitswap peer attempts
+  versus the same-window control (`287` vs `360`).
+- Block fetch totals: HTTP provider p50/p95/max `176/617/716ms`; Bitswap
+  p50/p95/max `103/734/1281ms`.
+
+Same-window no-env command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/noenv-after-dominant-session-peer-broader-selected-r5-20260507T053018Z-trace.jsonl \
+  --comparison-output /tmp/noenv-after-dominant-session-peer-broader-selected-r5-20260507T053018Z.json
+```
+
+Same-window no-env result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1251/1903ms` vs Kubo `2904/3126ms`.
+- Vitalik range: Rust `100/105ms` vs Kubo `2131/2654ms`.
+- `ipfs.tech` root range: Rust `674/1256ms` vs Kubo `997/1663ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `150/350ms`; Kubo root
+  `2/290ms`, assets `349/443ms`.
+- `ipfs.tech` hero range: Rust `125/137ms` vs Kubo `427/436ms`.
+- Wikipedia root lost worse than the opt-in run: Rust `776/1150ms` vs Kubo
+  `486/552ms`.
+- Resource max: Rust `50508KiB` RSS and `36` FDs vs Kubo `171980KiB` RSS and
+  `312` FDs.
+- Block fetch totals: HTTP provider p50/p95/max `177/451/898ms`; Bitswap
+  p50/p95/max `145/854/1262ms`.
+
+Decision:
+Keep this as a disabled lab control for source-quality experiments, but do not
+promote it. The gate improved Wikipedia p50/p95 relative to the immediate
+control (`610/796ms` vs `776/1150ms`) and reduced Bitswap peer attempts
+(`287` vs `360`), but it regressed the `ipfs.tech` page-asset p95
+(`544ms` vs `350ms`) and root-range p95 (`1615ms` vs `1256ms`). The useful
+signal is narrower: peer dominance can reduce fanout and help unrelated
+zero-HTTP roots, but using global session dominance for page assets is too
+blunt. Future work should combine source quality with page/root or request-class
+context instead of applying one global dominant peer to every shortcut.
