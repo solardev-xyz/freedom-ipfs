@@ -33768,3 +33768,66 @@ Keep. This is diagnostics-only and changes no retrieval behavior. Future
 source-quality experiments can now see whether winning Bitswap sources are
 early direct candidates, later `WANT_HAVE` candidates, session peers, or
 unknown peers directly in the normal harness summary.
+
+## 2026-05-07 Reject: Static Zero-Untrusted Direct WANT_BLOCK Width
+
+Hypothesis:
+
+The fresh focused baseline showed the Wikipedia root block repeatedly delivered
+by later provider candidates at indexes `4` and `5` through `WANT_HAVE`, while
+the earlier direct `WANT_BLOCK` candidates did not become winning sources.
+Maybe setting the generic untrusted direct width to `0` would let useful
+`WANT_HAVE` responders win without spending direct requests on bad early
+candidates.
+
+Command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS=0 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/direct0-focused-r10-20260507Tafter-candidate-summary-trace.jsonl \
+  --comparison-output /tmp/direct0-focused-r10-20260507Tafter-candidate-summary.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10`.
+- `ipfs.tech` page assets:
+  - root TTFB/total p50/p95: Rust `782/1570ms` and `783/1571ms`; Kubo
+    `2111/2910ms` and `2111/2912ms`.
+  - asset TTFB/total p50/p95: Rust `144/772ms`; Kubo `140/389ms`.
+- `wikipedia-on-ipfs-root` root TTFB/total p50/p95: Rust `698/1073ms`; Kubo
+  `167/746ms`.
+- Resource max: Rust `49356KiB` RSS and `37` FDs vs Kubo `277320KiB` RSS and
+  `420` FDs.
+- Bitswap block fetches worsened to p50/p95/max `149/1226/1381ms`.
+- `bitswap_want_have_probe` emitted `27` failures, all
+  `timeout_fallback_want_block` at about `751ms`.
+- The new candidate-index summary showed source candidates distributed across
+  `0=25`, `1=7`, `3=5`, `2=3`, `4=2`, `5=1`, so the all-probe shape did not
+  simply move wins to the previously observed Wikipedia indexes.
+
+Comparison to the immediate no-env focused baseline:
+
+- `ipfs.tech` asset p95 regressed from `398ms` to `772ms`.
+- Wikipedia p50/p95 regressed from `494/808ms` to `698/1073ms`.
+- Rust FD max rose from `25` to `37`.
+
+Decision:
+
+Do not promote direct width `0`. This completes the static direct-width family
+for current purposes: width `0`, `1`, `4`, `5`, `8`, and high-provider variants
+all fail to close the target without guardrail regressions. Future work should
+not keep sweeping static direct/probe widths; it needs source-quality signals
+that choose which peers to ask directly or probe based on delivery evidence and
+request shape.
