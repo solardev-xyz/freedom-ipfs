@@ -40271,3 +40271,178 @@ Post-promotion no-env result:
 - The slowest events were no longer Wikipedia root. They were a streamed
   direct-CID workload and `ipfs.tech` root tails under `1s`; Wikipedia's slowest
   request in this run was `654ms`.
+
+## 2026-05-07: Recheck Single-HTTP Direct-IP Fallback After 500ms Default
+
+Branch:
+
+- `codex/kubo-session-performance-20260506`
+- Head before this experiment: `3c883e2`
+
+Purpose:
+
+After promoting the `500ms` Bitswap `WANT_HAVE` timeout, run a fresh same-window
+r10 guardrail and recheck the existing disabled top-level single-HTTP failed
+direct-IP fallback only if the trace reproduces its target shape.
+
+### Fresh No-Env Baseline
+
+Command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/current-head-post500-baseline-r10-20260507T222953Z-trace.jsonl \
+  --comparison-output /tmp/current-head-post500-baseline-r10-20260507T222953Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10` for all four guardrail cases.
+- DAICO root: Rust `1033/1404ms`; Kubo `1233/2431ms`.
+- Vitalik range: Rust `106/228ms`; Kubo `3202/4368ms`.
+- `ipfs.tech` root: Rust `512/1156ms`; Kubo `765/1380ms`.
+- `ipfs.tech` assets: Rust `186/484ms`; Kubo `375/796ms`.
+- Wikipedia root: Rust `498/1026ms`; Kubo `465/705ms`.
+- Resource max: Rust `61032KiB` RSS and `45` FDs vs Kubo `134564KiB`
+  RSS and `163` FDs.
+- `meaningful_kubo_wins`: `2`, both Wikipedia root p95 TTFB/total.
+- Block fetch totals:
+  - HTTP provider: `387` blocks, p50/p95/max `181/324/672ms`.
+  - Bitswap: `83` blocks, p50/p95/max `156/835/985ms`.
+- Request classifications:
+  `zero_http_provider_bitswap=31`, `top_level_zero_http_provider_bitswap=21`,
+  `cold_bitswap_peer_expand=10`,
+  `top_level_zero_http_provider_cold_bitswap=10`,
+  `zero_http_provider_cold_bitswap=10`.
+- Zero-HTTP request latency:
+  - `zero_http_provider_bitswap`: p50/p95/max `334/962/1024ms`.
+  - `top_level_zero_http_provider_bitswap`: p50/p95/max `420/962/1024ms`.
+
+Trace finding:
+
+The active baseline Kubo win was Wikipedia p95. The slow Wikipedia requests
+were two-block UnixFS roots: a zero-HTTP root directory block followed by an
+`index.html` block where `f010479.twinquasar.io` returned HTTP `500` and the
+request fell back to Bitswap. That is close enough to the older
+single-HTTP-failed direct-IP fallback shape to justify one recheck.
+
+### Opt-In Recheck
+
+Command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_ENABLE_TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/single-http-directip-post500-r10-20260507T223248Z-trace.jsonl \
+  --comparison-output /tmp/single-http-directip-post500-r10-20260507T223248Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10` for all four guardrail cases.
+- DAICO root: Rust `1025/1347ms`; Kubo `1205/2214ms`.
+- Vitalik range: Rust `103/132ms`; Kubo `2136/4431ms`.
+- `ipfs.tech` root: Rust `656/1291ms`; Kubo `722/2177ms`.
+- `ipfs.tech` assets: Rust `139/460ms`; Kubo `368/858ms`.
+- Wikipedia root: Rust `166/427ms`; Kubo `462/723ms`.
+- Resource max: Rust `63444KiB` RSS and `45` FDs vs Kubo `279052KiB`
+  RSS and `257` FDs.
+- `meaningful_kubo_wins`: none.
+- Block fetch totals:
+  - HTTP provider: `274` blocks, p50/p95/max `105/257/962ms`.
+  - Bitswap: `193` blocks, p50/p95/max `128/685/1006ms`.
+- Request classifications:
+  `zero_http_provider_bitswap=44`, `top_level_zero_http_provider_bitswap=19`,
+  `cold_bitswap_peer_expand=10`,
+  `top_level_zero_http_provider_cold_bitswap=10`,
+  `zero_http_provider_cold_bitswap=10`.
+- Zero-HTTP request latency:
+  - `zero_http_provider_bitswap`: p50/p95/max `302/712/781ms`.
+  - `top_level_zero_http_provider_bitswap`: p50/p95/max `248/781/781ms`.
+- The direct-IP fallback trace phases did not appear.
+
+### Immediate No-Env Post-Control
+
+Command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/single-http-directip-post500-postcontrol-r10-20260507T223248Z-trace.jsonl \
+  --comparison-output /tmp/single-http-directip-post500-postcontrol-r10-20260507T223248Z.json
+```
+
+Post-control result:
+
+- Rust and Kubo passed `10/10` for all four guardrail cases.
+- DAICO root: Rust `979/1209ms`; Kubo `1188/2201ms`.
+- Vitalik range: Rust `102/143ms`; Kubo `3369/4471ms`.
+- `ipfs.tech` root: Rust `653/1859ms`; Kubo `718/1329ms`.
+- `ipfs.tech` assets: Rust `131/398ms`; Kubo `363/725ms`.
+- Wikipedia root: Rust `299/442ms`; Kubo `655/693ms`.
+- Resource max: Rust `62264KiB` RSS and `45` FDs vs Kubo `172232KiB`
+  RSS and `231` FDs.
+- `meaningful_kubo_wins`: `2`, both `ipfs.tech` root p95 TTFB/total.
+- Block fetch totals:
+  - HTTP provider: `279` blocks, p50/p95/max `104/248/386ms`.
+  - Bitswap: `187` blocks, p50/p95/max `113/732/1575ms`.
+- Request classifications:
+  `zero_http_provider_bitswap=50`, `top_level_zero_http_provider_bitswap=20`,
+  `cold_bitswap_peer_expand=10`,
+  `top_level_zero_http_provider_cold_bitswap=10`,
+  `zero_http_provider_cold_bitswap=10`.
+- Zero-HTTP request latency:
+  - `zero_http_provider_bitswap`: p50/p95/max `298/1157/1856ms`.
+  - `top_level_zero_http_provider_bitswap`: p50/p95/max `288/1315/1856ms`.
+
+Decision:
+
+Keep
+`FREEDOM_IPFS_ENABLE_TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK`
+disabled. The opt-in run looked much better on Wikipedia, but the fallback did
+not actually fire, and the immediate no-env post-control also removed the
+Wikipedia Kubo win. The improvement was network/window drift, not causal
+evidence for direct-IP fallback.
+
+The post-control shifted the active Kubo win back to `ipfs.tech` root p95, with
+the slowest root at `1856ms` caused by a zero-HTTP Bitswap block
+(`bafkreibnzgajg3gsyn5c4p5e2h7racpy6dy7tnhwe5l4v4vx5e32qmn4bi`) fetched from
+source peer `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT` after about
+`1403ms`. The next useful target is still page-scoped source quality and escape
+hatches for slow zero-HTTP `ipfs.tech` root/child Bitswap sources, not another
+direct-IP fallback promotion.
