@@ -33729,3 +33729,42 @@ lighter on resources. The live gaps in this window are `ipfs.tech` asset median
 and Wikipedia root p50/p95. The Wikipedia gap continues to look like top-level
 zero-HTTP provider Bitswap/source selection rather than HTTP-provider body
 streaming.
+
+## 2026-05-07 Keep: Bitswap Source Candidate Index Summary
+
+The focused total-metrics baseline exposed a useful source-quality clue in the
+raw trace: successful Wikipedia root Bitswap deliveries for
+`bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze` repeatedly came
+from provider candidates at indexes `4` and `5`, both through `WANT_HAVE`.
+The earlier direct `WANT_BLOCK` candidates were contacted but did not become the
+winning sources. That supports the existing conclusion that broader static
+direct fanout is too blunt; the useful evidence is about which candidate ranks
+actually deliver.
+
+Change:
+
+- Add `bitswap_source_candidate_indexes` to the harness trace summary JSON.
+- Print `bitswap source candidate indexes: ...` beside source peers,
+  transports, request modes, and deliveries.
+- Ignore `-1` unknown source-candidate markers.
+- Add focused test coverage using a successful `bitswap_fetch` trace event with
+  `source_peer_candidate_index=4`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details -- --nocapture
+cargo test -p mobile-web-harness trace_summary_counts_bitswap_peer_attempts -- --nocapture
+cargo test -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Validation passed.
+
+Decision:
+
+Keep. This is diagnostics-only and changes no retrieval behavior. Future
+source-quality experiments can now see whether winning Bitswap sources are
+early direct candidates, later `WANT_HAVE` candidates, session peers, or
+unknown peers directly in the normal harness summary.
