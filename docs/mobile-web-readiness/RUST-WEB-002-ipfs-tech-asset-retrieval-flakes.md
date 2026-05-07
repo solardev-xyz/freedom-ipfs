@@ -34483,3 +34483,144 @@ Decision:
 Keep. This is diagnostics-only and changes no retrieval behavior. It gives the
 next adaptive experiment direct evidence about whether a shortcut wait/race is
 using one-hit, slow, or stale session peers versus a strong repeated peer.
+
+## 2026-05-07 Current-Head Focused Baseline: Asset Median Gap Is Single-HTTP Heavy
+
+Question:
+
+After adding session shortcut peer-quality diagnostics, where is the remaining
+Kubo win in a focused cold `ipfs.tech` page-load comparison with serialized
+asset fetches?
+
+Command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-focused-ipfs-tech-r10-20260507Tresume-trace.jsonl \
+  --comparison-output /tmp/current-head-focused-ipfs-tech-r10-20260507Tresume.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10`.
+- Root TTFB/total p50/p95: Rust `591/1006ms`; Kubo `1477/2043ms`.
+- Asset TTFB/total p50/p95: Rust `127/329ms`; Kubo `97/663ms`.
+- Resource max: Rust `49116KiB` RSS and `29` FDs vs Kubo `183684KiB` RSS and
+  `177` FDs.
+
+Trace classification:
+
+- HTTP-provider block fetches: `228`, p50/p95/max `189/296/532ms`.
+- Bitswap block fetches: `122`, p50/p95/max `80/349/540ms`.
+- Delegated provider lookup was not the bottleneck: p50/p95/max
+  `20/56/106ms`.
+- Request classifications:
+  - `zero_http_provider_bitswap=29`
+  - `cold_bitswap_peer_expand=20`
+  - `zero_http_provider_cold_bitswap=20`
+- Single HTTP-provider results remained the common median tax:
+  `126` single-provider successes, all via `https://ipfs-bridge.sia.dev/`,
+  p50/p95/max `172/304/509ms`.
+- Multi-provider HTTP wins were much faster: p50/p95/max `58/125/191ms`.
+- Session shortcut trace:
+  - `shortcut_starts=220`
+  - `shortcut_attempts=103`
+  - `shortcut_hits=103`
+  - post-lookup waits `19`, hits `9`, timeouts `10`.
+
+Per-asset median comparison:
+
+- Kubo won median on `23/32` assets, mostly JavaScript chunks.
+- Rust still won the page tail: asset p95 was `329ms` vs Kubo `663ms`.
+- The largest Kubo median wins were single-HTTP-heavy script chunks:
+  - `_nuxt/BfUTpfA9.js`: Rust/Kubo median `207/58ms`, Rust source mix
+    `http_provider=7`, `bitswap=3`.
+  - `_nuxt/Duo5E1ke.js`: `198/58ms`, source mix `http_provider=11`.
+  - `_nuxt/BXkYzPrD.js`: `299/88ms`, source mix `http_provider=9`,
+    `bitswap=1`.
+  - `_nuxt/B1ETkkRH.js`: `333/127ms`, source mix `bitswap=10`; this is the
+    main zero-HTTP Bitswap median loser.
+
+Interpretation:
+
+The focused asset p50 gap is narrower than earlier samples but still real. It
+is not a provider-lookup problem and not a broad page tail problem. It is mostly
+the verified single HTTP-provider path for JavaScript chunks, especially the
+Sia bridge, with one recurring zero-HTTP Bitswap script chunk. Future behavior
+work should target single-HTTP median without giving up the current Rust p95,
+RSS, and FD wins.
+
+## 2026-05-07 Reject Retest: Full Single-HTTP Bitswap Hedge At Asset Concurrency 1
+
+Question:
+
+The full single-HTTP Bitswap hedge was previously too broad at higher asset
+concurrency. Does it become attractive when the page crawl is serialized with
+`--asset-concurrency 1`, where mobile FD pressure should be lower?
+
+Command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --repeat 10 \
+    --asset-concurrency 1 \
+    --timeout-secs 120 \
+    --run-timeout-secs 300 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/single-http-bitswap-hedge-focused-c1-r10-20260507Tresume-trace.jsonl \
+    --comparison-output /tmp/single-http-bitswap-hedge-focused-c1-r10-20260507Tresume.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10`.
+- Root TTFB/total p50/p95: Rust `694/1065ms`; Kubo `1202/2817ms`.
+- Asset TTFB/total p50/p95: Rust `188/309ms`; Kubo `110/655ms`.
+- Resource max: Rust `49972KiB` RSS and `30` FDs vs Kubo `235092KiB` RSS and
+  `228` FDs.
+
+Trace findings:
+
+- HTTP-provider block fetches rose to `302`, p50/p95/max `189/289/858ms`.
+- Bitswap block fetches dropped to `48`, p50/p95/max `77/273/612ms`.
+- Single-provider HTTP results: `177`, all via `https://ipfs-bridge.sia.dev/`,
+  p50/p95/max `172/281/654ms`.
+- Full hedge emitted `179` starts and `178` results.
+- Hedge result sources were `http_provider=177`, `bitswap=1`.
+- Same-provider HTTP self-hedges were disabled by the hedge path
+  (`self_hedges=0`), so the candidate also removed the current same-provider
+  tail protection.
+- Bitswap work produced more connection noise than the default focused
+  baseline: `18` Bitswap connection errors and `2` connection backoffs.
+
+Comparison to the immediately preceding default focused baseline:
+
+- Asset p50 regressed from `127ms` to `188ms`.
+- Asset p95 slightly improved from `329ms` to `309ms`, but Rust already beat
+  Kubo p95 by a large margin in both runs.
+- Root p50/p95 regressed from `591/1006ms` to `694/1065ms`.
+- FD max stayed similar (`29 -> 30`), but the hedge did not buy useful Bitswap
+  wins.
+
+Decision:
+
+Do not promote or continue the full single-HTTP Bitswap hedge. The serialized
+page-load shape does not rescue it: Bitswap almost never wins the hedged race,
+asset median gets worse, and the extra peer work adds connection errors. A
+future single-HTTP median fix needs to be more selective than this existing
+lab knob, likely using page/session source quality or provider diversity rather
+than "start Bitswap beside every slow single HTTP provider."
