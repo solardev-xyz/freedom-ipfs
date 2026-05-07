@@ -163,6 +163,7 @@ const MAX_PENDING_INCOMING_BITSWAP_READS: usize = 32;
 // tails without requesting every block from every provider candidate.
 const MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS: usize = 3;
 const BITSWAP_DNS_PREFETCH_CONCURRENCY: usize = 8;
+const BITSWAP_DNS_LOOKUP_TIMEOUT_MS_ENV: &str = "FREEDOM_IPFS_BITSWAP_DNS_LOOKUP_TIMEOUT_MS";
 const BITSWAP_DNS_EXPANSION_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_BITSWAP_DNS_EXPANSION_CACHE_ENTRIES: usize = 128;
 const ENABLE_BITSWAP_DNS_EXPANSION_CACHE_ENV: &str =
@@ -3834,6 +3835,21 @@ fn bitswap_dns_expansion_cache_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_DNS_EXPANSION_CACHE_ENV).is_some()
 }
 
+fn bitswap_dns_lookup_timeout() -> Option<Duration> {
+    bitswap_dns_lookup_timeout_from_env_value(
+        std::env::var_os(BITSWAP_DNS_LOOKUP_TIMEOUT_MS_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn bitswap_dns_lookup_timeout_from_env_value(value: Option<&str>) -> Option<Duration> {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+}
+
 fn bitswap_dominant_session_peer_mode() -> Option<DominantSessionPeerMode> {
     dominant_session_peer_mode_for_context(
         std::env::var_os(ENABLE_BITSWAP_DOMINANT_SESSION_PEER_ENV).is_some(),
@@ -5547,9 +5563,24 @@ async fn resolve_dnsaddr_host(
     host: String,
 ) -> (String, Vec<String>) {
     let lookup = format!("_dnsaddr.{host}");
-    let records = match resolver.txt_lookup(&lookup).await {
-        Ok(records) => dnsaddr_records(records),
-        Err(_) => Vec::new(),
+    let records = match bitswap_dns_lookup_timeout() {
+        Some(lookup_timeout) => match timeout(lookup_timeout, resolver.txt_lookup(&lookup)).await {
+            Ok(Ok(records)) => dnsaddr_records(records),
+            Ok(Err(_)) => Vec::new(),
+            Err(_) => {
+                tracing::info!(
+                    phase = "bitswap_dns_lookup_timeout",
+                    lookup_kind = "dnsaddr",
+                    host = %host,
+                    timeout_ms = lookup_timeout.as_millis()
+                );
+                Vec::new()
+            }
+        },
+        None => match resolver.txt_lookup(&lookup).await {
+            Ok(records) => dnsaddr_records(records),
+            Err(_) => Vec::new(),
+        },
     };
     (host, records)
 }
@@ -5579,7 +5610,21 @@ async fn resolve_dns_ip_host(
     resolver: Arc<CloudflareDohResolver>,
     host: String,
 ) -> (String, Vec<IpAddr>) {
-    let addrs = resolver.ip_lookup(&host).await.unwrap_or_default();
+    let addrs = match bitswap_dns_lookup_timeout() {
+        Some(lookup_timeout) => match timeout(lookup_timeout, resolver.ip_lookup(&host)).await {
+            Ok(addrs) => addrs.unwrap_or_default(),
+            Err(_) => {
+                tracing::info!(
+                    phase = "bitswap_dns_lookup_timeout",
+                    lookup_kind = "dns_ip",
+                    host = %host,
+                    timeout_ms = lookup_timeout.as_millis()
+                );
+                Vec::new()
+            }
+        },
+        None => resolver.ip_lookup(&host).await.unwrap_or_default(),
+    };
     (host, addrs)
 }
 
@@ -9180,6 +9225,17 @@ mod bitswap_tests {
         assert_eq!(
             bitswap_session_peer_limit_from_env_value(Some("999")),
             MAX_BITSWAP_SESSION_PEERS
+        );
+    }
+
+    #[test]
+    fn bitswap_dns_lookup_timeout_env_value_parses_optional_override() {
+        assert_eq!(bitswap_dns_lookup_timeout_from_env_value(None), None);
+        assert_eq!(bitswap_dns_lookup_timeout_from_env_value(Some("0")), None);
+        assert_eq!(bitswap_dns_lookup_timeout_from_env_value(Some("bad")), None);
+        assert_eq!(
+            bitswap_dns_lookup_timeout_from_env_value(Some("250")),
+            Some(Duration::from_millis(250))
         );
     }
 

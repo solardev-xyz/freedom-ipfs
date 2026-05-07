@@ -30413,3 +30413,166 @@ should avoid both extremes:
 - prefer a small top-level candidate set that includes the dominant recent peer
   plus one or two low-latency alternates, then broadens quickly if none produce
   the block.
+
+## 2026-05-07 - Lab Control: Bitswap DNS Lookup Timeout
+
+Question:
+The slowest no-env Wikipedia sample after the top-level dominant recheck paid
+`3126ms` in `bitswap_peer_expand` and `3056ms` in `bitswap_dns_prefetch`.
+Can a small opt-in cap on individual Bitswap DNS lookups avoid DNS-prefetch
+tail spikes without changing default behavior?
+
+Code:
+
+- Added disabled env flag:
+  `FREEDOM_IPFS_BITSWAP_DNS_LOOKUP_TIMEOUT_MS=<millis>`.
+- When set to a positive integer, individual Bitswap `/dnsaddr` TXT lookups and
+  DNS-to-IP lookups are wrapped in that timeout.
+- Timed-out lookups return an empty expansion for that host and emit
+  `phase=bitswap_dns_lookup_timeout` with `lookup_kind=dnsaddr|dns_ip`,
+  `host`, and `timeout_ms`.
+- Default behavior is unchanged when the env var is absent, zero, or invalid.
+
+Unit validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval bitswap_dns_lookup_timeout_env_value_parses_optional_override
+cargo fmt --all
+cargo fmt --all --check
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Result:
+
+- Focused unit test: pass.
+- `cargo fmt --all --check`: pass.
+- `cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings`: pass.
+
+250ms selected-case run:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_BITSWAP_DNS_LOOKUP_TIMEOUT_MS=250 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/dns-timeout250-selected-r5-20260507T0715Z-trace.jsonl \
+  --comparison-output /tmp/dns-timeout250-selected-r5-20260507T0715Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1273/1618ms` vs Kubo `2843/2954ms`.
+- Vitalik range: Rust `106/115ms` vs Kubo `1567/2785ms`.
+- `ipfs.tech` root range: Rust `593/1141ms` vs Kubo `817/1024ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `105/341ms`; Kubo root
+  `2/2ms`, assets `346/417ms`.
+- `ipfs.tech` hero range: Rust `140/170ms` vs Kubo `424/432ms`.
+- Wikipedia root: Rust `149/858ms` vs Kubo `499/507ms`.
+- Resource max: Rust `51364KiB` RSS and `25` FDs vs Kubo `150748KiB` RSS and
+  `292` FDs.
+- HTTP provider block fetch p50/p95/max: `184/555/977ms`.
+- Bitswap block fetch p50/p95/max: `68/354/855ms`.
+- Bitswap peer attempts: `224`.
+
+Trace interpretation:
+The 250ms run had no `bitswap_dns_lookup_timeout` markers, so it is only a
+guardrail sample. It cannot prove that the timeout cap caused the measured
+result.
+
+1ms marker smoke:
+
+```sh
+timeout 900s env FREEDOM_IPFS_BITSWAP_DNS_LOOKUP_TIMEOUT_MS=1 \
+  cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --repeat 1 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/dns-timeout1-marker-wikipedia-r1-20260507T0725Z-trace.jsonl \
+  --comparison-output /tmp/dns-timeout1-marker-wikipedia-r1-20260507T0725Z.json
+```
+
+Result:
+
+- Rust passed `1/1`.
+- Wikipedia root TTFB was `724ms`.
+- Resource sample: Rust `39792KiB` RSS and `18` FDs.
+- Trace had `4` `bitswap_dns_lookup_timeout` markers.
+
+Interpretation:
+The marker smoke proves the env flag and timeout trace path work. It is
+intentionally too aggressive to treat as a performance candidate.
+
+50ms selected-case run:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_BITSWAP_DNS_LOOKUP_TIMEOUT_MS=50 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/dns-timeout50-selected-r5-20260507T0730Z-trace.jsonl \
+  --comparison-output /tmp/dns-timeout50-selected-r5-20260507T0730Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1296/1548ms` vs Kubo `2837/3250ms`.
+- Vitalik range: Rust `104/122ms` vs Kubo `1664/2675ms`.
+- `ipfs.tech` root range: Rust `588/826ms` vs Kubo `941/1019ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `85/237ms`; Kubo root
+  `2/2ms`, assets `346/571ms`.
+- `ipfs.tech` hero range: Rust `91/120ms` vs Kubo `444/560ms`.
+- Wikipedia root still lost: Rust `347/755ms` vs Kubo `330/346ms`.
+- Resource max: Rust `50948KiB` RSS and `25` FDs vs Kubo `155136KiB` RSS and
+  `269` FDs.
+- HTTP provider block fetch p50/p95/max: `128/543/723ms`.
+- Bitswap block fetch p50/p95/max: `56/294/516ms`.
+- Bitswap peer attempts: `218`.
+- Trace had `6` `bitswap_dns_lookup_timeout` markers, all for Wikipedia
+  `/dnsaddr` hosts: `bitswap.dget.top`, `bootstrap.libp2p.io`, and
+  `ipfs.twdragon.net`.
+
+Interpretation:
+The 50ms cap participated and coincided with better selected-case p95s than the
+fresh no-env r5 baseline for `ipfs.tech` root range, `ipfs.tech` page assets,
+and Wikipedia. It still did not beat Kubo on Wikipedia median or p95, and the
+trace shows only a narrow set of DNSADDR timeouts. The remaining slow path is
+still source quality and fast escape from weak zero-HTTP Bitswap paths, not
+DNS lookup time alone.
+
+Decision:
+Keep the DNS lookup timeout as a disabled lab/diagnostic flag for now. Do not
+promote a default cap from this evidence. It is useful as a guardrail when
+probing DNS-prefetch tails, but a default would need larger r10+ same-window
+coverage and a clear answer for lost providers before it can be considered
+mobile-safe.
