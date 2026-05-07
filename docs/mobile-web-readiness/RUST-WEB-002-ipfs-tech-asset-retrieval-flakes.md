@@ -35738,3 +35738,124 @@ loses the artificial range-first/full-read sequence, do not add unconditional
 range prefetch. Any future optimization here should be explicit and narrow, for
 example HTML-only small-prefix range warming with strict byte and resource
 limits.
+
+## 2026-05-07 HTML Prefix Range Warm Lab
+
+Question:
+
+Can an explicit, disabled-by-default HTML prefix range warm close the
+DAICO range-first then full-read Kubo win without changing default range
+behavior?
+
+Implementation:
+
+- Added an opt-in gateway lab knob:
+  `FREEDOM_IPFS_GATEWAY_HTML_RANGE_WARM_MAX_BYTES=<bytes>`.
+- Optional concurrency cap:
+  `FREEDOM_IPFS_GATEWAY_HTML_RANGE_WARM_CONCURRENCY=<n>`.
+- Default is disabled with max bytes `0`.
+- When enabled, the gateway only schedules a background warm for non-HEAD
+  `text/html` ranges that start at byte `0`, are not already the full file,
+  and whose full file length is within the configured byte cap.
+- The warm reads the full UnixFS file through the underlying block retrieval
+  path and inserts into the small-body cache only when that cache accepts the
+  entry.
+
+Focused tests:
+
+```sh
+cargo test -p freedom-ipfs-gateway range_warm -- --nocapture
+cargo test -p freedom-ipfs-gateway
+cargo fmt --all --check
+cargo clippy -p freedom-ipfs-gateway --all-targets -- -D warnings
+```
+
+Validation result:
+
+- Focused range-warm tests passed.
+- Full `freedom-ipfs-gateway` test suite passed.
+- `cargo fmt --all --check` passed.
+- Gateway clippy with `-D warnings` passed.
+
+Same-window control command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-root-html-range \
+  --case daicowtf-page-assets \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/html-range-warm-control-daico-r5-20260507T161846Z-trace.jsonl \
+  --comparison-output /tmp/html-range-warm-control-daico-r5-20260507T161846Z.json
+```
+
+Control result:
+
+- Rust and Kubo passed `5/5`.
+- DAICO range-first request: Rust `893/1529ms`; Kubo `3207/3318ms`.
+- Following DAICO full-page request: Rust `408/503ms`; Kubo `1/2ms`.
+- Resource max: Rust `36612KiB` RSS and `15` FDs vs Kubo `107896KiB` RSS and
+  `82` FDs.
+- Trace shape:
+  - HTTP-provider blocks: `15`, p50/p95/max `411/953/953ms`.
+  - Gateway streamed full bodies: `5`, max stream elapsed `500ms`.
+
+Lab command:
+
+```sh
+FREEDOM_IPFS_GATEWAY_HTML_RANGE_WARM_MAX_BYTES=524288 \
+FREEDOM_IPFS_GATEWAY_HTML_RANGE_WARM_CONCURRENCY=1 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-root-html-range \
+  --case daicowtf-page-assets \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/html-range-warm512-daico-r5-20260507T161846Z-trace.jsonl \
+  --comparison-output /tmp/html-range-warm512-daico-r5-20260507T161846Z.json
+```
+
+Lab result:
+
+- Rust and Kubo passed `5/5`.
+- DAICO range-first request: Rust `873/1059ms`; Kubo `2867/3127ms`.
+- Following DAICO full-page request: Rust `433/545ms`; Kubo `2/2ms`.
+- Resource max: Rust `38068KiB` RSS and `15` FDs vs Kubo `107100KiB` RSS and
+  `72` FDs.
+- Trace shape:
+  - `gateway_html_range_warm_schedule`: `5`.
+  - `gateway_html_range_warm_done`: `5`.
+  - Warm elapsed range: `278-546ms`.
+  - Background block range batches: `5`, `706815` bytes, p50/p95/max
+    `431/543/543ms`.
+  - HTTP-provider blocks increased from control `15` to lab `20`.
+  - Full body was `403507` bytes, so it exceeded the gateway small-body cache
+    entry cap and `cache_inserted=false`.
+
+Decision:
+
+Do not promote HTML prefix range warming as default. The lab fires correctly,
+but it does not make the immediate following full-page request hot because the
+browser-style next request starts while the background warm is still running.
+The work overlaps/coalesces instead of completing before the full read, so the
+DAICO full-page p50/p95 slightly worsened from `408/503ms` to `433/545ms` and
+RSS rose by about `1.4MiB`.
+
+Keep the knob disabled as a diagnostic because it is tightly gated and useful
+for proving the Kubo difference is "range warmed more file state", not a cheap
+metadata-cache miss. Future work should not continue broad range warming unless
+it targets a real user pause/delay case or can prove a net page-session win
+without increasing mobile background bytes. The important product view remains
+that Rust's combined range-then-full sequence is still much faster than Kubo's
+slow range followed by hot full read.

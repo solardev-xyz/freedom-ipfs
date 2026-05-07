@@ -38,6 +38,9 @@ const DEFAULT_GATEWAY_HTML_PREFETCH_MAX_ASSETS: usize = 0;
 const DEFAULT_GATEWAY_HTML_PREFETCH_MAX_BYTES: u64 = GATEWAY_STREAM_CHUNK_SIZE;
 const DEFAULT_GATEWAY_HTML_PREFETCH_CONCURRENCY: usize = 2;
 const GATEWAY_HTML_PREFETCH_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_GATEWAY_HTML_RANGE_WARM_MAX_BYTES: u64 = 0;
+const DEFAULT_GATEWAY_HTML_RANGE_WARM_CONCURRENCY: usize = 1;
+const GATEWAY_HTML_RANGE_WARM_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 const X_FREEDOM_REQUEST_ID: &str = "x-freedom-request-id";
 const X_FREEDOM_PARENT_REQUEST_ID: &str = "x-freedom-parent-request-id";
 const X_FREEDOM_TOP_LEVEL_PATH: &str = "x-freedom-top-level-path";
@@ -178,6 +181,7 @@ pub struct GatewayConfig {
     unixfs_metadata_cache_capacity: usize,
     small_body_cache_max_bytes: usize,
     html_prefetch: GatewayHtmlPrefetchConfig,
+    html_range_warm: GatewayHtmlRangeWarmConfig,
 }
 
 impl GatewayConfig {
@@ -187,6 +191,7 @@ impl GatewayConfig {
             unixfs_metadata_cache_capacity: DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY,
             small_body_cache_max_bytes: DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
             html_prefetch: GatewayHtmlPrefetchConfig::default(),
+            html_range_warm: GatewayHtmlRangeWarmConfig::default(),
         }
     }
 
@@ -218,6 +223,15 @@ impl GatewayConfig {
 
     pub fn with_html_prefetch(mut self, html_prefetch: GatewayHtmlPrefetchConfig) -> Self {
         self.html_prefetch = html_prefetch;
+        self
+    }
+
+    pub fn html_range_warm(&self) -> GatewayHtmlRangeWarmConfig {
+        self.html_range_warm
+    }
+
+    pub fn with_html_range_warm(mut self, html_range_warm: GatewayHtmlRangeWarmConfig) -> Self {
+        self.html_range_warm = html_range_warm;
         self
     }
 }
@@ -275,6 +289,46 @@ impl Default for GatewayHtmlPrefetchConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct GatewayHtmlRangeWarmConfig {
+    max_bytes: u64,
+    concurrency: usize,
+}
+
+impl GatewayHtmlRangeWarmConfig {
+    pub fn new(max_bytes: u64, concurrency: usize) -> Self {
+        Self {
+            max_bytes,
+            concurrency: concurrency.max(1),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self::new(
+            DEFAULT_GATEWAY_HTML_RANGE_WARM_MAX_BYTES,
+            DEFAULT_GATEWAY_HTML_RANGE_WARM_CONCURRENCY,
+        )
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self.max_bytes > 0
+    }
+
+    pub fn max_bytes(self) -> u64 {
+        self.max_bytes
+    }
+
+    pub fn concurrency(self) -> usize {
+        self.concurrency
+    }
+}
+
+impl Default for GatewayHtmlRangeWarmConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
 #[derive(Clone)]
 struct HtmlPrefetchRuntime {
     config: GatewayHtmlPrefetchConfig,
@@ -295,6 +349,25 @@ impl HtmlPrefetchRuntime {
 }
 
 #[derive(Clone)]
+struct HtmlRangeWarmRuntime {
+    config: GatewayHtmlRangeWarmConfig,
+    limiter: Arc<Semaphore>,
+}
+
+impl HtmlRangeWarmRuntime {
+    fn new(config: GatewayHtmlRangeWarmConfig) -> Self {
+        Self {
+            config,
+            limiter: Arc::new(Semaphore::new(config.concurrency())),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.config.is_enabled()
+    }
+}
+
+#[derive(Clone)]
 pub struct GatewayState {
     provider: Arc<dyn BlockProvider>,
     name_resolver: Arc<dyn NameResolver>,
@@ -302,6 +375,7 @@ pub struct GatewayState {
     request_limiter: Arc<Semaphore>,
     small_body_cache: Arc<SmallBodyCache>,
     html_prefetch: HtmlPrefetchRuntime,
+    html_range_warm: HtmlRangeWarmRuntime,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -361,6 +435,7 @@ impl GatewayState {
             request_limiter: Arc::new(Semaphore::new(config.max_concurrent_requests())),
             small_body_cache: Arc::new(SmallBodyCache::new(config.small_body_cache_max_bytes())),
             html_prefetch: HtmlPrefetchRuntime::new(config.html_prefetch()),
+            html_range_warm: HtmlRangeWarmRuntime::new(config.html_range_warm()),
         }
     }
 }
@@ -596,17 +671,26 @@ async fn ipfs_get(
             parent_request_id,
             Some(context_top_level_path),
         );
+        let response_features = GatewayResponseFeatures {
+            small_body_cache: state.small_body_cache.clone(),
+            html_prefetch: html_prefetch_runtime(
+                &state,
+                method == Method::HEAD,
+                headers.get(RANGE),
+                parent_request_id,
+            ),
+            html_range_warm: html_range_warm_runtime(
+                &state,
+                method == Method::HEAD,
+                headers.get(RANGE),
+                parent_request_id,
+            ),
+        };
         let response = with_retrieval_request_context(retrieval_context, async {
             match serve_ipfs_path(
                 state.provider.clone(),
                 state.unixfs.clone(),
-                state.small_body_cache.clone(),
-                html_prefetch_runtime(
-                    &state,
-                    method == Method::HEAD,
-                    headers.get(RANGE),
-                    parent_request_id,
-                ),
+                response_features,
                 &path,
                 GatewayRequestHeaders {
                     range: headers.get(RANGE),
@@ -686,17 +770,26 @@ async fn ipns_get(
             parent_request_id,
             Some(context_top_level_path),
         );
+        let response_features = GatewayResponseFeatures {
+            small_body_cache: state.small_body_cache.clone(),
+            html_prefetch: html_prefetch_runtime(
+                &state,
+                method == Method::HEAD,
+                headers.get(RANGE),
+                parent_request_id,
+            ),
+            html_range_warm: html_range_warm_runtime(
+                &state,
+                method == Method::HEAD,
+                headers.get(RANGE),
+                parent_request_id,
+            ),
+        };
         let response = with_retrieval_request_context(retrieval_context, async {
             match serve_ipns_path(
                 state.provider.clone(),
                 state.unixfs.clone(),
-                state.small_body_cache.clone(),
-                html_prefetch_runtime(
-                    &state,
-                    method == Method::HEAD,
-                    headers.get(RANGE),
-                    parent_request_id,
-                ),
+                response_features,
                 state.name_resolver.as_ref(),
                 &path,
                 GatewayRequestHeaders {
@@ -739,6 +832,23 @@ fn html_prefetch_runtime(
         None
     } else {
         Some(state.html_prefetch.clone())
+    }
+}
+
+fn html_range_warm_runtime(
+    state: &GatewayState,
+    is_head: bool,
+    range: Option<&HeaderValue>,
+    parent_request_id: Option<u64>,
+) -> Option<HtmlRangeWarmRuntime> {
+    if is_head
+        || range.is_none()
+        || parent_request_id.is_some()
+        || !state.html_range_warm.is_enabled()
+    {
+        None
+    } else {
+        Some(state.html_range_warm.clone())
     }
 }
 
@@ -809,6 +919,13 @@ fn header_u64_for_trace(headers: &HeaderMap, name: &'static str) -> Option<u64> 
         .and_then(|value| value.parse::<u64>().ok())
 }
 
+#[derive(Clone)]
+struct GatewayResponseFeatures {
+    small_body_cache: Arc<SmallBodyCache>,
+    html_prefetch: Option<HtmlPrefetchRuntime>,
+    html_range_warm: Option<HtmlRangeWarmRuntime>,
+}
+
 #[derive(Clone, Copy)]
 struct GatewayRequestHeaders<'a> {
     range: Option<&'a HeaderValue>,
@@ -819,16 +936,14 @@ struct GatewayRequestHeaders<'a> {
 async fn serve_ipfs_path(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
-    small_body_cache: Arc<SmallBodyCache>,
-    html_prefetch: Option<HtmlPrefetchRuntime>,
+    features: GatewayResponseFeatures,
     path: &str,
     request_headers: GatewayRequestHeaders<'_>,
 ) -> Result<Response, GatewayError> {
     serve_ipfs_path_with_listing_path(
         provider,
         unixfs,
-        small_body_cache,
-        html_prefetch,
+        features,
         path,
         request_headers,
         GatewayIpfsPathOptions::default(),
@@ -854,8 +969,7 @@ impl Default for GatewayIpfsPathOptions<'_> {
 async fn serve_ipfs_path_with_listing_path(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
-    small_body_cache: Arc<SmallBodyCache>,
-    html_prefetch: Option<HtmlPrefetchRuntime>,
+    features: GatewayResponseFeatures,
     path: &str,
     request_headers: GatewayRequestHeaders<'_>,
     options: GatewayIpfsPathOptions<'_>,
@@ -937,13 +1051,21 @@ async fn serve_ipfs_path_with_listing_path(
                 is_head: request_headers.is_head,
             };
             if let Some((start, end)) = parsed_range {
-                ranged_response(provider, unixfs.clone(), target, start, end, headers)?
+                ranged_response(
+                    provider,
+                    unixfs.clone(),
+                    features.clone(),
+                    target,
+                    start,
+                    end,
+                    headers,
+                )?
             } else {
                 streaming_response(
                     provider,
                     unixfs.clone(),
-                    small_body_cache.clone(),
-                    html_prefetch,
+                    features.small_body_cache.clone(),
+                    features.html_prefetch,
                     target,
                     headers,
                 )?
@@ -1109,6 +1231,16 @@ struct HtmlPrefetchSeed<'a> {
     body: &'a Bytes,
 }
 
+struct HtmlRangeWarmSeed<'a> {
+    root_cid: Cid,
+    file_cid: Cid,
+    path: &'a str,
+    mime: &'a str,
+    total_len: u64,
+    range_start: u64,
+    range_end: u64,
+}
+
 fn maybe_spawn_html_prefetch(
     runtime: Option<&HtmlPrefetchRuntime>,
     provider: Arc<dyn BlockProvider>,
@@ -1206,6 +1338,212 @@ fn maybe_spawn_html_prefetch(
             .instrument(span),
         );
     }
+}
+
+fn maybe_spawn_html_range_warm(
+    runtime: Option<&HtmlRangeWarmRuntime>,
+    provider: Arc<dyn BlockProvider>,
+    unixfs: UnixfsResolver,
+    small_body_cache: Arc<SmallBodyCache>,
+    seed: HtmlRangeWarmSeed<'_>,
+) {
+    let Some(runtime) = runtime.filter(|runtime| runtime.is_enabled()) else {
+        return;
+    };
+    let skip_reason = if seed.range_start != 0 {
+        Some("non_prefix_range")
+    } else if !seed.mime.starts_with("text/html") {
+        Some("mime")
+    } else if seed.total_len == 0 || seed.total_len > runtime.config.max_bytes() {
+        Some("size")
+    } else if seed.range_end >= seed.total_len.saturating_sub(1) {
+        Some("already_complete")
+    } else {
+        None
+    };
+    if let Some(reason) = skip_reason {
+        tracing::info!(
+            phase = "gateway_html_range_warm_skip",
+            cid = %seed.root_cid,
+            file_cid = %seed.file_cid,
+            unixfs_path = %seed.path,
+            file_len = seed.total_len,
+            range_start = seed.range_start,
+            range_end = seed.range_end,
+            max_bytes = runtime.config.max_bytes(),
+            reason
+        );
+        return;
+    }
+
+    tracing::info!(
+        phase = "gateway_html_range_warm_schedule",
+        cid = %seed.root_cid,
+        file_cid = %seed.file_cid,
+        unixfs_path = %seed.path,
+        file_len = seed.total_len,
+        range_start = seed.range_start,
+        range_end = seed.range_end,
+        max_bytes = runtime.config.max_bytes(),
+        concurrency = runtime.config.concurrency(),
+    );
+
+    let limiter = runtime.limiter.clone();
+    let config = runtime.config;
+    let root_cid = seed.root_cid;
+    let file_cid = seed.file_cid;
+    let path = seed.path.to_string();
+    let span = tracing::info_span!(
+        "gateway_html_range_warm",
+        cid = %root_cid,
+        file_cid = %file_cid,
+        unixfs_path = %path
+    );
+    tokio::spawn(
+        async move {
+            let queued = Instant::now();
+            let permit = match tokio::time::timeout(
+                GATEWAY_HTML_RANGE_WARM_QUEUE_TIMEOUT,
+                limiter.acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(err)) => {
+                    tracing::info!(
+                        phase = "gateway_html_range_warm_failed",
+                        cid = %root_cid,
+                        file_cid = %file_cid,
+                        unixfs_path = %path,
+                        error = %err,
+                        elapsed_ms = queued.elapsed().as_millis()
+                    );
+                    return;
+                }
+                Err(_) => {
+                    tracing::info!(
+                        phase = "gateway_html_range_warm_skip",
+                        cid = %root_cid,
+                        file_cid = %file_cid,
+                        unixfs_path = %path,
+                        reason = "queue_timeout",
+                        timeout_ms = GATEWAY_HTML_RANGE_WARM_QUEUE_TIMEOUT.as_millis(),
+                        elapsed_ms = queued.elapsed().as_millis()
+                    );
+                    return;
+                }
+            };
+            let _permit = permit;
+            let task_path = path.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                html_range_warm_one(
+                    provider.as_ref(),
+                    &unixfs,
+                    &small_body_cache,
+                    root_cid,
+                    file_cid,
+                    &task_path,
+                    config,
+                )
+            })
+            .await;
+            if let Err(err) = joined {
+                tracing::info!(
+                    phase = "gateway_html_range_warm_failed",
+                    cid = %root_cid,
+                    file_cid = %file_cid,
+                    unixfs_path = %path,
+                    error = %err
+                );
+            }
+        }
+        .instrument(span),
+    );
+}
+
+fn html_range_warm_one(
+    provider: &dyn BlockProvider,
+    unixfs: &UnixfsResolver,
+    small_body_cache: &SmallBodyCache,
+    root_cid: Cid,
+    file_cid: Cid,
+    path: &str,
+    config: GatewayHtmlRangeWarmConfig,
+) {
+    let started = Instant::now();
+    let len = match unixfs.file_size_cid(provider, &file_cid) {
+        Ok(len) => len,
+        Err(err) => {
+            tracing::info!(
+                phase = "gateway_html_range_warm_failed",
+                cid = %root_cid,
+                file_cid = %file_cid,
+                unixfs_path = %path,
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis()
+            );
+            return;
+        }
+    };
+    if len == 0 || len > config.max_bytes() {
+        tracing::info!(
+            phase = "gateway_html_range_warm_skip",
+            cid = %root_cid,
+            file_cid = %file_cid,
+            unixfs_path = %path,
+            file_len = len,
+            max_bytes = config.max_bytes(),
+            reason = "size",
+            elapsed_ms = started.elapsed().as_millis()
+        );
+        return;
+    }
+
+    let cache_key = SmallBodyCacheKey { file_cid, len };
+    if small_body_cache.get(&cache_key).is_some() {
+        tracing::info!(
+            phase = "gateway_html_range_warm_skip",
+            cid = %root_cid,
+            file_cid = %file_cid,
+            unixfs_path = %path,
+            file_len = len,
+            reason = "cache_hit",
+            elapsed_ms = started.elapsed().as_millis()
+        );
+        return;
+    }
+
+    let end = len - 1;
+    let bytes = match unixfs.read_file_cid_range(provider, &file_cid, 0, end) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(err) => {
+            tracing::info!(
+                phase = "gateway_html_range_warm_failed",
+                cid = %root_cid,
+                file_cid = %file_cid,
+                unixfs_path = %path,
+                file_len = len,
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis()
+            );
+            return;
+        }
+    };
+    let body_len = bytes.len();
+    let insert = small_body_cache.insert(cache_key, bytes);
+    tracing::info!(
+        phase = "gateway_html_range_warm_done",
+        cid = %root_cid,
+        file_cid = %file_cid,
+        unixfs_path = %path,
+        file_len = len,
+        body_len,
+        cache_inserted = insert.inserted,
+        evicted = insert.evicted,
+        cache_len = insert.cache_len,
+        cache_bytes = insert.cache_bytes,
+        elapsed_ms = started.elapsed().as_millis()
+    );
 }
 
 fn html_prefetch_one(
@@ -1763,8 +2101,7 @@ fn split_ipfs_path(path: &str) -> Result<(Cid, &str), GatewayError> {
 async fn serve_ipns_path(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
-    small_body_cache: Arc<SmallBodyCache>,
-    html_prefetch: Option<HtmlPrefetchRuntime>,
+    features: GatewayResponseFeatures,
     name_resolver: &dyn NameResolver,
     path: &str,
     request_headers: GatewayRequestHeaders<'_>,
@@ -1777,8 +2114,7 @@ async fn serve_ipns_path(
             return serve_ipfs_path_with_listing_path(
                 provider.clone(),
                 unixfs.clone(),
-                small_body_cache.clone(),
-                html_prefetch.clone(),
+                features.clone(),
                 ipfs,
                 request_headers,
                 GatewayIpfsPathOptions {
@@ -2279,6 +2615,7 @@ impl Drop for ScopedBlockProvider {
 fn ranged_response(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
+    features: GatewayResponseFeatures,
     target: FileResponseTarget,
     start: u64,
     end: u64,
@@ -2306,6 +2643,21 @@ fn ranged_response(
             range_end = end,
             body_len = body.len(),
             elapsed_ms = started.elapsed().as_millis()
+        );
+        maybe_spawn_html_range_warm(
+            features.html_range_warm.as_ref(),
+            provider,
+            unixfs,
+            features.small_body_cache,
+            HtmlRangeWarmSeed {
+                root_cid,
+                file_cid,
+                path: &path,
+                mime: headers.mime,
+                total_len,
+                range_start: start,
+                range_end: end,
+            },
         );
         let mut response = Body::from(body).into_response();
         set_gateway_body_mode(&mut response, GatewayBodyMode::Direct);
@@ -2960,6 +3312,97 @@ mod tests {
             .unwrap();
         assert_eq!(asset_body.as_ref(), app);
         assert_eq!(provider.call_count(&app_cid), prefetched_app_calls);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn html_prefix_range_warm_is_disabled_by_default() {
+        let first = b"<!doctype html><html><body>prefix</body>";
+        let second = vec![b'x'; GATEWAY_STREAM_CHUNK_SIZE as usize + 1024];
+        let first_cid = cid_from_data(CODEC_RAW, first);
+        let second_cid = cid_from_data(CODEC_RAW, &second);
+        let file_block = test_pb_file_with_links(
+            vec![test_link("", &first_cid), test_link("", &second_cid)],
+            (first.len() + second.len()) as u64,
+            vec![first.len() as u64, second.len() as u64],
+        );
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (file_cid, file_block),
+            (first_cid, first.to_vec()),
+            (second_cid, second),
+        ])));
+        let state = GatewayState::with_provider(provider.clone());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=0-14"));
+        let response = ipfs_get(
+            State(state),
+            Path(file_cid.to_string()),
+            Method::GET,
+            headers,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"<!doctype html>");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            provider.call_count(&second_cid),
+            0,
+            "default range handling should not warm unread file blocks"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enabled_html_prefix_range_warm_reads_remaining_file_blocks() {
+        let first = b"<!doctype html><html><body>prefix</body>";
+        let second = vec![b'x'; GATEWAY_STREAM_CHUNK_SIZE as usize + 1024];
+        let first_cid = cid_from_data(CODEC_RAW, first);
+        let second_cid = cid_from_data(CODEC_RAW, &second);
+        let total_len = (first.len() + second.len()) as u64;
+        let file_block = test_pb_file_with_links(
+            vec![test_link("", &first_cid), test_link("", &second_cid)],
+            total_len,
+            vec![first.len() as u64, second.len() as u64],
+        );
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (file_cid, file_block),
+            (first_cid, first.to_vec()),
+            (second_cid, second),
+        ])));
+        let config = GatewayConfig::new(8)
+            .with_html_range_warm(GatewayHtmlRangeWarmConfig::new(total_len, 1));
+        let state = GatewayState::with_provider_config(provider.clone(), config);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=0-14"));
+        let response = ipfs_get(
+            State(state),
+            Path(file_cid.to_string()),
+            Method::GET,
+            headers,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"<!doctype html>");
+        for _ in 0..100 {
+            if provider.call_count(&second_cid) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            provider.call_count(&second_cid) > 0,
+            "enabled range warm should fetch blocks outside the requested prefix"
+        );
     }
 
     #[test]

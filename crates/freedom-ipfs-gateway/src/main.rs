@@ -4,7 +4,7 @@ use clap::{Parser, ValueEnum};
 use freedom_ipfs_core::parse_cid;
 use freedom_ipfs_gateway::{
     router_with_provider_and_name_resolver_config, GatewayConfig, GatewayHtmlPrefetchConfig,
-    PersistentNameResolver, DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
+    GatewayHtmlRangeWarmConfig, PersistentNameResolver, DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
     DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
 };
 use freedom_ipfs_namesys::{
@@ -30,6 +30,8 @@ const DEFAULT_TRACE_FILTER: &str =
 const HTML_PREFETCH_MAX_ASSETS_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_ASSETS";
 const HTML_PREFETCH_MAX_BYTES_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_BYTES";
 const HTML_PREFETCH_CONCURRENCY_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_CONCURRENCY";
+const HTML_RANGE_WARM_MAX_BYTES_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_RANGE_WARM_MAX_BYTES";
+const HTML_RANGE_WARM_CONCURRENCY_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_RANGE_WARM_CONCURRENCY";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Local Freedom IPFS gateway")]
@@ -108,7 +110,8 @@ async fn main() -> Result<()> {
 
     let gateway_config = GatewayConfig::new(args.max_concurrent_requests)
         .with_small_body_cache_max_bytes(args.small_body_cache_max_bytes)
-        .with_html_prefetch(gateway_html_prefetch_config());
+        .with_html_prefetch(gateway_html_prefetch_config())
+        .with_html_range_warm(gateway_html_range_warm_config());
     let router = if start_online_gateway {
         let delegated_routers = args.delegated_router.clone();
         let delegated_router_endpoints = delegated_router_endpoints(&delegated_routers);
@@ -208,6 +211,12 @@ fn gateway_html_prefetch_config() -> GatewayHtmlPrefetchConfig {
     let max_bytes = env_u64(HTML_PREFETCH_MAX_BYTES_ENV, 64 * 1024);
     let concurrency = env_usize(HTML_PREFETCH_CONCURRENCY_ENV, 2);
     GatewayHtmlPrefetchConfig::new(max_assets, max_bytes, concurrency)
+}
+
+fn gateway_html_range_warm_config() -> GatewayHtmlRangeWarmConfig {
+    let max_bytes = env_u64(HTML_RANGE_WARM_MAX_BYTES_ENV, 0);
+    let concurrency = env_usize(HTML_RANGE_WARM_CONCURRENCY_ENV, 1);
+    GatewayHtmlRangeWarmConfig::new(max_bytes, concurrency)
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
