@@ -37349,3 +37349,60 @@ using far less RSS and fewer FDs. The remaining useful work is to keep reducing
 Rust's own tails, especially zero-HTTP `ipfs.tech` child Bitswap requests where
 the session shortcut waits `100ms`, then provider-expanded Bitswap may still
 land on a slow new peer.
+
+### Compact Guardrail Recheck
+
+Command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-page-assets-cid-direct \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 900 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-compact-guardrail-r5-20260507T183828Z-trace.jsonl \
+  --comparison-output /tmp/current-compact-guardrail-r5-20260507T183828Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5` for every case.
+- DAICO page root: Rust `1312/1451ms`; Kubo `2840/3186ms`.
+- Vitalik range: Rust `103/135ms`; Kubo `1684/2148ms`.
+- `ipfs.tech` page root: Rust `605/690ms`; Kubo `1153/1412ms`.
+- `ipfs.tech` page assets: Rust `104/353ms`; Kubo `355/453ms`.
+- `ipfs.tech` CID-direct hot-cache root/assets were tiny Kubo wins:
+  root Rust `3/3ms` vs Kubo `1/2ms`, assets Rust `2/3ms` vs Kubo `1/2ms`.
+- Wikipedia root: Rust `331/490ms`; Kubo `667/685ms`.
+- Resource max: Rust `51100KiB` RSS and `25` FDs vs Kubo `150360KiB`
+  RSS and `211` FDs.
+
+Trace summary:
+
+- HTTP-provider blocks: `127`, p50/p90/p95/max `195/404/513/791ms`.
+- Bitswap blocks: `83`, p50/p90/p95/max `65/183/222/406ms`.
+- Delegated provider lookups: `197`, p50/p90/p95/max `20/52/58/433ms`.
+- Zero-HTTP classifications were modest in this window:
+  `zero_http_provider_bitswap=6`, `zero_http_provider_cold_bitswap=6`, and
+  `top_level_zero_http_provider_bitswap=1`.
+- Zero-HTTP cold request latency p50/p95/max was `227/603/603ms`.
+- Slowest visible requests were DAICO root streams around `835-1043ms`, driven
+  by HTTP-provider block fetches; Kubo was still much slower on the same case.
+
+Decision:
+
+This compact guardrail confirms the current branch has no meaningful
+same-window Kubo gap in the selected corpus. Do not chase CID-direct `1-2ms`
+hot-cache noise. Near-term work should either run a longer corpus to catch rare
+Kubo-win windows or focus on reducing Rust's own remaining tail classes:
+slow single-provider HTTP leaves and occasional zero-HTTP Bitswap roots/assets,
+while preserving the `~0.34x` RSS and `~0.12x` FD profile seen here.
