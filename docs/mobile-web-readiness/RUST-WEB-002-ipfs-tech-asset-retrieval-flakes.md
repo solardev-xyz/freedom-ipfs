@@ -34791,3 +34791,131 @@ root/asset fetches with no useful session peers and candidate-index-0 sources,
 while preserving the current `ipfs.tech` p50/p95 wins and resource advantage.
 Do not reopen broad HTTP-provider reuse, static direct-width, static grace, or
 single-HTTP Bitswap hedge experiments based on this sample.
+
+## 2026-05-07 Wikipedia Isolation And Shared-Window Follow-up
+
+Purpose:
+
+Check whether the narrow Wikipedia root gap from the fresh focused baseline is
+an intrinsic current-head weakness or a shared-page-session/order effect. The
+focused run above loaded `ipfs.tech` and Wikipedia in the same fresh-gateway
+window, while the slow trace shape did not match the older static direct-width
+or HTTP-provider reuse hypotheses.
+
+Isolated Wikipedia command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-wikipedia-only-r10-20260507Tbaseline2-trace.jsonl \
+  --comparison-output /tmp/current-head-wikipedia-only-r10-20260507Tbaseline2.json
+```
+
+Isolated result:
+
+- Rust and Kubo passed `10/10`.
+- Wikipedia root TTFB/total p50/p95: Rust `1107/1209ms`; Kubo
+  `1651/2462ms`.
+- Resource max: Rust `41216KiB` RSS and `19` FDs vs Kubo `138492KiB` RSS and
+  `67` FDs.
+
+Trace shape:
+
+- Bitswap blocks: `10`, p50/p95/max `789/915/915ms`.
+- HTTP-provider blocks: `10`, p50/p95/max `276/378/378ms`.
+- Request classifications:
+  - `cold_bitswap_peer_expand=10`
+  - `top_level_zero_http_provider_bitswap=1`
+  - `top_level_zero_http_provider_cold_bitswap=1`
+  - `zero_http_provider_bitswap=1`
+  - `zero_http_provider_cold_bitswap=1`
+- Every slow request had `max_session_peers=0`.
+- HTTP provider fetches included `19` `http_5xx` failures from
+  `https://f010479.twinquasar.io/`.
+- Bitswap source request mode was `want_have=10`; source candidate indexes were
+  `4=9`, `3=1`.
+
+Interpretation:
+
+Isolated Wikipedia is not currently a Kubo gap. Rust wins this case
+same-window while using much less RSS/FD budget. The absolute Rust p50 is still
+around one second, but this sample does not justify re-opening global static
+Bitswap width or HTTP-provider reuse work.
+
+Shared-window command-order check:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-focused-reversed-r10-20260507Tbaseline2-trace.jsonl \
+  --comparison-output /tmp/current-head-focused-reversed-r10-20260507Tbaseline2.json
+```
+
+Important caveat:
+
+Although the CLI order above listed Wikipedia first, the trace request IDs show
+`ipfs.tech` still ran first (`/ipns/ipfs.tech/` request id `1`; Wikipedia
+request id `34`). Treat this as another shared focused run, not as a proven
+reverse-order experiment. The harness appears to preserve corpus order here.
+
+Shared-window result:
+
+- Rust and Kubo passed `10/10`.
+- `ipfs.tech` page assets:
+  - root TTFB/total p50/p95: Rust `697/1166ms`; Kubo `1420/2783ms`.
+  - asset TTFB/total p50/p95: Rust `185/320ms`; Kubo `98/439ms`.
+- `wikipedia-on-ipfs-root`:
+  - root TTFB/total p50/p95: Rust `599/1231ms`; Kubo `116/254ms`.
+- Resource max: Rust `49852KiB` RSS and `35` FDs vs Kubo `234136KiB` RSS and
+  `174` FDs.
+
+Trace shape:
+
+- HTTP-provider blocks: `312`, p50/p95/max `183/268/546ms`.
+- Bitswap blocks: `58`, p50/p95/max `103/812/996ms`.
+- Request classifications:
+  - `cold_bitswap_peer_expand=13`
+  - `zero_http_provider_bitswap=13`
+  - `zero_http_provider_cold_bitswap=13`
+  - `top_level_zero_http_provider_bitswap=1`
+  - `top_level_zero_http_provider_cold_bitswap=1`
+- Slow Wikipedia requests had `max_session_peers=1`, `cold_expands=0`, and were
+  dominated by the follow-on `index.html` block
+  `bafkreicr5w6i2f3m664a2fnl4vhtg3s6dhhk6n5hrf3gqzcf7v5bu6b7te` after
+  `https://f010479.twinquasar.io/` returned HTTP `5xx`.
+- Bitswap session state was involved: fetches `18`, with trusted peers `8`,
+  trusted successes `3`, shortcut starts `140`, shortcut hits `49`.
+
+Decision:
+
+Do not promote or retry the previously rejected broad top-level scoping and
+global/top-level min-success threshold experiments as-is. The shared-window
+Wikipedia loss appears to be page-session shaped: session peers learned during
+`ipfs.tech` can carry into the following Wikipedia load and sometimes help, but
+slow samples show a single session peer on the path and a Bitswap follow-on
+block tail after the HTTP provider fails.
+
+Next concrete step should be behavior-neutral diagnostics for cross-top-level
+Bitswap session-peer reuse. Add trace fields that distinguish same-top-level,
+cross-top-level, and unknown-top-level recent peers on shortcut starts and
+successful sources. Then rerun a small focused smoke before deciding whether a
+narrow cross-top-level filter is justified. A blunt cross-top-level ban is not
+supported by the evidence because the reused peer can also produce fast
+Wikipedia root and follow-on block wins.
