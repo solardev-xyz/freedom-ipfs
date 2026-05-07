@@ -36027,3 +36027,55 @@ more selective than a static peer count: apply only when provider lookup returns
 zero HTTP providers repeatedly for the same top-level root, or when recent
 session peer quality is already known, rather than forcing direct wants for
 every zero-HTTP shape.
+
+Subresource-only follow-up:
+
+The retrieval code already has a narrower lab switch:
+`FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK=1`. This applies
+the built-in `2` peer direct-WANT budget only to gateway subresources, avoiding
+top-level roots.
+
+Command:
+
+```sh
+FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK=1 \
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-subresource-direct2-ipfs-tech-r10-20260507T162341Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-subresource-direct2-ipfs-tech-r10-20260507T162341Z.json
+```
+
+Result compared with the same focused no-env control above:
+
+- Rust and Kubo passed `10/10`.
+- `ipfs.tech` root p50/p95: control `599/869ms`; subresource-direct2
+  `555/874ms`.
+- `ipfs.tech` asset p50/p95: control `53/219ms`; subresource-direct2
+  `144/325ms`.
+- Kubo asset p50/p95 in this window: `110/459ms`, so subresource-direct2 lost
+  asset median to Kubo despite retaining p95 advantage.
+- Rust resource max: control `48476KiB` RSS and `24` FDs; subresource-direct2
+  `48848KiB` RSS and `24` FDs.
+- Bitswap blocks: control `287`, p50/p95/max `47/263/777ms`;
+  subresource-direct2 `75`, p50/p95/max `68/302/1077ms`.
+- HTTP-provider blocks: control `63`; subresource-direct2 `275`.
+- Bitswap connections: control `37`; subresource-direct2 `46`.
+- Slowest request was `_nuxt/hfYlCurB.js` at `1079ms`, classified as
+  zero-HTTP cold Bitswap.
+
+Decision:
+
+Reject subresource-only direct2 as a default candidate. It avoided the broad
+top-level direct-WANT shape, but it made focused asset median much worse,
+increased Bitswap connections, and produced a worse Bitswap p95/max. The
+earlier focused global direct2 win was not simply "direct wants for
+subresources"; it depended on a broader source-selection shift that did not
+survive guardrails.
