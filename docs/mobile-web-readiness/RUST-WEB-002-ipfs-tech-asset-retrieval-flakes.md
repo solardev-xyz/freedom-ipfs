@@ -30994,3 +30994,99 @@ zero-HTTP race finding: static impatience can reduce peer attempts, but the
 remaining problem is source quality and provider expansion choice, not simply
 the `100ms` wait. Future work should use the knob only for controlled
 comparisons, while focusing on adaptive peer/source selection.
+
+## 2026-05-07 - Reject: Early Bitswap Provider Peer Cap
+
+Hypothesis:
+Bitswap provider candidate construction can expand all delegated provider
+records and DNS-derived addresses before truncating to
+`MAX_BITSWAP_PEERS_PER_BLOCK`. For high-provider zero-HTTP paths such as
+Wikipedia, this may spend latency on provider records that cannot be dialed in
+the current command anyway. An env-gated early stop after enough dialable peers
+may reduce provider/DNS expansion tails without increasing fanout.
+
+Code:
+
+- Added disabled env flag:
+  `FREEDOM_IPFS_ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP=1`.
+- When enabled, Bitswap provider expansion skips the up-front DNS prefetch and
+  stops scanning provider records once `MAX_BITSWAP_PEERS_PER_BLOCK` dialable
+  peers have been found.
+- Default behavior is unchanged when the flag is absent.
+- `bitswap_peer_expand` now includes diagnostic fields:
+  `processed_provider_count`, `skipped_provider_count`,
+  `early_provider_peer_cap`, and `early_provider_peer_cap_hit`.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval early_provider_peer_cap_stops_after_enough_bitswap_peers --lib
+cargo test -p freedom-ipfs-retrieval reports_bitswap_provider_address_quality --lib
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Result:
+
+- New early-cap candidate-building test passed.
+- Existing provider-address-quality test passed with the new diagnostic counts.
+- Focused retrieval clippy passed.
+
+Live command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/early-provider-peer-cap-selected-r5-20260507T072348Z-trace.jsonl \
+  --comparison-output /tmp/early-provider-peer-cap-selected-r5-20260507T072348Z.json
+```
+
+Live result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1240/1312ms` vs Kubo `2942/3634ms`.
+- Vitalik range: Rust `107/125ms` vs Kubo `1780/2710ms`.
+- `ipfs.tech` root range: Rust `1203/1527ms` vs Kubo `806/1541ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `132/467ms`; Kubo root
+  `2/2ms`, assets `372/514ms`.
+- `ipfs.tech` hero range: Rust `117/125ms` vs Kubo `442/489ms`.
+- Wikipedia root regressed badly: Rust `770/1443ms` vs Kubo `533/550ms`.
+- Resource max: Rust `51324KiB` RSS and `30` FDs vs Kubo `167600KiB` RSS and
+  `261` FDs.
+- HTTP provider block fetch p50/p95/max: `182/562/970ms`.
+- Bitswap block fetch p50/p95/max: `103/493/1023ms`.
+- Bitswap peer attempts dropped to `216` from `301` in the no-env baseline.
+- `early_provider_peer_cap_hit=true` appeared `6` times. The Wikipedia
+  64-provider paths stopped after about `19-24` processed providers and skipped
+  `40-45` provider records.
+
+Trace interpretation:
+The flag did what it was designed to do: it reduced provider processing and
+peer attempts. That was not enough, and it likely removed useful later provider
+addresses for the target path. The slowest Wikipedia samples still had two
+Bitswap fetches and reached `1438-1442ms`, while the no-env baseline was
+`564/782ms` for Wikipedia in the prior selected window. The `ipfs.tech` asset
+median improved, but p95 regressed versus the no-env baseline (`467ms` vs
+`416ms`), and `ipfs.tech` root median lost to Kubo in this window.
+
+Decision:
+Do not promote early provider peer capping. Keep the flag and trace fields as a
+disabled diagnostic for provider-expansion experiments, but source quality
+cannot be recovered by simply stopping at the first 16 dialable peers. A better
+future version would need a quality-aware early set, for example streaming in
+provider candidates while preserving late high-quality/HTTP-capable records, or
+learning which provider peers actually deliver for a page/session.

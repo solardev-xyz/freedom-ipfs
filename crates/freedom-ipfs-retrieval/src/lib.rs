@@ -129,6 +129,8 @@ const ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_ENV: &str =
     "FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK";
 const BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS";
+const ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP";
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
 const BITSWAP_SESSION_LATE_PEER_WAIT: Duration = Duration::from_secs(2);
 const BITSWAP_SESSION_LATE_PEER_POLL: Duration = Duration::from_millis(50);
@@ -2506,6 +2508,10 @@ impl HttpRetriever {
             ip4_addr_count = addr_stats.ip4,
             ip6_addr_count = addr_stats.ip6,
             provider_addr_count = quality.provider_addr_count,
+            processed_provider_count = quality.processed_provider_count,
+            skipped_provider_count = quality.skipped_provider_count,
+            early_provider_peer_cap = quality.early_peer_cap,
+            early_provider_peer_cap_hit = quality.early_peer_cap_hit,
             expanded_provider_addr_count = quality.expanded_addr_count,
             supported_provider_addr_count = quality.supported_addr_count,
             rejected_provider_addr_count = quality.rejected_addr_count(),
@@ -4012,6 +4018,10 @@ fn bitswap_top_level_scoped_session_peers_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_TOP_LEVEL_SCOPED_SESSION_PEERS_ENV).is_some()
 }
 
+fn bitswap_early_provider_peer_cap_enabled() -> bool {
+    std::env::var_os(ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP_ENV).is_some()
+}
+
 fn successful_peer_matches_top_level_scope(
     success: &SuccessfulBitswapPeer,
     scoped_session_peers: bool,
@@ -5210,6 +5220,10 @@ struct BitswapProviderCandidates {
 
 #[derive(Default)]
 struct BitswapProviderAddrQuality {
+    processed_provider_count: usize,
+    skipped_provider_count: usize,
+    early_peer_cap: bool,
+    early_peer_cap_hit: bool,
     provider_addr_count: usize,
     expanded_addr_count: usize,
     supported_addr_count: usize,
@@ -5319,11 +5333,32 @@ async fn bitswap_peers_with_quality_using_caches(
     dnsaddr_cache: &mut DnsaddrCache,
     dns_ip_cache: &mut DnsIpCache,
 ) -> BitswapProviderCandidates {
-    let mut peers = Vec::new();
-    let mut quality = BitswapProviderAddrQuality::default();
-    prefetch_bitswap_dns_expansions(providers, dnsaddr_cache, dns_ip_cache).await;
+    bitswap_peers_with_quality_using_caches_with_options(
+        providers,
+        dnsaddr_cache,
+        dns_ip_cache,
+        bitswap_early_provider_peer_cap_enabled(),
+    )
+    .await
+}
 
-    for provider in providers {
+async fn bitswap_peers_with_quality_using_caches_with_options(
+    providers: &[Provider],
+    dnsaddr_cache: &mut DnsaddrCache,
+    dns_ip_cache: &mut DnsIpCache,
+    early_peer_cap: bool,
+) -> BitswapProviderCandidates {
+    let mut peers = Vec::new();
+    let mut quality = BitswapProviderAddrQuality {
+        early_peer_cap,
+        ..BitswapProviderAddrQuality::default()
+    };
+    if !early_peer_cap {
+        prefetch_bitswap_dns_expansions(providers, dnsaddr_cache, dns_ip_cache).await;
+    }
+
+    for (index, provider) in providers.iter().enumerate() {
+        quality.processed_provider_count += 1;
         let provider_peer = provider.id.as_deref().and_then(parse_peer_id);
         if provider.id.is_some() && provider_peer.is_none() {
             quality.invalid_provider_id_count += 1;
@@ -5364,6 +5399,12 @@ async fn bitswap_peers_with_quality_using_caches(
                 addrs.truncate(MAX_BITSWAP_ADDRS_PER_PEER);
                 merge_bitswap_peer(&mut peers, id, addrs);
             }
+        }
+
+        if early_peer_cap && peers.len() >= MAX_BITSWAP_PEERS_PER_BLOCK {
+            quality.early_peer_cap_hit = index + 1 < providers.len();
+            quality.skipped_provider_count = providers.len().saturating_sub(index + 1);
+            break;
         }
     }
 
@@ -7440,6 +7481,10 @@ mod bitswap_tests {
         let quality = candidates.quality;
 
         assert_eq!(candidates.peers.len(), 1);
+        assert_eq!(quality.processed_provider_count, providers.len());
+        assert_eq!(quality.skipped_provider_count, 0);
+        assert!(!quality.early_peer_cap);
+        assert!(!quality.early_peer_cap_hit);
         assert_eq!(quality.provider_addr_count, 7);
         assert_eq!(quality.expanded_addr_count, 7);
         assert_eq!(quality.supported_addr_count, 1);
@@ -7456,6 +7501,41 @@ mod bitswap_tests {
         assert_eq!(quality.addr_with_webtransport_count, 1);
         assert_eq!(quality.addr_with_webrtc_count, 0);
         assert_eq!(quality.addr_with_certhash_count, 1);
+    }
+
+    #[tokio::test]
+    async fn early_provider_peer_cap_stops_after_enough_bitswap_peers() {
+        let providers = (0..(MAX_BITSWAP_PEERS_PER_BLOCK + 5))
+            .map(|index| {
+                let peer = libp2p::identity::Keypair::generate_ed25519()
+                    .public()
+                    .to_peer_id();
+                Provider::from_parts(
+                    Some(peer.to_string()),
+                    vec![format!("/ip4/127.0.0.{}/tcp/4001", index + 1)],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut dnsaddr_cache = DnsaddrCache::new();
+        let mut dns_ip_cache = DnsIpCache::new();
+
+        let candidates = bitswap_peers_with_quality_using_caches_with_options(
+            &providers,
+            &mut dnsaddr_cache,
+            &mut dns_ip_cache,
+            true,
+        )
+        .await;
+
+        assert_eq!(candidates.peers.len(), MAX_BITSWAP_PEERS_PER_BLOCK);
+        assert!(candidates.quality.early_peer_cap);
+        assert!(candidates.quality.early_peer_cap_hit);
+        assert_eq!(
+            candidates.quality.processed_provider_count,
+            MAX_BITSWAP_PEERS_PER_BLOCK
+        );
+        assert_eq!(candidates.quality.skipped_provider_count, 5);
     }
 
     #[tokio::test]
