@@ -38308,3 +38308,133 @@ global `direct2` and subresource-only `direct2` were already rejected earlier in
 this document. A future improvement should be more selective, likely based on
 per-page repeated zero-HTTP child CIDs, known source peer quality, or adaptive
 peer ordering rather than fixed direct-WANT fanout.
+
+### Zero-HTTP Subresource Peer Rotation Lab Control
+
+Purpose:
+
+The wide sweep showed slow `ipfs.tech` child requests where the zero-HTTP
+Bitswap source was usually candidate index `0`. Add an env-gated lab control
+to test whether rotating only the untrusted zero-HTTP subresource peer suffix
+by CID/top-level path improves page-source diversity without touching already
+trusted/session peers.
+
+Code change:
+
+- Added disabled-by-default
+  `FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_PEER_ROTATION=1`.
+- When enabled, gateway subresource requests with zero HTTP providers rotate
+  the untrusted Bitswap provider suffix before the normal direct
+  `WANT_BLOCK`/`WANT_HAVE` mode assignment.
+- `bitswap_peer_expand` now reports
+  `zero_http_subresource_peer_rotation`, with `-1` when the lab control did
+  not apply.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval zero_http_subresource_peer_rotation --lib
+```
+
+Both passed.
+
+Baseline command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/zero-http-rotation-baseline-r10-20260507Tnext-trace.jsonl \
+  --comparison-output /tmp/zero-http-rotation-baseline-r10-20260507Tnext.json
+```
+
+Baseline result:
+
+- Rust/Kubo passed `10/10`.
+- Root: Rust `820/1475ms`; Kubo `1736/2989ms`.
+- Assets: Rust `179/472ms`; Kubo `180/1452ms`.
+- Resource max: Rust `58424KiB` RSS and `38` FDs vs Kubo `410628KiB`
+  RSS and `734` FDs.
+- `meaningful_kubo_wins`: none.
+- Zero-HTTP child classifications:
+  `cold_bitswap_peer_expand=12`,
+  `zero_http_provider_bitswap=12`,
+  `zero_http_provider_cold_bitswap=12`.
+- Zero-HTTP child latency: p50/p90/p95/max `253/468/510/510ms`.
+- All zero-HTTP child Bitswap successes came from candidate index `0` and
+  source peer
+  `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT`.
+
+Opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_PEER_ROTATION=1 \
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/zero-http-rotation-optin-r10-20260507Tnext-trace.jsonl \
+  --comparison-output /tmp/zero-http-rotation-optin-r10-20260507Tnext.json
+```
+
+Opt-in result:
+
+- Rust/Kubo passed `10/10`.
+- Root improved in this window: Rust `535/1031ms`; Kubo `1777/2803ms`.
+- Assets were not better: Rust `195/498ms`; Kubo `205/742ms`.
+- Resource max stayed light: Rust `58240KiB` RSS and `35` FDs vs Kubo
+  `313176KiB` RSS and `743` FDs.
+- `meaningful_kubo_wins`: none.
+- Zero-HTTP child classifications:
+  `cold_bitswap_peer_expand=10`,
+  `zero_http_provider_bitswap=10`,
+  `zero_http_provider_cold_bitswap=10`.
+- Zero-HTTP child latency regressed badly:
+  p50/p90/p95/max `1381/1633/1643/1643ms`.
+- All zero-HTTP child Bitswap successes moved to candidate index `3` and
+  source peer
+  `12D3KooWF1vFVwEbAqHMnXPnKVJmjT5Ncj39zZkZPk87KCBvTFfo`.
+- The selected source used `WANT_HAVE`, hit the `750ms` probe timeout, then
+  fell back to `WANT_BLOCK`. That made every affected `mHWTJadT.js` child load
+  a 1.3-1.6s tail.
+
+Post-control command:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/zero-http-rotation-post-control-r5-20260507Tnext-trace.jsonl \
+  --comparison-output /tmp/zero-http-rotation-post-control-r5-20260507Tnext.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `5/5`.
+- Root: Rust `535/793ms`; Kubo `1695/2096ms`.
+- Assets: Rust `193/489ms`; Kubo `138/511ms`.
+- `meaningful_kubo_wins` flagged only `55ms` asset p50 wins for Kubo.
+- Zero-HTTP child latency returned to p50/p90/p95/max `268/491/491/491ms`.
+- Zero-HTTP child Bitswap successes returned to candidate index `0` and source
+  peer
+  `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT`.
+
+Decision:
+
+Reject peer rotation as an optimization. The hypothesis was useful because it
+confirmed that candidate index `0` dominance is real, but naive per-CID
+rotation simply moved the page onto a slower `WANT_HAVE` candidate and inflated
+the exact zero-HTTP child tail we care about. Keep the env-gated lab control
+disabled for now as a diagnostic/repro knob, not as a promotion candidate.
+Future work should prefer candidate quality scoring, fast negative feedback for
+slow `WANT_HAVE` sources, or selective direct `WANT_BLOCK` promotion based on
+observed peer quality rather than blind rotation.

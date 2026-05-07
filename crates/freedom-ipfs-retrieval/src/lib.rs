@@ -169,6 +169,8 @@ const BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS_ENV: &str =
 const BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_MIN_PROVIDERS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_MIN_PROVIDERS";
 const BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_MIN_PROVIDERS: usize = 32;
+const ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_PEER_ROTATION_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_PEER_ROTATION";
 const ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP_ENV: &str =
     "FREEDOM_IPFS_ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP";
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -3511,6 +3513,8 @@ impl HttpRetriever {
         }
         self.apply_successful_bitswap_peer_scores(&mut peers).await;
         let session_peer_count = self.insert_recent_bitswap_session_peers(&mut peers).await;
+        let zero_http_subresource_peer_rotation =
+            maybe_rotate_zero_http_subresource_peers(providers, context.as_ref(), cid, &mut peers);
         let gateway_subresource = context
             .as_ref()
             .is_some_and(RetrievalRequestContext::gateway_subresource);
@@ -3544,6 +3548,9 @@ impl HttpRetriever {
                     .map(|min_provider_count| min_provider_count as i64)
                     .unwrap_or(-1),
             trusted_want_have_probe_count,
+            zero_http_subresource_peer_rotation = zero_http_subresource_peer_rotation
+                .map(|offset| offset as i64)
+                .unwrap_or(-1),
             trusted_direct_want_block_limit = bitswap_trusted_direct_want_block_peers()
                 .map(|limit| limit as i64)
                 .unwrap_or(-1),
@@ -5465,6 +5472,68 @@ fn bitswap_zero_http_direct_want_block_peers_from_values(
             .filter(RetrievalRequestContext::gateway_subresource)
             .map(|_| BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS)
     })
+}
+
+fn bitswap_zero_http_subresource_peer_rotation_enabled() -> bool {
+    std::env::var_os(ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_PEER_ROTATION_ENV).is_some()
+}
+
+fn maybe_rotate_zero_http_subresource_peers(
+    providers: &[Provider],
+    context: Option<&RetrievalRequestContext>,
+    cid: &Cid,
+    peers: &mut [BitswapPeer],
+) -> Option<usize> {
+    if !bitswap_zero_http_subresource_peer_rotation_enabled()
+        || provider_http_url_count(providers) != 0
+    {
+        return None;
+    }
+    let context = context.filter(|context| context.gateway_subresource())?;
+    let top_level_path = context.top_level_path();
+    let untrusted_peer_count = peers.iter().filter(|peer| !peer.skip_want_have).count();
+    if untrusted_peer_count < 2 {
+        return None;
+    }
+    let offset = stable_zero_http_subresource_peer_rotation_offset(
+        cid,
+        top_level_path,
+        untrusted_peer_count,
+    );
+    rotate_untrusted_bitswap_peer_suffix(peers, offset)
+}
+
+fn stable_zero_http_subresource_peer_rotation_offset(
+    cid: &Cid,
+    top_level_path: Option<&str>,
+    peer_count: usize,
+) -> usize {
+    if peer_count == 0 {
+        return 0;
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in cid.to_string().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if let Some(top_level_path) = top_level_path {
+        for byte in top_level_path.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    (hash as usize) % peer_count
+}
+
+fn rotate_untrusted_bitswap_peer_suffix(peers: &mut [BitswapPeer], offset: usize) -> Option<usize> {
+    let start = peers.iter().position(|peer| !peer.skip_want_have)?;
+    let len = peers.len().saturating_sub(start);
+    if len < 2 {
+        return None;
+    }
+    let offset = offset % len;
+    peers[start..].rotate_left(offset);
+    Some(offset)
 }
 
 fn bitswap_high_provider_zero_http_direct_want_block_min_providers() -> Option<usize> {
@@ -12610,6 +12679,73 @@ mod bitswap_tests {
         );
 
         assert_eq!(marked, 0);
+    }
+
+    #[test]
+    fn zero_http_subresource_peer_rotation_preserves_trusted_prefix() {
+        let trusted =
+            parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let first = parse_peer_id("12D3KooWAtxJkDLacJdK7yZkk2iPp8iMdSVh1bDHzmJ3t8oKUkqA").unwrap();
+        let second = parse_peer_id("12D3KooWQpU6Qg7vHmzZDQ1kEU1vq3Jua3BMyyMi5LfQcwTJTQJJ").unwrap();
+        let third = parse_peer_id("12D3KooWGLJ5YV1mbFWfvUXCLDn3gXVKqvKiLR1zNVzFCSkSBGSA").unwrap();
+        let mut peers = vec![
+            BitswapPeer {
+                id: trusted,
+                addrs: Vec::new(),
+                skip_want_have: true,
+                force_want_block: false,
+                force_want_have: false,
+            },
+            BitswapPeer {
+                id: first,
+                addrs: Vec::new(),
+                skip_want_have: false,
+                force_want_block: false,
+                force_want_have: false,
+            },
+            BitswapPeer {
+                id: second,
+                addrs: Vec::new(),
+                skip_want_have: false,
+                force_want_block: false,
+                force_want_have: false,
+            },
+            BitswapPeer {
+                id: third,
+                addrs: Vec::new(),
+                skip_want_have: false,
+                force_want_block: false,
+                force_want_have: false,
+            },
+        ];
+
+        let offset = rotate_untrusted_bitswap_peer_suffix(&mut peers, 1);
+
+        assert_eq!(offset, Some(1));
+        assert_eq!(peers[0].id, trusted);
+        assert_eq!(peers[1].id, second);
+        assert_eq!(peers[2].id, third);
+        assert_eq!(peers[3].id, first);
+    }
+
+    #[test]
+    fn zero_http_subresource_peer_rotation_hash_is_stable_and_bounded() {
+        let cid = "bafkreiezrxpztxumjtm7g6ea7a4bhna2dkuxun4evxawb5b7lo5k4t3u5u"
+            .parse::<Cid>()
+            .unwrap();
+
+        let offset =
+            stable_zero_http_subresource_peer_rotation_offset(&cid, Some("/ipns/ipfs.tech/"), 8);
+
+        assert_eq!(
+            offset,
+            stable_zero_http_subresource_peer_rotation_offset(&cid, Some("/ipns/ipfs.tech/"), 8)
+        );
+        assert!(offset < 8);
+        assert_eq!(
+            stable_zero_http_subresource_peer_rotation_offset(&cid, Some("/ipns/ipfs.tech/"), 0),
+            0
+        );
     }
 
     #[test]
