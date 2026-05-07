@@ -109,6 +109,8 @@ const SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS";
 const ENABLE_MULTI_HTTP_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_ENABLE_MULTI_HTTP_POST_LOOKUP_RACE";
+const MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS_ENV: &str =
+    "FREEDOM_IPFS_MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS";
 const ENABLE_ZERO_HTTP_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_RACE";
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -503,16 +505,25 @@ impl HttpRetriever {
                                                         bitswap_session_post_lookup_grace(&providers);
                                                     let http_provider_count =
                                                         provider_http_url_count(&providers);
-                                                    let post_lookup_race_allowed =
+                                                    let mut post_lookup_race_allowed =
                                                         explicit_post_lookup_race_enabled_for_width(
                                                             http_provider_count,
                                                         ) || self
                                                             .single_http_post_lookup_race_allows(
-                                                            cid,
-                                                            &providers,
-                                                            http_provider_count,
-                                                        )
+                                                                cid,
+                                                                &providers,
+                                                                http_provider_count,
+                                                            )
                                                             .await;
+                                                    if !post_lookup_race_allowed {
+                                                        post_lookup_race_allowed = self
+                                                            .multi_http_fast_post_lookup_race_allows(
+                                                                cid,
+                                                                &providers,
+                                                                http_provider_count,
+                                                            )
+                                                            .await;
+                                                    }
                                                     if post_lookup_race_allowed
                                                     {
                                                         if let Some((block, source)) = self
@@ -698,16 +709,25 @@ impl HttpRetriever {
                                                     bitswap_session_post_lookup_grace(&providers);
                                                 let http_provider_count =
                                                     provider_http_url_count(&providers);
-                                                let post_lookup_race_allowed =
+                                                let mut post_lookup_race_allowed =
                                                     explicit_post_lookup_race_enabled_for_width(
                                                         http_provider_count,
                                                     ) || self
                                                         .single_http_post_lookup_race_allows(
-                                                        cid,
-                                                        &providers,
-                                                        http_provider_count,
-                                                    )
+                                                            cid,
+                                                            &providers,
+                                                            http_provider_count,
+                                                        )
                                                         .await;
+                                                if !post_lookup_race_allowed {
+                                                    post_lookup_race_allowed = self
+                                                        .multi_http_fast_post_lookup_race_allows(
+                                                            cid,
+                                                            &providers,
+                                                            http_provider_count,
+                                                        )
+                                                        .await;
+                                                }
                                                 if post_lookup_race_allowed
                                                 {
                                                     if let Some((block, source)) = self
@@ -1223,6 +1243,104 @@ impl HttpRetriever {
             );
             return false;
         }
+        true
+    }
+
+    async fn multi_http_fast_post_lookup_race_allows(
+        &self,
+        cid: &Cid,
+        providers: &[Provider],
+        http_provider_count: usize,
+    ) -> bool {
+        self.multi_http_fast_post_lookup_race_allows_with_max(
+            cid,
+            providers,
+            http_provider_count,
+            multi_http_fast_post_lookup_race_max_score(),
+        )
+        .await
+    }
+
+    async fn multi_http_fast_post_lookup_race_allows_with_max(
+        &self,
+        cid: &Cid,
+        providers: &[Provider],
+        http_provider_count: usize,
+        max_score: Option<Duration>,
+    ) -> bool {
+        let Some(max_score) = max_score else {
+            return false;
+        };
+        if http_provider_count <= 1 {
+            return false;
+        }
+        if !http_provider_scoring_enabled() {
+            tracing::info!(
+                phase = "bitswap_session_shortcut_post_lookup_race_skip",
+                cid = %cid,
+                reason = "multi_http_scoring_disabled",
+                provider_scored = false,
+                provider_score_ms = 0u128,
+                max_score_ms = max_score.as_millis(),
+                http_provider_count
+            );
+            return false;
+        }
+
+        let bases = providers
+            .iter()
+            .flat_map(|provider| provider.http_urls.iter().cloned())
+            .collect::<Vec<_>>();
+        if bases.len() <= 1 {
+            return false;
+        }
+
+        let candidates = self.scored_http_provider_candidates(bases).await;
+        let scored_provider_count = candidates
+            .iter()
+            .filter(|candidate| candidate.score_elapsed.is_some())
+            .count();
+        let Some(best_score) = candidates
+            .iter()
+            .filter_map(|candidate| candidate.score_elapsed)
+            .min()
+        else {
+            tracing::info!(
+                phase = "bitswap_session_shortcut_post_lookup_race_skip",
+                cid = %cid,
+                reason = "multi_http_providers_unscored",
+                provider_scored = false,
+                provider_score_ms = 0u128,
+                max_score_ms = max_score.as_millis(),
+                http_provider_count,
+                scored_provider_count
+            );
+            return false;
+        };
+
+        if best_score > max_score {
+            tracing::info!(
+                phase = "bitswap_session_shortcut_post_lookup_race_skip",
+                cid = %cid,
+                reason = "multi_http_provider_score_above_threshold",
+                provider_scored = true,
+                provider_score_ms = best_score.as_millis(),
+                max_score_ms = max_score.as_millis(),
+                http_provider_count,
+                scored_provider_count
+            );
+            return false;
+        }
+
+        tracing::info!(
+            phase = "bitswap_session_shortcut_post_lookup_race_gate",
+            cid = %cid,
+            reason = "multi_http_fast_provider_score",
+            provider_score_ms = best_score.as_millis(),
+            max_score_ms = max_score.as_millis(),
+            http_provider_count,
+            scored_provider_count
+        );
         true
     }
 
@@ -3177,6 +3295,12 @@ fn explicit_post_lookup_race_enabled_for_width(http_provider_count: usize) -> bo
 
 fn single_http_post_lookup_race_min_score() -> Option<Duration> {
     std::env::var_os(SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS_ENV)
+        .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+fn multi_http_fast_post_lookup_race_max_score() -> Option<Duration> {
+    std::env::var_os(MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS_ENV)
         .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
         .map(Duration::from_millis)
 }
@@ -7860,6 +7984,68 @@ mod bitswap_tests {
                 )
                 .await,
             "slow scored providers should still race the shortcut"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_http_fast_post_lookup_race_requires_fast_scored_provider() {
+        let cid = freedom_ipfs_core::cid_from_data(
+            freedom_ipfs_core::CODEC_RAW,
+            b"score gated multi HTTP post lookup race",
+        );
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store,
+        );
+        let fast_base = Url::parse("https://fast-post-lookup-provider.example/").unwrap();
+        let other_base = Url::parse("https://other-post-lookup-provider.example/").unwrap();
+        let providers = vec![Provider {
+            id: None,
+            addrs: Vec::new(),
+            http_urls: vec![fast_base.clone(), other_base],
+        }];
+
+        assert!(
+            !retriever
+                .multi_http_fast_post_lookup_race_allows_with_max(
+                    &cid,
+                    &providers,
+                    2,
+                    Some(Duration::from_millis(100)),
+                )
+                .await,
+            "unscored multi-HTTP providers should keep the existing wait"
+        );
+
+        retriever
+            .record_http_provider_success(&fast_base, Duration::from_millis(50))
+            .await;
+        assert!(
+            retriever
+                .multi_http_fast_post_lookup_race_allows_with_max(
+                    &cid,
+                    &providers,
+                    2,
+                    Some(Duration::from_millis(100)),
+                )
+                .await,
+            "recently fast multi-HTTP providers should skip the wait tax"
+        );
+
+        retriever
+            .record_http_provider_success(&fast_base, Duration::from_millis(500))
+            .await;
+        assert!(
+            !retriever
+                .multi_http_fast_post_lookup_race_allows_with_max(
+                    &cid,
+                    &providers,
+                    2,
+                    Some(Duration::from_millis(100)),
+                )
+                .await,
+            "slow scored multi-HTTP providers should keep the shortcut wait"
         );
     }
 

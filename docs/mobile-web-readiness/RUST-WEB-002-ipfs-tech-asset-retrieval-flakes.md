@@ -27198,3 +27198,195 @@ Keep the current defaults. The branch now wins this broader r5 guardrail while
 using a fraction of Kubo RSS/FDs. Future work should be very selective: the main
 remaining opportunity is focused-window `ipfs.tech` asset p50 when Kubo has a
 favorable public-network sample, not broad page-load behavior.
+
+## 2026-05-07 Lab: Fast-Scored Multi-HTTP Post-Lookup Race
+
+Hypothesis:
+The focused `ipfs.tech` p50 gap is no longer a general retrieval problem. A
+path-level read of `/tmp/current-code-default-ipfs-tech-r10-20260507T003532Z.*`
+showed many Kubo-favored tiny JS/CSS/image assets paying the full `100ms`
+multi-HTTP post-lookup session-peer wait even though a scored HTTP provider then
+served the block in tens of milliseconds. Broad multi-HTTP racing was already
+tested and rejected, so try a narrower gate: only race provider fetch against
+the session shortcut when a multi-HTTP provider set has an already-scored fast
+HTTP provider.
+
+Change:
+Added an opt-in lab gate:
+
+```text
+FREEDOM_IPFS_MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS=<ms>
+```
+
+The default remains off. When set, multi-HTTP post-lookup racing is allowed only
+if HTTP provider scoring is enabled and at least one HTTP provider score is at
+or below the configured threshold. The trace emits
+`bitswap_session_shortcut_post_lookup_race_gate` for allowed races and
+`bitswap_session_shortcut_post_lookup_race_skip` with
+`multi_http_providers_unscored`,
+`multi_http_provider_score_above_threshold`, or
+`multi_http_scoring_disabled` for skipped candidates.
+
+Focused no-env control:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-default-fastscore-control-ipfs-tech-r10-20260507T005535Z-trace.jsonl \
+  --comparison-output /tmp/current-default-fastscore-control-ipfs-tech-r10-20260507T005535Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Focused `100ms` score gate:
+
+```sh
+FREEDOM_IPFS_MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS=100 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/fastscore100-ipfs-tech-r10-20260507T005727Z-trace.jsonl \
+  --comparison-output /tmp/fastscore100-ipfs-tech-r10-20260507T005727Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Focused `50ms` score gate:
+
+```sh
+FREEDOM_IPFS_MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS=50 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/fastscore50-ipfs-tech-r10-20260507T010055Z-trace.jsonl \
+  --comparison-output /tmp/fastscore50-ipfs-tech-r10-20260507T010055Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Focused result:
+
+- All Rust and Kubo focused runs passed `10/10`.
+- No-env Rust:
+  - root TTFB p50/p95: `653/1802ms`
+  - asset TTFB p50/p95: `237/548ms`
+  - run total p50/p95: `2252/4070ms`
+  - resource max: `54892KiB` RSS, `33` FDs
+- `100ms` gate Rust:
+  - root TTFB p50/p95: `718/2334ms`
+  - asset TTFB p50/p95: `205/443ms`
+  - run total p50/p95: `2133/3852ms`
+  - resource max: `55472KiB` RSS, `35` FDs
+- `50ms` gate Rust:
+  - root TTFB p50/p95: `637/833ms`
+  - asset TTFB p50/p95: `198/500ms`
+  - run total p50/p95: `1884/2627ms`
+  - resource max: `55532KiB` RSS, `35` FDs
+
+Focused trace findings:
+
+- `100ms` gate:
+  - post-lookup waits: `143 -> 23`
+  - gate events: `127`
+  - skips: `13`, all `multi_http_providers_unscored`
+  - gate score p50/p95/max: `54/81/92ms`
+- `50ms` gate:
+  - post-lookup waits: `143 -> 79`
+  - gate events were narrower, roughly the fastest half of scored providers in
+    the focused sample.
+
+Broader `100ms` score-gate guardrail:
+
+```sh
+FREEDOM_IPFS_MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS=100 \
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/fastscore100-multicase-r5-20260507T005922Z-trace.jsonl \
+  --comparison-output /tmp/fastscore100-multicase-r5-20260507T005922Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Broader `50ms` score-gate guardrail:
+
+```sh
+FREEDOM_IPFS_MULTI_HTTP_FAST_POST_LOOKUP_RACE_MAX_SCORE_MS=50 \
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/fastscore50-multicase-r5-20260507T010210Z-trace.jsonl \
+  --comparison-output /tmp/fastscore50-multicase-r5-20260507T010210Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Broader result:
+
+- All Rust and Kubo broader runs passed.
+- `100ms` gate:
+  - run total p50/p95: `2916/3280ms`
+  - `ipfs.tech` root TTFB p50/p95: `590/690ms`
+  - `ipfs.tech` asset TTFB p50/p95: `187/407ms`
+  - DAICO root TTFB p50/p95: `1087/1509ms`
+  - Vitalik root/range TTFB p50/p95: `102/107ms`
+  - resource max: `58444KiB` RSS, `38` FDs
+- `50ms` gate:
+  - run total p50/p95: `3572/3925ms`
+  - `ipfs.tech` root TTFB p50/p95: `632/768ms`
+  - `ipfs.tech` asset TTFB p50/p95: `209/531ms`
+  - DAICO root TTFB p50/p95: `1321/1432ms`
+  - Vitalik root/range TTFB p50/p95: `101/110ms`
+  - resource max: `57460KiB` RSS, `41` FDs
+
+Decision:
+Keep this as a promising opt-in lab control, not a default yet. The `100ms`
+score gate directly targets the observed median tax and materially improves
+`ipfs.tech` asset p50/p95 in both focused and broader samples, but it still
+increases RSS/FDs versus the current no-env default and slightly regressed DAICO
+p95 compared with the earlier no-env guardrail. The `50ms` gate is narrower, but
+it did not preserve the broader result as well as `100ms` in this sample and had
+even higher FD max. Before promotion, rerun same-window no-env vs `100ms` on the
+multi-case guardrail and inspect whether the remaining resource cost comes from
+extra HTTP races, Bitswap shortcuts left running after provider wins, or public
+network variance.
