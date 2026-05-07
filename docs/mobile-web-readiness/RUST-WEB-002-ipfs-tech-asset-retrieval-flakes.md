@@ -28962,3 +28962,91 @@ runtime behavior. The next experiment should target delegated-provider lookup
 tail latency for zero-HTTP root CIDs, especially the single-endpoint self-hedge
 path and streaming parser return conditions, then re-run this same controlled
 case against a same-window no-env control.
+
+## 2026-05-07 - Direct Bitswap Target Under CID-Scoped HTTP Drop
+
+Question:
+The CID-scoped HTTP-drop lab reproduced a slow zero-HTTP root where the
+delegated response body, not Bitswap transfer, dominated the tail. Does the
+existing env-gated direct Bitswap streamed delegated target fix that controlled
+shape without reintroducing the earlier top-level root failure mode?
+
+Env-on command:
+
+```sh
+FREEDOM_IPFS_LAB_DROP_HTTP_PROVIDERS_FOR_CIDS=bafkreibnzgajg3gsyn5c4p5e2h7racpy6dy7tnhwe5l4v4vx5e32qmn4bi \
+FREEDOM_IPFS_ENABLE_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET=1 \
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/lab-drop-plus-direct-target-ipfs-tech-r10-20260507T041200Z-trace.jsonl \
+  --comparison-output /tmp/lab-drop-plus-direct-target-ipfs-tech-r10-20260507T041200Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Env-on result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `618/1150ms`; Kubo `1840/2872ms`.
+- Asset p50/p95: Rust `144/551ms`; Kubo `271/810ms`.
+- Resource max: Rust `55140KiB` RSS, `42` FDs; Kubo `271304KiB`,
+  `305` FDs.
+- Delegated provider lookup p50/p95/max: `36/78/750ms`.
+- Delegated self-hedges: `1`.
+- HTTP provider distribution: `zero=27`, `single=179`, `multi=138`.
+- Top-level zero-HTTP cold Bitswap p50/p95/max: `615/1147/1147ms`.
+- Bitswap block fetch p50/p95/max: `142/413/1274ms`.
+- HTTP-provider block fetch p50/p95/max: `104/383/803ms`.
+
+Immediate env-off control:
+
+```sh
+FREEDOM_IPFS_LAB_DROP_HTTP_PROVIDERS_FOR_CIDS=bafkreibnzgajg3gsyn5c4p5e2h7racpy6dy7tnhwe5l4v4vx5e32qmn4bi \
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/lab-drop-control-after-direct-target-ipfs-tech-r10-20260507T035200Z-trace.jsonl \
+  --comparison-output /tmp/lab-drop-control-after-direct-target-ipfs-tech-r10-20260507T035200Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Env-off result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `586/875ms`; Kubo `1838/5296ms`.
+- Asset p50/p95: Rust `137/421ms`; Kubo `215/724ms`.
+- Resource max: Rust `55556KiB` RSS, `43` FDs; Kubo `318804KiB`,
+  `539` FDs.
+- Delegated provider lookup p50/p95/max: `20/49/178ms`.
+- Delegated self-hedges: `0`.
+- HTTP provider distribution: `zero=30`, `single=179`, `multi=140`.
+- Top-level zero-HTTP cold Bitswap p50/p95/max: `583/872/872ms`.
+- Bitswap block fetch p50/p95/max: `141/297/536ms`.
+- HTTP-provider block fetch p50/p95/max: `104/264/390ms`.
+
+Decision:
+Do not promote the direct Bitswap streamed delegated target. In the earlier
+controlled run it would have reduced a rare delegated-response body tail, but
+the immediate same-CID env-off control was faster on root p95, asset p95,
+delegated lookup max, Bitswap block max, and HTTP-provider block max. This
+matches the previous broader A/B rejection: direct target is useful as a
+diagnostic lever for proving delegated-stream tails, but it is not robust enough
+as default behavior on top-level roots. Keep looking for a safer policy that
+uses stronger page/session evidence or provider quality rather than raw early
+direct-peer count.
