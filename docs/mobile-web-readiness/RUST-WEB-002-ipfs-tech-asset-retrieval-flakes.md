@@ -27911,3 +27911,215 @@ performance work should broaden the search for remaining Kubo-win workloads
 instead of retuning the already-rejected generic Bitswap fanout knobs. Good next
 targets are new page corpora, media/range seeking, IPNS/DNSLink edge cases, or
 long-session resource behavior with the same trace discipline.
+
+## 2026-05-07 - Corpus Broadening And Rejected HTTP Provider Reuse
+
+Question:
+After the cap-8 current-head baselines moved the old `ipfs.tech` gap, where
+does Kubo still beat current head, and can a lightweight same-retriever HTTP
+provider reuse race close the remaining asset median?
+
+Default corpus command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-default-corpus-r10-20260507T015653Z-trace.jsonl \
+  --comparison-output /tmp/current-head-default-corpus-r10-20260507T015653Z.json
+```
+
+Default corpus result:
+
+- Rust passed `10/10`; Kubo showed expected comparison failures on the
+  Kubo-incompatible/control cases, but timing data was still useful.
+- `vitalik-root-html-range`: Rust `129/179ms` vs Kubo `3325/4707ms`.
+- `ipfs-tech-root-html-range`: Rust `594/1439ms` vs Kubo `1491/2736ms`.
+- `ipfs-tech-page-assets`: Rust asset `173/438ms` vs Kubo `373/874ms`.
+- `ipfs-tech-developers-hero-range`: Rust `105/205ms` vs Kubo
+  `410/1543ms` timing, though Kubo failed harness expectations.
+- `wikipedia-on-ipfs-root` initially looked like a p50 concern:
+  Rust `488/613ms` vs Kubo `318/708ms`.
+
+Focused Wikipedia confirmation:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --repeat 20 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-wikipedia-root-r20-20260507T015946Z-trace.jsonl \
+  --comparison-output /tmp/current-head-wikipedia-root-r20-20260507T015946Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `20/20`.
+- Rust root p50/p95 `719/1200ms`; Kubo `2201/2362ms`.
+- Rust resource max `40448KiB` RSS, `21` FDs; Kubo `154444KiB`, `110` FDs.
+- The default-corpus Wikipedia p50 loss was a window/order artifact, not a
+  confirmed Kubo-win workload.
+
+Media/range confirmation:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-developers-hero-range \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-media-ranges-r10-20260507T020129Z-trace.jsonl \
+  --comparison-output /tmp/current-head-media-ranges-r10-20260507T020129Z.json
+```
+
+Result:
+
+- Rust passed `10/10`; Kubo failed the strict harness expectations for these
+  media cases.
+- Cold prefix range timing: Rust `642/814ms`; Kubo `1629/3045ms`.
+- Middle/suffix/HEAD were cache-hot within the same fresh process for both
+  engines at roughly `2-3ms`.
+- This is not a current performance gap. Any Kubo failure here is a
+  compatibility/expectation issue, not a latency win.
+
+CID-direct page-assets baseline:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets-cid-direct \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-ipfs-tech-cid-direct-r10-20260507T020222Z-trace.jsonl \
+  --comparison-output /tmp/current-head-ipfs-tech-cid-direct-r10-20260507T020222Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `496/630ms`; Kubo `1754/2401ms`.
+- Asset p50/p95: Rust `204/563ms`; Kubo `141/652ms`.
+- Resource max: Rust `55936KiB` RSS, `36` FDs; Kubo `289780KiB`, `491` FDs.
+- This is the best current-head Kubo-win sample found in this sweep: Kubo wins
+  asset p50, while Rust wins root, asset p95, RSS, and FDs.
+- Trace shape:
+  - HTTP-provider blocks: `344` blocks, p50/p95/max `198/309/574ms`.
+  - Bitswap blocks: `55` blocks, p50/p95/max `199/962/1005ms`.
+  - Single-provider HTTP winners were mostly `https://ipfs-bridge.sia.dev/`
+    at p50/p95/max `187/298/352ms`.
+  - Fast multi-provider winners were mostly `https://dag.w3s.link/` at
+    p50/p95/max `40/92/162ms`.
+
+Rejected experiment:
+Try a disabled local code experiment that reused recently fast HTTP provider
+bases from the retriever's score table as opportunistic extra candidates when
+routing already found an advertised HTTP provider for a sibling block. The
+experiment did not hard-code gateways and verified every returned block, but it
+was intentionally tested as a lab control only.
+
+Focused opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_HTTP_PROVIDER_SESSION_REUSE=1 timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets-cid-direct \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/http-session-reuse-ipfs-tech-cid-direct-r10-20260507T020953Z-trace.jsonl \
+  --comparison-output /tmp/http-session-reuse-ipfs-tech-cid-direct-r10-20260507T020953Z.json
+```
+
+Focused opt-in result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `548/2823ms`; Kubo `2337/4607ms`.
+- Asset p50/p95: Rust `195/449ms`; Kubo `126/787ms`.
+- Resource max: Rust `56256KiB` RSS, `37` FDs; Kubo `310908KiB`, `415` FDs.
+- Trace analysis:
+  - `155` opportunistic `dag.w3s.link` candidates were added.
+  - Only `13` were actually fetched.
+  - All `13` returned `404`.
+  - There were `0` opportunistic winners.
+
+Guardrail opt-in command:
+
+```sh
+FREEDOM_IPFS_ENABLE_HTTP_PROVIDER_SESSION_REUSE=1 timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case ipfs-tech-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/http-session-reuse-multicase-r5-20260507T021215Z-trace.jsonl \
+  --comparison-output /tmp/http-session-reuse-multicase-r5-20260507T021215Z.json
+```
+
+Guardrail opt-in result:
+
+- Rust and Kubo passed `5/5`.
+- `daicowtf-page-assets` root p50/p95: Rust `1408/1468ms`;
+  Kubo `2898/3301ms`.
+- `vitalik-root-html-range` root p50/p95: Rust `94/111ms`;
+  Kubo `1916/2478ms`.
+- `ipfs-tech-page-assets`: Rust root `699/779ms`, asset `160/427ms`;
+  Kubo root `999/1603ms`, asset `264/1176ms`.
+- Resource max: Rust `56272KiB` RSS, `42` FDs; Kubo `236572KiB`, `221` FDs.
+- Trace analysis:
+  - `165` opportunistic `trustless.filebase.io` candidates were added.
+  - `90` were fetched.
+  - All `90` returned `404`.
+  - There were `0` opportunistic winners.
+
+Decision:
+Reject and revert this implementation. The tiny focused asset p50/p95 movement
+was not caused by successful provider reuse: the opportunistic candidate never
+won, and the broader run produced many useless `404`s. The core idea remains
+interesting only if future work can scope reuse to a real top-level page/content
+session or learn per-provider/per-root usefulness, instead of reusing globally
+across unrelated CIDs that happen to share one retriever process.
+
+Current remaining gap from this sweep:
+`ipfs-tech-page-assets-cid-direct` asset p50 remains the clearest live
+Kubo-win sample: Rust `204ms` vs Kubo `141ms` in the no-env r10, with Rust
+still ahead on root, asset p95, RSS, and FDs. The common shape is not IPNS; it is
+cold sibling asset retrieval on a known immutable root, with median requests
+spending roughly `20-40ms` in provider lookup and `160-190ms` in a single
+advertised HTTP provider fetch. Future work should target scoped page-session
+provider/source reuse, earlier provider-set sharing among sibling CIDs, or
+better first-use provider choice without cross-root opportunistic fallbacks.
