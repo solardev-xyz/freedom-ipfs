@@ -38438,3 +38438,42 @@ disabled for now as a diagnostic/repro knob, not as a promotion candidate.
 Future work should prefer candidate quality scoring, fast negative feedback for
 slow `WANT_HAVE` sources, or selective direct `WANT_BLOCK` promotion based on
 observed peer quality rather than blind rotation.
+
+### Harness Request-Classification Source Details
+
+Purpose:
+
+The rotation lab showed that candidate index alone is insufficient: the bad
+opt-in sample selected candidate index `3`, but the actionable detail was that
+the source used `WANT_HAVE`, timed out after `750ms`, and only then fell back to
+`WANT_BLOCK`. Extend the harness trace summary so future zero-HTTP child
+analysis includes the request mode and source peer directly on the same
+classification lines.
+
+Code change:
+
+- `TraceRequestAggregate` now records successful Bitswap
+  `source_peer_request_mode` and `source_peer` alongside
+  `source_peer_candidate_index`.
+- `TraceRequestClassificationAggregate` now rolls those values up per
+  classification.
+- The printed `request classification latencies` section now includes:
+  - `bitswap_source_candidate_indexes`
+  - `bitswap_source_request_modes`
+  - `bitswap_source_peers`
+- Slow request detail lines include source indexes and modes when classified.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_classifies_zero_http_cold_bitswap_requests -- --nocapture
+```
+
+Both passed.
+
+Decision:
+
+Keep. This does not alter gateway/retrieval behavior, but it reduces future
+analysis friction and should make the next candidate-quality experiment easier
+to judge without bespoke trace scripts.
