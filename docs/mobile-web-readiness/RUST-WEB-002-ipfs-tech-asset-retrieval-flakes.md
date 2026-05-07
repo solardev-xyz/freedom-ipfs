@@ -31090,3 +31090,116 @@ cannot be recovered by simply stopping at the first 16 dialable peers. A better
 future version would need a quality-aware early set, for example streaming in
 provider candidates while preserving late high-quality/HTTP-capable records, or
 learning which provider peers actually deliver for a page/session.
+
+## 2026-05-07 - Fresh Selected Baseline And Bitswap Source-Peer Diagnostics
+
+Purpose:
+Restart the next iteration from a fresh same-window selected-corpus baseline,
+then add diagnostics inspired by Kubo/Boxo's Bitswap session behavior. Kubo
+keeps a session peer manager, sends one optimistic `want-block`, sends
+`want-have` probes to other session peers, tracks first responders, and prunes
+peers after repeated `DONT_HAVE`s. Our current Rust path already has session
+peer reuse and direct/want-have splitting, but the trace did not show enough
+about which candidate actually delivered a slow block.
+
+Fresh no-env baseline:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-selected-r5-20260507T073414Z-trace.jsonl \
+  --comparison-output /tmp/current-head-selected-r5-20260507T073414Z.json
+```
+
+Baseline result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1179/1287ms` vs Kubo `2612/3097ms`.
+- Vitalik range: Rust `102/118ms` vs Kubo `909/1128ms`.
+- `ipfs.tech` root range: Rust `604/1021ms` vs Kubo `912/1383ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `94/420ms`; Kubo root
+  `2/2ms`, assets `350/471ms`.
+- `ipfs.tech` hero range: Rust `118/143ms` vs Kubo `422/455ms`.
+- Wikipedia root: Rust `246/721ms` vs Kubo `517/536ms`; Rust won median but
+  still lost p95.
+- Resource max: Rust `51588KiB` RSS and `31` FDs vs Kubo `355616KiB` RSS and
+  `399` FDs.
+- HTTP provider block fetch p50/p95/max: `177/542/704ms`.
+- Bitswap block fetch p50/p95/max: `73/498/1285ms`.
+- Request classifications included `12` `zero_http_provider_bitswap`, `7`
+  `zero_http_provider_cold_bitswap`, and `5`
+  `top_level_zero_http_provider_cold_bitswap`.
+
+Code:
+
+- Added `source_peer_candidate_index` to successful `bitswap_fetch`,
+  `bitswap_session_shortcut`, and `bitswap_session_range_batch` events.
+- Added `source_peer_request_mode`, `source_peer_force_want_block`,
+  `source_peer_addr_count`, previous session success count, previous latency,
+  and previous seen-age fields to those success events.
+- Added `bitswap_successful_peer_recorded` events with success count, latency,
+  address count, and top-level path.
+- Added bounded target summaries to `bitswap_dial_plan` so the candidate order
+  and request modes are visible without waiting for a timeout.
+- Default behavior is unchanged.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval traces_bitswap_source_peer_candidate_mode --lib
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+git diff --check
+```
+
+All passed.
+
+Trace smoke:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/source-peer-trace-smoke-20260507T074126Z.jsonl \
+  --output /tmp/source-peer-trace-smoke-20260507T074126Z.json
+```
+
+Smoke result:
+
+- Rust passed `1/1`.
+- `ipfs.tech` root was `1238ms`; asset TTFB p50/p95/max was
+  `101/669/1267ms`.
+- The trace emitted the new fields.
+- The slowest asset was `_nuxt/entry.C4ErMpWu.css` at `1265ms`. Its slow block
+  `bafkreifmja...` had zero HTTP providers and was delivered by
+  `12D3KooWD8ys...` at candidate index `1`, request mode `want_block`,
+  previous success count `0`, latency `1087ms`.
+- A previously successful trusted peer `12D3KooWDpp...` was present at
+  candidate index `0` and was also requested with `want_block`, but it did not
+  win before the cold provider candidate delivered.
+
+Decision:
+Keep these diagnostics. The fresh baseline is strong overall but still has
+zero-HTTP/Bitswap tails. The new evidence suggests the next behavior lab should
+test Kubo-like optimistic direct width: fewer untrusted direct `want-block`
+targets plus broader `want-have` probing, rather than simply capping providers
+or globally trusting/distrusting recent successful peers.

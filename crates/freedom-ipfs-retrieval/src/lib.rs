@@ -2604,15 +2604,11 @@ impl HttpRetriever {
                 return Err(err);
             }
         };
-        let source_peer = result.source_peer;
-        let source_peer_trusted = source_peer
-            .map(|peer| {
-                peers_for_record
-                    .iter()
-                    .any(|candidate| candidate.id == peer && candidate.skip_want_have)
-            })
-            .unwrap_or(false);
         let elapsed = bitswap_started.elapsed();
+        let source_peer = result.source_peer;
+        let source_trace = self
+            .bitswap_source_peer_trace(source_peer, &peers_for_record)
+            .await;
         tracing::info!(
             phase = "bitswap_fetch",
             cid = %cid,
@@ -2624,7 +2620,17 @@ impl HttpRetriever {
             source_peer = source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
             source_transport = result.source_transport.unwrap_or("unknown"),
             bitswap_delivery = result.delivery,
-            source_peer_trusted,
+            source_peer_trusted = source_trace.skip_want_have,
+            source_peer_candidate_index = source_trace
+                .candidate_index
+                .map(|index| index as i64)
+                .unwrap_or(-1),
+            source_peer_request_mode = source_trace.request_mode,
+            source_peer_force_want_block = source_trace.force_want_block,
+            source_peer_addr_count = source_trace.addr_count,
+            source_peer_previous_success_count = source_trace.previous_success_count,
+            source_peer_previous_latency_ms = source_trace.previous_latency_ms,
+            source_peer_previous_seen_age_ms = source_trace.previous_seen_age_ms,
             extra_blocks = result.extra_blocks.len(),
             bytes = result.requested_block.len(),
             elapsed_ms = elapsed.as_millis()
@@ -2764,6 +2770,17 @@ impl HttpRetriever {
             .get(&peer)
             .map(|success| success.success_count.saturating_add(1))
             .unwrap_or(1);
+        let top_level_path = current_retrieval_request_context()
+            .and_then(|context| context.top_level_path().map(ToOwned::to_owned));
+        let addr_count = addrs.len();
+        tracing::info!(
+            phase = "bitswap_successful_peer_recorded",
+            peer = %peer,
+            success_count,
+            latency_ms = last_latency.as_millis(),
+            addr_count,
+            top_level_path = %top_level_path.as_deref().unwrap_or("")
+        );
         successes.insert(
             peer,
             SuccessfulBitswapPeer {
@@ -2771,8 +2788,7 @@ impl HttpRetriever {
                 addrs,
                 last_latency,
                 success_count,
-                top_level_path: current_retrieval_request_context()
-                    .and_then(|context| context.top_level_path().map(ToOwned::to_owned)),
+                top_level_path,
             },
         );
     }
@@ -2787,6 +2803,23 @@ impl HttpRetriever {
             self.record_successful_bitswap_peer(peer, candidate.addrs.clone(), last_latency)
                 .await;
         }
+    }
+
+    async fn bitswap_source_peer_trace(
+        &self,
+        source_peer: Option<PeerId>,
+        peers: &[BitswapPeer],
+    ) -> BitswapSourcePeerTrace {
+        let mut trace = bitswap_source_peer_trace_from_peers(source_peer, peers);
+        if let Some(peer) = source_peer {
+            let successes = self.successful_bitswap_peers.lock().await;
+            if let Some(success) = successes.get(&peer) {
+                trace.previous_success_count = success.success_count;
+                trace.previous_latency_ms = success.last_latency.as_millis();
+                trace.previous_seen_age_ms = success.seen_at.elapsed().as_millis();
+            }
+        }
+        trace
     }
 
     async fn recent_bitswap_peers(&self) -> Vec<BitswapPeer> {
@@ -2963,6 +2996,9 @@ impl HttpRetriever {
         };
 
         let elapsed = started.elapsed();
+        let source_trace = self
+            .bitswap_source_peer_trace(result.source_peer, &peers_for_record)
+            .await;
         tracing::info!(
             phase = "bitswap_session_shortcut",
             cid = %cid,
@@ -2972,7 +3008,17 @@ impl HttpRetriever {
             source_peer = result.source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
             source_transport = result.source_transport.unwrap_or("unknown"),
             bitswap_delivery = result.delivery,
-            source_peer_trusted = true,
+            source_peer_trusted = source_trace.skip_want_have,
+            source_peer_candidate_index = source_trace
+                .candidate_index
+                .map(|index| index as i64)
+                .unwrap_or(-1),
+            source_peer_request_mode = source_trace.request_mode,
+            source_peer_force_want_block = source_trace.force_want_block,
+            source_peer_addr_count = source_trace.addr_count,
+            source_peer_previous_success_count = source_trace.previous_success_count,
+            source_peer_previous_latency_ms = source_trace.previous_latency_ms,
+            source_peer_previous_seen_age_ms = source_trace.previous_seen_age_ms,
             extra_blocks = result.extra_blocks.len(),
             bytes = result.requested_block.len(),
             elapsed_ms = elapsed.as_millis()
@@ -3068,6 +3114,9 @@ impl HttpRetriever {
         };
 
         let elapsed = started.elapsed();
+        let source_trace = self
+            .bitswap_source_peer_trace(result.source_peer, &peers_for_record)
+            .await;
         if let Some(peer) = result.source_peer {
             self.record_successful_bitswap_peer_from_peers(peer, &peers_for_record, elapsed)
                 .await;
@@ -3088,7 +3137,17 @@ impl HttpRetriever {
             source_peer = %source_peer.map(|peer| peer.to_string()).unwrap_or_default(),
             source_transport = source_transport.unwrap_or("unknown"),
             bitswap_delivery = delivery,
-            source_peer_trusted = true,
+            source_peer_trusted = source_trace.skip_want_have,
+            source_peer_candidate_index = source_trace
+                .candidate_index
+                .map(|index| index as i64)
+                .unwrap_or(-1),
+            source_peer_request_mode = source_trace.request_mode,
+            source_peer_force_want_block = source_trace.force_want_block,
+            source_peer_addr_count = source_trace.addr_count,
+            source_peer_previous_success_count = source_trace.previous_success_count,
+            source_peer_previous_latency_ms = source_trace.previous_latency_ms,
+            source_peer_previous_seen_age_ms = source_trace.previous_seen_age_ms,
             requested_blocks = requested_block_count,
             extra_blocks = extra_block_count,
             bytes = blocks.values().map(|block| block.data().len()).sum::<usize>(),
@@ -3639,6 +3698,33 @@ struct SuccessfulBitswapPeer {
     last_latency: Duration,
     success_count: u64,
     top_level_path: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BitswapSourcePeerTrace {
+    candidate_index: Option<usize>,
+    request_mode: &'static str,
+    skip_want_have: bool,
+    force_want_block: bool,
+    addr_count: usize,
+    previous_success_count: u64,
+    previous_latency_ms: u128,
+    previous_seen_age_ms: u128,
+}
+
+impl Default for BitswapSourcePeerTrace {
+    fn default() -> Self {
+        Self {
+            candidate_index: None,
+            request_mode: "unknown",
+            skip_want_have: false,
+            force_want_block: false,
+            addr_count: 0,
+            previous_success_count: 0,
+            previous_latency_ms: 0,
+            previous_seen_age_ms: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4534,6 +4620,8 @@ async fn run_shared_bitswap_swarm(
                         connection_ready,
                     });
                 }
+                let target_summary =
+                    tracing::enabled!(tracing::Level::INFO).then(|| format_bitswap_targets(&peer_targets));
                 tracing::info!(
                     phase = "bitswap_dial_plan",
                     cid = %primary_cid,
@@ -4548,7 +4636,8 @@ async fn run_shared_bitswap_swarm(
                     suppressed_dial_peer_count,
                     pending_dial_peer_count,
                     connected_peer_count,
-                    command_queued_ms
+                    command_queued_ms,
+                    targets = %target_summary.as_deref().unwrap_or("")
                 );
 
                 let mut started_dial_peers = BTreeSet::new();
@@ -5035,6 +5124,40 @@ fn format_bitswap_peers(peers: &[BitswapPeer]) -> String {
         .join("; ")
 }
 
+fn bitswap_source_peer_trace_from_peers(
+    source_peer: Option<PeerId>,
+    peers: &[BitswapPeer],
+) -> BitswapSourcePeerTrace {
+    let Some(source_peer) = source_peer else {
+        return BitswapSourcePeerTrace::default();
+    };
+    let has_multiple_peers = peers.len() > 1;
+    let mut direct_untrusted_want_block_count = 0usize;
+    for (index, peer) in peers.iter().enumerate() {
+        let prefer_want_have = bitswap_prefer_want_have(
+            has_multiple_peers,
+            peer.skip_want_have,
+            peer.force_want_block,
+            &mut direct_untrusted_want_block_count,
+        );
+        if peer.id == source_peer {
+            return BitswapSourcePeerTrace {
+                candidate_index: Some(index),
+                request_mode: if prefer_want_have {
+                    "want_have"
+                } else {
+                    "want_block"
+                },
+                skip_want_have: peer.skip_want_have,
+                force_want_block: peer.force_want_block,
+                addr_count: peer.addrs.len(),
+                ..BitswapSourcePeerTrace::default()
+            };
+        }
+    }
+    BitswapSourcePeerTrace::default()
+}
+
 fn format_cids(cids: &[Cid]) -> String {
     cids.iter()
         .take(MAX_BITSWAP_FAILURE_DETAILS)
@@ -5044,10 +5167,25 @@ fn format_cids(cids: &[Cid]) -> String {
 }
 
 fn format_bitswap_targets(peers: &[BitswapPeerTarget]) -> String {
+    let has_multiple_peers = peers.len() > 1;
+    let mut direct_untrusted_want_block_count = 0usize;
     peers
         .iter()
         .take(MAX_BITSWAP_FAILURE_DETAILS)
-        .map(|peer| format!("{}@{}", peer.id, format_multiaddrs(&peer.addrs)))
+        .map(|peer| {
+            let prefer_want_have = bitswap_prefer_want_have(
+                has_multiple_peers,
+                peer.skip_want_have,
+                peer.force_want_block,
+                &mut direct_untrusted_want_block_count,
+            );
+            let mode = if prefer_want_have {
+                "want-have"
+            } else {
+                "want-block"
+            };
+            format!("{}:{}@{}", peer.id, mode, format_multiaddrs(&peer.addrs))
+        })
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -7710,6 +7848,53 @@ mod bitswap_tests {
             )
         );
         assert_eq!(bitswap_request_target_mode_counts(&peers), (4, 1));
+    }
+
+    #[test]
+    fn traces_bitswap_source_peer_candidate_mode() {
+        let first = parse_peer_id("12D3KooWLSFr3c4K1dxWavx5XFsUjeSXap3VPMuEbe28zeL5B1v3").unwrap();
+        let second = parse_peer_id("12D3KooWGU3fJrHaWtRSWyrrzCpdgFX5bxbS69hqL1MSdKMGez12").unwrap();
+        let third = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let fourth = parse_peer_id("12D3KooWGtYkBAaqJMJEmywMxaCiNP7LCEFUAFiLEBASe232c2VH").unwrap();
+        let peers = vec![
+            BitswapPeer {
+                id: first,
+                addrs: Vec::new(),
+                skip_want_have: false,
+                force_want_block: false,
+            },
+            BitswapPeer {
+                id: second,
+                addrs: Vec::new(),
+                skip_want_have: false,
+                force_want_block: false,
+            },
+            BitswapPeer {
+                id: third,
+                addrs: Vec::new(),
+                skip_want_have: false,
+                force_want_block: false,
+            },
+            BitswapPeer {
+                id: fourth,
+                addrs: Vec::new(),
+                skip_want_have: false,
+                force_want_block: false,
+            },
+        ];
+
+        let first_trace = bitswap_source_peer_trace_from_peers(Some(first), &peers);
+        assert_eq!(first_trace.candidate_index, Some(0));
+        assert_eq!(first_trace.request_mode, "want_block");
+
+        let fourth_trace = bitswap_source_peer_trace_from_peers(Some(fourth), &peers);
+        assert_eq!(fourth_trace.candidate_index, Some(3));
+        assert_eq!(fourth_trace.request_mode, "want_have");
+
+        assert_eq!(
+            bitswap_source_peer_trace_from_peers(None, &peers),
+            BitswapSourcePeerTrace::default()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
