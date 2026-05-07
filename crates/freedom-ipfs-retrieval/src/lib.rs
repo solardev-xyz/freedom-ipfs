@@ -59,6 +59,8 @@ const SINGLE_HTTP_SELF_HEDGE_MIN_SCORE_MS_ENV: &str =
 const ENABLE_SINGLE_HTTP_BITSWAP_HEDGE_ENV: &str = "FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE";
 const SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS";
+const ENABLE_SINGLE_HTTP_5XX_FAST_BITSWAP_FALLBACK_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_SINGLE_HTTP_5XX_FAST_BITSWAP_FALLBACK";
 const MAX_CONCURRENT_HTTP_PROVIDER_FETCHES: usize = 8;
 const MAX_CONCURRENT_HTTP_PROVIDER_FETCHES_ENV: &str =
     "FREEDOM_IPFS_MAX_CONCURRENT_HTTP_PROVIDER_FETCHES";
@@ -1080,6 +1082,22 @@ impl HttpRetriever {
         providers: &[Provider],
         context: Option<RetrievalRequestContext>,
     ) -> Result<(Block, RetrievalSource)> {
+        self.fetch_from_providers_with_source_with_options(
+            cid,
+            providers,
+            context,
+            ProviderFetchOptions::from_env(),
+        )
+        .await
+    }
+
+    async fn fetch_from_providers_with_source_with_options(
+        &self,
+        cid: &Cid,
+        providers: &[Provider],
+        context: Option<RetrievalRequestContext>,
+        options: ProviderFetchOptions,
+    ) -> Result<(Block, RetrievalSource)> {
         tracing::info!(
             phase = "provider_fetch_start",
             cid = %cid,
@@ -1095,9 +1113,10 @@ impl HttpRetriever {
                 http_provider_bases.push(base.clone());
             }
         }
+        let bitswap_provider_candidate_available = has_bitswap_provider_candidate(providers);
         if http_provider_bases.len() == 1
             && single_http_provider_bitswap_hedge_enabled()
-            && has_bitswap_provider_candidate(providers)
+            && bitswap_provider_candidate_available
             && self
                 .single_http_provider_bitswap_hedge_score_allows(
                     cid,
@@ -1116,7 +1135,12 @@ impl HttpRetriever {
                 .await;
         }
         if let Some(block) = self
-            .fetch_from_http_provider_candidates(cid, http_provider_bases)
+            .fetch_from_http_provider_candidates(
+                cid,
+                http_provider_bases,
+                options.single_http_5xx_fast_bitswap_fallback
+                    && bitswap_provider_candidate_available,
+            )
             .await?
         {
             return Ok((block, RetrievalSource::HttpProvider));
@@ -1473,6 +1497,7 @@ impl HttpRetriever {
         &self,
         cid: &Cid,
         bases: Vec<Url>,
+        single_http_5xx_fast_bitswap_fallback: bool,
     ) -> Result<Option<Block>> {
         if bases.is_empty() {
             return Ok(None);
@@ -1513,6 +1538,7 @@ impl HttpRetriever {
                         provider_count,
                         scored_provider_count,
                         started,
+                        single_http_5xx_fast_bitswap_fallback,
                     )
                     .await;
             }
@@ -1795,6 +1821,7 @@ impl HttpRetriever {
         provider_count: usize,
         scored_provider_count: usize,
         started: Instant,
+        single_http_5xx_fast_bitswap_fallback: bool,
     ) -> Result<Option<Block>> {
         let mut pending = FuturesUnordered::new();
         pending.push(self.fetch_from_http_provider_candidate_with_index(
@@ -1847,8 +1874,34 @@ impl HttpRetriever {
                             );
                             return Ok(Some(block));
                         }
-                        Err(_) => {
+                        Err(err) => {
                             failed_provider_count += 1;
+                            let server_error_status = http_provider_server_error_status(&err);
+                            if pending.is_empty()
+                                && !hedge_fired
+                                && single_http_5xx_fast_bitswap_fallback
+                            {
+                                if let Some(server_error_status) = server_error_status {
+                                    tracing::info!(
+                                        phase = "http_provider_self_hedge_skip",
+                                        cid = %cid,
+                                        provider = %candidate.base,
+                                        provider_index = 0,
+                                        original_provider_rank = candidate.original_index + 1,
+                                        provider_scored = candidate.score_elapsed.is_some(),
+                                        provider_score_ms = candidate
+                                            .score_elapsed
+                                            .map(|elapsed| elapsed.as_millis())
+                                            .unwrap_or_default(),
+                                        reason = "server_error_fast_bitswap_fallback",
+                                        http_status = server_error_status,
+                                        attempted_provider_count,
+                                        failed_provider_count,
+                                        elapsed_ms = started.elapsed().as_millis()
+                                    );
+                                    return Ok(None);
+                                }
+                            }
                             if pending.is_empty() && !hedge_fired {
                                 attempted_provider_count += 1;
                                 hedge_fired = true;
@@ -3569,6 +3622,19 @@ struct HttpProviderCandidateResult {
     result: Result<Block>,
 }
 
+#[derive(Clone, Copy)]
+struct ProviderFetchOptions {
+    single_http_5xx_fast_bitswap_fallback: bool,
+}
+
+impl ProviderFetchOptions {
+    fn from_env() -> Self {
+        Self {
+            single_http_5xx_fast_bitswap_fallback: single_http_5xx_fast_bitswap_fallback_enabled(),
+        }
+    }
+}
+
 fn http_provider_score_key(base: &Url) -> Option<String> {
     let host = base.host_str()?;
     let mut key = format!("{}://{}", base.scheme(), host);
@@ -3602,6 +3668,20 @@ fn single_http_provider_self_hedge_min_score() -> Option<Duration> {
 
 fn single_http_provider_bitswap_hedge_enabled() -> bool {
     std::env::var_os(ENABLE_SINGLE_HTTP_BITSWAP_HEDGE_ENV).is_some()
+}
+
+fn single_http_5xx_fast_bitswap_fallback_enabled() -> bool {
+    std::env::var_os(ENABLE_SINGLE_HTTP_5XX_FAST_BITSWAP_FALLBACK_ENV).is_some()
+}
+
+fn http_provider_server_error_status(err: &RetrievalError) -> Option<u16> {
+    match err {
+        RetrievalError::Http(err) => err
+            .status()
+            .filter(|status| status.is_server_error())
+            .map(|status| status.as_u16()),
+        _ => None,
+    }
 }
 
 fn max_concurrent_http_provider_fetches() -> usize {
@@ -8644,6 +8724,103 @@ mod bitswap_tests {
         task.abort();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_http_5xx_default_keeps_self_hedge_recovery() {
+        let expected = b"verified single HTTP 5xx retry recovery block";
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, expected);
+        let requests = Arc::new(AtomicU64::new(0));
+        let (addr, task) = spawn_sequenced_status_http_provider(
+            expected.to_vec(),
+            std::collections::VecDeque::from([500, 200]),
+            requests.clone(),
+        )
+        .await;
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let provider = Provider::from_parts(
+            None,
+            vec![format!("/ip4/{}/tcp/{}/http", addr.ip(), addr.port())],
+        )
+        .unwrap_or_else(|_| panic!("failed to build single HTTP provider"));
+
+        let (block, source) = retriever
+            .fetch_from_providers_with_source_with_options(
+                &cid,
+                &[provider],
+                None,
+                ProviderFetchOptions {
+                    single_http_5xx_fast_bitswap_fallback: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(source, RetrievalSource::HttpProvider);
+        assert_eq!(block.data(), expected);
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_http_5xx_fast_fallback_skips_duplicate_http_and_uses_bitswap() {
+        let expected = b"verified single HTTP 5xx fast Bitswap fallback block";
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, expected);
+        let http_requests = Arc::new(AtomicU64::new(0));
+        let (http_addr, http_task) = spawn_sequenced_status_http_provider(
+            expected.to_vec(),
+            std::collections::VecDeque::from([500, 200]),
+            http_requests.clone(),
+        )
+        .await;
+        let (peer_id, bitswap_addr, bitswap_swarm, bitswap_stream) =
+            spawn_local_bitswap_peer(cid, expected.to_vec()).await;
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        let providers = vec![
+            Provider::from_parts(
+                None,
+                vec![format!(
+                    "/ip4/{}/tcp/{}/http",
+                    http_addr.ip(),
+                    http_addr.port()
+                )],
+            )
+            .unwrap(),
+            Provider::from_parts(Some(peer_id.to_string()), vec![bitswap_addr.to_string()])
+                .unwrap(),
+        ];
+
+        let (block, source) = retriever
+            .fetch_from_providers_with_source_with_options(
+                &cid,
+                &providers,
+                None,
+                ProviderFetchOptions {
+                    single_http_5xx_fast_bitswap_fallback: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(source, RetrievalSource::Bitswap);
+        assert_eq!(block.data(), expected);
+        assert_eq!(http_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
+        tokio::time::timeout(Duration::from_secs(5), bitswap_stream)
+            .await
+            .unwrap()
+            .unwrap();
+        bitswap_swarm.abort();
+        http_task.abort();
+    }
+
     #[tokio::test]
     async fn single_http_self_hedge_score_gate_skips_fast_scored_provider() {
         let cid = freedom_ipfs_core::cid_from_data(
@@ -10390,6 +10567,49 @@ mod bitswap_tests {
                     .into_bytes()
                     .into_iter()
                     .chain(data)
+                    .collect::<Vec<_>>();
+                    let _ = stream.write_all(&response).await;
+                });
+            }
+        });
+        (addr, task)
+    }
+
+    async fn spawn_sequenced_status_http_provider(
+        data: Vec<u8>,
+        statuses: std::collections::VecDeque<u16>,
+        requests: Arc<AtomicU64>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let statuses = Arc::new(tokio::sync::Mutex::new(statuses));
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let data = data.clone();
+                let requests = requests.clone();
+                let statuses = statuses.clone();
+                tokio::spawn(async move {
+                    let mut request = vec![0u8; 4096];
+                    if stream.read(&mut request).await.is_err() {
+                        return;
+                    }
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    let status = statuses.lock().await.pop_front().unwrap_or(200);
+                    let (reason, body) = if status == 200 {
+                        ("OK", data)
+                    } else {
+                        ("Internal Server Error", Vec::new())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes()
+                    .into_iter()
+                    .chain(body)
                     .collect::<Vec<_>>();
                     let _ = stream.write_all(&response).await;
                 });

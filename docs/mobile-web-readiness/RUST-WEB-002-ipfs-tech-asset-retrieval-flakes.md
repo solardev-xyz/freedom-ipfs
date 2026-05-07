@@ -30188,3 +30188,114 @@ median in this same-window retest, and increased fanout/resource pressure. The
 next experiment should inspect failed single-HTTP-provider fallback and source
 quality, especially where a sole HTTP provider returns `5xx` before Bitswap
 eventually wins.
+
+## 2026-05-07 - Reject: Single-HTTP 5xx Fast Bitswap Fallback Lab
+
+Hypothesis:
+The fresh baseline showed the Wikipedia `/index.html` leaf hitting a single HTTP
+provider (`https://f010479.twinquasar.io/`) that returned `500` twice before
+Bitswap won. A narrow lab flag should skip the duplicate same-provider
+self-hedge after an actual HTTP `5xx` when Bitswap candidates exist, then fall
+through to Bitswap sooner without changing default behavior.
+
+Code:
+
+- Added disabled env flag:
+  `FREEDOM_IPFS_ENABLE_SINGLE_HTTP_5XX_FAST_BITSWAP_FALLBACK=1`.
+- The flag only applies when:
+  - there is exactly one HTTP provider candidate,
+  - Bitswap provider candidates are available, and
+  - the first HTTP attempt fails with a server-error status.
+- Default behavior remains unchanged: a single HTTP provider can still recover
+  through the existing same-provider self-hedge.
+- Added trace marker:
+  `phase=http_provider_self_hedge_skip`,
+  `reason=server_error_fast_bitswap_fallback`.
+
+Unit validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval single_http_5xx
+cargo test -p freedom-ipfs-retrieval
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Result:
+
+- `cargo fmt --all --check`: pass.
+- `cargo test -p freedom-ipfs-retrieval single_http_5xx`: `2` passed.
+- `cargo test -p freedom-ipfs-retrieval`: `98` passed, `1` ignored.
+- `cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings`: pass.
+
+Live command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_ENABLE_SINGLE_HTTP_5XX_FAST_BITSWAP_FALLBACK=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/single-http-5xx-fastbitswap-selected-r5-20260507T0615Z-trace.jsonl \
+  --comparison-output /tmp/single-http-5xx-fastbitswap-selected-r5-20260507T0615Z.json
+```
+
+Live result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1224/1600ms` vs Kubo `2790/3209ms`.
+- Vitalik range: Rust `100/113ms` vs Kubo `1341/2360ms`.
+- `ipfs.tech` root range: Rust `1016/1206ms` vs Kubo `745/1261ms`.
+- `ipfs.tech` page assets: Rust root `3/4ms`, assets `133/485ms`; Kubo root
+  `2/2ms`, assets `358/522ms`.
+- `ipfs.tech` hero range: Rust `131/243ms` vs Kubo `438/588ms`.
+- Wikipedia root still lost: Rust `744/1076ms` vs Kubo `523/712ms`.
+- Resource max: Rust `52020KiB` RSS and `36` FDs vs Kubo `169048KiB` RSS and
+  `261` FDs.
+- HTTP provider block fetch p50/p95/max: `180/518/705ms`.
+- Bitswap block fetch p50/p95/max: `127/617/1430ms`.
+- Delegated provider lookup p50/p95/max: `18/55/115ms`.
+- HTTP provider fetch failures: `3`, all `http_5xx` from
+  `https://f010479.twinquasar.io/`.
+- Self-hedge skips: `3`, all
+  `server_error_fast_bitswap_fallback`.
+
+Comparison to the fresh no-env baseline in this same branch:
+
+- The flag did skip the duplicate 5xx self-hedges it was meant to skip.
+- Wikipedia did not improve enough and remained behind Kubo. Compared with the
+  fresh no-env baseline, Wikipedia median regressed (`111ms` to `744ms`) while
+  p95 was effectively unchanged/slightly worse (`1052ms` to `1076ms`).
+- `ipfs.tech` root range median regressed (`620ms` to `1016ms`), although p95
+  remained slightly below Kubo in this run.
+- `ipfs.tech` page assets remained ahead of Kubo but regressed versus no-env
+  (`82/302ms` to `133/485ms`).
+- Bitswap peer attempts increased (`286` to `367`), and Bitswap p95/max
+  worsened (`326/564ms` to `617/1430ms`).
+
+Trace interpretation:
+The lab hit the intended path, but the saved duplicate HTTP request was not the
+dominant tail. After the first HTTP `500`, the leaf still waited on an existing
+Bitswap shortcut/fetch path around `500-560ms`. The slowest requests in the lab
+run were mostly zero-HTTP `ipfs.tech` Bitswap blocks and Wikipedia root/leaf
+Bitswap path timing, not repeated HTTP self-hedge time.
+
+Decision:
+Keep the code as a disabled lab switch for future controlled comparisons, but
+do not promote it. This experiment proves that the f010479 `5xx` duplicate
+retry is real and removable, but removing it alone does not close the remaining
+Kubo gap and appears to increase Bitswap pressure in the selected r5 window.
+Future work should focus on why Kubo gets to useful Bitswap source peers faster
+for these root/leaf paths, and on adaptive source quality or session-peer reuse,
+not on this isolated single-provider `5xx` shortcut.
