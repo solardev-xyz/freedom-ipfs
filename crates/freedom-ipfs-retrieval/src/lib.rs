@@ -99,6 +99,8 @@ const BITSWAP_SESSION_PRE_LOOKUP_GRACE: Duration = Duration::from_millis(0);
 const BITSWAP_SESSION_PRE_LOOKUP_GRACE_MS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_SESSION_PRE_LOOKUP_GRACE_MS";
 const BITSWAP_SESSION_POST_LOOKUP_GRACE: Duration = Duration::from_millis(100);
+const BITSWAP_SESSION_ZERO_HTTP_POST_LOOKUP_GRACE_MS_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_SESSION_ZERO_HTTP_POST_LOOKUP_GRACE_MS";
 const BITSWAP_SESSION_MULTI_HTTP_POST_LOOKUP_GRACE_MS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_SESSION_MULTI_HTTP_POST_LOOKUP_GRACE_MS";
 // Give a recent Bitswap session peer a short chance to win before falling back
@@ -3236,6 +3238,10 @@ fn single_http_provider_base(providers: &[Provider]) -> Option<&Url> {
 }
 
 fn bitswap_session_post_lookup_grace(providers: &[Provider]) -> Duration {
+    let zero_http_override = std::env::var_os(BITSWAP_SESSION_ZERO_HTTP_POST_LOOKUP_GRACE_MS_ENV);
+    let zero_http_override = zero_http_override
+        .as_ref()
+        .map(|value| value.to_string_lossy());
     let single_http_override =
         std::env::var_os(BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS_ENV);
     let single_http_override = single_http_override
@@ -3248,6 +3254,7 @@ fn bitswap_session_post_lookup_grace(providers: &[Provider]) -> Duration {
 
     bitswap_session_post_lookup_grace_from_env_value(
         providers,
+        zero_http_override.as_deref(),
         single_http_override.as_deref(),
         multi_http_override.as_deref(),
     )
@@ -3255,11 +3262,14 @@ fn bitswap_session_post_lookup_grace(providers: &[Provider]) -> Duration {
 
 fn bitswap_session_post_lookup_grace_from_env_value(
     providers: &[Provider],
+    zero_http_grace_ms: Option<&str>,
     single_http_grace_ms: Option<&str>,
     multi_http_grace_ms: Option<&str>,
 ) -> Duration {
     match provider_http_url_count(providers) {
-        0 => BITSWAP_SESSION_POST_LOOKUP_GRACE,
+        0 => {
+            post_lookup_grace_from_env_value(zero_http_grace_ms, BITSWAP_SESSION_POST_LOOKUP_GRACE)
+        }
         1 => post_lookup_grace_from_env_value(
             single_http_grace_ms,
             BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE,
@@ -10441,19 +10451,48 @@ mod bitswap_tests {
         .unwrap()];
 
         assert_eq!(
-            bitswap_session_post_lookup_grace_from_env_value(&single_http, Some("125"), Some("0")),
+            bitswap_session_post_lookup_grace_from_env_value(
+                &single_http,
+                Some("25"),
+                Some("125"),
+                Some("0")
+            ),
             Duration::from_millis(125)
         );
         assert_eq!(
-            bitswap_session_post_lookup_grace_from_env_value(&multi_http, Some("125"), None),
+            bitswap_session_post_lookup_grace_from_env_value(
+                &multi_http,
+                Some("25"),
+                Some("125"),
+                None
+            ),
             BITSWAP_SESSION_POST_LOOKUP_GRACE
         );
         assert_eq!(
-            bitswap_session_post_lookup_grace_from_env_value(&multi_http, Some("125"), Some("0")),
+            bitswap_session_post_lookup_grace_from_env_value(
+                &multi_http,
+                Some("25"),
+                Some("125"),
+                Some("0")
+            ),
             Duration::from_millis(0)
         );
         assert_eq!(
-            bitswap_session_post_lookup_grace_from_env_value(&bitswap_only, Some("125"), Some("0")),
+            bitswap_session_post_lookup_grace_from_env_value(
+                &bitswap_only,
+                Some("25"),
+                Some("125"),
+                Some("0")
+            ),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            bitswap_session_post_lookup_grace_from_env_value(
+                &bitswap_only,
+                Some("not-a-number"),
+                Some("125"),
+                Some("0")
+            ),
             BITSWAP_SESSION_POST_LOOKUP_GRACE
         );
     }

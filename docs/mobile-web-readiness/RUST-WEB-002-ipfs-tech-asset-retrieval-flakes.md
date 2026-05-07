@@ -30842,3 +30842,155 @@ or top-level session peer reuse. The next useful work should keep the global
 pool available but add better escape hatches for slow trusted shortcuts, or seed
 candidate peers from provider/source quality rather than siloing the session by
 top-level path.
+
+## 2026-05-07 - Current Head Selected R5 After Scoped-Peer Lab
+
+Purpose:
+Re-establish a same-window no-env baseline after the top-level scoped session
+peer lab was committed. The lab is disabled by default, so this should describe
+the current default branch behavior before the next tuning attempt.
+
+Command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-selected-r5-20260507T070228Z-trace.jsonl \
+  --comparison-output /tmp/current-head-selected-r5-20260507T070228Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1306/1490ms` vs Kubo `2805/2890ms`.
+- Vitalik range: Rust `124/129ms` vs Kubo `2152/2601ms`.
+- `ipfs.tech` root range: Rust `967/1688ms` vs Kubo `1126/2917ms`.
+- `ipfs.tech` page assets: Rust root `3/4ms`, assets `179/416ms`; Kubo root
+  `2/2ms`, assets `340/558ms`.
+- `ipfs.tech` hero range: Rust `104/126ms` vs Kubo `428/517ms`.
+- Wikipedia root: Rust `564/782ms` vs Kubo `508/927ms`.
+- Resource max: Rust `50824KiB` RSS and `31` FDs vs Kubo `292376KiB` RSS and
+  `611` FDs.
+- HTTP provider block fetch p50/p95/max: `179/464/772ms`.
+- Bitswap block fetch p50/p95/max: `105/797/866ms`.
+- Bitswap peer attempts: `301`.
+- Request classifications included `15` `zero_http_provider_bitswap`, `10`
+  `cold_bitswap_peer_expand`, `10` `zero_http_provider_cold_bitswap`, `6`
+  `top_level_zero_http_provider_bitswap`, and `1`
+  `top_level_zero_http_provider_cold_bitswap`.
+
+Interpretation:
+The branch is currently ahead of Kubo on almost every selected metric while
+using far less memory and far fewer file descriptors. The visible Kubo edge in
+this window is narrow: Wikipedia median was slightly slower for Rust, although
+Rust won Wikipedia p95. The slowest Rust request was an `ipfs.tech` range root
+at `1687ms`; it was a top-level zero-HTTP cold Bitswap path with no session
+peers, but Kubo was still slower on that case p95.
+
+Decision:
+Use this as the immediate no-env comparison for the next small tuning lab.
+Because the remaining gap is noisy and narrow, any candidate must preserve the
+`ipfs.tech` asset/root wins and the RSS/FD advantage, not merely improve one
+Wikipedia sample.
+
+## 2026-05-07 - Reject: Zero-HTTP Post-Lookup Grace 25ms
+
+Hypothesis:
+Zero-HTTP provider sets still pay a fixed `100ms` post-lookup wait for recent
+Bitswap session peers before broad provider fetch starts. Single-HTTP and
+multi-HTTP grace already have env overrides, but zero-HTTP does not. A shorter
+zero-HTTP grace may trim the remaining top-level Wikipedia median/tail without
+the larger fanout cost of full zero-HTTP post-lookup racing.
+
+Code:
+
+- Added disabled env knob:
+  `FREEDOM_IPFS_BITSWAP_SESSION_ZERO_HTTP_POST_LOOKUP_GRACE_MS=<millis>`.
+- The knob only affects provider lookups with zero HTTP providers.
+- Default behavior is unchanged: zero-HTTP post-lookup grace remains `100ms`
+  when the env var is absent or invalid.
+- Existing single-HTTP and multi-HTTP grace knobs keep their prior behavior.
+
+Focused validation:
+
+```sh
+cargo test -p freedom-ipfs-retrieval post_lookup_grace_overrides_are_http_width_scoped
+cargo fmt --all
+cargo fmt --all --check
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Result:
+
+- Focused grace-width test passed.
+- Formatting and focused retrieval clippy passed.
+
+Live command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_BITSWAP_SESSION_ZERO_HTTP_POST_LOOKUP_GRACE_MS=25 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-grace25-selected-r5-20260507T071344Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-grace25-selected-r5-20260507T071344Z.json
+```
+
+Live result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1199/1481ms` vs Kubo `3002/3570ms`.
+- Vitalik range: Rust `104/134ms` vs Kubo `2652/2764ms`.
+- `ipfs.tech` root range: Rust `984/1611ms` vs Kubo `1324/1540ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `186/343ms`; Kubo root
+  `2/4ms`, assets `355/522ms`.
+- `ipfs.tech` hero range: Rust `147/286ms` vs Kubo `417/469ms`.
+- Wikipedia root regressed: Rust `596/1203ms` vs Kubo `511/535ms`.
+- Resource max: Rust `51168KiB` RSS and `31` FDs vs Kubo `199872KiB` RSS and
+  `223` FDs.
+- HTTP provider block fetch p50/p95/max: `183/492/764ms`.
+- Bitswap block fetch p50/p95/max: `242/670/911ms`.
+- Bitswap peer attempts dropped to `139` from `301` in the no-env baseline.
+- Zero-HTTP post-lookup waits used the new `25ms` budget: `6` timeouts with
+  p50/p95/max around `26ms`.
+
+Trace interpretation:
+The shorter wait reduced Bitswap fanout, but it did not improve the target. The
+slowest Wikipedia request still spent about `1201ms`, with repeated
+`bitswap_dnsaddr_expand`, `bitswap_dns_multiaddr_expand`, and two Bitswap
+fetches. `ipfs.tech` page assets remained ahead of Kubo, but `ipfs.tech` root
+p95 slightly lost to Kubo in this window (`1611ms` vs `1540ms`), and Wikipedia
+p95 became much worse than both Kubo and the no-env baseline.
+
+Decision:
+Keep the zero-HTTP grace override as a disabled diagnostic knob, but do not
+promote `25ms` or a shorter static default. The result reinforces the earlier
+zero-HTTP race finding: static impatience can reduce peer attempts, but the
+remaining problem is source quality and provider expansion choice, not simply
+the `100ms` wait. Future work should use the knob only for controlled
+comparisons, while focusing on adaptive peer/source selection.
