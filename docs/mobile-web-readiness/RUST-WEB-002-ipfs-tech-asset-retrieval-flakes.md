@@ -35693,3 +35693,48 @@ Current no-env status after this sweep:
   are all at parity or better than Kubo.
 - Remaining actionable work has shifted to warm-session semantics and
   range-then-full reuse, not broad preconnect or static Bitswap fanout.
+
+Page-first DAICO isolate:
+
+To confirm the ordering hypothesis, a temporary two-entry corpus was generated
+at `/tmp/daico-page-then-range-corpus-20260507.json` with
+`daicowtf-page-assets` before `daicowtf-root-html-range`.
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --corpus /tmp/daico-page-then-range-corpus-20260507.json \
+  --case daicowtf-page-assets \
+  --case daicowtf-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/daico-page-then-range-r5-20260507Tisolate-trace.jsonl \
+  --comparison-output /tmp/daico-page-then-range-r5-20260507Tisolate.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5`.
+- DAICO page-first root p50/p95: Rust `1211/1517ms`; Kubo `2891/3175ms`.
+- DAICO range after full page: Rust `3/3ms`; Kubo `2/2ms`.
+- Resource max: Rust `35508KiB` RSS and `15` FDs vs Kubo `104376KiB` RSS and
+  `119` FDs.
+- Trace shape:
+  - HTTP-provider blocks: `15`, p50/p95/max `423/804/804ms`.
+  - No Bitswap block fetches.
+
+Decision:
+
+This confirms the broad-corpus DAICO Kubo win is ordering-specific. Kubo's
+range-first request appears to warm enough of the file for an immediate full
+HTML read to complete from local state, while Rust's page-first full read also
+warms its later range. Since Rust wins the user-like page-first case and only
+loses the artificial range-first/full-read sequence, do not add unconditional
+range prefetch. Any future optimization here should be explicit and narrow, for
+example HTML-only small-prefix range warming with strict byte and resource
+limits.
