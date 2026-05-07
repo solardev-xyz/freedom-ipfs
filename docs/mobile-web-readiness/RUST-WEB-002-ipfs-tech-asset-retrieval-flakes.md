@@ -33531,3 +33531,115 @@ lesson matches the direct-fast-wave result: improving the first top-level
 zero-HTTP Bitswap block alone is insufficient when the visible request also
 needs follow-on UnixFS/index blocks. Continue toward page-load/session-level
 multi-block behavior instead.
+
+## 2026-05-07 - Reject: Raw Link Tsize Header Shortcut
+
+Hypothesis:
+
+UnixFS directory links often carry `Tsize`. For raw linked files, that can be
+the raw block length. A gateway lab could trust that size for raw links and
+avoid fetching the child block before response headers, potentially reducing
+root/subresource TTFB while the body stream fetches the block later.
+
+Trial code:
+
+- Added an uncommitted env-gated prototype:
+  `FREEDOM_IPFS_ENABLE_UNIXFS_RAW_LINK_TSIZE_FILE_SIZE_HINT=1`.
+- The prototype let the gateway resolve raw linked files with a size hint and
+  use that hint for `Content-Length`/ETag setup.
+- Added trace field `file_size_source=raw_link_tsize|file_size_cid`.
+- Default behavior was unchanged when the env var was absent.
+- The prototype code and tests were reverted after the live runs below.
+
+Focused validation while the prototype existed:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-unixfs --lib
+cargo test -p freedom-ipfs-gateway raw_index_link_tsize_can_avoid_pre_header_child_fetch --lib
+cargo test -p freedom-ipfs-gateway serves_directory_index_with_path_based_mime_type --lib
+cargo clippy -p freedom-ipfs-unixfs -p freedom-ipfs-gateway --all-targets -- -D warnings
+git diff --check
+```
+
+Validation passed.
+
+Opt-in command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_ENABLE_UNIXFS_RAW_LINK_TSIZE_FILE_SIZE_HINT=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/raw-link-tsize-focused-r10-20260507Tlive-trace.jsonl \
+  --comparison-output /tmp/raw-link-tsize-focused-r10-20260507Tlive.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `792/1372ms`, assets `186/371ms`;
+  Kubo root `1734/4021ms`, assets `202/964ms`.
+- Wikipedia root: Rust `645/1108ms` vs Kubo `374/1625ms`.
+- Resource max: Rust `48832KiB` RSS and `29` FDs vs Kubo `309324KiB` RSS and
+  `705` FDs.
+- Trace showed the prototype participated heavily for `ipfs.tech`:
+  `330` `file_size_source=raw_link_tsize` events and `10`
+  `file_size_source=file_size_cid` events.
+- The Wikipedia `/index.html` leaf still used `file_size_cid`; its
+  `unixfs_index_lookup` elapsed values included `622ms`, `240ms`, `239ms`,
+  and similar network-bound fetches.
+- The work shifted into response bodies: `gateway_direct_body` max elapsed
+  became `842ms` in the opt-in run.
+
+Immediate no-env control command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/raw-link-tsize-noenv-focused-r10-20260507Tlive-trace.jsonl \
+  --comparison-output /tmp/raw-link-tsize-noenv-focused-r10-20260507Tlive.json
+```
+
+No-env result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `556/1034ms`, assets `186/314ms`;
+  Kubo root `1502/3194ms`, assets `115/757ms`.
+- Wikipedia root: Rust `469/1513ms` vs Kubo `125/1009ms`.
+- Resource max: Rust `49536KiB` RSS and `26` FDs vs Kubo `279996KiB` RSS and
+  `394` FDs.
+- No-env trace had `340` `file_size_source=file_size_cid` events and
+  `gateway_direct_body` max elapsed stayed at `0ms` because the raw child block
+  fetch happened before the response body path.
+
+Decision:
+
+Do not keep the raw-link `Tsize` shortcut. It reduced pre-header file-size
+fetches for many `ipfs.tech` raw links, but it mostly moved the same network
+work into the body stream. Same-window `ipfs.tech` root and asset p95 regressed,
+and the target Wikipedia leaf did not carry a useful raw-link size hint in this
+path. This is a metric-shifting TTFB optimization rather than a real page-load
+speed win for the current gap.
+
+Future gateway work should treat header-only latency wins skeptically and
+compare total/body timing as well as TTFB. The remaining useful direction is
+still retrieval/source quality for the Wikipedia root/leaf fetches, not serving
+headers earlier while the body waits on the same block.
