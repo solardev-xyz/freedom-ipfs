@@ -29990,3 +29990,65 @@ Wikipedia p50/p95 (`638/775ms` vs `776/1150ms`). It still did not beat Kubo on
 Wikipedia, and the r5 sample is too small to treat as a default candidate. The
 next useful variant should keep this request-class scoping and add page/root
 source evidence, rather than allowing global dominance to steer subresources.
+
+## 2026-05-07 - Reject: Top-Level Dominant Peer Plus DNS Expansion Cache
+
+Hypothesis:
+The DNS expansion cache had an earlier unclear Wikipedia win, and the
+top-level dominant-peer gate reduced Bitswap fanout. Combining both lab flags
+may improve the zero-HTTP Wikipedia root tail while preserving strong page-asset
+behavior.
+
+Command:
+
+```sh
+timeout 3000s env \
+  FREEDOM_IPFS_ENABLE_BITSWAP_TOP_LEVEL_DOMINANT_SESSION_PEER=1 \
+  FREEDOM_IPFS_ENABLE_BITSWAP_DNS_EXPANSION_CACHE=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/topdominant-dnscache-broader-selected-r5-20260507T054128Z-trace.jsonl \
+  --comparison-output /tmp/topdominant-dnscache-broader-selected-r5-20260507T054128Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1212/1461ms` vs Kubo `2974/3011ms`.
+- Vitalik range: Rust `101/108ms` vs Kubo `2611/2662ms`.
+- `ipfs.tech` root range: Rust `577/840ms` vs Kubo `1081/6168ms`.
+- `ipfs.tech` page assets: Rust root `3/4ms`, assets `100/281ms`; Kubo root
+  `2/76ms`, assets `357/438ms`.
+- `ipfs.tech` hero range: Rust `128/162ms` vs Kubo `443/549ms`.
+- Wikipedia root still lost badly at p95: Rust `618/1168ms` vs Kubo
+  `508/573ms`.
+- Resource max: Rust `50200KiB` RSS and `35` FDs vs Kubo `325064KiB` RSS and
+  `716` FDs.
+- DNS expansion cache marker count was `10`: `12` DNSADDR requests,
+  `3` DNSADDR hits, `9` DNSADDR misses; `5` DNS-IP requests, `1` DNS-IP hit,
+  `4` DNS-IP misses.
+- Wikipedia still paid repeated DNSADDR work: the slowest Wikipedia request had
+  `20` `bitswap_dnsaddr_expand` events and `4`
+  `bitswap_dominant_session_peer` events.
+
+Decision:
+Reject this combination as a Wikipedia fix. It produced excellent `ipfs.tech`
+numbers in this window, but the target gap remained: Wikipedia p95 was slightly
+worse than the immediate no-env reference (`1168ms` vs `1150ms`) and much worse
+than Kubo (`573ms`). DNS cache hits did occur, so the plumbing is real, but the
+remaining slow path is not solved by caching DNS expansion alone. Future
+Wikipedia work should inspect why Kubo chooses or reaches useful source peers
+faster after provider lookup, not simply cache expanded provider addresses.
