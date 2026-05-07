@@ -36891,3 +36891,117 @@ top-level gateway request only, zero HTTP providers only, high provider count,
 Bitswap candidates present, and only around the non-racing post-lookup shortcut
 wait. Keep the rollback env documented for fast reversal if a longer corpus
 finds a top-level zero-HTTP regression.
+
+## 2026-05-07 Broaden: Promoted Zero-HTTP DNS Prefetch Corpus
+
+Purpose:
+
+Run a broader same-window Rust-vs-Kubo corpus after promoting zero-HTTP
+post-lookup DNS prefetch to default. The goal was to verify that the promotion
+still holds outside the focused guardrail and to identify the next real
+Kubo-win shape before starting another behavior experiment.
+
+Command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-root-html-range \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-page-assets-cid-direct \
+  --case ipfs-tech-developers-hero-range \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 420 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/promoted-zero-http-postlookup-dns-prefetch-broad-corpus-r5-20260507T174508Z-trace.jsonl \
+  --comparison-output /tmp/promoted-zero-http-postlookup-dns-prefetch-broad-corpus-r5-20260507T174508Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5` for every case.
+- Overall run total: Rust `8151/10872ms` vs Kubo `19048/20645ms`.
+- Resource max: Rust `52936KiB` RSS and `28` FDs vs Kubo `305448KiB`
+  RSS and `519` FDs.
+- DAICO range: Rust `860/1459ms` vs Kubo `2929/3229ms`.
+- Vitalik range: Rust `114/143ms` vs Kubo `1794/3075ms`.
+- `ipfs.tech` root range: Rust `842/948ms` vs Kubo `1340/2410ms`.
+- `ipfs.tech` page assets: root Rust `3/4ms` vs Kubo `4/166ms`; assets
+  Rust `130/396ms` vs Kubo `378/570ms`.
+- `ipfs.tech` CID-direct hot-cache assets: Rust `2/3ms` vs Kubo `1/2ms`.
+- `ipfs.tech` hero prefix range: Rust `139/191ms` vs Kubo `361/578ms`.
+- `ipfs.tech` hero middle/suffix/head were millisecond-level ties or Rust wins.
+- Wikipedia root: Rust `260/1111ms` vs Kubo `447/716ms`.
+
+Trace summary:
+
+- Block sources: HTTP provider `155`, Bitswap `60`.
+- HTTP-provider block fetch p50/p95/max: `191/608/879ms`.
+- Bitswap block fetch p50/p95/max: `83/338/521ms`.
+- Delegated provider lookups: `207`, all successful; zero HTTP `12`, single
+  HTTP `105`, multi HTTP `90`.
+- HTTP-provider races: `194`; single-provider successes p50/p95/max
+  `189/577/655ms`, multi-provider successes `64/224/622ms`.
+- Provider latency remains provider-specific:
+  `dag.w3s.link` `64/139/278ms`, `ipfs-bridge.sia.dev` `184/530/655ms`,
+  `gateway-v3.pinata.cloud` `430/603/603ms`,
+  `trustless.filebase.io` `26/70/70ms`, and `f010479.twinquasar.io`
+  `0/3` successes with `500`-class failures around `64-68ms`.
+- Zero-HTTP request classifications: `12` `zero_http_provider_bitswap`,
+  `6` `zero_http_provider_cold_bitswap`, and `3`
+  `top_level_zero_http_provider_bitswap`.
+- Zero-HTTP provider Bitswap request latency: p50/p95/max `253/1109/1109ms`.
+- Top-level zero-HTTP provider Bitswap request latency: p50/p95/max
+  `453/1109/1109ms`.
+- The zero-HTTP DNS-prefetch default fired in the broad trace without env:
+  `3` `zero_http_post_lookup_dns_prefetch_start` events and `2` successful
+  `zero_http_post_lookup_dns_prefetch_result` events.
+
+Remaining Kubo-win shapes from this broad run:
+
+- DAICO page root is an ordering artifact in this corpus: `daicowtf-root-html-range`
+  runs first and warms Kubo's repo for `daicowtf-page-assets`, so Kubo reports
+  `2/2ms` while Rust reports `412/458ms`. Earlier page-first samples showed
+  Rust winning the user-like cold page load. Do not treat this as a DAICO
+  retrieval regression without a page-first same-window recheck.
+- CID-direct `ipfs.tech` hot-cache assets are now only millisecond noise:
+  Rust `2/3ms` vs Kubo `1/2ms`.
+- Wikipedia p50 still favors Rust, but Kubo wins p95 in this sample. The
+  slowest Rust request was process `2383750`, request `75`, elapsed `1109ms`.
+  The root CID
+  `bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze` had zero HTTP
+  providers and was rescued by the promoted DNS-prefetch path: prefetch start,
+  post-lookup wait timeout at `102ms`, DNS/provider expansion, Bitswap fetch
+  from candidate index `4`, and root `block_fetch_total=410ms`.
+- The slow part of that Wikipedia request was the follow-on `/index.html` CID
+  `bafkreicr5w6i2f3m664a2fnl4vhtg3s6dhhk6n5hrf3gqzcf7v5bu6b7te`.
+  Delegated routing returned `64` providers with `2` HTTP providers.
+  `f010479.twinquasar.io` failed quickly with HTTP `500`, while
+  `ipfs-bridge.sia.dev` succeeded only after about `620ms`; the
+  `http_provider_race_result` took `622ms`, and that block's
+  `block_fetch_total` was `688ms`.
+- The `bitswap_session_shortcut_post_lookup_race` event for the slow
+  `/index.html` block reported `outcome=provider_won`,
+  `provider_win_grace_outcome=disabled`, `provider_count=64`, and
+  `http_provider_count=2`. This is a different bottleneck than the
+  zero-HTTP root gap closed by the promotion.
+
+Decision:
+
+Keep the promoted default. The broad corpus confirms the branch still beats
+Kubo overall while using a fraction of Kubo's RSS and FDs. Do not start another
+generic zero-HTTP grace or direct-`WANT_BLOCK` experiment from this evidence.
+The next useful hypothesis should target one of the current shapes directly:
+slow single/multi HTTP-provider leaves after a failing provider, or
+page-scoped source quality for the recurring `ipfs.tech` zero-HTTP child CIDs.
