@@ -138,6 +138,11 @@ const ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_ENV: &str =
     "FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK";
 const BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS";
+const BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS";
+const BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_MIN_PROVIDERS_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_MIN_PROVIDERS";
+const BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_MIN_PROVIDERS: usize = 32;
 const ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP_ENV: &str =
     "FREEDOM_IPFS_ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP";
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2590,8 +2595,14 @@ impl HttpRetriever {
         let gateway_subresource = context
             .as_ref()
             .is_some_and(RetrievalRequestContext::gateway_subresource);
+        let zero_http_direct_want_block_limit =
+            bitswap_zero_http_direct_want_block_peers(providers.len(), context);
         let zero_http_direct_want_block_peer_count =
-            maybe_force_zero_http_direct_want_block_peers(providers, &mut peers, context);
+            maybe_force_zero_http_direct_want_block_peers_with_limit(
+                providers,
+                &mut peers,
+                zero_http_direct_want_block_limit,
+            );
         let trusted_want_have_probe_count =
             maybe_force_trusted_bitswap_want_have_probes(&mut peers);
         let addr_stats = bitswap_peer_addr_stats(&peers);
@@ -2606,6 +2617,13 @@ impl HttpRetriever {
             trusted_peer_count,
             gateway_subresource,
             zero_http_direct_want_block_peer_count,
+            zero_http_direct_want_block_limit = zero_http_direct_want_block_limit
+                .map(|limit| limit as i64)
+                .unwrap_or(-1),
+            zero_http_direct_want_block_min_provider_count =
+                bitswap_high_provider_zero_http_direct_want_block_min_providers()
+                    .map(|min_provider_count| min_provider_count as i64)
+                    .unwrap_or(-1),
             trusted_want_have_probe_count,
             trusted_direct_want_block_limit = bitswap_trusted_direct_want_block_peers()
                 .map(|limit| limit as i64)
@@ -4165,6 +4183,7 @@ fn zero_http_post_lookup_race_enabled() -> bool {
 }
 
 fn bitswap_zero_http_direct_want_block_peers(
+    provider_count: usize,
     context: Option<RetrievalRequestContext>,
 ) -> Option<usize> {
     bitswap_zero_http_direct_want_block_peers_from_values(
@@ -4172,6 +4191,11 @@ fn bitswap_zero_http_direct_want_block_peers(
         std::env::var_os(BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS_ENV)
             .as_deref()
             .and_then(|value| value.to_str()),
+        std::env::var_os(BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+        bitswap_high_provider_zero_http_direct_want_block_min_providers(),
+        provider_count,
         context,
     )
 }
@@ -4185,9 +4209,19 @@ fn bitswap_zero_http_direct_want_block_peers_from_env_value(value: Option<&str>)
 fn bitswap_zero_http_direct_want_block_peers_from_values(
     subresource_enabled: bool,
     override_value: Option<&str>,
+    high_provider_override_value: Option<&str>,
+    high_provider_min_providers: Option<usize>,
+    provider_count: usize,
     context: Option<RetrievalRequestContext>,
 ) -> Option<usize> {
     bitswap_zero_http_direct_want_block_peers_from_env_value(override_value).or_else(|| {
+        if high_provider_min_providers.is_some_and(|minimum| provider_count >= minimum) {
+            if let Some(limit) = bitswap_zero_http_direct_want_block_peers_from_env_value(
+                high_provider_override_value,
+            ) {
+                return Some(limit);
+            }
+        }
         if !subresource_enabled {
             return None;
         }
@@ -4195,6 +4229,18 @@ fn bitswap_zero_http_direct_want_block_peers_from_values(
             .filter(RetrievalRequestContext::gateway_subresource)
             .map(|_| BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS)
     })
+}
+
+fn bitswap_high_provider_zero_http_direct_want_block_min_providers() -> Option<usize> {
+    std::env::var_os(BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS_ENV)?;
+    Some(
+        std::env::var_os(BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_MIN_PROVIDERS_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_MIN_PROVIDERS),
+    )
 }
 
 fn bitswap_session_shortcut_grace() -> Duration {
@@ -5951,18 +5997,6 @@ async fn bitswap_peers_with_quality_using_caches_with_options(
 
     peers.truncate(MAX_BITSWAP_PEERS_PER_BLOCK);
     BitswapProviderCandidates { peers, quality }
-}
-
-fn maybe_force_zero_http_direct_want_block_peers(
-    providers: &[Provider],
-    peers: &mut [BitswapPeer],
-    context: Option<RetrievalRequestContext>,
-) -> usize {
-    maybe_force_zero_http_direct_want_block_peers_with_limit(
-        providers,
-        peers,
-        bitswap_zero_http_direct_want_block_peers(context),
-    )
 }
 
 fn maybe_force_zero_http_direct_want_block_peers_with_limit(
@@ -10102,13 +10136,18 @@ mod bitswap_tests {
             Some(5)
         );
         assert_eq!(
-            bitswap_zero_http_direct_want_block_peers_from_values(false, None, None),
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                false, None, None, None, 64, None
+            ),
             None
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
                 false,
                 None,
+                None,
+                None,
+                64,
                 Some(RetrievalRequestContext::gateway_request(Some(1))),
             ),
             None
@@ -10117,6 +10156,9 @@ mod bitswap_tests {
             bitswap_zero_http_direct_want_block_peers_from_values(
                 true,
                 None,
+                None,
+                None,
+                64,
                 Some(RetrievalRequestContext::gateway_request(Some(1))),
             ),
             Some(BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS)
@@ -10125,6 +10167,9 @@ mod bitswap_tests {
             bitswap_zero_http_direct_want_block_peers_from_values(
                 true,
                 None,
+                None,
+                None,
+                64,
                 Some(RetrievalRequestContext::gateway_request(None)),
             ),
             None
@@ -10133,6 +10178,9 @@ mod bitswap_tests {
             bitswap_zero_http_direct_want_block_peers_from_values(
                 false,
                 Some("5"),
+                None,
+                None,
+                64,
                 Some(RetrievalRequestContext::gateway_request(None)),
             ),
             Some(5)
@@ -10141,9 +10189,45 @@ mod bitswap_tests {
             bitswap_zero_http_direct_want_block_peers_from_values(
                 true,
                 Some("5"),
+                Some("8"),
+                Some(32),
+                64,
                 Some(RetrievalRequestContext::gateway_request(Some(1))),
             ),
             Some(5)
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                false,
+                None,
+                Some("8"),
+                Some(32),
+                64,
+                Some(RetrievalRequestContext::gateway_request(None)),
+            ),
+            Some(8)
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                false,
+                None,
+                Some("8"),
+                Some(32),
+                16,
+                Some(RetrievalRequestContext::gateway_request(None)),
+            ),
+            None
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                true,
+                None,
+                Some("bad"),
+                Some(32),
+                64,
+                Some(RetrievalRequestContext::gateway_request(Some(1))),
+            ),
+            Some(BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS)
         );
     }
 

@@ -32229,3 +32229,148 @@ Keep. This is behavior-neutral harness instrumentation. It lowers the cost of
 future Bitswap source-quality experiments by putting probe outcomes in the same
 summary view as root/asset latency, provider lookups, Bitswap sources, peer
 attempts, and slow CID/request classifications.
+
+## 2026-05-07 - Reject: High-Provider Zero-HTTP Direct WANT_BLOCK Gate
+
+Hypothesis:
+Previous zero-HTTP direct `WANT_BLOCK` lab knobs were too broad: they applied to
+all zero-HTTP Bitswap fetches and hurt `ipfs.tech` even when they helped one
+focused Wikipedia sample. The latest no-env baseline showed Wikipedia's cold
+zero-HTTP path with `64` providers, while typical `ipfs.tech` zero-HTTP paths
+were lower. A disabled high-provider gate might target dense provider sets
+without changing the common page-asset path.
+
+Code:
+
+- Added
+  `FREEDOM_IPFS_BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=<n>`.
+- Added
+  `FREEDOM_IPFS_BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_MIN_PROVIDERS=<n>`,
+  defaulting to `32` only when the high-provider peer knob is set.
+- The existing broad override
+  `FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=<n>` still takes
+  precedence.
+- The existing subresource lab flag still behaves as before when the
+  high-provider override is absent or invalid.
+- Added `bitswap_peer_expand` trace fields:
+  - `zero_http_direct_want_block_limit`
+  - `zero_http_direct_want_block_min_provider_count`
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval zero_http_direct --lib -- --nocapture
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting and whitespace checks passed.
+- Focused zero-HTTP direct tests passed: `2` passed.
+- Clippy for `freedom-ipfs-retrieval` passed with `-D warnings`.
+
+No-env focused control:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-focused-r10-20260507T093240Z-trace.jsonl \
+  --comparison-output /tmp/current-head-focused-r10-20260507T093240Z.json
+```
+
+Control result:
+
+- Rust and Kubo passed `10/10` for both focused cases.
+- `ipfs.tech` page assets: Rust root `601/825ms`, assets `118/310ms`;
+  Kubo root `1679/6165ms`, assets `113/570ms`.
+- Wikipedia root: Rust `306/791ms` vs Kubo `148/507ms`.
+- Resource max: Rust `49088KiB` RSS and `28` FDs vs Kubo `313620KiB` RSS and
+  `711` FDs.
+- Block fetch source latency:
+  - HTTP provider: `221` blocks, p50/p95/max `172/260/484ms`.
+  - Bitswap: `149` blocks, p50/p95/max `87/341/909ms`.
+- Request classifications included:
+  - `zero_http_provider_bitswap=21`
+  - `cold_bitswap_peer_expand=15`
+  - `zero_http_provider_cold_bitswap=15`
+  - `top_level_zero_http_provider_bitswap=11`
+  - `top_level_zero_http_provider_cold_bitswap=10`
+- Bitswap peer attempts: `442`.
+
+Opt-in high-provider direct run:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=8 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/high-provider-zero-http-direct8-focused-r10-20260507T094122Z-trace.jsonl \
+  --comparison-output /tmp/high-provider-zero-http-direct8-focused-r10-20260507T094122Z.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `10/10` for both focused cases.
+- `ipfs.tech` page assets: Rust root `722/1293ms`, assets `187/317ms`;
+  Kubo root `1468/2699ms`, assets `128/665ms`.
+- Wikipedia root: Rust `955/1064ms` vs Kubo `146/457ms`.
+- Resource max: Rust `49068KiB` RSS and `25` FDs vs Kubo `336796KiB` RSS and
+  `622` FDs.
+- Block fetch source latency:
+  - HTTP provider: `338` blocks, p50/p95/max `185/304/1223ms`.
+  - Bitswap: `32` blocks, p50/p95/max `397/613/633ms`.
+- Request classifications included:
+  - `cold_bitswap_peer_expand=11`
+  - `zero_http_provider_bitswap=11`
+  - `zero_http_provider_cold_bitswap=11`
+  - `top_level_zero_http_provider_bitswap=10`
+  - `top_level_zero_http_provider_cold_bitswap=10`
+- Bitswap peer attempts dropped from `442` to `177`, but Bitswap source latency
+  worsened sharply.
+- Bitswap source request modes moved to direct `want_block` only in the opt-in
+  sample.
+- The high-provider gate participated on:
+  - Wikipedia root-like `64` provider paths.
+  - One `ipfs.tech` subresource with `33` providers:
+    `/ipns/ipfs.tech/_nuxt/mHWTJadT.js`.
+
+Trace interpretation:
+
+- Provider count is not a sufficient quality signal. The `32` provider
+  threshold was not exclusive to Wikipedia and also caught an `ipfs.tech`
+  subresource.
+- Wider direct `WANT_BLOCK` reduced outgoing Bitswap attempt count but did not
+  pick better sources. It made the Wikipedia target much worse and widened the
+  `ipfs.tech` asset median loss.
+- This supports the broader pattern from earlier direct-width experiments:
+  source selection needs delivery evidence, peer/provider quality, or
+  page-session locality. Static direct `WANT_BLOCK` width, even with provider
+  count gating, is too blunt.
+
+Decision:
+Do not promote. Keep the disabled/env-gated lab knob and trace fields for now
+because the default path is unchanged and the instrumentation documents a
+specific rejected discriminator. Do not use
+`FREEDOM_IPFS_BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=8` with
+the default `32` provider threshold as a tuning candidate. The next useful work
+should focus on source quality from actual delivery evidence rather than
+increasing direct `WANT_BLOCK` fanout.
