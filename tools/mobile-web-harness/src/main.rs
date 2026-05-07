@@ -2077,14 +2077,16 @@ fn print_trace_slow_details(trace: &TraceSummary) {
             };
             let correlation = format_request_correlation(request);
             let classifications = format_request_classification_details(request);
+            let source_details = format_request_source_details(request);
             println!(
-                "    {}: {}ms status={} request_id={}{}{} events={} max_event={}ms phases={} cids={}",
+                "    {}: {}ms status={} request_id={}{}{}{} events={} max_event={}ms phases={} cids={}",
                 request.path,
                 request.elapsed_ms,
                 status,
                 request_id,
                 correlation,
                 classifications,
+                source_details,
                 request.event_count,
                 request.max_event_ms,
                 phases,
@@ -5800,7 +5802,7 @@ impl CaseAggregate {
     }
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 struct LatencySummary {
     count: usize,
     p50_ms: Option<u128>,
@@ -7479,6 +7481,13 @@ struct TraceRequestAggregate {
     event_count: usize,
     phases: Vec<TraceValueCount>,
     cids: Vec<TraceValueCount>,
+    block_sources: Vec<TraceValueCount>,
+    http_provider_fetches: usize,
+    http_provider_fetch_successes: usize,
+    http_provider_fetch_failures: usize,
+    http_provider_fetch_elapsed_ms: LatencySummary,
+    http_provider_fetch_providers: Vec<TraceValueCount>,
+    http_provider_fetch_error_classes: Vec<TraceValueCount>,
     bitswap_source_candidate_indexes: Vec<TraceValueCount>,
     bitswap_source_request_modes: Vec<TraceValueCount>,
     bitswap_source_peers: Vec<TraceValueCount>,
@@ -7513,6 +7522,8 @@ struct TraceProgressRequestAggregate {
     status: Option<String>,
     elapsed_ms: u128,
     max_event_ms: u128,
+    block_sources: Vec<TraceValueCount>,
+    http_provider_fetch_providers: Vec<TraceValueCount>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -7536,6 +7547,13 @@ struct TraceRequestBuilder {
     event_count: usize,
     phases: BTreeMap<String, usize>,
     cids: BTreeMap<String, usize>,
+    block_sources: BTreeMap<String, usize>,
+    http_provider_fetches: usize,
+    http_provider_fetch_successes: usize,
+    http_provider_fetch_failures: usize,
+    http_provider_fetch_elapsed_values: Vec<u128>,
+    http_provider_fetch_providers: BTreeMap<String, usize>,
+    http_provider_fetch_error_classes: BTreeMap<String, usize>,
     bitswap_source_candidate_indexes: BTreeMap<String, usize>,
     bitswap_source_request_modes: BTreeMap<String, usize>,
     bitswap_source_peers: BTreeMap<String, usize>,
@@ -7561,6 +7579,13 @@ impl TraceRequestBuilder {
             event_count: 0,
             phases: BTreeMap::new(),
             cids: BTreeMap::new(),
+            block_sources: BTreeMap::new(),
+            http_provider_fetches: 0,
+            http_provider_fetch_successes: 0,
+            http_provider_fetch_failures: 0,
+            http_provider_fetch_elapsed_values: Vec::new(),
+            http_provider_fetch_providers: BTreeMap::new(),
+            http_provider_fetch_error_classes: BTreeMap::new(),
             bitswap_source_candidate_indexes: BTreeMap::new(),
             bitswap_source_request_modes: BTreeMap::new(),
             bitswap_source_peers: BTreeMap::new(),
@@ -7592,10 +7617,42 @@ impl TraceRequestBuilder {
         {
             self.delegated_zero_http_provider_lookups += 1;
         }
+        if matches!(phase, "block_fetch_total" | "block_range_batch_fetch") {
+            if let Some(source) = json_detail_string(value.get("source")) {
+                if !source.is_empty() {
+                    *self.block_sources.entry(source).or_default() += 1;
+                }
+            }
+        }
         if phase == "block_fetch_total"
             && value.get("source").and_then(|source| source.as_str()) == Some("bitswap")
         {
             self.bitswap_block_fetches += 1;
+        }
+        if phase == "http_provider_fetch" {
+            self.http_provider_fetches += 1;
+            match value.get("ok").and_then(|ok| ok.as_bool()) {
+                Some(true) => self.http_provider_fetch_successes += 1,
+                Some(false) => self.http_provider_fetch_failures += 1,
+                None => {}
+            }
+            if let Some(elapsed_ms) = elapsed_ms {
+                self.http_provider_fetch_elapsed_values.push(elapsed_ms);
+            }
+            if let Some(provider) = json_detail_string(value.get("provider")) {
+                if !provider.is_empty() {
+                    *self
+                        .http_provider_fetch_providers
+                        .entry(provider)
+                        .or_default() += 1;
+                }
+            }
+            if let Some(error) = json_detail_string(value.get("error")) {
+                *self
+                    .http_provider_fetch_error_classes
+                    .entry(http_provider_error_class(&error).to_string())
+                    .or_default() += 1;
+            }
         }
         if phase == "bitswap_fetch" && value.get("ok").and_then(|ok| ok.as_bool()) == Some(true) {
             if let Some(index) = json_detail_string(value.get("source_peer_candidate_index")) {
@@ -7669,6 +7726,17 @@ impl TraceRequestBuilder {
             event_count: self.event_count,
             phases: sorted_trace_counts(self.phases),
             cids: sorted_trace_counts(self.cids),
+            block_sources: sorted_trace_counts(self.block_sources),
+            http_provider_fetches: self.http_provider_fetches,
+            http_provider_fetch_successes: self.http_provider_fetch_successes,
+            http_provider_fetch_failures: self.http_provider_fetch_failures,
+            http_provider_fetch_elapsed_ms: LatencySummary::from_values(
+                self.http_provider_fetch_elapsed_values,
+            ),
+            http_provider_fetch_providers: sorted_trace_counts(self.http_provider_fetch_providers),
+            http_provider_fetch_error_classes: sorted_trace_counts(
+                self.http_provider_fetch_error_classes,
+            ),
             bitswap_source_candidate_indexes: sorted_trace_counts(
                 self.bitswap_source_candidate_indexes,
             ),
@@ -9444,6 +9512,8 @@ impl TraceProgressRequestGroupBuilder {
             status: request.status.clone(),
             elapsed_ms: request.elapsed_ms,
             max_event_ms: request.max_event_ms,
+            block_sources: request.block_sources.clone(),
+            http_provider_fetch_providers: request.http_provider_fetch_providers.clone(),
         });
     }
 
@@ -9958,14 +10028,16 @@ fn print_trace_progress_request_groups(trace: &TraceSummary) {
             phases
         );
         for request in group.slow_requests.iter().take(3) {
+            let source_details = format_progress_request_source_details(request);
             println!(
-                "      {}: {}ms status={} progress_id={} parent_progress_id={} max_event={}ms",
+                "      {}: {}ms status={} progress_id={} parent_progress_id={} max_event={}ms{}",
                 request.path,
                 request.elapsed_ms,
                 request.status.as_deref().unwrap_or("unknown"),
                 request.progress_request_id.as_deref().unwrap_or("-"),
                 request.parent_progress_request_id.as_deref().unwrap_or("-"),
-                request.max_event_ms
+                request.max_event_ms,
+                source_details
             );
         }
     }
@@ -10019,6 +10091,61 @@ fn format_request_classification_details(request: &TraceRequestAggregate) -> Str
         request.max_bitswap_session_peer_count,
         source_indexes,
         source_modes
+    )
+}
+
+fn format_request_source_details(request: &TraceRequestAggregate) -> String {
+    if request.block_sources.is_empty()
+        && request.http_provider_fetches == 0
+        && request.http_provider_fetch_providers.is_empty()
+        && request.http_provider_fetch_error_classes.is_empty()
+    {
+        return String::new();
+    }
+    let block_sources = if request.block_sources.is_empty() {
+        "-".to_string()
+    } else {
+        format_trace_counts(&request.block_sources)
+    };
+    let http_providers = if request.http_provider_fetch_providers.is_empty() {
+        "-".to_string()
+    } else {
+        format_trace_counts(&request.http_provider_fetch_providers)
+    };
+    let http_errors = if request.http_provider_fetch_error_classes.is_empty() {
+        "-".to_string()
+    } else {
+        format_trace_counts(&request.http_provider_fetch_error_classes)
+    };
+    format!(
+        " block_sources={} http_fetches={} ok={} fail={} http_elapsed={} http_providers={} http_errors={}",
+        block_sources,
+        request.http_provider_fetches,
+        request.http_provider_fetch_successes,
+        request.http_provider_fetch_failures,
+        request.http_provider_fetch_elapsed_ms,
+        http_providers,
+        http_errors
+    )
+}
+
+fn format_progress_request_source_details(request: &TraceProgressRequestAggregate) -> String {
+    if request.block_sources.is_empty() && request.http_provider_fetch_providers.is_empty() {
+        return String::new();
+    }
+    let block_sources = if request.block_sources.is_empty() {
+        "-".to_string()
+    } else {
+        format_trace_counts(&request.block_sources)
+    };
+    let http_providers = if request.http_provider_fetch_providers.is_empty() {
+        "-".to_string()
+    } else {
+        format_trace_counts(&request.http_provider_fetch_providers)
+    };
+    format!(
+        " block_sources={} http_providers={}",
+        block_sources, http_providers
     )
 }
 
@@ -11424,6 +11551,81 @@ mod tests {
         assert_eq!(other.root_progress_request_id.as_deref(), Some("200"));
         assert_eq!(other.request_count, 1);
         assert_eq!(other.failed_request_count, 0);
+    }
+
+    #[test]
+    fn trace_summary_attaches_sources_to_slow_requests() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-request-sources-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"request_start\",\"request_id\":1,\"path\":\"/ipns/site/app.js\",\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":42,\"cid\":\"cid-a\",\"source\":\"http_provider\",\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"http_provider_fetch\",\"elapsed_ms\":40,\"cid\":\"cid-a\",\"provider\":\"https://provider-a.example\",\"ok\":true,\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":1,\"cid\":\"cid-b\",\"source\":\"cache\",\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"http_provider_fetch\",\"elapsed_ms\":120,\"cid\":\"cid-c\",\"provider\":\"https://provider-b.example\",\"ok\":false,\"error\":\"request timed out\",\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipns/site/app.js\",\"status\":200,\"elapsed_ms\":150,\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(summary.slow_requests.len(), 1);
+        let request = &summary.slow_requests[0];
+        assert_eq!(request.path, "/ipns/site/app.js");
+        assert_eq!(
+            trace_value_count(&request.block_sources, "http_provider"),
+            1
+        );
+        assert_eq!(trace_value_count(&request.block_sources, "cache"), 1);
+        assert_eq!(request.http_provider_fetches, 2);
+        assert_eq!(request.http_provider_fetch_successes, 1);
+        assert_eq!(request.http_provider_fetch_failures, 1);
+        assert_eq!(request.http_provider_fetch_elapsed_ms.count, 2);
+        assert_eq!(request.http_provider_fetch_elapsed_ms.max_ms, Some(120));
+        assert_eq!(
+            trace_value_count(
+                &request.http_provider_fetch_providers,
+                "https://provider-a.example"
+            ),
+            1
+        );
+        assert_eq!(
+            trace_value_count(
+                &request.http_provider_fetch_providers,
+                "https://provider-b.example"
+            ),
+            1
+        );
+        assert_eq!(
+            trace_value_count(&request.http_provider_fetch_error_classes, "timeout"),
+            1
+        );
+
+        let group = &summary.progress_request_groups[0];
+        assert_eq!(group.top_level_path, "/ipns/site/");
+        assert_eq!(group.slow_requests[0].path, "/ipns/site/app.js");
+        assert_eq!(
+            trace_value_count(&group.slow_requests[0].block_sources, "http_provider"),
+            1
+        );
+        assert_eq!(
+            trace_value_count(
+                &group.slow_requests[0].http_provider_fetch_providers,
+                "https://provider-b.example"
+            ),
+            1
+        );
     }
 
     #[test]

@@ -39220,3 +39220,100 @@ asset losses are mostly still provider/body latency under page concurrency.
 Future work should target single-provider HTTP tails, source/provider choice
 for small direct bodies, and whether large streamed raw assets can safely send
 early headers without degrading error semantics.
+
+## 2026-05-07: Request-local source/provider trace diagnostics
+
+Branch:
+
+- `codex/kubo-session-performance-20260506`
+- Base before this diagnostic patch: `c0aee13`
+
+Problem:
+
+The comparison report already names the exact asset paths where Kubo wins, and
+the trace summary already has global block-source and HTTP-provider aggregates.
+However, explaining a specific slow request still required manual JSONL trace
+spelunking. That made the next optimization target ambiguous when several
+assets were slow in the same run.
+
+Change:
+
+- Extend the harness `TraceRequestAggregate` with request-local source detail:
+  - `block_sources`
+  - `http_provider_fetches`
+  - `http_provider_fetch_successes`
+  - `http_provider_fetch_failures`
+  - `http_provider_fetch_elapsed_ms`
+  - `http_provider_fetch_providers`
+  - `http_provider_fetch_error_classes`
+- Include block source and HTTP provider summaries in:
+  - `slow requests`
+  - `progress request groups`
+- Add `trace_summary_attaches_sources_to_slow_requests` to cover the JSONL
+  aggregation path.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness -- --nocapture
+cargo check -p mobile-web-harness
+```
+
+Result:
+
+- `cargo fmt --all --check`: passed
+- `cargo test -p mobile-web-harness -- --nocapture`: passed, `57` tests
+- `cargo check -p mobile-web-harness`: passed
+
+Live diagnostic run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --repeat 1 \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/request-source-diagnostics-r1-20260507T-trace.jsonl \
+  --comparison-output /tmp/request-source-diagnostics-r1-20260507T.json
+```
+
+Result:
+
+- Rust/Kubo passed `1/1`.
+- `ipfs.tech` root: Rust `1094/1095ms`; Kubo `1683/1684ms`.
+- `ipfs.tech` assets:
+  - Rust p50 TTFB/total: `215/215ms`
+  - Kubo p50 TTFB/total: `179/180ms`
+  - Rust p95 TTFB/total: `629/629ms`
+  - Kubo p95 TTFB/total: `313/313ms`
+- Resource max: Rust `52212KiB` RSS and `29` FDs vs Kubo `125060KiB`
+  RSS and `72` FDs.
+- `meaningful_kubo_wins`: `2`, both asset p95 metrics.
+
+Useful new trace signal:
+
+The slow-request output now directly explains the top Kubo wins:
+
+- `_nuxt/BXkYzPrD.js`: request `1229ms`,
+  `block_sources=http_provider=1`, `http_fetches=1 ok=1 fail=0`,
+  `http_elapsed=p50=1203ms ... max=1203ms`,
+  `http_providers=https://ipfs-bridge.sia.dev/=1`.
+- page root: request `1090ms`, `block_sources=http_provider=2`,
+  `http_elapsed=p50=309ms ... max=514ms`,
+  `http_providers=https://ipfs-bridge.sia.dev/=2`.
+- `_nuxt/DzK6mLCt.js`: request `627ms`,
+  `block_sources=http_provider=1`, `http_elapsed=max=164ms`,
+  `http_providers=https://ipfs-bridge.sia.dev/=1`.
+
+Decision:
+
+Keep this diagnostic change. It does not change retrieval behavior, but it makes
+future page-load experiments much easier to classify: slow asset lines now show
+whether the request was cache/Bitswap/HTTP-provider sourced, which provider was
+used, and whether HTTP-provider latency or some surrounding gateway/UnixFS work
+is dominating the request. The same-window sample again points at
+single-provider `ipfs-bridge.sia.dev` tails for the worst asset, while some
+medium slow requests have shorter HTTP fetch time and need separate
+gateway/UnixFS investigation.
