@@ -33009,3 +33009,159 @@ as a diagnostic because it cleanly isolates one-hit session reuse, but the
 default should remain `1` until a broader same-window sample proves the tradeoff.
 The remaining gap is not simply "trust only repeated peers"; it is picking a
 better first cold source while preserving useful opportunistic session reuse.
+
+## 2026-05-07 - Recheck Reject: Early Provider Peer Cap
+
+Hypothesis:
+
+The immediate no-env control after the session-min-successes lab showed
+Wikipedia's zero-HTTP root block succeeding from early provider candidates with
+low provider lookup cost and no trusted peers in the good window. A previously
+rejected early-provider cap was worth one focused recheck against the current
+branch because it could reduce cold Bitswap peer expansion/dial work if the
+first provider window already contains the useful peers.
+
+Opt-in command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/early-provider-cap-focused-recheck-r10-20260507T112109-trace.jsonl \
+  --comparison-output /tmp/early-provider-cap-focused-recheck-r10-20260507T112109.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `726/1435ms`, assets `115/362ms`;
+  Kubo root `1574/3526ms`, assets `105/505ms`.
+- Wikipedia root: Rust `361/657ms` vs Kubo `134/379ms`.
+- Resource max: Rust `49332KiB` RSS and `31` FDs vs Kubo `290740KiB` RSS and
+  `380` FDs.
+- Bitswap blocks: `147`, p50/p95/max `75/327/1166ms`.
+- Wikipedia's top-level zero-HTTP cold Bitswap request took `554ms`.
+
+Decision:
+
+Do not promote the early provider peer cap. The recheck preserved reliability,
+kept Rust resource use far below Kubo, and improved `ipfs.tech` asset p50/p95
+versus the immediate no-env control, but it still lost the target Wikipedia root
+median badly (`361ms` vs Kubo `134ms`) and did not consistently beat the
+current no-env Wikipedia p95. The useful signal is narrower than a fixed early
+provider cap: future work should start high-quality dials earlier without
+discarding later candidates that may win in other windows.
+
+## 2026-05-07 - Reject: DNS Segment Fast Path And 50ms DNS Timeout Recheck
+
+Hypothesis:
+
+A fresh focused trace showed high-provider zero-HTTP roots spending about
+`180-199ms` in `bitswap_peer_expand` even when the final candidate set had no
+DNS addresses. The candidate construction path parsed many non-DNS multiaddrs
+while deciding whether DNS expansion was needed. A behavior-preserving parser
+fast path might reduce local candidate-expansion CPU before source selection.
+
+Trial code:
+
+- Added cheap protocol-segment checks before DNS-IP expansion so non-DNS
+  multiaddrs would skip the `websocket_multiaddr` / `dns_multiaddr_name`
+  parsing prepass.
+- Added a focused unit check that `/dnsaddr/...` is not treated as a normal
+  DNS-IP multiaddr.
+- Default behavior was intended to remain semantically unchanged.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval detects_dns_ip_multiaddr_without_matching_dnsaddr --lib
+cargo test -p freedom-ipfs-retrieval cached_dns_expansion_reuses_dnsaddr_and_ip_results --lib
+cargo test -p freedom-ipfs-retrieval reports_bitswap_provider_address_quality --lib
+```
+
+Validation passed.
+
+Default-code live command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/dns-segment-fastpath-focused-r10-20260507Tlive-trace.jsonl \
+  --comparison-output /tmp/dns-segment-fastpath-focused-r10-20260507Tlive.json
+```
+
+Default-code result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `821/1385ms`, assets `112/863ms`;
+  Kubo root `1535/3188ms`, assets `117/435ms`.
+- Wikipedia root: Rust `204/3907ms` vs Kubo `213/575ms`.
+- Resource max: Rust `53060KiB` RSS and `33` FDs vs Kubo `297020KiB` RSS and
+  `564` FDs.
+- The current public provider window was DNS-heavy: the slowest Wikipedia
+  requests emitted `82-162` `bitswap_dns_multiaddr_expand` events and spent
+  `1304-1516ms` in `bitswap_peer_expand`.
+
+Follow-up 50ms DNS timeout command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_BITSWAP_DNS_LOOKUP_TIMEOUT_MS=50 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/dns-timeout50-fastpath-focused-r10-20260507Tlive-trace.jsonl \
+  --comparison-output /tmp/dns-timeout50-fastpath-focused-r10-20260507Tlive.json
+```
+
+50ms timeout result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `741/1102ms`, assets `183/409ms`;
+  Kubo root `2591/7246ms`, assets `210/432ms`.
+- Wikipedia root: Rust `1134/1354ms` vs Kubo `619/766ms`.
+- Resource max: Rust `55292KiB` RSS and `31` FDs vs Kubo `274836KiB` RSS and
+  `525` FDs.
+- Trace emitted `1018` `bitswap_dns_lookup_timeout` markers.
+- The timeout reduced the worst Wikipedia p95 from the default-code run
+  (`3907ms -> 1354ms`) and recovered `ipfs.tech` asset p95, but it made
+  Wikipedia median much worse (`204ms -> 1134ms`) and still lost to Kubo.
+
+Decision:
+
+Do not keep the parser fast-path code and do not promote the `50ms` DNS timeout.
+The code was reverted because the live same-window result did not prove a
+default win, and the roadmap rule is to avoid keeping unproven default behavior.
+The useful evidence is that the current remaining tail can shift into DNS-heavy
+provider expansion: provider records with `70+` DNS-IP hosts can dominate
+`bitswap_peer_expand`, and a blunt timeout can trade p95 for a much worse
+median. Future DNS/source work should be adaptive, likely starting a small
+direct IP candidate set before full DNS expansion while continuing DNS in the
+background, instead of synchronously waiting on all DNS names or dropping them
+with a fixed timeout.
