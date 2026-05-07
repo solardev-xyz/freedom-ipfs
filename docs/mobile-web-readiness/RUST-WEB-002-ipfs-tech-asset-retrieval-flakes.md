@@ -29502,3 +29502,144 @@ Wikipedia win appears to come from better warmed source/peer choice for a
 small zero-HTTP top-level Bitswap request after previous page cases. Next work
 should focus on source/peer quality and cross-request learned peer selection,
 not more static zero-HTTP racing or wider direct WANT_BLOCK.
+
+## 2026-05-07 - Env-Gated Bitswap DNS Expansion Cache Lab
+
+Question:
+Can a retriever-wide DNSADDR/DNS-IP expansion cache reduce repeated Bitswap
+provider expansion cost in broad page sessions without increasing peer fanout?
+
+Implementation:
+
+- Added a disabled lab flag:
+  `FREEDOM_IPFS_ENABLE_BITSWAP_DNS_EXPANSION_CACHE=1`.
+- When enabled, `HttpRetriever` seeds each per-fetch DNSADDR/DNS-IP expansion
+  cache from a small shared in-memory cache, then records successful expansion
+  results back into that shared cache.
+- The shared cache is bounded to `128` DNSADDR entries and `128` DNS-IP entries,
+  with a `5m` TTL.
+- Default behavior is unchanged when the flag is unset.
+- Added trace marker `phase=bitswap_dns_expansion_cache` with requested/hit/miss
+  counts so future runs can verify whether the flag actually participated.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval cached_dns_expansion_reuses_dnsaddr_and_ip_results
+cargo test -p freedom-ipfs-retrieval shared_dns_expansion_cache_seeds_records_and_prunes_stale_entries
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+All passed.
+
+Broad env run:
+
+```sh
+timeout 4800s env FREEDOM_IPFS_ENABLE_BITSWAP_DNS_EXPANSION_CACHE=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/dns-cache-broader-selected-r10-20260507T044711Z-trace.jsonl \
+  --comparison-output /tmp/dns-cache-broader-selected-r10-20260507T044711Z.json
+```
+
+Broad env result:
+
+- Rust and Kubo passed `10/10` for every selected case.
+- Wikipedia flipped from the earlier Rust loss into a win: Rust `438/449ms`
+  vs Kubo `501/548ms`.
+- `ipfs.tech` root range regressed: Rust `790/2292ms` vs Kubo `1014/1628ms`.
+- `ipfs.tech` page assets p95 regressed: Rust `132/540ms` vs Kubo
+  `352/444ms`.
+- Resource max stayed light: Rust `50884KiB` RSS and `37` FDs vs Kubo
+  `172056KiB` RSS and `263` FDs.
+- Trace had no DNS cache marker yet, and no DNSADDR expansion events, so this
+  run could not prove the Wikipedia win was caused by the cache rather than
+  public-provider/source-peer variation.
+
+Same-window no-env control:
+
+```sh
+timeout 4800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/noenv-after-dns-cache-broader-selected-r10-20260507T045320Z-trace.jsonl \
+  --comparison-output /tmp/noenv-after-dns-cache-broader-selected-r10-20260507T045320Z.json
+```
+
+Same-window no-env result:
+
+- Rust and Kubo passed `10/10` for every selected case.
+- Wikipedia remained a Rust loss: Rust `689/1180ms` vs Kubo `470/556ms`.
+- `ipfs.tech` root range still had a Rust p95 loss: Rust `683/1671ms` vs
+  Kubo `985/1243ms`.
+- `ipfs.tech` page assets were strong again: Rust `119/291ms` vs Kubo
+  `347/425ms`.
+- Resource max: Rust `50840KiB` RSS and `31` FDs vs Kubo `208016KiB` RSS and
+  `313` FDs.
+- Trace showed Wikipedia paying DNSADDR expansion again:
+  `bitswap_dns_prefetch=12`, `bitswap_dnsaddr_expand=99`,
+  `bitswap_peer_expand=25`.
+
+Marker smoke after adding explicit instrumentation:
+
+```sh
+timeout 900s env FREEDOM_IPFS_ENABLE_BITSWAP_DNS_EXPANSION_CACHE=1 \
+  cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case wikipedia-on-ipfs-root \
+  --repeat 1 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/dns-cache-marker-wikipedia-r1-20260507T050053Z-trace.jsonl \
+  --comparison-output /tmp/dns-cache-marker-wikipedia-r1-20260507T050053Z.json
+```
+
+Marker smoke result:
+
+- Rust passed `1/1`; Wikipedia root TTFB was `608ms`.
+- Trace confirmed the flag reached the gateway:
+  `phase=bitswap_dns_expansion_cache`, `provider_count=64`,
+  `candidate_peer_count=16`, `dnsaddr_requested=3`,
+  `dnsaddr_hits=0`, `dnsaddr_misses=3`, `dns_ip_requested=1`,
+  `dns_ip_hits=0`, `dns_ip_misses=1`.
+- This single-request smoke is not a performance proof. It only verifies the
+  lab marker and env plumbing.
+
+Decision:
+Keep the cache as a disabled, bounded, instrumented lab knob for further
+experiments, but do not promote it to default. The broad env run is interesting
+because it beat Kubo on Wikipedia in the same selected corpus, but the evidence
+does not yet show a causal DNS-cache win, and it carried `ipfs.tech` p95
+regressions. The next promising line is still cross-request learned source-peer
+selection: explain why the env run reused a fast Bitswap source for Wikipedia
+while the no-env control paid DNS/provider expansion and landed on slower
+sources.

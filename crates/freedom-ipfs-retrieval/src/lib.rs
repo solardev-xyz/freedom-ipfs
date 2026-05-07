@@ -154,6 +154,10 @@ const MAX_PENDING_INCOMING_BITSWAP_READS: usize = 32;
 // tails without requesting every block from every provider candidate.
 const MAX_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS: usize = 3;
 const BITSWAP_DNS_PREFETCH_CONCURRENCY: usize = 8;
+const BITSWAP_DNS_EXPANSION_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_BITSWAP_DNS_EXPANSION_CACHE_ENTRIES: usize = 128;
+const ENABLE_BITSWAP_DNS_EXPANSION_CACHE_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_BITSWAP_DNS_EXPANSION_CACHE";
 const MAX_BITSWAP_FAILURE_DETAILS: usize = 8;
 const MAX_RECORDED_DIAL_ERRORS_PER_PEER: usize = 6;
 const MAX_INFLIGHT_BLOCK_FETCHES: usize = 256;
@@ -252,6 +256,8 @@ pub struct HttpRetriever {
     inflight: Arc<tokio::sync::Mutex<HashMap<Cid, SharedBlockFetch>>>,
     successful_bitswap_peers: Arc<tokio::sync::Mutex<HashMap<PeerId, SuccessfulBitswapPeer>>>,
     http_provider_scores: Arc<tokio::sync::Mutex<HashMap<String, HttpProviderScore>>>,
+    bitswap_dnsaddr_cache: Arc<tokio::sync::Mutex<SharedDnsaddrCache>>,
+    bitswap_dns_ip_cache: Arc<tokio::sync::Mutex<SharedDnsIpCache>>,
     http_provider_fetch_limiter: Arc<tokio::sync::Semaphore>,
     http_provider_fetch_limit: usize,
 }
@@ -313,6 +319,8 @@ impl HttpRetriever {
             inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             successful_bitswap_peers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             http_provider_scores: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            bitswap_dnsaddr_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            bitswap_dns_ip_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             http_provider_fetch_limiter: Arc::new(tokio::sync::Semaphore::new(
                 http_provider_fetch_limit,
             )),
@@ -2241,6 +2249,137 @@ impl HttpRetriever {
         ))
     }
 
+    async fn bitswap_peers_with_quality(
+        &self,
+        providers: &[Provider],
+    ) -> BitswapProviderCandidates {
+        if !bitswap_dns_expansion_cache_enabled() {
+            return bitswap_peers_with_quality(providers).await;
+        }
+
+        let mut dnsaddr_cache = DnsaddrCache::new();
+        let mut dns_ip_cache = DnsIpCache::new();
+        let stats = self
+            .seed_bitswap_dns_expansion_caches(providers, &mut dnsaddr_cache, &mut dns_ip_cache)
+            .await;
+        let candidates = bitswap_peers_with_quality_using_caches(
+            providers,
+            &mut dnsaddr_cache,
+            &mut dns_ip_cache,
+        )
+        .await;
+        self.record_bitswap_dns_expansion_caches(&dnsaddr_cache, &dns_ip_cache)
+            .await;
+        tracing::info!(
+            phase = "bitswap_dns_expansion_cache",
+            provider_count = providers.len(),
+            candidate_peer_count = candidates.peers.len(),
+            dnsaddr_requested = stats.dnsaddr_requested,
+            dnsaddr_hits = stats.dnsaddr_hits,
+            dnsaddr_misses = stats.dnsaddr_misses,
+            dns_ip_requested = stats.dns_ip_requested,
+            dns_ip_hits = stats.dns_ip_hits,
+            dns_ip_misses = stats.dns_ip_misses,
+            dnsaddr_cache_len = stats.dnsaddr_cache_len,
+            dns_ip_cache_len = stats.dns_ip_cache_len
+        );
+        candidates
+    }
+
+    async fn seed_bitswap_dns_expansion_caches(
+        &self,
+        providers: &[Provider],
+        dnsaddr_cache: &mut DnsaddrCache,
+        dns_ip_cache: &mut DnsIpCache,
+    ) -> BitswapDnsExpansionCacheStats {
+        let now = Instant::now();
+        let dnsaddr_hosts = provider_dnsaddr_hosts(providers);
+        let mut stats = BitswapDnsExpansionCacheStats {
+            dnsaddr_requested: dnsaddr_hosts.len(),
+            ..BitswapDnsExpansionCacheStats::default()
+        };
+        {
+            let mut shared = self.bitswap_dnsaddr_cache.lock().await;
+            prune_shared_dnsaddr_cache(&mut shared, now);
+            for host in &dnsaddr_hosts {
+                if let Some(entry) = shared.get_mut(host) {
+                    entry.seen_at = now;
+                    dnsaddr_cache.insert(
+                        host.clone(),
+                        CachedDnsaddrRecords {
+                            records: entry.records.clone(),
+                            log_as_cached: true,
+                        },
+                    );
+                    stats.dnsaddr_hits += 1;
+                } else {
+                    stats.dnsaddr_misses += 1;
+                }
+            }
+            stats.dnsaddr_cache_len = shared.len();
+        }
+
+        let dns_names = provider_dns_ip_names(providers, dnsaddr_cache);
+        stats.dns_ip_requested = dns_names.len();
+        {
+            let mut shared = self.bitswap_dns_ip_cache.lock().await;
+            prune_shared_dns_ip_cache(&mut shared, now);
+            for host in &dns_names {
+                if let Some(entry) = shared.get_mut(host) {
+                    entry.seen_at = now;
+                    dns_ip_cache.insert(
+                        host.clone(),
+                        CachedDnsIpRecords {
+                            addrs: entry.addrs.clone(),
+                            log_as_cached: true,
+                        },
+                    );
+                    stats.dns_ip_hits += 1;
+                } else {
+                    stats.dns_ip_misses += 1;
+                }
+            }
+            stats.dns_ip_cache_len = shared.len();
+        }
+        stats
+    }
+
+    async fn record_bitswap_dns_expansion_caches(
+        &self,
+        dnsaddr_cache: &DnsaddrCache,
+        dns_ip_cache: &DnsIpCache,
+    ) {
+        let now = Instant::now();
+        {
+            let mut shared = self.bitswap_dnsaddr_cache.lock().await;
+            prune_shared_dnsaddr_cache(&mut shared, now);
+            for (host, entry) in dnsaddr_cache {
+                shared.insert(
+                    host.clone(),
+                    SharedCachedDnsaddrRecords {
+                        records: entry.records.clone(),
+                        seen_at: now,
+                    },
+                );
+            }
+            prune_shared_dnsaddr_cache_len(&mut shared);
+        }
+        {
+            let mut shared = self.bitswap_dns_ip_cache.lock().await;
+            prune_shared_dns_ip_cache(&mut shared, now);
+            for (host, entry) in dns_ip_cache {
+                shared.insert(
+                    host.clone(),
+                    SharedCachedDnsIpRecords {
+                        addrs: entry.addrs.clone(),
+                        seen_at: now,
+                    },
+                );
+            }
+            prune_shared_dns_ip_cache_len(&mut shared);
+        }
+    }
+
     async fn fetch_from_bitswap_providers(
         &self,
         cid: &Cid,
@@ -2249,7 +2388,7 @@ impl HttpRetriever {
     ) -> Result<Block> {
         let peer_started = Instant::now();
         let BitswapProviderCandidates { mut peers, quality } =
-            bitswap_peers_with_quality(providers).await;
+            self.bitswap_peers_with_quality(providers).await;
         let provider_peer_count = peers.len();
         if provider_peer_count == 0 && !providers.is_empty() {
             tracing::info!(
@@ -3560,6 +3699,10 @@ fn bitswap_session_range_batch_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_SESSION_RANGE_BATCH_ENV).is_some()
 }
 
+fn bitswap_dns_expansion_cache_enabled() -> bool {
+    std::env::var_os(ENABLE_BITSWAP_DNS_EXPANSION_CACHE_ENV).is_some()
+}
+
 fn bitswap_incoming_batch_partial_grace() -> Duration {
     let override_value = std::env::var_os(BITSWAP_INCOMING_BATCH_PARTIAL_GRACE_MS_ENV);
     let override_value = override_value.as_ref().map(|value| value.to_string_lossy());
@@ -4767,6 +4910,33 @@ struct CachedDnsIpRecords {
 type DnsaddrCache = HashMap<String, CachedDnsaddrRecords>;
 type DnsIpCache = HashMap<String, CachedDnsIpRecords>;
 
+#[derive(Clone)]
+struct SharedCachedDnsaddrRecords {
+    records: Vec<String>,
+    seen_at: Instant,
+}
+
+#[derive(Clone)]
+struct SharedCachedDnsIpRecords {
+    addrs: Vec<IpAddr>,
+    seen_at: Instant,
+}
+
+type SharedDnsaddrCache = HashMap<String, SharedCachedDnsaddrRecords>;
+type SharedDnsIpCache = HashMap<String, SharedCachedDnsIpRecords>;
+
+#[derive(Default)]
+struct BitswapDnsExpansionCacheStats {
+    dnsaddr_requested: usize,
+    dnsaddr_hits: usize,
+    dnsaddr_misses: usize,
+    dns_ip_requested: usize,
+    dns_ip_hits: usize,
+    dns_ip_misses: usize,
+    dnsaddr_cache_len: usize,
+    dns_ip_cache_len: usize,
+}
+
 impl BitswapProviderAddrQuality {
     fn rejected_addr_count(&self) -> usize {
         self.unsupported_relay_addr_count
@@ -4805,11 +4975,19 @@ async fn bitswap_peers(providers: &[Provider]) -> Vec<BitswapPeer> {
 }
 
 async fn bitswap_peers_with_quality(providers: &[Provider]) -> BitswapProviderCandidates {
-    let mut peers = Vec::new();
-    let mut quality = BitswapProviderAddrQuality::default();
     let mut dnsaddr_cache = DnsaddrCache::new();
     let mut dns_ip_cache = DnsIpCache::new();
-    prefetch_bitswap_dns_expansions(providers, &mut dnsaddr_cache, &mut dns_ip_cache).await;
+    bitswap_peers_with_quality_using_caches(providers, &mut dnsaddr_cache, &mut dns_ip_cache).await
+}
+
+async fn bitswap_peers_with_quality_using_caches(
+    providers: &[Provider],
+    dnsaddr_cache: &mut DnsaddrCache,
+    dns_ip_cache: &mut DnsIpCache,
+) -> BitswapProviderCandidates {
+    let mut peers = Vec::new();
+    let mut quality = BitswapProviderAddrQuality::default();
+    prefetch_bitswap_dns_expansions(providers, dnsaddr_cache, dns_ip_cache).await;
 
     for provider in providers {
         let provider_peer = provider.id.as_deref().and_then(parse_peer_id);
@@ -4824,9 +5002,7 @@ async fn bitswap_peers_with_quality(providers: &[Provider]) -> BitswapProviderCa
         let mut peer_id = provider_peer;
         let mut provider_has_supported_addr = false;
 
-        for addr in
-            expand_provider_multiaddrs(&provider.addrs, &mut dnsaddr_cache, &mut dns_ip_cache).await
-        {
+        for addr in expand_provider_multiaddrs(&provider.addrs, dnsaddr_cache, dns_ip_cache).await {
             quality.expanded_addr_count += 1;
             match analyze_bitswap_multiaddr(&addr, provider_peer) {
                 Ok((addr_peer, dial_addr, features)) => {
@@ -5004,6 +5180,83 @@ fn bitswap_transport_label(addr: &Multiaddr) -> &'static str {
         "tcp"
     } else {
         "other"
+    }
+}
+
+fn provider_dnsaddr_hosts(providers: &[Provider]) -> Vec<String> {
+    providers
+        .iter()
+        .flat_map(|provider| provider.addrs.iter())
+        .filter_map(|addr| dnsaddr_host(addr).map(str::to_string))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn provider_dns_ip_names(providers: &[Provider], dnsaddr_cache: &DnsaddrCache) -> Vec<String> {
+    providers
+        .iter()
+        .flat_map(|provider| provider.addrs.iter())
+        .flat_map(|addr| {
+            if let Some(host) = dnsaddr_host(addr) {
+                dnsaddr_cache
+                    .get(host)
+                    .map(|entry| entry.records.clone())
+                    .unwrap_or_default()
+            } else {
+                vec![addr.clone()]
+            }
+        })
+        .filter(|addr| !websocket_multiaddr(addr))
+        .filter_map(|addr| dns_multiaddr_name(&addr))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn prune_shared_dnsaddr_cache(cache: &mut SharedDnsaddrCache, now: Instant) {
+    cache.retain(|_, entry| {
+        now.saturating_duration_since(entry.seen_at) <= BITSWAP_DNS_EXPANSION_CACHE_TTL
+    });
+}
+
+fn prune_shared_dns_ip_cache(cache: &mut SharedDnsIpCache, now: Instant) {
+    cache.retain(|_, entry| {
+        now.saturating_duration_since(entry.seen_at) <= BITSWAP_DNS_EXPANSION_CACHE_TTL
+    });
+}
+
+fn prune_shared_dnsaddr_cache_len(cache: &mut SharedDnsaddrCache) {
+    if cache.len() <= MAX_BITSWAP_DNS_EXPANSION_CACHE_ENTRIES {
+        return;
+    }
+    let mut entries = cache
+        .iter()
+        .map(|(host, entry)| (host.clone(), entry.seen_at))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(_, seen_at)| *seen_at);
+    for (host, _) in entries
+        .into_iter()
+        .take(cache.len() - MAX_BITSWAP_DNS_EXPANSION_CACHE_ENTRIES)
+    {
+        cache.remove(&host);
+    }
+}
+
+fn prune_shared_dns_ip_cache_len(cache: &mut SharedDnsIpCache) {
+    if cache.len() <= MAX_BITSWAP_DNS_EXPANSION_CACHE_ENTRIES {
+        return;
+    }
+    let mut entries = cache
+        .iter()
+        .map(|(host, entry)| (host.clone(), entry.seen_at))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(_, seen_at)| *seen_at);
+    for (host, _) in entries
+        .into_iter()
+        .take(cache.len() - MAX_BITSWAP_DNS_EXPANSION_CACHE_ENTRIES)
+    {
+        cache.remove(&host);
     }
 }
 
@@ -6658,6 +6911,132 @@ mod bitswap_tests {
         );
         assert_eq!(dnsaddr_cache.len(), 1);
         assert_eq!(dns_ip_cache.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_dns_expansion_cache_seeds_records_and_prunes_stale_entries() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store,
+        );
+        let now = Instant::now();
+        let stale = now
+            .checked_sub(BITSWAP_DNS_EXPANSION_CACHE_TTL + Duration::from_secs(1))
+            .unwrap();
+        {
+            let mut shared = retriever.bitswap_dnsaddr_cache.lock().await;
+            shared.insert(
+                "bootstrap.example".to_string(),
+                SharedCachedDnsaddrRecords {
+                    records: vec![
+                        "/dns4/inner.example/tcp/4001".to_string(),
+                        "/dns4/ws.example/tcp/443/wss".to_string(),
+                    ],
+                    seen_at: now,
+                },
+            );
+            shared.insert(
+                "stale-bootstrap.example".to_string(),
+                SharedCachedDnsaddrRecords {
+                    records: vec!["/dns4/stale.example/tcp/4001".to_string()],
+                    seen_at: stale,
+                },
+            );
+        }
+        {
+            let mut shared = retriever.bitswap_dns_ip_cache.lock().await;
+            shared.insert(
+                "inner.example".to_string(),
+                SharedCachedDnsIpRecords {
+                    addrs: vec!["203.0.113.10".parse().unwrap()],
+                    seen_at: now,
+                },
+            );
+            shared.insert(
+                "direct.example".to_string(),
+                SharedCachedDnsIpRecords {
+                    addrs: vec!["203.0.113.20".parse().unwrap()],
+                    seen_at: now,
+                },
+            );
+            shared.insert(
+                "stale.example".to_string(),
+                SharedCachedDnsIpRecords {
+                    addrs: vec!["203.0.113.30".parse().unwrap()],
+                    seen_at: stale,
+                },
+            );
+        }
+
+        let providers = vec![Provider {
+            id: None,
+            addrs: vec![
+                "/dnsaddr/bootstrap.example".to_string(),
+                "/dns4/direct.example/tcp/4001".to_string(),
+            ],
+            http_urls: Vec::new(),
+        }];
+        let mut dnsaddr_cache = DnsaddrCache::new();
+        let mut dns_ip_cache = DnsIpCache::new();
+        let stats = retriever
+            .seed_bitswap_dns_expansion_caches(&providers, &mut dnsaddr_cache, &mut dns_ip_cache)
+            .await;
+
+        assert_eq!(stats.dnsaddr_requested, 1);
+        assert_eq!(stats.dnsaddr_hits, 1);
+        assert_eq!(stats.dnsaddr_misses, 0);
+        assert_eq!(stats.dns_ip_requested, 2);
+        assert_eq!(stats.dns_ip_hits, 2);
+        assert_eq!(stats.dns_ip_misses, 0);
+        assert!(
+            dnsaddr_cache
+                .get("bootstrap.example")
+                .unwrap()
+                .log_as_cached
+        );
+        assert!(dns_ip_cache.get("inner.example").unwrap().log_as_cached);
+        assert!(dns_ip_cache.get("direct.example").unwrap().log_as_cached);
+        assert!(!dns_ip_cache.contains_key("ws.example"));
+        assert!(!retriever
+            .bitswap_dnsaddr_cache
+            .lock()
+            .await
+            .contains_key("stale-bootstrap.example"));
+        assert!(!retriever
+            .bitswap_dns_ip_cache
+            .lock()
+            .await
+            .contains_key("stale.example"));
+
+        dnsaddr_cache.insert(
+            "new-bootstrap.example".to_string(),
+            CachedDnsaddrRecords {
+                records: vec!["/dns4/new.example/tcp/4001".to_string()],
+                log_as_cached: false,
+            },
+        );
+        dns_ip_cache.insert(
+            "new.example".to_string(),
+            CachedDnsIpRecords {
+                addrs: vec!["203.0.113.40".parse().unwrap()],
+                log_as_cached: false,
+            },
+        );
+        retriever
+            .record_bitswap_dns_expansion_caches(&dnsaddr_cache, &dns_ip_cache)
+            .await;
+
+        assert!(retriever
+            .bitswap_dnsaddr_cache
+            .lock()
+            .await
+            .contains_key("new-bootstrap.example"));
+        assert!(retriever
+            .bitswap_dns_ip_cache
+            .lock()
+            .await
+            .contains_key("new.example"));
     }
 
     #[test]
