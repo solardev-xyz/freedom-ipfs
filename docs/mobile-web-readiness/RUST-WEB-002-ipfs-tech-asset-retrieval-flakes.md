@@ -34240,3 +34240,80 @@ Reject and revert the lab code. The result confirms that blindly suppressing
 one-hit top-level session shortcuts is not enough. Future work should target a
 more specific condition, such as the follow-on UnixFS/index block after a
 failing single HTTP provider, instead of all top-level gateway block fetches.
+
+## 2026-05-07 Reject: Zero-HTTP Post-Lookup Grace 50ms Recheck
+
+Hypothesis:
+
+The latest no-env focused trace showed zero-HTTP session shortcut hits landing
+around `32-50ms`, while misses burned the full default `100ms` post-lookup wait.
+The earlier `25ms` grace was too impatient. A `50ms` grace might preserve most
+real shortcut hits while trimming timeout waste.
+
+No-env comparison point:
+
+The same-code focused control immediately before this run was:
+
+- `ipfs.tech` root TTFB/total p50/p95: Rust `765/984ms`; Kubo
+  `1938/8763ms`.
+- `ipfs.tech` asset TTFB/total p50/p95: Rust `185/298ms`; Kubo `160/598ms`.
+- Wikipedia root TTFB/total p50/p95: Rust `365/789ms`; Kubo `276/481ms`.
+- Resource max: Rust `48888KiB` RSS and `25` FDs vs Kubo `292464KiB` RSS and
+  `556` FDs.
+- Artifacts:
+  `/tmp/current-focused-control-r10-20260507Tafter-topmin.json` and
+  `/tmp/current-focused-control-r10-20260507Tafter-topmin-trace.jsonl`.
+
+Opt-in command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_BITSWAP_SESSION_ZERO_HTTP_POST_LOOKUP_GRACE_MS=50 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --case wikipedia-on-ipfs-root \
+    --repeat 10 \
+    --asset-concurrency 1 \
+    --timeout-secs 120 \
+    --run-timeout-secs 300 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/zero-http-grace50-focused-r10-20260507Tlab-trace.jsonl \
+    --comparison-output /tmp/zero-http-grace50-focused-r10-20260507Tlab.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` root TTFB/total p50/p95: Rust `759/1444ms`; Kubo
+  `2688/5937ms`.
+- `ipfs.tech` asset TTFB/total p50/p95: Rust `181/415ms`; Kubo `174/419ms`.
+- Wikipedia root TTFB/total p50/p95: Rust `468/765ms`; Kubo `273/766ms`.
+- Resource max: Rust `48256KiB` RSS and `28` FDs vs Kubo `287864KiB` RSS and
+  `514` FDs.
+- Bitswap blocks increased to `74`, p50/p95/max `118/748/1221ms`.
+- Zero-HTTP post-lookup waits used the `50ms` budget:
+  `post_lookup_hits=2`, `post_lookup_timeouts=8`,
+  `post_lookup_budgets=50=10`.
+
+Interpretation:
+
+The `50ms` grace avoided the extreme Wikipedia p95 loss from the earlier `25ms`
+run and tied Kubo p95 in this focused window, but it did not beat the same-code
+no-env control overall:
+
+- `ipfs.tech` root p95 regressed from `984ms` to `1444ms`.
+- `ipfs.tech` asset p95 regressed from `298ms` to `415ms`.
+- Wikipedia median regressed from `365ms` to `468ms`.
+- Wikipedia p95 improved only slightly, from `789ms` to `765ms`.
+- Bitswap work increased materially versus the control (`74` Bitswap blocks vs
+  `32`) and max FD rose from `25` to `28`.
+
+Decision:
+
+Do not promote `50ms`. Keep the existing zero-HTTP grace env as a diagnostic
+knob only. The useful signal is that hit timing is clustered and observable, but
+a static shorter grace still shifts work into slower Bitswap tails elsewhere.
+Future work should make the wait adaptive to session-peer quality or current
+request shape rather than choosing another fixed zero-HTTP grace.
