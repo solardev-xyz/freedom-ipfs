@@ -30674,3 +30674,71 @@ recent alternates is not enough when the session has not learned diverse good
 sources. The next source-quality experiment should seed a small candidate set
 from provider lookup quality itself, not only from prior successful session
 peers.
+
+## 2026-05-07 - Reject: Successful Bitswap Peer Max 500ms Selected Recheck
+
+Question:
+The current selected corpus still shows occasional tails where a successful
+Bitswap source peer is slow but then remains eligible as a trusted session peer.
+The existing disabled
+`FREEDOM_IPFS_BITSWAP_SUCCESSFUL_PEER_MAX_LATENCY_MS` lab knob was previously
+tested on narrower corpora. Recheck `500ms` on the current selected corpus that
+includes Wikipedia, `ipfs.tech` roots/assets, DAICO, and Vitalik.
+
+Command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_BITSWAP_SUCCESSFUL_PEER_MAX_LATENCY_MS=500 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/success-peer-max500-selected-r5-20260507T0850Z-trace.jsonl \
+  --comparison-output /tmp/success-peer-max500-selected-r5-20260507T0850Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1332/1454ms` vs Kubo `2789/2815ms`.
+- Vitalik range: Rust `107/118ms` vs Kubo `1481/2616ms`.
+- `ipfs.tech` root range: Rust `1010/1211ms` vs Kubo `1185/1374ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `127/302ms`; Kubo root
+  `2/72ms`, assets `356/487ms`.
+- `ipfs.tech` hero range: Rust `109/133ms` vs Kubo `403/432ms`.
+- Wikipedia root remained the target loss at p95: Rust `205/1397ms` vs Kubo
+  `509/559ms`.
+- Resource max: Rust `51616KiB` RSS and `34` FDs vs Kubo `177440KiB` RSS and
+  `384` FDs.
+- HTTP provider block fetch p50/p95/max: `184/516/776ms`.
+- Bitswap block fetch p50/p95/max: `55/938/979ms`.
+- Bitswap peer attempts: `148`.
+- `bitswap_successful_peer_skipped` markers: `4`, with skipped latencies
+  `841-907ms`.
+
+Interpretation:
+The `500ms` cap did skip slow successful peers and kept `ipfs.tech` asset
+p50/p95 ahead of Kubo, but it did not close the broader target. Wikipedia
+median improved versus Kubo in this window, but p95 regressed badly, and Bitswap
+p95 stayed high at `938ms`. The slowest Wikipedia request still paid repeated
+DNS/provider expansion plus two Bitswap fetches; removing a few slow successes
+from the session cache does not provide the missing source diversity.
+
+Decision:
+Do not promote the `500ms` successful-peer cap. Keep it as a diagnostic only.
+This recheck reinforces the earlier conclusion: globally filtering slow
+successful peers is too blunt. The next useful source-quality work should be
+request-shape-specific, especially for zero-HTTP top-level/page-session cases
+where Kubo finds a better warmed source without sacrificing our lower RSS/FD
+profile.
