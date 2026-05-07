@@ -34704,3 +34704,90 @@ asset in the same top-level navigation. Any future retry should be based on
 stronger evidence, such as provider records for the specific CID, content-root
 advertisement semantics, or a cheap validating probe that cannot slow the main
 single-provider path.
+
+## 2026-05-07 Fresh Focused Baseline After Top-Level HTTP Reuse Rejection
+
+Purpose:
+
+Re-establish a same-window Rust-vs-Kubo baseline after rejecting and reverting
+the top-level scoped HTTP provider reuse smoke. Public-provider windows have
+shifted enough that the next experiment should use current evidence, not the
+older single-HTTP median gap sample alone.
+
+Command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-focused-r10-20260507Tbaseline2-trace.jsonl \
+  --comparison-output /tmp/current-head-focused-r10-20260507Tbaseline2.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets:
+  - root TTFB/total p50/p95: Rust `751/1607ms` and `752/1608ms`; Kubo
+    `1776/4126ms` and `1776/4127ms`.
+  - asset TTFB/total p50/p95: Rust `125/429ms`; Kubo `196/767ms`.
+- `wikipedia-on-ipfs-root`:
+  - root TTFB/total p50/p95: Rust `314/864ms`; Kubo `305/726ms`.
+- Resource max: Rust `48960KiB` RSS and `36` FDs vs Kubo `336932KiB` RSS and
+  `627` FDs.
+
+Trace shape:
+
+- HTTP-provider blocks: `220`, p50/p95/max `178/281/1081ms`.
+- Bitswap blocks: `150`, p50/p95/max `97/768/1274ms`.
+- Delegated provider lookup p50/p95/max: `20/59/686ms`.
+- Request classifications:
+  - `zero_http_provider_bitswap=47`
+  - `cold_bitswap_peer_expand=26`
+  - `zero_http_provider_cold_bitswap=26`
+  - `top_level_zero_http_provider_bitswap=18`
+  - `top_level_zero_http_provider_cold_bitswap=9`
+- Request-classified source indexes:
+  - `zero_http_provider_bitswap`: `0=24`, `3=4`, `2=2`, `1=1`, `5=1`,
+    `9=1`
+  - `zero_http_provider_cold_bitswap`: `0=20`, `3=3`, `2=2`, `9=1`
+  - `top_level_zero_http_provider_bitswap`: `0=11`, `1=1`, `3=1`, `5=1`
+  - `top_level_zero_http_provider_cold_bitswap`: `0=9`
+- HTTP provider fetches included `6` `http_5xx` failures from
+  `https://f010479.twinquasar.io/`, but the visible slowest requests in this
+  window were not dominated by the Wikipedia follow-on `index.html` path.
+- Bitswap session state was active but not the main slow-request cause:
+  `shortcut_starts=339`, `shortcut_hits=120`, post-lookup waits `37`, hits
+  `14`, timeouts `23`.
+- Slowest requests were zero-HTTP cold Bitswap `ipfs.tech` root and asset
+  paths:
+  - `/ipns/ipfs.tech/` at `1604ms`, `1136ms`, and `951ms`
+  - `_nuxt/entry.C4ErMpWu.css` at `1547ms`, `1475ms`, `1032ms`, and `996ms`
+  - `_nuxt/DBHrpFkY.js` at `1049ms`
+
+Interpretation:
+
+This window does not support chasing the old focused `ipfs.tech` asset median
+gap: Rust now beats Kubo on `ipfs.tech` root and asset p50/p95 while using a
+small fraction of Kubo RSS/FDs. The only Kubo win in the headline metrics is a
+narrow Wikipedia root p50/p95 edge. The trace also differs from the earlier
+scoped-source-index baseline: top-level zero-HTTP cold Bitswap winners are now
+mostly candidate index `0`, not later `WANT_HAVE` candidates. That weakens any
+case for another static direct/probe-width experiment.
+
+Decision:
+
+Use this as the current focused baseline. The next behavior experiment should
+only proceed if it targets the current slow shape: zero-HTTP cold Bitswap
+root/asset fetches with no useful session peers and candidate-index-0 sources,
+while preserving the current `ipfs.tech` p50/p95 wins and resource advantage.
+Do not reopen broad HTTP-provider reuse, static direct-width, static grace, or
+single-HTTP Bitswap hedge experiments based on this sample.
