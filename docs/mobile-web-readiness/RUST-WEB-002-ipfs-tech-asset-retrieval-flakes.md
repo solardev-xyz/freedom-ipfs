@@ -33279,3 +33279,175 @@ direct-IP-only. Instead, use direct IP candidates as a fast first wave while
 full DNS/provider expansion continues in the background. If the direct wave
 wins quickly, return; if not, broaden to DNS-expanded candidates without
 discarding them.
+
+## 2026-05-07 - Reject: Direct-IP Bitswap Fast Wave
+
+Hypothesis:
+
+The direct-IP-only lab improved the focused Wikipedia median and p95 but
+discarded DNS-expanded candidates and slightly regressed `ipfs.tech`. A better
+shape might be a speculative direct-IP "fast first wave": start Bitswap against
+already-direct IP candidates while full DNS/provider expansion continues, return
+if the direct wave wins quickly, and otherwise fall back to the normal
+DNS-expanded candidate set.
+
+Trial code:
+
+- Added an uncommitted opt-in prototype
+  `FREEDOM_IPFS_ENABLE_BITSWAP_DIRECT_IP_FAST_WAVE=1`.
+- The first variant applied to all Bitswap provider fetches after HTTP-provider
+  paths did not win.
+- A second variant scoped the wave to zero-HTTP, non-subresource requests.
+- A third variant kept that scope but stopped direct-wave wins from recording a
+  reusable successful session peer.
+- All fast-wave prototype code was reverted after the live runs below. No
+  direct-fast-wave env knob is kept in the tree.
+
+Focused validation while the prototype existed:
+
+```sh
+cargo fmt --all
+cargo test -p freedom-ipfs-retrieval bitswap_direct_ip_fast_wave --lib
+cargo test -p freedom-ipfs-retrieval --lib
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Validation passed.
+
+Unscoped opt-in command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_ENABLE_BITSWAP_DIRECT_IP_FAST_WAVE=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/direct-ip-fastwave-focused-r10-20260507Tlive-trace.jsonl \
+  --comparison-output /tmp/direct-ip-fastwave-focused-r10-20260507Tlive.json
+```
+
+Unscoped opt-in result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `758/1170ms`, assets `185/308ms`;
+  Kubo root `1533/2935ms`, assets `123/430ms`.
+- Wikipedia root: Rust `311/703ms` vs Kubo `291/534ms`.
+- Resource max: Rust `52492KiB` RSS and `37` FDs vs Kubo `238816KiB` RSS and
+  `287` FDs.
+- Fast-wave trace outcomes: `2` `direct_won`, `14`
+  `full_fetch_after_direct_wave`.
+- Bitswap attempts/connections rose versus the immediate no-env control:
+  `301` peer-attempt starts and `73` established connections.
+
+Immediate no-env control command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/direct-ip-fastwave-noenv-control-focused-r10-20260507Tlive-trace.jsonl \
+  --comparison-output /tmp/direct-ip-fastwave-noenv-control-focused-r10-20260507Tlive.json
+```
+
+Immediate no-env control result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `578/975ms`, assets `187/301ms`;
+  Kubo root `1422/2861ms`, assets `125/441ms`.
+- Wikipedia root: Rust `659/910ms` vs Kubo `115/733ms`.
+- Resource max: Rust `49784KiB` RSS and `26` FDs vs Kubo `227688KiB` RSS and
+  `350` FDs.
+- Bitswap attempts/connections: `194` peer-attempt starts and `55`
+  established connections.
+
+Scoped opt-in command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_ENABLE_BITSWAP_DIRECT_IP_FAST_WAVE=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/direct-ip-fastwave-toplevel-focused-r10-20260507Tlive-trace.jsonl \
+  --comparison-output /tmp/direct-ip-fastwave-toplevel-focused-r10-20260507Tlive.json
+```
+
+Scoped opt-in result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `721/817ms`, assets `182/337ms`;
+  Kubo root `1520/3907ms`, assets `100/437ms`.
+- Wikipedia root: Rust `710/2214ms` vs Kubo `130/416ms`.
+- Resource max: Rust `50072KiB` RSS and `40` FDs vs Kubo `270516KiB` RSS and
+  `269` FDs.
+- Fast-wave trace outcomes: `6` `direct_won`, `2`
+  `full_fetch_after_direct_wave`.
+
+No-session-record opt-in command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_ENABLE_BITSWAP_DIRECT_IP_FAST_WAVE=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/direct-ip-fastwave-norecord-focused-r10-20260507Tlive-trace.jsonl \
+  --comparison-output /tmp/direct-ip-fastwave-norecord-focused-r10-20260507Tlive.json
+```
+
+No-session-record opt-in result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets: Rust root `777/943ms`, assets `150/342ms`;
+  Kubo root `1543/3056ms`, assets `98/565ms`.
+- Wikipedia root: Rust `670/2015ms` vs Kubo `170/665ms`.
+- Resource max: Rust `49824KiB` RSS and `36` FDs vs Kubo `268044KiB` RSS and
+  `329` FDs.
+
+Decision:
+
+Do not keep the direct-IP fast-wave prototype. The unscoped version improved
+Wikipedia against its same-code no-env control (`659/910ms -> 311/703ms`) but
+still lost to Kubo there, regressed `ipfs.tech` root p50/p95, and raised
+Bitswap peer attempts and established connections. Scoping the wave to top-level
+zero-HTTP requests increased direct wins but made Wikipedia much worse because
+the page still needed follow-on UnixFS/index blocks that hit slow Bitswap
+session/fallback behavior. Disabling successful-peer recording for direct-wave
+wins did not remove that tail.
+
+The next useful direction is not "start direct root Bitswap earlier" by itself.
+For UnixFS page roots, the remaining gap is multi-block/session behavior after
+the first block: child/index blocks, session shortcut selection, and provider
+reuse need to be optimized as a small page-load unit. Future work should either
+batch/prefetch the likely follow-on UnixFS block with the root or make the
+follow-on block avoid slow session shortcuts when the root was won by an
+unproven public Bitswap peer.
