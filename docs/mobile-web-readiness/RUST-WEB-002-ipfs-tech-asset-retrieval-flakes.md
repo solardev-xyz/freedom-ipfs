@@ -30052,3 +30052,139 @@ than Kubo (`573ms`). DNS cache hits did occur, so the plumbing is real, but the
 remaining slow path is not solved by caching DNS expansion alone. Future
 Wikipedia work should inspect why Kubo chooses or reaches useful source peers
 faster after provider lookup, not simply cache expanded provider addresses.
+
+## 2026-05-07 - Fresh Selected-Case Baseline After Branch Recovery
+
+Purpose:
+After the branch/context recovery, re-establish a same-window Rust-vs-Kubo
+baseline across the current selected guardrail set before making another code
+change. This checks the real current branch state rather than relying on older
+single-case notes.
+
+Command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/fresh-baseline-selected-r5-20260507Tnow-trace.jsonl \
+  --comparison-output /tmp/fresh-baseline-selected-r5-20260507Tnow.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1227/1726ms` vs Kubo `2822/2871ms`.
+- Vitalik range: Rust `105/116ms` vs Kubo `2680/3495ms`.
+- `ipfs.tech` root range: Rust `620/970ms` vs Kubo `1011/1229ms`.
+- `ipfs.tech` page assets: Rust root `3/3ms`, assets `82/302ms`; Kubo root
+  `2/2ms`, assets `361/472ms`.
+- `ipfs.tech` hero range: Rust `86/89ms` vs Kubo `449/483ms`.
+- Wikipedia root was the remaining Kubo-relative loss: Rust `111/1052ms` vs
+  Kubo `520/541ms`.
+- Resource max: Rust `51832KiB` RSS and `35` FDs vs Kubo `165556KiB` RSS and
+  `246` FDs.
+- Block fetch totals: HTTP provider p50/p95/max `185/563/837ms`; Bitswap
+  p50/p95/max `57/326/564ms`.
+- Delegated provider lookup p50/p95/max was `18/49/649ms`.
+- Request classifications included `15` `zero_http_provider_bitswap`, `8`
+  `cold_bitswap_peer_expand`, `8` `zero_http_provider_cold_bitswap`, `7`
+  `top_level_zero_http_provider_bitswap`, and `5`
+  `top_level_zero_http_provider_cold_bitswap`.
+
+Trace interpretation:
+The slowest Wikipedia request was `/ipns/en.wikipedia-on-ipfs.org`
+(`progress_id=152`), elapsed about `1050ms`. The root directory block had `64`
+providers, no HTTP providers, a post-lookup shortcut timeout, DNS expansion
+around `162ms`, and then a useful Bitswap block about `153ms` after connection
+establishment. The `/index.html` leaf had `64` providers and a single HTTP
+provider, `https://f010479.twinquasar.io/`, which returned HTTP `500` on both
+the initial attempt and the same-provider self-hedge before Bitswap delivered
+the block. The useful Bitswap transfer itself was not the only cost; repeated
+provider/DNS expansion plus a failed single HTTP provider path dominated the
+tail.
+
+Decision:
+Use this as the current no-env baseline. The remaining same-window gap is now
+narrower than earlier broad asset work: Rust wins most selected cases while
+staying much lighter on RSS/FDs, and Wikipedia p95 is the visible remaining
+loss. The next useful code experiment should target source selection/fallback
+around the observed Wikipedia path, not broad static fanout increases.
+
+## 2026-05-07 - Reject: DNS Expansion Cache Retest On Fresh Selected Baseline
+
+Hypothesis:
+The disabled DNS expansion cache may remove repeated DNS expansion cost in the
+current fresh selected-case window and close the Wikipedia tail without
+materially increasing mobile resource use.
+
+Command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_ENABLE_BITSWAP_DNS_EXPANSION_CACHE=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/dnscache-fresh-selected-r5-20260507Tafter-baseline-trace.jsonl \
+  --comparison-output /tmp/dnscache-fresh-selected-r5-20260507Tafter-baseline.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5` for every selected case.
+- DAICO root: Rust `1174/1437ms` vs Kubo `2916/3151ms`.
+- Vitalik range: Rust `107/170ms` vs Kubo `1667/2680ms`.
+- `ipfs.tech` root range: Rust `615/673ms` vs Kubo `776/1239ms`.
+- `ipfs.tech` page assets: Rust root `3/4ms`, assets `82/248ms`; Kubo root
+  `2/2ms`, assets `359/489ms`.
+- `ipfs.tech` hero range: Rust `129/158ms` vs Kubo `446/456ms`.
+- Wikipedia root still lost at p95 and had a worse median than the no-env
+  baseline: Rust `478/976ms` vs Kubo `510/532ms`.
+- Resource max: Rust `52080KiB` RSS and `39` FDs vs Kubo `158548KiB` RSS and
+  `260` FDs.
+- Block fetch totals: HTTP provider p50/p95/max `125/535/777ms`; Bitswap
+  p50/p95/max `60/368/537ms`.
+- Delegated provider lookup p50/p95/max was `17/49/89ms`.
+- Request classifications included `20` `zero_http_provider_bitswap`, `12`
+  `cold_bitswap_peer_expand`, `12` `zero_http_provider_cold_bitswap`, `10`
+  `top_level_zero_http_provider_bitswap`, and `5`
+  `top_level_zero_http_provider_cold_bitswap`.
+
+Trace interpretation:
+DNS cache hits happened, but the slow Wikipedia request still recorded `15`
+`bitswap_dnsaddr_expand` events, `5` `bitswap_dns_multiaddr_expand` events,
+and only `2` `bitswap_dns_expansion_cache` markers. The run increased Bitswap
+peer attempts (`328` vs `286` in the fresh no-env baseline) and increased max
+FDs (`39` vs `35`) while failing to beat Kubo on the target p95.
+
+Decision:
+Keep the DNS expansion cache disabled/lab-only. It can improve some metrics in
+some windows, but it did not close the Wikipedia p95 gap, worsened Wikipedia
+median in this same-window retest, and increased fanout/resource pressure. The
+next experiment should inspect failed single-HTTP-provider fallback and source
+quality, especially where a sole HTTP provider returns `5xx` before Bitswap
+eventually wins.
