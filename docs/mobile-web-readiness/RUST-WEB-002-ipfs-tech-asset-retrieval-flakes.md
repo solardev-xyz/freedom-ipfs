@@ -28722,3 +28722,169 @@ Kubo even though top-level roots were not forced direct. Keep the behavior behin
 experiment should use the new `gateway_subresource` trace field for
 peer-quality/session gating instead of applying direct `WANT_BLOCK` solely from
 request kind.
+
+## 2026-05-07 - Current-Head Baseline After Subresource Context
+
+Question:
+After keeping the gateway request-context diagnostics and leaving subresource
+direct `WANT_BLOCK` default-off, what is the current no-env same-window baseline
+against Kubo?
+
+Focused command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-subresource-context-default-ipfs-tech-r10-20260507T032838Z-trace.jsonl \
+  --comparison-output /tmp/current-head-subresource-context-default-ipfs-tech-r10-20260507T032838Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Focused result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `740/1389ms`; Kubo `1807/2925ms`.
+- Asset p50/p95: Rust `151/515ms`; Kubo `353/802ms`.
+- Resource max: Rust `54036KiB` RSS, `46` FDs; Kubo `383296KiB`,
+  `1087` FDs.
+- Zero-HTTP cold Bitswap p50/p95/max: `748/1386/1386ms`.
+- Top-level zero-HTTP cold Bitswap p50/p95/max: `738/1386/1386ms`.
+- Bitswap fetch p50/p95/max: `147/512/1079ms`.
+- HTTP provider fetch p50/p95/max: `66/243/765ms`.
+
+Three-case guardrail command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case ipfs-tech-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-subresource-context-multicase-r10-20260507T033036Z-trace.jsonl \
+  --comparison-output /tmp/current-head-subresource-context-multicase-r10-20260507T033036Z.json
+```
+
+Three-case guardrail result:
+
+- Rust and Kubo passed `10/10`.
+- DAICO root p50/p95: Rust `1167/1289ms`; Kubo `2951/3215ms`.
+- Vitalik root/range p50/p95: Rust `100/234ms`; Kubo `1540/2759ms`.
+- `ipfs.tech` root p50/p95: Rust `574/2484ms`; Kubo `1127/1523ms`.
+- `ipfs.tech` asset p50/p95: Rust `157/355ms`; Kubo `373/864ms`.
+- Resource max: Rust `56052KiB` RSS, `37` FDs; Kubo `277984KiB`,
+  `435` FDs.
+- Zero-HTTP cold Bitswap requests: `10`, all top-level `/ipns/ipfs.tech/`.
+- Zero-HTTP cold Bitswap p50/p95/max: `571/2482/2482ms`.
+- Bitswap fetch p50/p95/max: `122/289/2055ms`.
+
+Trace finding:
+The only Kubo-relative loss in this guardrail is `ipfs.tech` root p95. The
+slowest root fetched the UnixFS `/index.html` leaf CID
+`bafkreibnzgajg3gsyn5c4p5e2h7racpy6dy7tnhwe5l4v4vx5e32qmn4bi` through
+zero-HTTP Bitswap. The first direct peer failed protocol negotiation quickly,
+then an untrusted `WANT_HAVE` peer eventually delivered the block after about
+`2s`. Subsequent fresh runs often received the same block from a different peer
+in about `200-350ms`. This is a peer-quality/source-selection outlier, not an
+asset fan-out or HTTP-provider race problem.
+
+Decision:
+Current no-env is strong and should remain the default. It wins assets, DAICO,
+Vitalik, and resource use. The remaining actionable shape is intermittent
+top-level zero-HTTP root Bitswap outliers when delegated routing does not return
+an HTTP provider for the root index block. Continue with peer-quality/session
+selection experiments for that shape; do not revisit generic subresource
+prefetching or multi-HTTP races for this gap.
+
+## 2026-05-07 - Direct5 Multi-Case Recheck During HTTP-Provider Shift
+
+Question:
+The prior zero-HTTP trace showed a root p95 miss caused by a failed direct peer
+and slow `WANT_HAVE` fallback. Does the existing direct5 lab knob improve the
+three-case guardrail in the same network window?
+
+Opt-in command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=5 timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case ipfs-tech-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-direct5-multicase-r10-20260507T033420Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-direct5-multicase-r10-20260507T033420Z.json
+```
+
+Opt-in result:
+
+- Rust and Kubo passed `10/10`.
+- DAICO root p50/p95: Rust `1270/1469ms`; Kubo `2825/3129ms`.
+- Vitalik root/range p50/p95: Rust `100/111ms`; Kubo `1402/3161ms`.
+- `ipfs.tech` root p50/p95: Rust `568/780ms`; Kubo `1087/1292ms`.
+- `ipfs.tech` asset p50/p95: Rust `191/447ms`; Kubo `391/851ms`.
+- Resource max: Rust `58352KiB` RSS, `32` FDs; Kubo `316552KiB`,
+  `781` FDs.
+- Zero-HTTP cold Bitswap requests: `1`.
+- Bitswap fetch p50/p95/max: `257/371/371ms`.
+
+Immediate no-env control:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case ipfs-tech-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-post-direct5-multicase-control-r10-20260507T033645Z-trace.jsonl \
+  --comparison-output /tmp/current-head-post-direct5-multicase-control-r10-20260507T033645Z.json
+```
+
+Immediate no-env result:
+
+- Rust and Kubo passed `10/10`.
+- DAICO root p50/p95: Rust `1210/1494ms`; Kubo `2814/3168ms`.
+- Vitalik root/range p50/p95: Rust `96/241ms`; Kubo `2056/3374ms`.
+- `ipfs.tech` root p50/p95: Rust `517/985ms`; Kubo `1140/1548ms`.
+- `ipfs.tech` asset p50/p95: Rust `195/461ms`; Kubo `374/843ms`.
+- Resource max: Rust `52544KiB` RSS, `32` FDs; Kubo `362472KiB`,
+  `1519` FDs.
+- Zero-HTTP provider lookups: `0`.
+- HTTP provider fetch p50/p95/max: `161/304/594ms`.
+
+Decision:
+Do not promote or tune direct5 from this sample. The opt-in run looked good, but
+the immediate no-env control also looked good and had `0` zero-HTTP provider
+lookups. Provider availability shifted between runs, so the direct5 sample did
+not actually exercise the target failure mode. Keep the existing direct peer
+count knob as a lab tool only. A useful next experiment needs either a naturally
+occurring zero-HTTP window or a controlled harness/routing mode that can
+reproduce zero-HTTP provider sets without changing unrelated page behavior.
