@@ -33872,3 +33872,107 @@ Keep. This is diagnostics-only and changes no retrieval behavior. The next live
 same-window focused run should use this field to separate top-level zero-HTTP
 Bitswap source quality from asset/subresource source quality before attempting
 another adaptive source-selection change.
+
+## 2026-05-07 Fresh Focused Baseline With Scoped Source Indexes
+
+Refresh the focused same-window baseline after adding request-classified Bitswap
+source candidate indexes.
+
+Command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-scoped-index-focused-r10-20260507Tbaseline-trace.jsonl \
+  --comparison-output /tmp/current-scoped-index-focused-r10-20260507Tbaseline.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10` for both cases.
+- `ipfs.tech` page assets:
+  - root TTFB/total p50/p95: Rust `931/1283ms` and `932/1284ms`; Kubo
+    `1469/2642ms` and `1469/2643ms`.
+  - asset TTFB/total p50/p95: Rust `186/366ms`; Kubo `124/760ms`.
+- `wikipedia-on-ipfs-root`:
+  - root TTFB/total p50/p95: Rust `1693/2159ms`; Kubo `265/1232ms`.
+- Resource max: Rust `49348KiB` RSS and `36` FDs vs Kubo `317328KiB` RSS and
+  `521` FDs.
+- Trace shape: HTTP-provider blocks `332`, p50/p95/max `184/342/856ms`;
+  Bitswap blocks `38`, p50/p95/max `390/1159/1191ms`; delegated lookup
+  p50/p95/max `22/58/184ms`.
+- Request classifications: `zero_http_provider_bitswap=15`,
+  `cold_bitswap_peer_expand=13`, `zero_http_provider_cold_bitswap=13`,
+  `top_level_zero_http_provider_bitswap=10`,
+  `top_level_zero_http_provider_cold_bitswap=9`.
+- Scoped source indexes:
+  - `top_level_zero_http_provider_bitswap`: `4=14`, `1=4`, `0=1`.
+  - `top_level_zero_http_provider_cold_bitswap`: `4=14`, `1=4`.
+
+Trace drill-down:
+
+- The Wikipedia root request is now clearly a two-block problem in this window.
+- The directory/root CID
+  `bafybeiaysi4s6lnjev27ln5icwm6tueaw2vdykrtjkwiphwekaywqhcjze` delivered
+  from candidate index `4` five times, index `1` four times, and index `0` once.
+  Index `4` could be fast (`159-296ms`) or slow (`779ms`), while index `1`
+  samples clustered near `797-929ms`.
+- The follow-on `index.html` CID
+  `bafkreicr5w6i2f3m664a2fnl4vhtg3s6dhhk6n5hrf3gqzcf7v5bu6b7te` delivered
+  from candidate index `4` nine times with p50/max `635/701ms`. The only HTTP
+  provider for that CID was `https://f010479.twinquasar.io/`, which returned
+  repeated `500` errors before Bitswap completed.
+- The visible Wikipedia root latency is therefore the sum of a zero-HTTP
+  Bitswap directory/root block plus a follow-on index block that falls through
+  a failing single HTTP provider and Bitswap. Improving only the first root
+  block is unlikely to close the gap.
+
+Decision:
+
+Use this as the latest focused no-env baseline. It reinforces the post-fast-wave
+conclusion: the next behavior work should be page-load/session-level multi-block
+work, especially follow-on UnixFS/index block scheduling and source selection,
+not another global static direct/probe width sweep.
+
+## 2026-05-07 Keep: Slow-CID Bitswap Source Diagnostics
+
+The scoped baseline required a manual JSONL drill-down to separate the
+Wikipedia directory/root CID from the follow-on `index.html` CID. The normal
+`slow_cids` summary already identifies the high-cost CIDs, so it should also
+show which Bitswap source candidate indexes and peers actually delivered those
+CIDs.
+
+Change:
+
+- Add `bitswap_source_candidate_indexes` and `bitswap_source_peers` to each
+  `slow_cids` aggregate.
+- Print those fields under slow CID rows when present.
+- Extend the trace-summary test to assert CID-level source candidate index and
+  peer aggregation.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details -- --nocapture
+cargo test -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Validation passed.
+
+Decision:
+
+Keep. This is diagnostics-only and changes no retrieval behavior. Future live
+runs should show the root-vs-index source split directly in harness output,
+which should make the next page-level source-selection experiment easier to
+validate without custom trace scripts.

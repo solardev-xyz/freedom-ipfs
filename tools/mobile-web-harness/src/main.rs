@@ -1921,10 +1921,21 @@ fn print_trace_slow_details(trace: &TraceSummary) {
         for cid in trace.slow_cids.iter().take(8) {
             let phases = format_trace_counts(&cid.phases);
             let paths = format_trace_counts(&cid.paths);
+            let bitswap_source_candidate_indexes =
+                format_trace_counts(&cid.bitswap_source_candidate_indexes);
+            let bitswap_source_peers = format_trace_counts(&cid.bitswap_source_peers);
             println!(
                 "    {}: count={} total={}ms max={}ms phases={} paths={}",
                 cid.cid, cid.count, cid.total_ms, cid.max_ms, phases, paths
             );
+            if !cid.bitswap_source_candidate_indexes.is_empty()
+                || !cid.bitswap_source_peers.is_empty()
+            {
+                println!(
+                    "      bitswap_source_candidate_indexes={} bitswap_source_peers={}",
+                    bitswap_source_candidate_indexes, bitswap_source_peers
+                );
+            }
         }
     }
     if !trace.slow_requests.is_empty() {
@@ -6965,6 +6976,8 @@ struct TraceCidAggregate {
     max_ms: u128,
     phases: Vec<TraceValueCount>,
     paths: Vec<TraceValueCount>,
+    bitswap_source_candidate_indexes: Vec<TraceValueCount>,
+    bitswap_source_peers: Vec<TraceValueCount>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -7217,6 +7230,8 @@ struct TraceCidBuilder {
     max_ms: u128,
     phases: BTreeMap<String, usize>,
     paths: BTreeMap<String, usize>,
+    bitswap_source_candidate_indexes: BTreeMap<String, usize>,
+    bitswap_source_peers: BTreeMap<String, usize>,
 }
 
 #[derive(Default)]
@@ -8526,6 +8541,21 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             if let Some(path) = trace_event_path(&value) {
                 *entry.paths.entry(path).or_default() += 1;
             }
+            if successful_bitswap_fetch {
+                if let Some(index) = json_detail_string(value.get("source_peer_candidate_index")) {
+                    if index != "-1" {
+                        *entry
+                            .bitswap_source_candidate_indexes
+                            .entry(index)
+                            .or_default() += 1;
+                    }
+                }
+                if let Some(peer) = json_detail_string(value.get("source_peer")) {
+                    if !peer.is_empty() {
+                        *entry.bitswap_source_peers.entry(peer).or_default() += 1;
+                    }
+                }
+            }
         }
     }
 
@@ -9030,6 +9060,10 @@ fn sorted_trace_cids(counts: BTreeMap<String, TraceCidBuilder>) -> Vec<TraceCidA
             max_ms: builder.max_ms,
             phases: sorted_trace_counts(builder.phases),
             paths: sorted_trace_counts(builder.paths),
+            bitswap_source_candidate_indexes: sorted_trace_counts(
+                builder.bitswap_source_candidate_indexes,
+            ),
+            bitswap_source_peers: sorted_trace_counts(builder.bitswap_source_peers),
         })
         .collect::<Vec<_>>();
     values.sort_by(|left, right| {
@@ -10660,6 +10694,11 @@ mod tests {
             .unwrap();
         assert_eq!(cid1.total_ms, 30);
         assert_eq!(cid1.count, 2);
+        assert_eq!(
+            trace_value_count(&cid1.bitswap_source_candidate_indexes, "4"),
+            1
+        );
+        assert_eq!(trace_value_count(&cid1.bitswap_source_peers, "peer1"), 1);
         assert_eq!(summary.slow_requests.len(), 1);
         assert_eq!(summary.slow_requests[0].path, "/ipns/site/asset.js");
         assert_eq!(summary.slow_requests[0].request_id, "9");
