@@ -183,6 +183,7 @@ pub struct GatewayConfig {
     html_prefetch: GatewayHtmlPrefetchConfig,
     html_range_warm: GatewayHtmlRangeWarmConfig,
     raw_link_tsize_fast_headers: bool,
+    stream_small_bodies: bool,
 }
 
 impl GatewayConfig {
@@ -194,6 +195,7 @@ impl GatewayConfig {
             html_prefetch: GatewayHtmlPrefetchConfig::default(),
             html_range_warm: GatewayHtmlRangeWarmConfig::default(),
             raw_link_tsize_fast_headers: false,
+            stream_small_bodies: false,
         }
     }
 
@@ -243,6 +245,15 @@ impl GatewayConfig {
 
     pub fn with_raw_link_tsize_fast_headers(mut self, enabled: bool) -> Self {
         self.raw_link_tsize_fast_headers = enabled;
+        self
+    }
+
+    pub fn stream_small_bodies(&self) -> bool {
+        self.stream_small_bodies
+    }
+
+    pub fn with_stream_small_bodies(mut self, enabled: bool) -> Self {
+        self.stream_small_bodies = enabled;
         self
     }
 }
@@ -388,6 +399,7 @@ pub struct GatewayState {
     html_prefetch: HtmlPrefetchRuntime,
     html_range_warm: HtmlRangeWarmRuntime,
     raw_link_tsize_fast_headers: bool,
+    stream_small_bodies: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -449,6 +461,7 @@ impl GatewayState {
             html_prefetch: HtmlPrefetchRuntime::new(config.html_prefetch()),
             html_range_warm: HtmlRangeWarmRuntime::new(config.html_range_warm()),
             raw_link_tsize_fast_headers: config.raw_link_tsize_fast_headers(),
+            stream_small_bodies: config.stream_small_bodies(),
         }
     }
 }
@@ -699,6 +712,7 @@ async fn ipfs_get(
                 parent_request_id,
             ),
             raw_link_tsize_fast_headers: state.raw_link_tsize_fast_headers,
+            stream_small_bodies: state.stream_small_bodies,
         };
         let response = with_retrieval_request_context(retrieval_context, async {
             match serve_ipfs_path(
@@ -799,6 +813,7 @@ async fn ipns_get(
                 parent_request_id,
             ),
             raw_link_tsize_fast_headers: state.raw_link_tsize_fast_headers,
+            stream_small_bodies: state.stream_small_bodies,
         };
         let response = with_retrieval_request_context(retrieval_context, async {
             match serve_ipns_path(
@@ -940,6 +955,7 @@ struct GatewayResponseFeatures {
     html_prefetch: Option<HtmlPrefetchRuntime>,
     html_range_warm: Option<HtmlRangeWarmRuntime>,
     raw_link_tsize_fast_headers: bool,
+    stream_small_bodies: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1088,6 +1104,7 @@ async fn serve_ipfs_path_with_listing_path(
                     unixfs.clone(),
                     features.small_body_cache.clone(),
                     features.html_prefetch,
+                    features.stream_small_bodies,
                     target,
                     headers,
                 )?
@@ -2366,6 +2383,7 @@ fn streaming_response(
     unixfs: UnixfsResolver,
     small_body_cache: Arc<SmallBodyCache>,
     html_prefetch: Option<HtmlPrefetchRuntime>,
+    stream_small_bodies: bool,
     target: FileResponseTarget,
     headers: FileResponseHeaders<'_>,
 ) -> Result<Response, GatewayError> {
@@ -2375,7 +2393,7 @@ fn streaming_response(
         path,
         len,
     } = target;
-    if !headers.is_head && len <= GATEWAY_STREAM_CHUNK_SIZE {
+    if !headers.is_head && !stream_small_bodies && len <= GATEWAY_STREAM_CHUNK_SIZE {
         let end = len.saturating_sub(1);
         let body = if len == 0 {
             Bytes::new()
@@ -3259,6 +3277,47 @@ mod tests {
         assert_eq!(second_body.as_ref(), data);
         assert_eq!(provider.call_count(&dir_cid), dir_calls);
         assert_eq!(provider.call_count(&file_cid), file_calls);
+    }
+
+    #[tokio::test]
+    async fn gateway_can_stream_small_full_bodies_when_configured() {
+        let data = b"console.log('small streamed asset');";
+        let file_block = test_pb_file(data);
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_block);
+        let dir_block = test_pb_directory(vec![test_link("app.js", &file_cid)]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (dir_cid, dir_block),
+            (file_cid, file_block),
+        ])));
+        let config = GatewayConfig::new(8).with_stream_small_bodies(true);
+        let state = GatewayState::with_provider_config(provider.clone(), config);
+
+        let response = ipfs_get(
+            State(state),
+            Path(format!("{dir_cid}/app.js")),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(gateway_body_mode(&response), "stream");
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            data.len().to_string()
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), data);
+        assert_eq!(provider.call_count(&dir_cid), 1);
+        assert_eq!(provider.call_count(&file_cid), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -39705,3 +39705,168 @@ Next agent guidance:
   confirm whether the delayed target actually returned early. Do not rely only
   on `response_target_met`, which also records target conditions seen before a
   full response ends.
+
+## 2026-05-07: Focused Current-Head R10 After Delayed Direct-Target Lab
+
+Branch:
+
+- `codex/kubo-session-performance-20260506`
+- Head: `835d185`
+
+Command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/current-focused-post-delayed-target-r10-20260507T230000Z-trace.jsonl \
+  --comparison-output /tmp/current-focused-post-delayed-target-r10-20260507T230000Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10` for both focused cases.
+- `ipfs.tech` root: Rust `645/1239ms`; Kubo `1681/2758ms`.
+- `ipfs.tech` assets: Rust `190/473ms`; Kubo `161/432ms`.
+  Kubo was slightly faster on aggregate asset p50/p95, but the deltas stayed
+  below the meaningful threshold.
+- `wikipedia-on-ipfs-root`: Rust `527/736ms`; Kubo `357/1668ms`.
+  Kubo still had the median root win, while Rust kept the p95 win.
+- Resource max: Rust `57820KiB` RSS and `36` FDs vs Kubo `256396KiB`
+  RSS and `167` FDs.
+- `meaningful_kubo_wins`: `2`, both Wikipedia median root metrics:
+  `root_ttfb_p50` and `root_total_p50`.
+- Path-local `ipfs.tech` asset Kubo wins remained visible, led by:
+  - `_nuxt/BRRQtYXV.js` p95: Rust `995ms`; Kubo `260/261ms`.
+  - `_nuxt/entry.C4ErMpWu.css` p95: Rust `1156/1157ms`; Kubo `432ms`.
+  - `_nuxt/DzK6mLCt.js` p95: Rust `890ms`; Kubo `292ms`.
+- Gateway body modes: `320` direct bodies (`2292180` bytes) and `20`
+  streamed bodies (`3198420` bytes).
+- Block fetch totals:
+  - HTTP provider: `357` blocks, p50/p90/p95/max
+    `188/269/389/924ms`.
+  - Bitswap: `63` blocks, p50/p90/p95/max `161/402/429/508ms`.
+- Request classifications: `zero_http_provider_bitswap=18`,
+  `cold_bitswap_peer_expand=10`, `top_level_zero_http_provider_bitswap=9`,
+  `zero_http_provider_cold_bitswap=9`.
+
+Interpretation:
+
+The current aggregate gap is narrow and case-specific. `ipfs.tech` root and
+resources are clearly ahead of Kubo, `ipfs.tech` aggregate assets are only
+slightly behind Kubo, and Wikipedia still has a median zero-HTTP/Bitswap root
+gap. The visible path-local `ipfs.tech` asset gaps suggested one hypothesis:
+small gateway direct bodies might be delaying HTTP response headers until the
+whole body is fetched.
+
+## 2026-05-07: Stream Small Gateway Bodies Lab
+
+Branch:
+
+- `codex/kubo-session-performance-20260506`
+- Base before this lab patch: `835d185`
+
+Question:
+
+For non-HEAD full responses up to `64KiB`, the gateway direct-body path reads
+the whole UnixFS body before constructing the HTTP response. That is good for
+warm cache reuse, but it can make harness/browser TTFB equal the full cold body
+fetch for small CSS/JS assets.
+
+Does forcing those small full responses through the existing streaming response
+path improve cold TTFB without hurting page totals or resources?
+
+Change:
+
+- Keep defaults unchanged.
+- Add disabled/env-gated gateway config:
+  `FREEDOM_IPFS_GATEWAY_STREAM_SMALL_BODIES=1`.
+- When enabled, only the full-response small direct-body shortcut is skipped.
+  Small byte ranges still use the existing range direct-body path.
+- Add `GatewayConfig::with_stream_small_bodies(true)` for tests and local
+  harness experiments.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-gateway gateway_can_stream_small_full_bodies_when_configured -- --nocapture
+cargo test -p freedom-ipfs-gateway gateway_reuses_small_direct_body_cache_for_repeated_assets -- --nocapture
+cargo check -p freedom-ipfs-gateway
+cargo test -p freedom-ipfs-gateway -- --nocapture
+cargo test -p freedom-ipfs-retrieval slow_source_suppression -- --nocapture
+cargo clippy -p freedom-ipfs-gateway --all-targets -- -D warnings
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Result:
+
+- Formatting passed.
+- Focused stream-small-bodies test passed.
+- Focused default direct-body cache test passed.
+- Gateway package check passed.
+- Full gateway package test passed: `40` lib tests, `4` main tests, `1`
+  CLI test, parser tests, and ignored live/Kubo tests unchanged.
+- Retrieval slow-source suppression focused tests passed after a narrow
+  clippy-only cleanup that groups the suppression helper inputs into a struct.
+- Gateway and retrieval clippy passed with `-D warnings`.
+
+Live command:
+
+```sh
+FREEDOM_IPFS_GATEWAY_STREAM_SMALL_BODIES=1 timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/stream-small-bodies-focused-r10-20260507T214718Z-trace.jsonl \
+  --comparison-output /tmp/stream-small-bodies-focused-r10-20260507T214718Z.json
+```
+
+Live result:
+
+- Rust and Kubo passed `10/10` for both focused cases.
+- `ipfs.tech` root: Rust `597/1343ms`; Kubo `2443/3005ms`.
+- `ipfs.tech` assets: Rust `194/575ms`; Kubo `138/620ms`.
+- `wikipedia-on-ipfs-root`: Rust `577/1101ms`; Kubo `370/1116ms`.
+- Resource max: Rust `58100KiB` RSS and `47` FDs vs Kubo `242052KiB`
+  RSS and `219` FDs.
+- `meaningful_kubo_wins`: `4`:
+  - `ipfs-tech-page-assets asset_ttfb_p50`: Rust `194ms`; Kubo `138ms`.
+  - `ipfs-tech-page-assets asset_total_p50`: Rust `194ms`; Kubo `139ms`.
+  - `wikipedia-on-ipfs-root root_ttfb_p50`: Rust `577ms`; Kubo `370ms`.
+  - `wikipedia-on-ipfs-root root_total_p50`: Rust `577ms`; Kubo `370ms`.
+- Gateway body modes shifted as expected: direct bodies dropped from `320`
+  to `60`, while streamed bodies rose from `20` to `280`.
+- Bitswap got worse in this window: block fetch p50/p90/p95/max moved from
+  `161/402/429/508ms` to `244/901/939/1622ms`.
+- The slowest asset examples were zero-HTTP Bitswap assets, not HTTP header
+  formation:
+  - `_nuxt/hfYlCurB.js`: `1625ms`, `zero_http_provider_cold_bitswap=1`,
+    Bitswap source candidate index `4`, `bitswap_fetch=1561ms`.
+  - `_nuxt/hfYlCurB.js`: `1365ms`, source candidate index `5`.
+  - `_nuxt/DBHrpFkY.js`: `1183ms`, source candidate index `1`.
+
+Decision:
+
+Keep `FREEDOM_IPFS_GATEWAY_STREAM_SMALL_BODIES=1` as a disabled lab knob, but
+do not promote it. The hypothesis did not hold for the current focused gap:
+streaming small bodies changed the body mode but did not improve aggregate
+TTFB/total, added two meaningful `ipfs.tech` median asset losses, raised FD
+usage, and exposed worse zero-HTTP Bitswap tails. The remaining work is still
+provider/peer/session selection for zero-HTTP Bitswap subresources and the
+Wikipedia median root path, not small-body response-header timing.
