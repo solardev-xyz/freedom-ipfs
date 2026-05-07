@@ -25,6 +25,8 @@ const DEFAULT_KUBO_BIN: &str = "target/tools/kubo/kubo/ipfs";
 const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 const DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_ASSET_CONCURRENCY: usize = 6;
+const MEANINGFUL_KUBO_WIN_MIN_DELTA_MS: u128 = 50;
+const MEANINGFUL_KUBO_WIN_MIN_RATIO: f64 = 1.10;
 const MAX_TRACE_SLOW_EVENTS: usize = 16;
 const SYNTHETIC_MULTIBLOCK_RANGE_ID: &str = "synthetic-multiblock-range";
 const SYNTHETIC_MULTIBLOCK_FILE_BYTES: usize = 512 * 1024;
@@ -1650,8 +1652,46 @@ fn print_comparison_summary(report: &ComparisonReport) {
             display_option_f64(case.storage_ratio)
         );
     }
+    print_meaningful_kubo_wins(report);
     print_comparison_trace_summary("rust", &report.rust);
     print_comparison_trace_summary("kubo", &report.kubo);
+}
+
+fn print_meaningful_kubo_wins(report: &ComparisonReport) {
+    let wins = report
+        .cases
+        .iter()
+        .flat_map(|case| {
+            case.meaningful_kubo_wins
+                .iter()
+                .map(move |win| (case.id.as_str(), win))
+        })
+        .collect::<Vec<_>>();
+    if wins.is_empty() {
+        println!(
+            "meaningful_kubo_wins: none (delta>={}ms ratio>={:.2}x)",
+            MEANINGFUL_KUBO_WIN_MIN_DELTA_MS, MEANINGFUL_KUBO_WIN_MIN_RATIO
+        );
+        return;
+    }
+
+    println!(
+        "meaningful_kubo_wins: {} (delta>={}ms ratio>={:.2}x)",
+        wins.len(),
+        MEANINGFUL_KUBO_WIN_MIN_DELTA_MS,
+        MEANINGFUL_KUBO_WIN_MIN_RATIO
+    );
+    for (case_id, win) in wins {
+        println!(
+            "  {} {}: rust={} kubo={} delta={}ms ratio={:.2}x",
+            case_id,
+            win.metric,
+            display_option_ms(Some(win.rust_ms)),
+            display_option_ms(Some(win.kubo_ms)),
+            win.delta_ms,
+            win.ratio
+        );
+    }
 }
 
 fn print_offline_replay_summary(report: &OfflineReplayReport) {
@@ -4958,6 +4998,7 @@ struct ComparisonCase {
     id: String,
     rust_pass_rate: f64,
     kubo_pass_rate: f64,
+    meaningful_kubo_wins: Vec<ComparisonKuboWin>,
     rust_root_ttfb_p50_ms: Option<u128>,
     kubo_root_ttfb_p50_ms: Option<u128>,
     root_ttfb_p50_ratio: Option<f64>,
@@ -4999,6 +5040,15 @@ struct ComparisonCase {
     storage_ratio: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct ComparisonKuboWin {
+    metric: String,
+    rust_ms: u128,
+    kubo_ms: u128,
+    delta_ms: u128,
+    ratio: f64,
+}
+
 impl ComparisonCase {
     fn from_reports(rust: &RunReport, kubo: &RunReport) -> Vec<Self> {
         let mut ids = Vec::new();
@@ -5034,10 +5084,11 @@ impl ComparisonCase {
                 let rust_max_storage_bytes = rust.summary.gateway_storage_bytes.max;
                 let kubo_max_storage_bytes = kubo.summary.gateway_storage_bytes.max;
                 let kubo_setup_adjusted_root_ttfb = setup_adjusted_root_ttfb_ms(kubo, &id);
-                Some(Self {
+                let mut case = Self {
                     id,
                     rust_pass_rate: rust_case.pass_rate,
                     kubo_pass_rate: kubo_case.pass_rate,
+                    meaningful_kubo_wins: Vec::new(),
                     rust_root_ttfb_p50_ms: rust_case.root_ttfb_ms.p50_ms,
                     kubo_root_ttfb_p50_ms: kubo_case.root_ttfb_ms.p50_ms,
                     root_ttfb_p50_ratio: ratio(
@@ -5107,10 +5158,77 @@ impl ComparisonCase {
                     rust_max_storage_bytes,
                     kubo_max_storage_bytes,
                     storage_ratio: ratio_u64(rust_max_storage_bytes, kubo_max_storage_bytes),
-                })
+                };
+                case.meaningful_kubo_wins = case.detect_meaningful_kubo_wins();
+                Some(case)
             })
             .collect()
     }
+
+    fn detect_meaningful_kubo_wins(&self) -> Vec<ComparisonKuboWin> {
+        [
+            (
+                "root_ttfb_p50",
+                self.rust_root_ttfb_p50_ms,
+                self.kubo_root_ttfb_p50_ms,
+            ),
+            (
+                "root_ttfb_p95",
+                self.rust_root_ttfb_p95_ms,
+                self.kubo_root_ttfb_p95_ms,
+            ),
+            (
+                "root_total_p50",
+                self.rust_root_total_p50_ms,
+                self.kubo_root_total_p50_ms,
+            ),
+            (
+                "root_total_p95",
+                self.rust_root_total_p95_ms,
+                self.kubo_root_total_p95_ms,
+            ),
+            (
+                "asset_ttfb_p50",
+                self.rust_asset_ttfb_p50_ms,
+                self.kubo_asset_ttfb_p50_ms,
+            ),
+            (
+                "asset_ttfb_p95",
+                self.rust_asset_ttfb_p95_ms,
+                self.kubo_asset_ttfb_p95_ms,
+            ),
+            (
+                "asset_total_p50",
+                self.rust_asset_total_p50_ms,
+                self.kubo_asset_total_p50_ms,
+            ),
+            (
+                "asset_total_p95",
+                self.rust_asset_total_p95_ms,
+                self.kubo_asset_total_p95_ms,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(metric, rust_ms, kubo_ms)| meaningful_kubo_win(metric, rust_ms?, kubo_ms?))
+        .collect()
+    }
+}
+
+fn meaningful_kubo_win(metric: &str, rust_ms: u128, kubo_ms: u128) -> Option<ComparisonKuboWin> {
+    if rust_ms <= kubo_ms || kubo_ms == 0 {
+        return None;
+    }
+    let delta_ms = rust_ms - kubo_ms;
+    let ratio = rust_ms as f64 / kubo_ms as f64;
+    (delta_ms >= MEANINGFUL_KUBO_WIN_MIN_DELTA_MS && ratio >= MEANINGFUL_KUBO_WIN_MIN_RATIO).then(
+        || ComparisonKuboWin {
+            metric: metric.to_string(),
+            rust_ms,
+            kubo_ms,
+            delta_ms,
+            ratio,
+        },
+    )
 }
 
 fn setup_adjusted_root_ttfb_ms(report: &RunReport, id: &str) -> LatencySummary {
@@ -11944,6 +12062,81 @@ mod tests {
         assert_eq!(case.kubo_asset_total_p95_ms, Some(20));
         assert_eq!(case.asset_total_p50_ratio, Some(3.0));
         assert_eq!(case.asset_total_p95_ratio, Some(3.0));
+    }
+
+    #[test]
+    fn comparison_case_reports_meaningful_kubo_wins() {
+        let mut rust_runs = vec![
+            run_result(
+                RunPhase::Measured,
+                1,
+                400,
+                Some(40),
+                Some(12),
+                Some(0),
+                None,
+            ),
+            run_result(
+                RunPhase::Measured,
+                2,
+                800,
+                Some(41),
+                Some(12),
+                Some(0),
+                None,
+            ),
+        ];
+        rust_runs[0].results[0].assets = vec![script_asset_result(3, 3)];
+        rust_runs[1].results[0].assets = vec![script_asset_result(3, 3)];
+
+        let mut kubo_runs = vec![
+            run_result(
+                RunPhase::Measured,
+                1,
+                200,
+                Some(100),
+                Some(30),
+                Some(0),
+                None,
+            ),
+            run_result(
+                RunPhase::Measured,
+                2,
+                240,
+                Some(101),
+                Some(31),
+                Some(0),
+                None,
+            ),
+        ];
+        kubo_runs[0].results[0].assets = vec![script_asset_result(1, 1)];
+        kubo_runs[1].results[0].assets = vec![script_asset_result(1, 1)];
+
+        let rust = run_report(HarnessEngine::Rust, None, rust_runs);
+        let kubo = run_report(HarnessEngine::Kubo, None, kubo_runs);
+
+        let cases = ComparisonCase::from_reports(&rust, &kubo);
+        let wins = &cases[0].meaningful_kubo_wins;
+
+        assert!(wins.iter().any(|win| {
+            win.metric == "root_ttfb_p50"
+                && win.rust_ms == 200
+                && win.kubo_ms == 100
+                && win.delta_ms == 100
+        }));
+        assert!(wins.iter().all(|win| !win.metric.starts_with("asset_")));
+    }
+
+    #[test]
+    fn meaningful_kubo_win_filters_noise_and_small_ratios() {
+        assert!(meaningful_kubo_win("asset_ttfb_p50", 3, 1).is_none());
+        assert!(meaningful_kubo_win("root_ttfb_p50", 149, 100).is_none());
+        assert!(meaningful_kubo_win("root_ttfb_p50", 109, 100).is_none());
+
+        let win = meaningful_kubo_win("root_ttfb_p95", 160, 100).unwrap();
+        assert_eq!(win.metric, "root_ttfb_p95");
+        assert_eq!(win.delta_ms, 60);
+        assert!((win.ratio - 1.6).abs() < f64::EPSILON);
     }
 
     #[test]
