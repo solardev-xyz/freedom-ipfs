@@ -34919,3 +34919,92 @@ successful sources. Then rerun a small focused smoke before deciding whether a
 narrow cross-top-level filter is justified. A blunt cross-top-level ban is not
 supported by the evidence because the reused peer can also produce fast
 Wikipedia root and follow-on block wins.
+
+## 2026-05-07 Cross-Top-Level Bitswap Session Diagnostics Smoke
+
+Change:
+
+Added behavior-neutral Bitswap session diagnostics so future experiments can
+separate same-top-level, cross-top-level, and unknown-top-level recent session
+peers. The patch does not change session peer selection, ordering, timeout
+budgets, provider lookup, or request modes.
+
+New trace fields:
+
+- `bitswap_session_shortcut_start`:
+  - `session_peer_same_top_level_count`
+  - `session_peer_cross_top_level_count`
+  - `session_peer_unknown_top_level_count`
+- successful `bitswap_fetch`, `bitswap_session_shortcut`, and
+  `bitswap_session_range_batch`:
+  - `source_peer_previous_top_level_path`
+  - `source_peer_same_top_level`
+  - `source_peer_cross_top_level`
+  - `source_peer_unknown_top_level`
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Result:
+
+- `cargo fmt --all --check`: passed.
+- `cargo test -p freedom-ipfs-retrieval`: passed, `122` tests, `1` ignored.
+- `cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings`:
+  passed.
+
+Smoke command:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 3 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/cross-top-level-diagnostics-smoke-r3-20260507Tdiag-trace.jsonl \
+  --comparison-output /tmp/cross-top-level-diagnostics-smoke-r3-20260507Tdiag.json
+```
+
+Smoke result:
+
+- Rust and Kubo passed `3/3`.
+- `ipfs.tech` page assets:
+  - root TTFB/total p50/p95: Rust `912/1736ms`; Kubo `1319/2441ms`.
+  - asset TTFB/total p50/p95: Rust `187/418ms`; Kubo `91/623ms`.
+- `wikipedia-on-ipfs-root`:
+  - root TTFB/total p50/p95: Rust `201/351ms`; Kubo `99/261ms`.
+- Resource max: Rust `47728KiB` RSS and `19` FDs vs Kubo `321260KiB` RSS and
+  `261` FDs.
+
+Trace verification:
+
+- New diagnostics were present in `32` trace events.
+- `source_peer_cross_top_level=true`: `3` events.
+- `session_peer_cross_top_level_count=1`: `3` events.
+- `source_peer_same_top_level=true`: `9` events.
+- `session_peer_same_top_level_count=1`: `14` events.
+- The first Wikipedia root block reused a peer recorded under
+  `/ipns/ipfs.tech/`, and the trace now explicitly reports that as
+  `source_peer_cross_top_level=true`. The follow-on Wikipedia `index.html`
+  block then reports same-top-level reuse because the root success refreshes the
+  peer under `/ipns/en.wikipedia-on-ipfs.org`.
+
+Decision:
+
+Keep the diagnostics. They validate the current shared-window hypothesis without
+adding behavior risk. Next tuning work should use these fields to measure
+whether cross-top-level one-hit session peers are net positive or whether a
+narrow filter should apply only in specific cases, such as slow follow-on
+Wikipedia blocks after a failing single HTTP provider. Do not use this smoke to
+justify a blunt cross-top-level ban; in this sample, cross-top-level reuse made
+the Wikipedia root fast.

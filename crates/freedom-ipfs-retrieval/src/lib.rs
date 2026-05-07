@@ -2777,6 +2777,13 @@ impl HttpRetriever {
             source_peer_previous_success_count = source_trace.previous_success_count,
             source_peer_previous_latency_ms = source_trace.previous_latency_ms,
             source_peer_previous_seen_age_ms = source_trace.previous_seen_age_ms,
+            source_peer_previous_top_level_path = %source_trace
+                .previous_top_level_path
+                .as_deref()
+                .unwrap_or(""),
+            source_peer_same_top_level = source_trace.same_top_level,
+            source_peer_cross_top_level = source_trace.cross_top_level,
+            source_peer_unknown_top_level = source_trace.unknown_top_level,
             extra_blocks = result.extra_blocks.len(),
             bytes = result.requested_block.len(),
             elapsed_ms = elapsed.as_millis()
@@ -3026,6 +3033,23 @@ impl HttpRetriever {
                 trace.previous_success_count = success.success_count;
                 trace.previous_latency_ms = success.last_latency.as_millis();
                 trace.previous_seen_age_ms = success.seen_at.elapsed().as_millis();
+                trace.previous_top_level_path = success.top_level_path.clone();
+                let current_top_level_path = current_retrieval_request_context()
+                    .and_then(|context| context.top_level_path().map(ToOwned::to_owned));
+                match (
+                    success.top_level_path.as_deref(),
+                    current_top_level_path.as_deref(),
+                ) {
+                    (Some(previous), Some(current)) if previous == current => {
+                        trace.same_top_level = true;
+                    }
+                    (Some(_), Some(_)) => {
+                        trace.cross_top_level = true;
+                    }
+                    _ => {
+                        trace.unknown_top_level = true;
+                    }
+                }
             }
         }
         trace
@@ -3191,6 +3215,9 @@ impl HttpRetriever {
             session_peer_latency_ms_max = peer_quality.latency_ms_max,
             session_peer_seen_age_ms_min = peer_quality.seen_age_ms_min,
             session_peer_seen_age_ms_max = peer_quality.seen_age_ms_max,
+            session_peer_same_top_level_count = peer_quality.same_top_level_count,
+            session_peer_cross_top_level_count = peer_quality.cross_top_level_count,
+            session_peer_unknown_top_level_count = peer_quality.unknown_top_level_count,
             trusted_direct_want_block_limit = bitswap_trusted_direct_want_block_peers()
                 .map(|limit| limit as i64)
                 .unwrap_or(-1)
@@ -3272,6 +3299,13 @@ impl HttpRetriever {
             source_peer_previous_success_count = source_trace.previous_success_count,
             source_peer_previous_latency_ms = source_trace.previous_latency_ms,
             source_peer_previous_seen_age_ms = source_trace.previous_seen_age_ms,
+            source_peer_previous_top_level_path = %source_trace
+                .previous_top_level_path
+                .as_deref()
+                .unwrap_or(""),
+            source_peer_same_top_level = source_trace.same_top_level,
+            source_peer_cross_top_level = source_trace.cross_top_level,
+            source_peer_unknown_top_level = source_trace.unknown_top_level,
             extra_blocks = result.extra_blocks.len(),
             bytes = result.requested_block.len(),
             elapsed_ms = elapsed.as_millis()
@@ -3293,7 +3327,14 @@ impl HttpRetriever {
         peers: &[BitswapPeer],
     ) -> BitswapSessionPeerQuality {
         let successes = self.successful_bitswap_peers.lock().await;
-        bitswap_session_peer_quality_from_successes(peers, &successes, Instant::now())
+        let current_top_level_path = current_retrieval_request_context()
+            .and_then(|context| context.top_level_path().map(ToOwned::to_owned));
+        bitswap_session_peer_quality_from_successes(
+            peers,
+            &successes,
+            Instant::now(),
+            current_top_level_path.as_deref(),
+        )
     }
 
     async fn fetch_many_from_recent_bitswap_peers(
@@ -3431,6 +3472,13 @@ impl HttpRetriever {
             source_peer_previous_success_count = source_trace.previous_success_count,
             source_peer_previous_latency_ms = source_trace.previous_latency_ms,
             source_peer_previous_seen_age_ms = source_trace.previous_seen_age_ms,
+            source_peer_previous_top_level_path = %source_trace
+                .previous_top_level_path
+                .as_deref()
+                .unwrap_or(""),
+            source_peer_same_top_level = source_trace.same_top_level,
+            source_peer_cross_top_level = source_trace.cross_top_level,
+            source_peer_unknown_top_level = source_trace.unknown_top_level,
             requested_blocks = requested_block_count,
             extra_blocks = extra_block_count,
             bytes = blocks.values().map(|block| block.data().len()).sum::<usize>(),
@@ -4024,12 +4072,16 @@ struct BitswapSessionPeerQuality {
     latency_ms_max: u128,
     seen_age_ms_min: u128,
     seen_age_ms_max: u128,
+    same_top_level_count: usize,
+    cross_top_level_count: usize,
+    unknown_top_level_count: usize,
 }
 
 fn bitswap_session_peer_quality_from_successes(
     peers: &[BitswapPeer],
     successes: &HashMap<PeerId, SuccessfulBitswapPeer>,
     now: Instant,
+    current_top_level_path: Option<&str>,
 ) -> BitswapSessionPeerQuality {
     let mut quality = BitswapSessionPeerQuality::default();
     for peer in peers {
@@ -4053,6 +4105,17 @@ fn bitswap_session_peer_quality_from_successes(
             quality.seen_age_ms_min = quality.seen_age_ms_min.min(seen_age_ms);
             quality.seen_age_ms_max = quality.seen_age_ms_max.max(seen_age_ms);
         }
+        match (success.top_level_path.as_deref(), current_top_level_path) {
+            (Some(previous), Some(current)) if previous == current => {
+                quality.same_top_level_count += 1;
+            }
+            (Some(_), Some(_)) => {
+                quality.cross_top_level_count += 1;
+            }
+            _ => {
+                quality.unknown_top_level_count += 1;
+            }
+        }
         quality.scored_count += 1;
     }
     quality
@@ -4069,6 +4132,10 @@ struct BitswapSourcePeerTrace {
     previous_success_count: u64,
     previous_latency_ms: u128,
     previous_seen_age_ms: u128,
+    previous_top_level_path: Option<String>,
+    same_top_level: bool,
+    cross_top_level: bool,
+    unknown_top_level: bool,
 }
 
 impl Default for BitswapSourcePeerTrace {
@@ -4083,6 +4150,10 @@ impl Default for BitswapSourcePeerTrace {
             previous_success_count: 0,
             previous_latency_ms: 0,
             previous_seen_age_ms: 0,
+            previous_top_level_path: None,
+            same_top_level: false,
+            cross_top_level: false,
+            unknown_top_level: false,
         }
     }
 }
@@ -10911,8 +10982,7 @@ mod bitswap_tests {
     fn bitswap_session_peer_quality_summarizes_recent_peer_state() {
         let first = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
         let second = parse_peer_id("12D3KooWAtxJkDLacJdK7yZkk2iPp8iMdSVh1bDHzmJ3t8oKUkqA").unwrap();
-        let missing =
-            parse_peer_id("12D3KooWAC7ALVECw2xQHccT3hSUcQU7pJ3hvwV77w1kEevC5kKG").unwrap();
+        let third = parse_peer_id("12D3KooWAC7ALVECw2xQHccT3hSUcQU7pJ3hvwV77w1kEevC5kKG").unwrap();
         let now = Instant::now();
         let peers = vec![
             BitswapPeer {
@@ -10930,7 +11000,7 @@ mod bitswap_tests {
                 force_want_have: false,
             },
             BitswapPeer {
-                id: missing,
+                id: third,
                 addrs: Vec::new(),
                 skip_want_have: true,
                 force_want_block: false,
@@ -10945,7 +11015,7 @@ mod bitswap_tests {
                     addrs: Vec::new(),
                     last_latency: Duration::from_millis(40),
                     success_count: 1,
-                    top_level_path: None,
+                    top_level_path: Some("/ipns/ipfs.tech/".to_owned()),
                 },
             ),
             (
@@ -10955,25 +11025,92 @@ mod bitswap_tests {
                     addrs: Vec::new(),
                     last_latency: Duration::from_millis(120),
                     success_count: 3,
+                    top_level_path: Some("/ipns/en.wikipedia-on-ipfs.org".to_owned()),
+                },
+            ),
+            (
+                third,
+                SuccessfulBitswapPeer {
+                    seen_at: now - Duration::from_millis(100),
+                    addrs: Vec::new(),
+                    last_latency: Duration::from_millis(80),
+                    success_count: 2,
                     top_level_path: None,
                 },
             ),
         ]);
 
-        let quality = bitswap_session_peer_quality_from_successes(&peers, &successes, now);
+        let quality = bitswap_session_peer_quality_from_successes(
+            &peers,
+            &successes,
+            now,
+            Some("/ipns/ipfs.tech/"),
+        );
 
         assert_eq!(
             quality,
             BitswapSessionPeerQuality {
-                scored_count: 2,
+                scored_count: 3,
                 success_count_min: 1,
                 success_count_max: 3,
                 latency_ms_min: 40,
                 latency_ms_max: 120,
                 seen_age_ms_min: 25,
                 seen_age_ms_max: 250,
+                same_top_level_count: 1,
+                cross_top_level_count: 1,
+                unknown_top_level_count: 1,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn bitswap_source_peer_trace_reports_top_level_relation() {
+        let peer = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store,
+        );
+        let peers = vec![BitswapPeer {
+            id: peer,
+            addrs: Vec::new(),
+            skip_want_have: true,
+            force_want_block: false,
+            force_want_have: false,
+        }];
+        {
+            let mut successes = retriever.successful_bitswap_peers.lock().await;
+            successes.insert(
+                peer,
+                SuccessfulBitswapPeer {
+                    seen_at: Instant::now() - Duration::from_millis(50),
+                    addrs: Vec::new(),
+                    last_latency: Duration::from_millis(42),
+                    success_count: 2,
+                    top_level_path: Some("/ipns/ipfs.tech/".to_owned()),
+                },
+            );
+        }
+
+        let trace = with_retrieval_request_context(
+            RetrievalRequestContext::gateway_request_with_top_level(
+                None,
+                Some("/ipns/en.wikipedia-on-ipfs.org".to_owned()),
+            ),
+            retriever.bitswap_source_peer_trace(Some(peer), &peers),
+        )
+        .await;
+
+        assert_eq!(trace.previous_success_count, 2);
+        assert_eq!(trace.previous_latency_ms, 42);
+        assert_eq!(
+            trace.previous_top_level_path.as_deref(),
+            Some("/ipns/ipfs.tech/")
+        );
+        assert!(!trace.same_top_level);
+        assert!(trace.cross_top_level);
+        assert!(!trace.unknown_top_level);
     }
 
     #[test]
