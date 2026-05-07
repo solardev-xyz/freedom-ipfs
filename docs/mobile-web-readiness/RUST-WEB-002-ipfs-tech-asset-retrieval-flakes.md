@@ -27649,3 +27649,129 @@ Bitswap. Avoid repeating the already-rejected raw self-hedge and single-HTTP
 Bitswap hedge defaults; a useful next candidate needs a stronger signal, such
 as page-scoped provider/source reuse, better provider diversity for single-HTTP
 assets, or a resource-bounded zero-HTTP Bitswap improvement.
+
+## 2026-05-07 - HTTP Provider Fetch Concurrency Cap Lab
+
+Question:
+After the fast-scored multi-HTTP race promotion, are some same-page HTTP
+provider assets queued behind the global HTTP-provider fetch semaphore?
+
+Change:
+Add `FREEDOM_IPFS_MAX_CONCURRENT_HTTP_PROVIDER_FETCHES=<n>` as a tuning
+override and trace `http_provider_fetch_limiter` wait time. The default was then
+raised from `4` to `8`. Set
+`FREEDOM_IPFS_MAX_CONCURRENT_HTTP_PROVIDER_FETCHES=4` to restore the previous
+limit.
+
+Focused `ipfs.tech` cap sweep:
+
+```sh
+FREEDOM_IPFS_MAX_CONCURRENT_HTTP_PROVIDER_FETCHES=6 timeout 1500s cargo run -p mobile-web-harness -- \
+  --compare-kubo --build-gateway --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets --repeat 5 --asset-concurrency 6 \
+  --timeout-secs 120 --run-timeout-secs 240 --dht-query-timeout-secs 3 \
+  --trace-output /tmp/httpcap6-ipfs-tech-r5-20260507T013253Z-trace.jsonl \
+  --comparison-output /tmp/httpcap6-ipfs-tech-r5-20260507T013253Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+
+FREEDOM_IPFS_MAX_CONCURRENT_HTTP_PROVIDER_FETCHES=8 timeout 1500s cargo run -p mobile-web-harness -- \
+  --compare-kubo --build-gateway --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets --repeat 5 --asset-concurrency 6 \
+  --timeout-secs 120 --run-timeout-secs 240 --dht-query-timeout-secs 3 \
+  --trace-output /tmp/httpcap8-ipfs-tech-r5-20260507T013611Z-trace.jsonl \
+  --comparison-output /tmp/httpcap8-ipfs-tech-r5-20260507T013611Z.json
+```
+
+Focused results:
+
+- Cap 4 control:
+  `/tmp/httpcap4-ipfs-tech-r5-20260507T013136Z.json`
+  - Rust/Kubo pass `5/5`.
+  - Rust root p50/p95 `1021/1253ms`; Kubo `2412/4079ms`.
+  - Rust asset p50/p95 `252/672ms`; Kubo `205/1421ms`.
+  - Rust RSS/FD `54128KiB/28`; Kubo `299532KiB/414`.
+  - HTTP-provider fetch limiter wait p50/p95/max `41/181/425ms`.
+  - HTTP-provider block p50/p95/max `221/601/898ms`.
+- Cap 6:
+  `/tmp/httpcap6-ipfs-tech-r5-20260507T013253Z.json`
+  - Rust/Kubo pass `5/5`; trace requirement failed only because this sample had
+    no zero-HTTP/Bitswap requests.
+  - Rust root p50/p95 `723/772ms`; Kubo `2745/2833ms`.
+  - Rust asset p50/p95 `196/557ms`; Kubo `149/500ms`.
+  - Rust RSS/FD `48696KiB/28`; Kubo `244100KiB/153`.
+  - HTTP-provider fetch limiter wait p50/p95/max `0/45/95ms`.
+  - HTTP-provider block p50/p95/max `201/332/675ms`.
+- Cap 8:
+  `/tmp/httpcap8-ipfs-tech-r5-20260507T013611Z.json`
+  - Rust/Kubo pass `5/5`.
+  - Rust root p50/p95 `614/1280ms`; Kubo `2877/5198ms`.
+  - Rust asset p50/p95 `192/460ms`; Kubo `292/647ms`.
+  - Rust RSS/FD `49280KiB/30`; Kubo `320436KiB/697`.
+  - HTTP-provider fetch limiter wait p50/p95/max `0/0/20ms`.
+  - HTTP-provider block p50/p95/max `187/277/570ms`.
+
+Broad guardrail:
+
+```sh
+FREEDOM_IPFS_MAX_CONCURRENT_HTTP_PROVIDER_FETCHES=8 timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo --build-gateway --fresh-gateway-per-run \
+  --case daicowtf-page-assets --case ipfs-tech-page-assets --case vitalik-root-html-range \
+  --repeat 5 --asset-concurrency 6 --timeout-secs 120 --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/httpcap8-multicase-r5-20260507T013730Z-trace.jsonl \
+  --comparison-output /tmp/httpcap8-multicase-r5-20260507T013730Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `5/5`.
+- `daicowtf-page-assets` root p50/p95:
+  - Rust `1315/1439ms`
+  - Kubo `2780/2869ms`
+- `vitalik-root-html-range` root p50/p95:
+  - Rust `101/121ms`
+  - Kubo `1610/1631ms`
+- `ipfs-tech-page-assets`:
+  - root p50/p95: Rust `578/2224ms`; Kubo `1312/1748ms`
+  - asset p50/p95: Rust `193/478ms`; Kubo `373/811ms`
+- Resource max across cases:
+  - Rust `55204KiB` RSS, `38` FDs
+  - Kubo `167116KiB` RSS, `156` FDs
+- The remaining `ipfs.tech` root p95 loss was still the known zero-HTTP
+  Bitswap root path:
+  `zero_http_provider_cold_bitswap`, p50/p95/max `575/2222/2222ms`.
+
+Same-window cap 4 multi-case control:
+
+- Artifact:
+  `/tmp/httpcap4-multicase-r5-20260507T013851Z.json`
+- Rust and Kubo passed `5/5`.
+- `ipfs-tech-page-assets`:
+  - root p50/p95: Rust `1323/2448ms`; Kubo `1227/1509ms`
+  - asset p50/p95: Rust `163/419ms`; Kubo `379/806ms`
+- HTTP-provider fetch limiter wait p50/p95/max `16/124/170ms`.
+- The same zero-HTTP Bitswap root shape appeared, p50/p95/max
+  `1320/2446/2446ms`.
+
+Promoted no-env smoke:
+
+- Artifact:
+  `/tmp/httpcap8-default-ipfs-tech-r3-20260507T014133Z.json`
+- Trace:
+  `/tmp/httpcap8-default-ipfs-tech-r3-20260507T014133Z-trace.jsonl`
+- Rust and Kubo passed `3/3`.
+- Rust root p50/p95 `587/744ms`; Kubo `2664/3740ms`.
+- Rust asset p50/p95 `185/406ms`; Kubo `117/457ms`.
+- Rust RSS/FD `53512KiB/33`; Kubo `285380KiB/275`.
+- `http_provider_fetch_limiter` emitted `max_concurrent=8` for all `151`
+  limiter events, confirming the default promotion is active without env.
+- Limiter wait p50/p95/max was `0/0/17ms`.
+
+Decision:
+Promote the HTTP-provider fetch cap from `4` to `8`, with
+`FREEDOM_IPFS_MAX_CONCURRENT_HTTP_PROVIDER_FETCHES` as a tuning/rollback knob.
+The cap increase removes a real semaphore queue created by page-level asset
+concurrency plus same-provider/multi-provider racing, while remaining far below
+Kubo's RSS/FD footprint. This is not a Bitswap-tail fix: the remaining root p95
+gap is still zero-HTTP cold Bitswap, especially the `ipfs.tech` root block.

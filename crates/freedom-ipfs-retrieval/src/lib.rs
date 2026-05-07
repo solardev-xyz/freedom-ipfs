@@ -59,7 +59,9 @@ const SINGLE_HTTP_SELF_HEDGE_MIN_SCORE_MS_ENV: &str =
 const ENABLE_SINGLE_HTTP_BITSWAP_HEDGE_ENV: &str = "FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE";
 const SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS";
-const MAX_CONCURRENT_HTTP_PROVIDER_FETCHES: usize = 4;
+const MAX_CONCURRENT_HTTP_PROVIDER_FETCHES: usize = 8;
+const MAX_CONCURRENT_HTTP_PROVIDER_FETCHES_ENV: &str =
+    "FREEDOM_IPFS_MAX_CONCURRENT_HTTP_PROVIDER_FETCHES";
 const BITSWAP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 // Start provider retry before a full dial timeout can dominate gateway TTFB.
 const BITSWAP_CONNECTION_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -244,6 +246,7 @@ pub struct HttpRetriever {
     successful_bitswap_peers: Arc<tokio::sync::Mutex<HashMap<PeerId, SuccessfulBitswapPeer>>>,
     http_provider_scores: Arc<tokio::sync::Mutex<HashMap<String, HttpProviderScore>>>,
     http_provider_fetch_limiter: Arc<tokio::sync::Semaphore>,
+    http_provider_fetch_limit: usize,
 }
 
 type SharedBlockFetch = Shared<BoxFuture<'static, Arc<SharedBlockFetchResult>>>;
@@ -259,6 +262,7 @@ struct MissingBlockRange {
 
 impl HttpRetriever {
     pub fn new(routing: impl Into<ProviderRoutingClient>, store: SqliteBlockStore) -> Self {
+        let http_provider_fetch_limit = max_concurrent_http_provider_fetches();
         Self {
             client: timeout_http_client(HTTP_PROVIDER_TIMEOUT),
             routing: routing.into(),
@@ -268,8 +272,9 @@ impl HttpRetriever {
             successful_bitswap_peers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             http_provider_scores: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             http_provider_fetch_limiter: Arc::new(tokio::sync::Semaphore::new(
-                MAX_CONCURRENT_HTTP_PROVIDER_FETCHES,
+                http_provider_fetch_limit,
             )),
+            http_provider_fetch_limit,
         }
     }
 
@@ -1848,14 +1853,39 @@ impl HttpRetriever {
     }
 
     async fn fetch_from_http_provider_candidate(&self, cid: Cid, base: Url) -> Result<Block> {
-        let _permit = self
+        let limiter_started = Instant::now();
+        let _permit = match self
             .http_provider_fetch_limiter
             .clone()
             .acquire_owned()
             .await
-            .map_err(|err| {
-                RetrievalError::Bitswap(format!("HTTP provider limiter closed: {err}"))
-            })?;
+        {
+            Ok(permit) => {
+                tracing::info!(
+                    phase = "http_provider_fetch_limiter",
+                    cid = %cid,
+                    provider = %base,
+                    acquired = true,
+                    max_concurrent = self.http_provider_fetch_limit,
+                    elapsed_ms = limiter_started.elapsed().as_millis()
+                );
+                permit
+            }
+            Err(err) => {
+                tracing::info!(
+                    phase = "http_provider_fetch_limiter",
+                    cid = %cid,
+                    provider = %base,
+                    acquired = false,
+                    max_concurrent = self.http_provider_fetch_limit,
+                    error = %err,
+                    elapsed_ms = limiter_started.elapsed().as_millis()
+                );
+                return Err(RetrievalError::Bitswap(format!(
+                    "HTTP provider limiter closed: {err}"
+                )));
+            }
+        };
         let started = Instant::now();
         match self.fetch_from_http_provider(&cid, &base).await {
             Ok((block, stats)) => {
@@ -3281,6 +3311,20 @@ fn single_http_provider_self_hedge_min_score() -> Option<Duration> {
 
 fn single_http_provider_bitswap_hedge_enabled() -> bool {
     std::env::var_os(ENABLE_SINGLE_HTTP_BITSWAP_HEDGE_ENV).is_some()
+}
+
+fn max_concurrent_http_provider_fetches() -> usize {
+    let override_value = std::env::var_os(MAX_CONCURRENT_HTTP_PROVIDER_FETCHES_ENV);
+    max_concurrent_http_provider_fetches_from_env_value(
+        override_value.as_deref().and_then(|value| value.to_str()),
+    )
+}
+
+fn max_concurrent_http_provider_fetches_from_env_value(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(MAX_CONCURRENT_HTTP_PROVIDER_FETCHES)
 }
 
 fn single_http_post_lookup_race_enabled() -> bool {
@@ -8097,6 +8141,26 @@ mod bitswap_tests {
                 Some(std::borrow::Cow::Borrowed("50")),
             ),
             None
+        );
+    }
+
+    #[test]
+    fn max_concurrent_http_provider_fetches_env_value_parses_override() {
+        assert_eq!(
+            max_concurrent_http_provider_fetches_from_env_value(None),
+            MAX_CONCURRENT_HTTP_PROVIDER_FETCHES
+        );
+        assert_eq!(
+            max_concurrent_http_provider_fetches_from_env_value(Some("6")),
+            6
+        );
+        assert_eq!(
+            max_concurrent_http_provider_fetches_from_env_value(Some("0")),
+            MAX_CONCURRENT_HTTP_PROVIDER_FETCHES
+        );
+        assert_eq!(
+            max_concurrent_http_provider_fetches_from_env_value(Some("not-a-number")),
+            MAX_CONCURRENT_HTTP_PROVIDER_FETCHES
         );
     }
 
