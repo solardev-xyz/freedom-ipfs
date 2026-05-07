@@ -34624,3 +34624,83 @@ asset median gets worse, and the extra peer work adds connection errors. A
 future single-HTTP median fix needs to be more selective than this existing
 lab knob, likely using page/session source quality or provider diversity rather
 than "start Bitswap beside every slow single HTTP provider."
+
+## 2026-05-07 Reject: Top-Level Scoped HTTP Provider Reuse Smoke
+
+Hypothesis:
+
+The previous retriever-wide HTTP provider reuse experiment failed because it
+borrowed fast providers across unrelated CIDs and produced many `404`s. A
+top-level-scoped variant might be safer: only remember successful HTTP provider
+bases under the same gateway top-level path, and only add one remembered base
+when a subresource has exactly one HTTP provider.
+
+Temporary implementation:
+
+- Disabled by default behind `FREEDOM_IPFS_ENABLE_TOP_LEVEL_HTTP_PROVIDER_REUSE`.
+- Remembered a small bounded list of successful HTTP provider bases by
+  `top_level_path`.
+- Applied only to gateway subresources with a known top-level path and exactly
+  one current HTTP provider.
+- Emitted `top_level_http_provider_reuse` and
+  `top_level_http_provider_reuse_record` trace events.
+
+Validation before the smoke:
+
+```sh
+cargo fmt --all
+cargo check -p freedom-ipfs-retrieval --all-targets
+```
+
+Smoke command:
+
+```sh
+timeout 900s env FREEDOM_IPFS_ENABLE_TOP_LEVEL_HTTP_PROVIDER_REUSE=1 \
+  cargo run -p mobile-web-harness -- \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --repeat 3 \
+    --asset-concurrency 1 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/top-level-http-reuse-smoke-r3-20260507Tresume-trace.jsonl \
+    --output /tmp/top-level-http-reuse-smoke-r3-20260507Tresume.json
+```
+
+Result:
+
+- Rust passed `3/3`.
+- Root TTFB/total p50/p95/max: `1166/1212/1212ms`.
+- Asset TTFB/total p50/p90/p95/max: `190/300/455/1088ms`.
+- Resource max: `48172KiB` RSS and `24` FDs.
+- Reuse engaged: `63` `top_level_http_provider_reuse` events and `76`
+  `top_level_http_provider_reuse_record` events.
+- HTTP provider races reported `98` events, `54` multi-provider events, and
+  `21` rank-2 winners.
+- The borrowed providers caused `4` real HTTP `404` fetch failures:
+  - `dag.w3s.link` for `_nuxt/entry.C4ErMpWu.css`
+  - `calib2.ezpdpz.net` for `_nuxt/ZT0_SuSb.js`
+  - `dag.w3s.link` for `_nuxt/BXkYzPrD.js`
+  - `calib2.ezpdpz.net` for `_nuxt/EgmQ2fGv.js`
+
+Interpretation:
+
+The narrower scope was still too broad. A provider that was fast for one
+subresource under `/ipns/ipfs.tech/` was not reliably a provider for sibling
+CID chunks. The lab added candidates and sometimes changed race ordering, but it
+also reproduced the core problem from the global reuse attempt: stale or
+non-serving HTTP gateways were introduced into otherwise simple single-provider
+fetches. The smoke's asset p50/p95 was also worse than the current focused
+default baseline (`127/329ms`) from
+`/tmp/current-head-focused-ipfs-tech-r10-20260507Tresume.json`.
+
+Decision:
+
+Reject and revert the temporary code. Future HTTP-provider reuse should not
+infer that a gateway can serve nearby page CIDs merely because it served another
+asset in the same top-level navigation. Any future retry should be based on
+stronger evidence, such as provider records for the specific CID, content-root
+advertisement semantics, or a cheap validating probe that cannot slow the main
+single-provider path.
