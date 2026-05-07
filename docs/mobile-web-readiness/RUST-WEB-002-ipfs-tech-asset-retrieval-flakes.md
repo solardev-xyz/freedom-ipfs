@@ -29226,3 +29226,93 @@ not expose a new Kubo performance win; it confirms Rust is especially strong on
 first media prefix ranges and remains resource-light. Future corpus sweeps can
 now include Rust-specific header-checking cases in Kubo comparisons without
 incorrectly counting Kubo as failed for expected gateway-header differences.
+
+## 2026-05-07 - Cold Single-Case Media Range And HEAD Checks
+
+Question:
+The media sweep ran prefix, middle, suffix, and HEAD in one fresh-daemon pass,
+so the prefix range warmed metadata and block state before the other media
+cases. Do cold single-case middle range, suffix range, and HEAD still beat Kubo?
+
+Middle range command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-developers-hero-middle-range \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/cold-hero-middle-range-r10-20260507T041200Z-trace.jsonl \
+  --comparison-output /tmp/cold-hero-middle-range-r10-20260507T041200Z.json
+```
+
+Middle range result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `632/1209ms`; Kubo `2259/3308ms`.
+- Resource max: Rust `35100KiB` RSS and `16` FDs; Kubo `203032KiB`
+  RSS and `152` FDs.
+- HTTP-provider block fetch p50/p95/max: `213/380/442ms`.
+
+Suffix range command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/cold-hero-suffix-range-r10-20260507T041500Z-trace.jsonl \
+  --comparison-output /tmp/cold-hero-suffix-range-r10-20260507T041500Z.json
+```
+
+Suffix range result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `658/1080ms`; Kubo `2223/2916ms`.
+- Resource max: Rust `35244KiB` RSS and `16` FDs; Kubo `224292KiB`
+  RSS and `196` FDs.
+- HTTP-provider block fetch p50/p95/max: `219/338/377ms`.
+
+HEAD command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-developers-hero-head \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/cold-hero-head-r10-20260507T041800Z-trace.jsonl \
+  --comparison-output /tmp/cold-hero-head-r10-20260507T041800Z.json
+```
+
+HEAD result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `623/709ms`; Kubo `2492/3175ms`.
+- Resource max: Rust `35304KiB` RSS and `15` FDs; Kubo `265776KiB`
+  RSS and `201` FDs.
+- HTTP-provider block fetch p50/p95/max: `189/258/277ms`.
+
+Decision:
+Cold media range and HEAD workloads are not current Kubo gaps. Rust still pays
+the expected cold metadata and provider fetch cost, but beats Kubo decisively
+while using a fraction of RSS and file descriptors. Range/HEAD work should stay
+in the guardrail set, but the next search for gaps should move to broader
+site/corpus diversity or longer session behavior rather than more hero-image
+single-range tuning.
