@@ -41238,3 +41238,125 @@ candidate should be targeted at this exact shape: a sparse zero-HTTP root or
 subresource where the only useful provider is WSS and the 250ms DHT fallback is
 empty. Broad DHT fallback changes are still risky because earlier sweeps showed
 longer DHT caps often added tail without finding providers.
+
+## 2026-05-07: Single DNS/WSS Provider DHT-Skip Lab
+
+Branch/head:
+
+- `codex/kubo-session-performance-20260506`
+- Base before this lab patch: `cec93f3`
+
+Hypothesis:
+
+For the DAICO residual, delegated routing returns exactly one zero-HTTP Bitswap
+provider. Retrieval then expands that DNS-backed provider to WSS and fetches the
+leaf successfully, while the low-diversity DHT fallback spends `250ms` and finds
+zero alternatives. An opt-in lab gate that skips the DHT fallback for this exact
+single DNSADDR/WSS provider shape might remove the p95 tax without increasing
+fanout.
+
+Change:
+
+- Add disabled lab env:
+  `FREEDOM_IPFS_LAB_SKIP_LOW_DIVERSITY_DHT_FOR_SINGLE_WSS=1`.
+- The gate only applies after delegated routing has a low-diversity non-empty
+  result, and only when the delegated set is one Bitswap provider with DNSADDR
+  or WSS-supported addresses and no direct non-WSS supported address.
+- Default behavior is unchanged.
+- Add routing tests for the DNSADDR/WSS detector and the no-DHT skip path.
+
+Validation:
+
+```sh
+cargo fmt --all
+cargo test -p freedom-ipfs-routing detects_single_supported_wss_or_dnsaddr_bitswap_provider -- --nocapture
+cargo test -p freedom-ipfs-routing auto_routing_lab_skips_low_diversity_dht_for_single_wss_provider -- --nocapture
+```
+
+Result:
+
+- Focused routing tests passed.
+
+Opt-in command:
+
+```sh
+timeout 1800s env \
+  FREEDOM_IPFS_LAB_SKIP_LOW_DIVERSITY_DHT_FOR_SINGLE_WSS=1 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --repeat 3 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --case daicowtf-page-assets \
+    --trace-output /tmp/skip-single-dns-wss-dht-daico-r3-20260508T003500Z-trace.jsonl \
+    --comparison-output /tmp/skip-single-dns-wss-dht-daico-r3-20260508T003500Z.json
+```
+
+Opt-in result:
+
+- Rust/Kubo passed `3/3`.
+- `meaningful_kubo_wins`: none.
+- DAICO root: Rust `646/1064ms`; Kubo `1206/2164ms`.
+- DAICO root total: Rust `648/1065ms`; Kubo `1208/2166ms`.
+- Resource max: Rust `42392KiB` RSS and `15` FDs vs Kubo `93144KiB` RSS and
+  `57` FDs.
+- The gate fired: no `dht_provider_lookup` events were emitted.
+- Provider-diversity-low events remained visible but were non-failures:
+  `events=6`, `failures=0`, `max_bitswap_provider_count=1`.
+- DHT-empty classifications disappeared; the remaining shape was
+  `top_level_zero_http_single_wss_bitswap=3`.
+- Bitswap remained the tail driver: WSS peer
+  `Qmdv6yNikmUWUWXufLJLRNkv6Y9sY5cmgeX5RVWA4WNMz4=3`, peer-fetch total
+  `1501ms`, max `793ms`; connection max `552ms`.
+
+Immediate no-env post-control command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --trace-output /tmp/skip-single-dns-wss-dht-post-control-daico-r3-20260508T004000Z-trace.jsonl \
+  --comparison-output /tmp/skip-single-dns-wss-dht-post-control-daico-r3-20260508T004000Z.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `3/3`.
+- `meaningful_kubo_wins`: none.
+- DAICO root: Rust `944/954ms`; Kubo `1195/1207ms`.
+- DAICO root total: Rust `946/956ms`; Kubo `1198/1209ms`.
+- Resource max: Rust `44692KiB` RSS and `17` FDs vs Kubo `94924KiB` RSS and
+  `72` FDs.
+- Default behavior still did the empty DHT fallback:
+  `dht_provider_lookup events=3`, `failures=3`, `providers=0`,
+  `max_elapsed_ms=251`.
+- DHT-empty classifications returned:
+  `top_level_zero_http_single_wss_bitswap_dht_empty=3`.
+- Bitswap peer fetches were less variable than the opt-in sample: total
+  `1139ms`, max `417ms`; connection max `260ms`.
+
+Decision:
+
+Do not promote this lab to default from the current evidence. The gate works and
+removes the empty DHT fallback, and the opt-in sample beat Kubo with lower
+median than the no-env post-control. But the immediate no-env post-control also
+beat Kubo and had better Rust p95, so WSS connection/fetch variance dominates
+enough that the DHT skip alone is not proven.
+
+Keep the lab env for future focused runs and larger guardrails. A future
+promotion would need same-window evidence across the broader guardrail showing
+that the skip improves or at least does not regress p95/reliability for
+`top_level_zero_http_single_wss_bitswap_dht_empty` requests. The next better
+behavior target may be WSS connection reuse/variance for the repeated Pinata
+Bitswap peer, not the DHT skip by itself.

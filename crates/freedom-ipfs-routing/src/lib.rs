@@ -44,6 +44,8 @@ const MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY: usize = 2;
 const LOW_DIVERSITY_DELEGATED_MERGE_TIMEOUT: Duration = Duration::from_millis(750);
 const LOW_DIVERSITY_DHT_FALLBACK_TIMEOUT: Duration = Duration::from_millis(250);
 const EMPTY_DELEGATED_PROVIDER_RETRY_DELAY: Duration = Duration::from_millis(100);
+const LAB_SKIP_LOW_DIVERSITY_DHT_FOR_SINGLE_WSS_ENV: &str =
+    "FREEDOM_IPFS_LAB_SKIP_LOW_DIVERSITY_DHT_FOR_SINGLE_WSS";
 const DHT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const DHT_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 const DHT_MAX_PENDING_OUTGOING_CONNECTIONS: u32 = 8;
@@ -685,6 +687,22 @@ impl AutoRoutingClient {
         providers: Vec<Provider>,
         stats: Option<&RoutingStatsHandle>,
     ) -> Result<Vec<Provider>> {
+        self.providers_after_delegated_results_inner(
+            cid,
+            providers,
+            stats,
+            lab_skip_low_diversity_dht_for_single_wss_enabled(),
+        )
+        .await
+    }
+
+    async fn providers_after_delegated_results_inner(
+        &self,
+        cid: &Cid,
+        providers: Vec<Provider>,
+        stats: Option<&RoutingStatsHandle>,
+        skip_single_wss_dht_fallback: bool,
+    ) -> Result<Vec<Provider>> {
         let bitswap_provider_count = bitswap_provider_diversity(&providers);
         if bitswap_provider_count >= MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY {
             return Ok(providers);
@@ -697,6 +715,22 @@ impl AutoRoutingClient {
             min_bitswap_provider_count = MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY,
             fallback = "light_dht"
         );
+        if skip_single_wss_dht_fallback
+            && single_supported_wss_or_dnsaddr_bitswap_provider(&providers)
+        {
+            tracing::info!(
+                phase = "provider_diversity_low",
+                cid = %cid,
+                provider_count = providers.len(),
+                bitswap_provider_count,
+                min_bitswap_provider_count = MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY,
+                fallback = "light_dht",
+                skipped = true,
+                skip_reason = "single_dns_or_wss_provider_lab",
+                env = LAB_SKIP_LOW_DIVERSITY_DHT_FOR_SINGLE_WSS_ENV
+            );
+            return Ok(providers);
+        }
         if let Some(stats) = stats {
             stats.record_dht_lookup();
         }
@@ -1374,6 +1408,10 @@ fn streaming_delegated_direct_bitswap_target_min_elapsed_from_env_value(
         .unwrap_or(Duration::ZERO)
 }
 
+fn lab_skip_low_diversity_dht_for_single_wss_enabled() -> bool {
+    std::env::var_os(LAB_SKIP_LOW_DIVERSITY_DHT_FOR_SINGLE_WSS_ENV).is_some()
+}
+
 fn supported_direct_bitswap_provider_diversity(providers: &[Provider]) -> usize {
     providers
         .iter()
@@ -1388,6 +1426,48 @@ fn supported_direct_bitswap_provider_diversity(providers: &[Provider]) -> usize 
         .filter_map(provider_dedupe_key)
         .collect::<HashSet<_>>()
         .len()
+}
+
+fn single_supported_wss_or_dnsaddr_bitswap_provider(providers: &[Provider]) -> bool {
+    let mut provider_keys = HashSet::new();
+    for provider in providers {
+        let Some(key) = provider_dedupe_key(provider) else {
+            continue;
+        };
+        let provider_peer = provider.id.as_deref().and_then(parse_peer_id);
+        let mut has_supported_wss_or_dnsaddr = false;
+        for addr in &provider.addrs {
+            if bitswap_multiaddr_uses_dnsaddr(addr) {
+                has_supported_wss_or_dnsaddr = true;
+                continue;
+            }
+            if !supported_direct_bitswap_multiaddr(addr, provider_peer) {
+                continue;
+            }
+            if !bitswap_multiaddr_uses_wss(addr) {
+                return false;
+            }
+            has_supported_wss_or_dnsaddr = true;
+        }
+        if has_supported_wss_or_dnsaddr {
+            provider_keys.insert(key);
+        }
+    }
+    provider_keys.len() == 1
+}
+
+fn bitswap_multiaddr_uses_wss(addr: &str) -> bool {
+    Multiaddr::from_str(addr).ok().is_some_and(|addr| {
+        addr.iter()
+            .any(|protocol| matches!(protocol, Protocol::Wss(_)))
+    })
+}
+
+fn bitswap_multiaddr_uses_dnsaddr(addr: &str) -> bool {
+    Multiaddr::from_str(addr).ok().is_some_and(|addr| {
+        addr.iter()
+            .any(|protocol| matches!(protocol, Protocol::Dnsaddr(_)))
+    })
 }
 
 fn supported_direct_bitswap_multiaddr(addr: &str, provider_peer: Option<PeerId>) -> bool {
@@ -2087,6 +2167,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn auto_routing_lab_skips_low_diversity_dht_for_single_wss_provider() {
+        let cid = "bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u"
+            .parse::<Cid>()
+            .unwrap();
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let peer_string = peer.to_string();
+        let delegated_providers = vec![Provider::from_parts(
+            Some(peer_string.clone()),
+            vec!["/dnsaddr/bitswap-v3.pinata.cloud".to_string()],
+        )
+        .unwrap()];
+        let dht = LightDhtClient::new(vec![
+            "/ip4/203.0.113.1/tcp/4001/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"
+                .to_string(),
+        ])
+        .with_query_timeout(Duration::from_secs(5))
+        .with_max_providers(1);
+        let stats = RoutingStatsHandle::default();
+        let client = AutoRoutingClient::new(DelegatedRoutingClient::new("http://127.0.0.1:1"), dht);
+
+        let providers = client
+            .providers_after_delegated_results_inner(&cid, delegated_providers, Some(&stats), true)
+            .await
+            .unwrap();
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id.as_deref(), Some(peer_string.as_str()));
+        assert_eq!(
+            stats.snapshot(),
+            RoutingStats {
+                delegated_provider_lookups: 0,
+                delegated_provider_results: 0,
+                delegated_provider_errors: 0,
+                dht_provider_lookups: 0,
+                dht_provider_results: 0,
+                dht_provider_errors: 0,
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn auto_routing_retries_empty_delegated_result_before_dht() {
         let cid = "bafybeiaql2jo3fu5b7c4lmpoi5drh5sam7yt652shwdgwbky4o7uw33u2u"
             .parse::<Cid>()
@@ -2502,6 +2623,64 @@ mod tests {
         ];
 
         assert_eq!(supported_direct_bitswap_provider_diversity(&providers), 1);
+    }
+
+    #[test]
+    fn detects_single_supported_wss_or_dnsaddr_bitswap_provider() {
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let peer_two = Keypair::generate_ed25519().public().to_peer_id();
+        let single_wss = vec![Provider::from_parts(
+            Some(peer.to_string()),
+            vec!["/dns4/bitswap-v3.pinata.cloud/tcp/443/wss".to_string()],
+        )
+        .unwrap()];
+        assert!(single_supported_wss_or_dnsaddr_bitswap_provider(
+            &single_wss
+        ));
+
+        let single_dnsaddr = vec![Provider::from_parts(
+            Some(peer.to_string()),
+            vec!["/dnsaddr/bitswap-v3.pinata.cloud".to_string()],
+        )
+        .unwrap()];
+        assert!(single_supported_wss_or_dnsaddr_bitswap_provider(
+            &single_dnsaddr
+        ));
+
+        let mixed_wss_and_tcp = vec![Provider::from_parts(
+            Some(peer.to_string()),
+            vec![
+                "/dns4/bitswap-v3.pinata.cloud/tcp/443/wss".to_string(),
+                "/ip4/127.0.0.1/tcp/4001".to_string(),
+            ],
+        )
+        .unwrap()];
+        assert!(!single_supported_wss_or_dnsaddr_bitswap_provider(
+            &mixed_wss_and_tcp
+        ));
+
+        let two_wss = vec![
+            Provider::from_parts(
+                Some(peer.to_string()),
+                vec!["/dns4/bitswap-a.example/tcp/443/wss".to_string()],
+            )
+            .unwrap(),
+            Provider::from_parts(
+                Some(peer_two.to_string()),
+                vec!["/dns4/bitswap-b.example/tcp/443/wss".to_string()],
+            )
+            .unwrap(),
+        ];
+        assert!(!single_supported_wss_or_dnsaddr_bitswap_provider(&two_wss));
+
+        let http_only = vec![Provider::from_parts(
+            Some(peer.to_string()),
+            vec!["/dns4/provider.example/tcp/443/tls/http".to_string()],
+        )
+        .unwrap()];
+        assert!(!single_supported_wss_or_dnsaddr_bitswap_provider(
+            &http_only
+        ));
     }
 
     #[test]
