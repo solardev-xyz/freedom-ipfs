@@ -38898,3 +38898,90 @@ Bitswap tail. Keep the default `200ms` self-hedge and the rollback knob. A
 future policy change needs a stronger condition, such as dynamically reducing
 same-provider duplicate requests only after a low duplicate-win rate while also
 checking that zero-HTTP Bitswap tails do not grow.
+
+### Harness Diagnostic: Per-Asset Rust-vs-Kubo Comparison
+
+Purpose:
+
+The case-level `asset_ttfb` summary can hide which individual assets are still
+Kubo wins. Add a diagnostics-only comparison summary so future experiments can
+identify the exact paths and metrics driving an aggregate asset p50/p95 gap
+without manually joining harness JSON and gateway traces.
+
+Implementation:
+
+- Add `asset_comparisons` to each comparison case in the harness JSON.
+- Normalize asset URLs to gateway path plus query so Rust and Kubo assets match
+  despite different local gateway ports.
+- For each path, report Rust/Kubo sample counts, pass counts, p50/p95 TTFB and
+  total latency, ratios, and path-local meaningful Kubo wins.
+- Print a compact `asset_kubo_wins` section for the top path/metric pairs.
+- No gateway or retrieval behavior changes.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness comparison_case_reports -- --nocapture
+```
+
+Result:
+
+- Formatting passed.
+- The four focused comparison tests passed, including the new per-asset path
+  normalization test.
+
+Fresh same-window diagnostic baseline:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --repeat 10 \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --trace-output /tmp/per-asset-baseline-r10-b6c66f6-20260507Tdiagnostic-trace.jsonl \
+  --comparison-output /tmp/per-asset-baseline-r10-b6c66f6-20260507Tdiagnostic.json
+```
+
+Result:
+
+- Rust/Kubo passed `10/10` for both cases.
+- `ipfs.tech` page root: Rust `588/1257ms`; Kubo `1290/1841ms`.
+- `ipfs.tech` page assets: Rust `142/514ms`; Kubo `128/477ms`.
+- Wikipedia root: Rust `360/728ms`; Kubo `474/1092ms`.
+- Resource max: Rust `58384KiB` RSS and `41` FDs vs Kubo `186856KiB`
+  RSS and `103` FDs.
+- Case-level `meaningful_kubo_wins`: none.
+
+Per-asset diagnostic signal:
+
+- `ipfs.tech` had `46` meaningful path/metric Kubo wins despite no case-level
+  meaningful win.
+- Largest printed deltas:
+  - `_nuxt/entry.C4ErMpWu.css` p95 total/TTFB: Rust `985ms`, Kubo `477ms`.
+  - `_nuxt/BXkYzPrD.js` p95 total/TTFB: Rust `709/708ms`, Kubo `311/310ms`.
+  - `_nuxt/Duo5E1ke.js` p95 total/TTFB: Rust `619ms`, Kubo `241ms`.
+  - `_nuxt/entry.C4ErMpWu.css` p50 total/TTFB: Rust `507/506ms`,
+    Kubo `203ms`.
+- Trace inspection showed the slowest asset paths were usually not provider
+  lookup dominated. They were mostly single-HTTP-provider reads through
+  `https://ipfs-bridge.sia.dev/`, sometimes with two block fetches for UnixFS
+  path traversal plus the file block. Example slow requests:
+  - `_nuxt/entry.C4ErMpWu.css` at `981ms`, with HTTP-provider block fetches
+    `631ms` and `344ms`.
+  - `_nuxt/BXkYzPrD.js` at `704ms`, with HTTP-provider block fetches `351ms`
+    and `348ms`.
+  - `_nuxt/Duo5E1ke.js` at `616ms`, with HTTP-provider block fetches `347ms`
+    and `264ms`.
+
+Decision:
+
+Keep the diagnostic. It does not close a gap by itself, but it materially
+improves experiment targeting: the next behavior candidate should be judged
+against path-local asset wins, not only aggregate case p50/p95. The current
+sample argues against broad zero-HTTP work as the immediate next step; the
+active asset deltas are mostly single-HTTP/provider-score/path-traversal
+shapes under page concurrency, while Rust still wins roots, Wikipedia, RSS, and
+FDs in the same window.

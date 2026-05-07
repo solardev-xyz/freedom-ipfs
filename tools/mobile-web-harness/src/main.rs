@@ -27,6 +27,7 @@ const DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_ASSET_CONCURRENCY: usize = 6;
 const MEANINGFUL_KUBO_WIN_MIN_DELTA_MS: u128 = 50;
 const MEANINGFUL_KUBO_WIN_MIN_RATIO: f64 = 1.10;
+const MAX_PRINTED_ASSET_KUBO_WINS: usize = 8;
 const MAX_TRACE_SLOW_EVENTS: usize = 16;
 const SYNTHETIC_MULTIBLOCK_RANGE_ID: &str = "synthetic-multiblock-range";
 const SYNTHETIC_MULTIBLOCK_FILE_BYTES: usize = 512 * 1024;
@@ -1660,6 +1661,7 @@ fn print_comparison_summary(report: &ComparisonReport) {
             display_option_ms(case.kubo_asset_total_p95_ms),
             display_option_f64(case.asset_total_p95_ratio)
         );
+        print_case_asset_kubo_wins(case);
         println!(
             "  resources: rust_rss_max={} kubo_rss_max={} rss_ratio={} rust_fd_max={} kubo_fd_max={} fd_ratio={} rust_storage_max={} kubo_storage_max={} storage_ratio={}",
             display_option_u64_unit(case.rust_max_rss_kib, "KiB"),
@@ -1676,6 +1678,50 @@ fn print_comparison_summary(report: &ComparisonReport) {
     print_meaningful_kubo_wins(report);
     print_comparison_trace_summary("rust", &report.rust);
     print_comparison_trace_summary("kubo", &report.kubo);
+}
+
+fn print_case_asset_kubo_wins(case: &ComparisonCase) {
+    let mut wins = case
+        .asset_comparisons
+        .iter()
+        .flat_map(|asset| {
+            asset
+                .meaningful_kubo_wins
+                .iter()
+                .map(move |win| (asset, win))
+        })
+        .collect::<Vec<_>>();
+    if wins.is_empty() {
+        return;
+    }
+    wins.sort_by(|(left_asset, left_win), (right_asset, right_win)| {
+        right_win
+            .delta_ms
+            .cmp(&left_win.delta_ms)
+            .then_with(|| left_asset.path.cmp(&right_asset.path))
+            .then_with(|| left_win.metric.cmp(&right_win.metric))
+    });
+    println!(
+        "  asset_kubo_wins: {} path/metric pair(s), showing top {}",
+        wins.len(),
+        wins.len().min(MAX_PRINTED_ASSET_KUBO_WINS)
+    );
+    for (asset, win) in wins.into_iter().take(MAX_PRINTED_ASSET_KUBO_WINS) {
+        println!(
+            "    {} {} kind={} rust={} kubo={} delta={}ms ratio={:.2}x samples=rust:{}/{} kubo:{}/{}",
+            asset.path,
+            win.metric,
+            asset.kind,
+            display_option_ms(Some(win.rust_ms)),
+            display_option_ms(Some(win.kubo_ms)),
+            win.delta_ms,
+            win.ratio,
+            asset.rust_pass_count,
+            asset.rust_count,
+            asset.kubo_pass_count,
+            asset.kubo_count
+        );
+    }
 }
 
 fn print_meaningful_kubo_wins(report: &ComparisonReport) {
@@ -5049,6 +5095,7 @@ struct ComparisonCase {
     rust_pass_rate: f64,
     kubo_pass_rate: f64,
     meaningful_kubo_wins: Vec<ComparisonKuboWin>,
+    asset_comparisons: Vec<ComparisonAsset>,
     rust_root_ttfb_p50_ms: Option<u128>,
     kubo_root_ttfb_p50_ms: Option<u128>,
     root_ttfb_p50_ratio: Option<f64>,
@@ -5099,6 +5146,78 @@ struct ComparisonKuboWin {
     ratio: f64,
 }
 
+#[derive(Debug, Serialize)]
+struct ComparisonAsset {
+    path: String,
+    kind: String,
+    source: String,
+    rust_count: usize,
+    kubo_count: usize,
+    rust_pass_count: usize,
+    kubo_pass_count: usize,
+    meaningful_kubo_wins: Vec<ComparisonKuboWin>,
+    rust_ttfb_p50_ms: Option<u128>,
+    kubo_ttfb_p50_ms: Option<u128>,
+    ttfb_p50_ratio: Option<f64>,
+    rust_ttfb_p95_ms: Option<u128>,
+    kubo_ttfb_p95_ms: Option<u128>,
+    ttfb_p95_ratio: Option<f64>,
+    rust_total_p50_ms: Option<u128>,
+    kubo_total_p50_ms: Option<u128>,
+    total_p50_ratio: Option<f64>,
+    rust_total_p95_ms: Option<u128>,
+    kubo_total_p95_ms: Option<u128>,
+    total_p95_ratio: Option<f64>,
+}
+
+#[derive(Default)]
+struct AssetComparisonSamples {
+    kind: String,
+    source: String,
+    count: usize,
+    pass_count: usize,
+    ttfb_ms: Vec<u128>,
+    total_ms: Vec<u128>,
+}
+
+impl ComparisonAsset {
+    fn max_kubo_win_delta_ms(&self) -> u128 {
+        self.meaningful_kubo_wins
+            .iter()
+            .map(|win| win.delta_ms)
+            .max()
+            .unwrap_or_default()
+    }
+
+    fn detect_meaningful_kubo_wins(&self) -> Vec<ComparisonKuboWin> {
+        [
+            (
+                "asset_ttfb_p50",
+                self.rust_ttfb_p50_ms,
+                self.kubo_ttfb_p50_ms,
+            ),
+            (
+                "asset_ttfb_p95",
+                self.rust_ttfb_p95_ms,
+                self.kubo_ttfb_p95_ms,
+            ),
+            (
+                "asset_total_p50",
+                self.rust_total_p50_ms,
+                self.kubo_total_p50_ms,
+            ),
+            (
+                "asset_total_p95",
+                self.rust_total_p95_ms,
+                self.kubo_total_p95_ms,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(metric, rust_ms, kubo_ms)| meaningful_kubo_win(metric, rust_ms?, kubo_ms?))
+        .collect()
+    }
+}
+
 impl ComparisonCase {
     fn from_reports(rust: &RunReport, kubo: &RunReport) -> Vec<Self> {
         let mut ids = Vec::new();
@@ -5134,11 +5253,13 @@ impl ComparisonCase {
                 let rust_max_storage_bytes = rust.summary.gateway_storage_bytes.max;
                 let kubo_max_storage_bytes = kubo.summary.gateway_storage_bytes.max;
                 let kubo_setup_adjusted_root_ttfb = setup_adjusted_root_ttfb_ms(kubo, &id);
+                let asset_comparisons = asset_comparisons_for_case(rust, kubo, &id);
                 let mut case = Self {
                     id,
                     rust_pass_rate: rust_case.pass_rate,
                     kubo_pass_rate: kubo_case.pass_rate,
                     meaningful_kubo_wins: Vec::new(),
+                    asset_comparisons,
                     rust_root_ttfb_p50_ms: rust_case.root_ttfb_ms.p50_ms,
                     kubo_root_ttfb_p50_ms: kubo_case.root_ttfb_ms.p50_ms,
                     root_ttfb_p50_ratio: ratio(
@@ -5262,6 +5383,125 @@ impl ComparisonCase {
         .filter_map(|(metric, rust_ms, kubo_ms)| meaningful_kubo_win(metric, rust_ms?, kubo_ms?))
         .collect()
     }
+}
+
+fn asset_comparisons_for_case(
+    rust: &RunReport,
+    kubo: &RunReport,
+    id: &str,
+) -> Vec<ComparisonAsset> {
+    let rust_assets = asset_samples_for_case(rust, id);
+    let kubo_assets = asset_samples_for_case(kubo, id);
+    let mut paths = rust_assets.keys().cloned().collect::<Vec<_>>();
+    for path in kubo_assets.keys() {
+        if !paths.contains(path) {
+            paths.push(path.clone());
+        }
+    }
+
+    let mut comparisons = paths
+        .into_iter()
+        .map(|path| {
+            let rust = rust_assets.get(&path);
+            let kubo = kubo_assets.get(&path);
+            let rust_ttfb = rust
+                .map(|samples| LatencySummary::from_values(samples.ttfb_ms.clone()))
+                .unwrap_or_default();
+            let kubo_ttfb = kubo
+                .map(|samples| LatencySummary::from_values(samples.ttfb_ms.clone()))
+                .unwrap_or_default();
+            let rust_total = rust
+                .map(|samples| LatencySummary::from_values(samples.total_ms.clone()))
+                .unwrap_or_default();
+            let kubo_total = kubo
+                .map(|samples| LatencySummary::from_values(samples.total_ms.clone()))
+                .unwrap_or_default();
+            let mut comparison = ComparisonAsset {
+                path,
+                kind: rust
+                    .or(kubo)
+                    .map(|samples| samples.kind.clone())
+                    .unwrap_or_default(),
+                source: rust
+                    .or(kubo)
+                    .map(|samples| samples.source.clone())
+                    .unwrap_or_default(),
+                rust_count: rust.map(|samples| samples.count).unwrap_or_default(),
+                kubo_count: kubo.map(|samples| samples.count).unwrap_or_default(),
+                rust_pass_count: rust.map(|samples| samples.pass_count).unwrap_or_default(),
+                kubo_pass_count: kubo.map(|samples| samples.pass_count).unwrap_or_default(),
+                meaningful_kubo_wins: Vec::new(),
+                rust_ttfb_p50_ms: rust_ttfb.p50_ms,
+                kubo_ttfb_p50_ms: kubo_ttfb.p50_ms,
+                ttfb_p50_ratio: ratio(rust_ttfb.p50_ms, kubo_ttfb.p50_ms),
+                rust_ttfb_p95_ms: rust_ttfb.p95_ms,
+                kubo_ttfb_p95_ms: kubo_ttfb.p95_ms,
+                ttfb_p95_ratio: ratio(rust_ttfb.p95_ms, kubo_ttfb.p95_ms),
+                rust_total_p50_ms: rust_total.p50_ms,
+                kubo_total_p50_ms: kubo_total.p50_ms,
+                total_p50_ratio: ratio(rust_total.p50_ms, kubo_total.p50_ms),
+                rust_total_p95_ms: rust_total.p95_ms,
+                kubo_total_p95_ms: kubo_total.p95_ms,
+                total_p95_ratio: ratio(rust_total.p95_ms, kubo_total.p95_ms),
+            };
+            comparison.meaningful_kubo_wins = comparison.detect_meaningful_kubo_wins();
+            comparison
+        })
+        .collect::<Vec<_>>();
+    comparisons.sort_by(|left, right| {
+        right
+            .max_kubo_win_delta_ms()
+            .cmp(&left.max_kubo_win_delta_ms())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    comparisons
+}
+
+fn asset_samples_for_case(
+    report: &RunReport,
+    id: &str,
+) -> BTreeMap<String, AssetComparisonSamples> {
+    let mut samples = BTreeMap::<String, AssetComparisonSamples>::new();
+    for run in report
+        .runs
+        .iter()
+        .filter(|run| run.phase == RunPhase::Measured)
+    {
+        let Some(result) = run.results.iter().find(|result| result.id == id) else {
+            continue;
+        };
+        for asset in &result.assets {
+            let sample = samples.entry(asset_comparison_path(asset)).or_default();
+            if sample.kind.is_empty() {
+                sample.kind = asset.kind.to_string();
+            }
+            if sample.source.is_empty() {
+                sample.source = asset.source.clone();
+            }
+            sample.count += 1;
+            if asset.passed {
+                sample.pass_count += 1;
+            }
+            sample.ttfb_ms.push(asset.ttfb_ms);
+            sample.total_ms.push(asset.total_ms);
+        }
+    }
+    samples
+}
+
+fn asset_comparison_path(asset: &AssetResult) -> String {
+    Url::parse(&asset.url)
+        .ok()
+        .map(|url| {
+            let mut path = url.path().to_string();
+            if let Some(query) = url.query() {
+                path.push('?');
+                path.push_str(query);
+            }
+            path
+        })
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| asset.url.clone())
 }
 
 fn meaningful_kubo_win(metric: &str, rust_ms: u128, kubo_ms: u128) -> Option<ComparisonKuboWin> {
@@ -12295,6 +12535,95 @@ mod tests {
     }
 
     #[test]
+    fn comparison_case_reports_per_asset_kubo_wins_by_path() {
+        let mut rust_runs = vec![
+            run_result(
+                RunPhase::Measured,
+                1,
+                200,
+                Some(40),
+                Some(12),
+                Some(0),
+                None,
+            ),
+            run_result(
+                RunPhase::Measured,
+                2,
+                400,
+                Some(41),
+                Some(12),
+                Some(0),
+                None,
+            ),
+        ];
+        rust_runs[0].results[0].assets = vec![
+            script_asset_result_for_path(200, 240, 8080, "/ipfs/root/app.js"),
+            script_asset_result_for_path(30, 40, 8080, "/ipfs/root/style.css"),
+        ];
+        rust_runs[1].results[0].assets = vec![
+            script_asset_result_for_path(220, 260, 8080, "/ipfs/root/app.js"),
+            script_asset_result_for_path(40, 50, 8080, "/ipfs/root/style.css"),
+        ];
+
+        let mut kubo_runs = vec![
+            run_result(
+                RunPhase::Measured,
+                1,
+                100,
+                Some(100),
+                Some(30),
+                Some(0),
+                None,
+            ),
+            run_result(
+                RunPhase::Measured,
+                2,
+                120,
+                Some(101),
+                Some(31),
+                Some(0),
+                None,
+            ),
+        ];
+        kubo_runs[0].results[0].assets = vec![
+            script_asset_result_for_path(80, 90, 5001, "/ipfs/root/app.js"),
+            script_asset_result_for_path(60, 70, 5001, "/ipfs/root/style.css"),
+        ];
+        kubo_runs[1].results[0].assets = vec![
+            script_asset_result_for_path(100, 110, 5001, "/ipfs/root/app.js"),
+            script_asset_result_for_path(70, 80, 5001, "/ipfs/root/style.css"),
+        ];
+
+        let rust = run_report(HarnessEngine::Rust, None, rust_runs);
+        let kubo = run_report(HarnessEngine::Kubo, None, kubo_runs);
+
+        let cases = ComparisonCase::from_reports(&rust, &kubo);
+        let assets = &cases[0].asset_comparisons;
+
+        assert_eq!(assets[0].path, "/ipfs/root/app.js");
+        let app = assets
+            .iter()
+            .find(|asset| asset.path == "/ipfs/root/app.js")
+            .unwrap();
+        assert_eq!(app.kind, "script");
+        assert_eq!(app.rust_count, 2);
+        assert_eq!(app.kubo_count, 2);
+        assert_eq!(app.rust_pass_count, 2);
+        assert_eq!(app.kubo_pass_count, 2);
+        assert_eq!(app.rust_ttfb_p50_ms, Some(200));
+        assert_eq!(app.kubo_ttfb_p50_ms, Some(80));
+        assert!(app.meaningful_kubo_wins.iter().any(|win| {
+            win.metric == "asset_ttfb_p50" && win.rust_ms == 200 && win.kubo_ms == 80
+        }));
+
+        let style = assets
+            .iter()
+            .find(|asset| asset.path == "/ipfs/root/style.css")
+            .unwrap();
+        assert!(style.meaningful_kubo_wins.is_empty());
+    }
+
+    #[test]
     fn comparison_case_reports_meaningful_kubo_wins() {
         let mut rust_runs = vec![
             run_result(
@@ -13808,6 +14137,23 @@ mod tests {
             passed: true,
             failures: Vec::new(),
         }
+    }
+
+    fn script_asset_result_for_path(
+        ttfb_ms: u128,
+        total_ms: u128,
+        port: u16,
+        path: &str,
+    ) -> AssetResult {
+        let mut asset = script_asset_result(ttfb_ms, total_ms);
+        asset.source = path
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(path)
+            .to_string();
+        asset.url = format!("http://127.0.0.1:{port}{path}");
+        asset
     }
 
     fn corpus_entry(id: &str, path: &str) -> CorpusEntry {
