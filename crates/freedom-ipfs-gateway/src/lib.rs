@@ -38,6 +38,10 @@ const DEFAULT_GATEWAY_HTML_PREFETCH_MAX_ASSETS: usize = 0;
 const DEFAULT_GATEWAY_HTML_PREFETCH_MAX_BYTES: u64 = GATEWAY_STREAM_CHUNK_SIZE;
 const DEFAULT_GATEWAY_HTML_PREFETCH_CONCURRENCY: usize = 2;
 const GATEWAY_HTML_PREFETCH_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_DIRS: usize = 0;
+const DEFAULT_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_BYTES: u64 = GATEWAY_STREAM_CHUNK_SIZE;
+const DEFAULT_GATEWAY_HTML_DIRECTORY_PREFETCH_CONCURRENCY: usize = 1;
+const GATEWAY_HTML_DIRECTORY_PREFETCH_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_GATEWAY_HTML_RANGE_WARM_MAX_BYTES: u64 = 0;
 const DEFAULT_GATEWAY_HTML_RANGE_WARM_CONCURRENCY: usize = 1;
 const GATEWAY_HTML_RANGE_WARM_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -181,6 +185,7 @@ pub struct GatewayConfig {
     unixfs_metadata_cache_capacity: usize,
     small_body_cache_max_bytes: usize,
     html_prefetch: GatewayHtmlPrefetchConfig,
+    html_directory_prefetch: GatewayHtmlDirectoryPrefetchConfig,
     html_range_warm: GatewayHtmlRangeWarmConfig,
     raw_link_tsize_fast_headers: bool,
     stream_small_bodies: bool,
@@ -193,6 +198,7 @@ impl GatewayConfig {
             unixfs_metadata_cache_capacity: DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY,
             small_body_cache_max_bytes: DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
             html_prefetch: GatewayHtmlPrefetchConfig::default(),
+            html_directory_prefetch: GatewayHtmlDirectoryPrefetchConfig::default(),
             html_range_warm: GatewayHtmlRangeWarmConfig::default(),
             raw_link_tsize_fast_headers: false,
             stream_small_bodies: false,
@@ -227,6 +233,18 @@ impl GatewayConfig {
 
     pub fn with_html_prefetch(mut self, html_prefetch: GatewayHtmlPrefetchConfig) -> Self {
         self.html_prefetch = html_prefetch;
+        self
+    }
+
+    pub fn html_directory_prefetch(&self) -> GatewayHtmlDirectoryPrefetchConfig {
+        self.html_directory_prefetch
+    }
+
+    pub fn with_html_directory_prefetch(
+        mut self,
+        html_directory_prefetch: GatewayHtmlDirectoryPrefetchConfig,
+    ) -> Self {
+        self.html_directory_prefetch = html_directory_prefetch;
         self
     }
 
@@ -312,6 +330,53 @@ impl Default for GatewayHtmlPrefetchConfig {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct GatewayHtmlDirectoryPrefetchConfig {
+    max_dirs: usize,
+    max_bytes: u64,
+    concurrency: usize,
+}
+
+impl GatewayHtmlDirectoryPrefetchConfig {
+    pub fn new(max_dirs: usize, max_bytes: u64, concurrency: usize) -> Self {
+        Self {
+            max_dirs,
+            max_bytes,
+            concurrency: concurrency.max(1),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self::new(
+            DEFAULT_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_DIRS,
+            DEFAULT_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_BYTES,
+            DEFAULT_GATEWAY_HTML_DIRECTORY_PREFETCH_CONCURRENCY,
+        )
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self.max_dirs > 0 && self.max_bytes > 0
+    }
+
+    pub fn max_dirs(self) -> usize {
+        self.max_dirs
+    }
+
+    pub fn max_bytes(self) -> u64 {
+        self.max_bytes
+    }
+
+    pub fn concurrency(self) -> usize {
+        self.concurrency
+    }
+}
+
+impl Default for GatewayHtmlDirectoryPrefetchConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct GatewayHtmlRangeWarmConfig {
     max_bytes: u64,
     concurrency: usize,
@@ -371,6 +436,25 @@ impl HtmlPrefetchRuntime {
 }
 
 #[derive(Clone)]
+struct HtmlDirectoryPrefetchRuntime {
+    config: GatewayHtmlDirectoryPrefetchConfig,
+    limiter: Arc<Semaphore>,
+}
+
+impl HtmlDirectoryPrefetchRuntime {
+    fn new(config: GatewayHtmlDirectoryPrefetchConfig) -> Self {
+        Self {
+            config,
+            limiter: Arc::new(Semaphore::new(config.concurrency())),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.config.is_enabled()
+    }
+}
+
+#[derive(Clone)]
 struct HtmlRangeWarmRuntime {
     config: GatewayHtmlRangeWarmConfig,
     limiter: Arc<Semaphore>,
@@ -397,6 +481,7 @@ pub struct GatewayState {
     request_limiter: Arc<Semaphore>,
     small_body_cache: Arc<SmallBodyCache>,
     html_prefetch: HtmlPrefetchRuntime,
+    html_directory_prefetch: HtmlDirectoryPrefetchRuntime,
     html_range_warm: HtmlRangeWarmRuntime,
     raw_link_tsize_fast_headers: bool,
     stream_small_bodies: bool,
@@ -459,6 +544,9 @@ impl GatewayState {
             request_limiter: Arc::new(Semaphore::new(config.max_concurrent_requests())),
             small_body_cache: Arc::new(SmallBodyCache::new(config.small_body_cache_max_bytes())),
             html_prefetch: HtmlPrefetchRuntime::new(config.html_prefetch()),
+            html_directory_prefetch: HtmlDirectoryPrefetchRuntime::new(
+                config.html_directory_prefetch(),
+            ),
             html_range_warm: HtmlRangeWarmRuntime::new(config.html_range_warm()),
             raw_link_tsize_fast_headers: config.raw_link_tsize_fast_headers(),
             stream_small_bodies: config.stream_small_bodies(),
@@ -705,6 +793,12 @@ async fn ipfs_get(
                 headers.get(RANGE),
                 parent_request_id,
             ),
+            html_directory_prefetch: html_directory_prefetch_runtime(
+                &state,
+                method == Method::HEAD,
+                headers.get(RANGE),
+                parent_request_id,
+            ),
             html_range_warm: html_range_warm_runtime(
                 &state,
                 method == Method::HEAD,
@@ -806,6 +900,12 @@ async fn ipns_get(
                 headers.get(RANGE),
                 parent_request_id,
             ),
+            html_directory_prefetch: html_directory_prefetch_runtime(
+                &state,
+                method == Method::HEAD,
+                headers.get(RANGE),
+                parent_request_id,
+            ),
             html_range_warm: html_range_warm_runtime(
                 &state,
                 method == Method::HEAD,
@@ -862,6 +962,23 @@ fn html_prefetch_runtime(
         None
     } else {
         Some(state.html_prefetch.clone())
+    }
+}
+
+fn html_directory_prefetch_runtime(
+    state: &GatewayState,
+    is_head: bool,
+    range: Option<&HeaderValue>,
+    parent_request_id: Option<u64>,
+) -> Option<HtmlDirectoryPrefetchRuntime> {
+    if is_head
+        || range.is_some()
+        || parent_request_id.is_some()
+        || !state.html_directory_prefetch.is_enabled()
+    {
+        None
+    } else {
+        Some(state.html_directory_prefetch.clone())
     }
 }
 
@@ -953,6 +1070,7 @@ fn header_u64_for_trace(headers: &HeaderMap, name: &'static str) -> Option<u64> 
 struct GatewayResponseFeatures {
     small_body_cache: Arc<SmallBodyCache>,
     html_prefetch: Option<HtmlPrefetchRuntime>,
+    html_directory_prefetch: Option<HtmlDirectoryPrefetchRuntime>,
     html_range_warm: Option<HtmlRangeWarmRuntime>,
     raw_link_tsize_fast_headers: bool,
     stream_small_bodies: bool,
@@ -1099,15 +1217,7 @@ async fn serve_ipfs_path_with_listing_path(
                     headers,
                 )?
             } else {
-                streaming_response(
-                    provider,
-                    unixfs.clone(),
-                    features.small_body_cache.clone(),
-                    features.html_prefetch,
-                    features.stream_small_bodies,
-                    target,
-                    headers,
-                )?
+                streaming_response(provider, unixfs.clone(), features, target, headers)?
             }
         }
         ServedResource::Directory { path, entries } => {
@@ -1278,6 +1388,96 @@ struct HtmlRangeWarmSeed<'a> {
     total_len: u64,
     range_start: u64,
     range_end: u64,
+}
+
+fn maybe_spawn_html_directory_prefetch(
+    runtime: Option<&HtmlDirectoryPrefetchRuntime>,
+    provider: Arc<dyn BlockProvider>,
+    unixfs: UnixfsResolver,
+    seed: HtmlPrefetchSeed<'_>,
+) {
+    let Some(runtime) = runtime.filter(|runtime| runtime.is_enabled()) else {
+        return;
+    };
+    if !seed.mime.starts_with("text/html") || seed.body.len() as u64 > runtime.config.max_bytes() {
+        return;
+    }
+    let html = String::from_utf8_lossy(seed.body);
+    let paths = html_prefetch_directory_paths(&html, seed.base_path, runtime.config.max_dirs());
+    if paths.is_empty() {
+        return;
+    }
+    tracing::info!(
+        phase = "gateway_html_directory_prefetch_schedule",
+        cid = %seed.root_cid,
+        unixfs_path = %seed.base_path,
+        directory_count = paths.len(),
+        max_dirs = runtime.config.max_dirs(),
+        max_bytes = runtime.config.max_bytes(),
+        concurrency = runtime.config.concurrency(),
+    );
+
+    for path in paths {
+        let provider = provider.clone();
+        let unixfs = unixfs.clone();
+        let limiter = runtime.limiter.clone();
+        let root_cid = seed.root_cid;
+        let span = tracing::info_span!(
+            "gateway_html_directory_prefetch",
+            cid = %root_cid,
+            unixfs_path = %path
+        );
+        tokio::spawn(
+            async move {
+                let queued = Instant::now();
+                let permit = match tokio::time::timeout(
+                    GATEWAY_HTML_DIRECTORY_PREFETCH_QUEUE_TIMEOUT,
+                    limiter.acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(err)) => {
+                        tracing::info!(
+                            phase = "gateway_html_directory_prefetch_failed",
+                            cid = %root_cid,
+                            unixfs_path = %path,
+                            error = %err,
+                            elapsed_ms = queued.elapsed().as_millis()
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::info!(
+                            phase = "gateway_html_directory_prefetch_skip",
+                            cid = %root_cid,
+                            unixfs_path = %path,
+                            reason = "queue_timeout",
+                            timeout_ms =
+                                GATEWAY_HTML_DIRECTORY_PREFETCH_QUEUE_TIMEOUT.as_millis(),
+                            elapsed_ms = queued.elapsed().as_millis()
+                        );
+                        return;
+                    }
+                };
+                let _permit = permit;
+                let task_path = path.clone();
+                let joined = tokio::task::spawn_blocking(move || {
+                    html_directory_prefetch_one(provider.as_ref(), &unixfs, root_cid, &task_path)
+                })
+                .await;
+                if let Err(err) = joined {
+                    tracing::info!(
+                        phase = "gateway_html_directory_prefetch_failed",
+                        cid = %root_cid,
+                        unixfs_path = %path,
+                        error = %err
+                    );
+                }
+            }
+            .instrument(span),
+        );
+    }
 }
 
 fn maybe_spawn_html_prefetch(
@@ -1585,6 +1785,47 @@ fn html_range_warm_one(
     );
 }
 
+fn html_directory_prefetch_one(
+    provider: &dyn BlockProvider,
+    unixfs: &UnixfsResolver,
+    root_cid: Cid,
+    path: &str,
+) {
+    let started = Instant::now();
+    match unixfs.resolve_path(provider, &root_cid, path) {
+        Ok(resolved) if matches!(resolved.kind, NodeKind::Directory | NodeKind::HamtShard) => {
+            tracing::info!(
+                phase = "gateway_html_directory_prefetch_done",
+                cid = %root_cid,
+                directory_cid = %resolved.cid,
+                unixfs_path = %path,
+                node_kind = node_kind_label(resolved.kind),
+                elapsed_ms = started.elapsed().as_millis()
+            );
+        }
+        Ok(resolved) => {
+            tracing::info!(
+                phase = "gateway_html_directory_prefetch_skip",
+                cid = %root_cid,
+                directory_cid = %resolved.cid,
+                unixfs_path = %path,
+                node_kind = node_kind_label(resolved.kind),
+                reason = "not_directory",
+                elapsed_ms = started.elapsed().as_millis()
+            );
+        }
+        Err(err) => {
+            tracing::info!(
+                phase = "gateway_html_directory_prefetch_failed",
+                cid = %root_cid,
+                unixfs_path = %path,
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis()
+            );
+        }
+    }
+}
+
 fn html_prefetch_one(
     provider: &dyn BlockProvider,
     unixfs: &UnixfsResolver,
@@ -1699,10 +1940,7 @@ fn html_prefetch_asset_paths(html: &str, base_path: &str, max_assets: usize) -> 
     }
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
-    let mut base_path = base_path.trim_start_matches('/').to_string();
-    if base_path.is_empty() || base_path.ends_with('/') {
-        base_path.push_str("index.html");
-    }
+    let base_path = html_prefetch_base_path(base_path);
 
     for tag in parse_html_tags(html) {
         for raw in html_prefetch_candidates(&tag) {
@@ -1718,6 +1956,42 @@ fn html_prefetch_asset_paths(html: &str, base_path: &str, max_assets: usize) -> 
         }
     }
     paths
+}
+
+fn html_prefetch_directory_paths(html: &str, base_path: &str, max_dirs: usize) -> Vec<String> {
+    if max_dirs == 0 {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    let base_path = html_prefetch_base_path(base_path);
+
+    for tag in parse_html_tags(html) {
+        for raw in html_prefetch_candidates(&tag) {
+            if paths.len() >= max_dirs {
+                return paths;
+            }
+            let Some(asset_path) = resolve_prefetch_asset_path(raw, &base_path) else {
+                continue;
+            };
+            let dir_path = parent_path(&asset_path);
+            if dir_path.is_empty() {
+                continue;
+            }
+            if seen.insert(dir_path.to_string()) {
+                paths.push(dir_path.to_string());
+            }
+        }
+    }
+    paths
+}
+
+fn html_prefetch_base_path(base_path: &str) -> String {
+    let mut base_path = base_path.trim_start_matches('/').to_string();
+    if base_path.is_empty() || base_path.ends_with('/') {
+        base_path.push_str("index.html");
+    }
+    base_path
 }
 
 fn html_prefetch_candidates(tag: &ParsedTag) -> Vec<&str> {
@@ -1790,6 +2064,15 @@ fn resolve_prefetch_asset_path(raw: &str, base_path: &str) -> Option<String> {
 
 fn parent_path(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+fn node_kind_label(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Raw => "raw",
+        NodeKind::File => "file",
+        NodeKind::Directory => "directory",
+        NodeKind::HamtShard => "hamt_shard",
+    }
 }
 
 fn normalize_prefetch_path(path: &str) -> Option<String> {
@@ -2381,12 +2664,14 @@ struct GatewayStreamState {
 fn streaming_response(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
-    small_body_cache: Arc<SmallBodyCache>,
-    html_prefetch: Option<HtmlPrefetchRuntime>,
-    stream_small_bodies: bool,
+    features: GatewayResponseFeatures,
     target: FileResponseTarget,
     headers: FileResponseHeaders<'_>,
 ) -> Result<Response, GatewayError> {
+    let small_body_cache = features.small_body_cache;
+    let html_prefetch = features.html_prefetch;
+    let html_directory_prefetch = features.html_directory_prefetch;
+    let stream_small_bodies = features.stream_small_bodies;
     let FileResponseTarget {
         root_cid,
         file_cid,
@@ -2461,6 +2746,17 @@ fn streaming_response(
                 bytes
             }
         };
+        maybe_spawn_html_directory_prefetch(
+            html_directory_prefetch.as_ref(),
+            provider.clone(),
+            unixfs.clone(),
+            HtmlPrefetchSeed {
+                root_cid,
+                base_path: &path,
+                mime: headers.mime,
+                body: &body,
+            },
+        );
         maybe_spawn_html_prefetch(
             html_prefetch.as_ref(),
             provider,
@@ -2494,6 +2790,7 @@ fn streaming_response(
             let unixfs = unixfs.clone();
             let small_body_cache = small_body_cache.clone();
             let html_prefetch = html_prefetch.clone();
+            let html_directory_prefetch = html_directory_prefetch.clone();
             let path = path.clone();
             let span = span.clone();
             let stream_mime = stream_mime.clone();
@@ -2530,6 +2827,17 @@ fn streaming_response(
                 if !state.prefetch_started {
                     if let Ok(bytes) = &chunk {
                         let prefetch_provider: Arc<dyn BlockProvider> = provider.clone();
+                        maybe_spawn_html_directory_prefetch(
+                            html_directory_prefetch.as_ref(),
+                            prefetch_provider.clone(),
+                            unixfs.clone(),
+                            HtmlPrefetchSeed {
+                                root_cid,
+                                base_path: &path,
+                                mime: &stream_mime,
+                                body: bytes,
+                            },
+                        );
                         maybe_spawn_html_prefetch(
                             html_prefetch.as_ref(),
                             prefetch_provider,
@@ -3380,6 +3688,75 @@ mod tests {
             .unwrap();
         assert_eq!(asset_body.as_ref(), app);
         assert_eq!(provider.call_count(&app_cid), prefetched_app_calls);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn top_level_html_directory_prefetch_warms_parent_directory_only() {
+        let app = b"console.log('directory parent warmed');";
+        let app_cid = cid_from_data(CODEC_RAW, app);
+        let assets_dir_block = test_pb_directory(vec![test_link("app.js", &app_cid)]);
+        let assets_dir_cid = cid_from_data(CODEC_DAG_PB, &assets_dir_block);
+        let html = b"<!doctype html><script src=\"/assets/app.js\"></script>";
+        let index_block = test_pb_file(html);
+        let index_cid = cid_from_data(CODEC_DAG_PB, &index_block);
+        let dir_block = test_pb_directory(vec![
+            test_link("index.html", &index_cid),
+            test_link("assets", &assets_dir_cid),
+        ]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (dir_cid, dir_block),
+            (index_cid, index_block),
+            (assets_dir_cid, assets_dir_block),
+            (app_cid, app.to_vec()),
+        ])));
+        let config = GatewayConfig::new(8).with_html_directory_prefetch(
+            GatewayHtmlDirectoryPrefetchConfig::new(1, GATEWAY_STREAM_CHUNK_SIZE, 1),
+        );
+        let state = GatewayState::with_provider_config(provider.clone(), config);
+
+        let root = ipfs_get(
+            State(state.clone()),
+            Path(dir_cid.to_string()),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(root.status(), StatusCode::OK);
+        let root_body = axum::body::to_bytes(root.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(root_body.as_ref(), html);
+
+        for _ in 0..100 {
+            if provider.call_count(&assets_dir_cid) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            provider.call_count(&assets_dir_cid) > 0,
+            "enabled directory prefetch should warm the shared asset directory"
+        );
+        assert_eq!(
+            provider.call_count(&app_cid),
+            0,
+            "directory prefetch should not read asset bodies"
+        );
+
+        let asset = ipfs_get(
+            State(state),
+            Path(format!("{dir_cid}/assets/app.js")),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(asset.status(), StatusCode::OK);
+        let asset_body = axum::body::to_bytes(asset.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(asset_body.as_ref(), app);
+        assert!(provider.call_count(&app_cid) > 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

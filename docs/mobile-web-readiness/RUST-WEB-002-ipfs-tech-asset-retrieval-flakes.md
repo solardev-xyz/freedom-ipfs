@@ -40603,3 +40603,142 @@ RSS/FDs. The post-control traces show `0` zero-HTTP lookups and HTTP provider
 fetch p50 around `189ms`; the next iteration should inspect HTTP-provider asset
 median latency and UnixFS/root metadata timing rather than continuing to tune
 zero-HTTP source suppression in windows where zero-HTTP does not occur.
+
+## 2026-05-07: HTML Directory-Only Prefetch Lab
+
+Branch/head before change:
+
+- `codex/kubo-session-performance-20260506`
+- `b4aa0ae`
+
+Hypothesis:
+
+The latest no-env `ipfs.tech` traces showed repeated cold child requests paying
+for the same `_nuxt` UnixFS parent directory block before fetching the leaf
+asset. Full HTML asset prefetch was already rejected because it fetched asset
+bodies and competed with foreground work. A lighter top-level HTML
+directory-only warmer might remove the shared parent directory delay without
+fanning out into every asset body.
+
+Code change:
+
+- Added disabled-by-default
+  `FREEDOM_IPFS_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_DIRS=<n>`.
+- Added optional controls:
+  `FREEDOM_IPFS_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_BYTES=<bytes>` and
+  `FREEDOM_IPFS_GATEWAY_HTML_DIRECTORY_PREFETCH_CONCURRENCY=<n>`.
+- Default is disabled with `max_dirs=0`, `max_bytes=64KiB`, and
+  `concurrency=1`.
+- When enabled for top-level non-range HTML responses, the gateway parses the
+  same asset candidates used by HTML asset prefetch, derives unique non-root
+  parent directories, and resolves only those directories.
+- It does not read asset leaf bodies or populate the small body cache.
+- Trace phases:
+  `gateway_html_directory_prefetch_schedule`,
+  `gateway_html_directory_prefetch_done`,
+  `gateway_html_directory_prefetch_skip`, and
+  `gateway_html_directory_prefetch_failed`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-gateway html_directory_prefetch -- --nocapture
+cargo clippy -p freedom-ipfs-gateway --all-targets -- -D warnings
+cargo test -p freedom-ipfs-gateway
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Results:
+
+- Formatting passed.
+- Focused gateway test passed:
+  `top_level_html_directory_prefetch_warms_parent_directory_only`.
+- Full gateway tests passed: `41` lib tests, `4` main tests, `1` CLI test,
+  and non-live parsing tests; Kubo/live/soak tests remained ignored unless
+  explicitly opted in.
+- Workspace check passed.
+- Workspace clippy passed with `-D warnings`.
+
+Opt-in command:
+
+```sh
+timeout 2400s env \
+  FREEDOM_IPFS_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_DIRS=1 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --repeat 10 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --case ipfs-tech-page-assets \
+    --trace-output /tmp/html-dir-prefetch1-ipfs-tech-r10-20260507T230629Z-trace.jsonl \
+    --comparison-output /tmp/html-dir-prefetch1-ipfs-tech-r10-20260507T230629Z.json
+```
+
+Opt-in result:
+
+- Rust/Kubo passed `10/10`.
+- `ipfs.tech` root: Rust `698/1008ms`; Kubo `1318/1772ms`.
+- `ipfs.tech` assets: Rust `135/429ms`; Kubo `121/525ms`.
+- Resource max: Rust `58216KiB` RSS and `42` FDs vs Kubo `170732KiB`
+  RSS and `94` FDs.
+- Aggregate `meaningful_kubo_wins`: none.
+- The new prefetch path fired exactly as intended: `10` schedules and `10`
+  successful `_nuxt` directory warms. The warmed directory CID was
+  `bafybeidaeoj3ctpgrkxromrf3bnregt2g3w6yxpgp6espt7ko3akaxnhua`.
+- Directory warm elapsed was typically small enough to plausibly overlap child
+  request startup: observed done events ranged from `54ms` to `196ms`.
+- The run still had path-level Rust p95 losses. The largest outlier was
+  `_nuxt/constellations-footer.BvyqPqzA.svg` at `3307ms` vs Kubo `269ms`,
+  driven by a delegated provider lookup/self-hedge path, not the `_nuxt`
+  directory warm itself.
+
+Immediate no-env post-control command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/html-dir-prefetch1-post-control-ipfs-tech-r10-20260507T230629Z-trace.jsonl \
+  --comparison-output /tmp/html-dir-prefetch1-post-control-ipfs-tech-r10-20260507T230629Z.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `10/10`.
+- `ipfs.tech` root: Rust `611/1645ms`; Kubo `1619/2473ms`.
+- `ipfs.tech` assets: Rust `159/434ms`; Kubo `178/400ms`.
+- Resource max: Rust `57092KiB` RSS and `43` FDs vs Kubo `200768KiB`
+  RSS and `127` FDs.
+- Aggregate `meaningful_kubo_wins`: none.
+- As expected, the post-control had no
+  `gateway_html_directory_prefetch_*` events.
+
+Decision:
+
+Keep the HTML directory-only prefetch as a disabled lab control, but do not
+promote it yet. The implementation is narrow and resource-light, and the opt-in
+run did warm the exact repeated `_nuxt` parent directory block without fetching
+leaf bodies. It also improved Rust aggregate asset p50 versus the immediate
+control (`135ms` vs `159ms`) while keeping asset p95 about the same
+(`429ms` vs `434ms`).
+
+That is not enough causal evidence for a default. The no-env control was
+already strong, the opt-in root p50 regressed versus control (`698ms` vs
+`611ms`), and the opt-in trace had a large unrelated delegated lookup outlier.
+Future work should either re-run this lab across a broader multi-case guardrail
+or combine it with a stricter trigger, such as only warming a directory when the
+HTML contains several same-directory assets and the top-level root is already
+successfully streaming.
