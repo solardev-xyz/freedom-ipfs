@@ -28425,3 +28425,102 @@ or sibling asset tails. Do not repeat generic zero-HTTP post-lookup racing based
 on these `18` waits; that experiment already removed the wait but hurt the
 page-level signal. A better next experiment needs to improve the actual Bitswap
 path after provider discovery yields no HTTP providers.
+
+## 2026-05-07 - Lab Control: Zero-HTTP Direct WANT_BLOCK Peer Limit
+
+Hypothesis:
+The latest promoted r10 showed slow zero-HTTP Bitswap asset fetches where the
+source peer was initially contacted with `WANT_HAVE`, then apparently paid the
+probe timeout before falling back to `WANT_BLOCK`. The old global direct
+untrusted cap-4 experiment was rejected, but this is a narrower shape: only
+provider sets with `http_provider_count=0`, where there is no HTTP-provider
+fallback. Add a disabled lab knob that can force a bounded number of untrusted
+zero-HTTP peers to direct `WANT_BLOCK`.
+
+Implementation:
+
+- Add `FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=<n>`.
+- When provider discovery returns zero HTTP providers, mark up to `n`
+  untrusted Bitswap provider peers as `force_want_block`.
+- Keep default behavior unchanged when the env var is absent.
+- Preserve the normal direct untrusted cap for non-zero-HTTP provider sets.
+- Trace `zero_http_direct_want_block_peer_count` on `bitswap_peer_expand` and
+  `force_want_block` on `bitswap_peer_attempt_start`.
+
+Focused opt-in command:
+
+```sh
+FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS=5 timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-direct5-ipfs-tech-r10-20260507T025106Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-direct5-ipfs-tech-r10-20260507T025106Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Focused opt-in result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `893/1560ms`; Kubo `2332/2932ms`.
+- Asset p50/p95: Rust `143/444ms`; Kubo `164/1206ms`.
+- Resource max: Rust `55844KiB` RSS, `38` FDs; Kubo `322588KiB`, `727` FDs.
+- Trace shape:
+  - `force_want_block` peer attempts: `123`.
+  - Bitswap source request modes: `want_block=158`, no `want_have` source wins.
+  - Bitswap fetch p50/p95/max: `153/339/1265ms`.
+  - Zero-HTTP cold Bitswap request p50/p95/max: `529/1300/1557ms`.
+  - Top-level zero-HTTP cold Bitswap p50/p95/max: `890/1557/1557ms`.
+  - Peer attempts rose to `529`; new dial addrs were `130`.
+
+Same-window no-env control:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-post-direct5-control-ipfs-tech-r10-20260507T025318Z-trace.jsonl \
+  --comparison-output /tmp/current-head-post-direct5-control-ipfs-tech-r10-20260507T025318Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Same-window no-env result:
+
+- Rust and Kubo passed `10/10`.
+- Root p50/p95: Rust `595/2731ms`; Kubo `2712/4440ms`.
+- Asset p50/p95: Rust `166/436ms`; Kubo `272/840ms`.
+- Resource max: Rust `55368KiB` RSS, `43` FDs; Kubo `305616KiB`, `765` FDs.
+- Trace shape:
+  - `force_want_block` peer attempts: `0`.
+  - Bitswap source request modes: `want_block=107`, `want_have=1`.
+  - Bitswap fetch p50/p95/max: `145/489/2000ms`.
+  - Zero-HTTP cold Bitswap request p50/p95/max: `491/2197/2727ms`.
+  - Top-level zero-HTTP cold Bitswap p50/p95/max: `592/2727/2727ms`.
+  - Peer attempts were `479`; new dial addrs were `124`.
+
+Decision:
+Keep this as a disabled lab knob, not a default. The opt-in did what it was
+designed to do at the Bitswap layer: it removed `WANT_HAVE` source wins and cut
+Bitswap fetch p95/max and top-level zero-HTTP p95 in this same-window sample.
+But the page-level result is mixed: root p95 improved while root p50 regressed,
+asset p50 improved while asset p95 was slightly worse, and peer attempts rose.
+This suggests conditional direct zero-HTTP fanout can be useful, but `5` is too
+blunt to promote. Next work should either try a smaller zero-HTTP-only direct
+limit, add peer-quality gating before forcing direct `WANT_BLOCK`, or use the
+new trace fields to find when a `WANT_HAVE` source is likely to be a slow
+fallback rather than a useful conservative probe.
