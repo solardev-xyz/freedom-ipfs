@@ -32575,3 +32575,78 @@ runtime. The useful result is negative: zero-HTTP rescue cannot be based only
 on recent HTTP provider speed. Any future HTTP fallback must learn
 availability/scope, not just latency, before it is worth racing against
 Bitswap.
+
+## 2026-05-07 - Current-Head Focused Baseline After HTTP Fallback Rejection
+
+Purpose:
+
+Refresh the focused same-window no-env baseline after reverting the zero-HTTP
+HTTP fallback lab. Public-provider variance was large enough in the preceding
+experiments that the next tuning attempt needs a fresh current-head comparison,
+not only older controls.
+
+Command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-focused-r10-20260507T1137Z-trace.jsonl \
+  --comparison-output /tmp/current-head-focused-r10-20260507T1137Z.json
+```
+
+Result:
+
+- Rust and Kubo passed `10/10` for both focused cases.
+- `ipfs.tech` page assets: Rust root `763/1464ms`, assets `188/336ms`;
+  Kubo root `1448/2854ms`, assets `103/696ms`.
+- Wikipedia root: Rust `652/1395ms` vs Kubo `174/1104ms`.
+- Resource max: Rust `47860KiB` RSS and `21` FDs vs Kubo `254352KiB` RSS and
+  `319` FDs.
+
+Trace shape:
+
+- HTTP provider blocks: `355`, p50/p95/max `187/378/927ms`.
+- Bitswap blocks: `15`, p50/p95/max `406/1155/1155ms`.
+- Request classifications:
+  - `cold_bitswap_peer_expand=10`
+  - `zero_http_provider_bitswap=10`
+  - `zero_http_provider_cold_bitswap=10`
+  - `top_level_zero_http_provider_bitswap=9`
+  - `top_level_zero_http_provider_cold_bitswap=9`
+- Bitswap peer attempts: `70`.
+- Bitswap source request modes: `want_have=8`, `want_block=7`.
+- WANT_HAVE probes: `1`, outcome `timeout_fallback_want_block`, elapsed
+  `750ms`.
+- Slowest Wikipedia request: `1392ms`; root directory block fetch was Bitswap
+  at `1155ms`, with no session peers and a cold peer expansion.
+
+Interpretation:
+
+The current default is still strong on the resource axis and beats Kubo on
+`ipfs.tech` root and asset p95, but the active gap in this window is clear:
+
+- Kubo wins `ipfs.tech` asset median (`103ms` vs Rust `188ms`).
+- Kubo wins Wikipedia root median (`174ms` vs Rust `652ms`) and still wins
+  Wikipedia p95 in this run (`1104ms` vs Rust `1395ms`).
+- The Wikipedia loss is not caused by HTTP provider selection; it is a
+  top-level zero-HTTP cold Bitswap path.
+- The trace has only one explicit WANT_HAVE probe event, but several successful
+  Bitswap sources are correlated as `want_have`, which keeps the direct-fanout
+  question alive. Earlier static direct-width experiments were too blunt, so a
+  future attempt needs peer-quality or request-shape gating.
+
+Decision:
+
+Use `/tmp/current-head-focused-r10-20260507T1137Z.json` and its trace as the
+next focused no-env baseline. The next experiment should target top-level
+zero-HTTP cold Bitswap source choice or scheduling, while preserving the
+`ipfs.tech` p95/resource wins.
