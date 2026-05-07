@@ -26789,3 +26789,103 @@ only one actual successful-peer skip, so the regression is mostly from losing
 session continuity rather than filtering many bad peers. Future selective work
 should gate the race itself using provider/source confidence, not globally cap
 successful peer recording at `300ms`.
+
+## 2026-05-07 Current-Head Focused Baseline And Multi-Race Recheck
+
+Purpose:
+After several env-flagged experiments, re-establish a no-env focused
+`ipfs.tech-page-assets` baseline from current branch head and rerun the pure
+multi-HTTP race in the same public-network window. This checks whether the
+earlier multi-race median win is stable enough to reconsider.
+
+No-env baseline command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-default-ipfs-tech-r10-20260507T000955Z-trace.jsonl \
+  --comparison-output /tmp/current-head-default-ipfs-tech-r10-20260507T000955Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/current-head-default-ipfs-tech-r10-20260507T000955Z.log 2>&1
+```
+
+No-env baseline result:
+
+- Rust and Kubo passed `10/10`.
+- Root TTFB p50/p95:
+  - Rust: `529/915ms`
+  - Kubo: `2063/5144ms`
+- Asset TTFB p50/p95/max:
+  - Rust: `204/498/1003ms`
+  - Kubo: `139/915/7157ms`
+- Resource max:
+  - Rust: `54116KiB` RSS, `30` FDs
+  - Kubo: `332068KiB` RSS, `864` FDs
+- Trace:
+  - HTTP provider blocks: `330`, p50/p95/max `199/378/814ms`
+  - Bitswap blocks: `69`, p50/p95/max `133/279/506ms`
+  - post-lookup waits: `26`, with `9` multi-HTTP hits and `17` timeouts
+  - Bitswap connections: `27`
+
+Current-window multi-race command:
+
+```sh
+FREEDOM_IPFS_ENABLE_MULTI_HTTP_POST_LOOKUP_RACE=1 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-multi-http-race-ipfs-tech-r10-20260507T001207Z-trace.jsonl \
+  --comparison-output /tmp/current-head-multi-http-race-ipfs-tech-r10-20260507T001207Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1 \
+  > /tmp/current-head-multi-http-race-ipfs-tech-r10-20260507T001207Z.log 2>&1
+```
+
+Current-window multi-race result:
+
+- Rust and Kubo passed `10/10`.
+- Root TTFB p50/p95:
+  - no-env Rust: `529/915ms`
+  - multi-race Rust: `594/1450ms`
+  - Kubo same-window: `2033/3052ms`
+- Asset TTFB p50/p95/max:
+  - no-env Rust: `204/498/1003ms`
+  - multi-race Rust: `191/512/1455ms`
+  - Kubo same-window: `166/1121/5267ms`
+- Resource max:
+  - no-env Rust: `54116KiB` RSS, `30` FDs
+  - multi-race Rust: `54828KiB` RSS, `35` FDs
+- Trace:
+  - post-lookup waits: `26 -> 9`
+  - post-lookup races: `66 -> 294`
+  - HTTP provider blocks: p50/p95/max `199/378/814ms -> 187/335/988ms`
+  - Bitswap blocks: p50/p95/max `133/279/506ms -> 171/443/1449ms`
+  - Bitswap dial plans: `102 -> 321`
+  - Bitswap connections: `27 -> 25`
+
+Decision:
+The multi-HTTP race remains lab-only. It again improves focused asset median
+(`204 -> 191ms`) and HTTP-provider p95, but the extra Bitswap race surface
+introduced a slow zero-HTTP/Bitswap tail and regressed root p95, asset p95/max,
+run total, RSS, and FD count. The current median gap to Kubo is now mostly
+HTTP-provider-backed subresource overhead (`~150-250ms` Rust assets versus
+Kubo's faster median in favorable windows), while Rust still has much better
+asset p95/max and mobile resource use. Next work should focus on HTTP-provider
+selection/scoring and request overhead, not broader multi-provider Bitswap
+racing.
