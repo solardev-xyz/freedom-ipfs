@@ -26889,3 +26889,158 @@ Kubo's faster median in favorable windows), while Rust still has much better
 asset p95/max and mobile resource use. Next work should focus on HTTP-provider
 selection/scoring and request overhead, not broader multi-provider Bitswap
 racing.
+
+## 2026-05-07 Experiment: Lab-Only Gateway HTML Subresource Prefetch
+
+Hypothesis:
+The remaining page-asset median gap may come from waiting until WebKit asks for
+each discovered subresource. If the gateway parses the top-level HTML and
+starts a bounded, verified prefetch for same-root assets, the existing UnixFS
+metadata cache and small-body cache may be warm by the time the browser issues
+asset requests.
+
+Implementation:
+
+- Add disabled-by-default gateway HTML prefetch config:
+  - `FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_ASSETS`
+  - `FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_BYTES`
+  - `FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_CONCURRENCY`
+- Prefetch only top-level, non-range, non-HEAD HTML responses.
+- Parse same-root `script`, stylesheet/preload `link`, `img`, and `source`
+  references from direct small bodies or the first streamed HTML chunk.
+- Resolve through the existing UnixFS path and block provider path, so blocks
+  are still CID-verified before they can populate the small-body cache.
+- Cap queued work by max assets, bytes, and a small concurrency semaphore.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-gateway html_prefetch -- --nocapture
+cargo check -p freedom-ipfs-gateway --all-targets
+```
+
+All passed.
+
+The first live attempt only hooked direct small bodies and was ineffective for
+`ipfs.tech`, whose root HTML is streamed:
+
+```sh
+FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_ASSETS=8 \
+FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_BYTES=65536 \
+FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_CONCURRENCY=2 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/html-prefetch8c2-ipfs-tech-r10-20260507T002948Z-trace.jsonl \
+  --comparison-output /tmp/html-prefetch8c2-ipfs-tech-r10-20260507T002948Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Trace finding:
+
+- No `gateway_html_prefetch_*` events.
+- `ipfs.tech` root responses were streamed, so the direct-body hook could not
+  schedule any prefetch work.
+
+After adding first-streamed-chunk parsing, rerun the lab variant:
+
+```sh
+FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_ASSETS=8 \
+FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_BYTES=65536 \
+FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_CONCURRENCY=2 \
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/html-prefetch8c2-stream-ipfs-tech-r10-20260507T003331Z-trace.jsonl \
+  --comparison-output /tmp/html-prefetch8c2-stream-ipfs-tech-r10-20260507T003331Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Same-window no-env control from the same code:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-code-default-ipfs-tech-r10-20260507T003532Z-trace.jsonl \
+  --comparison-output /tmp/current-code-default-ipfs-tech-r10-20260507T003532Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Result:
+
+- Both Rust and Kubo passed `10/10` in both runs.
+- No-env Rust:
+  - root TTFB p50/p95: `702/1030ms`
+  - asset TTFB p50/p95/max: `204/436/962ms`
+  - run total p50/p95: `2038/2463ms`
+  - resource max: `53976KiB` RSS, `29` FDs
+- Prefetch lab:
+  - root TTFB p50/p95: `543/1219ms`
+  - asset TTFB p50/p95/max: `243/524/857ms`
+  - run total p50/p95: `2128/2978ms`
+  - resource max: `58112KiB` RSS, `29` FDs
+- Kubo in the no-env control:
+  - root TTFB p50/p95: `2215/3648ms`
+  - asset TTFB p50/p95/max: `189/818/2710ms`
+- Kubo in the prefetch window:
+  - root TTFB p50/p95: `1510/2600ms`
+  - asset TTFB p50/p95/max: `166/648/8405ms`
+
+Prefetch trace findings:
+
+- `gateway_html_prefetch_schedule`: `10`
+- `gateway_html_prefetch_done`: `61`
+- `gateway_html_prefetch_skip`: `19`
+  - `size`: `10`
+  - `cache_hit`: `9`
+- Prefetch done latency p50/p95/max: `232/484/710ms`.
+- Top prefetched paths:
+  - `_nuxt/entry.C4ErMpWu.css`: `10`
+  - `_payload.json`: `10`
+  - `_nuxt/index.CZYCeseQ.css`: `10`
+  - `_nuxt/Duo5E1ke.js`: `9`
+  - `_nuxt/default.DILa3Uds.css`: `8`
+  - `_nuxt/Grid.CfsFuo-l.css`: `8`
+  - `_nuxt/CarouselCards.BIZdE3Oc.css`: `6`
+- Compared with the no-env control, prefetch shifted work:
+  - `http_provider_fetch`: `224 -> 346`
+  - `block_fetch_total`: `391 -> 453`
+  - `gateway_small_body_cache` hits appeared (`0 -> 51`)
+  - `bitswap_dial_plan`: `309 -> 48`
+  - `bitswap_peer_attempt_start`: `349 -> 88`
+
+Decision:
+Do not promote naive HTML subresource prefetch. It proves the gateway can warm
+asset metadata/body cache from a streamed root chunk, and it materially reduces
+Bitswap dial pressure, but the broad prefetch consumes extra HTTP-provider work
+before demand and regresses the metrics that matter for this goal: asset p50,
+asset p95, run total p95, and RSS. Keep it disabled as a lab control for future
+selective experiments only. A viable version would need a much tighter gate,
+for example prefetching only assets with known high reuse/value, only when the
+provider source is already fast, or only under low foreground request pressure.

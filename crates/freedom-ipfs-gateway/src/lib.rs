@@ -33,6 +33,10 @@ const GATEWAY_REQUEST_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 const GATEWAY_STREAM_CHUNK_SIZE: u64 = 64 * 1024;
 const GATEWAY_SMALL_BODY_CACHE_MAX_ENTRY_BYTES: usize = GATEWAY_STREAM_CHUNK_SIZE as usize;
 pub const DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_GATEWAY_HTML_PREFETCH_MAX_ASSETS: usize = 0;
+const DEFAULT_GATEWAY_HTML_PREFETCH_MAX_BYTES: u64 = GATEWAY_STREAM_CHUNK_SIZE;
+const DEFAULT_GATEWAY_HTML_PREFETCH_CONCURRENCY: usize = 2;
+const GATEWAY_HTML_PREFETCH_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 const X_FREEDOM_REQUEST_ID: &str = "x-freedom-request-id";
 const X_FREEDOM_PARENT_REQUEST_ID: &str = "x-freedom-parent-request-id";
 const X_FREEDOM_TOP_LEVEL_PATH: &str = "x-freedom-top-level-path";
@@ -172,6 +176,7 @@ pub struct GatewayConfig {
     max_concurrent_requests: usize,
     unixfs_metadata_cache_capacity: usize,
     small_body_cache_max_bytes: usize,
+    html_prefetch: GatewayHtmlPrefetchConfig,
 }
 
 impl GatewayConfig {
@@ -180,6 +185,7 @@ impl GatewayConfig {
             max_concurrent_requests: max_concurrent_requests.max(1),
             unixfs_metadata_cache_capacity: DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY,
             small_body_cache_max_bytes: DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
+            html_prefetch: GatewayHtmlPrefetchConfig::default(),
         }
     }
 
@@ -204,11 +210,86 @@ impl GatewayConfig {
         self.small_body_cache_max_bytes = max_bytes;
         self
     }
+
+    pub fn html_prefetch(&self) -> GatewayHtmlPrefetchConfig {
+        self.html_prefetch
+    }
+
+    pub fn with_html_prefetch(mut self, html_prefetch: GatewayHtmlPrefetchConfig) -> Self {
+        self.html_prefetch = html_prefetch;
+        self
+    }
 }
 
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self::new(DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GatewayHtmlPrefetchConfig {
+    max_assets: usize,
+    max_bytes: u64,
+    concurrency: usize,
+}
+
+impl GatewayHtmlPrefetchConfig {
+    pub fn new(max_assets: usize, max_bytes: u64, concurrency: usize) -> Self {
+        Self {
+            max_assets,
+            max_bytes,
+            concurrency: concurrency.max(1),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self::new(
+            DEFAULT_GATEWAY_HTML_PREFETCH_MAX_ASSETS,
+            DEFAULT_GATEWAY_HTML_PREFETCH_MAX_BYTES,
+            DEFAULT_GATEWAY_HTML_PREFETCH_CONCURRENCY,
+        )
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self.max_assets > 0 && self.max_bytes > 0
+    }
+
+    pub fn max_assets(self) -> usize {
+        self.max_assets
+    }
+
+    pub fn max_bytes(self) -> u64 {
+        self.max_bytes
+    }
+
+    pub fn concurrency(self) -> usize {
+        self.concurrency
+    }
+}
+
+impl Default for GatewayHtmlPrefetchConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+#[derive(Clone)]
+struct HtmlPrefetchRuntime {
+    config: GatewayHtmlPrefetchConfig,
+    limiter: Arc<Semaphore>,
+}
+
+impl HtmlPrefetchRuntime {
+    fn new(config: GatewayHtmlPrefetchConfig) -> Self {
+        Self {
+            config,
+            limiter: Arc::new(Semaphore::new(config.concurrency())),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.config.is_enabled()
     }
 }
 
@@ -219,6 +300,7 @@ pub struct GatewayState {
     unixfs: UnixfsResolver,
     request_limiter: Arc<Semaphore>,
     small_body_cache: Arc<SmallBodyCache>,
+    html_prefetch: HtmlPrefetchRuntime,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -277,6 +359,7 @@ impl GatewayState {
             unixfs,
             request_limiter: Arc::new(Semaphore::new(config.max_concurrent_requests())),
             small_body_cache: Arc::new(SmallBodyCache::new(config.small_body_cache_max_bytes())),
+            html_prefetch: HtmlPrefetchRuntime::new(config.html_prefetch()),
         }
     }
 }
@@ -507,6 +590,12 @@ async fn ipfs_get(
             state.provider.clone(),
             state.unixfs.clone(),
             state.small_body_cache.clone(),
+            html_prefetch_runtime(
+                &state,
+                method == Method::HEAD,
+                headers.get(RANGE),
+                parent_request_id,
+            ),
             &path,
             GatewayRequestHeaders {
                 range: headers.get(RANGE),
@@ -579,6 +668,12 @@ async fn ipns_get(
             state.provider.clone(),
             state.unixfs.clone(),
             state.small_body_cache.clone(),
+            html_prefetch_runtime(
+                &state,
+                method == Method::HEAD,
+                headers.get(RANGE),
+                parent_request_id,
+            ),
             state.name_resolver.as_ref(),
             &path,
             GatewayRequestHeaders {
@@ -603,6 +698,23 @@ async fn ipns_get(
     }
     .instrument(span)
     .await
+}
+
+fn html_prefetch_runtime(
+    state: &GatewayState,
+    is_head: bool,
+    range: Option<&HeaderValue>,
+    parent_request_id: Option<u64>,
+) -> Option<HtmlPrefetchRuntime> {
+    if is_head
+        || range.is_some()
+        || parent_request_id.is_some()
+        || !state.html_prefetch.is_enabled()
+    {
+        None
+    } else {
+        Some(state.html_prefetch.clone())
+    }
 }
 
 async fn acquire_gateway_request_permit(
@@ -683,6 +795,7 @@ async fn serve_ipfs_path(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
     small_body_cache: Arc<SmallBodyCache>,
+    html_prefetch: Option<HtmlPrefetchRuntime>,
     path: &str,
     request_headers: GatewayRequestHeaders<'_>,
 ) -> Result<Response, GatewayError> {
@@ -690,22 +803,37 @@ async fn serve_ipfs_path(
         provider,
         unixfs,
         small_body_cache,
+        html_prefetch,
         path,
         request_headers,
-        None,
-        FileCachePolicy::ImmutableIpfs,
+        GatewayIpfsPathOptions::default(),
     )
     .await
+}
+
+#[derive(Clone, Copy)]
+struct GatewayIpfsPathOptions<'a> {
+    listing_path: Option<&'a DirectoryListingPath>,
+    cache_policy: FileCachePolicy,
+}
+
+impl Default for GatewayIpfsPathOptions<'_> {
+    fn default() -> Self {
+        Self {
+            listing_path: None,
+            cache_policy: FileCachePolicy::ImmutableIpfs,
+        }
+    }
 }
 
 async fn serve_ipfs_path_with_listing_path(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
     small_body_cache: Arc<SmallBodyCache>,
+    html_prefetch: Option<HtmlPrefetchRuntime>,
     path: &str,
     request_headers: GatewayRequestHeaders<'_>,
-    listing_path: Option<&DirectoryListingPath>,
-    cache_policy: FileCachePolicy,
+    options: GatewayIpfsPathOptions<'_>,
 ) -> Result<Response, GatewayError> {
     let parse_started = Instant::now();
     let (cid, unixfs_path) = split_ipfs_path(path)?;
@@ -753,7 +881,7 @@ async fn serve_ipfs_path_with_listing_path(
                     etag = %etag,
                     outcome = "not_modified"
                 );
-                return not_modified_response(&etag, cache_policy);
+                return not_modified_response(&etag, options.cache_policy);
             }
             let parsed_range = request_headers
                 .range
@@ -780,7 +908,7 @@ async fn serve_ipfs_path_with_listing_path(
             let headers = FileResponseHeaders {
                 mime: &mime,
                 etag: &etag,
-                cache_policy,
+                cache_policy: options.cache_policy,
                 is_head: request_headers.is_head,
             };
             if let Some((start, end)) = parsed_range {
@@ -790,6 +918,7 @@ async fn serve_ipfs_path_with_listing_path(
                     provider,
                     unixfs.clone(),
                     small_body_cache.clone(),
+                    html_prefetch,
                     target,
                     headers,
                 )?
@@ -810,7 +939,7 @@ async fn serve_ipfs_path_with_listing_path(
                 ));
             }
             let default_listing_path;
-            let listing_path = if let Some(listing_path) = listing_path {
+            let listing_path = if let Some(listing_path) = options.listing_path {
                 listing_path
             } else {
                 default_listing_path = DirectoryListingPath::ipfs(&cid, &path);
@@ -946,6 +1075,477 @@ fn looks_like_html(bytes: &[u8]) -> bool {
         || lower.starts_with("<html")
         || lower.starts_with("<head")
         || lower.starts_with("<body")
+}
+
+struct HtmlPrefetchSeed<'a> {
+    root_cid: Cid,
+    base_path: &'a str,
+    mime: &'a str,
+    body: &'a Bytes,
+}
+
+fn maybe_spawn_html_prefetch(
+    runtime: Option<&HtmlPrefetchRuntime>,
+    provider: Arc<dyn BlockProvider>,
+    unixfs: UnixfsResolver,
+    small_body_cache: Arc<SmallBodyCache>,
+    seed: HtmlPrefetchSeed<'_>,
+) {
+    let Some(runtime) = runtime.filter(|runtime| runtime.is_enabled()) else {
+        return;
+    };
+    if !seed.mime.starts_with("text/html") || seed.body.len() as u64 > runtime.config.max_bytes() {
+        return;
+    }
+    let html = String::from_utf8_lossy(seed.body);
+    let paths = html_prefetch_asset_paths(&html, seed.base_path, runtime.config.max_assets());
+    if paths.is_empty() {
+        return;
+    }
+    tracing::info!(
+        phase = "gateway_html_prefetch_schedule",
+        cid = %seed.root_cid,
+        unixfs_path = %seed.base_path,
+        asset_count = paths.len(),
+        max_assets = runtime.config.max_assets(),
+        max_bytes = runtime.config.max_bytes(),
+        concurrency = runtime.config.concurrency(),
+    );
+
+    for path in paths {
+        let provider = provider.clone();
+        let unixfs = unixfs.clone();
+        let small_body_cache = small_body_cache.clone();
+        let config = runtime.config;
+        let limiter = runtime.limiter.clone();
+        let root_cid = seed.root_cid;
+        let span = tracing::info_span!(
+            "gateway_html_prefetch",
+            cid = %root_cid,
+            unixfs_path = %path
+        );
+        tokio::spawn(
+            async move {
+                let queued = Instant::now();
+                let permit = match tokio::time::timeout(
+                    GATEWAY_HTML_PREFETCH_QUEUE_TIMEOUT,
+                    limiter.acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(err)) => {
+                        tracing::info!(
+                            phase = "gateway_html_prefetch_failed",
+                            cid = %root_cid,
+                            unixfs_path = %path,
+                            error = %err,
+                            elapsed_ms = queued.elapsed().as_millis()
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::info!(
+                            phase = "gateway_html_prefetch_skip",
+                            cid = %root_cid,
+                            unixfs_path = %path,
+                            reason = "queue_timeout",
+                            timeout_ms = GATEWAY_HTML_PREFETCH_QUEUE_TIMEOUT.as_millis(),
+                            elapsed_ms = queued.elapsed().as_millis()
+                        );
+                        return;
+                    }
+                };
+                let _permit = permit;
+                let task_path = path.clone();
+                let joined = tokio::task::spawn_blocking(move || {
+                    html_prefetch_one(
+                        provider.as_ref(),
+                        &unixfs,
+                        &small_body_cache,
+                        root_cid,
+                        &task_path,
+                        config,
+                    )
+                })
+                .await;
+                if let Err(err) = joined {
+                    tracing::info!(
+                        phase = "gateway_html_prefetch_failed",
+                        cid = %root_cid,
+                        unixfs_path = %path,
+                        error = %err
+                    );
+                }
+            }
+            .instrument(span),
+        );
+    }
+}
+
+fn html_prefetch_one(
+    provider: &dyn BlockProvider,
+    unixfs: &UnixfsResolver,
+    small_body_cache: &SmallBodyCache,
+    root_cid: Cid,
+    path: &str,
+    config: GatewayHtmlPrefetchConfig,
+) {
+    let started = Instant::now();
+    let resolved = match unixfs.resolve_path(provider, &root_cid, path) {
+        Ok(resolved) if matches!(resolved.kind, NodeKind::Raw | NodeKind::File) => resolved,
+        Ok(_) => {
+            tracing::info!(
+                phase = "gateway_html_prefetch_skip",
+                cid = %root_cid,
+                unixfs_path = %path,
+                reason = "not_file",
+                elapsed_ms = started.elapsed().as_millis()
+            );
+            return;
+        }
+        Err(err) => {
+            tracing::info!(
+                phase = "gateway_html_prefetch_failed",
+                cid = %root_cid,
+                unixfs_path = %path,
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis()
+            );
+            return;
+        }
+    };
+    let len = match unixfs.file_size_cid(provider, &resolved.cid) {
+        Ok(len) => len,
+        Err(err) => {
+            tracing::info!(
+                phase = "gateway_html_prefetch_failed",
+                cid = %root_cid,
+                file_cid = %resolved.cid,
+                unixfs_path = %path,
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis()
+            );
+            return;
+        }
+    };
+    if len == 0
+        || len > config.max_bytes()
+        || len as usize > GATEWAY_SMALL_BODY_CACHE_MAX_ENTRY_BYTES
+    {
+        tracing::info!(
+            phase = "gateway_html_prefetch_skip",
+            cid = %root_cid,
+            file_cid = %resolved.cid,
+            unixfs_path = %path,
+            file_len = len,
+            reason = "size",
+            elapsed_ms = started.elapsed().as_millis()
+        );
+        return;
+    }
+    let cache_key = SmallBodyCacheKey {
+        file_cid: resolved.cid,
+        len,
+    };
+    if small_body_cache.get(&cache_key).is_some() {
+        tracing::info!(
+            phase = "gateway_html_prefetch_skip",
+            cid = %root_cid,
+            file_cid = %resolved.cid,
+            unixfs_path = %path,
+            file_len = len,
+            reason = "cache_hit",
+            elapsed_ms = started.elapsed().as_millis()
+        );
+        return;
+    }
+    let end = len - 1;
+    let bytes = match unixfs.read_file_cid_range(provider, &resolved.cid, 0, end) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(err) => {
+            tracing::info!(
+                phase = "gateway_html_prefetch_failed",
+                cid = %root_cid,
+                file_cid = %resolved.cid,
+                unixfs_path = %path,
+                file_len = len,
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis()
+            );
+            return;
+        }
+    };
+    let insert = small_body_cache.insert(cache_key, bytes);
+    tracing::info!(
+        phase = "gateway_html_prefetch_done",
+        cid = %root_cid,
+        file_cid = %resolved.cid,
+        unixfs_path = %path,
+        file_len = len,
+        cache_inserted = insert.inserted,
+        evicted = insert.evicted,
+        cache_len = insert.cache_len,
+        cache_bytes = insert.cache_bytes,
+        elapsed_ms = started.elapsed().as_millis()
+    );
+}
+
+fn html_prefetch_asset_paths(html: &str, base_path: &str, max_assets: usize) -> Vec<String> {
+    if max_assets == 0 {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    let mut base_path = base_path.trim_start_matches('/').to_string();
+    if base_path.is_empty() || base_path.ends_with('/') {
+        base_path.push_str("index.html");
+    }
+
+    for tag in parse_html_tags(html) {
+        for raw in html_prefetch_candidates(&tag) {
+            if paths.len() >= max_assets {
+                return paths;
+            }
+            let Some(path) = resolve_prefetch_asset_path(raw, &base_path) else {
+                continue;
+            };
+            if seen.insert(path.clone()) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+fn html_prefetch_candidates(tag: &ParsedTag) -> Vec<&str> {
+    let mut candidates = Vec::new();
+    match tag.name.as_str() {
+        "script" => {
+            if let Some(src) = tag.attr("src") {
+                candidates.push(src);
+            }
+        }
+        "link" => {
+            let rel = tag.attr("rel").unwrap_or("").to_ascii_lowercase();
+            if rel.contains("stylesheet")
+                || rel.contains("modulepreload")
+                || rel.contains("preload")
+                || rel.contains("prefetch")
+            {
+                if let Some(href) = tag.attr("href") {
+                    candidates.push(href);
+                }
+            }
+        }
+        "img" | "source" => {
+            if let Some(src) = tag.attr("src") {
+                candidates.push(src);
+            }
+            if let Some(srcset) = tag.attr("srcset") {
+                candidates.extend(srcset.split(',').filter_map(|candidate| {
+                    candidate
+                        .split_ascii_whitespace()
+                        .next()
+                        .filter(|candidate| !candidate.is_empty())
+                }));
+            }
+        }
+        _ => {}
+    }
+    candidates
+}
+
+fn resolve_prefetch_asset_path(raw: &str, base_path: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty()
+        || raw.starts_with('#')
+        || raw.starts_with("//")
+        || raw.contains("://")
+        || raw.contains("${")
+        || raw.contains("{{")
+        || starts_with_scheme(raw, "data")
+        || starts_with_scheme(raw, "blob")
+        || starts_with_scheme(raw, "javascript")
+        || starts_with_scheme(raw, "mailto")
+        || starts_with_scheme(raw, "tel")
+        || raw.starts_with("/ipfs/")
+        || raw.starts_with("/ipns/")
+    {
+        return None;
+    }
+    let raw = raw.split(['?', '#']).next().unwrap_or(raw).trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let candidate = if raw.starts_with('/') {
+        raw.trim_start_matches('/').to_string()
+    } else {
+        append_path(parent_path(base_path), raw)
+    };
+    normalize_prefetch_path(&candidate)
+}
+
+fn parent_path(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+fn normalize_prefetch_path(path: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+        if segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            return None;
+        }
+        if is_traversal_segment(segment) {
+            return None;
+        }
+        parts.push(segment);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn starts_with_scheme(value: &str, scheme: &str) -> bool {
+    value
+        .get(..scheme.len() + 1)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&format!("{scheme}:")))
+}
+
+#[derive(Debug, Clone)]
+struct ParsedTag {
+    name: String,
+    attrs: Vec<(String, String)>,
+}
+
+impl ParsedTag {
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+fn parse_html_tags(html: &str) -> Vec<ParsedTag> {
+    let mut tags = Vec::new();
+    let lower = html.to_ascii_lowercase();
+    let mut offset = 0;
+    while let Some(start) = html[offset..].find('<') {
+        let start = offset + start + 1;
+        let Some(end) = html[start..].find('>') else {
+            break;
+        };
+        let raw = &html[start..start + end];
+        if let Some(tag) = parse_html_tag(raw) {
+            let raw_name = tag.name.clone();
+            tags.push(tag);
+            if matches!(raw_name.as_str(), "script" | "style") {
+                let close_tag = format!("</{raw_name}");
+                if let Some(close_start) = lower[start + end + 1..].find(&close_tag) {
+                    let close_start = start + end + 1 + close_start;
+                    if let Some(close_end) = lower[close_start..].find('>') {
+                        offset = close_start + close_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        offset = start + end + 1;
+    }
+    tags
+}
+
+fn parse_html_tag(raw: &str) -> Option<ParsedTag> {
+    let raw = raw.trim();
+    if raw.is_empty()
+        || raw.starts_with('/')
+        || raw.starts_with('!')
+        || raw.starts_with('?')
+        || raw.starts_with("--")
+    {
+        return None;
+    }
+
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() && !bytes[index].is_ascii_whitespace() && bytes[index] != b'/' {
+        index += 1;
+    }
+    if index == 0 {
+        return None;
+    }
+    let name = raw[..index].to_ascii_lowercase();
+    let mut attrs = Vec::new();
+
+    while index < bytes.len() {
+        while index < bytes.len() && (bytes[index].is_ascii_whitespace() || bytes[index] == b'/') {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        let name_start = index;
+        while index < bytes.len()
+            && !bytes[index].is_ascii_whitespace()
+            && bytes[index] != b'='
+            && bytes[index] != b'/'
+        {
+            index += 1;
+        }
+        if index == name_start {
+            break;
+        }
+        let attr_name = raw[name_start..index].to_ascii_lowercase();
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let attr_value = if index < bytes.len() && bytes[index] == b'=' {
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if index < bytes.len() && (bytes[index] == b'"' || bytes[index] == b'\'') {
+                let quote = bytes[index];
+                index += 1;
+                let value_start = index;
+                while index < bytes.len() && bytes[index] != quote {
+                    index += 1;
+                }
+                let value = raw[value_start..index].to_string();
+                if index < bytes.len() {
+                    index += 1;
+                }
+                value
+            } else {
+                let value_start = index;
+                while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
+                    index += 1;
+                }
+                raw[value_start..index].to_string()
+            }
+        } else {
+            String::new()
+        };
+        attrs.push((attr_name, html_unescape_minimal(&attr_value)));
+    }
+
+    Some(ParsedTag { name, attrs })
+}
+
+fn html_unescape_minimal(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
 }
 
 enum ServedResource {
@@ -1139,6 +1739,7 @@ async fn serve_ipns_path(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
     small_body_cache: Arc<SmallBodyCache>,
+    html_prefetch: Option<HtmlPrefetchRuntime>,
     name_resolver: &dyn NameResolver,
     path: &str,
     request_headers: GatewayRequestHeaders<'_>,
@@ -1152,10 +1753,13 @@ async fn serve_ipns_path(
                 provider.clone(),
                 unixfs.clone(),
                 small_body_cache.clone(),
+                html_prefetch.clone(),
                 ipfs,
                 request_headers,
-                Some(&listing_path),
-                FileCachePolicy::RevalidateIpns,
+                GatewayIpfsPathOptions {
+                    listing_path: Some(&listing_path),
+                    cache_policy: FileCachePolicy::RevalidateIpns,
+                },
             )
             .await;
         }
@@ -1321,12 +1925,14 @@ struct GatewayStreamState {
     offset: u64,
     chunks: u64,
     started: Instant,
+    prefetch_started: bool,
 }
 
 fn streaming_response(
     provider: Arc<dyn BlockProvider>,
     unixfs: UnixfsResolver,
     small_body_cache: Arc<SmallBodyCache>,
+    html_prefetch: Option<HtmlPrefetchRuntime>,
     target: FileResponseTarget,
     headers: FileResponseHeaders<'_>,
 ) -> Result<Response, GatewayError> {
@@ -1404,6 +2010,18 @@ fn streaming_response(
                 bytes
             }
         };
+        maybe_spawn_html_prefetch(
+            html_prefetch.as_ref(),
+            provider,
+            unixfs,
+            small_body_cache,
+            HtmlPrefetchSeed {
+                root_cid,
+                base_path: &path,
+                mime: headers.mime,
+                body: &body,
+            },
+        );
         let mut response = Body::from(body).into_response();
         set_gateway_body_mode(&mut response, GatewayBodyMode::Direct);
         insert_full_file_headers(&mut response, len, headers)?;
@@ -1412,17 +2030,22 @@ fn streaming_response(
 
     let provider = Arc::new(ScopedBlockProvider::new(provider));
     let span = tracing::Span::current();
+    let stream_mime = headers.mime.to_string();
     let stream = stream::unfold(
         Some(GatewayStreamState {
             offset: 0,
             chunks: 0,
             started: Instant::now(),
+            prefetch_started: false,
         }),
         move |state| {
             let provider = provider.clone();
             let unixfs = unixfs.clone();
+            let small_body_cache = small_body_cache.clone();
+            let html_prefetch = html_prefetch.clone();
             let path = path.clone();
             let span = span.clone();
+            let stream_mime = stream_mime.clone();
             async move {
                 let state = state?;
                 let offset = state.offset;
@@ -1441,6 +2064,7 @@ fn streaming_response(
                         offset: end.saturating_add(1),
                         chunks,
                         started: state.started,
+                        prefetch_started: state.prefetch_started || offset == 0,
                     })
                 };
                 let chunk = unixfs
@@ -1452,6 +2076,23 @@ fn streaming_response(
                     )
                     .map(Bytes::from)
                     .map_err(|err| io::Error::other(err.to_string()));
+                if !state.prefetch_started {
+                    if let Ok(bytes) = &chunk {
+                        let prefetch_provider: Arc<dyn BlockProvider> = provider.clone();
+                        maybe_spawn_html_prefetch(
+                            html_prefetch.as_ref(),
+                            prefetch_provider,
+                            unixfs.clone(),
+                            small_body_cache,
+                            HtmlPrefetchSeed {
+                                root_cid,
+                                base_path: &path,
+                                mime: &stream_mime,
+                                body: bytes,
+                            },
+                        );
+                    }
+                }
                 match &chunk {
                     Ok(_) if end == last => {
                         tracing::info!(
@@ -1655,6 +2296,7 @@ fn ranged_response(
             offset: start,
             chunks: 0,
             started: Instant::now(),
+            prefetch_started: true,
         }),
         move |state| {
             let provider = provider.clone();
@@ -1678,6 +2320,7 @@ fn ranged_response(
                         offset: chunk_end.saturating_add(1),
                         chunks,
                         started: state.started,
+                        prefetch_started: true,
                     })
                 };
                 let chunk = unixfs
@@ -2169,6 +2812,131 @@ mod tests {
         assert_eq!(provider.call_count(&file_cid), file_calls);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn top_level_html_prefetch_populates_small_body_cache() {
+        let app = b"console.log('prefetched asset');";
+        let app_block = test_pb_file(app);
+        let app_cid = cid_from_data(CODEC_DAG_PB, &app_block);
+        let html = b"<!doctype html><script src=\"/app.js\"></script>";
+        let index_block = test_pb_file(html);
+        let index_cid = cid_from_data(CODEC_DAG_PB, &index_block);
+        let dir_block = test_pb_directory(vec![
+            test_link("index.html", &index_cid),
+            test_link("app.js", &app_cid),
+        ]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (dir_cid, dir_block),
+            (index_cid, index_block),
+            (app_cid, app_block),
+        ])));
+        let config = GatewayConfig::new(8).with_html_prefetch(GatewayHtmlPrefetchConfig::new(
+            4,
+            GATEWAY_STREAM_CHUNK_SIZE,
+            2,
+        ));
+        let state = GatewayState::with_provider_config(provider.clone(), config);
+
+        let root = ipfs_get(
+            State(state.clone()),
+            Path(dir_cid.to_string()),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(root.status(), StatusCode::OK);
+        let root_body = axum::body::to_bytes(root.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(root_body.as_ref(), html);
+
+        for _ in 0..100 {
+            if provider.call_count(&app_cid) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let prefetched_app_calls = provider.call_count(&app_cid);
+        assert!(prefetched_app_calls > 0);
+
+        let asset = ipfs_get(
+            State(state),
+            Path(format!("{dir_cid}/app.js")),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(asset.status(), StatusCode::OK);
+        let asset_body = axum::body::to_bytes(asset.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(asset_body.as_ref(), app);
+        assert_eq!(provider.call_count(&app_cid), prefetched_app_calls);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streamed_top_level_html_prefetches_from_first_chunk() {
+        let app = b"console.log('stream prefetched asset');";
+        let app_block = test_pb_file(app);
+        let app_cid = cid_from_data(CODEC_DAG_PB, &app_block);
+        let mut html = b"<!doctype html><script src=\"/app.js\"></script>".to_vec();
+        html.resize(GATEWAY_STREAM_CHUNK_SIZE as usize + 1024, b' ');
+        let index_block = test_pb_file(&html);
+        let index_cid = cid_from_data(CODEC_DAG_PB, &index_block);
+        let dir_block = test_pb_directory(vec![
+            test_link("index.html", &index_cid),
+            test_link("app.js", &app_cid),
+        ]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (dir_cid, dir_block),
+            (index_cid, index_block),
+            (app_cid, app_block),
+        ])));
+        let config = GatewayConfig::new(8).with_html_prefetch(GatewayHtmlPrefetchConfig::new(
+            4,
+            GATEWAY_STREAM_CHUNK_SIZE,
+            2,
+        ));
+        let state = GatewayState::with_provider_config(provider.clone(), config);
+
+        let root = ipfs_get(
+            State(state.clone()),
+            Path(dir_cid.to_string()),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(root.status(), StatusCode::OK);
+        let root_body = axum::body::to_bytes(root.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(root_body.as_ref(), html.as_slice());
+
+        for _ in 0..100 {
+            if provider.call_count(&app_cid) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let prefetched_app_calls = provider.call_count(&app_cid);
+        assert!(prefetched_app_calls > 0);
+
+        let asset = ipfs_get(
+            State(state),
+            Path(format!("{dir_cid}/app.js")),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(asset.status(), StatusCode::OK);
+        let asset_body = axum::body::to_bytes(asset.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(asset_body.as_ref(), app);
+        assert_eq!(provider.call_count(&app_cid), prefetched_app_calls);
+    }
+
     #[test]
     fn small_body_cache_evicts_to_byte_budget() {
         let first = cid_from_data(CODEC_RAW, b"one");
@@ -2361,6 +3129,32 @@ mod tests {
         assert_eq!(mime_fallback_source(0, false), "fallback_empty");
         assert_eq!(mime_fallback_source(10, true), "fallback_after_sniff");
         assert_eq!(mime_fallback_source(10, false), "fallback_no_sniff");
+    }
+
+    #[test]
+    fn html_prefetch_asset_paths_extracts_same_root_subresources() {
+        let html = r#"
+            <!doctype html>
+            <base href="https://example.invalid/ignored/">
+            <link rel="stylesheet" href="/assets/app.css?x=1">
+            <link rel="modulepreload" href="chunks/app.js">
+            <script src="./main.js"></script>
+            <img srcset="hero.avif 1x, hero@2x.avif 2x">
+            <script>var ignored = "<img src='/late.png'>";</script>
+            <script src="https://cdn.example/app.js"></script>
+            <img src="data:image/png;base64,aaa">
+        "#;
+
+        assert_eq!(
+            html_prefetch_asset_paths(html, "/pages/index.html", 8),
+            vec![
+                "assets/app.css",
+                "pages/chunks/app.js",
+                "pages/main.js",
+                "pages/hero.avif",
+                "pages/hero@2x.avif",
+            ]
+        );
     }
 
     #[tokio::test]

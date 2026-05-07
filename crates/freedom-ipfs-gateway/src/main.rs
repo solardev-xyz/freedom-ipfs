@@ -3,8 +3,9 @@ use axum::Router;
 use clap::{Parser, ValueEnum};
 use freedom_ipfs_core::parse_cid;
 use freedom_ipfs_gateway::{
-    router_with_provider_and_name_resolver_config, GatewayConfig, PersistentNameResolver,
-    DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS, DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
+    router_with_provider_and_name_resolver_config, GatewayConfig, GatewayHtmlPrefetchConfig,
+    PersistentNameResolver, DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
+    DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
 };
 use freedom_ipfs_namesys::{
     CachedNameResolver, CloudflareDohResolver, DefaultNameResolver, DelegatedIpnsResolver,
@@ -26,6 +27,9 @@ use tokio::net::TcpListener;
 
 const DEFAULT_TRACE_FILTER: &str =
     "freedom_ipfs_gateway=info,freedom_ipfs_retrieval=info,freedom_ipfs_namesys=info,freedom_ipfs_routing=info,warn";
+const HTML_PREFETCH_MAX_ASSETS_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_ASSETS";
+const HTML_PREFETCH_MAX_BYTES_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_BYTES";
+const HTML_PREFETCH_CONCURRENCY_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_CONCURRENCY";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Local Freedom IPFS gateway")]
@@ -103,7 +107,8 @@ async fn main() -> Result<()> {
     }
 
     let gateway_config = GatewayConfig::new(args.max_concurrent_requests)
-        .with_small_body_cache_max_bytes(args.small_body_cache_max_bytes);
+        .with_small_body_cache_max_bytes(args.small_body_cache_max_bytes)
+        .with_html_prefetch(gateway_html_prefetch_config());
     let router = if start_online_gateway {
         let delegated_routers = args.delegated_router.clone();
         let delegated_router_endpoints = delegated_router_endpoints(&delegated_routers);
@@ -196,6 +201,27 @@ async fn serve_router(router: Router, addr: SocketAddr) -> std::io::Result<()> {
 
 fn should_start_online_gateway(args: &Args) -> bool {
     args.online && args.routing_mode != RoutingMode::Offline
+}
+
+fn gateway_html_prefetch_config() -> GatewayHtmlPrefetchConfig {
+    let max_assets = env_usize(HTML_PREFETCH_MAX_ASSETS_ENV, 0);
+    let max_bytes = env_u64(HTML_PREFETCH_MAX_BYTES_ENV, 64 * 1024);
+    let concurrency = env_usize(HTML_PREFETCH_CONCURRENCY_ENV, 2);
+    GatewayHtmlPrefetchConfig::new(max_assets, max_bytes, concurrency)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
 }
 
 fn light_dht_client(dht_query_timeout_secs: u64, dht_max_providers: usize) -> LightDhtClient {
