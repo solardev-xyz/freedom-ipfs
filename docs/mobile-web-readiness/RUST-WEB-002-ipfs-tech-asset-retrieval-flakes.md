@@ -27775,3 +27775,71 @@ The cap increase removes a real semaphore queue created by page-level asset
 concurrency plus same-provider/multi-provider racing, while remaining far below
 Kubo's RSS/FD footprint. This is not a Bitswap-tail fix: the remaining root p95
 gap is still zero-HTTP cold Bitswap, especially the `ipfs.tech` root block.
+
+## 2026-05-07 - Current Head Zero-HTTP Gated Baseline After Cap 8
+
+Question:
+After promoting the HTTP-provider fetch cap to `8`, where does current head
+stand in a focused same-window sample that definitely exercises zero-HTTP cold
+Bitswap?
+
+Command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-zerohttp-ipfs-tech-r10-20260507T014733Z-trace.jsonl \
+  --comparison-output /tmp/current-head-zerohttp-ipfs-tech-r10-20260507T014733Z.json \
+  --require-request-classification zero_http_provider_cold_bitswap=1 \
+  --require-progress-phase fetching_bitswap=1
+```
+
+Result:
+
+- Rust and Kubo passed `10/10`.
+- Root TTFB p50/p95:
+  - Rust `560/1290ms`
+  - Kubo `1387/3458ms`
+- Asset TTFB p50/p95:
+  - Rust `150/489ms`
+  - Kubo `156/721ms`
+- Resource max:
+  - Rust `54324KiB` RSS, `32` FDs
+  - Kubo `272604KiB` RSS, `458` FDs
+
+Trace notes:
+
+- Request classifications:
+  - `zero_http_provider_cold_bitswap=10`
+  - `top_level_zero_http_provider_cold_bitswap=2`
+- Zero-HTTP cold Bitswap request latency p50/p95/max:
+  `449/1287/1287ms`
+- Top-level zero-HTTP cold Bitswap request latency p50/p95/max:
+  `557/1287/1287ms`
+- Block fetch totals:
+  - HTTP provider: `314` blocks, p50/p95/max `188/338/919ms`
+  - Bitswap: `84` blocks, p50/p95/max `147/317/503ms`
+- Bitswap source peer:
+  `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT=10`
+- Bitswap source request modes: `want_block=87`
+- Bitswap delivery: `incoming=87`
+- Bitswap incoming blocks max oldest pending wait: `448ms`
+- Bitswap connections established: `21`, p50/p95/max `516/594/671ms`
+
+Decision:
+Use this as the new current-head focused zero-HTTP baseline. In this same-window
+sample, current head beats Kubo on root p50/p95, asset p50/p95, RSS, and FDs
+while satisfying the zero-HTTP/Bitswap gates. Do not repeat broad direct
+WANT_BLOCK, shorter WANT_HAVE, or generic zero-HTTP post-lookup racing based on
+older traces unless a new same-window sample shows the old failure shape again.
+The next useful work is to find any remaining Kubo-win cases/windows after
+cap-8, especially beyond `ipfs.tech`, or to target specific slow provider/source
+quality cases with fresh evidence.
