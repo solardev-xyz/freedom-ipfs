@@ -1361,6 +1361,7 @@ fn print_summary(report: &RunReport) {
             );
         }
         print_trace_bitswap_peer_fetches(trace);
+        print_trace_bitswap_want_have_probes(trace);
         if trace.bitswap_session.has_events() {
             let session = &trace.bitswap_session;
             println!(
@@ -1770,6 +1771,7 @@ fn print_comparison_trace_summary(label: &str, report: &RunReport) {
     print_trace_http_provider_races(trace);
     print_trace_http_provider_fetches(trace);
     print_trace_bitswap_peer_attempts(trace);
+    print_trace_bitswap_want_have_probes(trace);
     print_trace_bitswap_dial_plans(trace);
     print_trace_bitswap_sources(trace);
     print_trace_bitswap_batches(trace);
@@ -2417,6 +2419,12 @@ fn print_trace_bitswap_peer_attempts(trace: &TraceSummary) {
     }
 }
 
+fn print_trace_bitswap_want_have_probes(trace: &TraceSummary) {
+    if let Some(line) = format_trace_bitswap_want_have_probes(&trace.bitswap_want_have_probes) {
+        println!("  {line}");
+    }
+}
+
 fn format_trace_bitswap_peer_attempts(
     attempts: &TraceBitswapPeerAttemptAggregate,
 ) -> Option<String> {
@@ -2433,6 +2441,31 @@ fn format_trace_bitswap_peer_attempts(
         attempts.read_timeouts,
         attempts.other_failures,
         attempts.prefer_want_have
+    ))
+}
+
+fn format_trace_bitswap_want_have_probes(
+    probes: &TraceBitswapWantHaveProbeAggregate,
+) -> Option<String> {
+    if !probes.has_events() {
+        return None;
+    }
+    Some(format!(
+        "bitswap WANT_HAVE probes: events={} ok={} failures={} have={} dont_have={} block={} want_block_followups={} no_presence={} bytes={} extra_blocks={} max_timeout={}ms elapsed={} outcomes={} peers={}",
+        probes.events,
+        probes.ok,
+        probes.failures,
+        probes.have,
+        probes.dont_have,
+        probes.block,
+        probes.want_block_followups,
+        probes.no_presence,
+        probes.bytes,
+        probes.extra_blocks,
+        probes.max_timeout_ms,
+        probes.elapsed_ms,
+        format_trace_counts(&probes.outcomes),
+        format_trace_counts(&probes.peers)
     ))
 }
 
@@ -5366,6 +5399,7 @@ struct TraceSummary {
     bitswap_peer_fetches: Vec<TracePeerAggregate>,
     bitswap_session: TraceBitswapSessionAggregate,
     bitswap_peer_attempts: TraceBitswapPeerAttemptAggregate,
+    bitswap_want_have_probes: TraceBitswapWantHaveProbeAggregate,
     bitswap_dial_plans: TraceBitswapDialPlanAggregate,
     bitswap_incoming_blocks: TraceBitswapIncomingBlockAggregate,
     bitswap_incoming_reads: TraceBitswapIncomingReadAggregate,
@@ -6649,6 +6683,30 @@ impl TraceBitswapPeerAttemptAggregate {
 }
 
 #[derive(Debug, Default, Serialize)]
+struct TraceBitswapWantHaveProbeAggregate {
+    events: usize,
+    ok: usize,
+    failures: usize,
+    have: usize,
+    dont_have: usize,
+    block: usize,
+    want_block_followups: usize,
+    no_presence: usize,
+    bytes: u128,
+    extra_blocks: u128,
+    max_timeout_ms: u128,
+    elapsed_ms: LatencySummary,
+    outcomes: Vec<TraceValueCount>,
+    peers: Vec<TraceValueCount>,
+}
+
+impl TraceBitswapWantHaveProbeAggregate {
+    fn has_events(&self) -> bool {
+        self.events > 0
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
 struct TraceBitswapDialPlanAggregate {
     events: usize,
     peer_targets: u128,
@@ -7165,6 +7223,20 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_dns_expansion = TraceBitswapDnsExpansionAggregate::default();
     let mut bitswap_session = TraceBitswapSessionAggregate::default();
     let mut bitswap_peer_attempts = TraceBitswapPeerAttemptAggregate::default();
+    let mut bitswap_want_have_probe_events = 0usize;
+    let mut bitswap_want_have_probe_ok = 0usize;
+    let mut bitswap_want_have_probe_failures = 0usize;
+    let mut bitswap_want_have_probe_have = 0usize;
+    let mut bitswap_want_have_probe_dont_have = 0usize;
+    let mut bitswap_want_have_probe_block = 0usize;
+    let mut bitswap_want_have_probe_want_block_followups = 0usize;
+    let mut bitswap_want_have_probe_no_presence = 0usize;
+    let mut bitswap_want_have_probe_bytes = 0u128;
+    let mut bitswap_want_have_probe_extra_blocks = 0u128;
+    let mut bitswap_want_have_probe_max_timeout_ms = 0u128;
+    let mut bitswap_want_have_probe_elapsed_values = Vec::<u128>::new();
+    let mut bitswap_want_have_probe_outcomes = BTreeMap::<String, usize>::new();
+    let mut bitswap_want_have_probe_peers = BTreeMap::<String, usize>::new();
     let mut bitswap_dial_plans = TraceBitswapDialPlanAggregate::default();
     let mut bitswap_incoming_blocks = TraceBitswapIncomingBlockAggregate::default();
     let mut bitswap_incoming_reads = TraceBitswapIncomingReadAggregate::default();
@@ -7937,6 +8009,66 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 }
             }
         }
+        if phase == "bitswap_want_have_probe" {
+            bitswap_want_have_probe_events += 1;
+            match value.get("ok").and_then(|ok| ok.as_bool()) {
+                Some(true) => bitswap_want_have_probe_ok += 1,
+                Some(false) => bitswap_want_have_probe_failures += 1,
+                None => {}
+            }
+            if value
+                .get("has_have")
+                .and_then(|has_have| has_have.as_bool())
+                == Some(true)
+            {
+                bitswap_want_have_probe_have += 1;
+            }
+            if value
+                .get("has_dont_have")
+                .and_then(|has_dont_have| has_dont_have.as_bool())
+                == Some(true)
+            {
+                bitswap_want_have_probe_dont_have += 1;
+            }
+            let mut outcome_no_presence = false;
+            if let Some(outcome) = value.get("outcome").and_then(|outcome| outcome.as_str()) {
+                *bitswap_want_have_probe_outcomes
+                    .entry(outcome.to_string())
+                    .or_default() += 1;
+                match outcome {
+                    "block" => bitswap_want_have_probe_block += 1,
+                    "have_then_want_block"
+                    | "timeout_fallback_want_block"
+                    | "no_presence_fallback_want_block" => {
+                        bitswap_want_have_probe_want_block_followups += 1;
+                    }
+                    _ => {}
+                }
+                if outcome == "no_presence_fallback_want_block" {
+                    outcome_no_presence = true;
+                }
+            }
+            let zero_presence = value.get("presence_count").and_then(json_u128) == Some(0);
+            if outcome_no_presence || zero_presence {
+                bitswap_want_have_probe_no_presence += 1;
+            }
+            bitswap_want_have_probe_bytes +=
+                value.get("bytes").and_then(json_u128).unwrap_or_default();
+            bitswap_want_have_probe_extra_blocks += value
+                .get("extra_blocks")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            if let Some(timeout_ms) = value.get("timeout_ms").and_then(json_u128) {
+                bitswap_want_have_probe_max_timeout_ms =
+                    bitswap_want_have_probe_max_timeout_ms.max(timeout_ms);
+            }
+            if let Some(elapsed_ms) = elapsed_ms {
+                bitswap_want_have_probe_elapsed_values.push(elapsed_ms);
+            }
+            if let Some(peer) = json_detail_string(value.get("peer")) {
+                *bitswap_want_have_probe_peers.entry(peer).or_default() += 1;
+            }
+        }
         if phase == "bitswap_dial_plan" {
             if let Some(cid) = json_detail_string(value.get("cid")) {
                 provider_fetch_dial_plan_seen.insert(cid, true);
@@ -8422,6 +8554,22 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_peer_fetches: sorted_trace_peers(bitswap_peer_fetches),
         bitswap_session,
         bitswap_peer_attempts,
+        bitswap_want_have_probes: TraceBitswapWantHaveProbeAggregate {
+            events: bitswap_want_have_probe_events,
+            ok: bitswap_want_have_probe_ok,
+            failures: bitswap_want_have_probe_failures,
+            have: bitswap_want_have_probe_have,
+            dont_have: bitswap_want_have_probe_dont_have,
+            block: bitswap_want_have_probe_block,
+            want_block_followups: bitswap_want_have_probe_want_block_followups,
+            no_presence: bitswap_want_have_probe_no_presence,
+            bytes: bitswap_want_have_probe_bytes,
+            extra_blocks: bitswap_want_have_probe_extra_blocks,
+            max_timeout_ms: bitswap_want_have_probe_max_timeout_ms,
+            elapsed_ms: LatencySummary::from_values(bitswap_want_have_probe_elapsed_values),
+            outcomes: sorted_trace_counts(bitswap_want_have_probe_outcomes),
+            peers: sorted_trace_counts(bitswap_want_have_probe_peers),
+        },
         bitswap_dial_plans,
         bitswap_incoming_blocks,
         bitswap_incoming_reads,
@@ -11165,6 +11313,91 @@ mod tests {
         assert_eq!(
             line,
             "bitswap peer attempts: starts=3 outgoing_completed=2 successes=1 failures=1 connection_timeouts=1 read_timeouts=0 other_failures=0 prefer_want_have=2"
+        );
+    }
+
+    #[test]
+    fn trace_summary_counts_bitswap_want_have_probes() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mobile-web-harness-trace-want-have-probes-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"phase\":\"bitswap_want_have_probe\",\"elapsed_ms\":25,\"cid\":\"cid-a\",\"peer\":\"peer-a\",\"ok\":true,\"outcome\":\"have_then_want_block\",\"has_have\":true,\"has_dont_have\":false,\"presence_count\":1}\n",
+                "{\"phase\":\"bitswap_want_have_probe\",\"elapsed_ms\":750,\"cid\":\"cid-b\",\"peer\":\"peer-b\",\"ok\":false,\"outcome\":\"timeout_fallback_want_block\",\"timeout_ms\":750}\n",
+                "{\"phase\":\"bitswap_want_have_probe\",\"elapsed_ms\":12,\"cid\":\"cid-c\",\"peer\":\"peer-c\",\"ok\":false,\"outcome\":\"dont_have\",\"has_have\":false,\"has_dont_have\":true,\"presence_count\":1}\n",
+                "{\"phase\":\"bitswap_want_have_probe\",\"elapsed_ms\":5,\"cid\":\"cid-d\",\"peer\":\"peer-a\",\"ok\":true,\"outcome\":\"block\",\"bytes\":42,\"extra_blocks\":2}\n",
+                "{\"phase\":\"bitswap_want_have_probe\",\"elapsed_ms\":18,\"cid\":\"cid-e\",\"peer\":\"peer-d\",\"ok\":false,\"outcome\":\"no_presence_fallback_want_block\",\"presence_count\":0}\n",
+            ),
+        )
+        .unwrap();
+
+        let summary = summarize_trace_output(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let probes = &summary.bitswap_want_have_probes;
+
+        assert_eq!(probes.events, 5);
+        assert_eq!(probes.ok, 2);
+        assert_eq!(probes.failures, 3);
+        assert_eq!(probes.have, 1);
+        assert_eq!(probes.dont_have, 1);
+        assert_eq!(probes.block, 1);
+        assert_eq!(probes.want_block_followups, 3);
+        assert_eq!(probes.no_presence, 1);
+        assert_eq!(probes.bytes, 42);
+        assert_eq!(probes.extra_blocks, 2);
+        assert_eq!(probes.max_timeout_ms, 750);
+        assert_eq!(probes.elapsed_ms.count, 5);
+        assert_eq!(probes.elapsed_ms.p50_ms, Some(18));
+        assert_eq!(probes.elapsed_ms.p90_ms, Some(750));
+        assert_eq!(probes.outcomes[0].value, "block");
+        assert_eq!(probes.outcomes[0].count, 1);
+        assert_eq!(probes.outcomes[4].value, "timeout_fallback_want_block");
+        assert_eq!(probes.peers[0].value, "peer-a");
+        assert_eq!(probes.peers[0].count, 2);
+    }
+
+    #[test]
+    fn formats_bitswap_want_have_probe_summary() {
+        assert!(format_trace_bitswap_want_have_probes(
+            &TraceBitswapWantHaveProbeAggregate::default()
+        )
+        .is_none());
+
+        let line = format_trace_bitswap_want_have_probes(&TraceBitswapWantHaveProbeAggregate {
+            events: 2,
+            ok: 1,
+            failures: 1,
+            have: 1,
+            dont_have: 0,
+            block: 0,
+            want_block_followups: 2,
+            no_presence: 1,
+            bytes: 0,
+            extra_blocks: 0,
+            max_timeout_ms: 750,
+            elapsed_ms: LatencySummary::from_values(vec![25, 750]),
+            outcomes: vec![TraceValueCount {
+                value: "timeout_fallback_want_block".to_string(),
+                count: 1,
+            }],
+            peers: vec![TraceValueCount {
+                value: "peer-a".to_string(),
+                count: 2,
+            }],
+        })
+        .unwrap();
+
+        assert_eq!(
+            line,
+            "bitswap WANT_HAVE probes: events=2 ok=1 failures=1 have=1 dont_have=0 block=0 want_block_followups=2 no_presence=1 bytes=0 extra_blocks=0 max_timeout=750ms elapsed=p50=25ms p90=750ms p95=750ms max=750ms outcomes=timeout_fallback_want_block=1 peers=peer-a=2"
         );
     }
 

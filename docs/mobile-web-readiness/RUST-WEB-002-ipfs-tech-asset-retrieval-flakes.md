@@ -32151,3 +32151,81 @@ Keep. This is diagnostics-only and low volume in default runs. It makes the
 next source-quality iteration sharper: we can now measure whether future
 `WANT_HAVE` or DONT_HAVE-suppression experiments are actually seeing useful
 presence responses, timing out, or learning that a peer does not have the CID.
+
+## 2026-05-07 - Keep: Harness Summary For Bitswap WANT_HAVE Probe Outcomes
+
+Hypothesis:
+The new `bitswap_want_have_probe` trace event is only useful during long-running
+optimization if the harness surfaces it without custom JSONL scripts. The normal
+trace summary should show whether probes saw `HAVE`, `DONT_HAVE`, direct block
+responses, no-presence fallback, or the existing timeout fallback.
+
+Code:
+
+- Added a `bitswap_want_have_probes` aggregate to the mobile web harness trace
+  summary.
+- The aggregate records:
+  - event count
+  - `ok` / failure counts
+  - `HAVE` / `DONT_HAVE` counts
+  - block-in-probe count
+  - WANT_BLOCK follow-up count
+  - no-presence count
+  - bytes and extra blocks
+  - max timeout
+  - elapsed latency summary
+  - top outcomes and peers
+- The terminal summary now prints a compact line such as:
+
+```text
+bitswap WANT_HAVE probes: events=1 ok=0 failures=1 have=0 dont_have=0 block=0 want_block_followups=1 no_presence=0 bytes=0 extra_blocks=0 max_timeout=750ms elapsed=p50=751ms p90=751ms p95=751ms max=751ms outcomes=timeout_fallback_want_block=1 peers=12D3...=1
+```
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness want_have -- --nocapture
+cargo test -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting and whitespace checks passed.
+- Focused WANT_HAVE harness tests passed: `2` passed.
+- Full `mobile-web-harness` tests passed: `51` passed.
+- Clippy for `mobile-web-harness` passed with `-D warnings`.
+
+Forced-probe summary smoke:
+
+```sh
+timeout 900s env FREEDOM_IPFS_BITSWAP_DIRECT_WANT_BLOCK_UNTRUSTED_PEERS=0 \
+  cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 1 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 180 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/want-have-probe-summary-smoke-20260507T-smoke.jsonl \
+  --output /tmp/want-have-probe-summary-smoke-20260507T-smoke.json
+```
+
+Smoke result:
+
+- Rust passed `1/1`.
+- `ipfs.tech` root `2281ms`; assets p50/p95/max `77/287/657ms`.
+- The trace summary printed one `bitswap WANT_HAVE probes` line:
+  `events=1`, `ok=0`, `failures=1`,
+  `outcomes=timeout_fallback_want_block=1`, elapsed
+  `p50/p90/p95/max=751/751/751/751ms`.
+
+Decision:
+Keep. This is behavior-neutral harness instrumentation. It lowers the cost of
+future Bitswap source-quality experiments by putting probe outcomes in the same
+summary view as root/asset latency, provider lookups, Bitswap sources, peer
+attempts, and slow CID/request classifications.
