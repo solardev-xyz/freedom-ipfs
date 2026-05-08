@@ -42161,3 +42161,182 @@ source selection and scheduling across these two shapes:
 
 Next experiment should target one of those shapes directly and must preserve the
 RSS/FD advantage shown in this baseline.
+
+## 2026-05-08: Keep Disabled Lab - Page-Budgeted Single-HTTP Bitswap Hedge
+
+Branch/head before change:
+
+- `codex/kubo-session-performance-20260506`
+- `38807ac` (`Document Kubo bitswap baseline`)
+
+Hypothesis:
+
+The broad opt-in single-HTTP Bitswap hedge was too expensive as a general
+policy, but a tiny page-scoped budget might still be useful during bad
+single-provider Sia windows. The intended shape is "at most N slow single-HTTP
+subresources per top-level page may start a delayed Bitswap hedge", preserving
+mobile resource bounds while giving a few cold rows an escape hatch.
+
+Change:
+
+- Added opt-in lab budget env:
+  `FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MAX_PER_TOP_LEVEL=<n>`.
+- It has no effect unless the existing broad lab is explicitly enabled with
+  `FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1`.
+- If the budget env is absent, the existing broad lab behavior is unchanged.
+- If the broad lab env is absent, default runtime behavior is unchanged.
+- Budget is scoped to gateway subresources with a known top-level path.
+- Added trace phases:
+  - `http_provider_bitswap_hedge_budget`
+  - `http_provider_bitswap_hedge_skip`
+
+Implementation correction:
+
+The first preflight reserved budget as soon as a request became hedge-eligible.
+That was wrong because fast HTTP completions could consume the page budget even
+when the delayed Bitswap hedge never actually started. The implementation was
+changed to reserve only when the hedge timer fires and immediately before
+starting the Bitswap hedge.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval single_http_bitswap_hedge -- --nocapture
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo test -p freedom-ipfs-retrieval -- --nocapture
+```
+
+Result:
+
+- Focused hedge tests passed: `3 passed`.
+- Full retrieval crate tests passed: `147 passed`, `1 ignored`.
+- `cargo check` and package clippy passed.
+
+Broken preflight before lazy reservation fix:
+
+```sh
+timeout 1200s env \
+  FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MAX_PER_TOP_LEVEL=2 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS=180 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS=250 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --repeat 3 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --case ipfs-tech-page-assets \
+    --trace-output /tmp/ipfs-tech-single-http-budget2-hedge250-r3-20260508T005422Z-trace.jsonl \
+    --comparison-output /tmp/ipfs-tech-single-http-budget2-hedge250-r3-20260508T005422Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `3/3`.
+- Root: Rust `1248/1496ms`; Kubo `1926/2154ms`.
+- Assets: Rust `102/480ms`; Kubo `113/398ms`.
+- `meaningful_kubo_wins`: `2`, both asset p95 TTFB/total.
+- Resource max: Rust `57712KiB` RSS and `29` FDs vs Kubo `124164KiB` RSS
+  and `77` FDs.
+- Trace showed the implementation flaw: `bitswap hedge starts=0`, while the
+  early budget gate had already skipped many later rows with
+  `top_level_budget_exhausted=42`.
+
+Lazy-budget opt-in run after the fix:
+
+```sh
+timeout 1200s env \
+  FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MAX_PER_TOP_LEVEL=2 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS=180 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS=250 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --repeat 3 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --case ipfs-tech-page-assets \
+    --trace-output /tmp/ipfs-tech-single-http-budget2-lazy-hedge250-r3-20260508T005718Z-trace.jsonl \
+    --comparison-output /tmp/ipfs-tech-single-http-budget2-lazy-hedge250-r3-20260508T005718Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `3/3`.
+- Kubo Bitswap per run: `blocks_received=35`, `data_received=793822`,
+  messages p50/p90/p95/max `31/34/34/34`, peers `6/7/7/7`.
+- Root: Rust `614/804ms`; Kubo `1301/1445ms`.
+- Assets: Rust `104/158ms`; Kubo `100/291ms`.
+- `meaningful_kubo_wins`: none.
+- Resource max: Rust `56004KiB` RSS and `28` FDs vs Kubo `131248KiB` RSS
+  and `80` FDs.
+
+Rust trace:
+
+- Bitswap blocks: `88`, p50/p90/p95/max `98/142/159/315ms`.
+- HTTP-provider blocks: `29`, p50/p90/p95/max `80/237/241/247ms`.
+- Delegated provider results: zero `3`, single `60`, multi `42`.
+- Bitswap connections established: `6`.
+- Single-provider hedge starts: `0`.
+- Hedge skip reason: `provider_unscored=3`.
+
+Immediate no-env post-control:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/ipfs-tech-single-http-budget2-lazy-post-control-r3-20260508T005718Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-single-http-budget2-lazy-post-control-r3-20260508T005718Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `3/3`.
+- Kubo Bitswap per run: blocks p50/p90/p95/max `41/44/44/44`,
+  data p50/max `796633/819922`, duplicate blocks p50/max `6/9`,
+  messages p50/max `222/250`, peers p50/max `30/36`.
+- Root: Rust `628/819ms`; Kubo `1999/2089ms`.
+- Assets: Rust `102/183ms`; Kubo `213/648ms`.
+- `meaningful_kubo_wins`: none.
+- Resource max: Rust `56504KiB` RSS and `29` FDs vs Kubo `220344KiB` RSS
+  and `141` FDs.
+
+Rust trace:
+
+- Bitswap blocks: `86`, p50/p90/p95/max `97/147/184/325ms`.
+- HTTP-provider blocks: `31`, p50/p90/p95/max `80/202/245/248ms`.
+- Single Sia HTTP max: `194ms`.
+- Bitswap connections established: `3`.
+
+Decision:
+
+Keep this as a disabled lab/tuning guard only. The favorable live window did
+not exercise the new budgeted hedge path after the lazy reservation fix, and
+the immediate no-env control was equally green or better for asset median. Do
+not promote it from this evidence.
+
+Future use:
+
+Rerun this lab only when a fresh bad `ipfs.tech` window shows slow scored
+single-provider rows and the trace confirms `http_provider_bitswap_hedge_budget`
+and `http_provider_bitswap_hedge_result` events with actual hedge starts. Judge
+it against no-env same-window control on asset p95, root latency, RSS, FDs, and
+whether the budget avoids broad Bitswap fanout.

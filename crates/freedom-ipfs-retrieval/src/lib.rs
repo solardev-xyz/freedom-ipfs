@@ -61,6 +61,8 @@ const SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS";
 const SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS";
+const SINGLE_HTTP_BITSWAP_HEDGE_MAX_PER_TOP_LEVEL_ENV: &str =
+    "FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MAX_PER_TOP_LEVEL";
 const ENABLE_SINGLE_HTTP_SESSION_BITSWAP_HEDGE_ENV: &str =
     "FREEDOM_IPFS_ENABLE_SINGLE_HTTP_SESSION_BITSWAP_HEDGE";
 const ENABLE_SINGLE_HTTP_5XX_FAST_BITSWAP_FALLBACK_ENV: &str =
@@ -152,6 +154,7 @@ const TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_MAX_REQUESTS: usize = 8;
 const TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_MAX_REQUESTS_ENV: &str =
     "FREEDOM_IPFS_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_MAX_REQUESTS";
 const MAX_TOP_LEVEL_BITSWAP_PROVIDER_PRECONNECT_TRACKED_PATHS: usize = 64;
+const MAX_SINGLE_HTTP_BITSWAP_HEDGE_TRACKED_PATHS: usize = 64;
 const DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE_ENV: &str =
     "FREEDOM_IPFS_DISABLE_SINGLE_HTTP_POST_LOOKUP_RACE";
 const SINGLE_HTTP_POST_LOOKUP_RACE_MIN_SCORE_MS_ENV: &str =
@@ -349,6 +352,7 @@ pub struct HttpRetriever {
     bitswap_dnsaddr_cache: Arc<tokio::sync::Mutex<SharedDnsaddrCache>>,
     bitswap_dns_ip_cache: Arc<tokio::sync::Mutex<SharedDnsIpCache>>,
     top_level_bitswap_provider_preconnect_counts: Arc<tokio::sync::Mutex<HashMap<String, usize>>>,
+    single_http_bitswap_hedge_counts: Arc<tokio::sync::Mutex<HashMap<String, usize>>>,
     http_provider_fetch_limiter: Arc<tokio::sync::Semaphore>,
     http_provider_fetch_limit: usize,
 }
@@ -430,6 +434,7 @@ impl HttpRetriever {
             top_level_bitswap_provider_preconnect_counts: Arc::new(tokio::sync::Mutex::new(
                 HashMap::new(),
             )),
+            single_http_bitswap_hedge_counts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             http_provider_fetch_limiter: Arc::new(tokio::sync::Semaphore::new(
                 http_provider_fetch_limit,
             )),
@@ -1223,6 +1228,7 @@ impl HttpRetriever {
                         cid,
                         http_provider_bases,
                         providers.to_vec(),
+                        context.clone(),
                     )
                     .await;
             }
@@ -1790,6 +1796,92 @@ impl HttpRetriever {
         }
         let count = counts.entry(top_level_path.to_owned()).or_default();
         if *count >= max_request_count {
+            return None;
+        }
+        *count += 1;
+        Some(*count)
+    }
+
+    async fn single_http_provider_bitswap_hedge_budget_allows(
+        &self,
+        cid: &Cid,
+        context: Option<&RetrievalRequestContext>,
+        provider: &Url,
+    ) -> bool {
+        let Some(max_per_top_level) = single_http_provider_bitswap_hedge_max_per_top_level() else {
+            return true;
+        };
+        let Some(context) = context else {
+            tracing::info!(
+                phase = "http_provider_bitswap_hedge_skip",
+                cid = %cid,
+                provider = %provider,
+                reason = "budget_missing_context",
+                max_per_top_level
+            );
+            return false;
+        };
+        if !context.gateway_subresource() {
+            tracing::info!(
+                phase = "http_provider_bitswap_hedge_skip",
+                cid = %cid,
+                provider = %provider,
+                reason = "budget_non_subresource",
+                max_per_top_level
+            );
+            return false;
+        }
+        let Some(top_level_path) = context.top_level_path() else {
+            tracing::info!(
+                phase = "http_provider_bitswap_hedge_skip",
+                cid = %cid,
+                provider = %provider,
+                reason = "budget_missing_top_level_path",
+                max_per_top_level
+            );
+            return false;
+        };
+        let Some(used_count) = self
+            .reserve_single_http_provider_bitswap_hedge(top_level_path, max_per_top_level)
+            .await
+        else {
+            tracing::info!(
+                phase = "http_provider_bitswap_hedge_skip",
+                cid = %cid,
+                provider = %provider,
+                top_level_path = %top_level_path,
+                reason = "top_level_budget_exhausted",
+                max_per_top_level
+            );
+            return false;
+        };
+        tracing::info!(
+            phase = "http_provider_bitswap_hedge_budget",
+            cid = %cid,
+            provider = %provider,
+            top_level_path = %top_level_path,
+            used_count,
+            max_per_top_level
+        );
+        true
+    }
+
+    async fn reserve_single_http_provider_bitswap_hedge(
+        &self,
+        top_level_path: &str,
+        max_per_top_level: usize,
+    ) -> Option<usize> {
+        if max_per_top_level == 0 {
+            return None;
+        }
+        let mut counts = self.single_http_bitswap_hedge_counts.lock().await;
+        if !counts.contains_key(top_level_path)
+            && counts.len() >= MAX_SINGLE_HTTP_BITSWAP_HEDGE_TRACKED_PATHS
+        {
+            counts.clear();
+        }
+        let count = counts.entry(top_level_path.to_owned()).or_default();
+        if *count >= max_per_top_level {
             return None;
         }
         *count += 1;
@@ -2624,6 +2716,7 @@ impl HttpRetriever {
         cid: &Cid,
         http_provider_bases: Vec<Url>,
         providers: Vec<Provider>,
+        context: Option<RetrievalRequestContext>,
     ) -> Result<(Block, RetrievalSource)> {
         let started = Instant::now();
         let provider_count = providers.len();
@@ -2647,6 +2740,7 @@ impl HttpRetriever {
         let Some(candidate) = candidates.into_iter().next() else {
             return Err(RetrievalError::NoHttpProviders);
         };
+        let candidate_base = candidate.base.clone();
         let mut pending =
             FuturesUnordered::<BoxFuture<'static, SingleHttpProviderBitswapHedgeResult>>::new();
 
@@ -2752,15 +2846,24 @@ impl HttpRetriever {
                 }
                 _ = &mut hedge, if !bitswap_started => {
                     bitswap_started = true;
-                    push_single_http_bitswap_hedge(
-                        &mut pending,
-                        self.clone(),
-                        *cid,
-                        providers.clone(),
-                        provider_count,
-                        started,
-                        "slow_single_http_provider",
-                    );
+                    if self
+                        .single_http_provider_bitswap_hedge_budget_allows(
+                            cid,
+                            context.as_ref(),
+                            &candidate_base,
+                        )
+                        .await
+                    {
+                        push_single_http_bitswap_hedge(
+                            &mut pending,
+                            self.clone(),
+                            *cid,
+                            providers.clone(),
+                            provider_count,
+                            started,
+                            "slow_single_http_provider",
+                        );
+                    }
                 }
                 else => break,
             }
@@ -5975,6 +6078,22 @@ fn single_http_provider_bitswap_hedge_min_score() -> Option<Duration> {
     std::env::var_os(SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS_ENV)
         .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
         .map(Duration::from_millis)
+}
+
+fn single_http_provider_bitswap_hedge_max_per_top_level() -> Option<usize> {
+    single_http_provider_bitswap_hedge_max_per_top_level_from_env_value(
+        std::env::var_os(SINGLE_HTTP_BITSWAP_HEDGE_MAX_PER_TOP_LEVEL_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn single_http_provider_bitswap_hedge_max_per_top_level_from_env_value(
+    value: Option<&str>,
+) -> Option<usize> {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
 }
 
 fn single_http_provider_bitswap_hedge_after_from_env_value(value: Option<&str>) -> Duration {
@@ -13327,6 +13446,66 @@ mod bitswap_tests {
     }
 
     #[test]
+    fn single_http_bitswap_hedge_budget_parses_override() {
+        assert_eq!(
+            single_http_provider_bitswap_hedge_max_per_top_level_from_env_value(None),
+            None
+        );
+        assert_eq!(
+            single_http_provider_bitswap_hedge_max_per_top_level_from_env_value(Some("0")),
+            None
+        );
+        assert_eq!(
+            single_http_provider_bitswap_hedge_max_per_top_level_from_env_value(Some("bad")),
+            None
+        );
+        assert_eq!(
+            single_http_provider_bitswap_hedge_max_per_top_level_from_env_value(Some("2")),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn single_http_bitswap_hedge_budget_is_top_level_scoped() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store,
+        );
+
+        assert_eq!(
+            retriever
+                .reserve_single_http_provider_bitswap_hedge("/ipns/site-a/", 2)
+                .await,
+            Some(1)
+        );
+        assert_eq!(
+            retriever
+                .reserve_single_http_provider_bitswap_hedge("/ipns/site-a/", 2)
+                .await,
+            Some(2)
+        );
+        assert_eq!(
+            retriever
+                .reserve_single_http_provider_bitswap_hedge("/ipns/site-a/", 2)
+                .await,
+            None
+        );
+        assert_eq!(
+            retriever
+                .reserve_single_http_provider_bitswap_hedge("/ipns/site-b/", 2)
+                .await,
+            Some(1)
+        );
+        assert_eq!(
+            retriever
+                .reserve_single_http_provider_bitswap_hedge("/ipns/site-c/", 0)
+                .await,
+            None
+        );
+    }
+
+    #[test]
     fn bitswap_session_peer_min_successes_env_value_parses_override() {
         assert_eq!(
             bitswap_session_peer_min_successes_from_env_value(None),
@@ -13744,6 +13923,7 @@ mod bitswap_tests {
                 &cid,
                 vec![http_base],
                 providers,
+                None,
             ),
         )
         .await
