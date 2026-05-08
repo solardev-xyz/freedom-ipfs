@@ -162,9 +162,10 @@ matching Rust path summary to each printed per-asset Kubo-win row as
 `rust_trace`. This directly shows block source mix, HTTP provider, HTTP max
 latency, HTTP-provider response bytes/header/first-chunk/body maxima, successful
 Bitswap fetch count/bytes/max latency, Bitswap source transport, low-diversity
-DHT fallback cost, classifications, and dominant request-local phases for a
-Kubo-winning asset path. The console output prints both sections so optimization
-runs immediately show which URL/CID/request caused the tail. Sparse
+DHT fallback cost, UnixFS metadata/path/file-size cache deltas,
+classifications, and dominant request-local phases for a Kubo-winning asset
+path. The console output prints both sections so optimization runs immediately
+show which URL/CID/request caused the tail. Sparse
 public-network residuals are
 classified explicitly, including zero-HTTP single Bitswap-provider WSS requests
 where the low-diversity DHT fallback found no alternate providers.

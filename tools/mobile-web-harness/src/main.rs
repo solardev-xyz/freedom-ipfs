@@ -1801,8 +1801,9 @@ fn format_comparison_asset_trace_details(trace: Option<&TraceRequestPathAggregat
         )
     };
     let dht_details = format_trace_path_dht_details(trace);
+    let unixfs_cache_details = format_trace_unixfs_cache_details(&trace.unixfs_metadata_cache);
     format!(
-        " rust_trace=requests={} elapsed={} max_event={}ms statuses={} classifications={} block_sources={} http_fetches={} ok={} fail={} http_max={}ms http_providers={}{} phases={}{}{}",
+        " rust_trace=requests={} elapsed={} max_event={}ms statuses={} classifications={} block_sources={} http_fetches={} ok={} fail={} http_max={}ms http_providers={}{} phases={}{}{}{}",
         trace.request_count,
         trace.request_elapsed_ms,
         trace.max_event_ms,
@@ -1817,7 +1818,27 @@ fn format_comparison_asset_trace_details(trace: Option<&TraceRequestPathAggregat
         http_milestones,
         phases,
         bitswap_details,
-        dht_details
+        dht_details,
+        unixfs_cache_details
+    )
+}
+
+fn format_trace_unixfs_cache_details(cache: &TraceUnixfsMetadataCacheAggregate) -> String {
+    if !cache.has_events() {
+        return String::new();
+    }
+    format!(
+        " unixfs_cache=events={} metadata={}/{}/{} path={}/{}/{} file_size={}/{}/{}",
+        cache.events,
+        cache.hits,
+        cache.misses,
+        cache.inserts,
+        cache.path_hits,
+        cache.path_misses,
+        cache.path_inserts,
+        cache.file_size_hits,
+        cache.file_size_misses,
+        cache.file_size_inserts
     )
 }
 
@@ -6194,6 +6215,7 @@ struct TraceRequestPathAggregate {
     dht_provider_lookup_providers: u128,
     dht_provider_lookup_max_elapsed_ms: u128,
     dht_provider_lookup_max_timeout_ms: u128,
+    unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
     phase_latencies: Vec<TraceRequestPathPhaseAggregate>,
 }
 
@@ -7167,7 +7189,7 @@ struct TraceGatewayStreamBodyAggregate {
     max_elapsed_ms: u128,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 struct TraceUnixfsMetadataCacheAggregate {
     events: usize,
     hits: u128,
@@ -7188,6 +7210,109 @@ struct TraceUnixfsMetadataCacheAggregate {
     file_size_evictions: u128,
     max_file_size_len: u128,
     max_capacity: u128,
+}
+
+impl TraceUnixfsMetadataCacheAggregate {
+    fn has_events(&self) -> bool {
+        self.events > 0
+    }
+
+    fn record(&mut self, value: &serde_json::Value) {
+        self.events += 1;
+        self.hits += value.get("hits").and_then(json_u128).unwrap_or_default();
+        self.misses += value.get("misses").and_then(json_u128).unwrap_or_default();
+        self.inserts += value.get("inserts").and_then(json_u128).unwrap_or_default();
+        self.evictions += value
+            .get("evictions")
+            .and_then(json_u128)
+            .unwrap_or_default();
+        self.oversized_skips += value
+            .get("oversized_skips")
+            .and_then(json_u128)
+            .unwrap_or_default();
+        self.path_hits += value
+            .get("path_hits")
+            .and_then(json_u128)
+            .unwrap_or_default();
+        self.path_misses += value
+            .get("path_misses")
+            .and_then(json_u128)
+            .unwrap_or_default();
+        self.path_inserts += value
+            .get("path_inserts")
+            .and_then(json_u128)
+            .unwrap_or_default();
+        self.path_evictions += value
+            .get("path_evictions")
+            .and_then(json_u128)
+            .unwrap_or_default();
+        self.path_oversized_skips += value
+            .get("path_oversized_skips")
+            .and_then(json_u128)
+            .unwrap_or_default();
+        self.file_size_hits += value
+            .get("file_size_hits")
+            .and_then(json_u128)
+            .unwrap_or_default();
+        self.file_size_misses += value
+            .get("file_size_misses")
+            .and_then(json_u128)
+            .unwrap_or_default();
+        self.file_size_inserts += value
+            .get("file_size_inserts")
+            .and_then(json_u128)
+            .unwrap_or_default();
+        self.file_size_evictions += value
+            .get("file_size_evictions")
+            .and_then(json_u128)
+            .unwrap_or_default();
+        self.max_len = self.max_len.max(
+            value
+                .get("cache_len")
+                .and_then(json_u128)
+                .unwrap_or_default(),
+        );
+        self.max_path_len = self.max_path_len.max(
+            value
+                .get("path_cache_len")
+                .and_then(json_u128)
+                .unwrap_or_default(),
+        );
+        self.max_file_size_len = self.max_file_size_len.max(
+            value
+                .get("file_size_cache_len")
+                .and_then(json_u128)
+                .unwrap_or_default(),
+        );
+        self.max_capacity = self.max_capacity.max(
+            value
+                .get("cache_capacity")
+                .and_then(json_u128)
+                .unwrap_or_default(),
+        );
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.events += other.events;
+        self.hits += other.hits;
+        self.misses += other.misses;
+        self.inserts += other.inserts;
+        self.evictions += other.evictions;
+        self.oversized_skips += other.oversized_skips;
+        self.path_hits += other.path_hits;
+        self.path_misses += other.path_misses;
+        self.path_inserts += other.path_inserts;
+        self.path_evictions += other.path_evictions;
+        self.path_oversized_skips += other.path_oversized_skips;
+        self.file_size_hits += other.file_size_hits;
+        self.file_size_misses += other.file_size_misses;
+        self.file_size_inserts += other.file_size_inserts;
+        self.file_size_evictions += other.file_size_evictions;
+        self.max_len = self.max_len.max(other.max_len);
+        self.max_path_len = self.max_path_len.max(other.max_path_len);
+        self.max_file_size_len = self.max_file_size_len.max(other.max_file_size_len);
+        self.max_capacity = self.max_capacity.max(other.max_capacity);
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -7748,6 +7873,7 @@ struct TraceRequestAggregate {
     dht_provider_lookup_providers: u128,
     dht_provider_lookup_max_elapsed_ms: u128,
     dht_provider_lookup_max_timeout_ms: u128,
+    unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
 }
 
 #[derive(Debug, Serialize)]
@@ -7833,6 +7959,7 @@ struct TraceRequestBuilder {
     dht_provider_lookup_providers: u128,
     dht_provider_lookup_max_elapsed_ms: u128,
     dht_provider_lookup_max_timeout_ms: u128,
+    unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
 }
 
 #[derive(Default)]
@@ -7872,6 +7999,7 @@ struct TraceRequestPathBuilder {
     dht_provider_lookup_providers: u128,
     dht_provider_lookup_max_elapsed_ms: u128,
     dht_provider_lookup_max_timeout_ms: u128,
+    unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate,
     phase_latencies: BTreeMap<String, TraceRequestPathPhaseBuilder>,
 }
 
@@ -7976,6 +8104,8 @@ impl TraceRequestPathBuilder {
         self.dht_provider_lookup_max_timeout_ms = self
             .dht_provider_lookup_max_timeout_ms
             .max(request.dht_provider_lookup_max_timeout_ms);
+        self.unixfs_metadata_cache
+            .merge(&request.unixfs_metadata_cache);
         for phase in &request.phase_latencies {
             let builder = self.phase_latencies.entry(phase.phase.clone()).or_default();
             builder.count += phase.count;
@@ -8029,6 +8159,7 @@ impl TraceRequestPathBuilder {
             dht_provider_lookup_providers: self.dht_provider_lookup_providers,
             dht_provider_lookup_max_elapsed_ms: self.dht_provider_lookup_max_elapsed_ms,
             dht_provider_lookup_max_timeout_ms: self.dht_provider_lookup_max_timeout_ms,
+            unixfs_metadata_cache: self.unixfs_metadata_cache,
             phase_latencies: sorted_trace_request_path_phase_latencies(self.phase_latencies),
         }
     }
@@ -8084,6 +8215,7 @@ impl TraceRequestBuilder {
             dht_provider_lookup_providers: 0,
             dht_provider_lookup_max_elapsed_ms: 0,
             dht_provider_lookup_max_timeout_ms: 0,
+            unixfs_metadata_cache: TraceUnixfsMetadataCacheAggregate::default(),
         }
     }
 
@@ -8249,6 +8381,9 @@ impl TraceRequestBuilder {
                     *self.bitswap_source_transports.entry(transport).or_default() += 1;
                 }
             }
+        }
+        if phase == "unixfs_metadata_cache" {
+            self.unixfs_metadata_cache.record(value);
         }
         if phase == "bitswap_peer_expand" {
             let peer_count = value
@@ -8424,6 +8559,7 @@ impl TraceRequestBuilder {
             dht_provider_lookup_providers: self.dht_provider_lookup_providers,
             dht_provider_lookup_max_elapsed_ms: self.dht_provider_lookup_max_elapsed_ms,
             dht_provider_lookup_max_timeout_ms: self.dht_provider_lookup_max_timeout_ms,
+            unixfs_metadata_cache: self.unixfs_metadata_cache,
         }
     }
 }
@@ -8915,80 +9051,7 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 .max(elapsed_ms.unwrap_or_default());
         }
         if phase == "unixfs_metadata_cache" {
-            unixfs_metadata_cache.events += 1;
-            unixfs_metadata_cache.hits += value.get("hits").and_then(json_u128).unwrap_or_default();
-            unixfs_metadata_cache.misses +=
-                value.get("misses").and_then(json_u128).unwrap_or_default();
-            unixfs_metadata_cache.inserts +=
-                value.get("inserts").and_then(json_u128).unwrap_or_default();
-            unixfs_metadata_cache.evictions += value
-                .get("evictions")
-                .and_then(json_u128)
-                .unwrap_or_default();
-            unixfs_metadata_cache.oversized_skips += value
-                .get("oversized_skips")
-                .and_then(json_u128)
-                .unwrap_or_default();
-            unixfs_metadata_cache.path_hits += value
-                .get("path_hits")
-                .and_then(json_u128)
-                .unwrap_or_default();
-            unixfs_metadata_cache.path_misses += value
-                .get("path_misses")
-                .and_then(json_u128)
-                .unwrap_or_default();
-            unixfs_metadata_cache.path_inserts += value
-                .get("path_inserts")
-                .and_then(json_u128)
-                .unwrap_or_default();
-            unixfs_metadata_cache.path_evictions += value
-                .get("path_evictions")
-                .and_then(json_u128)
-                .unwrap_or_default();
-            unixfs_metadata_cache.path_oversized_skips += value
-                .get("path_oversized_skips")
-                .and_then(json_u128)
-                .unwrap_or_default();
-            unixfs_metadata_cache.file_size_hits += value
-                .get("file_size_hits")
-                .and_then(json_u128)
-                .unwrap_or_default();
-            unixfs_metadata_cache.file_size_misses += value
-                .get("file_size_misses")
-                .and_then(json_u128)
-                .unwrap_or_default();
-            unixfs_metadata_cache.file_size_inserts += value
-                .get("file_size_inserts")
-                .and_then(json_u128)
-                .unwrap_or_default();
-            unixfs_metadata_cache.file_size_evictions += value
-                .get("file_size_evictions")
-                .and_then(json_u128)
-                .unwrap_or_default();
-            unixfs_metadata_cache.max_len = unixfs_metadata_cache.max_len.max(
-                value
-                    .get("cache_len")
-                    .and_then(json_u128)
-                    .unwrap_or_default(),
-            );
-            unixfs_metadata_cache.max_path_len = unixfs_metadata_cache.max_path_len.max(
-                value
-                    .get("path_cache_len")
-                    .and_then(json_u128)
-                    .unwrap_or_default(),
-            );
-            unixfs_metadata_cache.max_file_size_len = unixfs_metadata_cache.max_file_size_len.max(
-                value
-                    .get("file_size_cache_len")
-                    .and_then(json_u128)
-                    .unwrap_or_default(),
-            );
-            unixfs_metadata_cache.max_capacity = unixfs_metadata_cache.max_capacity.max(
-                value
-                    .get("cache_capacity")
-                    .and_then(json_u128)
-                    .unwrap_or_default(),
-            );
+            unixfs_metadata_cache.record(&value);
         }
         let successful_bitswap_fetch =
             phase == "bitswap_fetch" && value.get("ok").and_then(|ok| ok.as_bool()) == Some(true);
@@ -10853,6 +10916,7 @@ fn format_request_source_details(request: &TraceRequestAggregate) -> String {
         && request.http_provider_fetches == 0
         && request.http_provider_fetch_providers.is_empty()
         && request.http_provider_fetch_error_classes.is_empty()
+        && !request.unixfs_metadata_cache.has_events()
     {
         return String::new();
     }
@@ -10872,8 +10936,9 @@ fn format_request_source_details(request: &TraceRequestAggregate) -> String {
         format_trace_counts(&request.http_provider_fetch_error_classes)
     };
     let http_milestones = format_request_http_milestones(request);
+    let unixfs_cache_details = format_trace_unixfs_cache_details(&request.unixfs_metadata_cache);
     format!(
-        " block_sources={} http_fetches={} ok={} fail={} http_elapsed={} http_providers={} http_errors={}{}",
+        " block_sources={} http_fetches={} ok={} fail={} http_elapsed={} http_providers={} http_errors={}{}{}",
         block_sources,
         request.http_provider_fetches,
         request.http_provider_fetch_successes,
@@ -10881,7 +10946,8 @@ fn format_request_source_details(request: &TraceRequestAggregate) -> String {
         request.http_provider_fetch_elapsed_ms,
         http_providers,
         http_errors,
-        http_milestones
+        http_milestones,
+        unixfs_cache_details
     )
 }
 
@@ -12366,6 +12432,7 @@ mod tests {
                 "{\"phase\":\"http_provider_fetch\",\"elapsed_ms\":40,\"cid\":\"cid-a\",\"provider\":\"https://provider-a.example\",\"ok\":true,\"response_bytes\":1024,\"response_first_chunk_seen\":true,\"response_headers_elapsed_ms\":10,\"response_first_chunk_elapsed_ms\":12,\"response_body_elapsed_ms\":38,\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":1,\"cid\":\"cid-b\",\"source\":\"cache\",\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"http_provider_fetch\",\"elapsed_ms\":120,\"cid\":\"cid-c\",\"provider\":\"https://provider-b.example\",\"ok\":false,\"error\":\"request timed out\",\"response_headers_elapsed_ms\":90,\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"unixfs_metadata_cache\",\"elapsed_ms\":0,\"hits\":1,\"misses\":2,\"inserts\":2,\"path_hits\":3,\"path_misses\":4,\"path_inserts\":4,\"file_size_hits\":5,\"file_size_misses\":6,\"file_size_inserts\":6,\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipns/site/app.js\",\"status\":200,\"elapsed_ms\":150,\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
             ),
         )
@@ -12432,6 +12499,10 @@ mod tests {
             trace_value_count(&request.http_provider_fetch_error_classes, "timeout"),
             1
         );
+        assert_eq!(request.unixfs_metadata_cache.events, 1);
+        assert_eq!(request.unixfs_metadata_cache.misses, 2);
+        assert_eq!(request.unixfs_metadata_cache.path_inserts, 4);
+        assert_eq!(request.unixfs_metadata_cache.file_size_misses, 6);
 
         assert_eq!(summary.request_paths.len(), 1);
         let request_path = &summary.request_paths[0];
@@ -12450,6 +12521,10 @@ mod tests {
         assert_eq!(request_path.http_provider_fetch_headers_max_ms, 90);
         assert_eq!(request_path.http_provider_fetch_first_chunk_max_ms, 12);
         assert_eq!(request_path.http_provider_fetch_body_max_ms, 38);
+        assert_eq!(request_path.unixfs_metadata_cache.events, 1);
+        assert_eq!(request_path.unixfs_metadata_cache.misses, 2);
+        assert_eq!(request_path.unixfs_metadata_cache.path_inserts, 4);
+        assert_eq!(request_path.unixfs_metadata_cache.file_size_misses, 6);
         assert_eq!(
             trace_value_count(
                 &request_path.http_provider_fetch_providers,
@@ -13826,6 +13901,7 @@ mod tests {
                 "{\"phase\":\"request_start\",\"request_id\":1,\"path\":\"/ipfs/root/app.js\",\"span\":{\"path\":\"/ipfs/root/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipfs/root\"}}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":80,\"cid\":\"cid-a\",\"source\":\"http_provider\",\"span\":{\"path\":\"/ipfs/root/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipfs/root\"}}\n",
                 "{\"phase\":\"http_provider_fetch\",\"elapsed_ms\":75,\"cid\":\"cid-a\",\"provider\":\"https://provider-a.example\",\"ok\":true,\"response_bytes\":2048,\"response_first_chunk_seen\":true,\"response_headers_elapsed_ms\":30,\"response_first_chunk_elapsed_ms\":35,\"response_body_elapsed_ms\":70,\"span\":{\"path\":\"/ipfs/root/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipfs/root\"}}\n",
+                "{\"phase\":\"unixfs_metadata_cache\",\"elapsed_ms\":0,\"hits\":2,\"misses\":1,\"inserts\":1,\"path_hits\":3,\"path_misses\":4,\"path_inserts\":4,\"file_size_hits\":5,\"file_size_misses\":6,\"file_size_inserts\":6,\"span\":{\"path\":\"/ipfs/root/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipfs/root\"}}\n",
                 "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipfs/root/app.js\",\"status\":200,\"elapsed_ms\":90,\"span\":{\"path\":\"/ipfs/root/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipfs/root\"}}\n",
             ),
         )
@@ -13896,6 +13972,10 @@ mod tests {
         assert_eq!(rust_trace.http_provider_fetch_headers_max_ms, 30);
         assert_eq!(rust_trace.http_provider_fetch_first_chunk_max_ms, 35);
         assert_eq!(rust_trace.http_provider_fetch_body_max_ms, 70);
+        assert_eq!(rust_trace.unixfs_metadata_cache.events, 1);
+        assert_eq!(rust_trace.unixfs_metadata_cache.hits, 2);
+        assert_eq!(rust_trace.unixfs_metadata_cache.path_misses, 4);
+        assert_eq!(rust_trace.unixfs_metadata_cache.file_size_inserts, 6);
     }
 
     #[test]
