@@ -46727,3 +46727,187 @@ slow shape: a zero-HTTP gateway subresource, no useful session peer, source peer
 with a slow scheduled IPv6/TCP address, and a suppressed IPv4/TCP alternate for
 that same peer. Do not generalize this into global IPv4-first ordering or a
 broad dial-address-cap increase; both families already have rejected evidence.
+
+## 2026-05-08: Current-Head Refresh - No Cold Subresource Kubo Gap Reproduced
+
+Branch/head: `codex/kubo-session-performance-20260506` at `7c51e00`.
+
+Purpose:
+
+After the zero-HTTP subresource IPv4-first lab remained disabled, rerun current
+same-window Rust-vs-Kubo baselines before trying another behavior change. The
+goal was to find a current, meaningful Kubo win rather than optimize against an
+old public-network window.
+
+Selected six-case baseline:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-developers-hero-range \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-selected-c6-r5-7c51e00-20260508T060350Z-trace.jsonl \
+  --comparison-output /tmp/current-selected-c6-r5-7c51e00-20260508T060350Z.json
+```
+
+Selected result:
+
+- Rust/Kubo passed all cases `5/5`.
+- DAICO root: Rust `302/373ms`; Kubo `2180/2264ms`.
+- Vitalik range root: Rust `102/151ms`; Kubo `2122/2441ms`.
+- `ipfs.tech` range root: Rust `728/1165ms`; Kubo `1012/1268ms`.
+- `ipfs.tech` page root: Rust `3/3ms`; Kubo `1/2ms`.
+- `ipfs.tech` assets: Rust `101/194ms`; Kubo `405/903ms`.
+- `ipfs.tech` developers hero range: Rust `95/151ms`; Kubo `377/451ms`.
+- Wikipedia root: Rust `625/766ms`; Kubo `698/746ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `61180KiB` RSS and `38` FDs vs Kubo `150892KiB`
+  RSS and `231` FDs.
+- Path-local asset comparison had only one Rust-negative p95 delta:
+  `/ipns/ipfs.tech/_nuxt/BRRQtYXV.js` at Rust/Kubo `489/462ms`, below the
+  meaningful-win threshold.
+- Trace shape still includes zero-HTTP top-level Bitswap work:
+  `zero_http_provider_bitswap=23`, `top_level_zero_http_provider_bitswap=10`,
+  `cold_bitswap_peer_expand=6`, but these did not produce a current Kubo win.
+
+Focused historical trouble-shape baseline:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-ipfs-tech-c1-r10-7c51e00-20260508T060626Z-trace.jsonl \
+  --comparison-output /tmp/current-ipfs-tech-c1-r10-7c51e00-20260508T060626Z.json
+```
+
+Focused result:
+
+- Rust/Kubo passed `10/10`.
+- `ipfs.tech` root: Rust `574/668ms`; Kubo `1327/5410ms`.
+- `ipfs.tech` assets: Rust `48/92ms`; Kubo `119/498ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `49024KiB` RSS and `20` FDs vs Kubo `356752KiB`
+  RSS and `750` FDs.
+- Trace shape:
+  - Bitswap blocks `340`, p50/p90/p95/max `44/72/103/287ms`.
+  - HTTP-provider blocks `10`, p50/p90/p95/max `243/268/290/290ms`.
+  - `zero_http_provider_bitswap=37`.
+  - `cold_bitswap_peer_expand=10`.
+  - session shortcut hits `330`.
+
+Broad positive opt-in suite:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-root-html-range \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-page-assets-cid-direct \
+  --case ipfs-tech-developers-hero-range \
+  --case ipfs-tech-developers-hero-middle-range \
+  --case ipfs-tech-developers-hero-suffix-range \
+  --case ipfs-tech-developers-hero-head \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-broad-positive-c6-r5-7c51e00-20260508T060847Z-trace.jsonl \
+  --comparison-output /tmp/current-broad-positive-c6-r5-7c51e00-20260508T060847Z.json
+```
+
+Broad result:
+
+- Rust/Kubo passed all cases `5/5`.
+- `ipfs.tech` page assets still strongly favored Rust: asset p50/p95
+  `104/195ms` vs Kubo `407/896ms`.
+- `ipfs.tech` CID-direct assets were essentially hot for both: Rust asset
+  `3/6ms` vs Kubo `2/6ms`.
+- Media range and HEAD cases were parity or Rust wins after the prefix range
+  warmed metadata/block state.
+- Wikipedia root favored Rust: `482/535ms` vs Kubo `691/740ms`.
+- Meaningful aggregate Kubo wins: only DAICO range-first then full-page root
+  metrics:
+  - DAICO follow-up full root TTFB `72/78ms` vs Kubo `1/3ms`.
+  - DAICO follow-up full root total `115/122ms` vs Kubo `3/5ms`.
+- Resource max: Rust `61584KiB` RSS and `38` FDs vs Kubo `152604KiB`
+  RSS and `153` FDs.
+
+DAICO classification:
+
+The broad-suite Kubo win is the already-known ordering artifact from the
+2026-05-07 HTML prefix range warm lab. In corpus order, `daicowtf-root-html-range`
+runs before `daicowtf-page-assets`. The first request is `bytes=0-256` on a
+`403507` byte HTML file. Rust fetches and caches the UnixFS metadata plus the
+first data block, then the immediate full-page follow-up still needs the second
+data block:
+
+- follow-up full-page trace has cached first block range hits;
+- it then fetches `bafkreibvhjyqywfmbw7srwl2673dxjt73ere2j4uyzhi2kojsjzql5g2ci`;
+- `gateway_stream_done` is around `61-75ms`;
+- Kubo appears to have already pulled enough file state during the prefix range,
+  making the follow-up full page effectively local.
+
+The existing disabled knob
+`FREEDOM_IPFS_GATEWAY_HTML_RANGE_WARM_MAX_BYTES=524288` already tested this
+family. It scheduled and completed range warms, but did not make the immediate
+next full-page request hot because the warm overlapped with that request, and it
+slightly worsened p50/p95 plus RSS. Do not promote or rework broad HTML prefix
+range warming unless a real user pause/delay case appears.
+
+Control for the user-like DAICO full-page path:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-daico-page-assets-only-r5-7c51e00-20260508T061221Z-trace.jsonl \
+  --comparison-output /tmp/current-daico-page-assets-only-r5-7c51e00-20260508T061221Z.json
+```
+
+Control result:
+
+- Rust/Kubo passed `5/5`.
+- DAICO full-page root: Rust `296/318ms`; Kubo `1216/2149ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `36364KiB` RSS and `14` FDs vs Kubo `101680KiB`
+  RSS and `59` FDs.
+
+Decision:
+
+Do not change behavior from this evidence. Current head does not reproduce a
+meaningful cold `ipfs.tech` asset/subresource Kubo gap, and the only broad-suite
+Kubo win is the previously rejected artificial range-first/full-read ordering.
+The next useful agent step is to broaden or extend the live search for a fresh
+real gap rather than promote one of the disabled lab controls.
