@@ -57,6 +57,8 @@ const SINGLE_HTTP_SELF_HEDGE_AFTER_MS_ENV: &str = "FREEDOM_IPFS_SINGLE_HTTP_SELF
 const SINGLE_HTTP_SELF_HEDGE_MIN_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_SELF_HEDGE_MIN_SCORE_MS";
 const ENABLE_SINGLE_HTTP_BITSWAP_HEDGE_ENV: &str = "FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE";
+const SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS_ENV: &str =
+    "FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS";
 const SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS";
 const ENABLE_SINGLE_HTTP_5XX_FAST_BITSWAP_FALLBACK_ENV: &str =
@@ -2631,7 +2633,8 @@ impl HttpRetriever {
             .boxed(),
         );
 
-        let hedge = tokio::time::sleep(SINGLE_HTTP_PROVIDER_BITSWAP_HEDGE_AFTER);
+        let bitswap_hedge_after = single_http_provider_bitswap_hedge_after();
+        let hedge = tokio::time::sleep(bitswap_hedge_after);
         tokio::pin!(hedge);
         let mut bitswap_started = false;
         let mut http_done = false;
@@ -5320,6 +5323,14 @@ fn single_http_provider_bitswap_hedge_enabled() -> bool {
     std::env::var_os(ENABLE_SINGLE_HTTP_BITSWAP_HEDGE_ENV).is_some()
 }
 
+fn single_http_provider_bitswap_hedge_after() -> Duration {
+    single_http_provider_bitswap_hedge_after_from_env_value(
+        std::env::var_os(SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS_ENV)
+            .as_ref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
 fn single_http_5xx_fast_bitswap_fallback_enabled() -> bool {
     std::env::var_os(ENABLE_SINGLE_HTTP_5XX_FAST_BITSWAP_FALLBACK_ENV).is_some()
 }
@@ -5771,6 +5782,13 @@ fn single_http_provider_bitswap_hedge_min_score() -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
+fn single_http_provider_bitswap_hedge_after_from_env_value(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(SINGLE_HTTP_PROVIDER_BITSWAP_HEDGE_AFTER)
+}
+
 fn bitswap_session_range_batch_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_SESSION_RANGE_BATCH_ENV).is_some()
 }
@@ -6154,7 +6172,7 @@ fn push_single_http_bitswap_hedge(
         phase = "http_provider_bitswap_hedge",
         cid = %cid,
         provider_count,
-        timeout_ms = SINGLE_HTTP_PROVIDER_BITSWAP_HEDGE_AFTER.as_millis(),
+        timeout_ms = single_http_provider_bitswap_hedge_after().as_millis(),
         reason,
         elapsed_ms = started.elapsed().as_millis()
     );
@@ -14717,6 +14735,26 @@ mod bitswap_tests {
                 BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE
             ),
             BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE
+        );
+    }
+
+    #[test]
+    fn single_http_bitswap_hedge_after_env_value_parses_override() {
+        assert_eq!(
+            single_http_provider_bitswap_hedge_after_from_env_value(None),
+            SINGLE_HTTP_PROVIDER_BITSWAP_HEDGE_AFTER
+        );
+        assert_eq!(
+            single_http_provider_bitswap_hedge_after_from_env_value(Some("500")),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            single_http_provider_bitswap_hedge_after_from_env_value(Some("0")),
+            Duration::from_millis(0)
+        );
+        assert_eq!(
+            single_http_provider_bitswap_hedge_after_from_env_value(Some("not-a-number")),
+            SINGLE_HTTP_PROVIDER_BITSWAP_HEDGE_AFTER
         );
     }
 
