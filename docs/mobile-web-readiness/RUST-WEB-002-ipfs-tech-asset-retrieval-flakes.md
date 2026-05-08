@@ -45005,3 +45005,43 @@ actionable gap is narrow and path-local:
 
 Prefer diagnostics or very scoped source-quality changes over global timeout,
 DNS, preconnect, or direct-WANT knobs.
+
+### Focused Path-Local CSS P95 Diagnosis
+
+After the no-env focused r10 above, inspect the only path-local Kubo win:
+
+`/ipns/ipfs.tech/_nuxt/index.CZYCeseQ.css`
+
+The comparison reported:
+
+- Rust p50/p95 TTFB/total: `71/232ms`;
+- Kubo p50/p95 TTFB/total: `50/175ms`;
+- delta: `57ms` at p95.
+
+Trace diagnosis for the slowest Rust sample:
+
+- The request was a two-block UnixFS path.
+- Parent/root directory block:
+  - provider lookup found `18` providers, `1` HTTP provider;
+  - the HTTP provider was `https://ipfs-bridge.sia.dev/`;
+  - the trusted Bitswap session shortcut won at `167ms`;
+  - the post-lookup race returned `bitswap_won` at `124ms` after provider
+    lookup.
+- CSS leaf block:
+  - provider lookup found `4` providers, `3` HTTP providers;
+  - `https://dag.w3s.link/` won in `37ms`;
+  - the whole visible request completed in `230ms`.
+
+Decision:
+
+Do not change behavior for this row. It is a small path-local p95 loss inside
+an aggregate Rust win (`ipfs.tech` assets `63/221ms` vs Kubo `175/692ms`) and
+the slow sample already uses the intended low-fanout race shape. Optimizing this
+specific row would likely mean either more speculative connection pressure or
+overriding a trusted session shortcut for a single-provider parent block, both
+of which previous guardrails rejected in broader forms.
+
+Use this as a regression watch item only. If it repeats as an aggregate loss in
+a future same-window run, investigate parent-directory source selection for
+single-HTTP-provider UnixFS parent blocks rather than changing global
+subresource scheduling.
