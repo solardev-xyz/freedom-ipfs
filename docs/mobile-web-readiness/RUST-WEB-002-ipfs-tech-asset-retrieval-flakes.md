@@ -43746,3 +43746,201 @@ families it does not solve:
   small `_nuxt` rows;
 - top-level zero-HTTP root blocks that still select late `WANT_HAVE` peers and
   can dominate root p50/p95 in some windows.
+
+## 2026-05-08: Single-HTTP Bitswap Hedge Retune, Budget 4 / 75ms / Score 300
+
+Branch/head: `codex/kubo-session-performance-20260506` at `b2bd75e`.
+
+Purpose:
+
+Revisit the disabled single-HTTP-provider Bitswap hedge with a more aggressive
+mobile-bounded shape. Earlier session-only hedging rarely fired because the slow
+single-provider rows often had no usable session peers, and the earlier broad
+budgeted probe (`max_per_top_level=2`, `after=200ms`,
+`min_score=180ms`) improved some medians but did not close the Kubo gap. This
+run kept the existing disabled lab path but changed the policy to:
+
+- per top-level page budget `4`;
+- hedge delay `75ms`;
+- only hedge previously scored single HTTP providers at or above `300ms`.
+
+Focused opt-in command:
+
+```sh
+timeout 1200s env FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MAX_PER_TOP_LEVEL=4 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS=300 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS=75 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/single-http-budget4-hedge75-score300-ipfs-tech-r5-20260508T022802Z-trace.jsonl \
+  --comparison-output /tmp/single-http-budget4-hedge75-score300-ipfs-tech-r5-20260508T022802Z.json
+```
+
+Focused opt-in result:
+
+- Rust/Kubo passed `5/5`.
+- Root: Rust `795/1246ms`; Kubo `1316/2086ms`.
+- Assets: Rust `112/284ms`; Kubo `108/454ms`.
+- `meaningful_kubo_wins`: none.
+- Resource max: Rust `61412KiB` RSS and `42` FDs vs Kubo `159312KiB`
+  RSS and `82` FDs.
+- Block fetches:
+  - Bitswap count `126`, p50/p90/p95/max `104/246/275/335ms`;
+  - HTTP provider count `72`, p50/p90/p95/max `85/266/314/870ms`.
+- The lab path fired, but narrowly:
+  - Bitswap hedge starts `4`;
+  - Bitswap hedge results `1`, with the HTTP provider still winning at
+    `178ms`;
+  - skip reasons:
+    `provider_score_below_threshold=72`,
+    `top_level_budget_exhausted=9`,
+    `provider_unscored=5`.
+- Single-provider HTTP race winners remained the slow side:
+  p50/p90/p95/max `192/390/757/757ms`.
+
+Immediate no-env focused post-control:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/single-http-budget4-hedge75-score300-post-control-ipfs-tech-r5-20260508T022859Z-trace.jsonl \
+  --comparison-output /tmp/single-http-budget4-hedge75-score300-post-control-ipfs-tech-r5-20260508T022859Z.json
+```
+
+Focused post-control result:
+
+- Rust/Kubo passed `5/5`.
+- Root: Rust `2068/2188ms`; Kubo `1560/3547ms`.
+- Assets: Rust `191/476ms`; Kubo `112/372ms`.
+- `meaningful_kubo_wins`: `6`, covering root p50 and asset p50/p95
+  TTFB/total.
+- Resource max: Rust `56572KiB` RSS and `33` FDs vs Kubo `258400KiB`
+  RSS and `375` FDs.
+- HTTP-provider fetch count jumped to `170`, with Sia dominant:
+  `https://ipfs-bridge.sia.dev/=100`,
+  `https://dag.w3s.link/=70`.
+- HTTP-provider fetch p50/p90/p95/max: `158/209/250/444ms`.
+- Bitswap count was only `5`, p50/p90/p95/max `1771/1797/1797/1797ms`.
+- Post-lookup races were all provider wins: `165` provider wins,
+  `0` Bitswap wins.
+
+The focused same-window comparison is a useful signal: the opt-in run erased
+the aggregate Kubo wins and cut `ipfs.tech` asset p95 from `476ms` to `284ms`.
+But it is not proof that the policy should be default. Only four hedges started
+and the only completed hedge result was still won by the HTTP provider; much of
+the apparent win may be cancellation and ordinary network variance.
+
+Multi-case opt-in guardrail:
+
+```sh
+timeout 1200s env FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MAX_PER_TOP_LEVEL=4 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS=300 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS=75 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --case ipfs-tech-page-assets \
+  --case vitalik-root-html-range \
+  --trace-output /tmp/single-http-budget4-hedge75-score300-guardrail-r5-20260508T023003Z-trace.jsonl \
+  --comparison-output /tmp/single-http-budget4-hedge75-score300-guardrail-r5-20260508T023003Z.json
+```
+
+Guardrail opt-in result:
+
+- Rust/Kubo passed `5/5`.
+- DAICO root: Rust `433/587ms`; Kubo `1203/2616ms`.
+- Vitalik range root: Rust `106/121ms`; Kubo `2691/3543ms`.
+- `ipfs.tech` root: Rust `565/763ms`; Kubo `808/1357ms`.
+- `ipfs.tech` assets: Rust `118/210ms`; Kubo `393/760ms`.
+- `meaningful_kubo_wins`: none.
+- Resource max: Rust `63804KiB` RSS and `33` FDs vs Kubo `178780KiB`
+  RSS and `127` FDs.
+- Bitswap block p50/p90/p95/max: `108/158/216/281ms`.
+- HTTP-provider block p50/p90/p95/max: `80/230/234/321ms`.
+- The configured hedge did **not** exercise:
+  - starts `0`;
+  - skips `115`;
+  - skip reasons:
+    `provider_score_below_threshold=105`, `provider_unscored=10`.
+
+Immediate no-env multi-case post-control:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --case ipfs-tech-page-assets \
+  --case vitalik-root-html-range \
+  --trace-output /tmp/single-http-budget4-hedge75-score300-guardrail-post-control-r5-20260508T023346Z-trace.jsonl \
+  --comparison-output /tmp/single-http-budget4-hedge75-score300-guardrail-post-control-r5-20260508T023346Z.json
+```
+
+Guardrail post-control result:
+
+- Rust/Kubo passed `5/5`.
+- DAICO root: Rust `439/453ms`; Kubo `1205/2458ms`.
+- Vitalik range root: Rust `101/110ms`; Kubo `3093/4406ms`.
+- `ipfs.tech` root: Rust `613/753ms`; Kubo `1142/1474ms`.
+- `ipfs.tech` assets: Rust `118/375ms`; Kubo `338/878ms`.
+- `meaningful_kubo_wins`: none.
+- Resource max: Rust `59400KiB` RSS and `38` FDs vs Kubo `214308KiB`
+  RSS and `144` FDs.
+- Bitswap block p50/p90/p95/max: `112/228/329/378ms`.
+- HTTP-provider block p50/p90/p95/max: `86/231/242/259ms`.
+
+Decision:
+
+Do **not** promote this policy yet.
+
+The focused run is a legitimate lead because it improved the exact
+single-provider/Sia window where Kubo had just won. But the broad guardrail did
+not actually start any hedges, and the immediate no-env guardrail also beat
+Kubo on the tracked aggregate metrics. The current branch is already strong in
+many same-window samples; a default change needs evidence from a guardrail that
+both exercises the hedge path and preserves the RSS/FD advantage.
+
+Next lead:
+
+Continue from this disabled lab, but retune for actual exercise before judging
+promotion:
+
+- try the same `75ms` hedge delay and budget `4` with a lower score threshold
+  such as `180ms` or `220ms`;
+- require a guardrail where hedges start on slow single-provider rows, not only
+  skips;
+- watch for RSS/FD growth, duplicate Bitswap traffic, and whether Bitswap ever
+  wins enough hedges to justify default fanout;
+- keep the path disabled/env-gated unless a same-window multi-case control shows
+  clear aggregate improvement and no resource regression.
