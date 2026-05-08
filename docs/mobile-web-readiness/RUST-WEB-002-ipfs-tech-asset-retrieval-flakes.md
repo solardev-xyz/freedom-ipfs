@@ -46301,3 +46301,222 @@ self-hedge still lost to the initial request, and the cancelled duplicate was
 still waiting for headers. The remaining HTTP-provider work should focus on
 source/provider selection and avoiding slow single-provider rows, not increasing
 duplicate same-provider pressure blindly.
+
+## 2026-05-08: Keep Lab Control - Top-Level Single-HTTP Bitswap Hedge Seed
+
+Branch/head before patch: `codex/kubo-session-performance-20260506` at
+`fc3d48f`.
+
+Hypothesis:
+
+The latest focused baseline reopened the single-provider `ipfs.tech` asset
+median gap, but in an all-HTTP shape rather than the previous zero-HTTP
+Bitswap shape. The no-env control had `0` zero-HTTP delegated results, all
+`175` block fetches came from HTTP providers, and the slow side was
+single-provider `https://ipfs-bridge.sia.dev/` rows. Kubo was much faster on
+assets, likely because it seeded a Bitswap session/source that Rust never got in
+that all-HTTP window.
+
+The existing disabled page-budgeted single-HTTP Bitswap hedge only spends its
+budget on gateway subresources. Add a default-neutral lab flag so the same
+budget can include the top-level gateway request. This lets future runs test
+whether the root request can cheaply seed a same-page Bitswap peer before
+subresources arrive, without promoting the old broad hedge.
+
+Change:
+
+- Added disabled lab flag
+  `FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_INCLUDE_TOP_LEVEL=1`.
+- It has no effect unless the existing disabled hedge is also enabled with
+  `FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1` and a page budget is set
+  with `FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MAX_PER_TOP_LEVEL=<n>`.
+- Default behavior is unchanged: budgeted single-HTTP hedges still apply only to
+  gateway subresources.
+- When enabled, top-level and subresource requests share the same
+  top-level-path budget, so the top-level seed cannot create unbounded fanout.
+- Added trace field `include_top_level` to the budget/skip events.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval single_http_bitswap_hedge --lib -- --nocapture
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Result:
+
+- Formatting passed.
+- Focused retrieval tests passed: `5` passed.
+- Retrieval all-target check passed.
+- Retrieval all-target clippy passed with `-D warnings`.
+
+Fresh no-env all-HTTP baseline:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-fc3d48f-ipfs-tech-r5-20260508Tbaseline-trace.jsonl \
+  --comparison-output /tmp/current-fc3d48f-ipfs-tech-r5-20260508Tbaseline.json
+```
+
+Baseline result:
+
+- Rust/Kubo passed `5/5`.
+- Root: Rust p50/p95 `546/1157ms`; Kubo `1376/3092ms`.
+- Assets: Rust p50/p95 `185/341ms`; Kubo `64/159ms`.
+- Meaningful aggregate Kubo wins: `4`, all asset p50/p95 TTFB/total.
+- Resource max: Rust `43696KiB` RSS and `16` FDs vs Kubo `168480KiB`
+  RSS and `155` FDs.
+- Trace shape:
+  - block fetch totals: HTTP provider `175`, Bitswap `0`;
+  - delegated provider results: zero HTTP `0`, single HTTP `105`,
+    multi HTTP `70`;
+  - single-provider Sia winner p50/p90/p95/max `164/258/311/772ms`;
+  - HTTP candidate cancellations `87`, mostly still `waiting_headers`.
+
+Existing immediate subresource-only hedge probe, before this patch:
+
+```sh
+timeout 1800s env \
+  FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MAX_PER_TOP_LEVEL=4 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS=180 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS=0 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --repeat 5 \
+    --asset-concurrency 1 \
+    --timeout-secs 120 \
+    --run-timeout-secs 300 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/single-http-budget4-hedge0-score180-ipfs-tech-c1-r5-fc3d48f-20260508Tprobe-trace.jsonl \
+    --comparison-output /tmp/single-http-budget4-hedge0-score180-ipfs-tech-c1-r5-fc3d48f-20260508Tprobe.json
+```
+
+Probe result:
+
+- Rust/Kubo passed `5/5`.
+- Root: Rust `681/1080ms`; Kubo `1363/4263ms`.
+- Assets: Rust `50/204ms`; Kubo `77/294ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `51664KiB` RSS and `29` FDs vs Kubo `279044KiB`
+  RSS and `625` FDs.
+- Trace:
+  - block fetch totals moved to Bitswap `136` and HTTP provider `39`;
+  - Bitswap hedge starts `20`, but completed hedge results were still
+    `http_provider=8`;
+  - the actual asset win came from session shortcut reuse:
+    post-lookup races had `bitswap_won=104`;
+  - Bitswap peer attempts `186`, connections established `10`.
+
+Immediate no-env post-control:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/single-http-budget4-hedge0-score180-ipfs-tech-c1-postcontrol-r5-fc3d48f-20260508Tprobe-trace.jsonl \
+  --comparison-output /tmp/single-http-budget4-hedge0-score180-ipfs-tech-c1-postcontrol-r5-fc3d48f-20260508Tprobe.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `5/5`.
+- Root: Rust `626/1247ms`; Kubo `1255/3726ms`.
+- Assets: Rust `49/98ms`; Kubo `92/359ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `49836KiB` RSS and `18` FDs vs Kubo `282636KiB`
+  RSS and `538` FDs.
+- Trace:
+  - block fetch totals: Bitswap `170`, HTTP provider `5`;
+  - delegated provider results now included zero HTTP `9`;
+  - the default session shortcut had `shortcut_hits=165` and
+    post-lookup `bitswap_won=124`.
+
+This post-control means the subresource-only immediate hedge probe was
+inconclusive as a promotion signal. The public-provider window changed from
+all-HTTP to zero-HTTP/session-seeded, and the default code won once it had a
+good Bitswap source.
+
+New top-level include smoke:
+
+```sh
+timeout 1200s env \
+  FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_INCLUDE_TOP_LEVEL=1 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MAX_PER_TOP_LEVEL=4 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS=180 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS=0 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --repeat 3 \
+    --asset-concurrency 1 \
+    --timeout-secs 120 \
+    --run-timeout-secs 300 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/single-http-include-top-level-hedge0-score180-ipfs-tech-c1-r3-fc3d48f-wip-20260508Tsmoke-trace.jsonl \
+    --comparison-output /tmp/single-http-include-top-level-hedge0-score180-ipfs-tech-c1-r3-fc3d48f-wip-20260508Tsmoke.json
+```
+
+Smoke result:
+
+- Rust/Kubo passed `3/3`.
+- Root: Rust `761/1285ms`; Kubo `2633/2797ms`.
+- Assets: Rust `86/250ms`; Kubo `107/537ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `51328KiB` RSS and `30` FDs vs Kubo `202776KiB`
+  RSS and `165` FDs.
+- The new lab path exercised:
+  - Bitswap hedge starts `10`;
+  - result sources `http_provider=9`, `bitswap=2`;
+  - skip reasons:
+    `provider_score_below_threshold=20`, `top_level_budget_exhausted=19`,
+    `provider_unscored=3`;
+  - Bitswap peer attempts were bounded at `95`;
+  - Bitswap connections established `12`.
+- The same run still had zero-HTTP and cold Bitswap tails, including
+  `_nuxt/hfYlCurB.js` at `988ms`, so this is not promotion evidence.
+
+Decision:
+
+Keep the top-level include switch as a disabled lab control. Do **not** promote
+any immediate single-HTTP Bitswap hedge default yet. The useful learning is that
+when a good Bitswap source is seeded, same-page session shortcuts can make Rust
+materially faster than Kubo on assets while staying far lighter. The unresolved
+case is how to seed that source in all-HTTP windows without repeating the broad
+preconnect/direct-WANT fanout regressions.
+
+Next lead:
+
+Use this new flag only for controlled all-HTTP windows. A promotion candidate
+would need a same-window guardrail where:
+
+- the no-env control shows the all-HTTP/Sia asset gap again;
+- the top-level include path actually starts hedges and gets Bitswap wins or
+  earlier session-peer records;
+- assets improve without root regression;
+- RSS, FDs, Bitswap attempts, expanded provider addrs, and connections stay
+  near current mobile-friendly levels.

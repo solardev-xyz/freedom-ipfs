@@ -63,6 +63,8 @@ const SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS";
 const SINGLE_HTTP_BITSWAP_HEDGE_MAX_PER_TOP_LEVEL_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MAX_PER_TOP_LEVEL";
+const SINGLE_HTTP_BITSWAP_HEDGE_INCLUDE_TOP_LEVEL_ENV: &str =
+    "FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_INCLUDE_TOP_LEVEL";
 const ENABLE_SINGLE_HTTP_SESSION_BITSWAP_HEDGE_ENV: &str =
     "FREEDOM_IPFS_ENABLE_SINGLE_HTTP_SESSION_BITSWAP_HEDGE";
 const ENABLE_SINGLE_HTTP_5XX_FAST_BITSWAP_FALLBACK_ENV: &str =
@@ -1876,13 +1878,15 @@ impl HttpRetriever {
             );
             return false;
         };
-        if !context.gateway_subresource() {
+        let include_top_level = single_http_provider_bitswap_hedge_include_top_level();
+        if !single_http_provider_bitswap_hedge_context_allows(context, include_top_level) {
             tracing::info!(
                 phase = "http_provider_bitswap_hedge_skip",
                 cid = %cid,
                 provider = %provider,
                 reason = "budget_non_subresource",
-                max_per_top_level
+                max_per_top_level,
+                include_top_level
             );
             return false;
         }
@@ -1916,7 +1920,8 @@ impl HttpRetriever {
             provider = %provider,
             top_level_path = %top_level_path,
             used_count,
-            max_per_top_level
+            max_per_top_level,
+            include_top_level
         );
         true
     }
@@ -6386,6 +6391,27 @@ fn single_http_provider_bitswap_hedge_max_per_top_level_from_env_value(
     value
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
+}
+
+fn single_http_provider_bitswap_hedge_include_top_level() -> bool {
+    single_http_provider_bitswap_hedge_include_top_level_from_env_value(
+        std::env::var_os(SINGLE_HTTP_BITSWAP_HEDGE_INCLUDE_TOP_LEVEL_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn single_http_provider_bitswap_hedge_include_top_level_from_env_value(
+    value: Option<&str>,
+) -> bool {
+    value.is_some()
+}
+
+fn single_http_provider_bitswap_hedge_context_allows(
+    context: &RetrievalRequestContext,
+    include_top_level: bool,
+) -> bool {
+    context.gateway_subresource() || include_top_level
 }
 
 fn single_http_provider_bitswap_hedge_after_from_env_value(value: Option<&str>) -> Duration {
@@ -14407,6 +14433,36 @@ mod bitswap_tests {
             single_http_provider_bitswap_hedge_max_per_top_level_from_env_value(Some("2")),
             Some(2)
         );
+    }
+
+    #[test]
+    fn single_http_bitswap_hedge_top_level_include_flag_is_presence_based() {
+        assert!(!single_http_provider_bitswap_hedge_include_top_level_from_env_value(None));
+        assert!(single_http_provider_bitswap_hedge_include_top_level_from_env_value(Some("1")));
+        assert!(single_http_provider_bitswap_hedge_include_top_level_from_env_value(Some("0")));
+    }
+
+    #[test]
+    fn single_http_bitswap_hedge_budget_context_requires_subresource_by_default() {
+        let top_level = RetrievalRequestContext::gateway_request_with_top_level(
+            None,
+            Some("/ipns/site/".to_string()),
+        );
+        let subresource = RetrievalRequestContext::gateway_request_with_top_level(
+            Some(1),
+            Some("/ipns/site/".to_string()),
+        );
+
+        assert!(!single_http_provider_bitswap_hedge_context_allows(
+            &top_level, false
+        ));
+        assert!(single_http_provider_bitswap_hedge_context_allows(
+            &subresource,
+            false
+        ));
+        assert!(single_http_provider_bitswap_hedge_context_allows(
+            &top_level, true
+        ));
     }
 
     #[tokio::test]
