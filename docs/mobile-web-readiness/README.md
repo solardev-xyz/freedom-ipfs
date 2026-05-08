@@ -257,6 +257,11 @@ For page-asset session tuning, the disabled lab knob
 overrides the single-HTTP post-lookup Bitswap session grace only for gateway
 subresources. Top-level requests and non-single-HTTP provider sets keep the
 normal grace unless their existing width-specific overrides are set.
+For top-level zero-HTTP root-tail experiments, the disabled lab knob
+`FREEDOM_IPFS_ENABLE_ZERO_HTTP_TOP_LEVEL_DIRECT_WANT_BLOCK=1` forces a bounded
+direct `WANT_BLOCK` budget only for gateway top-level requests; tune the budget
+with `FREEDOM_IPFS_ZERO_HTTP_TOP_LEVEL_DIRECT_WANT_BLOCK_PEERS`. Subresources
+and non-gateway reads keep the normal zero-HTTP peer-selection behavior.
 
 The harness can also spawn Kubo as a comparison engine when a Kubo `ipfs`
 binary is available:

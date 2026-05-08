@@ -47365,3 +47365,180 @@ Next follow-up:
   the same slow root/path CID cluster despite the aggregate win;
 - keep top-level zero-HTTP root `WANT_HAVE` as a separate candidate, not a
   reason to reject this subresource-only lab.
+
+## 2026-05-08: Keep Lab Control - Top-Level Zero-HTTP Direct WANT_BLOCK
+
+Branch/head before change:
+
+- `codex/kubo-session-performance-20260506`
+- `0a8ce43`
+
+Hypothesis:
+
+The immediate no-env control from the previous subresource-grace lab reproduced
+the top-level `/ipns/ipfs.tech/` zero-HTTP root tail: the directory root block
+arrived from the single HTTP provider, then the `/index.html` leaf CID had no
+HTTP providers and sometimes fell through to candidate index `4` in
+`want_have` mode. The existing global zero-HTTP direct-WANT controls are too
+blunt because they also affect subresources. Add a narrower default-off lab
+switch that only forces direct `WANT_BLOCK` for zero-HTTP top-level gateway
+requests.
+
+Change:
+
+- Added disabled lab flag
+  `FREEDOM_IPFS_ENABLE_ZERO_HTTP_TOP_LEVEL_DIRECT_WANT_BLOCK=1`.
+- Added override
+  `FREEDOM_IPFS_ZERO_HTTP_TOP_LEVEL_DIRECT_WANT_BLOCK_PEERS=<n>`, defaulting to
+  `5` peers when the lab flag is enabled.
+- The lab applies only when retrieval context is a gateway top-level request
+  and provider lookup returned zero HTTP providers.
+- Gateway subresources, non-gateway reads, non-zero-HTTP provider sets, and
+  default no-env behavior are unchanged.
+- `bitswap_peer_expand` now also traces `gateway_request`, so top-level versus
+  subresource scope can be audited alongside `gateway_subresource`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval zero_http_direct --lib -- --nocapture
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo test -p freedom-ipfs-retrieval --lib -- --nocapture
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Result:
+
+- Formatting passed after applying `cargo fmt --all`.
+- Focused zero-HTTP/direct parser tests passed: `2` passed.
+- Retrieval all-target check passed.
+- Full retrieval lib tests passed: `156` passed, `1` ignored.
+- Retrieval all-target clippy passed with `-D warnings`.
+
+Opt-in command:
+
+```sh
+timeout 2400s env \
+  FREEDOM_IPFS_ENABLE_ZERO_HTTP_TOP_LEVEL_DIRECT_WANT_BLOCK=1 \
+  FREEDOM_IPFS_ZERO_HTTP_TOP_LEVEL_DIRECT_WANT_BLOCK_PEERS=5 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --repeat 10 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 300 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/top-level-zero-http-direct5-ipfs-tech-c6-r10-0a8ce43-dirty-20260508Tnext-trace.jsonl \
+    --comparison-output /tmp/top-level-zero-http-direct5-ipfs-tech-c6-r10-0a8ce43-dirty-20260508Tnext.json
+```
+
+Opt-in result:
+
+- Rust/Kubo passed `10/10`.
+- Root: Rust `677/1272ms`; Kubo `1757/1945ms`.
+- Assets: Rust `124/293ms`; Kubo `190/453ms`.
+- Case-level `meaningful_kubo_wins`: none.
+- Resource max: Rust `58216KiB` RSS and `40` FDs vs Kubo `184412KiB`
+  RSS and `213` FDs.
+- Top-level zero-HTTP root classifications:
+  - requests `10`;
+  - elapsed p50/p90/p95/max `674/917/1269/1269ms`;
+  - source candidate indexes `0=10`;
+  - source request modes `want_block=10`.
+- The lab marked `50` direct-WANT peer attempts across the ten top-level root
+  zero-HTTP expansions. It did not mark subresource expansions.
+- `bitswap_want_have_probe` events fell to `1`, and that event was not from the
+  top-level root source.
+
+Immediate no-env post-control command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/top-level-zero-http-direct5-postcontrol-ipfs-tech-c6-r10-0a8ce43-dirty-20260508Tnext-trace.jsonl \
+  --comparison-output /tmp/top-level-zero-http-direct5-postcontrol-ipfs-tech-c6-r10-0a8ce43-dirty-20260508Tnext.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `10/10`.
+- Root: Rust `617/2475ms`; Kubo `1763/4108ms`.
+- Assets: Rust `122/355ms`; Kubo `196/518ms`.
+- Case-level `meaningful_kubo_wins`: none.
+- Resource max: Rust `57660KiB` RSS and `39` FDs vs Kubo `245004KiB`
+  RSS and `263` FDs.
+- Top-level zero-HTTP root classifications:
+  - requests `10`;
+  - elapsed p50/p90/p95/max `613/2169/2472/2472ms`;
+  - source candidate indexes `0=7`, `4=3`;
+  - source request modes `want_block=7`, `want_have=3`.
+- `bitswap_want_have_probe` events were `7`, all timeout-fallback rows, with
+  candidate indexes `4=4` and `3=3`.
+
+Opt-in guardrail command:
+
+```sh
+timeout 3000s env \
+  FREEDOM_IPFS_ENABLE_ZERO_HTTP_TOP_LEVEL_DIRECT_WANT_BLOCK=1 \
+  FREEDOM_IPFS_ZERO_HTTP_TOP_LEVEL_DIRECT_WANT_BLOCK_PEERS=5 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case daicowtf-page-assets \
+    --case ipfs-tech-page-assets \
+    --case vitalik-root-html-range \
+    --repeat 5 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 300 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/top-level-zero-http-direct5-guardrail-r5-0a8ce43-dirty-20260508Tnext-trace.jsonl \
+    --comparison-output /tmp/top-level-zero-http-direct5-guardrail-r5-0a8ce43-dirty-20260508Tnext.json
+```
+
+Guardrail result:
+
+- Rust/Kubo passed `5/5` for DAICO, Vitalik, and `ipfs.tech`.
+- DAICO root: Rust `289/350ms`; Kubo `2185/2293ms`.
+- Vitalik range/root: Rust `97/113ms`; Kubo `2152/2238ms`.
+- `ipfs.tech` root: Rust `675/926ms`; Kubo `732/843ms`.
+- `ipfs.tech` assets: Rust `114/201ms`; Kubo `367/747ms`.
+- Case-level `meaningful_kubo_wins`: none.
+- Resource max: Rust `62832KiB` RSS and `37` FDs vs Kubo `130372KiB`
+  RSS and `126` FDs.
+- Top-level zero-HTTP root classifications:
+  - requests `5`;
+  - elapsed p50/p90/p95/max `673/923/923/923ms`;
+  - source candidate indexes `0=5`;
+  - source request modes `want_block=5`.
+
+Decision:
+
+Keep the top-level-only direct-WANT switch as a disabled lab control. The A/B
+pair strongly supports the mechanism in this public-network window: the opt-in
+removed the top-level root candidate-index-4 `want_have` tail, cut Rust root
+p95 from `2475ms` to `1272ms`, improved aggregate asset p95 from `355ms` to
+`293ms`, and kept the resource profile far below Kubo.
+
+Do **not** promote it as a default yet. This is still a static direct-WANT peer
+count, and prior global/static direct-WANT experiments showed that fixed fanout
+can regress other windows. The small opt-in guardrail did not show an obvious
+resource or case-level regression, but `ipfs.tech` root p95 remained close to
+Kubo in that five-run window, so the next step should run a larger selected
+multi-case guardrail and, if it keeps winning, investigate an adaptive promotion
+rule such as enabling the top-level direct budget only when the provider set has
+repeated late `want_have` root tails or when earlier direct candidates are stuck
+in connection setup.
