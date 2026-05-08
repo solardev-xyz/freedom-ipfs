@@ -1751,6 +1751,7 @@ fn format_comparison_asset_trace_details(trace: Option<&TraceRequestPathAggregat
     } else {
         format_trace_counts(&trace.http_provider_fetch_providers)
     };
+    let http_milestones = format_trace_path_http_milestones(trace);
     let phases = if trace.phase_latencies.is_empty() {
         "-".to_string()
     } else {
@@ -1794,7 +1795,7 @@ fn format_comparison_asset_trace_details(trace: Option<&TraceRequestPathAggregat
     };
     let dht_details = format_trace_path_dht_details(trace);
     format!(
-        " rust_trace=requests={} elapsed={} max_event={}ms statuses={} classifications={} block_sources={} http_fetches={} ok={} fail={} http_max={}ms http_providers={} phases={}{}{}",
+        " rust_trace=requests={} elapsed={} max_event={}ms statuses={} classifications={} block_sources={} http_fetches={} ok={} fail={} http_max={}ms http_providers={}{} phases={}{}{}",
         trace.request_count,
         trace.request_elapsed_ms,
         trace.max_event_ms,
@@ -1806,9 +1807,29 @@ fn format_comparison_asset_trace_details(trace: Option<&TraceRequestPathAggregat
         trace.http_provider_fetch_failures,
         trace.http_provider_fetch_max_ms,
         http_providers,
+        http_milestones,
         phases,
         bitswap_details,
         dht_details
+    )
+}
+
+fn format_trace_path_http_milestones(trace: &TraceRequestPathAggregate) -> String {
+    if trace.http_provider_fetch_response_bytes == 0
+        && trace.http_provider_fetch_first_chunk_events == 0
+        && trace.http_provider_fetch_headers_max_ms == 0
+        && trace.http_provider_fetch_first_chunk_max_ms == 0
+        && trace.http_provider_fetch_body_max_ms == 0
+    {
+        return String::new();
+    }
+    format!(
+        " http_response_bytes={} http_first_chunks={} http_header_max={}ms http_first_chunk_max={}ms http_body_max={}ms",
+        trace.http_provider_fetch_response_bytes,
+        trace.http_provider_fetch_first_chunk_events,
+        trace.http_provider_fetch_headers_max_ms,
+        trace.http_provider_fetch_first_chunk_max_ms,
+        trace.http_provider_fetch_body_max_ms
     )
 }
 
@@ -6142,6 +6163,11 @@ struct TraceRequestPathAggregate {
     http_provider_fetch_successes: usize,
     http_provider_fetch_failures: usize,
     http_provider_fetch_max_ms: u128,
+    http_provider_fetch_response_bytes: u128,
+    http_provider_fetch_first_chunk_events: usize,
+    http_provider_fetch_headers_max_ms: u128,
+    http_provider_fetch_first_chunk_max_ms: u128,
+    http_provider_fetch_body_max_ms: u128,
     http_provider_fetch_providers: Vec<TraceValueCount>,
     http_provider_fetch_error_classes: Vec<TraceValueCount>,
     bitswap_source_candidate_indexes: Vec<TraceValueCount>,
@@ -7682,6 +7708,11 @@ struct TraceRequestAggregate {
     http_provider_fetch_successes: usize,
     http_provider_fetch_failures: usize,
     http_provider_fetch_elapsed_ms: LatencySummary,
+    http_provider_fetch_response_bytes: u128,
+    http_provider_fetch_first_chunk_events: usize,
+    http_provider_fetch_headers_elapsed_ms: LatencySummary,
+    http_provider_fetch_first_chunk_elapsed_ms: LatencySummary,
+    http_provider_fetch_body_elapsed_ms: LatencySummary,
     http_provider_fetch_providers: Vec<TraceValueCount>,
     http_provider_fetch_error_classes: Vec<TraceValueCount>,
     bitswap_source_candidate_indexes: Vec<TraceValueCount>,
@@ -7760,6 +7791,11 @@ struct TraceRequestBuilder {
     http_provider_fetch_successes: usize,
     http_provider_fetch_failures: usize,
     http_provider_fetch_elapsed_values: Vec<u128>,
+    http_provider_fetch_response_bytes: u128,
+    http_provider_fetch_first_chunk_events: usize,
+    http_provider_fetch_headers_elapsed_values: Vec<u128>,
+    http_provider_fetch_first_chunk_elapsed_values: Vec<u128>,
+    http_provider_fetch_body_elapsed_values: Vec<u128>,
     http_provider_fetch_providers: BTreeMap<String, usize>,
     http_provider_fetch_error_classes: BTreeMap<String, usize>,
     bitswap_source_candidate_indexes: BTreeMap<String, usize>,
@@ -7796,6 +7832,11 @@ struct TraceRequestPathBuilder {
     http_provider_fetch_successes: usize,
     http_provider_fetch_failures: usize,
     http_provider_fetch_max_ms: u128,
+    http_provider_fetch_response_bytes: u128,
+    http_provider_fetch_first_chunk_events: usize,
+    http_provider_fetch_headers_max_ms: u128,
+    http_provider_fetch_first_chunk_max_ms: u128,
+    http_provider_fetch_body_max_ms: u128,
     http_provider_fetch_providers: BTreeMap<String, usize>,
     http_provider_fetch_error_classes: BTreeMap<String, usize>,
     bitswap_source_candidate_indexes: BTreeMap<String, usize>,
@@ -7839,9 +7880,31 @@ impl TraceRequestPathBuilder {
         self.http_provider_fetches += request.http_provider_fetches;
         self.http_provider_fetch_successes += request.http_provider_fetch_successes;
         self.http_provider_fetch_failures += request.http_provider_fetch_failures;
+        self.http_provider_fetch_response_bytes += request.http_provider_fetch_response_bytes;
+        self.http_provider_fetch_first_chunk_events +=
+            request.http_provider_fetch_first_chunk_events;
         self.http_provider_fetch_max_ms = self.http_provider_fetch_max_ms.max(
             request
                 .http_provider_fetch_elapsed_ms
+                .max_ms
+                .unwrap_or_default(),
+        );
+        self.http_provider_fetch_headers_max_ms = self.http_provider_fetch_headers_max_ms.max(
+            request
+                .http_provider_fetch_headers_elapsed_ms
+                .max_ms
+                .unwrap_or_default(),
+        );
+        self.http_provider_fetch_first_chunk_max_ms =
+            self.http_provider_fetch_first_chunk_max_ms.max(
+                request
+                    .http_provider_fetch_first_chunk_elapsed_ms
+                    .max_ms
+                    .unwrap_or_default(),
+            );
+        self.http_provider_fetch_body_max_ms = self.http_provider_fetch_body_max_ms.max(
+            request
+                .http_provider_fetch_body_elapsed_ms
                 .max_ms
                 .unwrap_or_default(),
         );
@@ -7912,6 +7975,11 @@ impl TraceRequestPathBuilder {
             http_provider_fetch_successes: self.http_provider_fetch_successes,
             http_provider_fetch_failures: self.http_provider_fetch_failures,
             http_provider_fetch_max_ms: self.http_provider_fetch_max_ms,
+            http_provider_fetch_response_bytes: self.http_provider_fetch_response_bytes,
+            http_provider_fetch_first_chunk_events: self.http_provider_fetch_first_chunk_events,
+            http_provider_fetch_headers_max_ms: self.http_provider_fetch_headers_max_ms,
+            http_provider_fetch_first_chunk_max_ms: self.http_provider_fetch_first_chunk_max_ms,
+            http_provider_fetch_body_max_ms: self.http_provider_fetch_body_max_ms,
             http_provider_fetch_providers: sorted_trace_counts(self.http_provider_fetch_providers),
             http_provider_fetch_error_classes: sorted_trace_counts(
                 self.http_provider_fetch_error_classes,
@@ -7960,6 +8028,11 @@ impl TraceRequestBuilder {
             http_provider_fetch_successes: 0,
             http_provider_fetch_failures: 0,
             http_provider_fetch_elapsed_values: Vec::new(),
+            http_provider_fetch_response_bytes: 0,
+            http_provider_fetch_first_chunk_events: 0,
+            http_provider_fetch_headers_elapsed_values: Vec::new(),
+            http_provider_fetch_first_chunk_elapsed_values: Vec::new(),
+            http_provider_fetch_body_elapsed_values: Vec::new(),
             http_provider_fetch_providers: BTreeMap::new(),
             http_provider_fetch_error_classes: BTreeMap::new(),
             bitswap_source_candidate_indexes: BTreeMap::new(),
@@ -8070,8 +8143,37 @@ impl TraceRequestBuilder {
                 Some(false) => self.http_provider_fetch_failures += 1,
                 None => {}
             }
+            self.http_provider_fetch_response_bytes += value
+                .get("response_bytes")
+                .and_then(json_u128)
+                .unwrap_or_default();
+            if value
+                .get("response_first_chunk_seen")
+                .and_then(|seen| seen.as_bool())
+                == Some(true)
+            {
+                self.http_provider_fetch_first_chunk_events += 1;
+            }
             if let Some(elapsed_ms) = elapsed_ms {
                 self.http_provider_fetch_elapsed_values.push(elapsed_ms);
+            }
+            if let Some(headers_elapsed_ms) =
+                value.get("response_headers_elapsed_ms").and_then(json_u128)
+            {
+                self.http_provider_fetch_headers_elapsed_values
+                    .push(headers_elapsed_ms);
+            }
+            if let Some(first_chunk_elapsed_ms) = value
+                .get("response_first_chunk_elapsed_ms")
+                .and_then(json_u128)
+            {
+                self.http_provider_fetch_first_chunk_elapsed_values
+                    .push(first_chunk_elapsed_ms);
+            }
+            if let Some(body_elapsed_ms) = value.get("response_body_elapsed_ms").and_then(json_u128)
+            {
+                self.http_provider_fetch_body_elapsed_values
+                    .push(body_elapsed_ms);
             }
             if let Some(provider) = json_detail_string(value.get("provider")) {
                 if !provider.is_empty() {
@@ -8242,6 +8344,17 @@ impl TraceRequestBuilder {
             http_provider_fetch_failures: self.http_provider_fetch_failures,
             http_provider_fetch_elapsed_ms: LatencySummary::from_values(
                 self.http_provider_fetch_elapsed_values,
+            ),
+            http_provider_fetch_response_bytes: self.http_provider_fetch_response_bytes,
+            http_provider_fetch_first_chunk_events: self.http_provider_fetch_first_chunk_events,
+            http_provider_fetch_headers_elapsed_ms: LatencySummary::from_values(
+                self.http_provider_fetch_headers_elapsed_values,
+            ),
+            http_provider_fetch_first_chunk_elapsed_ms: LatencySummary::from_values(
+                self.http_provider_fetch_first_chunk_elapsed_values,
+            ),
+            http_provider_fetch_body_elapsed_ms: LatencySummary::from_values(
+                self.http_provider_fetch_body_elapsed_values,
             ),
             http_provider_fetch_providers: sorted_trace_counts(self.http_provider_fetch_providers),
             http_provider_fetch_error_classes: sorted_trace_counts(
@@ -10714,15 +10827,36 @@ fn format_request_source_details(request: &TraceRequestAggregate) -> String {
     } else {
         format_trace_counts(&request.http_provider_fetch_error_classes)
     };
+    let http_milestones = format_request_http_milestones(request);
     format!(
-        " block_sources={} http_fetches={} ok={} fail={} http_elapsed={} http_providers={} http_errors={}",
+        " block_sources={} http_fetches={} ok={} fail={} http_elapsed={} http_providers={} http_errors={}{}",
         block_sources,
         request.http_provider_fetches,
         request.http_provider_fetch_successes,
         request.http_provider_fetch_failures,
         request.http_provider_fetch_elapsed_ms,
         http_providers,
-        http_errors
+        http_errors,
+        http_milestones
+    )
+}
+
+fn format_request_http_milestones(request: &TraceRequestAggregate) -> String {
+    if request.http_provider_fetch_response_bytes == 0
+        && request.http_provider_fetch_first_chunk_events == 0
+        && request.http_provider_fetch_headers_elapsed_ms.count == 0
+        && request.http_provider_fetch_first_chunk_elapsed_ms.count == 0
+        && request.http_provider_fetch_body_elapsed_ms.count == 0
+    {
+        return String::new();
+    }
+    format!(
+        " http_response_bytes={} http_first_chunks={} http_headers={} http_first_chunk={} http_body={}",
+        request.http_provider_fetch_response_bytes,
+        request.http_provider_fetch_first_chunk_events,
+        request.http_provider_fetch_headers_elapsed_ms,
+        request.http_provider_fetch_first_chunk_elapsed_ms,
+        request.http_provider_fetch_body_elapsed_ms
     )
 }
 
@@ -12185,9 +12319,9 @@ mod tests {
             concat!(
                 "{\"phase\":\"request_start\",\"request_id\":1,\"path\":\"/ipns/site/app.js\",\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":42,\"cid\":\"cid-a\",\"source\":\"http_provider\",\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
-                "{\"phase\":\"http_provider_fetch\",\"elapsed_ms\":40,\"cid\":\"cid-a\",\"provider\":\"https://provider-a.example\",\"ok\":true,\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"http_provider_fetch\",\"elapsed_ms\":40,\"cid\":\"cid-a\",\"provider\":\"https://provider-a.example\",\"ok\":true,\"response_bytes\":1024,\"response_first_chunk_seen\":true,\"response_headers_elapsed_ms\":10,\"response_first_chunk_elapsed_ms\":12,\"response_body_elapsed_ms\":38,\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":1,\"cid\":\"cid-b\",\"source\":\"cache\",\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
-                "{\"phase\":\"http_provider_fetch\",\"elapsed_ms\":120,\"cid\":\"cid-c\",\"provider\":\"https://provider-b.example\",\"ok\":false,\"error\":\"request timed out\",\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"http_provider_fetch\",\"elapsed_ms\":120,\"cid\":\"cid-c\",\"provider\":\"https://provider-b.example\",\"ok\":false,\"error\":\"request timed out\",\"response_headers_elapsed_ms\":90,\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipns/site/app.js\",\"status\":200,\"elapsed_ms\":150,\"span\":{\"path\":\"/ipns/site/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipns/site/\"}}\n",
             ),
         )
@@ -12209,6 +12343,18 @@ mod tests {
         assert_eq!(request.http_provider_fetch_failures, 1);
         assert_eq!(request.http_provider_fetch_elapsed_ms.count, 2);
         assert_eq!(request.http_provider_fetch_elapsed_ms.max_ms, Some(120));
+        assert_eq!(request.http_provider_fetch_response_bytes, 1024);
+        assert_eq!(request.http_provider_fetch_first_chunk_events, 1);
+        assert_eq!(request.http_provider_fetch_headers_elapsed_ms.count, 2);
+        assert_eq!(
+            request.http_provider_fetch_headers_elapsed_ms.max_ms,
+            Some(90)
+        );
+        assert_eq!(
+            request.http_provider_fetch_first_chunk_elapsed_ms.max_ms,
+            Some(12)
+        );
+        assert_eq!(request.http_provider_fetch_body_elapsed_ms.max_ms, Some(38));
         let http_phase = request
             .phase_latencies
             .iter()
@@ -12255,6 +12401,11 @@ mod tests {
         assert_eq!(trace_value_count(&request_path.block_sources, "cache"), 1);
         assert_eq!(request_path.http_provider_fetches, 2);
         assert_eq!(request_path.http_provider_fetch_max_ms, 120);
+        assert_eq!(request_path.http_provider_fetch_response_bytes, 1024);
+        assert_eq!(request_path.http_provider_fetch_first_chunk_events, 1);
+        assert_eq!(request_path.http_provider_fetch_headers_max_ms, 90);
+        assert_eq!(request_path.http_provider_fetch_first_chunk_max_ms, 12);
+        assert_eq!(request_path.http_provider_fetch_body_max_ms, 38);
         assert_eq!(
             trace_value_count(
                 &request_path.http_provider_fetch_providers,
@@ -13617,7 +13768,7 @@ mod tests {
             concat!(
                 "{\"phase\":\"request_start\",\"request_id\":1,\"path\":\"/ipfs/root/app.js\",\"span\":{\"path\":\"/ipfs/root/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipfs/root\"}}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":80,\"cid\":\"cid-a\",\"source\":\"http_provider\",\"span\":{\"path\":\"/ipfs/root/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipfs/root\"}}\n",
-                "{\"phase\":\"http_provider_fetch\",\"elapsed_ms\":75,\"cid\":\"cid-a\",\"provider\":\"https://provider-a.example\",\"ok\":true,\"span\":{\"path\":\"/ipfs/root/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipfs/root\"}}\n",
+                "{\"phase\":\"http_provider_fetch\",\"elapsed_ms\":75,\"cid\":\"cid-a\",\"provider\":\"https://provider-a.example\",\"ok\":true,\"response_bytes\":2048,\"response_first_chunk_seen\":true,\"response_headers_elapsed_ms\":30,\"response_first_chunk_elapsed_ms\":35,\"response_body_elapsed_ms\":70,\"span\":{\"path\":\"/ipfs/root/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipfs/root\"}}\n",
                 "{\"phase\":\"request_done\",\"request_id\":1,\"path\":\"/ipfs/root/app.js\",\"status\":200,\"elapsed_ms\":90,\"span\":{\"path\":\"/ipfs/root/app.js\",\"request_id\":1,\"progress_request_id\":101,\"parent_request_id\":100,\"top_level_path\":\"/ipfs/root\"}}\n",
             ),
         )
@@ -13683,6 +13834,11 @@ mod tests {
             1
         );
         assert_eq!(rust_trace.http_provider_fetch_max_ms, 75);
+        assert_eq!(rust_trace.http_provider_fetch_response_bytes, 2048);
+        assert_eq!(rust_trace.http_provider_fetch_first_chunk_events, 1);
+        assert_eq!(rust_trace.http_provider_fetch_headers_max_ms, 30);
+        assert_eq!(rust_trace.http_provider_fetch_first_chunk_max_ms, 35);
+        assert_eq!(rust_trace.http_provider_fetch_body_max_ms, 70);
     }
 
     #[test]
