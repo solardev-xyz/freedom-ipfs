@@ -42340,3 +42340,301 @@ single-provider rows and the trace confirms `http_provider_bitswap_hedge_budget`
 and `http_provider_bitswap_hedge_result` events with actual hedge starts. Judge
 it against no-env same-window control on asset p95, root latency, RSS, FDs, and
 whether the budget avoids broad Bitswap fanout.
+
+## 2026-05-08: Reproduced Zero-HTTP Subresource Tail And Backoff Threshold Signal
+
+Branch/head: `codex/kubo-session-performance-20260506` at `310b290`.
+
+Purpose:
+
+The current no-env branch is usually ahead of Kubo on root latency, range
+latency, RSS, and FD count. This pass looked for the remaining narrow tail:
+`ipfs.tech` subresource rows where Kubo still wins because a sparse zero-HTTP
+Bitswap path stalls inside an otherwise healthy page-load session.
+
+Common harness settings:
+
+- `--compare-kubo`
+- `--build-gateway`
+- `--fresh-gateway-per-run`
+- `--repeat 5`
+- `--asset-concurrency 6`
+- `--timeout-secs 120`
+- `--run-timeout-secs 240`
+- `--dht-query-timeout-secs 3`
+- `--case ipfs-tech-page-assets`
+
+Fresh current-head no-env baseline:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/current-head-ipfs-tech-r5-20260508T010211Z-trace.jsonl \
+  --comparison-output /tmp/current-head-ipfs-tech-r5-20260508T010211Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/p90/p95/max `35/41/41/41`, data p50/max
+  `793822/852707`, duplicate blocks p50/p90/p95/max `0/6/6/6`, messages
+  p50/p90/max `34/130/130`, peers p50/p90/max `8/40/40`.
+- Root: Rust `705/880ms`; Kubo `1382/2237ms`.
+- Assets: Rust `132/485ms`; Kubo `92/423ms`.
+- `meaningful_kubo_wins`: `2`, both asset p95 TTFB/total by `62ms`
+  (`1.15x`).
+- Resource max: Rust `57832KiB` RSS and `33` FDs vs Kubo `206176KiB` RSS
+  and `163` FDs.
+
+Rust trace:
+
+- HTTP-provider blocks: `154`, p50/p90/p95/max `193/265/324/577ms`.
+- Bitswap blocks: `46`, p50/p90/p95/max `97/208/231/320ms`.
+- Delegated provider results: zero `5`, single `98`, multi `69`.
+- Request classifications: `cold_bitswap_peer_expand=5`,
+  `zero_http_provider_bitswap=5`, `zero_http_provider_cold_bitswap=5`.
+- Classified zero-HTTP latency: p50/p90/p95/max `225/702/702/702ms`.
+- Bitswap connections established: `9`.
+- Worst path-local Kubo wins were still `_nuxt` assets:
+  `_nuxt/entry.C4ErMpWu.css` p50 Rust `447ms` vs Kubo `130/131ms`,
+  `_nuxt/DzK6mLCt.js` p95 Rust `459ms` vs Kubo `227/228ms`, and
+  `_nuxt/BfUTpfA9.js` p50 Rust `288ms` vs Kubo `67ms`.
+
+Interpretation:
+
+This was not a broad root lookup failure. The branch remained strong on root
+latency and resources, while the residual gap was concentrated in page
+subresources with HTTP-provider/UnixFS wrapper latency plus a small zero-HTTP
+Bitswap tail. Because repeated `_nuxt` parent-directory block latency appeared
+in the trace, this window warranted re-testing the existing HTML directory-only
+prefetch lab.
+
+HTML directory-only prefetch current-window opt-in:
+
+```sh
+timeout 1200s env FREEDOM_IPFS_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_DIRS=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/html-dir-prefetch1-current-window-ipfs-tech-r5-20260508T010421Z-trace.jsonl \
+  --comparison-output /tmp/html-dir-prefetch1-current-window-ipfs-tech-r5-20260508T010421Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/p90/max `35/39/39`, data max `1120777`,
+  duplicate blocks max `4`, messages p50/max `37/112`, peers p50/max `8/20`.
+- Root: Rust `636/824ms`; Kubo `1365/1909ms`.
+- Assets: Rust `188/432ms`; Kubo `80/378ms`.
+- `meaningful_kubo_wins`: `4`, asset p50 and p95 TTFB/total.
+- Resource max: Rust `58796KiB` RSS and `31` FDs vs Kubo `149644KiB` RSS
+  and `98` FDs.
+
+Rust trace:
+
+- HTTP-provider blocks: `186`, p50/p90/p95/max `179/250/272/419ms`.
+- Bitswap blocks: `19`, p50/p90/p95/max `154/243/385/385ms`.
+- Delegated provider results: zero `5`, single `100`, multi `70`.
+- Classified zero-HTTP latency: p50/p90/p95/max `219/430/430/430ms`.
+- Bitswap source choices were all candidate index `0` with `want_block`.
+- Single-provider HTTP race p50/p95/max `181/237/396ms`; Sia max `395ms`.
+- `_nuxt` directory CID max was `197ms`, but path-local asset rows worsened:
+  `_nuxt/entry.C4ErMpWu.css` p50 Rust `465ms` vs Kubo `114ms`, and
+  `_nuxt/ZT0_SuSb.js` p50 Rust `430ms` vs Kubo `114ms`.
+
+Decision:
+
+Keep HTML directory-only prefetch disabled. It did not help this current
+window and worsened asset median plus the number of meaningful Kubo wins.
+
+Immediate no-env post-control after directory prefetch:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/html-dir-prefetch1-current-window-post-control-ipfs-tech-r5-20260508T010458Z-trace.jsonl \
+  --comparison-output /tmp/html-dir-prefetch1-current-window-post-control-ipfs-tech-r5-20260508T010458Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/max `35/35`, messages p50/max `42/84`,
+  peers p50/max `8/14`.
+- Root: Rust `759/782ms`; Kubo `1409/2115ms`.
+- Assets: Rust `196/513ms`; Kubo `88/577ms`.
+- `meaningful_kubo_wins`: `2`, asset p50 TTFB/total by `108ms`
+  (`2.23x`).
+- Resource max: Rust `58340KiB` RSS and `34` FDs vs Kubo `168816KiB` RSS
+  and `89` FDs.
+
+Rust trace:
+
+- HTTP-provider blocks: `195`, p50/p90/p95/max `187/262/401/582ms`.
+- Bitswap blocks: `5`, p50/p90/p95/max `6858/8029/8029/8029ms`.
+- Provider retries: `refresh_timeout=3`, `retry_timeout=3`.
+- Delegated provider results: zero `8`, single `100`, multi `70`.
+- Classified zero-HTTP latency: p50/p90/p95/max `6860/8032/8032/8032ms`.
+- The severe row was `_nuxt/mHWTJadT.js`: Rust p50/p95
+  `6862/8033ms` vs Kubo `63/124ms`, statuses `200=5`, block sources
+  `bitswap=5`, `http_provider=1`, candidate indexes `0=3, 4=2`, and modes
+  `want_block=3`, `want_have=2`.
+- Trace inspection showed first attempts waiting on connection/read timeouts
+  before retrying after bad-peer suppression and succeeding quickly.
+
+Interpretation:
+
+The no-env post-control showed the real active bad shape: sparse zero-HTTP
+Bitswap subresources where retry/escalation scheduling around concrete
+connection/read failures produced an 8s tail. Directory prefetch was not
+causal. This trace specifically justified trying the existing
+`FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD` knob. Do not lower
+the connection-ready timeout globally from this evidence; earlier 3000ms
+connection-ready experiments were rejected in this notebook.
+
+Connection-error backoff threshold `1` opt-in:
+
+```sh
+timeout 1200s env FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/connerr-backoff1-current-window-ipfs-tech-r5-20260508T010700Z-trace.jsonl \
+  --comparison-output /tmp/connerr-backoff1-current-window-ipfs-tech-r5-20260508T010700Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/max `35/35`, data `793822`, messages p50/max
+  `38/89`, peers p50/max `13/23`.
+- Root: Rust `521/1130ms`; Kubo `1236/1862ms`.
+- Assets: Rust `188/474ms`; Kubo `71/555ms`.
+- `meaningful_kubo_wins`: `2`, asset p50 TTFB/total by `117ms`
+  (`2.65x`).
+- Resource max: Rust `57140KiB` RSS and `30` FDs vs Kubo `173896KiB` RSS
+  and `99` FDs.
+
+Rust trace:
+
+- HTTP-provider blocks: `176`, p50/p90/p95/max `188/249/276/422ms`.
+- Bitswap blocks: `24`, p50/p90/p95/max `122/228/239/283ms`.
+- Delegated provider results: zero `5`, single `100`, multi `70`.
+- Classified zero-HTTP latency: p50/p90/p95/max `231/513/513/513ms`.
+- Bitswap connection backoff fired: `backoffs=10`, with classes
+  `connection_refused=5`, `no_route_to_host=5`, and `skipped=0`.
+- Bitswap connections established: `9`.
+- The slow `_nuxt/mHWTJadT.js` shape was clipped to about `513ms` in the
+  affected progress group; there was no 8s stall.
+
+Interpretation:
+
+Threshold `1` looked promising in the exact bad-window shape. It converted
+concrete early connection errors into immediate peer suppression, avoided the
+previous sparse zero-HTTP tail, and kept RSS/FDs low. This was not enough to
+promote by itself because the knob is global and may be too aggressive outside
+gateway subresource zero-HTTP rows.
+
+Immediate no-env post-control after threshold `1`:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/connerr-backoff1-post-control-ipfs-tech-r5-20260508T010740Z-trace.jsonl \
+  --comparison-output /tmp/connerr-backoff1-post-control-ipfs-tech-r5-20260508T010740Z.json
+```
+
+Result:
+
+- Harness process exited `1` because Rust had one request failure; Kubo did
+  not fail.
+- Rust passed `4/5`; Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/p90/p95/max `35/37/37/37`, data p50/max
+  `793822/808581`, messages p50/max `79/123`, peers p50/max `21/29`.
+- Root: Rust `691/827ms`; Kubo `2254/2551ms`.
+- Aggregate assets: Rust `194/622ms`; Kubo `321/806ms`.
+- Aggregate `meaningful_kubo_wins`: none, but one Rust asset request failed.
+- Resource max: Rust `58952KiB` RSS and `43` FDs vs Kubo `213824KiB` RSS
+  and `185` FDs.
+
+Rust trace:
+
+- HTTP-provider blocks: `185`, p50/p90/p95/max `187/266/346/961ms`.
+- Bitswap blocks: `14`, p50/p90/p95/max `400/1326/6738/6738ms`.
+- Provider retries: `refresh_timeout=2`, `retry_timeout=1`.
+- Delegated provider results: zero `15`, single `92`, multi `70`.
+- Request classifications: `cold_bitswap_peer_expand=13`,
+  `zero_http_provider_bitswap=12`, `zero_http_provider_cold_bitswap=12`.
+- Classified zero-HTTP cold latency: p50/p90/p95/max
+  `620/6928/11827/11827ms`, statuses `200=12`, `504=1`.
+- Classified zero-HTTP provider latency: p50/p90/p95/max
+  `412/1351/6928/6928ms`, statuses `200=12`.
+- The severe row was again `_nuxt/mHWTJadT.js`: Rust p50/p95
+  `1222/11830ms` vs Kubo `379/874ms`, statuses `200=4`, `504=1`,
+  block sources `bitswap=4`, `http_provider=3`, `http_fetches=1`, candidate
+  indexes `0=2, 1=1, 7=1`, and modes `want_block=3`, `want_have=1`.
+- One request returned `504` after `11827ms`; another returned `200` after
+  `6928ms`.
+- Bitswap connection errors: `13`, with classes `no_route_to_host=6`,
+  `protocol_negotiation_failed=4`, `connection_refused=1`, `other=1`, and
+  `timeout=1`.
+- The default backoff fired only once, for `protocol_negotiation_failed`, which
+  was not enough to suppress the bad/erroring set early.
+
+Decision:
+
+Do not promote global threshold `1` yet, but treat it as the clearest current
+signal. The immediate no-env control reintroduced severe zero-HTTP subresource
+tails and one Rust `504`, while the threshold `1` run clipped the same class to
+`<=513ms` with no failures. The next useful work is either:
+
+1. Run a multi-case guardrail with
+   `FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD=1` to see whether
+   the broad global setting is safe enough.
+2. Implement a narrower default-on policy that lowers the connection-error
+   backoff threshold only for gateway subresource zero-HTTP provider sets, or
+   only after concrete same-top-level connection errors, then validate against
+   no-env same-window controls and multi-case guardrails.
+
+Keep the existing connection-ready timeout default. The trace points at
+connection-error suppression and retry/escalation timing for sparse zero-HTTP
+Bitswap subresources, not at a globally-too-long connection-ready timeout.
