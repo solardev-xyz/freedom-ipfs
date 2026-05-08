@@ -45714,3 +45714,216 @@ change would not create a meaningful improvement and would revisit rejected
 knob shapes. Keep `DlAUqK2U.js` as a regression watch item, but use the next
 behavior experiment only if a fresh selected/focused run shows a repeated
 aggregate gap or a larger path-local family.
+
+## 2026-05-08: Current Selected R10 Guardrail After DNS-Prefetch Recheck
+
+Branch/head: `codex/kubo-session-performance-20260506` at `4e8b84d`.
+
+Purpose:
+
+Repeat the selected six-case guardrail at `repeat=10` after the r5 check above.
+This asks whether the current no-env branch still beats Kubo across the broader
+mobile browsing corpus, and whether any remaining Kubo win is broad enough to
+justify another behavior experiment.
+
+Command:
+
+```sh
+timeout 5400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-selected-r10-4e8b84d-20260508T043946Z-trace.jsonl \
+  --comparison-output /tmp/current-selected-r10-4e8b84d-20260508T043946Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `10/10` for every selected case.
+- DAICO page root: Rust `276/338ms`; Kubo `2167/2328ms`.
+- Vitalik range root: Rust `101/125ms`; Kubo `1443/2782ms`.
+- `ipfs.tech` range root: Rust `581/980ms`; Kubo `738/2205ms`.
+- `ipfs.tech` page root: Rust `3/5ms`; Kubo `2/64ms`.
+- `ipfs.tech` assets: Rust TTFB/total `48/108ms`; Kubo TTFB/total
+  `344/420ms`.
+- `ipfs.tech` developers hero: Rust `87/109ms`; Kubo `426/582ms`.
+- Wikipedia root: Rust `448/724ms`; Kubo `388/721ms`.
+- Meaningful aggregate Kubo wins: `2`, both Wikipedia p50 TTFB/total by
+  `60ms` (`1.15x`).
+- Resource max: Rust `53152KiB` RSS and `27` FDs vs Kubo `249280KiB`
+  RSS and `299` FDs.
+- Trace source latencies:
+  - Bitswap: `352` blocks, p50/p90/p95/max `43/85/270/543ms`;
+  - HTTP provider: `78` blocks, p50/p90/p95/max `96/240/253/959ms`.
+- Delegated provider lookup p50/p90/p95/max: `18/43/47/102ms`.
+- Delegated provider self-hedges: `1`, with timeout max `750ms`.
+- Request classifications:
+  `zero_http_provider_bitswap=25`,
+  `top_level_zero_http_provider_bitswap=20`,
+  `cold_bitswap_peer_expand=11`,
+  `top_level_zero_http_provider_cold_bitswap=11`,
+  `zero_http_provider_cold_bitswap=11`.
+
+Path-local Kubo win:
+
+- `/ipns/ipfs.tech/_nuxt/DzK6mLCt.js`: Rust p50/p95 `47/963ms`; Kubo
+  `346/386ms`; Kubo won p95 TTFB/total by `577ms`.
+
+Trace diagnosis for `DzK6mLCt.js`:
+
+- The slow Rust sample was request `34`, CID
+  `bafkreigsgoao7ac5wyojveytzsobfzziohgahry2rqitaz4ddu6zgqojky`.
+- The request started a one-peer trusted Bitswap session shortcut immediately,
+  then the zero pre-lookup grace timed out after `1ms`.
+- The delegated lookup primary request stalled long enough for the existing
+  single-endpoint self-hedge to fire at `750ms`.
+- The duplicate delegated request returned `13` providers with `1` HTTP
+  provider in `44ms`; `delegated_provider_self_hedge_result` completed at
+  `795ms`, with `winner_attempt=1`.
+- The subsequent single HTTP provider fetch from `https://ipfs-bridge.sia.dev/`
+  succeeded in `159ms`; the whole request completed in `962ms`.
+- Normal same-CID samples completed in roughly `43-50ms` from the same page
+  session path.
+
+Decision:
+
+No behavior change from this run. The selected r10 keeps the key mobile profile
+intact: Rust wins the selected cold roots/ranges/assets overall and uses far
+less RSS/FDs than Kubo. The remaining actionable signal is not generic Bitswap
+tuning; it is a rare delegated-router primary-request stall where the existing
+same-endpoint duplicate worked but waited the full `750ms` before firing.
+
+The next scoped experiment should be a lab-only delegated self-hedge threshold
+knob so shorter thresholds can be tested same-window without repeatedly editing
+the constant. Do not promote a lower default from this single outlier: a prior
+`500ms` source patch was rejected because it did not fire in its live window.
+Use the knob to collect evidence first, and keep watching self-hedge count,
+delegated lookup tails, path-local p95, RSS, and FDs.
+
+## 2026-05-08: Lab Knob For Delegated Self-Hedge Threshold
+
+Branch/head before patch: `codex/kubo-session-performance-20260506` at
+`4e8b84d`.
+
+Purpose:
+
+The selected r10 above had one actionable delegated-router stall: the existing
+single-endpoint duplicate request won quickly, but only after waiting the fixed
+`750ms` threshold. A prior source patch lowering the constant to `500ms` was
+rejected because it did not fire in its live window. Add a default-neutral lab
+knob so future runs can test shorter thresholds without source edits.
+
+Change:
+
+- Add `FREEDOM_IPFS_SINGLE_DELEGATED_SELF_HEDGE_AFTER_MS=<ms>`.
+- Default remains `750ms`.
+- Invalid or absent values fall back to `750ms`.
+- Existing kill switch
+  `FREEDOM_IPFS_DISABLE_SINGLE_DELEGATED_SELF_HEDGE=1` is unchanged.
+- `delegated_provider_self_hedge.timeout_ms` now reports the effective
+  threshold.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-routing self_hedge
+cargo check -p freedom-ipfs-routing --all-targets
+```
+
+Result:
+
+- Formatting passed.
+- Routing self-hedge tests passed: `2` passed.
+- Routing all-target check passed.
+
+Live `250ms` selected r5 experiment:
+
+```sh
+timeout 3600s env FREEDOM_IPFS_SINGLE_DELEGATED_SELF_HEDGE_AFTER_MS=250 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/delegated-self-hedge250-selected-r5-4e8b84d-20260508Tnext-trace.jsonl \
+  --comparison-output /tmp/delegated-self-hedge250-selected-r5-4e8b84d-20260508Tnext.json
+```
+
+Live result:
+
+- Rust/Kubo passed `5/5` for every selected case.
+- DAICO page root: Rust `289/312ms`; Kubo `1220/2189ms`.
+- Vitalik range root: Rust `109/223ms`; Kubo `2527/2639ms`.
+- `ipfs.tech` range root: Rust `788/1261ms`; Kubo `740/1033ms`.
+- `ipfs.tech` page root: Rust `4/4ms`; Kubo `2/5ms`.
+- `ipfs.tech` assets: Rust TTFB/total `62/224ms`; Kubo TTFB/total
+  `348/443ms`.
+- `ipfs.tech` developers hero: Rust `87/100ms`; Kubo `424/427ms`.
+- Wikipedia root: Rust `408/467ms`; Kubo `572/715ms`.
+- Meaningful aggregate Kubo wins: `2`, both `ipfs.tech` range root p95
+  TTFB/total by `228ms` (`1.22x`).
+- Resource max: Rust `53564KiB` RSS and `25` FDs vs Kubo `167216KiB`
+  RSS and `295` FDs.
+- Delegated provider lookup p50/p90/p95/max: `18/43/47/113ms`.
+- Delegated provider self-hedges: `0`.
+- Trace source latencies:
+  - Bitswap: `130` blocks, p50/p90/p95/max `48/134/247/1320ms`;
+  - HTTP provider: `85` blocks, p50/p90/p95/max `107/242/393/694ms`.
+
+Path-local Kubo wins:
+
+- `/ipns/ipfs.tech/_nuxt/entry.C4ErMpWu.css`: Rust p95 `1568ms`; Kubo
+  `757ms`.
+- `/ipns/ipfs.tech/_nuxt/BXkYzPrD.js`: Rust p95 `696/697ms`; Kubo
+  `540ms`.
+
+Trace diagnosis:
+
+- The `250ms` delegated threshold did not fire (`self_hedges=0`), so this run
+  gives no evidence for lowering the production delegated self-hedge default.
+- The slowest path-local row was `entry.C4ErMpWu.css`, not `DzK6mLCt.js`.
+- The slow CSS sample was a zero-HTTP/cold Bitswap row:
+  `zero_http_provider_bitswap=1`, `cold_bitswap_peer_expand=1`,
+  `zero_http_provider_cold_bitswap=1`.
+- Its slow block `bafkreifmja74h3c7zpdcahxkmzyyhlyugnm3z6ey5ztt46leyiu3otdgmi`
+  arrived by Bitswap in `1267ms` from candidate index `1`, while an
+  `ipfs-bridge.sia.dev` HTTP provider fetch for a related block completed in
+  `194ms`.
+- This is therefore the recurring zero-HTTP/cold Bitswap source-quality tail,
+  not a delegated-routing self-hedge threshold tail.
+
+Decision:
+
+Keep the lab knob because it is default-neutral, tested, and directly supports
+future same-window threshold experiments when a delegated-router stall recurs.
+Do **not** lower the default from `750ms`: the first `250ms` live run produced
+`0` delegated self-hedges and moved the meaningful Kubo wins to unrelated
+`ipfs.tech` root p95 and CSS/Bitswap tails.
+
+Next useful work should inspect the repeated `entry.C4ErMpWu.css` /
+zero-HTTP cold Bitswap pattern. Avoid replaying broad direct-WANT, DNS timeout,
+or global grace knobs; prior guardrails rejected those shapes. Look for a
+narrow source-quality or page-session rule that can clip the `1s+` zero-HTTP
+subresource tail without increasing the normal selected-suite RSS/FD profile.

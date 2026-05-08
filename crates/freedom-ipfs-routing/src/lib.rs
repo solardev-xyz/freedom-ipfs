@@ -38,6 +38,8 @@ const STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_MIN_ELAPSED_ENV: &str =
     "FREEDOM_IPFS_STREAMING_DELEGATED_DIRECT_BITSWAP_TARGET_MIN_ELAPSED_MS";
 const LAB_DROP_HTTP_PROVIDERS_FOR_CIDS_ENV: &str = "FREEDOM_IPFS_LAB_DROP_HTTP_PROVIDERS_FOR_CIDS";
 const SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER: Duration = Duration::from_millis(750);
+const SINGLE_DELEGATED_SELF_HEDGE_AFTER_MS_ENV: &str =
+    "FREEDOM_IPFS_SINGLE_DELEGATED_SELF_HEDGE_AFTER_MS";
 const DISABLE_SINGLE_DELEGATED_SELF_HEDGE_ENV: &str =
     "FREEDOM_IPFS_DISABLE_SINGLE_DELEGATED_SELF_HEDGE";
 const MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY: usize = 2;
@@ -431,7 +433,8 @@ impl DelegatedRoutingClient {
         let started = Instant::now();
         let mut pending = FuturesUnordered::new();
         pending.push(self.providers_from_endpoint_attempt(endpoint, cid, 0));
-        let hedge = tokio::time::sleep(SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER);
+        let self_hedge_after = single_delegated_endpoint_self_hedge_after();
+        let hedge = tokio::time::sleep(self_hedge_after);
         tokio::pin!(hedge);
         let mut hedge_fired = false;
         let mut attempted_request_count = 1usize;
@@ -482,7 +485,7 @@ impl DelegatedRoutingClient {
                         phase = "delegated_provider_self_hedge",
                         cid = %cid,
                         endpoint,
-                        timeout_ms = SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER.as_millis(),
+                        timeout_ms = self_hedge_after.as_millis(),
                         reason = "slow_single_endpoint"
                     );
                     pending.push(self.providers_from_endpoint_attempt(endpoint, cid, 1));
@@ -592,6 +595,21 @@ fn delegated_lookup_cid(cid: &Cid) -> String {
 
 fn single_delegated_endpoint_self_hedge_enabled() -> bool {
     std::env::var_os(DISABLE_SINGLE_DELEGATED_SELF_HEDGE_ENV).is_none()
+}
+
+fn single_delegated_endpoint_self_hedge_after() -> Duration {
+    single_delegated_endpoint_self_hedge_after_from_env_value(
+        std::env::var_os(SINGLE_DELEGATED_SELF_HEDGE_AFTER_MS_ENV)
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    )
+}
+
+fn single_delegated_endpoint_self_hedge_after_from_env_value(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER)
 }
 
 #[derive(Debug, Clone)]
@@ -2696,6 +2714,26 @@ mod tests {
         assert_eq!(
             streaming_delegated_direct_bitswap_target_min_elapsed_from_env_value(Some("bad")),
             Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn delegated_self_hedge_after_parses_override() {
+        assert_eq!(
+            single_delegated_endpoint_self_hedge_after_from_env_value(None),
+            SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER
+        );
+        assert_eq!(
+            single_delegated_endpoint_self_hedge_after_from_env_value(Some("250")),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            single_delegated_endpoint_self_hedge_after_from_env_value(Some("0")),
+            Duration::from_millis(0)
+        );
+        assert_eq!(
+            single_delegated_endpoint_self_hedge_after_from_env_value(Some("bad")),
+            SINGLE_DELEGATED_ENDPOINT_SELF_HEDGE_AFTER
         );
     }
 
