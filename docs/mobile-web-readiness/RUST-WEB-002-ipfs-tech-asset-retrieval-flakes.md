@@ -44716,3 +44716,143 @@ Continue classifying the residual slow rows by source quality rather than only
 DNS volume. In this pair, the rollback control did more DNS work but achieved
 better Bitswap and HTTP-provider tails, which points back toward peer/address
 quality, source selection, and hedging policy instead of a simple DNS cap.
+
+## 2026-05-08: Post-Lookup Timeout Direct-WANT Selected Recheck
+
+Branch/head: `codex/kubo-session-performance-20260506` at `3506971`.
+
+Purpose:
+
+Recheck the existing disabled scoped direct-`WANT_BLOCK` hook on the current
+selected same-window suite. The latest no-env selected trace still had
+path-local `ipfs.tech` asset wins shaped like zero-HTTP subresources, post-lookup
+shortcut waits, and cold Bitswap peer expansion. Earlier focused testing showed
+that the hook can mechanically remove late `WANT_HAVE` on that shape, but it was
+not promoted because it failed broader guardrails.
+
+Opt-in command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-postlookup-timeout-direct5-selected-r5-3506971-20260508T040000Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-postlookup-timeout-direct5-selected-r5-3506971-20260508T040000Z.json
+```
+
+Opt-in result:
+
+- Rust/Kubo passed `5/5` all selected cases.
+- DAICO root: Rust `274/303ms`; Kubo `2227/2260ms`.
+- Vitalik range root: Rust `110/223ms`; Kubo `2194/3252ms`.
+- `ipfs.tech` range root: Rust `766/1030ms`; Kubo `1004/1150ms`.
+- `ipfs.tech` page root: Rust `3/3ms`; Kubo `2/145ms`.
+- `ipfs.tech` assets: Rust TTFB/total `96/351ms` and `97/351ms`;
+  Kubo TTFB/total `351/444ms`.
+- `ipfs.tech` developers hero: Rust `122/137ms`; Kubo `430/460ms`.
+- Wikipedia root: Rust `776/2007ms`; Kubo `633/765ms`.
+- Meaningful Kubo wins: `4`, all Wikipedia root p50/p95 TTFB/total.
+- Path-local `ipfs.tech` asset Kubo wins: `favicon.ico` p95 TTFB/total,
+  Rust `123ms` vs Kubo `58ms`.
+- Resource max: Rust `52328KiB` RSS and `32` FDs vs Kubo `145248KiB`
+  RSS and `194` FDs.
+- Block fetch source p50/p90/p95/max:
+  - HTTP provider: `113/247/429/672ms` across `100` blocks;
+  - Bitswap: `78/299/375/1582ms` across `115` blocks.
+- Delegated lookup p50/p90/p95/max: `17/44/49/113ms`.
+- Bitswap DNS expansion: `100` events, `62` cached, `38` uncached,
+  `39` failed, `766` records, `15` IPs.
+- Request classifications:
+  `zero_http_provider_bitswap=16`,
+  `cold_bitswap_peer_expand=12`,
+  `zero_http_provider_cold_bitswap=12`,
+  `top_level_zero_http_provider_bitswap=10`,
+  `top_level_zero_http_provider_cold_bitswap=8`.
+
+Immediate no-env post-control:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-postlookup-timeout-direct5-selected-post-control-r5-3506971-20260508T040000Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-postlookup-timeout-direct5-selected-post-control-r5-3506971-20260508T040000Z.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `5/5` all selected cases.
+- DAICO root: Rust `265/289ms`; Kubo `1249/2150ms`.
+- Vitalik range root: Rust `95/108ms`; Kubo `2149/2465ms`.
+- `ipfs.tech` range root: Rust `797/999ms`; Kubo `1692/8020ms`.
+- `ipfs.tech` page root: Rust `3/3ms`; Kubo `2/22ms`.
+- `ipfs.tech` assets: Rust TTFB/total `91/233ms`; Kubo TTFB/total
+  `344/619ms`.
+- `ipfs.tech` developers hero: Rust `108/149ms`; Kubo `402/563ms`.
+- Wikipedia root: Rust `537/2630ms`; Kubo `278/1030ms`.
+- Meaningful Kubo wins: `4`, all Wikipedia root p50/p95 TTFB/total.
+- Path-local `ipfs.tech` asset Kubo wins: `_nuxt/BfUTpfA9.js` p95 TTFB/total,
+  Rust `498ms` vs Kubo `442ms`.
+- Resource max: Rust `52308KiB` RSS and `34` FDs vs Kubo `390132KiB`
+  RSS and `774` FDs.
+- Block fetch source p50/p90/p95/max:
+  - Bitswap: `95/293/399/2272ms` across `95` blocks;
+  - HTTP provider: `86/212/239/352ms` across `120` blocks.
+- Delegated lookup p50/p90/p95/max: `17/45/48/104ms`.
+- Bitswap DNS expansion: `87` events, `54` cached, `33` uncached,
+  `33` failed, `630` records, `15` IPs.
+- Request classifications:
+  `zero_http_provider_bitswap=15`,
+  `top_level_zero_http_provider_bitswap=10`,
+  `cold_bitswap_peer_expand=8`,
+  `zero_http_provider_cold_bitswap=8`,
+  `top_level_zero_http_provider_cold_bitswap=7`.
+
+Decision:
+
+Reject promoting the scoped direct-WANT hook from this selected recheck.
+
+The opt-in did not reduce aggregate meaningful wins; both opt-in and control
+lost the same Wikipedia root metrics in this live window. The Wikipedia tail was
+therefore not direct-WANT-specific. But the opt-in still failed the target
+tradeoff:
+
+- `ipfs.tech` aggregate asset p95 regressed from `233ms` to `351ms`;
+- HTTP-provider p95 regressed from `239ms` to `429ms`;
+- DNS expansion increased from `630` to `766` records;
+- the path-local Kubo win merely moved from `_nuxt/BfUTpfA9.js` in control to
+  `favicon.ico` in opt-in.
+
+Keep `FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK=1`
+as a lab switch only. The useful next step is not wider direct `WANT_BLOCK`;
+the repeated slow families are now:
+
+- top-level Wikipedia zero-HTTP root/index rows where both the session shortcut
+  and provider-list Bitswap path can stall for seconds;
+- small `ipfs.tech` assets where Kubo occasionally wins one path-local p95 even
+  though Rust still wins the aggregate asset p50/p95.
