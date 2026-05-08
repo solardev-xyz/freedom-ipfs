@@ -3819,6 +3819,10 @@ impl HttpRetriever {
         }
         self.apply_successful_bitswap_peer_scores(&mut peers).await;
         let session_peer_count = self.insert_recent_bitswap_session_peers(&mut peers).await;
+        let bitswap_command_context = BitswapCommandContext::from_retrieval_context(
+            context.as_ref(),
+            provider_http_url_count(providers),
+        );
         let zero_http_subresource_peer_rotation =
             maybe_rotate_zero_http_subresource_peers(providers, context.as_ref(), cid, &mut peers);
         let gateway_context = GatewayBitswapSourceContext {
@@ -3927,7 +3931,11 @@ impl HttpRetriever {
         let bitswap_started = Instant::now();
         let peer_count = peers.len();
         let peers_for_record = peers.clone();
-        let result = self.shared_bitswap_client().await?.fetch(*cid, peers).await;
+        let result = self
+            .shared_bitswap_client()
+            .await?
+            .fetch_with_context(*cid, peers, bitswap_command_context)
+            .await;
         let result = match result {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => {
@@ -4553,9 +4561,14 @@ impl HttpRetriever {
         );
         let peers_for_record = peers.clone();
         let started = Instant::now();
+        let request_context = current_retrieval_request_context();
+        let bitswap_command_context =
+            BitswapCommandContext::from_retrieval_context(request_context.as_ref(), 0);
         let fetch = async {
             let client = self.shared_bitswap_client().await?;
-            client.fetch(*cid, peers).await
+            client
+                .fetch_with_context(*cid, peers, bitswap_command_context)
+                .await
         };
         let result = match timeout(BITSWAP_SESSION_SHORTCUT_TIMEOUT, fetch).await {
             Ok(Ok(Ok(result))) => result,
@@ -4705,9 +4718,14 @@ impl HttpRetriever {
             timeout_ms = BITSWAP_SESSION_RANGE_BATCH_TIMEOUT.as_millis()
         );
 
+        let request_context = current_retrieval_request_context();
+        let bitswap_command_context =
+            BitswapCommandContext::from_retrieval_context(request_context.as_ref(), 0);
         let fetch = async {
             let client = self.shared_bitswap_client().await?;
-            client.fetch_many(cids.clone(), peers).await
+            client
+                .fetch_many_with_context(cids.clone(), peers, bitswap_command_context)
+                .await
         };
         let result = match timeout(BITSWAP_SESSION_RANGE_BATCH_TIMEOUT, fetch).await {
             Ok(Ok(Ok(result))) => result,
@@ -6711,8 +6729,45 @@ struct BitswapCommand {
     sent_at: Instant,
     respond: Option<oneshot::Sender<Result<BitswapFetchBatchResult>>>,
     reason: &'static str,
+    context: BitswapCommandContext,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct BitswapCommandContext {
     top_level_path: Option<String>,
     gateway_subresource: bool,
+    zero_http_provider: bool,
+}
+
+impl BitswapCommandContext {
+    fn from_retrieval_context(
+        context: Option<&RetrievalRequestContext>,
+        http_provider_count: usize,
+    ) -> Self {
+        Self {
+            top_level_path: context
+                .and_then(|context| context.top_level_path().map(ToOwned::to_owned)),
+            gateway_subresource: context.is_some_and(RetrievalRequestContext::gateway_subresource),
+            zero_http_provider: http_provider_count == 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BitswapDialContext {
+    reason: &'static str,
+    command: BitswapCommandContext,
+    started: Instant,
+}
+
+impl BitswapDialContext {
+    fn new(reason: &'static str, command: BitswapCommandContext) -> Self {
+        Self {
+            reason,
+            command,
+            started: Instant::now(),
+        }
+    }
 }
 
 struct PendingIncomingBitswapResult {
@@ -6760,6 +6815,7 @@ impl SharedBitswapClient {
         Ok(Self { commands })
     }
 
+    #[cfg(test)]
     async fn fetch(&self, cid: Cid, peers: Vec<BitswapPeer>) -> Result<Result<BitswapFetchResult>> {
         let batch = self.fetch_many(vec![cid], peers).await?;
         Ok(batch.map(|mut result| BitswapFetchResult {
@@ -6775,10 +6831,43 @@ impl SharedBitswapClient {
         }))
     }
 
+    async fn fetch_with_context(
+        &self,
+        cid: Cid,
+        peers: Vec<BitswapPeer>,
+        context: BitswapCommandContext,
+    ) -> Result<Result<BitswapFetchResult>> {
+        let batch = self
+            .fetch_many_with_context(vec![cid], peers, context)
+            .await?;
+        Ok(batch.map(|mut result| BitswapFetchResult {
+            requested_block: result
+                .requested_blocks
+                .remove(&cid)
+                .expect("single-CID Bitswap batch omitted requested block"),
+            extra_blocks: result.extra_blocks,
+            source_peer: result.source_peer,
+            source_transport: result.source_transport,
+            source_addr: result.source_addr,
+            delivery: result.delivery,
+        }))
+    }
+
+    #[cfg(test)]
     async fn fetch_many(
         &self,
         cids: Vec<Cid>,
         peers: Vec<BitswapPeer>,
+    ) -> Result<Result<BitswapFetchBatchResult>> {
+        self.fetch_many_with_context(cids, peers, BitswapCommandContext::default())
+            .await
+    }
+
+    async fn fetch_many_with_context(
+        &self,
+        cids: Vec<Cid>,
+        peers: Vec<BitswapPeer>,
+        context: BitswapCommandContext,
     ) -> Result<Result<BitswapFetchBatchResult>> {
         if cids.is_empty() {
             return Err(RetrievalError::Bitswap(
@@ -6803,8 +6892,7 @@ impl SharedBitswapClient {
                 sent_at: Instant::now(),
                 respond: Some(respond),
                 reason: "fetch",
-                top_level_path: None,
-                gateway_subresource: false,
+                context,
             })
             .await
             .map_err(|_| RetrievalError::Bitswap("shared bitswap swarm stopped".into()))?;
@@ -6851,8 +6939,11 @@ impl SharedBitswapClient {
                 sent_at: Instant::now(),
                 respond: None,
                 reason,
-                top_level_path,
-                gateway_subresource,
+                context: BitswapCommandContext {
+                    top_level_path,
+                    gateway_subresource,
+                    zero_http_provider: false,
+                },
             })
             .await
             .map_err(|_| RetrievalError::Bitswap("shared bitswap swarm stopped".into()))?;
@@ -6971,6 +7062,7 @@ async fn run_shared_bitswap_swarm(
     let mut connection_wait_started = HashMap::<PeerId, Instant>::new();
     let mut preconnect_waiters = Vec::<HeldPreconnectWaiter>::new();
     let mut connection_error_backoff = HashMap::<PeerId, ConnectionErrorBackoff>::new();
+    let mut connection_dial_contexts = HashMap::<PeerId, BitswapDialContext>::new();
     let dial_errors = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let peer_transports = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
@@ -6984,10 +7076,11 @@ async fn run_shared_bitswap_swarm(
                 prune_preconnect_waiters(&mut preconnect_waiters);
                 prune_connection_waiters(&mut connection_waiters, &mut connection_wait_started);
                 prune_connection_error_backoff(&mut connection_error_backoff, Instant::now());
+                prune_connection_dial_contexts(&mut connection_dial_contexts, Instant::now());
                 if command.cids.is_empty() {
                     let reason = command.reason;
-                    let top_level_path = command.top_level_path;
-                    let gateway_subresource = command.gateway_subresource;
+                    let command_context = command.context;
+                    let dial_context = BitswapDialContext::new(reason, command_context.clone());
                     let mut peer_plans = Vec::new();
                     let mut dial_candidates = Vec::new();
                     for peer in command.peers {
@@ -6999,8 +7092,9 @@ async fn run_shared_bitswap_swarm(
                             tracing::info!(
                                 phase = "bitswap_provider_preconnect_peer_skipped",
                                 reason,
-                                top_level_path = %top_level_path.as_deref().unwrap_or(""),
-                                gateway_subresource,
+                                top_level_path = %command_context.top_level_path.as_deref().unwrap_or(""),
+                                gateway_subresource = command_context.gateway_subresource,
+                                zero_http_provider = command_context.zero_http_provider,
                                 peer = %peer.id,
                                 remaining_ms
                             );
@@ -7063,8 +7157,9 @@ async fn run_shared_bitswap_swarm(
                     tracing::info!(
                         phase = "bitswap_provider_preconnect_plan",
                         reason,
-                        top_level_path = %top_level_path.as_deref().unwrap_or(""),
-                        gateway_subresource,
+                        top_level_path = %command_context.top_level_path.as_deref().unwrap_or(""),
+                        gateway_subresource = command_context.gateway_subresource,
+                        zero_http_provider = command_context.zero_http_provider,
                         peer_count = candidate_peer_count,
                         candidate_peer_count,
                         candidate_dial_peer_count,
@@ -7086,6 +7181,7 @@ async fn run_shared_bitswap_swarm(
                         match swarm.dial(dial_addr) {
                             Ok(()) => {
                                 started_dial_peers.insert(peer_id);
+                                connection_dial_contexts.insert(peer_id, dial_context.clone());
                             }
                             Err(err) => {
                                 let error_detail = format_error_detail(&err);
@@ -7094,8 +7190,9 @@ async fn run_shared_bitswap_swarm(
                                 tracing::info!(
                                     phase = "bitswap_provider_preconnect_dial_rejected",
                                     reason,
-                                    top_level_path = %top_level_path.as_deref().unwrap_or(""),
-                                    gateway_subresource,
+                                    top_level_path = %command_context.top_level_path.as_deref().unwrap_or(""),
+                                    gateway_subresource = command_context.gateway_subresource,
+                                    zero_http_provider = command_context.zero_http_provider,
                                     peer = %peer_id,
                                     transport,
                                     connection_limit,
@@ -7115,8 +7212,9 @@ async fn run_shared_bitswap_swarm(
                         tracing::info!(
                             phase = "bitswap_provider_preconnect_dial_waiters_dropped",
                             reason,
-                            top_level_path = %top_level_path.as_deref().unwrap_or(""),
-                            gateway_subresource,
+                            top_level_path = %command_context.top_level_path.as_deref().unwrap_or(""),
+                            gateway_subresource = command_context.gateway_subresource,
+                            zero_http_provider = command_context.zero_http_provider,
                             peer_count = scheduled_dial_peers.len().saturating_sub(started_dial_peers.len()),
                             waiter_count = failed_dial_waiter_count
                         );
@@ -7127,6 +7225,9 @@ async fn run_shared_bitswap_swarm(
                 let cids = command.cids;
                 let cid_count = cids.len();
                 let primary_cid = cids[0];
+                let command_context = command.context;
+                let dial_context =
+                    BitswapDialContext::new(command.reason, command_context.clone());
                 let cid_summary =
                     tracing::enabled!(tracing::Level::INFO).then(|| format_cids(&cids));
                 let (incoming_result, incoming_results) = mpsc::unbounded_channel();
@@ -7153,6 +7254,9 @@ async fn run_shared_bitswap_swarm(
                             cid = %primary_cid,
                             cids = %cid_summary.as_deref().unwrap_or(""),
                             cid_count,
+                            top_level_path = %command_context.top_level_path.as_deref().unwrap_or(""),
+                            gateway_subresource = command_context.gateway_subresource,
+                            zero_http_provider = command_context.zero_http_provider,
                             peer = %peer.id,
                             remaining_ms
                         );
@@ -7236,6 +7340,9 @@ async fn run_shared_bitswap_swarm(
                     suppressed_dial_peer_count,
                     pending_dial_peer_count,
                     connected_peer_count,
+                    top_level_path = %command_context.top_level_path.as_deref().unwrap_or(""),
+                    gateway_subresource = command_context.gateway_subresource,
+                    zero_http_provider = command_context.zero_http_provider,
                     command_queued_ms,
                     direct_untrusted_want_block_limit = bitswap_direct_want_block_untrusted_peer_limit(),
                     targets = %target_summary.as_deref().unwrap_or("")
@@ -7248,6 +7355,7 @@ async fn run_shared_bitswap_swarm(
                     match swarm.dial(dial_addr) {
                         Ok(()) => {
                             started_dial_peers.insert(peer_id);
+                            connection_dial_contexts.insert(peer_id, dial_context.clone());
                         }
                         Err(err) => {
                             let error_detail = format_error_detail(&err);
@@ -7255,6 +7363,12 @@ async fn run_shared_bitswap_swarm(
                             record_dial_error(&dial_errors, peer_id, error_detail.clone()).await;
                             tracing::info!(
                                 phase = "bitswap_dial_rejected",
+                                cid = %primary_cid,
+                                cids = %cid_summary.as_deref().unwrap_or(""),
+                                cid_count,
+                                top_level_path = %command_context.top_level_path.as_deref().unwrap_or(""),
+                                gateway_subresource = command_context.gateway_subresource,
+                                zero_http_provider = command_context.zero_http_provider,
                                 peer = %peer_id,
                                 transport,
                                 connection_limit,
@@ -7276,6 +7390,9 @@ async fn run_shared_bitswap_swarm(
                         cid = %primary_cid,
                         cids = %cid_summary.as_deref().unwrap_or(""),
                         cid_count,
+                        top_level_path = %command_context.top_level_path.as_deref().unwrap_or(""),
+                        gateway_subresource = command_context.gateway_subresource,
+                        zero_http_provider = command_context.zero_http_provider,
                         peer_count = scheduled_dial_peers.len().saturating_sub(started_dial_peers.len()),
                         waiter_count = failed_dial_waiter_count
                     );
@@ -7464,6 +7581,7 @@ async fn run_shared_bitswap_swarm(
                         ..
                     } => {
                         *connected_peers.entry(peer_id).or_default() += 1;
+                        connection_dial_contexts.remove(&peer_id);
                         let wait_elapsed_ms = connection_wait_started
                             .remove(&peer_id)
                             .map(|started| started.elapsed().as_millis())
@@ -7530,6 +7648,7 @@ async fn run_shared_bitswap_swarm(
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                         let error_detail = format_error_detail(&error);
                         if let Some(peer_id) = peer_id {
+                            let dial_context = connection_dial_contexts.get(&peer_id);
                             record_dial_error(&dial_errors, peer_id, error_detail.clone()).await;
                             if let Some(backoff) = record_connection_error_backoff(
                                 &mut connection_error_backoff,
@@ -7540,6 +7659,14 @@ async fn run_shared_bitswap_swarm(
                                 tracing::info!(
                                     phase = "bitswap_connection_error_backoff",
                                     peer = %peer_id,
+                                    reason = dial_context.map(|context| context.reason).unwrap_or(""),
+                                    top_level_path = %dial_context
+                                        .and_then(|context| context.command.top_level_path.as_deref())
+                                        .unwrap_or(""),
+                                    gateway_subresource = dial_context
+                                        .is_some_and(|context| context.command.gateway_subresource),
+                                    zero_http_provider = dial_context
+                                        .is_some_and(|context| context.command.zero_http_provider),
                                     error_class = backoff.class,
                                     count = backoff.count,
                                     threshold = bitswap_connection_error_backoff_threshold(),
@@ -7550,6 +7677,20 @@ async fn run_shared_bitswap_swarm(
                         tracing::info!(
                             phase = "bitswap_connection_error",
                             peer = peer_id.map(|peer| peer.to_string()).unwrap_or_default(),
+                            reason = peer_id
+                                .and_then(|peer| connection_dial_contexts.get(&peer))
+                                .map(|context| context.reason)
+                                .unwrap_or(""),
+                            top_level_path = %peer_id
+                                .and_then(|peer| connection_dial_contexts.get(&peer))
+                                .and_then(|context| context.command.top_level_path.as_deref())
+                                .unwrap_or(""),
+                            gateway_subresource = peer_id
+                                .and_then(|peer| connection_dial_contexts.get(&peer))
+                                .is_some_and(|context| context.command.gateway_subresource),
+                            zero_http_provider = peer_id
+                                .and_then(|peer| connection_dial_contexts.get(&peer))
+                                .is_some_and(|context| context.command.zero_http_provider),
                             error = %error,
                             error_debug = ?error
                         );
@@ -7613,6 +7754,15 @@ fn prune_connection_error_backoff(
             || state
                 .suppress_until
                 .is_some_and(|suppress_until| suppress_until > now)
+    });
+}
+
+fn prune_connection_dial_contexts(
+    contexts: &mut HashMap<PeerId, BitswapDialContext>,
+    now: Instant,
+) {
+    contexts.retain(|_, context| {
+        now.duration_since(context.started) <= BITSWAP_CONNECTION_ERROR_BACKOFF_TTL
     });
 }
 
@@ -14798,6 +14948,71 @@ mod bitswap_tests {
         prune_preconnect_waiters(&mut waiters);
 
         assert_eq!(waiters.len(), 1);
+    }
+
+    #[test]
+    fn bitswap_command_context_captures_gateway_zero_http_subresource() {
+        let context = RetrievalRequestContext::gateway_request_with_top_level(
+            Some(7),
+            Some("/ipns/ipfs.tech/".to_owned()),
+        );
+
+        let command_context = BitswapCommandContext::from_retrieval_context(Some(&context), 0);
+
+        assert_eq!(
+            command_context.top_level_path.as_deref(),
+            Some("/ipns/ipfs.tech/")
+        );
+        assert!(command_context.gateway_subresource);
+        assert!(command_context.zero_http_provider);
+
+        let http_backed_context = BitswapCommandContext::from_retrieval_context(Some(&context), 1);
+        assert!(!http_backed_context.zero_http_provider);
+    }
+
+    #[test]
+    fn bitswap_command_context_defaults_for_non_gateway_fetch() {
+        let command_context = BitswapCommandContext::from_retrieval_context(None, 0);
+
+        assert!(command_context.top_level_path.is_none());
+        assert!(!command_context.gateway_subresource);
+        assert!(command_context.zero_http_provider);
+    }
+
+    #[test]
+    fn prunes_expired_bitswap_dial_contexts() {
+        let retained_peer =
+            parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let expired_peer =
+            parse_peer_id("12D3KooWLrHNtnKacjkq6cAVdmQDy1n3GUrZrJ8qzcyzqcnzMQ1x").unwrap();
+        let now = Instant::now();
+        let mut contexts = HashMap::from([
+            (
+                retained_peer,
+                BitswapDialContext {
+                    reason: "fetch",
+                    command: BitswapCommandContext::default(),
+                    started: now,
+                },
+            ),
+            (
+                expired_peer,
+                BitswapDialContext {
+                    reason: "fetch",
+                    command: BitswapCommandContext::default(),
+                    started: now
+                        .checked_sub(
+                            BITSWAP_CONNECTION_ERROR_BACKOFF_TTL + Duration::from_millis(1),
+                        )
+                        .unwrap(),
+                },
+            ),
+        ]);
+
+        prune_connection_dial_contexts(&mut contexts, now);
+
+        assert!(contexts.contains_key(&retained_peer));
+        assert!(!contexts.contains_key(&expired_peer));
     }
 
     #[test]

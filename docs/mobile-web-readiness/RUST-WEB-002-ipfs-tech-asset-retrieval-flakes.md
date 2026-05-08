@@ -42787,3 +42787,91 @@ Next useful work:
    threshold `1`.
 3. Validate the scoped policy against a fresh `ipfs.tech` bad window plus the
    same three-case no-env guardrail before promotion.
+
+## 2026-05-08: Bitswap Dial Context Diagnostics
+
+Branch/head before change: `codex/kubo-session-performance-20260506` at
+`5a8502d`.
+
+Purpose:
+
+The global backoff-threshold guardrail showed that threshold `1` should not be
+promoted broadly, but the focused bad-window run still points at a narrower
+class: concrete Bitswap connection errors during sparse zero-HTTP subresource
+fetches. The missing diagnostic was that `bitswap_connection_error` and
+`bitswap_connection_error_backoff` could not say which gateway request shape
+started the failed dial.
+
+Change:
+
+- Added an internal `BitswapCommandContext` carrying:
+  - `top_level_path`
+  - `gateway_subresource`
+  - `zero_http_provider`
+- Preserved that context through provider-backed Bitswap fetches, recent-peer
+  session shortcut fetches, and range batch recent-peer fetches.
+- Added a bounded `BitswapDialContext` map in the shared Bitswap swarm actor.
+  It is pruned with the existing connection-error backoff TTL.
+- Added `top_level_path`, `gateway_subresource`, and `zero_http_provider` to
+  Bitswap dial planning, dial rejection, peer skip, waiter-drop, connection
+  error, and connection backoff traces.
+- No default behavior changed. This is diagnostics only.
+
+Focused validation:
+
+```sh
+cargo fmt --all --check
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo test -p freedom-ipfs-retrieval bitswap_command_context -- --nocapture
+cargo test -p freedom-ipfs-retrieval prunes_expired_bitswap_dial_contexts -- --nocapture
+cargo test -p freedom-ipfs-retrieval dropped_bitswap_fetch_cancels_open_peer_stream -- --nocapture
+```
+
+Result:
+
+- All commands passed.
+
+Live trace smoke:
+
+```sh
+timeout 420s cargo run -p mobile-web-harness -- \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 1 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/bitswap-context-trace-smoke-ipfs-tech-r1-20260508T012622Z-trace.jsonl \
+  --output /tmp/bitswap-context-trace-smoke-ipfs-tech-r1-20260508T012622Z.json
+```
+
+Result:
+
+- Rust passed `1/1`.
+- Root: `1436/1436ms`.
+- Assets: `195/898ms`.
+- Resource max: `56940KiB` RSS and `28` FDs.
+- The run was HTTP-provider-heavy and did not produce connection errors, so it
+  was not performance evidence.
+- Raw trace check found `10` `bitswap_dial_plan` events with
+  `gateway_subresource=true`, `zero_http_provider=true`, and
+  `top_level_path=/ipns/ipfs.tech/`, confirming that recent-peer/session
+  Bitswap fetches now carry the request context needed for future
+  connection-error attribution.
+
+Decision:
+
+Keep this diagnostic increment. The next bad-window experiment should be able
+to separate:
+
+- top-level zero-HTTP connection errors
+- subresource zero-HTTP connection errors
+- HTTP-provider-backed connection errors
+- session shortcut connection errors
+
+Next useful work remains a scoped lab/policy for connection-error backoff
+threshold `1`, limited to the subresource zero-HTTP shape if live traces confirm
+that is where the repeated failures occur.
