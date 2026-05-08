@@ -1947,8 +1947,7 @@ fn print_meaningful_kubo_wins(report: &ComparisonReport) {
         .collect::<Vec<_>>();
     if wins.is_empty() {
         println!(
-            "meaningful_kubo_wins: none (delta>={}ms ratio>={:.2}x)",
-            MEANINGFUL_KUBO_WIN_MIN_DELTA_MS, MEANINGFUL_KUBO_WIN_MIN_RATIO
+            "meaningful_kubo_wins: none (delta>={MEANINGFUL_KUBO_WIN_MIN_DELTA_MS}ms ratio>={MEANINGFUL_KUBO_WIN_MIN_RATIO:.2}x)"
         );
         return;
     }
@@ -2269,8 +2268,7 @@ fn print_trace_slow_details(trace: &TraceSummary) {
                 || !cid.bitswap_source_peers.is_empty()
             {
                 println!(
-                    "      bitswap_source_candidate_indexes={} bitswap_source_peers={}",
-                    bitswap_source_candidate_indexes, bitswap_source_peers
+                    "      bitswap_source_candidate_indexes={bitswap_source_candidate_indexes} bitswap_source_peers={bitswap_source_peers}"
                 );
             }
         }
@@ -11432,10 +11430,7 @@ fn format_progress_request_source_details(request: &TraceProgressRequestAggregat
     } else {
         format_trace_counts(&request.http_provider_fetch_providers)
     };
-    format!(
-        " block_sources={} http_providers={}",
-        block_sources, http_providers
-    )
+    format!(" block_sources={block_sources} http_providers={http_providers}")
 }
 
 fn trace_error_key(phase: &str, value: &serde_json::Value) -> Option<String> {

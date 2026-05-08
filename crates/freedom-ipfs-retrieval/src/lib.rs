@@ -1320,18 +1320,16 @@ impl HttpRetriever {
             {
                 return Ok((block, source));
             }
-        } else {
-            if let Some(block) = self
-                .fetch_from_http_provider_candidates(
-                    cid,
-                    http_provider_bases,
-                    options.single_http_5xx_fast_bitswap_fallback
-                        && bitswap_provider_candidate_available,
-                )
-                .await?
-            {
-                return Ok((block, RetrievalSource::HttpProvider));
-            }
+        } else if let Some(block) = self
+            .fetch_from_http_provider_candidates(
+                cid,
+                http_provider_bases,
+                options.single_http_5xx_fast_bitswap_fallback
+                    && bitswap_provider_candidate_available,
+            )
+            .await?
+        {
+            return Ok((block, RetrievalSource::HttpProvider));
         }
         if top_level_single_http_failed_direct_ip_bitswap_fallback_allows(
             options.top_level_single_http_failed_direct_ip_bitswap_fallback,

@@ -1858,7 +1858,7 @@ mod tests {
         ));
         assert!(lab_drop_http_providers_for_cid_from_env_value(
             &cid,
-            Some(&format!("  {other}, {}  ", cid))
+            Some(&format!("  {other}, {cid}  "))
         ));
         assert!(lab_drop_http_providers_for_cid_from_env_value(
             &cid,
