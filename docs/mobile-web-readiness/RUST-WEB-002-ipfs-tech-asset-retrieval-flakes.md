@@ -41871,3 +41871,133 @@ slow". Candidate conditions:
   yields a high-confidence direct peer.
 - Continue studying why Kubo serves the Sia-only asset CIDs faster without
   paying Kubo-like RSS/FD costs.
+
+## 2026-05-08: Keep Disabled Lab - Session-Only Single-HTTP Bitswap Hedge
+
+Branch/head before change:
+
+- `codex/kubo-session-performance-20260506`
+- `3ad2ea8`
+
+Hypothesis:
+
+The broad single-HTTP Bitswap hedge was too expensive because it cold-expanded
+provider candidates. A narrower variant might be safe if it only races a recent
+successful/session Bitswap peer, never a cold provider set, when there is exactly
+one HTTP provider.
+
+Change:
+
+- Added disabled lab flag
+  `FREEDOM_IPFS_ENABLE_SINGLE_HTTP_SESSION_BITSWAP_HEDGE=1`.
+- When enabled, a single-HTTP provider fetch may race only the current recent
+  Bitswap session peers after `FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS`
+  or the default `150ms`.
+- The fallback does not expand cold Bitswap provider records and does not require
+  the current provider set to contain a Bitswap candidate.
+- Existing broad
+  `FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1` behavior remains separate.
+- Default behavior is unchanged.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval session_bitswap_hedge_uses_recent_peer_without_cold_provider_expansion -- --nocapture
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo test -p freedom-ipfs-retrieval -- --nocapture
+```
+
+Validation result:
+
+- `cargo fmt --all --check`: passed.
+- Focused session-hedge test: passed.
+- `cargo check -p freedom-ipfs-retrieval --all-targets`: passed.
+- `cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings`:
+  passed.
+- Full retrieval test package: passed, `145` tests, `1` ignored Kubo loopback
+  test.
+
+Session-only hedge r3 command:
+
+```sh
+timeout 1200s env \
+  FREEDOM_IPFS_ENABLE_SINGLE_HTTP_SESSION_BITSWAP_HEDGE=1 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --repeat 3 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --case ipfs-tech-page-assets \
+    --trace-output /tmp/ipfs-tech-single-http-session-hedge-r3-20260508T003409Z-trace.jsonl \
+    --comparison-output /tmp/ipfs-tech-single-http-session-hedge-r3-20260508T003409Z.json
+```
+
+Session-only hedge r3 result:
+
+- Rust/Kubo passed `3/3`.
+- `ipfs.tech` root: Rust `680/1393ms`; Kubo `1448/2446ms`.
+- `ipfs.tech` assets: Rust `189/885ms`; Kubo `131/527ms`.
+- `meaningful_kubo_wins`: `4`, the asset p50/p95 TTFB/total aggregates.
+- Resource max: Rust `56348KiB` RSS and `30` FDs vs Kubo `248088KiB` RSS
+  and `258` FDs.
+
+Session-only hedge trace:
+
+- The lab path barely applied: `bitswap hedge starts=1`,
+  `result_sources=http_provider=1`, and `skip_reasons=no_session_peers=53`.
+- FD pressure stayed low: Rust `30` FDs.
+- Bitswap pressure stayed low compared with the broad hedge: `17` peer attempts,
+  `13` commands, and `3` established connections. Most of that was normal
+  zero-HTTP root/session activity, not the session-only hedge.
+- The slow rows remained Sia-backed HTTP-provider rows, especially
+  `_nuxt/BXkYzPrD.js`, with HTTP max `1150ms`, header max `621ms`, and body max
+  `1136ms`.
+
+Immediate no-env post-control command:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/ipfs-tech-single-http-session-hedge-post-control-r3-20260508T003409Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-single-http-session-hedge-post-control-r3-20260508T003409Z.json
+```
+
+Immediate no-env post-control result:
+
+- Rust/Kubo passed `3/3`.
+- `ipfs.tech` root: Rust `531/699ms`; Kubo `1254/1643ms`.
+- `ipfs.tech` assets: Rust `197/498ms`; Kubo `104/519ms`.
+- `meaningful_kubo_wins`: `2`, both asset median TTFB/total.
+- Resource max: Rust `53500KiB` RSS and `33` FDs vs Kubo `162524KiB` RSS
+  and `94` FDs.
+
+Immediate no-env post-control trace:
+
+- No Bitswap hedge starts.
+- HTTP-provider block fetch p50/p95/max was `191/333/428ms`.
+- Single-provider Sia winner p50/p95/max was `182/357/367ms`.
+- The remaining path-local Kubo wins were still HTTP-provider/UnixFS wrapper
+  rows, not session-peer availability rows.
+
+Decision:
+
+Keep the session-only hedge disabled as a lab control, but do not promote it.
+It validates the safer shape mechanically and does not recreate the broad hedge's
+resource spike, but it does not close the active `ipfs.tech` gap because the
+target single-HTTP Sia-backed asset rows usually have no recent session peer
+available. The remaining work is still provider/source selection for those
+single-provider HTTP rows, not another generic Bitswap hedge.

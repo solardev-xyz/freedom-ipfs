@@ -61,6 +61,8 @@ const SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS";
 const SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS_ENV: &str =
     "FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS";
+const ENABLE_SINGLE_HTTP_SESSION_BITSWAP_HEDGE_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_SINGLE_HTTP_SESSION_BITSWAP_HEDGE";
 const ENABLE_SINGLE_HTTP_5XX_FAST_BITSWAP_FALLBACK_ENV: &str =
     "FREEDOM_IPFS_ENABLE_SINGLE_HTTP_5XX_FAST_BITSWAP_FALLBACK";
 const ENABLE_TOP_LEVEL_SINGLE_HTTP_FAILED_DIRECT_IP_BITSWAP_FALLBACK_ENV: &str =
@@ -1177,25 +1179,53 @@ impl HttpRetriever {
             http_provider_count,
             bitswap_provider_candidate_available,
         );
-        if http_provider_count == 1
-            && single_http_provider_bitswap_hedge_enabled()
-            && bitswap_provider_candidate_available
-            && self
-                .single_http_provider_bitswap_hedge_score_allows(
-                    cid,
-                    http_provider_bases
-                        .first()
-                        .expect("single HTTP provider base is present"),
-                )
-                .await
-        {
-            return self
-                .fetch_single_http_provider_with_bitswap_hedge(
-                    cid,
-                    http_provider_bases,
-                    providers.to_vec(),
-                )
-                .await;
+        if http_provider_count == 1 {
+            let single_http_base = http_provider_bases
+                .first()
+                .expect("single HTTP provider base is present")
+                .clone();
+            if options.single_http_session_bitswap_hedge
+                && self
+                    .single_http_provider_bitswap_hedge_score_allows(cid, &single_http_base)
+                    .await
+            {
+                let recent_peers = self.recent_bitswap_peers_for_fetch().await;
+                if !recent_peers.is_empty() {
+                    return self
+                        .fetch_single_http_provider_with_session_bitswap_hedge(
+                            cid,
+                            http_provider_bases.clone(),
+                            recent_peers,
+                        )
+                        .await;
+                }
+                tracing::info!(
+                    phase = "http_provider_bitswap_hedge_skip",
+                    cid = %cid,
+                    provider = %single_http_base,
+                    reason = "no_session_peers",
+                    provider_scored = false,
+                    provider_score_ms = 0u128,
+                    min_score_ms = single_http_provider_bitswap_hedge_min_score()
+                        .map(|score| score.as_millis())
+                        .unwrap_or_default(),
+                    session_peer_only = true
+                );
+            }
+            if single_http_provider_bitswap_hedge_enabled()
+                && bitswap_provider_candidate_available
+                && self
+                    .single_http_provider_bitswap_hedge_score_allows(cid, &single_http_base)
+                    .await
+            {
+                return self
+                    .fetch_single_http_provider_with_bitswap_hedge(
+                        cid,
+                        http_provider_bases,
+                        providers.to_vec(),
+                    )
+                    .await;
+            }
         }
         if top_level_multi_http_failed_direct_ip_bitswap_fallback_allows(
             options.top_level_multi_http_failed_direct_ip_bitswap_fallback,
@@ -2728,6 +2758,165 @@ impl HttpRetriever {
                         *cid,
                         providers.clone(),
                         provider_count,
+                        started,
+                        "slow_single_http_provider",
+                    );
+                }
+                else => break,
+            }
+        }
+
+        match bitswap_error {
+            Some(RetrievalError::NoBitswapProviders) | None => Err(RetrievalError::NoHttpProviders),
+            Some(err) => Err(err),
+        }
+    }
+
+    async fn fetch_single_http_provider_with_session_bitswap_hedge(
+        &self,
+        cid: &Cid,
+        http_provider_bases: Vec<Url>,
+        recent_peers: Vec<BitswapPeer>,
+    ) -> Result<(Block, RetrievalSource)> {
+        let started = Instant::now();
+        let candidates = self
+            .scored_http_provider_candidates(http_provider_bases)
+            .await;
+        let scored_provider_count = candidates
+            .iter()
+            .filter(|candidate| candidate.score_elapsed.is_some())
+            .count();
+        let scoring_enabled = http_provider_scoring_enabled();
+        let session_peer_count = recent_peers.len();
+        tracing::info!(
+            phase = "http_provider_race",
+            cid = %cid,
+            provider_count = candidates.len(),
+            race_width = HTTP_PROVIDER_RACE_WIDTH,
+            scored_provider_count,
+            scoring_enabled,
+            single_provider_bitswap_hedge = true,
+            session_peer_only = true,
+            session_peer_count
+        );
+        let Some(candidate) = candidates.into_iter().next() else {
+            return Err(RetrievalError::NoHttpProviders);
+        };
+        let mut pending =
+            FuturesUnordered::<BoxFuture<'static, SingleHttpProviderBitswapHedgeResult>>::new();
+
+        let retriever = self.clone();
+        let http_cid = *cid;
+        pending.push(
+            async move {
+                SingleHttpProviderBitswapHedgeResult::HttpCandidate(
+                    retriever
+                        .fetch_from_http_provider_candidate_with_index(http_cid, 0, candidate, 0)
+                        .await,
+                )
+            }
+            .boxed(),
+        );
+
+        let bitswap_hedge_after = single_http_provider_bitswap_hedge_after();
+        let hedge = tokio::time::sleep(bitswap_hedge_after);
+        tokio::pin!(hedge);
+        let mut bitswap_started = false;
+        let mut http_done = false;
+        let mut bitswap_error = None;
+
+        loop {
+            tokio::select! {
+                biased;
+
+                result = pending.next(), if !pending.is_empty() => {
+                    let Some(result) = result else {
+                        break;
+                    };
+                    match result {
+                        SingleHttpProviderBitswapHedgeResult::HttpCandidate(result) => {
+                            http_done = true;
+                            match result.result {
+                                Ok(block) => {
+                                    tracing::info!(
+                                        phase = "http_provider_race_result",
+                                        cid = %cid,
+                                        ok = true,
+                                        provider = %result.base,
+                                        winner_provider_index = result.provider_index,
+                                        winner_attempt_index = result.attempt_index,
+                                        winner_provider_rank = result.provider_index + 1,
+                                        winner_original_provider_rank = result.original_provider_index + 1,
+                                        winner_within_initial_width = true,
+                                        provider_count = 1usize,
+                                        race_width = HTTP_PROVIDER_RACE_WIDTH,
+                                        scored_provider_count,
+                                        winner_provider_scored = result.score_elapsed.is_some(),
+                                        winner_provider_score_ms = result
+                                            .score_elapsed
+                                            .map(|elapsed| elapsed.as_millis())
+                                            .unwrap_or_default(),
+                                        single_provider_bitswap_hedge = true,
+                                        session_peer_only = true,
+                                        session_peer_count,
+                                        bitswap_started,
+                                        elapsed_ms = started.elapsed().as_millis()
+                                    );
+                                    tracing::info!(
+                                        phase = "http_provider_bitswap_hedge_result",
+                                        cid = %cid,
+                                        source = "http_provider",
+                                        provider_count = 1usize,
+                                        session_peer_only = true,
+                                        session_peer_count,
+                                        bitswap_started,
+                                        elapsed_ms = started.elapsed().as_millis()
+                                    );
+                                    return Ok((block, RetrievalSource::HttpProvider));
+                                }
+                                Err(_) => {
+                                    if !bitswap_started {
+                                        bitswap_started = true;
+                                        push_single_http_session_bitswap_hedge(
+                                            &mut pending,
+                                            self.clone(),
+                                            *cid,
+                                            recent_peers.clone(),
+                                            started,
+                                            "http_provider_failed",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        SingleHttpProviderBitswapHedgeResult::Bitswap(Ok(block)) => {
+                            tracing::info!(
+                                phase = "http_provider_bitswap_hedge_result",
+                                cid = %cid,
+                                source = "bitswap",
+                                provider_count = 1usize,
+                                session_peer_only = true,
+                                session_peer_count,
+                                http_done,
+                                elapsed_ms = started.elapsed().as_millis()
+                            );
+                            return Ok((block, RetrievalSource::Bitswap));
+                        }
+                        SingleHttpProviderBitswapHedgeResult::Bitswap(Err(err)) => {
+                            bitswap_error = Some(err);
+                            if http_done {
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ = &mut hedge, if !bitswap_started => {
+                    bitswap_started = true;
+                    push_single_http_session_bitswap_hedge(
+                        &mut pending,
+                        self.clone(),
+                        *cid,
+                        recent_peers.clone(),
                         started,
                         "slow_single_http_provider",
                     );
@@ -5272,6 +5461,7 @@ struct HttpProviderCandidateResult {
 #[derive(Clone, Copy, Default)]
 struct ProviderFetchOptions {
     single_http_5xx_fast_bitswap_fallback: bool,
+    single_http_session_bitswap_hedge: bool,
     top_level_single_http_failed_direct_ip_bitswap_fallback: bool,
     top_level_multi_http_failed_direct_ip_bitswap_fallback: bool,
 }
@@ -5280,6 +5470,7 @@ impl ProviderFetchOptions {
     fn from_env() -> Self {
         Self {
             single_http_5xx_fast_bitswap_fallback: single_http_5xx_fast_bitswap_fallback_enabled(),
+            single_http_session_bitswap_hedge: single_http_session_bitswap_hedge_enabled(),
             top_level_single_http_failed_direct_ip_bitswap_fallback:
                 top_level_single_http_failed_direct_ip_bitswap_fallback_enabled(),
             top_level_multi_http_failed_direct_ip_bitswap_fallback:
@@ -5321,6 +5512,10 @@ fn single_http_provider_self_hedge_min_score() -> Option<Duration> {
 
 fn single_http_provider_bitswap_hedge_enabled() -> bool {
     std::env::var_os(ENABLE_SINGLE_HTTP_BITSWAP_HEDGE_ENV).is_some()
+}
+
+fn single_http_session_bitswap_hedge_enabled() -> bool {
+    std::env::var_os(ENABLE_SINGLE_HTTP_SESSION_BITSWAP_HEDGE_ENV).is_some()
 }
 
 fn single_http_provider_bitswap_hedge_after() -> Duration {
@@ -6183,6 +6378,37 @@ fn push_single_http_bitswap_hedge(
                     .fetch_from_bitswap_providers(&cid, &providers, None)
                     .await,
             )
+        }
+        .boxed(),
+    );
+}
+
+fn push_single_http_session_bitswap_hedge(
+    pending: &mut FuturesUnordered<BoxFuture<'static, SingleHttpProviderBitswapHedgeResult>>,
+    retriever: HttpRetriever,
+    cid: Cid,
+    recent_peers: Vec<BitswapPeer>,
+    started: Instant,
+    reason: &'static str,
+) {
+    let session_peer_count = recent_peers.len();
+    tracing::info!(
+        phase = "http_provider_bitswap_hedge",
+        cid = %cid,
+        provider_count = 1usize,
+        timeout_ms = single_http_provider_bitswap_hedge_after().as_millis(),
+        reason,
+        session_peer_only = true,
+        session_peer_count,
+        elapsed_ms = started.elapsed().as_millis()
+    );
+    pending.push(
+        async move {
+            let result = retriever
+                .fetch_from_recent_bitswap_peers(&cid, recent_peers)
+                .await
+                .and_then(|block| block.ok_or(RetrievalError::NoBitswapProviders));
+            SingleHttpProviderBitswapHedgeResult::Bitswap(result)
         }
         .boxed(),
     );
@@ -13530,6 +13756,60 @@ mod bitswap_tests {
             started.elapsed() < Duration::from_secs(3),
             "bitswap hedge should beat the slow HTTP provider"
         );
+        assert_eq!(http_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
+        tokio::time::timeout(Duration::from_secs(5), bitswap_stream)
+            .await
+            .unwrap()
+            .unwrap();
+        bitswap_swarm.abort();
+        http_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_bitswap_hedge_uses_recent_peer_without_cold_provider_expansion() {
+        let expected = b"verified single HTTP session bitswap hedge block";
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, expected);
+        let http_requests = Arc::new(AtomicU64::new(0));
+        let (http_addr, http_task) = spawn_hanging_http_provider(http_requests.clone()).await;
+        let (peer_id, bitswap_addr, bitswap_swarm, bitswap_stream) =
+            spawn_local_bitswap_peer(cid, expected.to_vec()).await;
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        );
+        retriever
+            .record_successful_bitswap_peer(peer_id, vec![bitswap_addr], Duration::from_millis(25))
+            .await;
+        let provider = Provider::from_parts(
+            None,
+            vec![format!(
+                "/ip4/{}/tcp/{}/http",
+                http_addr.ip(),
+                http_addr.port()
+            )],
+        )
+        .unwrap();
+
+        let (block, source) = tokio::time::timeout(
+            Duration::from_secs(3),
+            retriever.fetch_from_providers_with_source_with_options(
+                &cid,
+                &[provider],
+                None,
+                ProviderFetchOptions {
+                    single_http_session_bitswap_hedge: true,
+                    ..ProviderFetchOptions::default()
+                },
+            ),
+        )
+        .await
+        .expect("single HTTP session bitswap hedge timed out")
+        .unwrap();
+
+        assert_eq!(source, RetrievalSource::Bitswap);
+        assert_eq!(block.data(), expected);
         assert_eq!(http_requests.load(Ordering::Relaxed), 1);
         assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
         tokio::time::timeout(Duration::from_secs(5), bitswap_stream)
