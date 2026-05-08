@@ -1,47 +1,278 @@
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::header::{
+    ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
+    RANGE,
+};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use bytes::Bytes;
 use cid::Cid;
 use freedom_ipfs_core::{parse_cid, BlockProvider};
-use freedom_ipfs_namesys::{NameResolver, NamesysError};
+use freedom_ipfs_namesys::{NameResolver, NamesysError, ResolvedName};
+use freedom_ipfs_retrieval::{with_retrieval_request_context, RetrievalRequestContext};
 use freedom_ipfs_store::SqliteBlockStore;
 use freedom_ipfs_unixfs::{
-    file_size, list_directory, read_file_range, DirectoryEntry, UnixfsError,
+    DirectoryEntry, NodeKind, UnixfsError, UnixfsMetadataCacheStats, UnixfsResolver,
+    DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY,
 };
 use futures::stream;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
 pub const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
+const GATEWAY_REQUEST_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 const GATEWAY_STREAM_CHUNK_SIZE: u64 = 64 * 1024;
+const GATEWAY_SMALL_BODY_CACHE_MAX_ENTRY_BYTES: usize = GATEWAY_STREAM_CHUNK_SIZE as usize;
+pub const DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_GATEWAY_HTML_PREFETCH_MAX_ASSETS: usize = 0;
+const DEFAULT_GATEWAY_HTML_PREFETCH_MAX_BYTES: u64 = GATEWAY_STREAM_CHUNK_SIZE;
+const DEFAULT_GATEWAY_HTML_PREFETCH_CONCURRENCY: usize = 2;
+const GATEWAY_HTML_PREFETCH_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_DIRS: usize = 0;
+const DEFAULT_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_BYTES: u64 = GATEWAY_STREAM_CHUNK_SIZE;
+const DEFAULT_GATEWAY_HTML_DIRECTORY_PREFETCH_CONCURRENCY: usize = 1;
+const GATEWAY_HTML_DIRECTORY_PREFETCH_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_GATEWAY_HTML_RANGE_WARM_MAX_BYTES: u64 = 0;
+const DEFAULT_GATEWAY_HTML_RANGE_WARM_CONCURRENCY: usize = 1;
+const GATEWAY_HTML_RANGE_WARM_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+const X_FREEDOM_REQUEST_ID: &str = "x-freedom-request-id";
+const X_FREEDOM_PARENT_REQUEST_ID: &str = "x-freedom-parent-request-id";
+const X_FREEDOM_TOP_LEVEL_PATH: &str = "x-freedom-top-level-path";
+const CACHE_CONTROL_IPFS_FILE: &str = "public, max-age=31536000, immutable";
+const CACHE_CONTROL_IPNS_FILE: &str = "no-cache";
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+const DEFAULT_PERSISTENT_NAME_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone, Copy)]
+enum GatewayBodyMode {
+    Direct,
+    Stream,
+}
+
+impl GatewayBodyMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Stream => "stream",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct SmallBodyCacheKey {
+    file_cid: Cid,
+    len: u64,
+}
+
+#[derive(Debug)]
+struct SmallBodyCache {
+    max_bytes: usize,
+    inner: Mutex<SmallBodyCacheInner>,
+}
+
+#[derive(Debug, Default)]
+struct SmallBodyCacheInner {
+    entries: HashMap<SmallBodyCacheKey, Bytes>,
+    order: VecDeque<SmallBodyCacheKey>,
+    bytes: usize,
+}
+
+impl SmallBodyCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            inner: Mutex::new(SmallBodyCacheInner::default()),
+        }
+    }
+
+    fn get(&self, key: &SmallBodyCacheKey) -> Option<Bytes> {
+        if self.max_bytes == 0 {
+            return None;
+        }
+        let mut inner = self.lock_inner();
+        let body = inner.entries.get(key).cloned();
+        if body.is_some() {
+            touch_small_body_cache_order(&mut inner, key);
+        }
+        body
+    }
+
+    fn insert(&self, key: SmallBodyCacheKey, body: Bytes) -> SmallBodyCacheInsert {
+        let body_len = body.len();
+        if self.max_bytes == 0
+            || body_len > self.max_bytes
+            || body_len > GATEWAY_SMALL_BODY_CACHE_MAX_ENTRY_BYTES
+        {
+            return SmallBodyCacheInsert {
+                inserted: false,
+                evicted: 0,
+                cache_len: self.len(),
+                cache_bytes: self.bytes(),
+            };
+        }
+
+        let mut inner = self.lock_inner();
+        if let Some(previous) = inner.entries.insert(key.clone(), body) {
+            inner.bytes = inner.bytes.saturating_sub(previous.len());
+        }
+        inner.bytes = inner.bytes.saturating_add(body_len);
+        touch_small_body_cache_order(&mut inner, &key);
+
+        let mut evicted = 0usize;
+        while inner.bytes > self.max_bytes {
+            let Some(evicted_key) = inner.order.pop_front() else {
+                break;
+            };
+            if evicted_key == key {
+                inner.order.push_back(evicted_key);
+                break;
+            }
+            if let Some(evicted_body) = inner.entries.remove(&evicted_key) {
+                inner.bytes = inner.bytes.saturating_sub(evicted_body.len());
+                evicted = evicted.saturating_add(1);
+            }
+        }
+
+        SmallBodyCacheInsert {
+            inserted: true,
+            evicted,
+            cache_len: inner.entries.len(),
+            cache_bytes: inner.bytes,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.lock_inner().entries.len()
+    }
+
+    fn bytes(&self) -> usize {
+        self.lock_inner().bytes
+    }
+
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, SmallBodyCacheInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[derive(Debug)]
+struct SmallBodyCacheInsert {
+    inserted: bool,
+    evicted: usize,
+    cache_len: usize,
+    cache_bytes: usize,
+}
+
+fn touch_small_body_cache_order(inner: &mut SmallBodyCacheInner, key: &SmallBodyCacheKey) {
+    inner.order.retain(|candidate| candidate != key);
+    inner.order.push_back(key.clone());
+}
 
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     max_concurrent_requests: usize,
+    unixfs_metadata_cache_capacity: usize,
+    small_body_cache_max_bytes: usize,
+    html_prefetch: GatewayHtmlPrefetchConfig,
+    html_directory_prefetch: GatewayHtmlDirectoryPrefetchConfig,
+    html_range_warm: GatewayHtmlRangeWarmConfig,
+    raw_link_tsize_fast_headers: bool,
+    stream_small_bodies: bool,
 }
 
 impl GatewayConfig {
     pub fn new(max_concurrent_requests: usize) -> Self {
         Self {
             max_concurrent_requests: max_concurrent_requests.max(1),
+            unixfs_metadata_cache_capacity: DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY,
+            small_body_cache_max_bytes: DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
+            html_prefetch: GatewayHtmlPrefetchConfig::default(),
+            html_directory_prefetch: GatewayHtmlDirectoryPrefetchConfig::default(),
+            html_range_warm: GatewayHtmlRangeWarmConfig::default(),
+            raw_link_tsize_fast_headers: false,
+            stream_small_bodies: false,
         }
     }
 
     pub fn max_concurrent_requests(&self) -> usize {
         self.max_concurrent_requests
+    }
+
+    pub fn unixfs_metadata_cache_capacity(&self) -> usize {
+        self.unixfs_metadata_cache_capacity
+    }
+
+    pub fn with_unixfs_metadata_cache_capacity(mut self, capacity: usize) -> Self {
+        self.unixfs_metadata_cache_capacity = capacity;
+        self
+    }
+
+    pub fn small_body_cache_max_bytes(&self) -> usize {
+        self.small_body_cache_max_bytes
+    }
+
+    pub fn with_small_body_cache_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.small_body_cache_max_bytes = max_bytes;
+        self
+    }
+
+    pub fn html_prefetch(&self) -> GatewayHtmlPrefetchConfig {
+        self.html_prefetch
+    }
+
+    pub fn with_html_prefetch(mut self, html_prefetch: GatewayHtmlPrefetchConfig) -> Self {
+        self.html_prefetch = html_prefetch;
+        self
+    }
+
+    pub fn html_directory_prefetch(&self) -> GatewayHtmlDirectoryPrefetchConfig {
+        self.html_directory_prefetch
+    }
+
+    pub fn with_html_directory_prefetch(
+        mut self,
+        html_directory_prefetch: GatewayHtmlDirectoryPrefetchConfig,
+    ) -> Self {
+        self.html_directory_prefetch = html_directory_prefetch;
+        self
+    }
+
+    pub fn html_range_warm(&self) -> GatewayHtmlRangeWarmConfig {
+        self.html_range_warm
+    }
+
+    pub fn with_html_range_warm(mut self, html_range_warm: GatewayHtmlRangeWarmConfig) -> Self {
+        self.html_range_warm = html_range_warm;
+        self
+    }
+
+    pub fn raw_link_tsize_fast_headers(&self) -> bool {
+        self.raw_link_tsize_fast_headers
+    }
+
+    pub fn with_raw_link_tsize_fast_headers(mut self, enabled: bool) -> Self {
+        self.raw_link_tsize_fast_headers = enabled;
+        self
+    }
+
+    pub fn stream_small_bodies(&self) -> bool {
+        self.stream_small_bodies
+    }
+
+    pub fn with_stream_small_bodies(mut self, enabled: bool) -> Self {
+        self.stream_small_bodies = enabled;
+        self
     }
 }
 
@@ -51,11 +282,224 @@ impl Default for GatewayConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct GatewayHtmlPrefetchConfig {
+    max_assets: usize,
+    max_bytes: u64,
+    concurrency: usize,
+}
+
+impl GatewayHtmlPrefetchConfig {
+    pub fn new(max_assets: usize, max_bytes: u64, concurrency: usize) -> Self {
+        Self {
+            max_assets,
+            max_bytes,
+            concurrency: concurrency.max(1),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self::new(
+            DEFAULT_GATEWAY_HTML_PREFETCH_MAX_ASSETS,
+            DEFAULT_GATEWAY_HTML_PREFETCH_MAX_BYTES,
+            DEFAULT_GATEWAY_HTML_PREFETCH_CONCURRENCY,
+        )
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self.max_assets > 0 && self.max_bytes > 0
+    }
+
+    pub fn max_assets(self) -> usize {
+        self.max_assets
+    }
+
+    pub fn max_bytes(self) -> u64 {
+        self.max_bytes
+    }
+
+    pub fn concurrency(self) -> usize {
+        self.concurrency
+    }
+}
+
+impl Default for GatewayHtmlPrefetchConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GatewayHtmlDirectoryPrefetchConfig {
+    max_dirs: usize,
+    max_bytes: u64,
+    concurrency: usize,
+}
+
+impl GatewayHtmlDirectoryPrefetchConfig {
+    pub fn new(max_dirs: usize, max_bytes: u64, concurrency: usize) -> Self {
+        Self {
+            max_dirs,
+            max_bytes,
+            concurrency: concurrency.max(1),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self::new(
+            DEFAULT_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_DIRS,
+            DEFAULT_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_BYTES,
+            DEFAULT_GATEWAY_HTML_DIRECTORY_PREFETCH_CONCURRENCY,
+        )
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self.max_dirs > 0 && self.max_bytes > 0
+    }
+
+    pub fn max_dirs(self) -> usize {
+        self.max_dirs
+    }
+
+    pub fn max_bytes(self) -> u64 {
+        self.max_bytes
+    }
+
+    pub fn concurrency(self) -> usize {
+        self.concurrency
+    }
+}
+
+impl Default for GatewayHtmlDirectoryPrefetchConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GatewayHtmlRangeWarmConfig {
+    max_bytes: u64,
+    concurrency: usize,
+}
+
+impl GatewayHtmlRangeWarmConfig {
+    pub fn new(max_bytes: u64, concurrency: usize) -> Self {
+        Self {
+            max_bytes,
+            concurrency: concurrency.max(1),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self::new(
+            DEFAULT_GATEWAY_HTML_RANGE_WARM_MAX_BYTES,
+            DEFAULT_GATEWAY_HTML_RANGE_WARM_CONCURRENCY,
+        )
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self.max_bytes > 0
+    }
+
+    pub fn max_bytes(self) -> u64 {
+        self.max_bytes
+    }
+
+    pub fn concurrency(self) -> usize {
+        self.concurrency
+    }
+}
+
+impl Default for GatewayHtmlRangeWarmConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+#[derive(Clone)]
+struct HtmlPrefetchRuntime {
+    config: GatewayHtmlPrefetchConfig,
+    limiter: Arc<Semaphore>,
+}
+
+impl HtmlPrefetchRuntime {
+    fn new(config: GatewayHtmlPrefetchConfig) -> Self {
+        Self {
+            config,
+            limiter: Arc::new(Semaphore::new(config.concurrency())),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.config.is_enabled()
+    }
+}
+
+#[derive(Clone)]
+struct HtmlDirectoryPrefetchRuntime {
+    config: GatewayHtmlDirectoryPrefetchConfig,
+    limiter: Arc<Semaphore>,
+}
+
+impl HtmlDirectoryPrefetchRuntime {
+    fn new(config: GatewayHtmlDirectoryPrefetchConfig) -> Self {
+        Self {
+            config,
+            limiter: Arc::new(Semaphore::new(config.concurrency())),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.config.is_enabled()
+    }
+}
+
+#[derive(Clone)]
+struct HtmlRangeWarmRuntime {
+    config: GatewayHtmlRangeWarmConfig,
+    limiter: Arc<Semaphore>,
+}
+
+impl HtmlRangeWarmRuntime {
+    fn new(config: GatewayHtmlRangeWarmConfig) -> Self {
+        Self {
+            config,
+            limiter: Arc::new(Semaphore::new(config.concurrency())),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.config.is_enabled()
+    }
+}
+
 #[derive(Clone)]
 pub struct GatewayState {
     provider: Arc<dyn BlockProvider>,
     name_resolver: Arc<dyn NameResolver>,
+    unixfs: UnixfsResolver,
     request_limiter: Arc<Semaphore>,
+    small_body_cache: Arc<SmallBodyCache>,
+    html_prefetch: HtmlPrefetchRuntime,
+    html_directory_prefetch: HtmlDirectoryPrefetchRuntime,
+    html_range_warm: HtmlRangeWarmRuntime,
+    raw_link_tsize_fast_headers: bool,
+    stream_small_bodies: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FileCachePolicy {
+    ImmutableIpfs,
+    RevalidateIpns,
+}
+
+impl FileCachePolicy {
+    fn header_value(self) -> &'static str {
+        match self {
+            Self::ImmutableIpfs => CACHE_CONTROL_IPFS_FILE,
+            Self::RevalidateIpns => CACHE_CONTROL_IPNS_FILE,
+        }
+    }
 }
 
 impl GatewayState {
@@ -91,10 +535,21 @@ impl GatewayState {
         name_resolver: Arc<dyn NameResolver>,
         config: GatewayConfig,
     ) -> Self {
+        let unixfs =
+            UnixfsResolver::with_metadata_cache_capacity(config.unixfs_metadata_cache_capacity());
         Self {
             provider,
             name_resolver,
+            unixfs,
             request_limiter: Arc::new(Semaphore::new(config.max_concurrent_requests())),
+            small_body_cache: Arc::new(SmallBodyCache::new(config.small_body_cache_max_bytes())),
+            html_prefetch: HtmlPrefetchRuntime::new(config.html_prefetch()),
+            html_directory_prefetch: HtmlDirectoryPrefetchRuntime::new(
+                config.html_directory_prefetch(),
+            ),
+            html_range_warm: HtmlRangeWarmRuntime::new(config.html_range_warm()),
+            raw_link_tsize_fast_headers: config.raw_link_tsize_fast_headers(),
+            stream_small_bodies: config.stream_small_bodies(),
         }
     }
 }
@@ -138,13 +593,94 @@ pub fn router_with_provider_and_name_resolver_config(
 }
 
 #[derive(Debug, Clone)]
-struct OfflineNameResolver;
+pub struct OfflineNameResolver;
 
 #[async_trait::async_trait]
 impl NameResolver for OfflineNameResolver {
     async fn resolve_name(&self, name: &str) -> freedom_ipfs_namesys::Result<String> {
         Err(NamesysError::NotFound(name.to_string()))
     }
+}
+
+#[derive(Clone)]
+pub struct PersistentNameResolver<R> {
+    inner: R,
+    store: SqliteBlockStore,
+    ttl: Duration,
+}
+
+impl<R> PersistentNameResolver<R> {
+    pub fn new(inner: R, store: SqliteBlockStore) -> Self {
+        Self::with_ttl(inner, store, DEFAULT_PERSISTENT_NAME_CACHE_TTL)
+    }
+
+    pub fn with_ttl(inner: R, store: SqliteBlockStore, ttl: Duration) -> Self {
+        Self { inner, store, ttl }
+    }
+}
+
+impl PersistentNameResolver<OfflineNameResolver> {
+    pub fn cache_only(store: SqliteBlockStore) -> Self {
+        Self::new(OfflineNameResolver, store)
+    }
+}
+
+#[async_trait::async_trait]
+impl<R> NameResolver for PersistentNameResolver<R>
+where
+    R: NameResolver,
+{
+    async fn resolve_name(&self, name: &str) -> freedom_ipfs_namesys::Result<String> {
+        self.resolve_name_with_ttl(name)
+            .await
+            .map(|resolved| resolved.value)
+    }
+
+    async fn resolve_name_with_ttl(
+        &self,
+        name: &str,
+    ) -> freedom_ipfs_namesys::Result<ResolvedName> {
+        match self.store.get_name_record(name) {
+            Ok(Some(value)) => {
+                tracing::info!(
+                    phase = "name_persistent_cache",
+                    name,
+                    cache_hit = true,
+                    resolved_target = %value
+                );
+                return Ok(ResolvedName::new(value));
+            }
+            Ok(None) => {
+                tracing::info!(phase = "name_persistent_cache", name, cache_hit = false);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    phase = "name_persistent_cache",
+                    name,
+                    cache_hit = false,
+                    error = %err
+                );
+            }
+        }
+
+        let resolved = self.inner.resolve_name_with_ttl(name).await?;
+        if is_cacheable_name_target(&resolved.value) {
+            let ttl = resolved.ttl.map_or(self.ttl, |ttl| ttl.min(self.ttl));
+            if let Err(err) = self.store.put_name_record(name, &resolved.value, ttl) {
+                tracing::warn!(
+                    phase = "name_persistent_cache_store",
+                    name,
+                    resolved_target = %resolved.value,
+                    error = %err
+                );
+            }
+        }
+        Ok(resolved)
+    }
+}
+
+fn is_cacheable_name_target(value: &str) -> bool {
+    value.starts_with("/ipfs/") || value.starts_with("/ipns/")
 }
 
 pub async fn serve(store: SqliteBlockStore, addr: SocketAddr) -> std::io::Result<SocketAddr> {
@@ -200,14 +736,23 @@ async fn health() -> &'static str {
 async fn ipfs_get(
     State(state): State<GatewayState>,
     Path(path): Path<String>,
+    method: Method,
     headers: HeaderMap,
 ) -> Response {
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let process_id = std::process::id();
     let request_path = format!("/ipfs/{path}");
     let range = header_value_for_trace(headers.get(RANGE));
+    let progress_request_id = header_u64_for_trace(&headers, X_FREEDOM_REQUEST_ID);
+    let parent_request_id = header_u64_for_trace(&headers, X_FREEDOM_PARENT_REQUEST_ID);
+    let top_level_path = header_value_for_trace(headers.get(X_FREEDOM_TOP_LEVEL_PATH));
     let span = tracing::info_span!(
         "gateway_request",
+        process_id,
         request_id,
+        progress_request_id = progress_request_id.unwrap_or_default(),
+        parent_request_id = parent_request_id.unwrap_or_default(),
+        top_level_path = %top_level_path,
         namespace = "ipfs",
         path = %request_path,
         range = %range
@@ -217,39 +762,76 @@ async fn ipfs_get(
         let request_started = Instant::now();
         tracing::info!(phase = "request_start", request_id, path = %request_path);
 
-        let limiter_started = Instant::now();
-        let Ok(_permit) = state.request_limiter.clone().try_acquire_owned() else {
-            tracing::info!(
-                phase = "gateway_limiter",
-                request_id,
-                acquired = false,
-                elapsed_ms = limiter_started.elapsed().as_millis()
-            );
+        let Some(_permit) =
+            acquire_gateway_request_permit(state.request_limiter.clone(), request_id).await
+        else {
             let response = gateway_error(GatewayError::Busy);
             tracing::info!(
                 phase = "request_done",
                 request_id,
                 status = response.status().as_u16(),
+                body_mode = gateway_body_mode(&response),
                 elapsed_ms = request_started.elapsed().as_millis()
             );
             return response;
         };
-        tracing::info!(
-            phase = "gateway_limiter",
-            request_id,
-            acquired = true,
-            elapsed_ms = limiter_started.elapsed().as_millis()
-        );
 
-        let response =
-            match serve_ipfs_path(state.provider.clone(), &path, headers.get(RANGE)).await {
+        let context_top_level_path = if top_level_path.is_empty() {
+            request_path.clone()
+        } else {
+            top_level_path.clone()
+        };
+        let retrieval_context = RetrievalRequestContext::gateway_request_with_top_level(
+            parent_request_id,
+            Some(context_top_level_path),
+        );
+        let response_features = GatewayResponseFeatures {
+            small_body_cache: state.small_body_cache.clone(),
+            html_prefetch: html_prefetch_runtime(
+                &state,
+                method == Method::HEAD,
+                headers.get(RANGE),
+                parent_request_id,
+            ),
+            html_directory_prefetch: html_directory_prefetch_runtime(
+                &state,
+                method == Method::HEAD,
+                headers.get(RANGE),
+                parent_request_id,
+            ),
+            html_range_warm: html_range_warm_runtime(
+                &state,
+                method == Method::HEAD,
+                headers.get(RANGE),
+                parent_request_id,
+            ),
+            raw_link_tsize_fast_headers: state.raw_link_tsize_fast_headers,
+            stream_small_bodies: state.stream_small_bodies,
+        };
+        let response = with_retrieval_request_context(retrieval_context, async {
+            match serve_ipfs_path(
+                state.provider.clone(),
+                state.unixfs.clone(),
+                response_features,
+                &path,
+                GatewayRequestHeaders {
+                    range: headers.get(RANGE),
+                    if_none_match: headers.get(IF_NONE_MATCH),
+                    is_head: method == Method::HEAD,
+                },
+            )
+            .await
+            {
                 Ok(response) => response,
                 Err(err) => gateway_error(err),
-            };
+            }
+        })
+        .await;
         tracing::info!(
             phase = "request_done",
             request_id,
             status = response.status().as_u16(),
+            body_mode = gateway_body_mode(&response),
             elapsed_ms = request_started.elapsed().as_millis()
         );
         response
@@ -261,14 +843,23 @@ async fn ipfs_get(
 async fn ipns_get(
     State(state): State<GatewayState>,
     Path(path): Path<String>,
+    method: Method,
     headers: HeaderMap,
 ) -> Response {
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let process_id = std::process::id();
     let request_path = format!("/ipns/{path}");
     let range = header_value_for_trace(headers.get(RANGE));
+    let progress_request_id = header_u64_for_trace(&headers, X_FREEDOM_REQUEST_ID);
+    let parent_request_id = header_u64_for_trace(&headers, X_FREEDOM_PARENT_REQUEST_ID);
+    let top_level_path = header_value_for_trace(headers.get(X_FREEDOM_TOP_LEVEL_PATH));
     let span = tracing::info_span!(
         "gateway_request",
+        process_id,
         request_id,
+        progress_request_id = progress_request_id.unwrap_or_default(),
+        parent_request_id = parent_request_id.unwrap_or_default(),
+        top_level_path = %top_level_path,
         namespace = "ipns",
         path = %request_path,
         range = %range
@@ -278,51 +869,174 @@ async fn ipns_get(
         let request_started = Instant::now();
         tracing::info!(phase = "request_start", request_id, path = %request_path);
 
-        let limiter_started = Instant::now();
-        let Ok(_permit) = state.request_limiter.clone().try_acquire_owned() else {
-            tracing::info!(
-                phase = "gateway_limiter",
-                request_id,
-                acquired = false,
-                elapsed_ms = limiter_started.elapsed().as_millis()
-            );
+        let Some(_permit) =
+            acquire_gateway_request_permit(state.request_limiter.clone(), request_id).await
+        else {
             let response = gateway_error(GatewayError::Busy);
             tracing::info!(
                 phase = "request_done",
                 request_id,
                 status = response.status().as_u16(),
+                body_mode = gateway_body_mode(&response),
                 elapsed_ms = request_started.elapsed().as_millis()
             );
             return response;
         };
-        tracing::info!(
-            phase = "gateway_limiter",
-            request_id,
-            acquired = true,
-            elapsed_ms = limiter_started.elapsed().as_millis()
-        );
 
-        let response = match serve_ipns_path(
-            state.provider.clone(),
-            state.name_resolver.as_ref(),
-            &path,
-            headers.get(RANGE),
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(err) => gateway_error(err),
+        let context_top_level_path = if top_level_path.is_empty() {
+            request_path.clone()
+        } else {
+            top_level_path.clone()
         };
+        let retrieval_context = RetrievalRequestContext::gateway_request_with_top_level(
+            parent_request_id,
+            Some(context_top_level_path),
+        );
+        let response_features = GatewayResponseFeatures {
+            small_body_cache: state.small_body_cache.clone(),
+            html_prefetch: html_prefetch_runtime(
+                &state,
+                method == Method::HEAD,
+                headers.get(RANGE),
+                parent_request_id,
+            ),
+            html_directory_prefetch: html_directory_prefetch_runtime(
+                &state,
+                method == Method::HEAD,
+                headers.get(RANGE),
+                parent_request_id,
+            ),
+            html_range_warm: html_range_warm_runtime(
+                &state,
+                method == Method::HEAD,
+                headers.get(RANGE),
+                parent_request_id,
+            ),
+            raw_link_tsize_fast_headers: state.raw_link_tsize_fast_headers,
+            stream_small_bodies: state.stream_small_bodies,
+        };
+        let response = with_retrieval_request_context(retrieval_context, async {
+            match serve_ipns_path(
+                state.provider.clone(),
+                state.unixfs.clone(),
+                response_features,
+                state.name_resolver.as_ref(),
+                &path,
+                GatewayRequestHeaders {
+                    range: headers.get(RANGE),
+                    if_none_match: headers.get(IF_NONE_MATCH),
+                    is_head: method == Method::HEAD,
+                },
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => gateway_error(err),
+            }
+        })
+        .await;
         tracing::info!(
             phase = "request_done",
             request_id,
             status = response.status().as_u16(),
+            body_mode = gateway_body_mode(&response),
             elapsed_ms = request_started.elapsed().as_millis()
         );
         response
     }
     .instrument(span)
     .await
+}
+
+fn html_prefetch_runtime(
+    state: &GatewayState,
+    is_head: bool,
+    range: Option<&HeaderValue>,
+    parent_request_id: Option<u64>,
+) -> Option<HtmlPrefetchRuntime> {
+    if is_head
+        || range.is_some()
+        || parent_request_id.is_some()
+        || !state.html_prefetch.is_enabled()
+    {
+        None
+    } else {
+        Some(state.html_prefetch.clone())
+    }
+}
+
+fn html_directory_prefetch_runtime(
+    state: &GatewayState,
+    is_head: bool,
+    range: Option<&HeaderValue>,
+    parent_request_id: Option<u64>,
+) -> Option<HtmlDirectoryPrefetchRuntime> {
+    if is_head
+        || range.is_some()
+        || parent_request_id.is_some()
+        || !state.html_directory_prefetch.is_enabled()
+    {
+        None
+    } else {
+        Some(state.html_directory_prefetch.clone())
+    }
+}
+
+fn html_range_warm_runtime(
+    state: &GatewayState,
+    is_head: bool,
+    range: Option<&HeaderValue>,
+    parent_request_id: Option<u64>,
+) -> Option<HtmlRangeWarmRuntime> {
+    if is_head
+        || range.is_none()
+        || parent_request_id.is_some()
+        || !state.html_range_warm.is_enabled()
+    {
+        None
+    } else {
+        Some(state.html_range_warm.clone())
+    }
+}
+
+async fn acquire_gateway_request_permit(
+    limiter: Arc<Semaphore>,
+    request_id: u64,
+) -> Option<OwnedSemaphorePermit> {
+    let limiter_started = Instant::now();
+    match tokio::time::timeout(GATEWAY_REQUEST_QUEUE_TIMEOUT, limiter.acquire_owned()).await {
+        Ok(Ok(permit)) => {
+            tracing::info!(
+                phase = "gateway_limiter",
+                request_id,
+                acquired = true,
+                timeout_ms = GATEWAY_REQUEST_QUEUE_TIMEOUT.as_millis(),
+                elapsed_ms = limiter_started.elapsed().as_millis()
+            );
+            Some(permit)
+        }
+        Ok(Err(err)) => {
+            tracing::info!(
+                phase = "gateway_limiter",
+                request_id,
+                acquired = false,
+                error = %err,
+                timeout_ms = GATEWAY_REQUEST_QUEUE_TIMEOUT.as_millis(),
+                elapsed_ms = limiter_started.elapsed().as_millis()
+            );
+            None
+        }
+        Err(_) => {
+            tracing::info!(
+                phase = "gateway_limiter",
+                request_id,
+                acquired = false,
+                timeout_ms = GATEWAY_REQUEST_QUEUE_TIMEOUT.as_millis(),
+                elapsed_ms = limiter_started.elapsed().as_millis()
+            );
+            None
+        }
+    }
 }
 
 fn header_value_for_trace(value: Option<&HeaderValue>) -> String {
@@ -332,19 +1046,83 @@ fn header_value_for_trace(value: Option<&HeaderValue>) -> String {
         .to_string()
 }
 
+fn gateway_body_mode(response: &Response) -> &'static str {
+    response
+        .extensions()
+        .get::<GatewayBodyMode>()
+        .copied()
+        .unwrap_or(GatewayBodyMode::Direct)
+        .as_str()
+}
+
+fn set_gateway_body_mode(response: &mut Response, mode: GatewayBodyMode) {
+    response.extensions_mut().insert(mode);
+}
+
+fn header_u64_for_trace(headers: &HeaderMap, name: &'static str) -> Option<u64> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+#[derive(Clone)]
+struct GatewayResponseFeatures {
+    small_body_cache: Arc<SmallBodyCache>,
+    html_prefetch: Option<HtmlPrefetchRuntime>,
+    html_directory_prefetch: Option<HtmlDirectoryPrefetchRuntime>,
+    html_range_warm: Option<HtmlRangeWarmRuntime>,
+    raw_link_tsize_fast_headers: bool,
+    stream_small_bodies: bool,
+}
+
+#[derive(Clone, Copy)]
+struct GatewayRequestHeaders<'a> {
+    range: Option<&'a HeaderValue>,
+    if_none_match: Option<&'a HeaderValue>,
+    is_head: bool,
+}
+
 async fn serve_ipfs_path(
     provider: Arc<dyn BlockProvider>,
+    unixfs: UnixfsResolver,
+    features: GatewayResponseFeatures,
     path: &str,
-    range: Option<&HeaderValue>,
+    request_headers: GatewayRequestHeaders<'_>,
 ) -> Result<Response, GatewayError> {
-    serve_ipfs_path_with_listing_path(provider, path, range, None).await
+    serve_ipfs_path_with_listing_path(
+        provider,
+        unixfs,
+        features,
+        path,
+        request_headers,
+        GatewayIpfsPathOptions::default(),
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct GatewayIpfsPathOptions<'a> {
+    listing_path: Option<&'a DirectoryListingPath>,
+    cache_policy: FileCachePolicy,
+}
+
+impl Default for GatewayIpfsPathOptions<'_> {
+    fn default() -> Self {
+        Self {
+            listing_path: None,
+            cache_policy: FileCachePolicy::ImmutableIpfs,
+        }
+    }
 }
 
 async fn serve_ipfs_path_with_listing_path(
     provider: Arc<dyn BlockProvider>,
+    unixfs: UnixfsResolver,
+    features: GatewayResponseFeatures,
     path: &str,
-    range: Option<&HeaderValue>,
-    listing_path: Option<&DirectoryListingPath>,
+    request_headers: GatewayRequestHeaders<'_>,
+    options: GatewayIpfsPathOptions<'_>,
 ) -> Result<Response, GatewayError> {
     let parse_started = Instant::now();
     let (cid, unixfs_path) = split_ipfs_path(path)?;
@@ -355,32 +1133,91 @@ async fn serve_ipfs_path_with_listing_path(
         elapsed_ms = parse_started.elapsed().as_millis()
     );
 
+    let cache_before = unixfs.metadata_cache_stats();
     let resource_started = Instant::now();
-    let resource = served_resource(provider.as_ref(), &cid, unixfs_path)?;
+    let resource = served_resource(
+        &unixfs,
+        provider.as_ref(),
+        &cid,
+        unixfs_path,
+        features.raw_link_tsize_fast_headers && !request_headers.is_head,
+    )?;
     let resource_elapsed_ms = resource_started.elapsed().as_millis();
     let response = match resource {
-        ServedResource::File { path, len } => {
+        ServedResource::File {
+            path,
+            cid: file_cid,
+            len,
+        } => {
+            let target = FileResponseTarget {
+                root_cid: cid,
+                file_cid,
+                path,
+                len,
+            };
             tracing::info!(
                 phase = "unixfs_resource",
-                cid = %cid,
-                unixfs_path = %path,
+                cid = %target.root_cid,
+                file_cid = %target.file_cid,
+                unixfs_path = %target.path,
                 resource = "file",
-                file_len = len,
+                file_len = target.len,
                 elapsed_ms = resource_elapsed_ms
             );
+            let etag = file_etag(&target.root_cid, &target.path, target.len);
+            if request_headers.range.is_none()
+                && if_none_match_matches(request_headers.if_none_match, &etag)
+            {
+                tracing::info!(
+                    phase = "gateway_conditional",
+                    cid = %target.root_cid,
+                    file_cid = %target.file_cid,
+                    unixfs_path = %target.path,
+                    etag = %etag,
+                    outcome = "not_modified"
+                );
+                return not_modified_response(&etag, options.cache_policy);
+            }
+            let parsed_range = request_headers
+                .range
+                .map(|range| parse_range_header(range, target.len))
+                .transpose()?;
             let mime_started = Instant::now();
-            let mime = mime_for_served_file(provider.as_ref(), &cid, &path, len)?;
+            let mime = mime_for_served_file(
+                &unixfs,
+                provider.as_ref(),
+                &target.root_cid,
+                &target.file_cid,
+                &target.path,
+                target.len,
+                mime_sniff_end(target.len, parsed_range),
+            )?;
             tracing::info!(
                 phase = "mime_total",
-                cid = %cid,
-                unixfs_path = %path,
+                cid = %target.root_cid,
+                file_cid = %target.file_cid,
+                unixfs_path = %target.path,
                 mime = %mime,
                 elapsed_ms = mime_started.elapsed().as_millis()
             );
-            if let Some(range) = range {
-                ranged_response(provider, cid, path, len, range, &mime)?
+            let headers = FileResponseHeaders {
+                mime: &mime,
+                etag: &etag,
+                cache_policy: options.cache_policy,
+                is_head: request_headers.is_head,
+            };
+            if let Some((start, end)) = parsed_range {
+                ranged_response(
+                    provider,
+                    unixfs.clone(),
+                    features.clone(),
+                    target,
+                    start,
+                    end,
+                    headers,
+                )?
             } else {
-                streaming_response(provider, cid, path, len, &mime)?
+                streaming_response(provider, unixfs.clone(), features, target, headers)?
             }
         }
         ServedResource::Directory { path, entries } => {
@@ -392,13 +1229,13 @@ async fn serve_ipfs_path_with_listing_path(
                 entry_count = entries.len(),
                 elapsed_ms = resource_elapsed_ms
             );
-            if range.is_some() {
+            if request_headers.range.is_some() {
                 return Err(GatewayError::BadRequest(
                     "Range requests are not supported for directory listings".into(),
                 ));
             }
             let default_listing_path;
-            let listing_path = if let Some(listing_path) = listing_path {
+            let listing_path = if let Some(listing_path) = options.listing_path {
                 listing_path
             } else {
                 default_listing_path = DirectoryListingPath::ipfs(&cid, &path);
@@ -407,14 +1244,54 @@ async fn serve_ipfs_path_with_listing_path(
             directory_listing_response(listing_path, &entries)?
         }
     };
+    trace_unixfs_metadata_cache_delta(cache_before, unixfs.metadata_cache_stats());
     Ok(response)
 }
 
+fn trace_unixfs_metadata_cache_delta(
+    before: UnixfsMetadataCacheStats,
+    after: UnixfsMetadataCacheStats,
+) {
+    tracing::info!(
+        phase = "unixfs_metadata_cache",
+        elapsed_ms = 0u64,
+        cache_capacity = after.capacity,
+        cache_len = after.len,
+        hits = after.hits.saturating_sub(before.hits),
+        misses = after.misses.saturating_sub(before.misses),
+        inserts = after.inserts.saturating_sub(before.inserts),
+        evictions = after.evictions.saturating_sub(before.evictions),
+        oversized_skips = after.oversized_skips.saturating_sub(before.oversized_skips),
+        path_cache_len = after.path_len,
+        path_hits = after.path_hits.saturating_sub(before.path_hits),
+        path_misses = after.path_misses.saturating_sub(before.path_misses),
+        path_inserts = after.path_inserts.saturating_sub(before.path_inserts),
+        path_evictions = after.path_evictions.saturating_sub(before.path_evictions),
+        path_oversized_skips = after
+            .path_oversized_skips
+            .saturating_sub(before.path_oversized_skips),
+        file_size_cache_len = after.file_size_len,
+        file_size_hits = after.file_size_hits.saturating_sub(before.file_size_hits),
+        file_size_misses = after
+            .file_size_misses
+            .saturating_sub(before.file_size_misses),
+        file_size_inserts = after
+            .file_size_inserts
+            .saturating_sub(before.file_size_inserts),
+        file_size_evictions = after
+            .file_size_evictions
+            .saturating_sub(before.file_size_evictions)
+    );
+}
+
 fn mime_for_served_file(
+    unixfs: &UnixfsResolver,
     provider: &dyn BlockProvider,
     cid: &Cid,
+    file_cid: &Cid,
     path: &str,
     len: u64,
+    sniff_end: Option<u64>,
 ) -> Result<String, GatewayError> {
     let started = Instant::now();
     if let Some(mime) = mime_guess::from_path(path).first() {
@@ -427,13 +1304,15 @@ fn mime_for_served_file(
         );
         return Ok(mime.to_string());
     }
-    if len > 0 {
-        let end = (len - 1).min(512);
+    let sniffed = if let Some(end) = sniff_end {
         let sniff_started = Instant::now();
-        let prefix = read_file_range(provider, cid, path, 0, end).map_err(GatewayError::Unixfs)?;
+        let prefix = unixfs
+            .read_file_cid_range(provider, file_cid, 0, end)
+            .map_err(GatewayError::Unixfs)?;
         tracing::info!(
             phase = "mime_sniff_read",
             cid = %cid,
+            file_cid = %file_cid,
             unixfs_path = path,
             bytes = prefix.len(),
             elapsed_ms = sniff_started.elapsed().as_millis()
@@ -448,15 +1327,38 @@ fn mime_for_served_file(
             );
             return Ok("text/html".to_string());
         }
-    }
+        true
+    } else {
+        false
+    };
     tracing::info!(
         phase = "mime_detect",
         cid = %cid,
         unixfs_path = path,
-        source = "fallback",
+        source = mime_fallback_source(len, sniffed),
         elapsed_ms = started.elapsed().as_millis()
     );
     Ok("application/octet-stream".to_string())
+}
+
+fn mime_fallback_source(len: u64, sniffed: bool) -> &'static str {
+    match (len, sniffed) {
+        (0, _) => "fallback_empty",
+        (_, true) => "fallback_after_sniff",
+        (_, false) => "fallback_no_sniff",
+    }
+}
+
+fn mime_sniff_end(len: u64, parsed_range: Option<(u64, u64)>) -> Option<u64> {
+    if len == 0 {
+        return None;
+    }
+    let last_sniff_byte = (len - 1).min(512);
+    match parsed_range {
+        Some((0, end)) => Some(end.min(last_sniff_byte)),
+        Some(_) => None,
+        None => Some(last_sniff_byte),
+    }
 }
 
 fn looks_like_html(bytes: &[u8]) -> bool {
@@ -471,15 +1373,911 @@ fn looks_like_html(bytes: &[u8]) -> bool {
         || lower.starts_with("<body")
 }
 
+struct HtmlPrefetchSeed<'a> {
+    root_cid: Cid,
+    base_path: &'a str,
+    mime: &'a str,
+    body: &'a Bytes,
+}
+
+struct HtmlRangeWarmSeed<'a> {
+    root_cid: Cid,
+    file_cid: Cid,
+    path: &'a str,
+    mime: &'a str,
+    total_len: u64,
+    range_start: u64,
+    range_end: u64,
+}
+
+fn maybe_spawn_html_directory_prefetch(
+    runtime: Option<&HtmlDirectoryPrefetchRuntime>,
+    provider: Arc<dyn BlockProvider>,
+    unixfs: UnixfsResolver,
+    seed: HtmlPrefetchSeed<'_>,
+) {
+    let Some(runtime) = runtime.filter(|runtime| runtime.is_enabled()) else {
+        return;
+    };
+    if !seed.mime.starts_with("text/html") || seed.body.len() as u64 > runtime.config.max_bytes() {
+        return;
+    }
+    let html = String::from_utf8_lossy(seed.body);
+    let paths = html_prefetch_directory_paths(&html, seed.base_path, runtime.config.max_dirs());
+    if paths.is_empty() {
+        return;
+    }
+    tracing::info!(
+        phase = "gateway_html_directory_prefetch_schedule",
+        cid = %seed.root_cid,
+        unixfs_path = %seed.base_path,
+        directory_count = paths.len(),
+        max_dirs = runtime.config.max_dirs(),
+        max_bytes = runtime.config.max_bytes(),
+        concurrency = runtime.config.concurrency(),
+    );
+
+    for path in paths {
+        let provider = provider.clone();
+        let unixfs = unixfs.clone();
+        let limiter = runtime.limiter.clone();
+        let root_cid = seed.root_cid;
+        let span = tracing::info_span!(
+            "gateway_html_directory_prefetch",
+            cid = %root_cid,
+            unixfs_path = %path
+        );
+        tokio::spawn(
+            async move {
+                let queued = Instant::now();
+                let permit = match tokio::time::timeout(
+                    GATEWAY_HTML_DIRECTORY_PREFETCH_QUEUE_TIMEOUT,
+                    limiter.acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(err)) => {
+                        tracing::info!(
+                            phase = "gateway_html_directory_prefetch_failed",
+                            cid = %root_cid,
+                            unixfs_path = %path,
+                            error = %err,
+                            elapsed_ms = queued.elapsed().as_millis()
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::info!(
+                            phase = "gateway_html_directory_prefetch_skip",
+                            cid = %root_cid,
+                            unixfs_path = %path,
+                            reason = "queue_timeout",
+                            timeout_ms =
+                                GATEWAY_HTML_DIRECTORY_PREFETCH_QUEUE_TIMEOUT.as_millis(),
+                            elapsed_ms = queued.elapsed().as_millis()
+                        );
+                        return;
+                    }
+                };
+                let _permit = permit;
+                let task_path = path.clone();
+                let joined = tokio::task::spawn_blocking(move || {
+                    html_directory_prefetch_one(provider.as_ref(), &unixfs, root_cid, &task_path)
+                })
+                .await;
+                if let Err(err) = joined {
+                    tracing::info!(
+                        phase = "gateway_html_directory_prefetch_failed",
+                        cid = %root_cid,
+                        unixfs_path = %path,
+                        error = %err
+                    );
+                }
+            }
+            .instrument(span),
+        );
+    }
+}
+
+fn maybe_spawn_html_prefetch(
+    runtime: Option<&HtmlPrefetchRuntime>,
+    provider: Arc<dyn BlockProvider>,
+    unixfs: UnixfsResolver,
+    small_body_cache: Arc<SmallBodyCache>,
+    seed: HtmlPrefetchSeed<'_>,
+) {
+    let Some(runtime) = runtime.filter(|runtime| runtime.is_enabled()) else {
+        return;
+    };
+    if !seed.mime.starts_with("text/html") || seed.body.len() as u64 > runtime.config.max_bytes() {
+        return;
+    }
+    let html = String::from_utf8_lossy(seed.body);
+    let paths = html_prefetch_asset_paths(&html, seed.base_path, runtime.config.max_assets());
+    if paths.is_empty() {
+        return;
+    }
+    tracing::info!(
+        phase = "gateway_html_prefetch_schedule",
+        cid = %seed.root_cid,
+        unixfs_path = %seed.base_path,
+        asset_count = paths.len(),
+        max_assets = runtime.config.max_assets(),
+        max_bytes = runtime.config.max_bytes(),
+        concurrency = runtime.config.concurrency(),
+    );
+
+    for path in paths {
+        let provider = provider.clone();
+        let unixfs = unixfs.clone();
+        let small_body_cache = small_body_cache.clone();
+        let config = runtime.config;
+        let limiter = runtime.limiter.clone();
+        let root_cid = seed.root_cid;
+        let span = tracing::info_span!(
+            "gateway_html_prefetch",
+            cid = %root_cid,
+            unixfs_path = %path
+        );
+        tokio::spawn(
+            async move {
+                let queued = Instant::now();
+                let permit = match tokio::time::timeout(
+                    GATEWAY_HTML_PREFETCH_QUEUE_TIMEOUT,
+                    limiter.acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(err)) => {
+                        tracing::info!(
+                            phase = "gateway_html_prefetch_failed",
+                            cid = %root_cid,
+                            unixfs_path = %path,
+                            error = %err,
+                            elapsed_ms = queued.elapsed().as_millis()
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::info!(
+                            phase = "gateway_html_prefetch_skip",
+                            cid = %root_cid,
+                            unixfs_path = %path,
+                            reason = "queue_timeout",
+                            timeout_ms = GATEWAY_HTML_PREFETCH_QUEUE_TIMEOUT.as_millis(),
+                            elapsed_ms = queued.elapsed().as_millis()
+                        );
+                        return;
+                    }
+                };
+                let _permit = permit;
+                let task_path = path.clone();
+                let joined = tokio::task::spawn_blocking(move || {
+                    html_prefetch_one(
+                        provider.as_ref(),
+                        &unixfs,
+                        &small_body_cache,
+                        root_cid,
+                        &task_path,
+                        config,
+                    )
+                })
+                .await;
+                if let Err(err) = joined {
+                    tracing::info!(
+                        phase = "gateway_html_prefetch_failed",
+                        cid = %root_cid,
+                        unixfs_path = %path,
+                        error = %err
+                    );
+                }
+            }
+            .instrument(span),
+        );
+    }
+}
+
+fn maybe_spawn_html_range_warm(
+    runtime: Option<&HtmlRangeWarmRuntime>,
+    provider: Arc<dyn BlockProvider>,
+    unixfs: UnixfsResolver,
+    small_body_cache: Arc<SmallBodyCache>,
+    seed: HtmlRangeWarmSeed<'_>,
+) {
+    let Some(runtime) = runtime.filter(|runtime| runtime.is_enabled()) else {
+        return;
+    };
+    let skip_reason = if seed.range_start != 0 {
+        Some("non_prefix_range")
+    } else if !seed.mime.starts_with("text/html") {
+        Some("mime")
+    } else if seed.total_len == 0 || seed.total_len > runtime.config.max_bytes() {
+        Some("size")
+    } else if seed.range_end >= seed.total_len.saturating_sub(1) {
+        Some("already_complete")
+    } else {
+        None
+    };
+    if let Some(reason) = skip_reason {
+        tracing::info!(
+            phase = "gateway_html_range_warm_skip",
+            cid = %seed.root_cid,
+            file_cid = %seed.file_cid,
+            unixfs_path = %seed.path,
+            file_len = seed.total_len,
+            range_start = seed.range_start,
+            range_end = seed.range_end,
+            max_bytes = runtime.config.max_bytes(),
+            reason
+        );
+        return;
+    }
+
+    tracing::info!(
+        phase = "gateway_html_range_warm_schedule",
+        cid = %seed.root_cid,
+        file_cid = %seed.file_cid,
+        unixfs_path = %seed.path,
+        file_len = seed.total_len,
+        range_start = seed.range_start,
+        range_end = seed.range_end,
+        max_bytes = runtime.config.max_bytes(),
+        concurrency = runtime.config.concurrency(),
+    );
+
+    let limiter = runtime.limiter.clone();
+    let config = runtime.config;
+    let root_cid = seed.root_cid;
+    let file_cid = seed.file_cid;
+    let path = seed.path.to_string();
+    let span = tracing::info_span!(
+        "gateway_html_range_warm",
+        cid = %root_cid,
+        file_cid = %file_cid,
+        unixfs_path = %path
+    );
+    tokio::spawn(
+        async move {
+            let queued = Instant::now();
+            let permit = match tokio::time::timeout(
+                GATEWAY_HTML_RANGE_WARM_QUEUE_TIMEOUT,
+                limiter.acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(err)) => {
+                    tracing::info!(
+                        phase = "gateway_html_range_warm_failed",
+                        cid = %root_cid,
+                        file_cid = %file_cid,
+                        unixfs_path = %path,
+                        error = %err,
+                        elapsed_ms = queued.elapsed().as_millis()
+                    );
+                    return;
+                }
+                Err(_) => {
+                    tracing::info!(
+                        phase = "gateway_html_range_warm_skip",
+                        cid = %root_cid,
+                        file_cid = %file_cid,
+                        unixfs_path = %path,
+                        reason = "queue_timeout",
+                        timeout_ms = GATEWAY_HTML_RANGE_WARM_QUEUE_TIMEOUT.as_millis(),
+                        elapsed_ms = queued.elapsed().as_millis()
+                    );
+                    return;
+                }
+            };
+            let _permit = permit;
+            let task_path = path.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                html_range_warm_one(
+                    provider.as_ref(),
+                    &unixfs,
+                    &small_body_cache,
+                    root_cid,
+                    file_cid,
+                    &task_path,
+                    config,
+                )
+            })
+            .await;
+            if let Err(err) = joined {
+                tracing::info!(
+                    phase = "gateway_html_range_warm_failed",
+                    cid = %root_cid,
+                    file_cid = %file_cid,
+                    unixfs_path = %path,
+                    error = %err
+                );
+            }
+        }
+        .instrument(span),
+    );
+}
+
+fn html_range_warm_one(
+    provider: &dyn BlockProvider,
+    unixfs: &UnixfsResolver,
+    small_body_cache: &SmallBodyCache,
+    root_cid: Cid,
+    file_cid: Cid,
+    path: &str,
+    config: GatewayHtmlRangeWarmConfig,
+) {
+    let started = Instant::now();
+    let len = match unixfs.file_size_cid(provider, &file_cid) {
+        Ok(len) => len,
+        Err(err) => {
+            tracing::info!(
+                phase = "gateway_html_range_warm_failed",
+                cid = %root_cid,
+                file_cid = %file_cid,
+                unixfs_path = %path,
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis()
+            );
+            return;
+        }
+    };
+    if len == 0 || len > config.max_bytes() {
+        tracing::info!(
+            phase = "gateway_html_range_warm_skip",
+            cid = %root_cid,
+            file_cid = %file_cid,
+            unixfs_path = %path,
+            file_len = len,
+            max_bytes = config.max_bytes(),
+            reason = "size",
+            elapsed_ms = started.elapsed().as_millis()
+        );
+        return;
+    }
+
+    let cache_key = SmallBodyCacheKey { file_cid, len };
+    if small_body_cache.get(&cache_key).is_some() {
+        tracing::info!(
+            phase = "gateway_html_range_warm_skip",
+            cid = %root_cid,
+            file_cid = %file_cid,
+            unixfs_path = %path,
+            file_len = len,
+            reason = "cache_hit",
+            elapsed_ms = started.elapsed().as_millis()
+        );
+        return;
+    }
+
+    let end = len - 1;
+    let bytes = match unixfs.read_file_cid_range(provider, &file_cid, 0, end) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(err) => {
+            tracing::info!(
+                phase = "gateway_html_range_warm_failed",
+                cid = %root_cid,
+                file_cid = %file_cid,
+                unixfs_path = %path,
+                file_len = len,
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis()
+            );
+            return;
+        }
+    };
+    let body_len = bytes.len();
+    let insert = small_body_cache.insert(cache_key, bytes);
+    tracing::info!(
+        phase = "gateway_html_range_warm_done",
+        cid = %root_cid,
+        file_cid = %file_cid,
+        unixfs_path = %path,
+        file_len = len,
+        body_len,
+        cache_inserted = insert.inserted,
+        evicted = insert.evicted,
+        cache_len = insert.cache_len,
+        cache_bytes = insert.cache_bytes,
+        elapsed_ms = started.elapsed().as_millis()
+    );
+}
+
+fn html_directory_prefetch_one(
+    provider: &dyn BlockProvider,
+    unixfs: &UnixfsResolver,
+    root_cid: Cid,
+    path: &str,
+) {
+    let started = Instant::now();
+    match unixfs.resolve_path(provider, &root_cid, path) {
+        Ok(resolved) if matches!(resolved.kind, NodeKind::Directory | NodeKind::HamtShard) => {
+            tracing::info!(
+                phase = "gateway_html_directory_prefetch_done",
+                cid = %root_cid,
+                directory_cid = %resolved.cid,
+                unixfs_path = %path,
+                node_kind = node_kind_label(resolved.kind),
+                elapsed_ms = started.elapsed().as_millis()
+            );
+        }
+        Ok(resolved) => {
+            tracing::info!(
+                phase = "gateway_html_directory_prefetch_skip",
+                cid = %root_cid,
+                directory_cid = %resolved.cid,
+                unixfs_path = %path,
+                node_kind = node_kind_label(resolved.kind),
+                reason = "not_directory",
+                elapsed_ms = started.elapsed().as_millis()
+            );
+        }
+        Err(err) => {
+            tracing::info!(
+                phase = "gateway_html_directory_prefetch_failed",
+                cid = %root_cid,
+                unixfs_path = %path,
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis()
+            );
+        }
+    }
+}
+
+fn html_prefetch_one(
+    provider: &dyn BlockProvider,
+    unixfs: &UnixfsResolver,
+    small_body_cache: &SmallBodyCache,
+    root_cid: Cid,
+    path: &str,
+    config: GatewayHtmlPrefetchConfig,
+) {
+    let started = Instant::now();
+    let resolved = match unixfs.resolve_path(provider, &root_cid, path) {
+        Ok(resolved) if matches!(resolved.kind, NodeKind::Raw | NodeKind::File) => resolved,
+        Ok(_) => {
+            tracing::info!(
+                phase = "gateway_html_prefetch_skip",
+                cid = %root_cid,
+                unixfs_path = %path,
+                reason = "not_file",
+                elapsed_ms = started.elapsed().as_millis()
+            );
+            return;
+        }
+        Err(err) => {
+            tracing::info!(
+                phase = "gateway_html_prefetch_failed",
+                cid = %root_cid,
+                unixfs_path = %path,
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis()
+            );
+            return;
+        }
+    };
+    let len = match unixfs.file_size_cid(provider, &resolved.cid) {
+        Ok(len) => len,
+        Err(err) => {
+            tracing::info!(
+                phase = "gateway_html_prefetch_failed",
+                cid = %root_cid,
+                file_cid = %resolved.cid,
+                unixfs_path = %path,
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis()
+            );
+            return;
+        }
+    };
+    if len == 0
+        || len > config.max_bytes()
+        || len as usize > GATEWAY_SMALL_BODY_CACHE_MAX_ENTRY_BYTES
+    {
+        tracing::info!(
+            phase = "gateway_html_prefetch_skip",
+            cid = %root_cid,
+            file_cid = %resolved.cid,
+            unixfs_path = %path,
+            file_len = len,
+            reason = "size",
+            elapsed_ms = started.elapsed().as_millis()
+        );
+        return;
+    }
+    let cache_key = SmallBodyCacheKey {
+        file_cid: resolved.cid,
+        len,
+    };
+    if small_body_cache.get(&cache_key).is_some() {
+        tracing::info!(
+            phase = "gateway_html_prefetch_skip",
+            cid = %root_cid,
+            file_cid = %resolved.cid,
+            unixfs_path = %path,
+            file_len = len,
+            reason = "cache_hit",
+            elapsed_ms = started.elapsed().as_millis()
+        );
+        return;
+    }
+    let end = len - 1;
+    let bytes = match unixfs.read_file_cid_range(provider, &resolved.cid, 0, end) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(err) => {
+            tracing::info!(
+                phase = "gateway_html_prefetch_failed",
+                cid = %root_cid,
+                file_cid = %resolved.cid,
+                unixfs_path = %path,
+                file_len = len,
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis()
+            );
+            return;
+        }
+    };
+    let insert = small_body_cache.insert(cache_key, bytes);
+    tracing::info!(
+        phase = "gateway_html_prefetch_done",
+        cid = %root_cid,
+        file_cid = %resolved.cid,
+        unixfs_path = %path,
+        file_len = len,
+        cache_inserted = insert.inserted,
+        evicted = insert.evicted,
+        cache_len = insert.cache_len,
+        cache_bytes = insert.cache_bytes,
+        elapsed_ms = started.elapsed().as_millis()
+    );
+}
+
+fn html_prefetch_asset_paths(html: &str, base_path: &str, max_assets: usize) -> Vec<String> {
+    if max_assets == 0 {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    let base_path = html_prefetch_base_path(base_path);
+
+    for tag in parse_html_tags(html) {
+        for raw in html_prefetch_candidates(&tag) {
+            if paths.len() >= max_assets {
+                return paths;
+            }
+            let Some(path) = resolve_prefetch_asset_path(raw, &base_path) else {
+                continue;
+            };
+            if seen.insert(path.clone()) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+fn html_prefetch_directory_paths(html: &str, base_path: &str, max_dirs: usize) -> Vec<String> {
+    if max_dirs == 0 {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    let base_path = html_prefetch_base_path(base_path);
+
+    for tag in parse_html_tags(html) {
+        for raw in html_prefetch_candidates(&tag) {
+            if paths.len() >= max_dirs {
+                return paths;
+            }
+            let Some(asset_path) = resolve_prefetch_asset_path(raw, &base_path) else {
+                continue;
+            };
+            let dir_path = parent_path(&asset_path);
+            if dir_path.is_empty() {
+                continue;
+            }
+            if seen.insert(dir_path.to_string()) {
+                paths.push(dir_path.to_string());
+            }
+        }
+    }
+    paths
+}
+
+fn html_prefetch_base_path(base_path: &str) -> String {
+    let mut base_path = base_path.trim_start_matches('/').to_string();
+    if base_path.is_empty() || base_path.ends_with('/') {
+        base_path.push_str("index.html");
+    }
+    base_path
+}
+
+fn html_prefetch_candidates(tag: &ParsedTag) -> Vec<&str> {
+    let mut candidates = Vec::new();
+    match tag.name.as_str() {
+        "script" => {
+            if let Some(src) = tag.attr("src") {
+                candidates.push(src);
+            }
+        }
+        "link" => {
+            let rel = tag.attr("rel").unwrap_or("").to_ascii_lowercase();
+            if rel.contains("stylesheet")
+                || rel.contains("modulepreload")
+                || rel.contains("preload")
+                || rel.contains("prefetch")
+            {
+                if let Some(href) = tag.attr("href") {
+                    candidates.push(href);
+                }
+            }
+        }
+        "img" | "source" => {
+            if let Some(src) = tag.attr("src") {
+                candidates.push(src);
+            }
+            if let Some(srcset) = tag.attr("srcset") {
+                candidates.extend(srcset.split(',').filter_map(|candidate| {
+                    candidate
+                        .split_ascii_whitespace()
+                        .next()
+                        .filter(|candidate| !candidate.is_empty())
+                }));
+            }
+        }
+        _ => {}
+    }
+    candidates
+}
+
+fn resolve_prefetch_asset_path(raw: &str, base_path: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty()
+        || raw.starts_with('#')
+        || raw.starts_with("//")
+        || raw.contains("://")
+        || raw.contains("${")
+        || raw.contains("{{")
+        || starts_with_scheme(raw, "data")
+        || starts_with_scheme(raw, "blob")
+        || starts_with_scheme(raw, "javascript")
+        || starts_with_scheme(raw, "mailto")
+        || starts_with_scheme(raw, "tel")
+        || raw.starts_with("/ipfs/")
+        || raw.starts_with("/ipns/")
+    {
+        return None;
+    }
+    let raw = raw.split(['?', '#']).next().unwrap_or(raw).trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let candidate = if raw.starts_with('/') {
+        raw.trim_start_matches('/').to_string()
+    } else {
+        append_path(parent_path(base_path), raw)
+    };
+    normalize_prefetch_path(&candidate)
+}
+
+fn parent_path(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+fn node_kind_label(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Raw => "raw",
+        NodeKind::File => "file",
+        NodeKind::Directory => "directory",
+        NodeKind::HamtShard => "hamt_shard",
+    }
+}
+
+fn normalize_prefetch_path(path: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+        if segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            return None;
+        }
+        if is_traversal_segment(segment) {
+            return None;
+        }
+        parts.push(segment);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn starts_with_scheme(value: &str, scheme: &str) -> bool {
+    value
+        .get(..scheme.len() + 1)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&format!("{scheme}:")))
+}
+
+#[derive(Debug, Clone)]
+struct ParsedTag {
+    name: String,
+    attrs: Vec<(String, String)>,
+}
+
+impl ParsedTag {
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+fn parse_html_tags(html: &str) -> Vec<ParsedTag> {
+    let mut tags = Vec::new();
+    let lower = html.to_ascii_lowercase();
+    let mut offset = 0;
+    while let Some(start) = html[offset..].find('<') {
+        let start = offset + start + 1;
+        let Some(end) = html[start..].find('>') else {
+            break;
+        };
+        let raw = &html[start..start + end];
+        if let Some(tag) = parse_html_tag(raw) {
+            let raw_name = tag.name.clone();
+            tags.push(tag);
+            if matches!(raw_name.as_str(), "script" | "style") {
+                let close_tag = format!("</{raw_name}");
+                if let Some(close_start) = lower[start + end + 1..].find(&close_tag) {
+                    let close_start = start + end + 1 + close_start;
+                    if let Some(close_end) = lower[close_start..].find('>') {
+                        offset = close_start + close_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        offset = start + end + 1;
+    }
+    tags
+}
+
+fn parse_html_tag(raw: &str) -> Option<ParsedTag> {
+    let raw = raw.trim();
+    if raw.is_empty()
+        || raw.starts_with('/')
+        || raw.starts_with('!')
+        || raw.starts_with('?')
+        || raw.starts_with("--")
+    {
+        return None;
+    }
+
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() && !bytes[index].is_ascii_whitespace() && bytes[index] != b'/' {
+        index += 1;
+    }
+    if index == 0 {
+        return None;
+    }
+    let name = raw[..index].to_ascii_lowercase();
+    let mut attrs = Vec::new();
+
+    while index < bytes.len() {
+        while index < bytes.len() && (bytes[index].is_ascii_whitespace() || bytes[index] == b'/') {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        let name_start = index;
+        while index < bytes.len()
+            && !bytes[index].is_ascii_whitespace()
+            && bytes[index] != b'='
+            && bytes[index] != b'/'
+        {
+            index += 1;
+        }
+        if index == name_start {
+            break;
+        }
+        let attr_name = raw[name_start..index].to_ascii_lowercase();
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let attr_value = if index < bytes.len() && bytes[index] == b'=' {
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if index < bytes.len() && (bytes[index] == b'"' || bytes[index] == b'\'') {
+                let quote = bytes[index];
+                index += 1;
+                let value_start = index;
+                while index < bytes.len() && bytes[index] != quote {
+                    index += 1;
+                }
+                let value = raw[value_start..index].to_string();
+                if index < bytes.len() {
+                    index += 1;
+                }
+                value
+            } else {
+                let value_start = index;
+                while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
+                    index += 1;
+                }
+                raw[value_start..index].to_string()
+            }
+        } else {
+            String::new()
+        };
+        attrs.push((attr_name, html_unescape_minimal(&attr_value)));
+    }
+
+    Some(ParsedTag { name, attrs })
+}
+
+fn html_unescape_minimal(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
 enum ServedResource {
     File {
         path: String,
+        cid: Cid,
         len: u64,
     },
     Directory {
         path: String,
         entries: Vec<DirectoryEntry>,
     },
+}
+
+fn resolve_served_path(
+    unixfs: &UnixfsResolver,
+    provider: &dyn BlockProvider,
+    cid: &Cid,
+    unixfs_path: &str,
+    raw_link_tsize_fast_headers: bool,
+) -> Result<(freedom_ipfs_unixfs::ResolvedNode, Option<u64>), GatewayError> {
+    if raw_link_tsize_fast_headers {
+        return unixfs
+            .resolve_path_with_raw_link_tsize_hint(provider, cid, unixfs_path)
+            .map_err(GatewayError::Unixfs);
+    }
+
+    unixfs
+        .resolve_path(provider, cid, unixfs_path)
+        .map(|resolved| (resolved, None))
+        .map_err(GatewayError::Unixfs)
+}
+
+fn file_size_with_optional_hint(
+    unixfs: &UnixfsResolver,
+    provider: &dyn BlockProvider,
+    cid: &Cid,
+    size_hint: Option<u64>,
+) -> Result<(u64, &'static str), GatewayError> {
+    if let Some(size_hint) = size_hint {
+        return Ok((size_hint, "raw_link_tsize"));
+    }
+
+    unixfs
+        .file_size_cid(provider, cid)
+        .map(|size| (size, "unixfs_file_size"))
+        .map_err(GatewayError::Unixfs)
 }
 
 struct DirectoryListingPath {
@@ -511,27 +2309,41 @@ impl DirectoryListingPath {
 }
 
 fn served_resource(
+    unixfs: &UnixfsResolver,
     provider: &dyn BlockProvider,
     cid: &Cid,
     unixfs_path: &str,
+    raw_link_tsize_fast_headers: bool,
 ) -> Result<ServedResource, GatewayError> {
     let file_size_started = Instant::now();
-    match file_size(provider, cid, unixfs_path) {
-        Ok(len) => {
+    let (resolved, size_hint) = resolve_served_path(
+        unixfs,
+        provider,
+        cid,
+        unixfs_path,
+        raw_link_tsize_fast_headers,
+    )?;
+    match resolved.kind {
+        NodeKind::Raw | NodeKind::File => {
+            let (len, size_source) =
+                file_size_with_optional_hint(unixfs, provider, &resolved.cid, size_hint)?;
             tracing::info!(
                 phase = "unixfs_file_size",
                 cid = %cid,
+                file_cid = %resolved.cid,
                 unixfs_path,
                 outcome = "file",
                 file_len = len,
+                size_source,
                 elapsed_ms = file_size_started.elapsed().as_millis()
             );
             Ok(ServedResource::File {
                 path: unixfs_path.to_string(),
+                cid: resolved.cid,
                 len,
             })
         }
-        Err(UnixfsError::IsDirectory) => {
+        NodeKind::Directory | NodeKind::HamtShard => {
             tracing::info!(
                 phase = "unixfs_file_size",
                 cid = %cid,
@@ -541,22 +2353,40 @@ fn served_resource(
             );
             let index_path = append_path(unixfs_path, "index.html");
             let index_started = Instant::now();
-            match file_size(provider, cid, &index_path) {
-                Ok(len) => {
+            match resolve_served_path(
+                unixfs,
+                provider,
+                cid,
+                &index_path,
+                raw_link_tsize_fast_headers,
+            ) {
+                Ok((index_resolved, index_size_hint))
+                    if matches!(index_resolved.kind, NodeKind::Raw | NodeKind::File) =>
+                {
+                    let (len, size_source) = file_size_with_optional_hint(
+                        unixfs,
+                        provider,
+                        &index_resolved.cid,
+                        index_size_hint,
+                    )?;
                     tracing::info!(
                         phase = "unixfs_index_lookup",
                         cid = %cid,
+                        file_cid = %index_resolved.cid,
                         unixfs_path = %index_path,
                         outcome = "file",
                         file_len = len,
+                        size_source,
                         elapsed_ms = index_started.elapsed().as_millis()
                     );
                     Ok(ServedResource::File {
                         path: index_path,
+                        cid: index_resolved.cid,
                         len,
                     })
                 }
-                Err(UnixfsError::PathNotFound(_)) => {
+                Ok(_) => Err(GatewayError::Unixfs(UnixfsError::IsDirectory)),
+                Err(GatewayError::Unixfs(UnixfsError::PathNotFound(_))) => {
                     tracing::info!(
                         phase = "unixfs_index_lookup",
                         cid = %cid,
@@ -565,8 +2395,9 @@ fn served_resource(
                         elapsed_ms = index_started.elapsed().as_millis()
                     );
                     let list_started = Instant::now();
-                    let entries =
-                        list_directory(provider, cid, unixfs_path).map_err(GatewayError::Unixfs)?;
+                    let entries = unixfs
+                        .list_directory(provider, cid, unixfs_path)
+                        .map_err(GatewayError::Unixfs)?;
                     tracing::info!(
                         phase = "unixfs_list_directory",
                         cid = %cid,
@@ -579,10 +2410,9 @@ fn served_resource(
                         entries,
                     })
                 }
-                Err(err) => Err(GatewayError::Unixfs(err)),
+                Err(err) => Err(err),
             }
         }
-        Err(err) => Err(GatewayError::Unixfs(err)),
     }
 }
 
@@ -642,9 +2472,11 @@ fn split_ipfs_path(path: &str) -> Result<(Cid, &str), GatewayError> {
 
 async fn serve_ipns_path(
     provider: Arc<dyn BlockProvider>,
+    unixfs: UnixfsResolver,
+    features: GatewayResponseFeatures,
     name_resolver: &dyn NameResolver,
     path: &str,
-    range: Option<&HeaderValue>,
+    request_headers: GatewayRequestHeaders<'_>,
 ) -> Result<Response, GatewayError> {
     let listing_path = DirectoryListingPath::ipns(path);
     let mut target = format!("/ipns/{path}");
@@ -653,9 +2485,14 @@ async fn serve_ipns_path(
         if let Some(ipfs) = target.strip_prefix("/ipfs/") {
             return serve_ipfs_path_with_listing_path(
                 provider.clone(),
+                unixfs.clone(),
+                features.clone(),
                 ipfs,
-                range,
-                Some(&listing_path),
+                request_headers,
+                GatewayIpfsPathOptions {
+                    listing_path: Some(&listing_path),
+                    cache_policy: FileCachePolicy::RevalidateIpns,
+                },
             )
             .await;
         }
@@ -801,44 +2638,278 @@ fn percent_encode_segment(segment: &str) -> String {
     out
 }
 
-fn streaming_response(
-    provider: Arc<dyn BlockProvider>,
-    cid: Cid,
+#[derive(Clone, Copy)]
+struct FileResponseHeaders<'a> {
+    mime: &'a str,
+    etag: &'a str,
+    cache_policy: FileCachePolicy,
+    is_head: bool,
+}
+
+struct FileResponseTarget {
+    root_cid: Cid,
+    file_cid: Cid,
     path: String,
     len: u64,
-    mime: &str,
+}
+
+#[derive(Clone, Copy)]
+struct GatewayStreamState {
+    offset: u64,
+    chunks: u64,
+    started: Instant,
+    prefetch_started: bool,
+}
+
+fn streaming_response(
+    provider: Arc<dyn BlockProvider>,
+    unixfs: UnixfsResolver,
+    features: GatewayResponseFeatures,
+    target: FileResponseTarget,
+    headers: FileResponseHeaders<'_>,
 ) -> Result<Response, GatewayError> {
-    let provider = Arc::new(ScopedBlockProvider::new(provider));
-    let stream = stream::unfold(Some(0u64), move |offset| {
-        let provider = provider.clone();
-        let path = path.clone();
-        async move {
-            let offset = offset?;
-            if offset >= len {
-                return None;
+    let small_body_cache = features.small_body_cache;
+    let html_prefetch = features.html_prefetch;
+    let html_directory_prefetch = features.html_directory_prefetch;
+    let stream_small_bodies = features.stream_small_bodies;
+    let FileResponseTarget {
+        root_cid,
+        file_cid,
+        path,
+        len,
+    } = target;
+    if !headers.is_head && !stream_small_bodies && len <= GATEWAY_STREAM_CHUNK_SIZE {
+        let end = len.saturating_sub(1);
+        let body = if len == 0 {
+            Bytes::new()
+        } else {
+            let cache_key = SmallBodyCacheKey { file_cid, len };
+            let cache_started = Instant::now();
+            if let Some(bytes) = small_body_cache.get(&cache_key) {
+                tracing::info!(
+                    phase = "gateway_small_body_cache",
+                    cid = %root_cid,
+                    file_cid = %file_cid,
+                    unixfs_path = %path,
+                    cache_hit = true,
+                    body_len = bytes.len(),
+                    elapsed_ms = cache_started.elapsed().as_millis()
+                );
+                tracing::info!(
+                    phase = "gateway_direct_body",
+                    cid = %root_cid,
+                    file_cid = %file_cid,
+                    unixfs_path = %path,
+                    range_start = 0u64,
+                    range_end = end,
+                    body_len = bytes.len(),
+                    source = "small_body_cache",
+                    elapsed_ms = cache_started.elapsed().as_millis()
+                );
+                bytes
+            } else {
+                tracing::info!(
+                    phase = "gateway_small_body_cache",
+                    cid = %root_cid,
+                    file_cid = %file_cid,
+                    unixfs_path = %path,
+                    cache_hit = false,
+                    elapsed_ms = cache_started.elapsed().as_millis()
+                );
+                let started = Instant::now();
+                let bytes = unixfs
+                    .read_file_cid_range(provider.as_ref(), &file_cid, 0, end)
+                    .map(Bytes::from)
+                    .map_err(GatewayError::Unixfs)?;
+                tracing::info!(
+                    phase = "gateway_direct_body",
+                    cid = %root_cid,
+                    file_cid = %file_cid,
+                    unixfs_path = %path,
+                    range_start = 0u64,
+                    range_end = end,
+                    body_len = bytes.len(),
+                    source = "unixfs",
+                    elapsed_ms = started.elapsed().as_millis()
+                );
+                let insert = small_body_cache.insert(cache_key, bytes.clone());
+                tracing::info!(
+                    phase = "gateway_small_body_cache",
+                    cid = %root_cid,
+                    file_cid = %file_cid,
+                    unixfs_path = %path,
+                    cache_inserted = insert.inserted,
+                    evicted = insert.evicted,
+                    cache_len = insert.cache_len,
+                    cache_bytes = insert.cache_bytes
+                );
+                bytes
             }
-            let last = len - 1;
-            let end = offset
-                .saturating_add(GATEWAY_STREAM_CHUNK_SIZE - 1)
-                .min(last);
-            let next = if end == last { None } else { Some(end + 1) };
-            let chunk = read_file_range(
-                provider.as_ref() as &dyn BlockProvider,
-                &cid,
-                &path,
-                offset,
-                end,
-            )
-            .map(Bytes::from)
-            .map_err(|err| io::Error::other(err.to_string()));
-            Some((chunk, next))
-        }
-    });
+        };
+        maybe_spawn_html_directory_prefetch(
+            html_directory_prefetch.as_ref(),
+            provider.clone(),
+            unixfs.clone(),
+            HtmlPrefetchSeed {
+                root_cid,
+                base_path: &path,
+                mime: headers.mime,
+                body: &body,
+            },
+        );
+        maybe_spawn_html_prefetch(
+            html_prefetch.as_ref(),
+            provider,
+            unixfs,
+            small_body_cache,
+            HtmlPrefetchSeed {
+                root_cid,
+                base_path: &path,
+                mime: headers.mime,
+                body: &body,
+            },
+        );
+        let mut response = Body::from(body).into_response();
+        set_gateway_body_mode(&mut response, GatewayBodyMode::Direct);
+        insert_full_file_headers(&mut response, len, headers)?;
+        return Ok(response);
+    }
+
+    let provider = Arc::new(ScopedBlockProvider::new(provider));
+    let span = tracing::Span::current();
+    let stream_mime = headers.mime.to_string();
+    let stream = stream::unfold(
+        Some(GatewayStreamState {
+            offset: 0,
+            chunks: 0,
+            started: Instant::now(),
+            prefetch_started: false,
+        }),
+        move |state| {
+            let provider = provider.clone();
+            let unixfs = unixfs.clone();
+            let small_body_cache = small_body_cache.clone();
+            let html_prefetch = html_prefetch.clone();
+            let html_directory_prefetch = html_directory_prefetch.clone();
+            let path = path.clone();
+            let span = span.clone();
+            let stream_mime = stream_mime.clone();
+            async move {
+                let state = state?;
+                let offset = state.offset;
+                if offset >= len {
+                    return None;
+                }
+                let last = len - 1;
+                let end = offset
+                    .saturating_add(GATEWAY_STREAM_CHUNK_SIZE - 1)
+                    .min(last);
+                let chunks = state.chunks.saturating_add(1);
+                let next = if end == last {
+                    None
+                } else {
+                    Some(GatewayStreamState {
+                        offset: end.saturating_add(1),
+                        chunks,
+                        started: state.started,
+                        prefetch_started: state.prefetch_started || offset == 0,
+                    })
+                };
+                let chunk = unixfs
+                    .read_file_cid_range(
+                        provider.as_ref() as &dyn BlockProvider,
+                        &file_cid,
+                        offset,
+                        end,
+                    )
+                    .map(Bytes::from)
+                    .map_err(|err| io::Error::other(err.to_string()));
+                if !state.prefetch_started {
+                    if let Ok(bytes) = &chunk {
+                        let prefetch_provider: Arc<dyn BlockProvider> = provider.clone();
+                        maybe_spawn_html_directory_prefetch(
+                            html_directory_prefetch.as_ref(),
+                            prefetch_provider.clone(),
+                            unixfs.clone(),
+                            HtmlPrefetchSeed {
+                                root_cid,
+                                base_path: &path,
+                                mime: &stream_mime,
+                                body: bytes,
+                            },
+                        );
+                        maybe_spawn_html_prefetch(
+                            html_prefetch.as_ref(),
+                            prefetch_provider,
+                            unixfs.clone(),
+                            small_body_cache,
+                            HtmlPrefetchSeed {
+                                root_cid,
+                                base_path: &path,
+                                mime: &stream_mime,
+                                body: bytes,
+                            },
+                        );
+                    }
+                }
+                match &chunk {
+                    Ok(_) if end == last => {
+                        tracing::info!(
+                            phase = "gateway_stream_done",
+                            cid = %root_cid,
+                            file_cid = %file_cid,
+                            unixfs_path = %path,
+                            range_start = 0u64,
+                            range_end = last,
+                            body_len = len,
+                            chunks,
+                            elapsed_ms = state.started.elapsed().as_millis()
+                        );
+                    }
+                    Err(err) => {
+                        tracing::info!(
+                            phase = "gateway_stream_failed",
+                            cid = %root_cid,
+                            file_cid = %file_cid,
+                            unixfs_path = %path,
+                            range_start = offset,
+                            range_end = end,
+                            body_len = len,
+                            chunks = state.chunks,
+                            error = %err,
+                            elapsed_ms = state.started.elapsed().as_millis()
+                        );
+                    }
+                    _ => {}
+                }
+                Some((chunk, next))
+            }
+            .instrument(span)
+        },
+    );
 
     let mut response = Body::from_stream(stream).into_response();
+    set_gateway_body_mode(
+        &mut response,
+        if headers.is_head {
+            GatewayBodyMode::Direct
+        } else {
+            GatewayBodyMode::Stream
+        },
+    );
+    insert_full_file_headers(&mut response, len, headers)?;
+    Ok(response)
+}
+
+fn insert_full_file_headers(
+    response: &mut Response,
+    len: u64,
+    headers: FileResponseHeaders<'_>,
+) -> Result<(), GatewayError> {
     response.headers_mut().insert(
         CONTENT_TYPE,
-        HeaderValue::from_str(mime).map_err(|err| GatewayError::Internal(err.to_string()))?,
+        HeaderValue::from_str(headers.mime)
+            .map_err(|err| GatewayError::Internal(err.to_string()))?,
     );
     response
         .headers_mut()
@@ -848,7 +2919,8 @@ fn streaming_response(
         HeaderValue::from_str(&len.to_string())
             .map_err(|err| GatewayError::Internal(err.to_string()))?,
     );
-    Ok(response)
+    insert_cache_headers(response, headers.etag, headers.cache_policy)?;
+    Ok(())
 }
 
 struct ScopedBlockProvider {
@@ -893,6 +2965,39 @@ impl BlockProvider for ScopedBlockProvider {
             }
         }
     }
+
+    fn get_block_range(
+        &self,
+        cid: &Cid,
+        start: u64,
+        end: u64,
+    ) -> freedom_ipfs_core::Result<Option<Vec<u8>>> {
+        let mut retained_here = false;
+        {
+            let mut retained = self.retained.lock().map_err(|err| {
+                freedom_ipfs_core::CoreError::Storage(format!(
+                    "stream retention lock poisoned: {err}"
+                ))
+            })?;
+            if retained.insert(*cid) {
+                self.inner.retain_block(cid)?;
+                retained_here = true;
+            }
+        }
+
+        match self.inner.get_block_range(cid, start, end)? {
+            Some(bytes) => Ok(Some(bytes)),
+            None => {
+                if retained_here {
+                    if let Ok(mut retained) = self.retained.lock() {
+                        retained.remove(cid);
+                    }
+                    self.inner.release_block(cid);
+                }
+                Ok(None)
+            }
+        }
+    }
 }
 
 impl Drop for ScopedBlockProvider {
@@ -907,12 +3012,152 @@ impl Drop for ScopedBlockProvider {
 
 fn ranged_response(
     provider: Arc<dyn BlockProvider>,
-    cid: Cid,
-    path: String,
-    total_len: u64,
-    range: &HeaderValue,
-    mime: &str,
+    unixfs: UnixfsResolver,
+    features: GatewayResponseFeatures,
+    target: FileResponseTarget,
+    start: u64,
+    end: u64,
+    headers: FileResponseHeaders<'_>,
 ) -> Result<Response, GatewayError> {
+    let FileResponseTarget {
+        root_cid,
+        file_cid,
+        path,
+        len: total_len,
+    } = target;
+    let range_len = end - start + 1;
+    if !headers.is_head && range_len <= GATEWAY_STREAM_CHUNK_SIZE {
+        let started = Instant::now();
+        let body = unixfs
+            .read_file_cid_range(provider.as_ref(), &file_cid, start, end)
+            .map(Bytes::from)
+            .map_err(GatewayError::Unixfs)?;
+        tracing::info!(
+            phase = "gateway_direct_body",
+            cid = %root_cid,
+            file_cid = %file_cid,
+            unixfs_path = %path,
+            range_start = start,
+            range_end = end,
+            body_len = body.len(),
+            elapsed_ms = started.elapsed().as_millis()
+        );
+        maybe_spawn_html_range_warm(
+            features.html_range_warm.as_ref(),
+            provider,
+            unixfs,
+            features.small_body_cache,
+            HtmlRangeWarmSeed {
+                root_cid,
+                file_cid,
+                path: &path,
+                mime: headers.mime,
+                total_len,
+                range_start: start,
+                range_end: end,
+            },
+        );
+        let mut response = Body::from(body).into_response();
+        set_gateway_body_mode(&mut response, GatewayBodyMode::Direct);
+        *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+        insert_range_file_headers(&mut response, total_len, start, end, headers)?;
+        return Ok(response);
+    }
+
+    let provider = Arc::new(ScopedBlockProvider::new(provider));
+    let span = tracing::Span::current();
+    let stream = stream::unfold(
+        Some(GatewayStreamState {
+            offset: start,
+            chunks: 0,
+            started: Instant::now(),
+            prefetch_started: true,
+        }),
+        move |state| {
+            let provider = provider.clone();
+            let unixfs = unixfs.clone();
+            let path = path.clone();
+            let span = span.clone();
+            async move {
+                let state = state?;
+                let offset = state.offset;
+                if offset > end {
+                    return None;
+                }
+                let chunk_end = offset
+                    .saturating_add(GATEWAY_STREAM_CHUNK_SIZE - 1)
+                    .min(end);
+                let chunks = state.chunks.saturating_add(1);
+                let next = if chunk_end == end {
+                    None
+                } else {
+                    Some(GatewayStreamState {
+                        offset: chunk_end.saturating_add(1),
+                        chunks,
+                        started: state.started,
+                        prefetch_started: true,
+                    })
+                };
+                let chunk = unixfs
+                    .read_file_cid_range(
+                        provider.as_ref() as &dyn BlockProvider,
+                        &file_cid,
+                        offset,
+                        chunk_end,
+                    )
+                    .map(Bytes::from)
+                    .map_err(|err| io::Error::other(err.to_string()));
+                match &chunk {
+                    Ok(_) if chunk_end == end => {
+                        tracing::info!(
+                            phase = "gateway_stream_done",
+                            cid = %root_cid,
+                            file_cid = %file_cid,
+                            unixfs_path = %path,
+                            range_start = start,
+                            range_end = end,
+                            body_len = range_len,
+                            chunks,
+                            elapsed_ms = state.started.elapsed().as_millis()
+                        );
+                    }
+                    Err(err) => {
+                        tracing::info!(
+                            phase = "gateway_stream_failed",
+                            cid = %root_cid,
+                            file_cid = %file_cid,
+                            unixfs_path = %path,
+                            range_start = offset,
+                            range_end = chunk_end,
+                            body_len = range_len,
+                            chunks = state.chunks,
+                            error = %err,
+                            elapsed_ms = state.started.elapsed().as_millis()
+                        );
+                    }
+                    _ => {}
+                }
+                Some((chunk, next))
+            }
+            .instrument(span)
+        },
+    );
+
+    let mut response = Body::from_stream(stream).into_response();
+    set_gateway_body_mode(
+        &mut response,
+        if headers.is_head {
+            GatewayBodyMode::Direct
+        } else {
+            GatewayBodyMode::Stream
+        },
+    );
+    *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+    insert_range_file_headers(&mut response, total_len, start, end, headers)?;
+    Ok(response)
+}
+
+fn parse_range_header(range: &HeaderValue, total_len: u64) -> Result<(u64, u64), GatewayError> {
     let range = range
         .to_str()
         .map_err(|_| GatewayError::BadRequest("invalid Range header".into()))?;
@@ -921,39 +3166,20 @@ fn ranged_response(
             "only bytes ranges are supported".into(),
         ));
     };
-    let (start, end) = parse_range_spec(spec, total_len)?;
-    let provider = Arc::new(ScopedBlockProvider::new(provider));
-    let stream = stream::unfold(Some(start), move |offset| {
-        let provider = provider.clone();
-        let path = path.clone();
-        async move {
-            let offset = offset?;
-            let chunk_end = offset
-                .saturating_add(GATEWAY_STREAM_CHUNK_SIZE - 1)
-                .min(end);
-            let next = if chunk_end == end {
-                None
-            } else {
-                Some(chunk_end + 1)
-            };
-            let chunk = read_file_range(
-                provider.as_ref() as &dyn BlockProvider,
-                &cid,
-                &path,
-                offset,
-                chunk_end,
-            )
-            .map(Bytes::from)
-            .map_err(|err| io::Error::other(err.to_string()));
-            Some((chunk, next))
-        }
-    });
+    parse_range_spec(spec, total_len)
+}
 
-    let mut response = Body::from_stream(stream).into_response();
-    *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+fn insert_range_file_headers(
+    response: &mut Response,
+    total_len: u64,
+    start: u64,
+    end: u64,
+    headers: FileResponseHeaders<'_>,
+) -> Result<(), GatewayError> {
     response.headers_mut().insert(
         CONTENT_TYPE,
-        HeaderValue::from_str(mime).map_err(|err| GatewayError::Internal(err.to_string()))?,
+        HeaderValue::from_str(headers.mime)
+            .map_err(|err| GatewayError::Internal(err.to_string()))?,
     );
     response
         .headers_mut()
@@ -968,7 +3194,52 @@ fn ranged_response(
         HeaderValue::from_str(&(end - start + 1).to_string())
             .map_err(|err| GatewayError::Internal(err.to_string()))?,
     );
+    insert_cache_headers(response, headers.etag, headers.cache_policy)?;
+    Ok(())
+}
+
+fn not_modified_response(
+    etag: &str,
+    cache_policy: FileCachePolicy,
+) -> Result<Response, GatewayError> {
+    let mut response = StatusCode::NOT_MODIFIED.into_response();
+    insert_cache_headers(&mut response, etag, cache_policy)?;
     Ok(response)
+}
+
+fn insert_cache_headers(
+    response: &mut Response,
+    etag: &str,
+    cache_policy: FileCachePolicy,
+) -> Result<(), GatewayError> {
+    response.headers_mut().insert(
+        ETAG,
+        HeaderValue::from_str(etag).map_err(|err| GatewayError::Internal(err.to_string()))?,
+    );
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static(cache_policy.header_value()),
+    );
+    Ok(())
+}
+
+fn file_etag(cid: &Cid, path: &str, len: u64) -> String {
+    let path = if path.is_empty() {
+        ".".to_string()
+    } else {
+        encode_gateway_path(path)
+    };
+    format!("\"fi1:{cid}:{path}:{len}\"")
+}
+
+fn if_none_match_matches(value: Option<&HeaderValue>, etag: &str) -> bool {
+    let Some(value) = value.and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    value.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*" || candidate == etag || candidate.strip_prefix("W/") == Some(etag)
+    })
 }
 
 fn parse_range_spec(spec: &str, len: u64) -> Result<(u64, u64), GatewayError> {
@@ -1107,6 +3378,7 @@ mod tests {
     };
     use freedom_ipfs_namesys::{NamesysError, Result as NamesysResult};
     use prost::Message;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::net::TcpListener;
@@ -1129,6 +3401,87 @@ mod tests {
         let response = reqwest::get(url).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(data));
+    }
+
+    #[tokio::test]
+    async fn ipfs_file_responses_include_etag_and_support_not_modified() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"<html>cache me</html>";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(store);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/ipfs/{cid}");
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response.headers().get(ETAG).unwrap().clone();
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static(CACHE_CONTROL_IPFS_FILE)
+        );
+        assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(data));
+
+        let response = client
+            .get(&url)
+            .header(IF_NONE_MATCH, etag.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers().get(ETAG), Some(&etag));
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static(CACHE_CONTROL_IPFS_FILE)
+        );
+        assert!(response.bytes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn range_requests_include_etag_but_ignore_if_none_match() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"0123456789";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(store);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/ipfs/{cid}");
+        let etag = file_etag(&cid, "", data.len() as u64);
+        let response = client
+            .get(url)
+            .header(RANGE, "bytes=2-5")
+            .header(IF_NONE_MATCH, &etag)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(CONTENT_RANGE).unwrap(),
+            HeaderValue::from_static("bytes 2-5/10")
+        );
+        assert_eq!(
+            response.headers().get(ETAG).unwrap(),
+            HeaderValue::from_str(&etag).unwrap()
+        );
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static(CACHE_CONTROL_IPFS_FILE)
+        );
+        assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(b"2345"));
     }
 
     #[tokio::test]
@@ -1158,6 +3511,431 @@ mod tests {
             HeaderValue::from_static("text/html")
         );
         assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(index));
+    }
+
+    #[tokio::test]
+    async fn gateway_reuses_unixfs_metadata_within_dagpb_response() {
+        let data = b"<!doctype html><html>cached metadata</html>";
+        let file_block = test_pb_file(data);
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_block);
+        let dir_block = test_pb_directory(vec![test_link("index.html", &file_cid)]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (dir_cid, dir_block),
+            (file_cid, file_block),
+        ])));
+        let state = GatewayState::with_provider(provider.clone());
+
+        let response = ipfs_get(
+            State(state),
+            Path(format!("{dir_cid}/index.html")),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), data);
+        assert_eq!(provider.call_count(&dir_cid), 1);
+        assert_eq!(provider.call_count(&file_cid), 1);
+    }
+
+    #[tokio::test]
+    async fn gateway_reuses_small_direct_body_cache_for_repeated_assets() {
+        let data = b"console.log('small cached asset');";
+        let file_block = test_pb_file(data);
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_block);
+        let dir_block = test_pb_directory(vec![test_link("app.js", &file_cid)]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (dir_cid, dir_block),
+            (file_cid, file_block),
+        ])));
+        let state = GatewayState::with_provider(provider.clone());
+
+        let first = ipfs_get(
+            State(state.clone()),
+            Path(format!("{dir_cid}/app.js")),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(first_body.as_ref(), data);
+        let dir_calls = provider.call_count(&dir_cid);
+        let file_calls = provider.call_count(&file_cid);
+
+        let second = ipfs_get(
+            State(state),
+            Path(format!("{dir_cid}/app.js")),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(second_body.as_ref(), data);
+        assert_eq!(provider.call_count(&dir_cid), dir_calls);
+        assert_eq!(provider.call_count(&file_cid), file_calls);
+    }
+
+    #[tokio::test]
+    async fn gateway_can_stream_small_full_bodies_when_configured() {
+        let data = b"console.log('small streamed asset');";
+        let file_block = test_pb_file(data);
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_block);
+        let dir_block = test_pb_directory(vec![test_link("app.js", &file_cid)]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (dir_cid, dir_block),
+            (file_cid, file_block),
+        ])));
+        let config = GatewayConfig::new(8).with_stream_small_bodies(true);
+        let state = GatewayState::with_provider_config(provider.clone(), config);
+
+        let response = ipfs_get(
+            State(state),
+            Path(format!("{dir_cid}/app.js")),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(gateway_body_mode(&response), "stream");
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_LENGTH)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            data.len().to_string()
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), data);
+        assert_eq!(provider.call_count(&dir_cid), 1);
+        assert_eq!(provider.call_count(&file_cid), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn top_level_html_prefetch_populates_small_body_cache() {
+        let app = b"console.log('prefetched asset');";
+        let app_block = test_pb_file(app);
+        let app_cid = cid_from_data(CODEC_DAG_PB, &app_block);
+        let html = b"<!doctype html><script src=\"/app.js\"></script>";
+        let index_block = test_pb_file(html);
+        let index_cid = cid_from_data(CODEC_DAG_PB, &index_block);
+        let dir_block = test_pb_directory(vec![
+            test_link("index.html", &index_cid),
+            test_link("app.js", &app_cid),
+        ]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (dir_cid, dir_block),
+            (index_cid, index_block),
+            (app_cid, app_block),
+        ])));
+        let config = GatewayConfig::new(8).with_html_prefetch(GatewayHtmlPrefetchConfig::new(
+            4,
+            GATEWAY_STREAM_CHUNK_SIZE,
+            2,
+        ));
+        let state = GatewayState::with_provider_config(provider.clone(), config);
+
+        let root = ipfs_get(
+            State(state.clone()),
+            Path(dir_cid.to_string()),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(root.status(), StatusCode::OK);
+        let root_body = axum::body::to_bytes(root.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(root_body.as_ref(), html);
+
+        for _ in 0..100 {
+            if provider.call_count(&app_cid) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let prefetched_app_calls = provider.call_count(&app_cid);
+        assert!(prefetched_app_calls > 0);
+
+        let asset = ipfs_get(
+            State(state),
+            Path(format!("{dir_cid}/app.js")),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(asset.status(), StatusCode::OK);
+        let asset_body = axum::body::to_bytes(asset.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(asset_body.as_ref(), app);
+        assert_eq!(provider.call_count(&app_cid), prefetched_app_calls);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn top_level_html_directory_prefetch_warms_parent_directory_only() {
+        let app = b"console.log('directory parent warmed');";
+        let app_cid = cid_from_data(CODEC_RAW, app);
+        let assets_dir_block = test_pb_directory(vec![test_link("app.js", &app_cid)]);
+        let assets_dir_cid = cid_from_data(CODEC_DAG_PB, &assets_dir_block);
+        let html = b"<!doctype html><script src=\"/assets/app.js\"></script>";
+        let index_block = test_pb_file(html);
+        let index_cid = cid_from_data(CODEC_DAG_PB, &index_block);
+        let dir_block = test_pb_directory(vec![
+            test_link("index.html", &index_cid),
+            test_link("assets", &assets_dir_cid),
+        ]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (dir_cid, dir_block),
+            (index_cid, index_block),
+            (assets_dir_cid, assets_dir_block),
+            (app_cid, app.to_vec()),
+        ])));
+        let config = GatewayConfig::new(8).with_html_directory_prefetch(
+            GatewayHtmlDirectoryPrefetchConfig::new(1, GATEWAY_STREAM_CHUNK_SIZE, 1),
+        );
+        let state = GatewayState::with_provider_config(provider.clone(), config);
+
+        let root = ipfs_get(
+            State(state.clone()),
+            Path(dir_cid.to_string()),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(root.status(), StatusCode::OK);
+        let root_body = axum::body::to_bytes(root.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(root_body.as_ref(), html);
+
+        for _ in 0..100 {
+            if provider.call_count(&assets_dir_cid) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            provider.call_count(&assets_dir_cid) > 0,
+            "enabled directory prefetch should warm the shared asset directory"
+        );
+        assert_eq!(
+            provider.call_count(&app_cid),
+            0,
+            "directory prefetch should not read asset bodies"
+        );
+
+        let asset = ipfs_get(
+            State(state),
+            Path(format!("{dir_cid}/assets/app.js")),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(asset.status(), StatusCode::OK);
+        let asset_body = axum::body::to_bytes(asset.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(asset_body.as_ref(), app);
+        assert!(provider.call_count(&app_cid) > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streamed_top_level_html_prefetches_from_first_chunk() {
+        let app = b"console.log('stream prefetched asset');";
+        let app_block = test_pb_file(app);
+        let app_cid = cid_from_data(CODEC_DAG_PB, &app_block);
+        let mut html = b"<!doctype html><script src=\"/app.js\"></script>".to_vec();
+        html.resize(GATEWAY_STREAM_CHUNK_SIZE as usize + 1024, b' ');
+        let index_block = test_pb_file(&html);
+        let index_cid = cid_from_data(CODEC_DAG_PB, &index_block);
+        let dir_block = test_pb_directory(vec![
+            test_link("index.html", &index_cid),
+            test_link("app.js", &app_cid),
+        ]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (dir_cid, dir_block),
+            (index_cid, index_block),
+            (app_cid, app_block),
+        ])));
+        let config = GatewayConfig::new(8).with_html_prefetch(GatewayHtmlPrefetchConfig::new(
+            4,
+            GATEWAY_STREAM_CHUNK_SIZE,
+            2,
+        ));
+        let state = GatewayState::with_provider_config(provider.clone(), config);
+
+        let root = ipfs_get(
+            State(state.clone()),
+            Path(dir_cid.to_string()),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(root.status(), StatusCode::OK);
+        let root_body = axum::body::to_bytes(root.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(root_body.as_ref(), html.as_slice());
+
+        for _ in 0..100 {
+            if provider.call_count(&app_cid) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let prefetched_app_calls = provider.call_count(&app_cid);
+        assert!(prefetched_app_calls > 0);
+
+        let asset = ipfs_get(
+            State(state),
+            Path(format!("{dir_cid}/app.js")),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(asset.status(), StatusCode::OK);
+        let asset_body = axum::body::to_bytes(asset.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(asset_body.as_ref(), app);
+        assert_eq!(provider.call_count(&app_cid), prefetched_app_calls);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn html_prefix_range_warm_is_disabled_by_default() {
+        let first = b"<!doctype html><html><body>prefix</body>";
+        let second = vec![b'x'; GATEWAY_STREAM_CHUNK_SIZE as usize + 1024];
+        let first_cid = cid_from_data(CODEC_RAW, first);
+        let second_cid = cid_from_data(CODEC_RAW, &second);
+        let file_block = test_pb_file_with_links(
+            vec![test_link("", &first_cid), test_link("", &second_cid)],
+            (first.len() + second.len()) as u64,
+            vec![first.len() as u64, second.len() as u64],
+        );
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (file_cid, file_block),
+            (first_cid, first.to_vec()),
+            (second_cid, second),
+        ])));
+        let state = GatewayState::with_provider(provider.clone());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=0-14"));
+        let response = ipfs_get(
+            State(state),
+            Path(file_cid.to_string()),
+            Method::GET,
+            headers,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"<!doctype html>");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            provider.call_count(&second_cid),
+            0,
+            "default range handling should not warm unread file blocks"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enabled_html_prefix_range_warm_reads_remaining_file_blocks() {
+        let first = b"<!doctype html><html><body>prefix</body>";
+        let second = vec![b'x'; GATEWAY_STREAM_CHUNK_SIZE as usize + 1024];
+        let first_cid = cid_from_data(CODEC_RAW, first);
+        let second_cid = cid_from_data(CODEC_RAW, &second);
+        let total_len = (first.len() + second.len()) as u64;
+        let file_block = test_pb_file_with_links(
+            vec![test_link("", &first_cid), test_link("", &second_cid)],
+            total_len,
+            vec![first.len() as u64, second.len() as u64],
+        );
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (file_cid, file_block),
+            (first_cid, first.to_vec()),
+            (second_cid, second),
+        ])));
+        let config = GatewayConfig::new(8)
+            .with_html_range_warm(GatewayHtmlRangeWarmConfig::new(total_len, 1));
+        let state = GatewayState::with_provider_config(provider.clone(), config);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(RANGE, HeaderValue::from_static("bytes=0-14"));
+        let response = ipfs_get(
+            State(state),
+            Path(file_cid.to_string()),
+            Method::GET,
+            headers,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"<!doctype html>");
+        for _ in 0..100 {
+            if provider.call_count(&second_cid) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            provider.call_count(&second_cid) > 0,
+            "enabled range warm should fetch blocks outside the requested prefix"
+        );
+    }
+
+    #[test]
+    fn small_body_cache_evicts_to_byte_budget() {
+        let first = cid_from_data(CODEC_RAW, b"one");
+        let second = cid_from_data(CODEC_RAW, b"two");
+        let cache = SmallBodyCache::new(5);
+        let first_key = SmallBodyCacheKey {
+            file_cid: first,
+            len: 3,
+        };
+        let second_key = SmallBodyCacheKey {
+            file_cid: second,
+            len: 3,
+        };
+
+        let first_insert = cache.insert(first_key.clone(), Bytes::from_static(b"one"));
+        assert!(first_insert.inserted);
+        assert_eq!(first_insert.evicted, 0);
+        let second_insert = cache.insert(second_key.clone(), Bytes::from_static(b"two"));
+
+        assert!(second_insert.inserted);
+        assert_eq!(second_insert.evicted, 1);
+        assert!(cache.get(&first_key).is_none());
+        assert_eq!(cache.get(&second_key).unwrap(), Bytes::from_static(b"two"));
     }
 
     #[tokio::test]
@@ -1260,6 +4038,52 @@ mod tests {
         assert_eq!(ranged.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[test]
+    fn raw_link_tsize_fast_headers_skip_pre_response_raw_leaf_fetch() {
+        let leaf_data = vec![b'a'; (GATEWAY_STREAM_CHUNK_SIZE + 17) as usize];
+        let leaf_cid = cid_from_data(CODEC_RAW, &leaf_data);
+        let dir_data = test_pb_directory(vec![TestPbLink {
+            tsize: Some(leaf_data.len() as u64),
+            ..test_link("app.js", &leaf_cid)
+        }]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_data);
+        let provider =
+            MultiCountingProvider::new(HashMap::from([(leaf_cid, leaf_data), (dir_cid, dir_data)]));
+        let unixfs = UnixfsResolver::with_metadata_cache_capacity(8);
+
+        let resource = served_resource(&unixfs, &provider, &dir_cid, "app.js", true).unwrap();
+
+        match resource {
+            ServedResource::File { cid, len, .. } => {
+                assert_eq!(cid, leaf_cid);
+                assert_eq!(len, GATEWAY_STREAM_CHUNK_SIZE + 17);
+            }
+            ServedResource::Directory { .. } => panic!("expected file resource"),
+        }
+        assert_eq!(provider.call_count(&dir_cid), 1);
+        assert_eq!(provider.call_count(&leaf_cid), 0);
+    }
+
+    #[test]
+    fn raw_link_tsize_fast_headers_stay_opt_in() {
+        let leaf_data = vec![b'a'; (GATEWAY_STREAM_CHUNK_SIZE + 17) as usize];
+        let leaf_cid = cid_from_data(CODEC_RAW, &leaf_data);
+        let dir_data = test_pb_directory(vec![TestPbLink {
+            tsize: Some(leaf_data.len() as u64),
+            ..test_link("app.js", &leaf_cid)
+        }]);
+        let dir_cid = cid_from_data(CODEC_DAG_PB, &dir_data);
+        let provider =
+            MultiCountingProvider::new(HashMap::from([(leaf_cid, leaf_data), (dir_cid, dir_data)]));
+        let unixfs = UnixfsResolver::with_metadata_cache_capacity(8);
+
+        let resource = served_resource(&unixfs, &provider, &dir_cid, "app.js", false).unwrap();
+
+        assert!(matches!(resource, ServedResource::File { .. }));
+        assert_eq!(provider.call_count(&dir_cid), 1);
+        assert_eq!(provider.call_count(&leaf_cid), 2);
+    }
+
     #[tokio::test]
     async fn resolves_percent_encoded_browser_paths() {
         let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
@@ -1320,6 +4144,95 @@ mod tests {
                 "{range}"
             );
         }
+    }
+
+    #[test]
+    fn mime_fallback_source_distinguishes_sniff_status() {
+        assert_eq!(mime_fallback_source(0, false), "fallback_empty");
+        assert_eq!(mime_fallback_source(10, true), "fallback_after_sniff");
+        assert_eq!(mime_fallback_source(10, false), "fallback_no_sniff");
+    }
+
+    #[test]
+    fn html_prefetch_asset_paths_extracts_same_root_subresources() {
+        let html = r#"
+            <!doctype html>
+            <base href="https://example.invalid/ignored/">
+            <link rel="stylesheet" href="/assets/app.css?x=1">
+            <link rel="modulepreload" href="chunks/app.js">
+            <script src="./main.js"></script>
+            <img srcset="hero.avif 1x, hero@2x.avif 2x">
+            <script>var ignored = "<img src='/late.png'>";</script>
+            <script src="https://cdn.example/app.js"></script>
+            <img src="data:image/png;base64,aaa">
+        "#;
+
+        assert_eq!(
+            html_prefetch_asset_paths(html, "/pages/index.html", 8),
+            vec![
+                "assets/app.css",
+                "pages/chunks/app.js",
+                "pages/main.js",
+                "pages/hero.avif",
+                "pages/hero@2x.avif",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_byte_ranges_skip_mime_sniff_prefix_read() {
+        let first = b"<!DOCTYPE html><html><body>prefix block</body></html>";
+        let second = b"range payload";
+        let first_cid = cid_from_data(CODEC_RAW, first);
+        let second_cid = cid_from_data(CODEC_RAW, second);
+        let file_block = test_pb_file_with_links(
+            vec![test_link("", &first_cid), test_link("", &second_cid)],
+            (first.len() + second.len()) as u64,
+            vec![first.len() as u64, second.len() as u64],
+        );
+        let file_cid = cid_from_data(CODEC_DAG_PB, &file_block);
+        let provider = Arc::new(MultiCountingProvider::new(HashMap::from([
+            (file_cid, file_block),
+            (first_cid, first.to_vec()),
+            (second_cid, second.to_vec()),
+        ])));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router_with_provider(provider.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let start = first.len();
+        let end = start + second.len() - 1;
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/ipfs/{file_cid}"))
+            .header(RANGE, format!("bytes={start}-{end}"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            HeaderValue::from_static("application/octet-stream")
+        );
+        assert_eq!(
+            response.headers().get(CONTENT_RANGE).unwrap(),
+            HeaderValue::from_str(&format!(
+                "bytes {start}-{end}/{}",
+                first.len() + second.len()
+            ))
+            .unwrap()
+        );
+        assert_eq!(response.bytes().await.unwrap().as_ref(), second);
+        assert_eq!(
+            provider.call_count(&first_cid),
+            0,
+            "deep range should not fetch byte 0 only for MIME sniffing"
+        );
+        assert_eq!(provider.call_count(&second_cid), 1);
     }
 
     #[tokio::test]
@@ -1620,6 +4533,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipns_file_responses_use_revalidation_cache_policy() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"<html>ipns cache</html>";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router_with_provider_and_name_resolver(
+            Arc::new(store),
+            Arc::new(StaticNameResolver {
+                name: "example.com".to_string(),
+                target: format!("/ipfs/{cid}"),
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/ipns/example.com");
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response.headers().get(ETAG).unwrap().clone();
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static(CACHE_CONTROL_IPNS_FILE)
+        );
+
+        let response = client
+            .get(&url)
+            .header(IF_NONE_MATCH, format!("W/{}", etag.to_str().unwrap()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers().get(ETAG), Some(&etag));
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            HeaderValue::from_static(CACHE_CONTROL_IPNS_FILE)
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_name_resolver_stores_successful_resolution() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let resolver = PersistentNameResolver::new(
+            StaticNameResolver {
+                name: "example.com".to_string(),
+                target: "/ipfs/bafyroot".to_string(),
+            },
+            store.clone(),
+        );
+
+        assert_eq!(
+            resolver.resolve_name("example.com").await.unwrap(),
+            "/ipfs/bafyroot"
+        );
+        assert_eq!(
+            store.get_name_record("example.com").unwrap().as_deref(),
+            Some("/ipfs/bafyroot")
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_router_resolves_ipns_from_persistent_name_cache() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"<html>offline ipns</html>";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+        store
+            .put_name_record(
+                "example.com",
+                &format!("/ipfs/{cid}"),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router_with_provider_and_name_resolver(
+            Arc::new(store.clone()),
+            Arc::new(PersistentNameResolver::cache_only(store)),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/ipns/example.com");
+        let response = reqwest::get(url).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap(), Bytes::from_static(data));
+    }
+
+    #[tokio::test]
     async fn serves_directory_listing_through_ipns_resolution() {
         let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
         let plain = b"ipns linked file";
@@ -1796,7 +4804,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rejects_requests_above_concurrency_limit() {
+    async fn queues_requests_above_concurrency_limit() {
         let data = b"limited gateway";
         let cid = cid_from_data(CODEC_RAW, data);
         let entered = Arc::new(AtomicBool::new(false));
@@ -1804,12 +4812,14 @@ mod tests {
             cid,
             data: data.to_vec(),
             entered: entered.clone(),
+            delay: Duration::from_millis(300),
         });
 
         let state = GatewayState::with_provider_config(provider, GatewayConfig::new(1));
         let first = tokio::spawn(ipfs_get(
             State(state.clone()),
             Path(cid.to_string()),
+            Method::GET,
             HeaderMap::new(),
         ));
 
@@ -1821,7 +4831,54 @@ mod tests {
         }
         assert!(entered.load(Ordering::SeqCst));
 
-        let second = ipfs_get(State(state), Path(cid.to_string()), HeaderMap::new()).await;
+        let second = ipfs_get(
+            State(state),
+            Path(cid.to_string()),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let first = first.await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn times_out_requests_waiting_too_long_for_concurrency_permit() {
+        let data = b"limited gateway";
+        let cid = cid_from_data(CODEC_RAW, data);
+        let entered = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(SlowProvider {
+            cid,
+            data: data.to_vec(),
+            entered: entered.clone(),
+            delay: GATEWAY_REQUEST_QUEUE_TIMEOUT + Duration::from_millis(250),
+        });
+
+        let state = GatewayState::with_provider_config(provider, GatewayConfig::new(1));
+        let first = tokio::spawn(ipfs_get(
+            State(state.clone()),
+            Path(cid.to_string()),
+            Method::GET,
+            HeaderMap::new(),
+        ));
+
+        for _ in 0..50 {
+            if entered.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(entered.load(Ordering::SeqCst));
+
+        let second = ipfs_get(
+            State(state),
+            Path(cid.to_string()),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
         assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let first = first.await.unwrap();
@@ -1848,6 +4905,7 @@ mod tests {
         cid: Cid,
         data: Vec<u8>,
         entered: Arc<AtomicBool>,
+        delay: Duration,
     }
 
     impl BlockProvider for SlowProvider {
@@ -1856,7 +4914,7 @@ mod tests {
                 return Err(CoreError::Storage("unexpected cid".into()));
             }
             self.entered.store(true, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(300));
+            std::thread::sleep(self.delay);
             Ok(Some(Block::unchecked(*cid, self.data.clone())))
         }
     }
@@ -1874,6 +4932,43 @@ mod tests {
             }
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Some(Block::unchecked(*cid, self.data.clone())))
+        }
+    }
+
+    struct MultiCountingProvider {
+        blocks: HashMap<Cid, Vec<u8>>,
+        calls: std::sync::Mutex<HashMap<Cid, usize>>,
+    }
+
+    impl MultiCountingProvider {
+        fn new(blocks: HashMap<Cid, Vec<u8>>) -> Self {
+            Self {
+                blocks,
+                calls: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn call_count(&self, cid: &Cid) -> usize {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(cid)
+                .unwrap_or(&0)
+        }
+    }
+
+    impl BlockProvider for MultiCountingProvider {
+        fn get_block(&self, cid: &Cid) -> CoreResult<Option<Block>> {
+            if let Some(data) = self.blocks.get(cid) {
+                let mut calls = self
+                    .calls
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *calls.entry(*cid).or_default() += 1;
+                return Ok(Some(Block::unchecked(*cid, data.clone())));
+            }
+            Ok(None)
         }
     }
 
@@ -1934,6 +5029,26 @@ mod tests {
                 .encode_to_vec(),
             ),
             links: Vec::new(),
+        }
+        .encode_to_vec()
+    }
+
+    fn test_pb_file_with_links(
+        links: Vec<TestPbLink>,
+        filesize: u64,
+        blocksizes: Vec<u64>,
+    ) -> Vec<u8> {
+        TestPbNode {
+            data: Some(
+                TestUnixfsData {
+                    r#type: Some(TestDataType::File as i32),
+                    data: Some(Vec::new()),
+                    filesize: Some(filesize),
+                    blocksizes,
+                }
+                .encode_to_vec(),
+            ),
+            links,
         }
         .encode_to_vec()
     }

@@ -1,7 +1,7 @@
 use cid::Cid;
 use freedom_ipfs_core::{
-    encode_car_v1, parse_car_v1, verify_block, Block, BlockProvider, CarBlock, CoreError,
-    Result as CoreResult,
+    block_data_range, encode_car_v1, parse_car_v1, verify_block, Block, BlockProvider, CarBlock,
+    CoreError, Result as CoreResult,
 };
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -15,6 +15,8 @@ use thiserror::Error;
 
 const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_HOT_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+const HOT_CACHE_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_NAME_CACHE_RECORDS: i64 = 128;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -32,7 +34,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct SqliteBlockStore {
     conn: Arc<Mutex<Connection>>,
     max_bytes: u64,
-    hot: Arc<Mutex<HotCache>>,
+    hot: Arc<Mutex<VerifiedHotCache>>,
     retained: Arc<Mutex<HashMap<Vec<u8>, usize>>>,
 }
 
@@ -50,10 +52,11 @@ impl SqliteBlockStore {
         } else {
             max_bytes
         };
+        let hot_cache = VerifiedHotCache::new(hot_cache_bytes(max_bytes));
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             max_bytes,
-            hot: Arc::new(Mutex::new(HotCache::new(hot_cache_bytes(max_bytes)))),
+            hot: Arc::new(Mutex::new(hot_cache)),
             retained: Arc::new(Mutex::new(HashMap::new())),
         };
         store.init()?;
@@ -67,10 +70,11 @@ impl SqliteBlockStore {
         } else {
             max_bytes
         };
+        let hot_cache = VerifiedHotCache::new(hot_cache_bytes(max_bytes));
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             max_bytes,
-            hot: Arc::new(Mutex::new(HotCache::new(hot_cache_bytes(max_bytes)))),
+            hot: Arc::new(Mutex::new(hot_cache)),
             retained: Arc::new(Mutex::new(HashMap::new())),
         };
         store.init()?;
@@ -102,6 +106,14 @@ impl SqliteBlockStore {
                 providers_json TEXT NOT NULL,
                 expires_at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS name_cache (
+                name TEXT PRIMARY KEY NOT NULL,
+                resolved_target TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS name_cache_updated_at
+                ON name_cache(updated_at);
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
@@ -133,11 +145,11 @@ impl SqliteBlockStore {
                 now as i64
             ],
         )?;
-        self.evict_if_needed()?;
-        if self.block_exists(&cid_bytes)? {
-            self.hot.lock().put(cid_bytes, data.to_vec());
-        } else {
+        let inserted_block_evicted = self.evict_if_needed_tracking(&cid_bytes)?;
+        if inserted_block_evicted {
             self.hot.lock().remove(&cid_bytes);
+        } else {
+            self.hot.lock().put_verified(cid_bytes, data.to_vec(), now);
         }
         Ok(())
     }
@@ -148,10 +160,12 @@ impl SqliteBlockStore {
 
     pub fn get(&self, cid: &Cid) -> Result<Option<Block>> {
         let cid_bytes = block_key(cid);
-        if let Some(data) = self.hot.lock().get(&cid_bytes) {
-            verify_block(cid, &data)?;
-            self.touch(cid)?;
-            return Ok(Some(Block::unchecked(*cid, data)));
+        let now = now_secs();
+        if let Some(hit) = self.hot.lock().get_verified(&cid_bytes, now) {
+            if hit.touch_persistent {
+                self.touch_at(cid, now)?;
+            }
+            return Ok(Some(Block::unchecked(*cid, hit.data)));
         }
 
         let row = self
@@ -167,9 +181,45 @@ impl SqliteBlockStore {
         match row {
             Some(data) => {
                 verify_block(cid, &data)?;
-                self.touch(cid)?;
-                self.hot.lock().put(cid_bytes, data.clone());
+                self.touch_at(cid, now)?;
+                self.hot.lock().put_verified(cid_bytes, data.clone(), now);
                 Ok(Some(Block::unchecked(*cid, data)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_range(&self, cid: &Cid, start: u64, end: u64) -> Result<Option<Vec<u8>>> {
+        let cid_bytes = block_key(cid);
+        let now = now_secs();
+        if let Some(hit) = self
+            .hot
+            .lock()
+            .get_verified_range(&cid_bytes, now, start, end)
+        {
+            if hit.touch_persistent {
+                self.touch_at(cid, now)?;
+            }
+            return Ok(Some(hit.data));
+        }
+
+        let row = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT data FROM blocks WHERE cid = ?1",
+                params![&cid_bytes],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+
+        match row {
+            Some(data) => {
+                verify_block(cid, &data)?;
+                self.touch_at(cid, now)?;
+                let range = block_data_range(&data, start, end);
+                self.hot.lock().put_verified(cid_bytes, data, now);
+                Ok(Some(range))
             }
             None => Ok(None),
         }
@@ -210,9 +260,6 @@ impl SqliteBlockStore {
         providers: &[CachedProviderRecord],
         ttl: Duration,
     ) -> Result<()> {
-        if providers.is_empty() {
-            return Ok(());
-        }
         let expires_at = now_secs().saturating_add(ttl.as_secs());
         let providers_json = serde_json::to_string(providers)?;
         self.conn.lock().execute(
@@ -251,6 +298,50 @@ impl SqliteBlockStore {
             return Ok(None);
         }
         Ok(Some(serde_json::from_str(&providers_json)?))
+    }
+
+    pub fn put_name_record(&self, name: &str, resolved_target: &str, ttl: Duration) -> Result<()> {
+        if ttl.is_zero() {
+            return Ok(());
+        }
+        let now = now_secs();
+        let expires_at = now.saturating_add(ttl.as_secs());
+        self.conn.lock().execute(
+            r#"
+            INSERT INTO name_cache(name, resolved_target, expires_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(name) DO UPDATE SET
+                resolved_target = excluded.resolved_target,
+                expires_at = excluded.expires_at,
+                updated_at = excluded.updated_at
+            "#,
+            params![name, resolved_target, expires_at as i64, now as i64],
+        )?;
+        self.prune_name_cache()?;
+        Ok(())
+    }
+
+    pub fn get_name_record(&self, name: &str) -> Result<Option<String>> {
+        let row = self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT resolved_target, expires_at FROM name_cache WHERE name = ?1",
+                params![name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+
+        let Some((resolved_target, expires_at)) = row else {
+            return Ok(None);
+        };
+        if expires_at <= now_secs() as i64 {
+            self.conn
+                .lock()
+                .execute("DELETE FROM name_cache WHERE name = ?1", params![name])?;
+            return Ok(None);
+        }
+        Ok(Some(resolved_target))
     }
 
     pub fn mark_bad_provider(&self, peer_or_url: &str, reason: &str, ttl: Duration) -> Result<()> {
@@ -315,6 +406,7 @@ impl SqliteBlockStore {
         self.conn.lock().execute("DELETE FROM blocks", [])?;
         self.conn.lock().execute("DELETE FROM provider_cache", [])?;
         self.conn.lock().execute("DELETE FROM bad_providers", [])?;
+        self.conn.lock().execute("DELETE FROM name_cache", [])?;
         self.hot.lock().clear();
         Ok(())
     }
@@ -322,6 +414,7 @@ impl SqliteBlockStore {
     pub fn clear_provider_metadata(&self) -> Result<()> {
         self.conn.lock().execute("DELETE FROM provider_cache", [])?;
         self.conn.lock().execute("DELETE FROM bad_providers", [])?;
+        self.conn.lock().execute("DELETE FROM name_cache", [])?;
         Ok(())
     }
 
@@ -329,35 +422,64 @@ impl SqliteBlockStore {
         self.evict_until(max_bytes)
     }
 
-    fn touch(&self, cid: &Cid) -> Result<()> {
+    fn touch_at(&self, cid: &Cid, now: u64) -> Result<()> {
         self.conn.lock().execute(
             "UPDATE blocks SET last_accessed_at = ?1 WHERE cid = ?2",
-            params![now_secs() as i64, block_key(cid)],
+            params![now as i64, block_key(cid)],
         )?;
         Ok(())
     }
 
-    fn evict_if_needed(&self) -> Result<()> {
-        self.evict_until(self.max_bytes)
+    fn evict_if_needed_tracking(&self, tracked_cid_bytes: &[u8]) -> Result<bool> {
+        self.evict_until_tracking(self.max_bytes, tracked_cid_bytes)
+    }
+
+    fn prune_name_cache(&self) -> Result<()> {
+        let now = now_secs() as i64;
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM name_cache WHERE expires_at <= ?1",
+            params![now],
+        )?;
+        conn.execute(
+            r#"
+            DELETE FROM name_cache
+            WHERE name IN (
+                SELECT name FROM name_cache
+                ORDER BY updated_at DESC, name DESC
+                LIMIT -1 OFFSET ?1
+            )
+            "#,
+            params![MAX_NAME_CACHE_RECORDS],
+        )?;
+        Ok(())
     }
 
     fn evict_until(&self, max_bytes: u64) -> Result<()> {
+        self.evict_until_tracking(max_bytes, &[]).map(|_| ())
+    }
+
+    fn evict_until_tracking(&self, max_bytes: u64, tracked_cid_bytes: &[u8]) -> Result<bool> {
+        let mut tracked_block_evicted = false;
         loop {
             let total = self.total_bytes()?;
             if total <= max_bytes {
-                return Ok(());
+                return Ok(tracked_block_evicted);
             }
             let retained = self.retained.lock().clone();
             let cid_bytes = self.oldest_evictable_cid(&retained)?;
             let Some(cid_bytes) = cid_bytes else {
-                return Ok(());
+                return Ok(tracked_block_evicted);
             };
             let deleted = self
                 .conn
                 .lock()
                 .execute("DELETE FROM blocks WHERE cid = ?1", params![&cid_bytes])?;
             if deleted == 0 {
-                return Ok(());
+                return Ok(tracked_block_evicted);
+            }
+            if !tracked_cid_bytes.is_empty() && cid_bytes == tracked_cid_bytes {
+                tracked_block_evicted = true;
             }
             self.hot.lock().remove(&cid_bytes);
         }
@@ -396,25 +518,16 @@ impl SqliteBlockStore {
             retained.remove(cid_bytes);
         }
     }
-
-    fn block_exists(&self, cid_bytes: &[u8]) -> Result<bool> {
-        let exists = self
-            .conn
-            .lock()
-            .query_row(
-                "SELECT 1 FROM blocks WHERE cid = ?1",
-                params![cid_bytes],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        Ok(exists)
-    }
 }
 
 impl BlockProvider for SqliteBlockStore {
     fn get_block(&self, cid: &Cid) -> CoreResult<Option<Block>> {
         self.get(cid)
+            .map_err(|err| CoreError::Storage(err.to_string()))
+    }
+
+    fn get_block_range(&self, cid: &Cid, start: u64, end: u64) -> CoreResult<Option<Vec<u8>>> {
+        self.get_range(cid, start, end)
             .map_err(|err| CoreError::Storage(err.to_string()))
     }
 
@@ -447,19 +560,26 @@ fn hot_cache_bytes(max_bytes: u64) -> u64 {
     max_bytes.min(DEFAULT_HOT_CACHE_BYTES)
 }
 
-struct HotCache {
+// Private cache for block bytes that were already verified on put or cold read.
+struct VerifiedHotCache {
     max_bytes: u64,
     bytes: u64,
     clock: u64,
-    entries: HashMap<Vec<u8>, HotBlock>,
+    entries: HashMap<Vec<u8>, VerifiedHotBlock>,
 }
 
-struct HotBlock {
+struct VerifiedHotBlock {
     data: Vec<u8>,
     last_accessed: u64,
+    last_persistent_touch: u64,
 }
 
-impl HotCache {
+struct VerifiedHotCacheHit {
+    data: Vec<u8>,
+    touch_persistent: bool,
+}
+
+impl VerifiedHotCache {
     fn new(max_bytes: u64) -> Self {
         Self {
             max_bytes,
@@ -469,14 +589,43 @@ impl HotCache {
         }
     }
 
-    fn get(&mut self, cid: &[u8]) -> Option<Vec<u8>> {
+    fn get_verified(&mut self, cid: &[u8], now: u64) -> Option<VerifiedHotCacheHit> {
         let entry = self.entries.get_mut(cid)?;
         self.clock = self.clock.saturating_add(1);
         entry.last_accessed = self.clock;
-        Some(entry.data.clone())
+        let touch_persistent =
+            now.saturating_sub(entry.last_persistent_touch) >= HOT_CACHE_TOUCH_INTERVAL.as_secs();
+        if touch_persistent {
+            entry.last_persistent_touch = now;
+        }
+        Some(VerifiedHotCacheHit {
+            data: entry.data.clone(),
+            touch_persistent,
+        })
     }
 
-    fn put(&mut self, cid: Vec<u8>, data: Vec<u8>) {
+    fn get_verified_range(
+        &mut self,
+        cid: &[u8],
+        now: u64,
+        start: u64,
+        end: u64,
+    ) -> Option<VerifiedHotCacheHit> {
+        let entry = self.entries.get_mut(cid)?;
+        self.clock = self.clock.saturating_add(1);
+        entry.last_accessed = self.clock;
+        let touch_persistent =
+            now.saturating_sub(entry.last_persistent_touch) >= HOT_CACHE_TOUCH_INTERVAL.as_secs();
+        if touch_persistent {
+            entry.last_persistent_touch = now;
+        }
+        Some(VerifiedHotCacheHit {
+            data: block_data_range(&entry.data, start, end),
+            touch_persistent,
+        })
+    }
+
+    fn put_verified(&mut self, cid: Vec<u8>, data: Vec<u8>, now: u64) {
         if self.max_bytes == 0 || data.len() as u64 > self.max_bytes {
             self.remove(&cid);
             return;
@@ -488,9 +637,10 @@ impl HotCache {
         self.bytes = self.bytes.saturating_add(data.len() as u64);
         self.entries.insert(
             cid,
-            HotBlock {
+            VerifiedHotBlock {
                 data,
                 last_accessed: self.clock,
+                last_persistent_touch: now,
             },
         );
         self.evict_if_needed();
@@ -539,6 +689,114 @@ mod tests {
         assert_eq!(block.data(), data);
         assert_eq!(block.cid(), &cid);
         assert_eq!(store.block_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn rejected_put_does_not_populate_verified_hot_cache() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let cid = cid_from_data(CODEC_RAW, b"valid block");
+
+        assert!(store.put_block(&cid, b"invalid block").is_err());
+        assert!(!store.hot.lock().entries.contains_key(&block_key(&cid)));
+    }
+
+    #[test]
+    fn evicted_put_does_not_populate_verified_hot_cache() {
+        let store = SqliteBlockStore::in_memory(1).unwrap();
+        let data = b"larger than cache budget";
+        let cid = cid_from_data(CODEC_RAW, data);
+
+        store.put_block(&cid, data).unwrap();
+
+        assert_eq!(store.block_count().unwrap(), 0);
+        assert!(!store.hot.lock().entries.contains_key(&block_key(&cid)));
+    }
+
+    #[test]
+    fn cold_read_verifies_before_populating_verified_hot_cache() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let cid = cid_from_data(CODEC_RAW, b"valid block");
+        let cid_bytes = block_key(&cid);
+        store
+            .conn
+            .lock()
+            .execute(
+                r#"
+                INSERT INTO blocks(cid, codec, size, data, inserted_at, last_accessed_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                "#,
+                params![
+                    &cid_bytes,
+                    cid.codec() as i64,
+                    13i64,
+                    b"invalid block".as_slice(),
+                    now_secs() as i64
+                ],
+            )
+            .unwrap();
+
+        let err = store.get(&cid).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::Core(CoreError::HashMismatch { .. })
+        ));
+        assert!(!store.hot.lock().entries.contains_key(&cid_bytes));
+    }
+
+    #[test]
+    fn range_read_verifies_cold_block_before_populating_verified_hot_cache() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let cid = cid_from_data(CODEC_RAW, b"valid block");
+        let cid_bytes = block_key(&cid);
+        store
+            .conn
+            .lock()
+            .execute(
+                r#"
+                INSERT INTO blocks(cid, codec, size, data, inserted_at, last_accessed_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                "#,
+                params![
+                    &cid_bytes,
+                    cid.codec() as i64,
+                    13i64,
+                    b"invalid block".as_slice(),
+                    now_secs() as i64
+                ],
+            )
+            .unwrap();
+
+        let err = store.get_range(&cid, 0, 4).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::Core(CoreError::HashMismatch { .. })
+        ));
+        assert!(!store.hot.lock().entries.contains_key(&cid_bytes));
+    }
+
+    #[test]
+    fn hot_cache_range_hit_returns_requested_bytes() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"0123456789";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+        set_block_last_accessed_at(&store, &cid, 1);
+
+        assert_eq!(store.get_range(&cid, 2, 5).unwrap().unwrap(), b"2345");
+        assert_eq!(block_last_accessed_at(&store, &cid), 1);
+    }
+
+    #[test]
+    fn cold_range_read_populates_verified_hot_cache() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"cold range block";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+        store.hot.lock().clear();
+
+        assert_eq!(store.get_range(&cid, 5, 9).unwrap().unwrap(), b"range");
+
+        assert!(store.hot.lock().entries.contains_key(&block_key(&cid)));
     }
 
     #[test]
@@ -600,11 +858,53 @@ mod tests {
         let data = b"hot cache clear";
         let cid = cid_from_data(CODEC_RAW, data);
         store.put_block(&cid, data).unwrap();
+        store
+            .put_name_record(
+                "example.test",
+                "/ipfs/bafkqaddwgevxmmraojswg33smq",
+                Duration::from_secs(60),
+            )
+            .unwrap();
         assert_eq!(store.get(&cid).unwrap().unwrap().data(), data);
+        assert!(store.get_name_record("example.test").unwrap().is_some());
 
         store.clear().unwrap();
 
         assert!(store.get(&cid).unwrap().is_none());
+        assert!(store.get_name_record("example.test").unwrap().is_none());
+    }
+
+    #[test]
+    fn hot_cache_hit_skips_redundant_sqlite_touch() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"hot cache touch skip";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+        set_block_last_accessed_at(&store, &cid, 1);
+
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), data);
+
+        assert_eq!(block_last_accessed_at(&store, &cid), 1);
+    }
+
+    #[test]
+    fn hot_cache_hit_periodically_refreshes_sqlite_touch() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"hot cache touch refresh";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+        set_block_last_accessed_at(&store, &cid, 1);
+        store
+            .hot
+            .lock()
+            .entries
+            .get_mut(&block_key(&cid))
+            .unwrap()
+            .last_persistent_touch = 0;
+
+        assert_eq!(store.get(&cid).unwrap().unwrap().data(), data);
+
+        assert!(block_last_accessed_at(&store, &cid) > 1);
     }
 
     #[test]
@@ -683,6 +983,83 @@ mod tests {
         assert_eq!(store.block_count().unwrap(), 0);
     }
 
+    fn set_block_last_accessed_at(store: &SqliteBlockStore, cid: &Cid, value: i64) {
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE blocks SET last_accessed_at = ?1 WHERE cid = ?2",
+                params![value, block_key(cid)],
+            )
+            .unwrap();
+    }
+
+    fn block_last_accessed_at(store: &SqliteBlockStore, cid: &Cid) -> i64 {
+        store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT last_accessed_at FROM blocks WHERE cid = ?1",
+                params![block_key(cid)],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn caches_name_records_with_ttl() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+
+        store
+            .put_name_record(
+                "example.test",
+                "/ipfs/bafkqaddwgevxmmraojswg33smq",
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.get_name_record("example.test").unwrap().as_deref(),
+            Some("/ipfs/bafkqaddwgevxmmraojswg33smq")
+        );
+        assert!(store.get_name_record("missing.test").unwrap().is_none());
+    }
+
+    #[test]
+    fn skips_zero_ttl_name_records() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+
+        store
+            .put_name_record("example.test", "/ipfs/bafyroot", Duration::ZERO)
+            .unwrap();
+
+        assert!(store.get_name_record("example.test").unwrap().is_none());
+    }
+
+    #[test]
+    fn bounds_name_cache_records() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+
+        for index in 0..(MAX_NAME_CACHE_RECORDS + 2) {
+            store
+                .put_name_record(
+                    &format!("name-{index:03}.test"),
+                    "/ipfs/bafyroot",
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+        }
+
+        let count = store
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM name_cache", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(count, MAX_NAME_CACHE_RECORDS);
+    }
+
     #[test]
     fn exports_cache_as_importable_car() {
         let source = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
@@ -721,6 +1098,22 @@ mod tests {
                 }],
                 Duration::ZERO,
             )
+            .unwrap();
+        assert_eq!(store.get_provider_records(&cid).unwrap(), None);
+    }
+
+    #[test]
+    fn caches_empty_provider_records_until_ttl_expires() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let cid = cid_from_data(CODEC_RAW, b"empty provider cache key");
+
+        store
+            .put_provider_records(&cid, &[], Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(store.get_provider_records(&cid).unwrap(), Some(Vec::new()));
+
+        store
+            .put_provider_records(&cid, &[], Duration::ZERO)
             .unwrap();
         assert_eq!(store.get_provider_records(&cid).unwrap(), None);
     }

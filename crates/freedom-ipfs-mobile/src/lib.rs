@@ -9,18 +9,27 @@ use freedom_ipfs_routing::{
     ProviderRoutingClient, RoutingStatsHandle, DEFAULT_DELEGATED_ROUTER,
 };
 use freedom_ipfs_store::SqliteBlockStore;
+use serde::Serialize;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::ffi::{c_char, CStr, CString};
+use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Id, Subscriber};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::{Layer, Registry};
 
 const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const LOW_MEMORY_CACHE_BYTES: u64 = 32 * 1024 * 1024;
@@ -30,6 +39,10 @@ const ROUTING_MODE_DELEGATED: u32 = 1;
 const ROUTING_MODE_LIGHT_DHT: u32 = 2;
 const ROUTING_MODE_OFFLINE: u32 = 3;
 const PRELOAD_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_PROGRESS_EVENTS: usize = 512;
+
+static PROGRESS_RECORDER: OnceLock<Arc<ProgressRecorder>> = OnceLock::new();
+static PROGRESS_TRACING_INIT: Once = Once::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LifecycleState {
@@ -93,6 +106,672 @@ pub struct FreedomIpfsDiagnostics {
     pub lifecycle_background: u64,
 }
 
+#[derive(Clone, Default)]
+struct ProgressSpanFields {
+    request_id: Option<u64>,
+    progress_request_id: Option<u64>,
+    parent_request_id: Option<u64>,
+    top_level_path: Option<String>,
+    namespace: Option<String>,
+    path: Option<String>,
+}
+
+#[derive(Default)]
+struct ProgressRecorder {
+    inner: Mutex<ProgressInner>,
+}
+
+#[derive(Default)]
+struct ProgressInner {
+    next_event_id: u64,
+    events: VecDeque<ProgressEvent>,
+    active_targets: HashMap<String, ProgressTarget>,
+}
+
+#[derive(Clone, Serialize)]
+struct ProgressEvent {
+    event_id: u64,
+    target_id: u64,
+    request_id: Option<u64>,
+    parent_id: Option<u64>,
+    kind: String,
+    path: Option<String>,
+    top_level_path: Option<String>,
+    namespace: Option<String>,
+    phase: String,
+    raw_phase: String,
+    status: String,
+    source: Option<String>,
+    transport: Option<String>,
+    delivery: Option<String>,
+    bytes_loaded: Option<u64>,
+    bytes_total: Option<u64>,
+    providers_found: Option<u64>,
+    candidate_peers: Option<u64>,
+    blocks_loaded: u64,
+    retry_count: u64,
+    elapsed_ms: Option<u64>,
+    last_error_code: Option<String>,
+    last_error_message: Option<String>,
+    timestamp_ms: u64,
+}
+
+#[derive(Clone, Serialize)]
+struct ProgressTarget {
+    id: u64,
+    request_id: Option<u64>,
+    parent_id: Option<u64>,
+    kind: String,
+    path: Option<String>,
+    top_level_path: Option<String>,
+    namespace: Option<String>,
+    phase: String,
+    status: String,
+    source: Option<String>,
+    transport: Option<String>,
+    delivery: Option<String>,
+    bytes_loaded: Option<u64>,
+    bytes_total: Option<u64>,
+    active_subrequests: usize,
+    elapsed_ms: Option<u64>,
+    blocks_loaded: u64,
+    retry_count: u64,
+    last_error_code: Option<String>,
+    last_error_message: Option<String>,
+    last_event_id: u64,
+    updated_ms: u64,
+}
+
+#[derive(Serialize)]
+struct ProgressSnapshot {
+    generated_at_unix_ms: u64,
+    active_count: usize,
+    event_count: usize,
+    active: Vec<ProgressTarget>,
+    events: Vec<ProgressEvent>,
+}
+
+impl ProgressRecorder {
+    fn record_event(&self, span: ProgressSpanFields, fields: ProgressFields, _metadata_name: &str) {
+        let Some(raw_phase) = fields.get("phase").cloned() else {
+            return;
+        };
+        let kind = progress_kind(&fields, &raw_phase, &span);
+        let target_id = progress_target_id(&fields, &span);
+        let path = fields.get("path").cloned().or(span.path);
+        let top_level_path = fields
+            .get("top_level_path")
+            .filter(|path| !path.is_empty())
+            .cloned()
+            .or(span.top_level_path);
+        let namespace = fields.get("namespace").cloned().or(span.namespace);
+        let request_id = fields.get_u64("request_id").or(span.request_id);
+        let parent_id = fields
+            .get_u64("parent_request_id")
+            .filter(|id| *id != 0)
+            .or(span.parent_request_id);
+        let status = progress_status(&raw_phase, &fields);
+        let phase = progress_phase(&raw_phase, &fields, &status);
+        let elapsed_ms = fields.get_u64("elapsed_ms");
+        let timestamp_ms = now_ms();
+        let source = progress_source(&raw_phase, &fields);
+        let transport = fields
+            .get("source_transport")
+            .cloned()
+            .or_else(|| fields.get("transport").cloned());
+        let delivery = fields.get("bitswap_delivery").cloned();
+        let last_error_message = fields.get("error").cloned();
+        let last_error_code = progress_error_code(&raw_phase, &fields, &status);
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return,
+        };
+        inner.next_event_id = inner.next_event_id.saturating_add(1);
+        let target_key = format!("{kind}:{target_id}");
+        let previous_target = inner.active_targets.get(&target_key);
+        let (
+            previous_bytes_loaded,
+            previous_bytes_total,
+            previous_blocks_loaded,
+            previous_retry_count,
+        ) = previous_target
+            .map(|target| {
+                (
+                    target.bytes_loaded,
+                    target.bytes_total,
+                    target.blocks_loaded,
+                    target.retry_count,
+                )
+            })
+            .unwrap_or_default();
+        let target_source = source
+            .clone()
+            .or_else(|| previous_target.and_then(|target| target.source.clone()));
+        let target_transport = transport
+            .clone()
+            .or_else(|| previous_target.and_then(|target| target.transport.clone()));
+        let target_delivery = delivery
+            .clone()
+            .or_else(|| previous_target.and_then(|target| target.delivery.clone()));
+        let blocks_loaded =
+            previous_blocks_loaded.saturating_add(u64::from(raw_phase == "block_fetch_total"));
+        let retry_count = previous_retry_count.saturating_add(u64::from(phase == "retrying"));
+        let bytes_loaded = progress_bytes_loaded(&fields).or(previous_bytes_loaded);
+        let bytes_total = progress_bytes_total(&fields).or(previous_bytes_total);
+        let event = ProgressEvent {
+            event_id: inner.next_event_id,
+            target_id,
+            request_id,
+            parent_id,
+            kind: kind.clone(),
+            path: path.clone(),
+            top_level_path: top_level_path.clone(),
+            namespace: namespace.clone(),
+            phase: phase.clone(),
+            raw_phase: raw_phase.clone(),
+            status: status.clone(),
+            source: target_source.clone(),
+            transport: target_transport.clone(),
+            delivery: target_delivery.clone(),
+            bytes_loaded,
+            bytes_total,
+            providers_found: fields
+                .get_u64("provider_count")
+                .or_else(|| fields.get_u64("retry_provider_count")),
+            candidate_peers: fields
+                .get_u64("peer_count")
+                .or_else(|| fields.get_u64("candidate_peer_count")),
+            blocks_loaded,
+            retry_count,
+            elapsed_ms,
+            last_error_code: last_error_code.clone(),
+            last_error_message: last_error_message.clone(),
+            timestamp_ms,
+        };
+        inner.events.push_back(event.clone());
+        while inner.events.len() > MAX_PROGRESS_EVENTS {
+            inner.events.pop_front();
+        }
+
+        if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+            inner.active_targets.remove(&target_key);
+        } else if target_id != 0 {
+            inner.active_targets.insert(
+                target_key,
+                ProgressTarget {
+                    id: target_id,
+                    request_id,
+                    parent_id,
+                    kind,
+                    path,
+                    top_level_path,
+                    namespace,
+                    phase,
+                    status,
+                    source: target_source,
+                    transport: target_transport,
+                    delivery: target_delivery,
+                    bytes_loaded,
+                    bytes_total,
+                    active_subrequests: 0,
+                    elapsed_ms,
+                    blocks_loaded,
+                    retry_count,
+                    last_error_code,
+                    last_error_message,
+                    last_event_id: event.event_id,
+                    updated_ms: timestamp_ms,
+                },
+            );
+        }
+    }
+
+    fn snapshot_json(&self) -> String {
+        let snapshot = match self.inner.lock() {
+            Ok(inner) => ProgressSnapshot {
+                generated_at_unix_ms: now_ms(),
+                active_count: inner.active_targets.len(),
+                event_count: inner.events.len(),
+                active: progress_active_targets(&inner),
+                events: inner.events.iter().cloned().collect(),
+            },
+            Err(_) => ProgressSnapshot {
+                generated_at_unix_ms: now_ms(),
+                active_count: 0,
+                event_count: 0,
+                active: Vec::new(),
+                events: Vec::new(),
+            },
+        };
+        serde_json::to_string(&snapshot).unwrap_or_else(|_| "{\"active\":[],\"events\":[]}".into())
+    }
+
+    fn clear(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.events.clear();
+            inner.active_targets.clear();
+        }
+    }
+}
+
+fn progress_active_targets(inner: &ProgressInner) -> Vec<ProgressTarget> {
+    let mut active = inner.active_targets.values().cloned().collect::<Vec<_>>();
+    let mut active_subrequest_counts = HashMap::<u64, usize>::new();
+    for target in &active {
+        if let Some(parent_id) = target.parent_id {
+            *active_subrequest_counts.entry(parent_id).or_default() += 1;
+        }
+    }
+    for target in &mut active {
+        target.active_subrequests = active_subrequest_counts
+            .get(&target.id)
+            .copied()
+            .unwrap_or_default();
+    }
+    active.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    active
+}
+
+#[derive(Clone)]
+struct ProgressLayer {
+    recorder: Arc<ProgressRecorder>,
+}
+
+impl<S> Layer<S> for ProgressLayer
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        let mut fields = ProgressFields::default();
+        attrs.record(&mut fields);
+        let span_fields = ProgressSpanFields {
+            request_id: fields.get_u64("request_id"),
+            progress_request_id: fields.get_u64("progress_request_id").filter(|id| *id != 0),
+            parent_request_id: fields.get_u64("parent_request_id").filter(|id| *id != 0),
+            top_level_path: fields
+                .get("top_level_path")
+                .filter(|path| !path.is_empty())
+                .cloned(),
+            namespace: fields.get("namespace").cloned(),
+            path: fields.get("path").cloned(),
+        };
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(span_fields);
+        }
+    }
+
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let mut fields = ProgressFields::default();
+        event.record(&mut fields);
+        let span = ctx
+            .lookup_current()
+            .and_then(|span| span.extensions().get::<ProgressSpanFields>().cloned())
+            .unwrap_or_default();
+        self.recorder
+            .record_event(span, fields, event.metadata().name());
+    }
+}
+
+#[derive(Default)]
+struct ProgressFields {
+    values: HashMap<String, String>,
+}
+
+impl ProgressFields {
+    fn get(&self, key: &str) -> Option<&String> {
+        self.values.get(key)
+    }
+
+    fn get_u64(&self, key: &str) -> Option<u64> {
+        self.get(key).and_then(|value| value.parse::<u64>().ok())
+    }
+}
+
+impl Visit for ProgressFields {
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.values
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.values
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.values
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.values
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.values
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+}
+
+fn progress_recorder() -> Arc<ProgressRecorder> {
+    PROGRESS_RECORDER
+        .get_or_init(|| Arc::new(ProgressRecorder::default()))
+        .clone()
+}
+
+fn ensure_progress_tracing() {
+    let recorder = progress_recorder();
+    PROGRESS_TRACING_INIT.call_once(|| {
+        let layer = ProgressLayer { recorder };
+        let subscriber = Registry::default().with(layer);
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+}
+
+fn progress_bytes_loaded(fields: &ProgressFields) -> Option<u64> {
+    fields
+        .get_u64("bytes")
+        .or_else(|| fields.get_u64("body_len"))
+}
+
+fn progress_bytes_total(fields: &ProgressFields) -> Option<u64> {
+    fields
+        .get_u64("bytes_total")
+        .or_else(|| fields.get_u64("file_len"))
+        .or_else(|| fields.get_u64("body_len"))
+}
+
+fn progress_kind(fields: &ProgressFields, raw_phase: &str, span: &ProgressSpanFields) -> String {
+    if fields.get("preload_id").is_some() || raw_phase.starts_with("preload_") {
+        "preload".into()
+    } else if span.request_id.is_some() || fields.get("request_id").is_some() {
+        "gateway_request".into()
+    } else if raw_phase.contains("provider") || raw_phase.contains("routing") {
+        "provider_lookup".into()
+    } else if raw_phase.contains("name") || raw_phase.contains("ipns") {
+        "name_resolution".into()
+    } else if fields.get("cid").is_some() {
+        "block_fetch".into()
+    } else {
+        "event".into()
+    }
+}
+
+fn progress_target_id(fields: &ProgressFields, span: &ProgressSpanFields) -> u64 {
+    fields
+        .get_u64("preload_id")
+        .or_else(|| fields.get_u64("progress_request_id"))
+        .or(span.progress_request_id)
+        .or_else(|| fields.get_u64("request_id"))
+        .or(span.request_id)
+        .or_else(|| fields.get_u64("task_id"))
+        .unwrap_or(0)
+}
+
+fn progress_status(raw_phase: &str, fields: &ProgressFields) -> String {
+    match raw_phase {
+        "gateway_stream_done" => "completed",
+        "gateway_stream_failed" => "failed",
+        "request_done" => match fields.get_u64("status") {
+            Some(status)
+                if status < 400
+                    && fields.get("body_mode").map(String::as_str) == Some("stream") =>
+            {
+                "active"
+            }
+            Some(status) if status < 400 => "completed",
+            Some(_) => "failed",
+            None => "completed",
+        },
+        "preload_done" => match fields.get("ok").map(String::as_str) {
+            Some("true") => "completed",
+            Some("false") => "failed",
+            _ => "completed",
+        },
+        "preload_cancelled" => "cancelled",
+        "gateway_limiter" if fields.get("acquired").map(String::as_str) == Some("false") => {
+            "failed"
+        }
+        _ if fields.get("ok").map(String::as_str) == Some("false") => "active",
+        _ => "active",
+    }
+    .into()
+}
+
+fn progress_source(raw_phase: &str, fields: &ProgressFields) -> Option<String> {
+    if let Some(source) = fields.get("source") {
+        return Some(source.clone());
+    }
+    match raw_phase {
+        "block_store_get" | "gateway_conditional"
+            if fields.get("cache_hit").map(String::as_str) == Some("true") =>
+        {
+            Some("cache".into())
+        }
+        "gateway_small_body_cache"
+            if fields.get("cache_hit").map(String::as_str) == Some("true") =>
+        {
+            Some("cache".into())
+        }
+        "http_provider_fetch"
+        | "http_provider_candidate_cancelled"
+        | "http_provider_hedge"
+        | "http_provider_race"
+        | "http_provider_self_hedge_skip"
+        | "http_provider_bitswap_hedge_skip"
+        | "http_provider_race_result" => Some("http_provider".into()),
+        "http_provider_bitswap_hedge" => Some("bitswap".into()),
+        "http_provider_bitswap_hedge_result" => fields
+            .get("source")
+            .cloned()
+            .or_else(|| Some("unknown".into())),
+        "delegated_provider_lookup" | "delegated_provider_empty_retry" => {
+            Some("delegated_routing".into())
+        }
+        "provider_diversity_low" | "light_dht_provider_lookup" | "dht_provider_lookup" => {
+            Some("dht".into())
+        }
+        phase if phase.starts_with("bitswap_") => Some("bitswap".into()),
+        _ => None,
+    }
+}
+
+fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> String {
+    match raw_phase {
+        "request_start" | "preload_start" => "started",
+        "request_done"
+            if status == "active"
+                && fields.get("body_mode").map(String::as_str) == Some("stream") =>
+        {
+            "streaming"
+        }
+        "request_done" if status == "completed" => "completed",
+        "request_done" => "failed",
+        "gateway_stream_done" => "completed",
+        "gateway_stream_failed" => "failed",
+        "preload_done" if status == "completed" => "completed",
+        "preload_done" => "failed",
+        "preload_cancelled" => "cancelled",
+        "block_store_get" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
+            "cache_hit"
+        }
+        "block_store_get" => "checking_cache",
+        "gateway_small_body_cache"
+            if fields.get("cache_hit").map(String::as_str) == Some("true") =>
+        {
+            "cache_hit"
+        }
+        "gateway_small_body_cache"
+            if fields.get("cache_inserted").map(String::as_str) == Some("true") =>
+        {
+            "streaming"
+        }
+        "gateway_small_body_cache" => "checking_cache",
+        "block_fetch_total" if fields.get("source").map(String::as_str) == Some("cache") => {
+            "cache_hit"
+        }
+        "block_fetch_total" if fields.get("source").map(String::as_str) == Some("bitswap") => {
+            "fetching_bitswap"
+        }
+        "block_fetch_total"
+            if fields.get("source").map(String::as_str) == Some("http_provider") =>
+        {
+            "fetching_http_provider"
+        }
+        "block_range_batch_fetch" if fields.get("source").map(String::as_str) == Some("cache") => {
+            "cache_hit"
+        }
+        "block_range_batch_fetch"
+            if fields.get("source").map(String::as_str) == Some("bitswap") =>
+        {
+            "fetching_bitswap"
+        }
+        "block_range_batch_fetch"
+            if fields.get("source").map(String::as_str) == Some("http_provider") =>
+        {
+            "fetching_http_provider"
+        }
+        "block_fetch_total" | "block_fetch_coalesced" | "block_range_batch_fetch" => "streaming",
+        "name_cache" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
+            "name_resolved"
+        }
+        "name_cache" => "resolving_name",
+        "name_persistent_cache" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
+            "name_resolved"
+        }
+        "name_persistent_cache" => "resolving_name",
+        "name_resolve" if fields.get("ok").map(String::as_str) == Some("false") => "failed",
+        "name_resolve" => "name_resolved",
+        "provider_cache"
+            if fields.get("cache_hit").map(String::as_str) == Some("true")
+                && fields.get("provider_count").map(String::as_str) == Some("0") =>
+        {
+            "failed"
+        }
+        "provider_cache" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
+            "providers_found"
+        }
+        "provider_cache" => "provider_lookup",
+        "provider_lookup" | "provider_refresh_skipped_empty_provider_set"
+            if fields.get("error").is_some() =>
+        {
+            "failed"
+        }
+        "provider_lookup" => "providers_found",
+        "provider_diversity_low" => "provider_diversity_low",
+        "light_dht_provider_lookup" | "dht_provider_lookup" => "dht_fallback_started",
+        "provider_fetch_start" => "providers_found",
+        "delegated_provider_lookup"
+        | "delegated_provider_empty_retry"
+        | "bitswap_dns_prefetch"
+        | "bitswap_dnsaddr_expand"
+        | "bitswap_dns_multiaddr_expand" => "provider_lookup",
+        "http_provider_fetch"
+        | "http_provider_candidate_cancelled"
+        | "http_provider_hedge"
+        | "http_provider_race"
+        | "http_provider_self_hedge_skip"
+        | "http_provider_bitswap_hedge_skip"
+        | "http_provider_race_result" => "fetching_http_provider",
+        "http_provider_bitswap_hedge" => "fetching_bitswap",
+        "http_provider_bitswap_hedge_result"
+            if fields.get("source").map(String::as_str) == Some("bitswap") =>
+        {
+            "fetching_bitswap"
+        }
+        "http_provider_bitswap_hedge_result" => "fetching_http_provider",
+        "bitswap_fetch"
+        | "bitswap_connection_established"
+        | "bitswap_incoming_block"
+        | "bitswap_incoming_batch"
+        | "bitswap_peer_attempt"
+        | "bitswap_peer_attempt_cancelled"
+        | "bitswap_peer_attempt_start"
+        | "bitswap_peer_expand"
+        | "bitswap_dial_plan"
+        | "bitswap_session_shortcut"
+        | "bitswap_session_shortcut_start"
+        | "bitswap_session_shortcut_pre_lookup"
+        | "bitswap_session_late_peer_wait"
+        | "bitswap_session_shortcut_empty_providers_wait"
+        | "bitswap_session_shortcut_post_lookup_wait"
+        | "bitswap_session_shortcut_post_lookup_race" => "fetching_bitswap",
+        "bitswap_fetch_cancelled" => "cancelled",
+        "bitswap_request_timeout_detail"
+        | "retry_provider_count"
+        | "provider_retry_after_connection_timeout"
+        | "bitswap_connection_error_backoff"
+        | "bitswap_connection_error_peer_skipped" => "retrying",
+        "bad_peer_skipped"
+        | "bitswap_client_reset"
+        | "bitswap_connection_error"
+        | "bitswap_dial_rejected"
+        | "bitswap_dial_waiters_dropped"
+        | "bitswap_incoming_stream_read"
+        | "bitswap_peer_timeout"
+        | "bitswap_peer_timeout_suppressed"
+        | "bitswap_provider_candidates_empty" => "retrying",
+        "bitswap_request_timeout"
+        | "provider_retry_after_timeout"
+        | "provider_retry_after_request_timeout"
+        | "provider_refresh_after_timeout"
+        | "provider_refresh_after_failure" => "retrying",
+        "ipfs_path_parse"
+        | "gateway_direct_body"
+        | "mime_total"
+        | "mime_detect"
+        | "mime_sniff_read"
+        | "unixfs_resource"
+        | "unixfs_metadata_cache"
+        | "unixfs_file_size"
+        | "unixfs_index_lookup"
+        | "unixfs_list_directory" => "streaming",
+        "gateway_conditional" => "cache_hit",
+        "gateway_limiter" if fields.get("acquired").map(String::as_str) == Some("false") => {
+            "failed"
+        }
+        "gateway_limiter" => "queued",
+        _ => raw_phase,
+    }
+    .into()
+}
+
+fn progress_error_code(raw_phase: &str, fields: &ProgressFields, status: &str) -> Option<String> {
+    if raw_phase == "request_done" && status == "failed" {
+        return fields.get("status").map(|status| format!("http_{status}"));
+    }
+    if raw_phase == "gateway_stream_failed" {
+        return Some("gateway_stream_failed".into());
+    }
+    if raw_phase == "gateway_limiter" && fields.get("acquired").map(String::as_str) == Some("false")
+    {
+        return Some("gateway_busy".into());
+    }
+    if raw_phase == "bitswap_incoming_stream_read"
+        && fields.get("ok").map(String::as_str) == Some("false")
+    {
+        return Some("bitswap_incoming_stream_read".into());
+    }
+    if fields.get("error").is_some() {
+        Some(raw_phase.to_string())
+    } else {
+        None
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
+}
+
 #[no_mangle]
 pub extern "C" fn freedom_ipfs_version() -> *mut c_char {
     CString::new(env!("CARGO_PKG_VERSION"))
@@ -153,6 +832,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_new_with_data_dir(
 }
 
 fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
+    ensure_progress_tracing();
     let runtime = match Runtime::new() {
         Ok(runtime) => runtime,
         Err(_) => return ptr::null_mut(),
@@ -168,6 +848,37 @@ fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
         next_preload_id: AtomicU64::new(1),
         preload_tasks: Mutex::new(HashMap::new()),
     }))
+}
+
+/// # Safety
+///
+/// `ptr` must be a valid node pointer. The returned string is UTF-8 JSON and
+/// must be released with `freedom_ipfs_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_node_progress_snapshot_json(
+    ptr: *mut FreedomIpfsNode,
+) -> *mut c_char {
+    if ptr.is_null() {
+        return CString::new("{\"active\":[],\"events\":[]}")
+            .expect("static JSON has no nul")
+            .into_raw();
+    }
+    ensure_progress_tracing();
+    CString::new(progress_recorder().snapshot_json())
+        .unwrap_or_else(|_| CString::new("{\"active\":[],\"events\":[]}").unwrap())
+        .into_raw()
+}
+
+/// # Safety
+///
+/// `ptr` must be a valid node pointer.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_node_clear_progress(ptr: *mut FreedomIpfsNode) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
+    progress_recorder().clear();
+    true
 }
 
 /// # Safety
@@ -673,8 +1384,11 @@ unsafe fn gateway_router_for_routing_mode(
             node.store.clone(),
             ProviderRoutingClient::Offline.with_stats(routing_stats.clone()),
         );
-        let router = freedom_ipfs_gateway::router_with_provider_config(
+        let name_resolver =
+            freedom_ipfs_gateway::PersistentNameResolver::cache_only(node.store.clone());
+        let router = freedom_ipfs_gateway::router_with_provider_and_name_resolver_config(
             Arc::new(provider.clone()),
+            Arc::new(name_resolver),
             gateway_config,
         );
         return Some(OnlineGatewayParts {
@@ -705,9 +1419,12 @@ unsafe fn gateway_router_for_routing_mode(
     let routing_stats = RoutingStatsHandle::default();
     let routing = routing.with_stats(routing_stats.clone());
     let provider = FetchingBlockProvider::new(node.store.clone(), routing);
-    let name_resolver = CachedNameResolver::new(DefaultNameResolver::new(
-        CloudflareDohResolver::default(),
-        ipns_resolver(routing_mode, delegated_router_endpoints, dht),
+    let name_resolver = CachedNameResolver::new(freedom_ipfs_gateway::PersistentNameResolver::new(
+        DefaultNameResolver::new(
+            CloudflareDohResolver::default(),
+            ipns_resolver(routing_mode, delegated_router_endpoints, dht),
+        ),
+        node.store.clone(),
     ));
     let router = freedom_ipfs_gateway::router_with_provider_and_name_resolver_config(
         Arc::new(provider.clone()),
@@ -870,17 +1587,46 @@ pub unsafe extern "C" fn freedom_ipfs_node_preload_path(
 
     let id = node.next_preload_id.fetch_add(1, Ordering::Relaxed);
     let url = format!("http://{addr}{path}");
+    tracing::info!(phase = "preload_start", preload_id = id, path = %path);
+    let preload_path = path.clone();
     let task = node.runtime.spawn(async move {
         let Ok(client) = reqwest::Client::builder().timeout(PRELOAD_TIMEOUT).build() else {
+            tracing::info!(
+                phase = "preload_done",
+                preload_id = id,
+                path = %preload_path,
+                ok = false,
+                error = "client_build_failed"
+            );
             return;
         };
         let Ok(response) = client.get(url).send().await else {
+            tracing::info!(
+                phase = "preload_done",
+                preload_id = id,
+                path = %preload_path,
+                ok = false,
+                error = "request_failed"
+            );
             return;
         };
         let Ok(mut response) = response.error_for_status() else {
+            tracing::info!(
+                phase = "preload_done",
+                preload_id = id,
+                path = %preload_path,
+                ok = false,
+                error = "http_status"
+            );
             return;
         };
         while matches!(response.chunk().await, Ok(Some(_))) {}
+        tracing::info!(
+            phase = "preload_done",
+            preload_id = id,
+            path = %preload_path,
+            ok = true
+        );
     });
 
     let Ok(mut tasks) = node.preload_tasks.lock() else {
@@ -912,6 +1658,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_cancel_preload(
         return false;
     };
     task.abort();
+    tracing::info!(phase = "preload_cancelled", preload_id = task_id);
     true
 }
 
@@ -942,8 +1689,11 @@ fn stop_gateway(node: &FreedomIpfsNode) {
 
 fn stop_preloads(node: &FreedomIpfsNode) {
     if let Ok(mut tasks) = node.preload_tasks.lock() {
-        for (_, task) in tasks.drain() {
-            task.abort();
+        for (task_id, task) in tasks.drain() {
+            if !task.is_finished() {
+                task.abort();
+                tracing::info!(phase = "preload_cancelled", preload_id = task_id);
+            }
         }
     }
 }
@@ -1163,6 +1913,47 @@ mod tests {
     }
 
     #[test]
+    fn offline_routing_mode_uses_persistent_name_cache() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let data = b"offline ipns cache";
+            let cid = cid_from_data(CODEC_RAW, data);
+            (*node).store.put_block(&cid, data).unwrap();
+            (*node)
+                .store
+                .put_name_record(
+                    "example.com",
+                    &format!("/ipfs/{cid}"),
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+
+            let addr = CString::new("127.0.0.1:0").unwrap();
+            assert!(freedom_ipfs_node_start_gateway_online_with_config_v2(
+                node,
+                addr.as_ptr(),
+                ptr::null(),
+                ROUTING_MODE_OFFLINE,
+                1,
+                0,
+                0,
+            ));
+
+            assert_gateway_health(node);
+            assert_gateway_path(node, "/ipns/example.com", data);
+            assert_eq!(
+                freedom_ipfs_node_routing_stats(node),
+                FreedomIpfsRoutingStats::default()
+            );
+
+            assert!(freedom_ipfs_node_stop_gateway(node));
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
     fn online_gateway_idles_without_network_work_before_requests() {
         unsafe {
             let node = freedom_ipfs_node_new_in_memory();
@@ -1296,6 +2087,735 @@ mod tests {
             assert_eq!(diagnostics.lifecycle_background, 0);
             freedom_ipfs_node_free(node);
         }
+    }
+
+    #[test]
+    fn progress_snapshot_records_gateway_request_phases() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+            assert!(freedom_ipfs_node_clear_progress(node));
+
+            let data = b"progress fixture";
+            let cid = cid_from_data(CODEC_RAW, data);
+            (*node).store.put_block(&cid, data).unwrap();
+            let addr = CString::new("127.0.0.1:0").unwrap();
+            assert!(freedom_ipfs_node_start_gateway(node, addr.as_ptr()));
+
+            let path = format!("/ipfs/{cid}");
+            let top_level_path = format!("{path}?top=1");
+            let response = gateway_response_with_headers(
+                node,
+                &path,
+                &[
+                    ("X-Freedom-Request-ID", "4242"),
+                    ("X-Freedom-Parent-Request-ID", "7"),
+                    ("X-Freedom-Top-Level-Path", &top_level_path),
+                ],
+            );
+            assert!(
+                response.as_bytes().ends_with(data),
+                "response did not end with expected body: {response}"
+            );
+
+            let snapshot = progress_snapshot_json(node);
+            let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+            let events = value["events"].as_array().unwrap();
+            assert!(value["generated_at_unix_ms"].as_u64().unwrap() > 0);
+            let has_active_request = value["active"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|target| target["kind"] == "gateway_request" && target["id"] == 4242);
+            assert!(!has_active_request, "{snapshot}");
+            assert_eq!(value["event_count"].as_u64().unwrap(), events.len() as u64);
+            assert!(
+                events.iter().any(|event| event["path"] == path
+                    && event["phase"] == "started"
+                    && event["kind"] == "gateway_request"
+                    && event["target_id"] == 4242
+                    && event["parent_id"] == 7
+                    && event["top_level_path"] == top_level_path),
+                "{snapshot}"
+            );
+            assert!(
+                events.iter().any(|event| event["path"] == path
+                    && event["phase"] == "completed"
+                    && event["status"] == "completed"
+                    && event["blocks_loaded"] == 0
+                    && event["retry_count"] == 0),
+                "{snapshot}"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["path"] == path && event["raw_phase"] == "unixfs_resource"),
+                "{snapshot}"
+            );
+
+            assert!(freedom_ipfs_node_stop_gateway(node));
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
+    fn progress_snapshot_accumulates_target_counters() {
+        let recorder = ProgressRecorder::default();
+        let span = ProgressSpanFields {
+            request_id: Some(1),
+            ..ProgressSpanFields::default()
+        };
+
+        recorder.record_event(
+            span.clone(),
+            progress_fields([("phase", "request_start"), ("request_id", "1")]),
+            "test",
+        );
+        recorder.record_event(
+            span.clone(),
+            progress_fields([
+                ("phase", "bitswap_connection_error"),
+                ("request_id", "1"),
+                ("error", "timeout"),
+            ]),
+            "test",
+        );
+        recorder.record_event(
+            span.clone(),
+            progress_fields([
+                ("phase", "block_fetch_total"),
+                ("request_id", "1"),
+                ("source", "bitswap"),
+            ]),
+            "test",
+        );
+        recorder.record_event(
+            span,
+            progress_fields([
+                ("phase", "request_done"),
+                ("request_id", "1"),
+                ("status", "200"),
+            ]),
+            "test",
+        );
+
+        let snapshot = recorder.snapshot_json();
+        let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(value["active_count"].as_u64().unwrap(), 0);
+        let events = value["events"].as_array().unwrap();
+        let retrying = events
+            .iter()
+            .find(|event| event["phase"] == "retrying")
+            .unwrap();
+        assert_eq!(retrying["source"], "bitswap");
+        let completed = events
+            .iter()
+            .find(|event| event["phase"] == "completed")
+            .unwrap();
+        assert_eq!(completed["source"], "bitswap");
+        assert_eq!(completed["blocks_loaded"].as_u64().unwrap(), 1);
+        assert_eq!(completed["retry_count"].as_u64().unwrap(), 1);
+    }
+
+    #[test]
+    fn progress_snapshot_records_stream_body_bytes() {
+        let recorder = ProgressRecorder::default();
+        let span = ProgressSpanFields {
+            request_id: Some(1),
+            progress_request_id: Some(4242),
+            path: Some("/ipfs/root".into()),
+            ..ProgressSpanFields::default()
+        };
+
+        recorder.record_event(
+            span.clone(),
+            progress_fields([("phase", "request_start")]),
+            "test",
+        );
+        recorder.record_event(
+            span.clone(),
+            progress_fields([
+                ("phase", "unixfs_resource"),
+                ("resource", "file"),
+                ("file_len", "600000"),
+            ]),
+            "test",
+        );
+        recorder.record_event(
+            span.clone(),
+            progress_fields([
+                ("phase", "request_done"),
+                ("status", "200"),
+                ("body_mode", "stream"),
+            ]),
+            "test",
+        );
+        recorder.record_event(
+            span,
+            progress_fields([
+                ("phase", "gateway_stream_done"),
+                ("body_len", "600000"),
+                ("chunks", "10"),
+            ]),
+            "test",
+        );
+
+        let snapshot = recorder.snapshot_json();
+        let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(value["active_count"].as_u64().unwrap(), 0);
+        let events = value["events"].as_array().unwrap();
+        let response_ready = events
+            .iter()
+            .find(|event| event["raw_phase"] == "request_done")
+            .unwrap();
+        assert_eq!(response_ready["phase"], "streaming");
+        assert_eq!(response_ready["status"], "active");
+        assert_eq!(response_ready["bytes_total"].as_u64().unwrap(), 600000);
+        let completed = events
+            .iter()
+            .find(|event| event["raw_phase"] == "gateway_stream_done")
+            .unwrap();
+        assert_eq!(completed["target_id"].as_u64().unwrap(), 4242);
+        assert_eq!(completed["path"], "/ipfs/root");
+        assert_eq!(completed["phase"], "completed");
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["bytes_loaded"].as_u64().unwrap(), 600000);
+        assert_eq!(completed["bytes_total"].as_u64().unwrap(), 600000);
+    }
+
+    #[test]
+    fn progress_snapshot_counts_active_subrequests() {
+        let recorder = ProgressRecorder::default();
+        let root_span = ProgressSpanFields {
+            request_id: Some(1),
+            progress_request_id: Some(100),
+            path: Some("/ipns/site/".into()),
+            ..ProgressSpanFields::default()
+        };
+        let child_span = ProgressSpanFields {
+            request_id: Some(2),
+            progress_request_id: Some(101),
+            parent_request_id: Some(100),
+            path: Some("/ipns/site/app.js".into()),
+            ..ProgressSpanFields::default()
+        };
+        let second_child_span = ProgressSpanFields {
+            request_id: Some(3),
+            progress_request_id: Some(102),
+            parent_request_id: Some(100),
+            path: Some("/ipns/site/app.css".into()),
+            ..ProgressSpanFields::default()
+        };
+
+        recorder.record_event(
+            root_span,
+            progress_fields([("phase", "request_start")]),
+            "test",
+        );
+        recorder.record_event(
+            child_span,
+            progress_fields([("phase", "request_start")]),
+            "test",
+        );
+        recorder.record_event(
+            second_child_span,
+            progress_fields([("phase", "request_start")]),
+            "test",
+        );
+
+        let snapshot = recorder.snapshot_json();
+        let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(value["active_count"].as_u64().unwrap(), 3);
+        let active = value["active"].as_array().unwrap();
+        let root = active.iter().find(|target| target["id"] == 100).unwrap();
+        assert_eq!(root["active_subrequests"].as_u64().unwrap(), 2);
+        let child = active.iter().find(|target| target["id"] == 101).unwrap();
+        assert_eq!(child["parent_id"].as_u64().unwrap(), 100);
+        assert_eq!(child["active_subrequests"].as_u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn progress_phase_maps_trace_events_to_ui_states() {
+        assert_eq!(
+            progress_source(
+                "bitswap_fetch",
+                &progress_fields([("phase", "bitswap_fetch"), ("bitswap_delivery", "incoming")]),
+            )
+            .as_deref(),
+            Some("bitswap")
+        );
+        assert_eq!(
+            progress_source(
+                "delegated_provider_lookup",
+                &progress_fields([("phase", "delegated_provider_lookup")]),
+            )
+            .as_deref(),
+            Some("delegated_routing")
+        );
+        assert_eq!(
+            progress_source(
+                "delegated_provider_empty_retry",
+                &progress_fields([("phase", "delegated_provider_empty_retry")]),
+            )
+            .as_deref(),
+            Some("delegated_routing")
+        );
+        assert_eq!(
+            progress_source(
+                "http_provider_race",
+                &progress_fields([("phase", "http_provider_race")]),
+            )
+            .as_deref(),
+            Some("http_provider")
+        );
+        assert_eq!(
+            progress_source(
+                "http_provider_hedge",
+                &progress_fields([("phase", "http_provider_hedge")]),
+            )
+            .as_deref(),
+            Some("http_provider")
+        );
+        assert_eq!(
+            progress_source(
+                "http_provider_bitswap_hedge",
+                &progress_fields([("phase", "http_provider_bitswap_hedge")]),
+            )
+            .as_deref(),
+            Some("bitswap")
+        );
+        assert_eq!(
+            progress_source(
+                "http_provider_self_hedge_skip",
+                &progress_fields([("phase", "http_provider_self_hedge_skip")]),
+            )
+            .as_deref(),
+            Some("http_provider")
+        );
+        assert_eq!(
+            progress_source(
+                "http_provider_bitswap_hedge_skip",
+                &progress_fields([("phase", "http_provider_bitswap_hedge_skip")]),
+            )
+            .as_deref(),
+            Some("http_provider")
+        );
+        assert_eq!(
+            progress_source(
+                "http_provider_bitswap_hedge_result",
+                &progress_fields([
+                    ("phase", "http_provider_bitswap_hedge_result"),
+                    ("source", "bitswap")
+                ]),
+            )
+            .as_deref(),
+            Some("bitswap")
+        );
+        assert_eq!(
+            progress_source(
+                "gateway_small_body_cache",
+                &progress_fields([("phase", "gateway_small_body_cache"), ("cache_hit", "true")]),
+            )
+            .as_deref(),
+            Some("cache")
+        );
+        assert_eq!(
+            progress_phase(
+                "name_cache",
+                &progress_fields([("phase", "name_cache"), ("cache_hit", "false")]),
+                "active",
+            ),
+            "resolving_name"
+        );
+        assert_eq!(
+            progress_phase(
+                "name_resolve",
+                &progress_fields([("phase", "name_resolve"), ("ok", "true")]),
+                "active",
+            ),
+            "name_resolved"
+        );
+        assert_eq!(
+            progress_phase(
+                "name_persistent_cache",
+                &progress_fields([("phase", "name_persistent_cache"), ("cache_hit", "true")]),
+                "active",
+            ),
+            "name_resolved"
+        );
+        assert_eq!(
+            progress_phase(
+                "provider_cache",
+                &progress_fields([("phase", "provider_cache"), ("cache_hit", "false")]),
+                "active",
+            ),
+            "provider_lookup"
+        );
+        assert_eq!(
+            progress_phase(
+                "provider_cache",
+                &progress_fields([
+                    ("phase", "provider_cache"),
+                    ("cache_hit", "true"),
+                    ("provider_count", "0")
+                ]),
+                "active",
+            ),
+            "failed"
+        );
+        assert_eq!(
+            progress_phase(
+                "delegated_provider_lookup",
+                &progress_fields([
+                    ("phase", "delegated_provider_lookup"),
+                    ("provider_count", "8")
+                ]),
+                "active",
+            ),
+            "provider_lookup"
+        );
+        assert_eq!(
+            progress_phase(
+                "delegated_provider_empty_retry",
+                &progress_fields([
+                    ("phase", "delegated_provider_empty_retry"),
+                    ("provider_count", "1")
+                ]),
+                "active",
+            ),
+            "provider_lookup"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_dnsaddr_expand",
+                &progress_fields([("phase", "bitswap_dnsaddr_expand"), ("record_count", "2")]),
+                "active",
+            ),
+            "provider_lookup"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_dns_prefetch",
+                &progress_fields([
+                    ("phase", "bitswap_dns_prefetch"),
+                    ("dns_ip_host_count", "4")
+                ]),
+                "active",
+            ),
+            "provider_lookup"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_peer_expand",
+                &progress_fields([("phase", "bitswap_peer_expand"), ("peer_count", "3")]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_connection_established",
+                &progress_fields([("phase", "bitswap_connection_established")]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_incoming_batch",
+                &progress_fields([("phase", "bitswap_incoming_batch")]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_session_shortcut_pre_lookup",
+                &progress_fields([("phase", "bitswap_session_shortcut_pre_lookup")]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_session_shortcut_post_lookup_race",
+                &progress_fields([("phase", "bitswap_session_shortcut_post_lookup_race")]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_session_shortcut_empty_providers_wait",
+                &progress_fields([("phase", "bitswap_session_shortcut_empty_providers_wait")]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "unixfs_resource",
+                &progress_fields([("phase", "unixfs_resource")]),
+                "active",
+            ),
+            "streaming"
+        );
+        assert_eq!(
+            progress_phase(
+                "gateway_direct_body",
+                &progress_fields([("phase", "gateway_direct_body"), ("body_len", "4096")]),
+                "active",
+            ),
+            "streaming"
+        );
+        assert_eq!(
+            progress_phase(
+                "gateway_small_body_cache",
+                &progress_fields([
+                    ("phase", "gateway_small_body_cache"),
+                    ("cache_hit", "true"),
+                    ("body_len", "4096")
+                ]),
+                "active",
+            ),
+            "cache_hit"
+        );
+        assert_eq!(
+            progress_phase(
+                "gateway_small_body_cache",
+                &progress_fields([
+                    ("phase", "gateway_small_body_cache"),
+                    ("cache_hit", "false")
+                ]),
+                "active",
+            ),
+            "checking_cache"
+        );
+        assert_eq!(
+            progress_phase(
+                "gateway_small_body_cache",
+                &progress_fields([
+                    ("phase", "gateway_small_body_cache"),
+                    ("cache_inserted", "true")
+                ]),
+                "active",
+            ),
+            "streaming"
+        );
+        assert_eq!(
+            progress_phase(
+                "request_done",
+                &progress_fields([
+                    ("phase", "request_done"),
+                    ("status", "200"),
+                    ("body_mode", "stream")
+                ]),
+                "active",
+            ),
+            "streaming"
+        );
+        assert_eq!(
+            progress_phase(
+                "gateway_stream_done",
+                &progress_fields([
+                    ("phase", "gateway_stream_done"),
+                    ("body_len", "600000"),
+                    ("chunks", "3")
+                ]),
+                "completed",
+            ),
+            "completed"
+        );
+        assert_eq!(
+            progress_phase(
+                "gateway_stream_failed",
+                &progress_fields([
+                    ("phase", "gateway_stream_failed"),
+                    ("error", "missing block")
+                ]),
+                "failed",
+            ),
+            "failed"
+        );
+        assert_eq!(
+            progress_phase(
+                "gateway_conditional",
+                &progress_fields([
+                    ("phase", "gateway_conditional"),
+                    ("outcome", "not_modified")
+                ]),
+                "active",
+            ),
+            "cache_hit"
+        );
+        assert_eq!(
+            progress_phase(
+                "block_fetch_total",
+                &progress_fields([("phase", "block_fetch_total"), ("source", "http_provider")]),
+                "active",
+            ),
+            "fetching_http_provider"
+        );
+        assert_eq!(
+            progress_phase(
+                "block_range_batch_fetch",
+                &progress_fields([
+                    ("phase", "block_range_batch_fetch"),
+                    ("source", "bitswap"),
+                    ("range_len", "32768")
+                ]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "block_range_batch_fetch",
+                &progress_fields([
+                    ("phase", "block_range_batch_fetch"),
+                    ("source", "http_provider"),
+                    ("range_len", "32768")
+                ]),
+                "active",
+            ),
+            "fetching_http_provider"
+        );
+        assert_eq!(
+            progress_phase(
+                "http_provider_race",
+                &progress_fields([("phase", "http_provider_race")]),
+                "active",
+            ),
+            "fetching_http_provider"
+        );
+        assert_eq!(
+            progress_phase(
+                "http_provider_candidate_cancelled",
+                &progress_fields([("phase", "http_provider_candidate_cancelled")]),
+                "active",
+            ),
+            "fetching_http_provider"
+        );
+        assert_eq!(
+            progress_phase(
+                "http_provider_hedge",
+                &progress_fields([("phase", "http_provider_hedge")]),
+                "active",
+            ),
+            "fetching_http_provider"
+        );
+        assert_eq!(
+            progress_phase(
+                "http_provider_bitswap_hedge",
+                &progress_fields([("phase", "http_provider_bitswap_hedge")]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "http_provider_self_hedge_skip",
+                &progress_fields([("phase", "http_provider_self_hedge_skip")]),
+                "active",
+            ),
+            "fetching_http_provider"
+        );
+        assert_eq!(
+            progress_phase(
+                "http_provider_bitswap_hedge_skip",
+                &progress_fields([("phase", "http_provider_bitswap_hedge_skip")]),
+                "active",
+            ),
+            "fetching_http_provider"
+        );
+        assert_eq!(
+            progress_phase(
+                "http_provider_bitswap_hedge_result",
+                &progress_fields([
+                    ("phase", "http_provider_bitswap_hedge_result"),
+                    ("source", "bitswap")
+                ]),
+                "active",
+            ),
+            "fetching_bitswap"
+        );
+        assert_eq!(
+            progress_phase(
+                "http_provider_bitswap_hedge_result",
+                &progress_fields([
+                    ("phase", "http_provider_bitswap_hedge_result"),
+                    ("source", "http_provider")
+                ]),
+                "active",
+            ),
+            "fetching_http_provider"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_connection_error",
+                &progress_fields([("phase", "bitswap_connection_error"), ("error", "timeout")]),
+                "active",
+            ),
+            "retrying"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_dial_waiters_dropped",
+                &progress_fields([
+                    ("phase", "bitswap_dial_waiters_dropped"),
+                    ("waiter_count", "2")
+                ]),
+                "active",
+            ),
+            "retrying"
+        );
+        assert_eq!(
+            progress_phase(
+                "bitswap_incoming_stream_read",
+                &progress_fields([
+                    ("phase", "bitswap_incoming_stream_read"),
+                    ("ok", "false"),
+                    ("timed_out", "true")
+                ]),
+                "active",
+            ),
+            "retrying"
+        );
+        assert_eq!(
+            progress_phase(
+                "provider_retry_after_connection_timeout",
+                &progress_fields([("phase", "provider_retry_after_connection_timeout")]),
+                "active",
+            ),
+            "retrying"
+        );
+        assert_eq!(
+            progress_phase(
+                "provider_refresh_skipped_empty_provider_set",
+                &progress_fields([
+                    ("phase", "provider_refresh_skipped_empty_provider_set"),
+                    ("error", "no bitswap providers")
+                ]),
+                "active",
+            ),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn progress_error_code_marks_incoming_stream_read_failures() {
+        assert_eq!(
+            progress_error_code(
+                "bitswap_incoming_stream_read",
+                &progress_fields([
+                    ("phase", "bitswap_incoming_stream_read"),
+                    ("ok", "false"),
+                    ("timed_out", "true")
+                ]),
+                "active",
+            ),
+            Some("bitswap_incoming_stream_read".into())
+        );
     }
 
     #[test]
@@ -1545,6 +3065,62 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_preload_cancellation_clears_progress_target() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+            assert!(freedom_ipfs_node_clear_progress(node));
+
+            let preload_id = 77;
+            tracing::info!(
+                phase = "preload_start",
+                preload_id,
+                path = "/ipfs/bafyprogress"
+            );
+            let task = (*node).runtime.spawn(async {
+                std::future::pending::<()>().await;
+            });
+            (*node)
+                .preload_tasks
+                .lock()
+                .unwrap()
+                .insert(preload_id, task);
+
+            let snapshot = progress_snapshot_json(node);
+            let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+            let active = value["active"].as_array().unwrap();
+            assert!(
+                active.iter().any(|target| target["kind"] == "preload"
+                    && target["id"] == preload_id
+                    && target["status"] == "active"),
+                "{snapshot}"
+            );
+
+            assert!(freedom_ipfs_node_enter_background(node));
+
+            let snapshot = progress_snapshot_json(node);
+            let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+            let active = value["active"].as_array().unwrap();
+            let events = value["events"].as_array().unwrap();
+            assert!(
+                !active
+                    .iter()
+                    .any(|target| target["kind"] == "preload" && target["id"] == preload_id),
+                "{snapshot}"
+            );
+            assert!(
+                events.iter().any(|event| event["kind"] == "preload"
+                    && event["target_id"] == preload_id
+                    && event["phase"] == "cancelled"
+                    && event["status"] == "cancelled"),
+                "{snapshot}"
+            );
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
     fn network_change_clears_provider_metadata_without_blocks() {
         unsafe {
             let node = freedom_ipfs_node_new_in_memory();
@@ -1617,13 +3193,26 @@ mod tests {
     }
 
     unsafe fn gateway_response(node: *mut FreedomIpfsNode, path: &str) -> String {
+        gateway_response_with_headers(node, path, &[])
+    }
+
+    unsafe fn gateway_response_with_headers(
+        node: *mut FreedomIpfsNode,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> String {
         let url = gateway_url_string(node);
         assert!(url.starts_with("http://127.0.0.1:"));
 
         let addr = url.strip_prefix("http://").unwrap();
         let mut stream = std::net::TcpStream::connect(addr).unwrap();
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let extra_headers = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\n{extra_headers}Connection: close\r\n\r\n"
+        );
         stream.write_all(request.as_bytes()).unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
@@ -1636,5 +3225,24 @@ mod tests {
         let url = CStr::from_ptr(url_ptr).to_str().unwrap().to_string();
         freedom_ipfs_string_free(url_ptr);
         url
+    }
+
+    unsafe fn progress_snapshot_json(node: *mut FreedomIpfsNode) -> String {
+        let snapshot_ptr = freedom_ipfs_node_progress_snapshot_json(node);
+        assert!(!snapshot_ptr.is_null());
+        let snapshot = CStr::from_ptr(snapshot_ptr).to_str().unwrap().to_string();
+        freedom_ipfs_string_free(snapshot_ptr);
+        snapshot
+    }
+
+    fn progress_fields(
+        values: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> ProgressFields {
+        ProgressFields {
+            values: values
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        }
     }
 }

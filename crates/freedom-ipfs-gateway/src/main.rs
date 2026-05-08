@@ -3,8 +3,10 @@ use axum::Router;
 use clap::{Parser, ValueEnum};
 use freedom_ipfs_core::parse_cid;
 use freedom_ipfs_gateway::{
-    router_with_provider_and_name_resolver_config, router_with_provider_config, GatewayConfig,
-    DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
+    router_with_provider_and_name_resolver_config, GatewayConfig,
+    GatewayHtmlDirectoryPrefetchConfig, GatewayHtmlPrefetchConfig, GatewayHtmlRangeWarmConfig,
+    PersistentNameResolver, DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
+    DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
 };
 use freedom_ipfs_namesys::{
     CachedNameResolver, CloudflareDohResolver, DefaultNameResolver, DelegatedIpnsResolver,
@@ -26,6 +28,19 @@ use tokio::net::TcpListener;
 
 const DEFAULT_TRACE_FILTER: &str =
     "freedom_ipfs_gateway=info,freedom_ipfs_retrieval=info,freedom_ipfs_namesys=info,freedom_ipfs_routing=info,warn";
+const HTML_PREFETCH_MAX_ASSETS_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_ASSETS";
+const HTML_PREFETCH_MAX_BYTES_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_BYTES";
+const HTML_PREFETCH_CONCURRENCY_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_CONCURRENCY";
+const HTML_DIRECTORY_PREFETCH_MAX_DIRS_ENV: &str =
+    "FREEDOM_IPFS_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_DIRS";
+const HTML_DIRECTORY_PREFETCH_MAX_BYTES_ENV: &str =
+    "FREEDOM_IPFS_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_BYTES";
+const HTML_DIRECTORY_PREFETCH_CONCURRENCY_ENV: &str =
+    "FREEDOM_IPFS_GATEWAY_HTML_DIRECTORY_PREFETCH_CONCURRENCY";
+const HTML_RANGE_WARM_MAX_BYTES_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_RANGE_WARM_MAX_BYTES";
+const HTML_RANGE_WARM_CONCURRENCY_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_RANGE_WARM_CONCURRENCY";
+const RAW_LINK_TSIZE_FAST_HEADERS_ENV: &str = "FREEDOM_IPFS_ENABLE_RAW_LINK_TSIZE_FAST_HEADERS";
+const STREAM_SMALL_BODIES_ENV: &str = "FREEDOM_IPFS_GATEWAY_STREAM_SMALL_BODIES";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Local Freedom IPFS gateway")]
@@ -48,6 +63,8 @@ struct Args {
     routing_mode: RoutingMode,
     #[arg(long, default_value_t = DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS)]
     max_concurrent_requests: usize,
+    #[arg(long, default_value_t = DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES)]
+    small_body_cache_max_bytes: usize,
     #[arg(long, default_value_t = DEFAULT_DHT_QUERY_TIMEOUT.as_secs())]
     dht_query_timeout_secs: u64,
     #[arg(long, default_value_t = DEFAULT_MAX_DHT_PROVIDERS)]
@@ -56,6 +73,8 @@ struct Args {
     trace_output: Option<PathBuf>,
     #[arg(long)]
     trace_filter: Option<String>,
+    #[arg(long)]
+    trace_span_list: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -69,7 +88,11 @@ enum RoutingMode {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    init_tracing(args.trace_output.as_deref(), args.trace_filter.as_deref())?;
+    init_tracing(
+        args.trace_output.as_deref(),
+        args.trace_filter.as_deref(),
+        args.trace_span_list,
+    )?;
     let start_online_gateway = should_start_online_gateway(&args);
     let store = if let Some(path) = args.db {
         SqliteBlockStore::open(path, 256 * 1024 * 1024)?
@@ -94,7 +117,13 @@ async fn main() -> Result<()> {
         eprintln!("root: {root}");
     }
 
-    let gateway_config = GatewayConfig::new(args.max_concurrent_requests);
+    let gateway_config = GatewayConfig::new(args.max_concurrent_requests)
+        .with_small_body_cache_max_bytes(args.small_body_cache_max_bytes)
+        .with_html_prefetch(gateway_html_prefetch_config())
+        .with_html_directory_prefetch(gateway_html_directory_prefetch_config())
+        .with_html_range_warm(gateway_html_range_warm_config())
+        .with_raw_link_tsize_fast_headers(raw_link_tsize_fast_headers_enabled())
+        .with_stream_small_bodies(stream_small_bodies_enabled());
     let router = if start_online_gateway {
         let delegated_routers = args.delegated_router.clone();
         let delegated_router_endpoints = delegated_router_endpoints(&delegated_routers);
@@ -108,10 +137,13 @@ async fn main() -> Result<()> {
             RoutingMode::LightDht => ProviderRoutingClient::from(dht.clone()),
             RoutingMode::Offline => ProviderRoutingClient::Offline,
         };
-        let provider = FetchingBlockProvider::new(store, routing);
-        let name_resolver = CachedNameResolver::new(DefaultNameResolver::new(
-            CloudflareDohResolver::default(),
-            ipns_resolver(args.routing_mode, delegated_router_endpoints, dht),
+        let provider = FetchingBlockProvider::new(store.clone(), routing);
+        let name_resolver = CachedNameResolver::new(PersistentNameResolver::new(
+            DefaultNameResolver::new(
+                CloudflareDohResolver::default(),
+                ipns_resolver(args.routing_mode, delegated_router_endpoints, dht),
+            ),
+            store,
         ));
         router_with_provider_and_name_resolver_config(
             Arc::new(provider),
@@ -119,13 +151,21 @@ async fn main() -> Result<()> {
             gateway_config,
         )
     } else {
-        router_with_provider_config(Arc::new(store), gateway_config)
+        router_with_provider_and_name_resolver_config(
+            Arc::new(store.clone()),
+            Arc::new(PersistentNameResolver::cache_only(store)),
+            gateway_config,
+        )
     };
     serve_router(router, args.addr).await?;
     Ok(())
 }
 
-fn init_tracing(trace_output: Option<&std::path::Path>, trace_filter: Option<&str>) -> Result<()> {
+fn init_tracing(
+    trace_output: Option<&std::path::Path>,
+    trace_filter: Option<&str>,
+    trace_span_list: bool,
+) -> Result<()> {
     let filter = if let Some(trace_filter) = trace_filter {
         tracing_subscriber::EnvFilter::try_new(trace_filter)
             .with_context(|| format!("parse trace filter {trace_filter:?}"))?
@@ -147,7 +187,7 @@ fn init_tracing(trace_output: Option<&std::path::Path>, trace_filter: Option<&st
             .json()
             .flatten_event(true)
             .with_current_span(true)
-            .with_span_list(true)
+            .with_span_list(trace_span_list)
             .with_writer(TraceFileWriter(Arc::new(file)))
             .init();
     } else {
@@ -176,6 +216,48 @@ async fn serve_router(router: Router, addr: SocketAddr) -> std::io::Result<()> {
 
 fn should_start_online_gateway(args: &Args) -> bool {
     args.online && args.routing_mode != RoutingMode::Offline
+}
+
+fn gateway_html_prefetch_config() -> GatewayHtmlPrefetchConfig {
+    let max_assets = env_usize(HTML_PREFETCH_MAX_ASSETS_ENV, 0);
+    let max_bytes = env_u64(HTML_PREFETCH_MAX_BYTES_ENV, 64 * 1024);
+    let concurrency = env_usize(HTML_PREFETCH_CONCURRENCY_ENV, 2);
+    GatewayHtmlPrefetchConfig::new(max_assets, max_bytes, concurrency)
+}
+
+fn gateway_html_directory_prefetch_config() -> GatewayHtmlDirectoryPrefetchConfig {
+    let max_dirs = env_usize(HTML_DIRECTORY_PREFETCH_MAX_DIRS_ENV, 0);
+    let max_bytes = env_u64(HTML_DIRECTORY_PREFETCH_MAX_BYTES_ENV, 64 * 1024);
+    let concurrency = env_usize(HTML_DIRECTORY_PREFETCH_CONCURRENCY_ENV, 1);
+    GatewayHtmlDirectoryPrefetchConfig::new(max_dirs, max_bytes, concurrency)
+}
+
+fn gateway_html_range_warm_config() -> GatewayHtmlRangeWarmConfig {
+    let max_bytes = env_u64(HTML_RANGE_WARM_MAX_BYTES_ENV, 0);
+    let concurrency = env_usize(HTML_RANGE_WARM_CONCURRENCY_ENV, 1);
+    GatewayHtmlRangeWarmConfig::new(max_bytes, concurrency)
+}
+
+fn raw_link_tsize_fast_headers_enabled() -> bool {
+    std::env::var_os(RAW_LINK_TSIZE_FAST_HEADERS_ENV).is_some()
+}
+
+fn stream_small_bodies_enabled() -> bool {
+    std::env::var_os(STREAM_SMALL_BODIES_ENV).is_some()
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
 }
 
 fn light_dht_client(dht_query_timeout_secs: u64, dht_max_providers: usize) -> LightDhtClient {

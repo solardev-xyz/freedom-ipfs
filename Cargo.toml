@@ -18,8 +18,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.83"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/flotob/freedom-ipfs"
-homepage = "https://github.com/flotob/freedom-ipfs"
+repository = "https://github.com/solardev-xyz/freedom-ipfs"
+homepage = "https://github.com/solardev-xyz/freedom-ipfs"
 authors = ["Freedom IPFS contributors"]
 
 [workspace.dependencies]

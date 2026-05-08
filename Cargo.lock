@@ -944,8 +944,12 @@ dependencies = [
  "freedom-ipfs-routing",
  "freedom-ipfs-store",
  "reqwest",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2287,6 +2291,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
 ]
 
@@ -4605,6 +4610,7 @@ dependencies = [
  "anyhow",
  "clap",
  "freedom-ipfs-core",
+ "prost",
 ]
 
 [[package]]

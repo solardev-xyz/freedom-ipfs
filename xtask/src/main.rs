@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use freedom_ipfs_core::{cid_from_data, encode_car_v1, CarBlock, CODEC_RAW};
+use freedom_ipfs_core::{cid_from_data, encode_car_v1, CarBlock, CODEC_DAG_PB, CODEC_RAW};
+use prost::Message;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
@@ -19,6 +20,20 @@ struct Args {
 enum XtaskCommand {
     BuildXcframework,
     VerifyXcframework,
+    GenerateMobileWebFixture {
+        #[arg(long)]
+        car: PathBuf,
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long, default_value_t = 600_000)]
+        bytes: usize,
+        #[arg(long, default_value_t = 262_100)]
+        range_start: u64,
+        #[arg(long, default_value_t = 300)]
+        range_len: u64,
+        #[arg(long, default_value = DEFAULT_MOBILE_WEB_FIXTURE_CASE_ID)]
+        case_id: String,
+    },
     ValidateIosDeviceEvidence {
         #[arg(default_value = "docs/ios-device-evidence-template.csv")]
         path: PathBuf,
@@ -32,10 +47,287 @@ fn main() -> Result<()> {
     match args.command {
         XtaskCommand::BuildXcframework => build_xcframework(),
         XtaskCommand::VerifyXcframework => verify_xcframework_command(),
+        XtaskCommand::GenerateMobileWebFixture {
+            car,
+            corpus,
+            bytes,
+            range_start,
+            range_len,
+            case_id,
+        } => generate_mobile_web_fixture(&car, &corpus, bytes, range_start, range_len, &case_id),
         XtaskCommand::ValidateIosDeviceEvidence { path, filled } => {
             validate_ios_device_evidence(&path, filled)
         }
     }
+}
+
+const UNIXFS_CHUNK_SIZE: usize = 256 * 1024;
+const MOBILE_FIXTURE_PATTERN: &[u8] = b"freedom-ipfs multiblock fixture payload\n";
+const DEFAULT_MOBILE_WEB_FIXTURE_CASE_ID: &str = "multiblock-unixfs-range";
+
+#[derive(Clone, PartialEq, Message)]
+struct FixturePbNode {
+    #[prost(bytes, optional, tag = "1")]
+    data: Option<Vec<u8>>,
+    #[prost(message, repeated, tag = "2")]
+    links: Vec<FixturePbLink>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct FixturePbLink {
+    #[prost(bytes, optional, tag = "1")]
+    hash: Option<Vec<u8>>,
+    #[prost(string, optional, tag = "2")]
+    name: Option<String>,
+    #[prost(uint64, optional, tag = "3")]
+    tsize: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct FixtureUnixfsData {
+    #[prost(enumeration = "FixtureUnixfsDataType", optional, tag = "1")]
+    r#type: Option<i32>,
+    #[prost(bytes, optional, tag = "2")]
+    data: Option<Vec<u8>>,
+    #[prost(uint64, optional, tag = "3")]
+    filesize: Option<u64>,
+    #[prost(uint64, repeated, tag = "4")]
+    blocksizes: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+enum FixtureUnixfsDataType {
+    File = 2,
+}
+
+fn generate_mobile_web_fixture(
+    car_path: &Path,
+    corpus_path: &Path,
+    bytes: usize,
+    range_start: u64,
+    range_len: u64,
+    case_id: &str,
+) -> Result<()> {
+    if bytes == 0 {
+        bail!("--bytes must be greater than zero");
+    }
+    if bytes <= UNIXFS_CHUNK_SIZE {
+        bail!(
+            "--bytes must be greater than the UnixFS chunk size ({UNIXFS_CHUNK_SIZE}) for a multi-block fixture"
+        );
+    }
+    if range_len == 0 {
+        bail!("--range-len must be greater than zero");
+    }
+    let range_end = range_start
+        .checked_add(range_len - 1)
+        .context("range end overflow")?;
+    if range_end >= bytes as u64 {
+        bail!("range {range_start}-{range_end} is outside generated fixture length {bytes}");
+    }
+
+    let payload = deterministic_fixture_payload(bytes);
+    let mut blocks = Vec::new();
+    let mut links = Vec::new();
+    let mut blocksizes = Vec::new();
+    for chunk in payload.chunks(UNIXFS_CHUNK_SIZE) {
+        let data = chunk.to_vec();
+        let cid = cid_from_data(CODEC_RAW, &data);
+        blocksizes.push(data.len() as u64);
+        links.push(FixturePbLink {
+            hash: Some(cid.to_bytes()),
+            name: Some(String::new()),
+            tsize: Some(data.len() as u64),
+        });
+        blocks.push(CarBlock { cid, data });
+    }
+
+    let root_data = FixturePbNode {
+        data: Some(
+            FixtureUnixfsData {
+                r#type: Some(FixtureUnixfsDataType::File as i32),
+                data: Some(Vec::new()),
+                filesize: Some(bytes as u64),
+                blocksizes,
+            }
+            .encode_to_vec(),
+        ),
+        links,
+    }
+    .encode_to_vec();
+    let root = cid_from_data(CODEC_DAG_PB, &root_data);
+    blocks.insert(
+        0,
+        CarBlock {
+            cid: root,
+            data: root_data,
+        },
+    );
+
+    write_parent_dir(car_path)?;
+    fs::write(car_path, encode_car_v1(&blocks))
+        .with_context(|| format!("write {}", car_path.display()))?;
+
+    write_parent_dir(corpus_path)?;
+    let range_cases = mobile_web_fixture_range_cases(case_id, bytes as u64, range_start, range_len);
+    let corpus = mobile_web_fixture_corpus(&root.to_string(), bytes as u64, case_id, &range_cases);
+    fs::write(corpus_path, corpus).with_context(|| format!("write {}", corpus_path.display()))?;
+
+    println!("root_cid: {root}");
+    println!("car: {}", car_path.display());
+    println!("corpus: {}", corpus_path.display());
+    println!("blocks: {}", blocks.len());
+    println!("bytes: {bytes}");
+    println!(
+        "case {}: full response bytes={bytes}",
+        derived_fixture_case_id(case_id, "full")
+    );
+    for case in range_cases {
+        println!("case {}: bytes={}-{}", case.id, case.start, case.end);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct FixtureRangeCase {
+    id: String,
+    description: String,
+    start: u64,
+    end: u64,
+}
+
+fn mobile_web_fixture_range_cases(
+    case_id: &str,
+    bytes: u64,
+    range_start: u64,
+    range_len: u64,
+) -> Vec<FixtureRangeCase> {
+    let range_end = range_start + range_len - 1;
+    let max_start = bytes - range_len;
+    let boundary_start = (UNIXFS_CHUNK_SIZE as u64)
+        .saturating_sub(range_len / 2)
+        .min(max_start);
+    let boundary_end = boundary_start + range_len - 1;
+    let suffix_start = bytes - range_len;
+    vec![
+        FixtureRangeCase {
+            id: case_id.to_string(),
+            description:
+                "Configured deep range from a deterministic multi-block DAG-PB UnixFS file."
+                    .to_string(),
+            start: range_start,
+            end: range_end,
+        },
+        FixtureRangeCase {
+            id: derived_fixture_case_id(case_id, "prefix-range"),
+            description: "Prefix byte range from a deterministic multi-block DAG-PB UnixFS file."
+                .to_string(),
+            start: 0,
+            end: range_len - 1,
+        },
+        FixtureRangeCase {
+            id: derived_fixture_case_id(case_id, "boundary-range"),
+            description: "Byte range crossing the first UnixFS chunk boundary.".to_string(),
+            start: boundary_start,
+            end: boundary_end,
+        },
+        FixtureRangeCase {
+            id: derived_fixture_case_id(case_id, "suffix-range"),
+            description: "Suffix byte range from a deterministic multi-block DAG-PB UnixFS file."
+                .to_string(),
+            start: suffix_start,
+            end: bytes - 1,
+        },
+    ]
+}
+
+fn derived_fixture_case_id(case_id: &str, suffix: &str) -> String {
+    if case_id == DEFAULT_MOBILE_WEB_FIXTURE_CASE_ID {
+        format!("multiblock-unixfs-{suffix}")
+    } else {
+        format!("{case_id}-{suffix}")
+    }
+}
+
+fn mobile_web_fixture_corpus(
+    root: &str,
+    bytes: u64,
+    case_id: &str,
+    cases: &[FixtureRangeCase],
+) -> String {
+    let mut corpus = String::from("{\n  \"entries\": [\n");
+    corpus.push_str(&format!(
+        concat!(
+            "    {{\n",
+            "      \"id\": \"{}\",\n",
+            "      \"description\": \"Full deterministic multi-block DAG-PB UnixFS file generated by xtask.\",\n",
+            "      \"path\": \"/ipfs/{}\",\n",
+            "      \"expect_status\": 200,\n",
+            "      \"min_bytes\": {},\n",
+            "      \"max_ttfb_ms\": 5000\n",
+            "    }}"
+        ),
+        escape_json(&derived_fixture_case_id(case_id, "full")),
+        root,
+        bytes
+    ));
+    for case in cases {
+        corpus.push_str(",\n");
+        let range_len = case.end - case.start + 1;
+        corpus.push_str(&format!(
+            concat!(
+                "    {{\n",
+                "      \"id\": \"{}\",\n",
+                "      \"description\": \"{}\",\n",
+                "      \"path\": \"/ipfs/{}\",\n",
+                "      \"range\": \"bytes={}-{}\",\n",
+                "      \"expect_status\": 206,\n",
+                "      \"expect_content_range_prefix\": \"bytes {}-{}/{}\",\n",
+                "      \"min_bytes\": {},\n",
+                "      \"max_ttfb_ms\": 5000\n",
+                "    }}"
+            ),
+            escape_json(&case.id),
+            escape_json(&case.description),
+            root,
+            case.start,
+            case.end,
+            case.start,
+            case.end,
+            bytes,
+            range_len
+        ));
+    }
+    corpus.push_str("\n  ]\n}\n");
+    corpus
+}
+
+fn deterministic_fixture_payload(bytes: usize) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(bytes);
+    while payload.len() < bytes {
+        payload.extend_from_slice(MOBILE_FIXTURE_PATTERN);
+    }
+    payload.truncate(bytes);
+    payload
+}
+
+fn write_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn escape_json(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 const IOS_DEVICE_EVIDENCE_HEADER: [&str; 25] = [
@@ -623,6 +915,8 @@ fn verify_exported_symbols(library: &Path) -> Result<()> {
         "freedom_ipfs_node_routing_stats",
         "freedom_ipfs_node_active_preload_count",
         "freedom_ipfs_node_diagnostics",
+        "freedom_ipfs_node_progress_snapshot_json",
+        "freedom_ipfs_node_clear_progress",
     ] {
         if !stdout.contains(symbol) {
             bail!("{} does not export {symbol}", library.display());
@@ -750,6 +1044,9 @@ enum FreedomIpfsSmoke {{
         guard let url = reader.localGatewayURL(for: "/ipfs/{fixture_cid}") else {{
             fatalError("fixture gateway URL missing")
         }}
+        guard reader.clearProgress() else {{
+            fatalError("clear progress failed")
+        }}
         let beforeDiagnostics = reader.diagnostics
         let (data, response) = try await URLSession.shared.data(from: url)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else {{
@@ -757,6 +1054,20 @@ enum FreedomIpfsSmoke {{
         }}
         guard data == Data([{fixture_body}]) else {{
             fatalError("fixture body mismatch")
+        }}
+        let progressJSON = reader.progressSnapshotJSON
+        guard let progressData = progressJSON.data(using: .utf8),
+              let progressObject = try JSONSerialization.jsonObject(with: progressData) as? [String: Any],
+              let progressEvents = progressObject["events"] as? [[String: Any]],
+              progressEvents.contains(where: {{ event in
+                  event["kind"] as? String == "gateway_request"
+                      && event["path"] as? String == "/ipfs/{fixture_cid}"
+                      && event["phase"] as? String == "completed"
+              }}) else {{
+            fatalError("progress snapshot missing completed fixture request: \(progressJSON)")
+        }}
+        guard reader.clearProgress() else {{
+            fatalError("clear progress after request failed")
         }}
         let retrievalStats = reader.retrievalStats
         guard retrievalStats.cacheHits > 0,
@@ -1204,6 +1515,46 @@ fn format_swift_byte_array(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freedom_ipfs_core::parse_car_v1;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn generates_multiblock_mobile_web_fixture() {
+        let stamp = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(format!("freedom-ipfs-xtask-fixture-{stamp}"));
+        let car = dir.join("fixture.car");
+        let corpus = dir.join("corpus.json");
+
+        generate_mobile_web_fixture(&car, &corpus, 600_000, 262_100, 300, "fixture-case").unwrap();
+
+        let parsed = parse_car_v1(&fs::read(&car).unwrap()).unwrap();
+        assert_eq!(parsed.blocks.len(), 4);
+        assert_eq!(parsed.blocks[0].cid.codec(), CODEC_DAG_PB);
+        assert_eq!(parsed.blocks[1].cid.codec(), CODEC_RAW);
+
+        let corpus = fs::read_to_string(&corpus).unwrap();
+        assert!(corpus.contains("fixture-case"));
+        assert!(corpus.contains("fixture-case-full"));
+        assert!(corpus.contains("fixture-case-prefix-range"));
+        assert!(corpus.contains("fixture-case-boundary-range"));
+        assert!(corpus.contains("fixture-case-suffix-range"));
+        assert!(corpus.contains(&format!("/ipfs/{}", parsed.blocks[0].cid)));
+        assert!(corpus.contains("\"expect_status\": 200"));
+        assert!(corpus.contains("\"min_bytes\": 600000"));
+        assert!(corpus.contains("bytes=262100-262399"));
+        assert!(corpus.contains("bytes=0-299"));
+        assert!(corpus.contains("bytes=261994-262293"));
+        assert!(corpus.contains("bytes=599700-599999"));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn parses_quoted_csv_fields() {
