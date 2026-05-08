@@ -200,6 +200,8 @@ const BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_MIN_PROVIDERS_ENV: &str 
 const BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_MIN_PROVIDERS: usize = 32;
 const ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_PEER_ROTATION_ENV: &str =
     "FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_PEER_ROTATION";
+const ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_IP4_FIRST_ADDRS_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_IP4_FIRST_ADDRS";
 const ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP_ENV: &str =
     "FREEDOM_IPFS_ENABLE_BITSWAP_EARLY_PROVIDER_PEER_CAP";
 const BITSWAP_SESSION_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -3917,6 +3919,12 @@ impl HttpRetriever {
         );
         let zero_http_subresource_peer_rotation =
             maybe_rotate_zero_http_subresource_peers(providers, context.as_ref(), cid, &mut peers);
+        let zero_http_subresource_ip4_first_addr_reordered =
+            maybe_sort_zero_http_subresource_ip4_first_addrs(
+                providers,
+                context.as_ref(),
+                &mut peers,
+            );
         let gateway_context = GatewayBitswapSourceContext {
             gateway_request: context.is_some(),
             gateway_subresource: context
@@ -3960,6 +3968,7 @@ impl HttpRetriever {
             zero_http_subresource_peer_rotation = zero_http_subresource_peer_rotation
                 .map(|offset| offset as i64)
                 .unwrap_or(-1),
+            zero_http_subresource_ip4_first_addr_reordered,
             trusted_direct_want_block_limit = bitswap_trusted_direct_want_block_peers()
                 .map(|limit| limit as i64)
                 .unwrap_or(-1),
@@ -6217,6 +6226,10 @@ fn bitswap_zero_http_subresource_peer_rotation_enabled() -> bool {
     std::env::var_os(ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_PEER_ROTATION_ENV).is_some()
 }
 
+fn bitswap_zero_http_subresource_ip4_first_addrs_enabled() -> bool {
+    std::env::var_os(ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_IP4_FIRST_ADDRS_ENV).is_some()
+}
+
 fn maybe_rotate_zero_http_subresource_peers(
     providers: &[Provider],
     context: Option<&RetrievalRequestContext>,
@@ -6273,6 +6286,58 @@ fn rotate_untrusted_bitswap_peer_suffix(peers: &mut [BitswapPeer], offset: usize
     let offset = offset % len;
     peers[start..].rotate_left(offset);
     Some(offset)
+}
+
+fn maybe_sort_zero_http_subresource_ip4_first_addrs(
+    providers: &[Provider],
+    context: Option<&RetrievalRequestContext>,
+    peers: &mut [BitswapPeer],
+) -> usize {
+    maybe_sort_zero_http_subresource_ip4_first_addrs_with_enabled(
+        bitswap_zero_http_subresource_ip4_first_addrs_enabled(),
+        providers,
+        context,
+        peers,
+    )
+}
+
+fn maybe_sort_zero_http_subresource_ip4_first_addrs_with_enabled(
+    enabled: bool,
+    providers: &[Provider],
+    context: Option<&RetrievalRequestContext>,
+    peers: &mut [BitswapPeer],
+) -> usize {
+    if !enabled
+        || provider_http_url_count(providers) != 0
+        || !context.is_some_and(RetrievalRequestContext::gateway_subresource)
+    {
+        return 0;
+    }
+
+    let mut reordered = 0usize;
+    for peer in peers.iter_mut().filter(|peer| !peer.skip_want_have) {
+        let before = peer.addrs.clone();
+        peer.addrs.sort_by_key(|addr| {
+            (
+                bitswap_addr_score(addr),
+                bitswap_addr_ip4_first_family_rank(addr),
+            )
+        });
+        if peer.addrs != before {
+            reordered += 1;
+        }
+    }
+    reordered
+}
+
+fn bitswap_addr_ip4_first_family_rank(addr: &Multiaddr) -> u8 {
+    match bitswap_addr_family_label(addr) {
+        "ip4" => 0,
+        "mixed_ip" => 1,
+        "ip6" => 2,
+        "dns" => 3,
+        _ => 4,
+    }
 }
 
 fn bitswap_high_provider_zero_http_direct_want_block_min_providers() -> Option<usize> {
@@ -14298,6 +14363,105 @@ mod bitswap_tests {
             stable_zero_http_subresource_peer_rotation_offset(&cid, Some("/ipns/ipfs.tech/"), 0),
             0
         );
+    }
+
+    #[test]
+    fn zero_http_subresource_ip4_first_addr_sort_is_scoped() {
+        let provider = Provider {
+            id: None,
+            addrs: Vec::new(),
+            http_urls: Vec::new(),
+        };
+        let http_provider = Provider {
+            id: None,
+            addrs: Vec::new(),
+            http_urls: vec![Url::parse("https://provider.example/").unwrap()],
+        };
+        let subresource = RetrievalRequestContext::gateway_request(Some(7));
+        let top_level = RetrievalRequestContext::gateway_request(None);
+        let peer = parse_peer_id("12D3KooWAtxJkDLacJdK7yZkk2iPp8iMdSVh1bDHzmJ3t8oKUkqA").unwrap();
+        let trusted =
+            parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+
+        let make_peers = || {
+            vec![
+                BitswapPeer {
+                    id: trusted,
+                    addrs: vec![
+                        "/ip6/2001:db8::1/tcp/4001".parse().unwrap(),
+                        "/ip4/192.0.2.1/tcp/4001".parse().unwrap(),
+                    ],
+                    skip_want_have: true,
+                    force_want_block: false,
+                    force_want_have: false,
+                },
+                BitswapPeer {
+                    id: peer,
+                    addrs: vec![
+                        "/ip6/2001:db8::2/tcp/4001".parse().unwrap(),
+                        "/ip4/192.0.2.2/tcp/4001".parse().unwrap(),
+                    ],
+                    skip_want_have: false,
+                    force_want_block: false,
+                    force_want_have: false,
+                },
+            ]
+        };
+
+        let mut disabled = make_peers();
+        assert_eq!(
+            maybe_sort_zero_http_subresource_ip4_first_addrs_with_enabled(
+                false,
+                std::slice::from_ref(&provider),
+                Some(&subresource),
+                &mut disabled,
+            ),
+            0
+        );
+        assert_eq!(
+            disabled[1].addrs[0].to_string(),
+            "/ip6/2001:db8::2/tcp/4001"
+        );
+
+        let mut top_level_peers = make_peers();
+        assert_eq!(
+            maybe_sort_zero_http_subresource_ip4_first_addrs_with_enabled(
+                true,
+                std::slice::from_ref(&provider),
+                Some(&top_level),
+                &mut top_level_peers,
+            ),
+            0
+        );
+
+        let mut http_peers = make_peers();
+        assert_eq!(
+            maybe_sort_zero_http_subresource_ip4_first_addrs_with_enabled(
+                true,
+                std::slice::from_ref(&http_provider),
+                Some(&subresource),
+                &mut http_peers,
+            ),
+            0
+        );
+
+        let mut enabled = make_peers();
+        assert_eq!(
+            maybe_sort_zero_http_subresource_ip4_first_addrs_with_enabled(
+                true,
+                std::slice::from_ref(&provider),
+                Some(&subresource),
+                &mut enabled,
+            ),
+            1
+        );
+        assert_eq!(
+            enabled[0].addrs[0].to_string(),
+            "/ip6/2001:db8::1/tcp/4001",
+            "trusted/session peers keep their learned address order"
+        );
+        assert_eq!(enabled[1].addrs[0].to_string(), "/ip4/192.0.2.2/tcp/4001");
+        assert_eq!(enabled[1].addrs[1].to_string(), "/ip6/2001:db8::2/tcp/4001");
     }
 
     #[test]

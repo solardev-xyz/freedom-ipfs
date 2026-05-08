@@ -46520,3 +46520,210 @@ would need a same-window guardrail where:
 - assets improve without root regression;
 - RSS, FDs, Bitswap attempts, expanded provider addrs, and connections stay
   near current mobile-friendly levels.
+
+## 2026-05-08: Keep Lab Control - Zero-HTTP Subresource IPv4-First Address Ordering
+
+Branch/head before patch: `codex/kubo-session-performance-20260506` at
+`6d80f8f`.
+
+Purpose:
+
+The fresh same-window guardrail reopened a path-local `ipfs.tech` asset tail,
+but not as a broad direct-`WANT_BLOCK` or global `WANT_HAVE` problem. The worst
+asset row was `/ipns/ipfs.tech/_nuxt/BfUTpfA9.js` at `1121ms`. Its delegated
+lookup had `12` providers and `0` HTTP providers; provider expansion produced
+`7` Bitswap peers and no session peers. The winning source was an untrusted
+direct `WANT_BLOCK` peer at candidate index `2`, but the dial plan scheduled
+that peer's IPv6/TCP address while suppressing its IPv4/TCP alternate because
+the per-command dial-address cap had already been spent.
+
+This patch adds a narrower address-level lab switch than the previously rejected
+global IPv4-first ordering and broad dial-cap experiments.
+
+Code shape:
+
+- disabled by default;
+- enable with
+  `FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_IP4_FIRST_ADDRS=1`;
+- applies only when all of these are true:
+  - gateway request is a subresource;
+  - provider lookup returned zero HTTP provider URLs;
+  - peer is an untrusted provider peer, not a trusted/session peer;
+- sorts each matching peer's existing address list by existing
+  `bitswap_addr_score` plus an IPv4-before-IPv6 tie-breaker;
+- does not add peers, raise connection limits, raise the dial-address cap, or
+  reorder trusted/session peer addresses;
+- adds trace field
+  `zero_http_subresource_ip4_first_addr_reordered` to `bitswap_peer_expand`.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval zero_http_subresource_ip4_first_addr_sort_is_scoped --lib -- --nocapture
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting passed after applying `cargo fmt --all`.
+- Focused retrieval test passed.
+- Retrieval all-target check passed.
+- Retrieval all-target clippy passed with `-D warnings`.
+- Diff whitespace check passed.
+
+Fresh no-env selected guardrail before the patch:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-focused-guardrail-r5-6d80f8f-20260508T054800Z-trace.jsonl \
+  --comparison-output /tmp/current-focused-guardrail-r5-6d80f8f-20260508T054800Z.json
+```
+
+Baseline result:
+
+- Rust/Kubo passed `5/5` for all cases.
+- DAICO root: Rust `299/404ms`; Kubo `2232/4044ms`.
+- Vitalik range root: Rust `100/137ms`; Kubo `1506/1594ms`.
+- `ipfs.tech` root: Rust `773/1309ms`; Kubo `816/1529ms`.
+- `ipfs.tech` assets: Rust `51/221ms`; Kubo `341/559ms`.
+- Wikipedia root: Rust `434/459ms`; Kubo `281/729ms`.
+- Meaningful aggregate Kubo wins: `2`, both Wikipedia root p50 TTFB/total.
+- Resource max: Rust `52648KiB` RSS and `36` FDs vs Kubo `278964KiB`
+  RSS and `302` FDs.
+- Path-local `ipfs.tech` Kubo wins included `_nuxt/BfUTpfA9.js` p95,
+  Rust `1123ms` vs Kubo `389ms`.
+- The slow `BfUTpfA9.js` trace showed candidate index `2`, request mode
+  `want_block`, source family `ip6`, and the source peer's IPv4/TCP alternate
+  was present in `suppressed_dials`.
+
+Selected guardrail with the new flag:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_IP4_FIRST_ADDRS=1 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --case wikipedia-on-ipfs-root \
+    --case daicowtf-page-assets \
+    --case vitalik-root-html-range \
+    --repeat 5 \
+    --asset-concurrency 1 \
+    --timeout-secs 120 \
+    --run-timeout-secs 300 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/zero-http-subresource-ip4-first-guardrail-r5-6d80f8f-20260508T055352Z-trace.jsonl \
+    --comparison-output /tmp/zero-http-subresource-ip4-first-guardrail-r5-6d80f8f-20260508T055352Z.json
+```
+
+Guardrail result:
+
+- Rust/Kubo passed `5/5` for all cases.
+- DAICO root: Rust `320/387ms`; Kubo `2278/2452ms`.
+- Vitalik range root: Rust `106/128ms`; Kubo `2128/3766ms`.
+- `ipfs.tech` root: Rust `802/992ms`; Kubo `855/1004ms`.
+- `ipfs.tech` assets: Rust `48/102ms`; Kubo `359/469ms`.
+- Wikipedia root: Rust `442/480ms`; Kubo `718/782ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `51816KiB` RSS and `25` FDs vs Kubo `148512KiB`
+  RSS and `226` FDs.
+- The new gate did **not** fire: all `bitswap_peer_expand` events were
+  top-level and `zero_http_subresource_ip4_first_addr_reordered=0`.
+
+Focused `ipfs.tech` c6 opt-in:
+
+```sh
+timeout 1200s env FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_IP4_FIRST_ADDRS=1 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --repeat 5 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 300 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/zero-http-subresource-ip4-first-ipfs-tech-c6-r5-6d80f8f-20260508T055706Z-trace.jsonl \
+    --comparison-output /tmp/zero-http-subresource-ip4-first-ipfs-tech-c6-r5-6d80f8f-20260508T055706Z.json
+```
+
+Opt-in result:
+
+- Rust/Kubo passed `5/5`.
+- Root: Rust `617/640ms`; Kubo `1342/2066ms`.
+- Assets: Rust `104/212ms`; Kubo `112/757ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `57220KiB` RSS and `32` FDs vs Kubo `213472KiB`
+  RSS and `121` FDs.
+- The new gate fired once on `_nuxt/BfUTpfA9.js`:
+  `zero_http_subresource_ip4_first_addr_reordered=3`.
+- That fired row was already fast: `BfUTpfA9.js` Bitswap fetch `40ms`,
+  source candidate index `1`, source family `ip6`, source addr index `1`.
+- Block fetch totals: Bitswap `150` blocks, p50/p90/p95/max
+  `87/157/176/321ms`; HTTP provider `47` blocks, p50/p90/p95/max
+  `93/245/260/378ms`.
+
+Immediate no-env c6 post-control:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-subresource-ip4-first-post-control-ipfs-tech-c6-r5-6d80f8f-20260508T055756Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-subresource-ip4-first-post-control-ipfs-tech-c6-r5-6d80f8f-20260508T055756Z.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `5/5`.
+- Root: Rust `622/639ms`; Kubo `1249/1868ms`.
+- Assets: Rust `108/203ms`; Kubo `115/470ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `58216KiB` RSS and `34` FDs vs Kubo `198384KiB`
+  RSS and `119` FDs.
+- The new gate was disabled and did not fire.
+- The comparable `BfUTpfA9.js` row was also already fast in control:
+  Bitswap fetch `21ms`, source candidate index `0`, source family `ip6`.
+- Block fetch totals: Bitswap `141` blocks, p50/p90/p95/max
+  `99/169/213/330ms`; HTTP provider `57` blocks, p50/p90/p95/max
+  `81/203/249/267ms`.
+
+Decision:
+
+Keep the flag as a disabled lab control, but do **not** promote it. The c6
+opt-in did exercise the gate and remained mobile-light, but the immediate
+control was equally aggregate-clean and slightly better on asset p95. The fired
+row was already fast in both runs, so this does not prove that IPv4-first
+address ordering closes the slow subresource tail.
+
+Next lead:
+
+Only revisit address-family ordering when a fresh trace reproduces the specific
+slow shape: a zero-HTTP gateway subresource, no useful session peer, source peer
+with a slow scheduled IPv6/TCP address, and a suppressed IPv4/TCP alternate for
+that same peer. Do not generalize this into global IPv4-first ordering or a
+broad dial-address-cap increase; both families already have rejected evidence.
