@@ -42638,3 +42638,152 @@ tails and one Rust `504`, while the threshold `1` run clipped the same class to
 Keep the existing connection-ready timeout default. The trace points at
 connection-error suppression and retry/escalation timing for sparse zero-HTTP
 Bitswap subresources, not at a globally-too-long connection-ready timeout.
+
+## 2026-05-08: Global Backoff Threshold Guardrail Is Not Promotion Evidence
+
+Branch/head: `codex/kubo-session-performance-20260506` at `6ba96a0`.
+
+Purpose:
+
+The focused `ipfs.tech` bad-window run above showed a clear signal for
+`FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD=1`: it clipped a
+sparse zero-HTTP subresource tail from multi-second latency to about `513ms`.
+This guardrail checked whether the broad global threshold looked safe enough
+across the current three-case mobile benchmark set before writing a narrower
+default policy.
+
+Global threshold `1` multi-case guardrail:
+
+```sh
+timeout 1200s env FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/connerr-backoff1-guardrail-r5-20260508T011312Z-trace.jsonl \
+  --comparison-output /tmp/connerr-backoff1-guardrail-r5-20260508T011312Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/p90/p95/max `40/42/42/42`, data p50/max
+  `1236210/1236478`, duplicate blocks p50/p90/p95/max `0/2/2/2`,
+  messages p50/p90/max `216/426/426`, peers p50/p90/max `24/30/30`.
+- DAICO root: Rust `653/1132ms`; Kubo `2663/7236ms`.
+- Vitalik range: Rust `108/253ms`; Kubo `840/1246ms`.
+- `ipfs.tech` root: Rust `925/2685ms`; Kubo `1008/1125ms`.
+- `ipfs.tech` assets: Rust `114/279ms`; Kubo `402/804ms`.
+- `meaningful_kubo_wins`: `2`, both `ipfs.tech` root p95 TTFB/total
+  by `1560ms` (`2.39x`).
+- Resource max: Rust `60432KiB` RSS and `33` FDs vs Kubo `179164KiB` RSS
+  and `215` FDs.
+
+Rust trace:
+
+- HTTP-provider blocks: `97`, p50/p90/p95/max `88/342/463/939ms`.
+- Bitswap blocks: `125`, p50/p90/p95/max `105/175/225/1867ms`.
+- Delegated provider lookup: events `191`, successes `191`, failures `0`,
+  p50/p90/p95/max `21/45/50/1599ms`, with `self_hedges=2` and
+  `self_hedge_timeout_max=750ms`.
+- Delegated provider distribution: zero `8`, single `103`, multi `80`.
+- Request classifications: `zero_http_provider_bitswap=8`,
+  `cold_bitswap_peer_expand=5`, `top_level_zero_http_provider_bitswap=5`,
+  `top_level_zero_http_provider_cold_bitswap=5`,
+  `zero_http_provider_cold_bitswap=5`.
+- Classified zero-HTTP provider latency: p50/p90/p95/max
+  `405/2680/2680/2680ms`, statuses `200=8`.
+- Bitswap connection errors: `1`, class `no_route_to_host=1`.
+- Bitswap connection backoff fired once, with `skipped=0`.
+
+Interpretation:
+
+The threshold `1` guardrail won the tracked asset aggregates decisively, but
+it did not exercise the same bad subresource connection-error shape from the
+focused run. Only one connection backoff fired. The meaningful Kubo wins moved
+to `ipfs.tech` root p95, where the slowest trace was dominated by a slow
+delegated provider lookup/self-hedge path, not by repeated Bitswap connection
+errors. This is not promotion evidence for a global threshold change.
+
+Immediate no-env multi-case post-control:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/connerr-backoff1-post-control-guardrail-r5-20260508T011433Z-trace.jsonl \
+  --comparison-output /tmp/connerr-backoff1-post-control-guardrail-r5-20260508T011433Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/p90/p95/max `40/45/45/45`, data p50/max
+  `1236210/1237280`, duplicate blocks p50/p90/p95/max `0/5/5/5`,
+  messages p50/p90/max `223/380/380`, peers p50/p90/max `19/36/36`.
+- DAICO root: Rust `449/453ms`; Kubo `2600/2863ms`.
+- Vitalik range: Rust `103/126ms`; Kubo `798/2639ms`.
+- `ipfs.tech` root: Rust `592/765ms`; Kubo `751/817ms`.
+- `ipfs.tech` assets: Rust `111/303ms`; Kubo `364/881ms`.
+- `meaningful_kubo_wins`: none.
+- Resource max: Rust `59084KiB` RSS and `34` FDs vs Kubo `257380KiB` RSS
+  and `156` FDs.
+
+Rust trace:
+
+- HTTP-provider blocks: `118`, p50/p90/p95/max `85/249/308/393ms`.
+- Bitswap blocks: `104`, p50/p90/p95/max `112/191/218/293ms`.
+- Delegated provider lookup: events `200`, successes `200`, failures `0`,
+  p50/p90/p95/max `19/45/48/58ms`, with no self hedges.
+- Delegated provider distribution: zero `5`, single `115`, multi `80`.
+- Request classifications: `cold_bitswap_peer_expand=5`,
+  `top_level_zero_http_provider_bitswap=5`,
+  `top_level_zero_http_provider_cold_bitswap=5`,
+  `zero_http_provider_bitswap=5`, `zero_http_provider_cold_bitswap=5`.
+- Classified zero-HTTP provider latency: p50/p90/p95/max
+  `590/762/762/762ms`, statuses `200=5`.
+- Bitswap connection errors/backoffs: none.
+
+Decision:
+
+Do not promote `FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD=1`
+globally. In the paired guardrail, no-env was better overall: it had no
+meaningful Kubo wins, kept `ipfs.tech` root p95 below Kubo, and preserved the
+same mobile resource advantage. The broad threshold run did not reproduce the
+bad subresource connection-error shape strongly enough to justify changing the
+default.
+
+The useful signal is narrower:
+
+- The focused bad-window run showed that immediate suppression after concrete
+  connection errors can clip sparse zero-HTTP subresource tails.
+- The broad guardrail showed that global threshold `1` is not the right
+  promotion vehicle.
+
+Next useful work:
+
+1. Add request-context diagnostics to Bitswap connection-error/backoff traces so
+   connection errors can be tied to top-level vs subresource requests and
+   zero-HTTP vs HTTP-provider-backed fetches.
+2. Test a scoped policy or lab knob for
+   `gateway_subresource && zero_http_provider` connection-error backoff
+   threshold `1`.
+3. Validate the scoped policy against a fresh `ipfs.tech` bad window plus the
+   same three-case no-env guardrail before promotion.
