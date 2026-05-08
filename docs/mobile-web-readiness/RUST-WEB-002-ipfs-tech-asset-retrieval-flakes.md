@@ -43033,3 +43033,200 @@ Next useful work:
    resource-bounded, rather than a broad hedge for every single-provider block.
 3. Validate against the same `ipfs.tech` same-window r5 harness plus the broader
    DAICO/Vitalik/`ipfs.tech` guardrail before considering promotion.
+
+## 2026-05-08: Budgeted Single-HTTP Hedge Fires, But Does Not Close Gap
+
+Branch/head: `codex/kubo-session-performance-20260506` at `9795e8f`.
+
+Purpose:
+
+The previous page-budgeted single-HTTP Bitswap hedge lab did not exercise after
+the lazy reservation fix because the providers were unscored in that window.
+The latest no-env trace had slow scored single-provider Sia rows, so this reran
+the existing disabled lab with a slightly earlier delay:
+
+- at most `2` single-HTTP Bitswap hedges per top-level page
+- score gate `>=180ms`
+- hedge delay `200ms`
+
+Opt-in command:
+
+```sh
+timeout 1200s env \
+  FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MAX_PER_TOP_LEVEL=2 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS=180 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS=200 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/ipfs-tech-single-http-budget2-hedge200-r5-20260508T013758Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-single-http-budget2-hedge200-r5-20260508T013758Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/p90/p95/max `35/40/40/40`, data max `968432`,
+  duplicate blocks max `5`, messages p50/p90/max `31/100/100`, peers
+  p50/p90/max `6/18/18`.
+- Root: Rust `520/705ms`; Kubo `1273/1906ms`.
+- Assets: Rust `140/484ms`; Kubo `82/438ms`.
+- `meaningful_kubo_wins`: `2`, both asset p50 TTFB/total by `58ms`
+  (`1.71x`).
+- Resource max: Rust `58560KiB` RSS and `32` FDs vs Kubo `169880KiB` RSS
+  and `76` FDs.
+
+Rust trace:
+
+- The lab path did fire this time:
+  `bitswap hedge starts=5`, `result_sources=http_provider=36, bitswap=1`.
+- Skip reasons:
+  `provider_score_below_threshold=45`, `provider_unscored=5`,
+  `budget_non_subresource=2`, `top_level_budget_exhausted=2`.
+- HTTP-provider blocks: `141`, p50/p90/p95/max `188/263/351/646ms`.
+- Bitswap blocks: `59`, p50/p90/p95/max `86/198/256/632ms`.
+- Single-provider Sia winner p50/p90/p95/max `183/238/295/626ms`.
+- FD/RSS stayed low, but the one Bitswap hedge win did not move the aggregate
+  Kubo gap enough.
+
+Immediate no-env post-control:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/ipfs-tech-single-http-budget2-hedge200-post-control-r5-20260508T013758Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-single-http-budget2-hedge200-post-control-r5-20260508T013758Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/p90/p95/max `35/42/42/42`, data max `796724`,
+  duplicate blocks max `7`, messages p50/p90/max `44/217/217`, peers
+  p50/p90/max `13/63/63`.
+- Root: Rust `533/721ms`; Kubo `1339/3559ms`.
+- Assets: Rust `196/457ms`; Kubo `103/419ms`.
+- `meaningful_kubo_wins`: `2`, both asset p50 TTFB/total by `93ms`
+  (`1.90x`).
+- Resource max: Rust `57836KiB` RSS and `34` FDs vs Kubo `272168KiB` RSS
+  and `390` FDs.
+
+Control trace:
+
+- The active shape changed away from single-HTTP Sia as the top tail.
+- Worst path-local row was `_nuxt/BfUTpfA9.js`, a zero-HTTP Bitswap asset:
+  Rust p50/p95 about `895/914ms` vs Kubo `60/228ms`.
+- Zero-HTTP Bitswap classifications: `5`, all for that asset.
+- Bitswap blocks: `5`, p50/p90/p95/max `890/910/910/910ms`.
+- Bitswap connection errors: `5`, all
+  `protocol_negotiation_failed` on the same peer
+  `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT`.
+- The raw trace confirmed those errors carried
+  `gateway_subresource=true` and `zero_http_provider=true`.
+
+Decision:
+
+Keep the page-budgeted single-HTTP Bitswap hedge disabled. It now exercised the
+intended path, stayed resource-bounded, and improved asset median versus the
+immediate no-env control (`140ms` vs `196ms`), but p95 stayed worse than Kubo and
+the control exposed a larger zero-HTTP Bitswap tail. The one Bitswap hedge winner
+is not enough to promote the policy.
+
+## 2026-05-08: Scoped Connection Backoff Fires, But Cannot Save One-Shot Fresh Runs
+
+Branch/head: `codex/kubo-session-performance-20260506` at `9795e8f`.
+
+Purpose:
+
+The immediate no-env control above finally reproduced the exact scoped backoff
+shape:
+
+- gateway subresource
+- zero HTTP providers
+- repeated protocol-negotiation connection errors on the same peer
+
+This reran the scoped backoff lab against that window.
+
+Command:
+
+```sh
+timeout 1200s env FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_CONNECTION_ERROR_BACKOFF=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/scoped-zero-http-backoff-bfut-window-ipfs-tech-r5-20260508T013945Z-trace.jsonl \
+  --comparison-output /tmp/scoped-zero-http-backoff-bfut-window-ipfs-tech-r5-20260508T013945Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/p90/p95/max `35/35/35/35`, duplicate blocks `0`,
+  messages p50/p90/max `31/46/46`, peers p50/p90/max `6/12/12`.
+- Root: Rust `513/593ms`; Kubo `1262/1716ms`.
+- Assets: Rust `189/490ms`; Kubo `74/191ms`.
+- `meaningful_kubo_wins`: `4`, asset p50 and p95 TTFB/total.
+- Resource max: Rust `57952KiB` RSS and `33` FDs vs Kubo `141496KiB` RSS
+  and `66` FDs.
+
+Rust trace:
+
+- The scoped backoff fired exactly as intended:
+  `bitswap_connection_error_backoff` events `5`, threshold `1`, count `1`,
+  `gateway_subresource=true`, `zero_http_provider=true`.
+- Backoff skips were still `0`.
+- Worst row stayed `_nuxt/BfUTpfA9.js`: p50/p95 around `880/902ms` vs Kubo
+  `71/88ms`.
+- Bitswap blocks: `5`, p50/p90/p95/max `876/898/898/898ms`.
+- Bitswap connections established: `10`, p50/p90/p95/max about
+  `531/571/574/574ms`.
+- The bad peer was suppressed after the first failed dial in each fresh gateway
+  process, but each measured run only hit one such failure before succeeding
+  through other TCP peers.
+
+Decision:
+
+Keep the scoped backoff as a disabled lab hook, but do not promote it. It now has
+mechanical proof that the context gate and threshold work, yet it does not
+improve this harness shape because there is no later same-process retry to skip.
+
+New lead:
+
+The remaining zero-HTTP asset tail is earlier than connection-error retry
+policy. For this BfUT window Rust spends about `530-575ms` establishing usable
+TCP Bitswap connections, then the full block/request lands around `830-900ms`.
+Kubo serves the same tiny asset block in roughly `70-230ms` while doing modest
+Bitswap work. The next useful work is peer/address selection and connection
+startup for zero-HTTP subresources:
+
+- avoid known-bad address families or protocol-negotiating addresses before
+  first dial, not only after the first failed dial;
+- inspect whether useful QUIC/WebTransport/WSS addresses are being rejected or
+  sorted behind slow TCP paths;
+- compare the provider multiaddrs for `_nuxt/BfUTpfA9.js` against Kubo's faster
+  provider choice;
+- add trace fields for selected candidate multiaddr/transport ordering if the
+  current trace is not enough to explain the 500ms connection setup tax.
