@@ -43409,3 +43409,88 @@ Continue with finer peer/address selection instead of broad fanout:
   preserve RSS/FD bounds;
 - study whether Kubo avoids the slow IPv6/TCP or slow protocol-negotiation
   addresses earlier than we do.
+
+## 2026-05-08: Keep Diagnostic - Bitswap Source Address And Dial Plan Details
+
+Branch/head: `codex/kubo-session-performance-20260506` at `c153152` before the
+diagnostic patch.
+
+Purpose:
+
+The global dial-cap probes above showed that raw fanout is not a clean promotion
+path. The next useful distinction is whether a run wins because Rust chose a
+better peer, a better alternate address for the same peer, or just happened to
+race more addresses. This patch adds diagnostics only:
+
+- successful Bitswap fetch/session traces now include
+  `source_peer_addr_index`, `source_peer_addr_known`,
+  `source_peer_addr_matches_candidate`, `source_peer_addr_transport`, and
+  `source_peer_addr_family`;
+- `bitswap_dial_plan` traces now include compact `scheduled_dials` and
+  `suppressed_dials` summaries with peer index, address index, peer id,
+  transport, family, and multiaddr;
+- the mobile web harness summary now prints global Bitswap source address index,
+  family, and match-status counts.
+
+No retrieval behavior or default knobs changed.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo check -p mobile-web-harness --all-targets
+cargo test -p freedom-ipfs-retrieval bitswap_source_peer -- --nocapture
+cargo test -p freedom-ipfs-retrieval interleaves_bitswap_dials_by_address_rank -- --nocapture
+cargo test -p freedom-ipfs-retrieval caps_bitswap_dial_addresses_per_command -- --nocapture
+cargo test -p freedom-ipfs-retrieval wider_bitswap_dial_address_limit_keeps_interleaved_order -- --nocapture
+cargo test -p mobile-web-harness trace_summary_includes_slowest_events_with_details -- --nocapture
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+All passed.
+
+Live smoke:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 1 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/source-addr-diagnostics-ipfs-tech-r1-20260508Tdiag-trace.jsonl \
+  --comparison-output /tmp/source-addr-diagnostics-ipfs-tech-r1-20260508Tdiag.json
+```
+
+Result:
+
+- Rust/Kubo passed `1/1`.
+- Root: Rust `1414/1414ms`; Kubo `1675/1675ms`.
+- Assets: Rust `100/682ms`; Kubo `91/174ms`.
+- Resource max: Rust `58648KiB` RSS and `30` FDs vs Kubo `178136KiB` RSS
+  and `102` FDs.
+
+Diagnostic proof:
+
+- Harness printed:
+  `bitswap source addr indexes: 0=1`,
+  `bitswap source addr families: ip4=1`,
+  `bitswap source addr matches: matched=1`.
+- Raw trace line for the BfUT Bitswap fetch included
+  `source_peer_addr_index=0`, `source_peer_addr_family=ip4`, and
+  `source_peer_addr_matches_candidate=true`.
+- Raw `bitswap_dial_plan` showed the first scheduled BfUT dial was the winning
+  peer's IPv4 TCP address, while alternate IPv6/TCP, QUIC, and other peers were
+  visible in `suppressed_dials`.
+
+Decision:
+
+Keep this diagnostic. It is low risk, tested, and gives future experiments the
+missing evidence needed to decide between peer ordering, address-family ordering,
+and scoped fanout changes.

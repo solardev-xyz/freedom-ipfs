@@ -2888,6 +2888,24 @@ fn print_trace_bitswap_sources(trace: &TraceSummary) {
             format_trace_counts(&trace.bitswap_source_candidate_indexes)
         );
     }
+    if !trace.bitswap_source_addr_indexes.is_empty() {
+        println!(
+            "  bitswap source addr indexes: {}",
+            format_trace_counts(&trace.bitswap_source_addr_indexes)
+        );
+    }
+    if !trace.bitswap_source_addr_families.is_empty() {
+        println!(
+            "  bitswap source addr families: {}",
+            format_trace_counts(&trace.bitswap_source_addr_families)
+        );
+    }
+    if !trace.bitswap_source_addr_match_statuses.is_empty() {
+        println!(
+            "  bitswap source addr matches: {}",
+            format_trace_counts(&trace.bitswap_source_addr_match_statuses)
+        );
+    }
     if !trace.bitswap_deliveries.is_empty() {
         println!(
             "  bitswap deliveries: {}",
@@ -6295,6 +6313,9 @@ struct TraceSummary {
     bitswap_source_transports: Vec<TraceValueCount>,
     bitswap_source_request_modes: Vec<TraceValueCount>,
     bitswap_source_candidate_indexes: Vec<TraceValueCount>,
+    bitswap_source_addr_indexes: Vec<TraceValueCount>,
+    bitswap_source_addr_families: Vec<TraceValueCount>,
+    bitswap_source_addr_match_statuses: Vec<TraceValueCount>,
     bitswap_deliveries: Vec<TraceValueCount>,
     bitswap_batches: TraceBitswapBatchAggregate,
     bitswap_extra_blocks: TraceBitswapExtraBlockAggregate,
@@ -8828,6 +8849,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_source_transports = BTreeMap::<String, usize>::new();
     let mut bitswap_source_request_modes = BTreeMap::<String, usize>::new();
     let mut bitswap_source_candidate_indexes = BTreeMap::<String, usize>::new();
+    let mut bitswap_source_addr_indexes = BTreeMap::<String, usize>::new();
+    let mut bitswap_source_addr_families = BTreeMap::<String, usize>::new();
+    let mut bitswap_source_addr_match_statuses = BTreeMap::<String, usize>::new();
     let mut bitswap_attempt_modes = BTreeMap::<(String, String), String>::new();
     let mut bitswap_deliveries = BTreeMap::<String, usize>::new();
     let mut bitswap_batches = TraceBitswapBatchAggregate::default();
@@ -9895,6 +9919,34 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                     *bitswap_source_candidate_indexes.entry(index).or_default() += 1;
                 }
             }
+            if let Some(index) = json_detail_string(value.get("source_peer_addr_index")) {
+                if index != "-1" {
+                    *bitswap_source_addr_indexes.entry(index).or_default() += 1;
+                }
+            }
+            if let Some(family) = json_detail_string(value.get("source_peer_addr_family")) {
+                if !family.is_empty() && family != "unknown" {
+                    *bitswap_source_addr_families.entry(family).or_default() += 1;
+                }
+            }
+            let addr_match_status = match (
+                value
+                    .get("source_peer_addr_known")
+                    .and_then(|value| value.as_bool()),
+                value
+                    .get("source_peer_addr_matches_candidate")
+                    .and_then(|value| value.as_bool()),
+            ) {
+                (Some(true), Some(true)) => Some("matched"),
+                (Some(true), Some(false)) => Some("unmatched"),
+                (Some(false), _) => Some("unknown"),
+                _ => None,
+            };
+            if let Some(status) = addr_match_status {
+                *bitswap_source_addr_match_statuses
+                    .entry(status.to_string())
+                    .or_default() += 1;
+            }
         }
         if successful_bitswap_delivery {
             if let (Some(cid), Some(peer)) = (
@@ -10198,6 +10250,9 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
         bitswap_source_transports: sorted_trace_counts(bitswap_source_transports),
         bitswap_source_request_modes: sorted_trace_counts(bitswap_source_request_modes),
         bitswap_source_candidate_indexes: sorted_trace_counts(bitswap_source_candidate_indexes),
+        bitswap_source_addr_indexes: sorted_trace_counts(bitswap_source_addr_indexes),
+        bitswap_source_addr_families: sorted_trace_counts(bitswap_source_addr_families),
+        bitswap_source_addr_match_statuses: sorted_trace_counts(bitswap_source_addr_match_statuses),
         bitswap_deliveries: sorted_trace_counts(bitswap_deliveries),
         bitswap_batches,
         bitswap_extra_blocks,
@@ -12059,7 +12114,7 @@ mod tests {
             &path,
             concat!(
                 "{\"phase\":\"request_start\",\"request_id\":9,\"path\":\"/ipns/site/asset.js\",\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9,\"progress_request_id\":77,\"parent_request_id\":1,\"top_level_path\":\"/ipns/site/\"}}\n",
-                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":\"25\",\"cid\":\"cid1\",\"ok\":true,\"bytes\":100,\"extra_blocks\":2,\"source\":\"bitswap\",\"source_peer\":\"peer1\",\"source_transport\":\"tcp\",\"bitswap_delivery\":\"incoming\",\"source_peer_trusted\":true,\"source_peer_candidate_index\":4,\"trusted_peer_count\":1,\"provider_peer_count\":2,\"session_peer_count\":0,\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9,\"progress_request_id\":77,\"parent_request_id\":1,\"top_level_path\":\"/ipns/site/\"}}\n",
+                "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":\"25\",\"cid\":\"cid1\",\"ok\":true,\"bytes\":100,\"extra_blocks\":2,\"source\":\"bitswap\",\"source_peer\":\"peer1\",\"source_transport\":\"tcp\",\"bitswap_delivery\":\"incoming\",\"source_peer_trusted\":true,\"source_peer_candidate_index\":4,\"source_peer_addr_index\":1,\"source_peer_addr_family\":\"ip4\",\"source_peer_addr_known\":true,\"source_peer_addr_matches_candidate\":true,\"trusted_peer_count\":1,\"provider_peer_count\":2,\"session_peer_count\":0,\"span\":{\"path\":\"/ipns/site/asset.js\",\"request_id\":9,\"progress_request_id\":77,\"parent_request_id\":1,\"top_level_path\":\"/ipns/site/\"}}\n",
                 "{\"phase\":\"request_done\",\"request_id\":9,\"path\":\"/ipns/site/asset.js\",\"status\":200,\"elapsed_ms\":1}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":5,\"cid\":\"cid1\",\"source\":\"bitswap\"}\n",
                 "{\"phase\":\"block_fetch_total\",\"elapsed_ms\":4,\"cid\":\"cid5\",\"source\":\"cache\"}\n",
@@ -12233,6 +12288,18 @@ mod tests {
         assert_eq!(summary.bitswap_source_candidate_indexes.len(), 1);
         assert_eq!(summary.bitswap_source_candidate_indexes[0].value, "4");
         assert_eq!(summary.bitswap_source_candidate_indexes[0].count, 1);
+        assert_eq!(summary.bitswap_source_addr_indexes.len(), 1);
+        assert_eq!(summary.bitswap_source_addr_indexes[0].value, "1");
+        assert_eq!(summary.bitswap_source_addr_indexes[0].count, 1);
+        assert_eq!(summary.bitswap_source_addr_families.len(), 1);
+        assert_eq!(summary.bitswap_source_addr_families[0].value, "ip4");
+        assert_eq!(summary.bitswap_source_addr_families[0].count, 1);
+        assert_eq!(summary.bitswap_source_addr_match_statuses.len(), 1);
+        assert_eq!(
+            summary.bitswap_source_addr_match_statuses[0].value,
+            "matched"
+        );
+        assert_eq!(summary.bitswap_source_addr_match_statuses[0].count, 1);
         assert_eq!(summary.bitswap_deliveries.len(), 2);
         assert_eq!(summary.bitswap_deliveries[0].value, "incoming");
         assert_eq!(summary.bitswap_deliveries[0].count, 1);

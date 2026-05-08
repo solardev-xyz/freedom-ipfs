@@ -3986,7 +3986,7 @@ impl HttpRetriever {
         let source_peer = result.source_peer;
         let source_addr = result.source_addr.clone();
         let source_trace = self
-            .bitswap_source_peer_trace(source_peer, &peers_for_record)
+            .bitswap_source_peer_trace(source_peer, source_addr.as_ref(), &peers_for_record)
             .await;
         tracing::info!(
             phase = "bitswap_fetch",
@@ -4008,6 +4008,14 @@ impl HttpRetriever {
                 .candidate_index
                 .map(|index| index as i64)
                 .unwrap_or(-1),
+            source_peer_addr_index = source_trace
+                .source_addr_index
+                .map(|index| index as i64)
+                .unwrap_or(-1),
+            source_peer_addr_known = source_trace.source_addr_known,
+            source_peer_addr_matches_candidate = source_trace.source_addr_matches_candidate,
+            source_peer_addr_transport = source_trace.source_addr_transport,
+            source_peer_addr_family = source_trace.source_addr_family,
             source_peer_request_mode = source_trace.request_mode,
             source_peer_force_want_block = source_trace.force_want_block,
             source_peer_force_want_have = source_trace.force_want_have,
@@ -4363,9 +4371,10 @@ impl HttpRetriever {
     async fn bitswap_source_peer_trace(
         &self,
         source_peer: Option<PeerId>,
+        source_addr: Option<&Multiaddr>,
         peers: &[BitswapPeer],
     ) -> BitswapSourcePeerTrace {
-        let mut trace = bitswap_source_peer_trace_from_peers(source_peer, peers);
+        let mut trace = bitswap_source_peer_trace_from_peers(source_peer, source_addr, peers);
         if let Some(peer) = source_peer {
             let successes = self.successful_bitswap_peers.lock().await;
             if let Some(success) = successes.get(&peer) {
@@ -4616,7 +4625,7 @@ impl HttpRetriever {
         let elapsed = started.elapsed();
         let source_addr = result.source_addr.clone();
         let source_trace = self
-            .bitswap_source_peer_trace(result.source_peer, &peers_for_record)
+            .bitswap_source_peer_trace(result.source_peer, source_addr.as_ref(), &peers_for_record)
             .await;
         tracing::info!(
             phase = "bitswap_session_shortcut",
@@ -4636,6 +4645,14 @@ impl HttpRetriever {
                 .candidate_index
                 .map(|index| index as i64)
                 .unwrap_or(-1),
+            source_peer_addr_index = source_trace
+                .source_addr_index
+                .map(|index| index as i64)
+                .unwrap_or(-1),
+            source_peer_addr_known = source_trace.source_addr_known,
+            source_peer_addr_matches_candidate = source_trace.source_addr_matches_candidate,
+            source_peer_addr_transport = source_trace.source_addr_transport,
+            source_peer_addr_family = source_trace.source_addr_family,
             source_peer_request_mode = source_trace.request_mode,
             source_peer_force_want_block = source_trace.force_want_block,
             source_peer_force_want_have = source_trace.force_want_have,
@@ -4778,7 +4795,7 @@ impl HttpRetriever {
         let elapsed = started.elapsed();
         let source_addr = result.source_addr.clone();
         let source_trace = self
-            .bitswap_source_peer_trace(result.source_peer, &peers_for_record)
+            .bitswap_source_peer_trace(result.source_peer, source_addr.as_ref(), &peers_for_record)
             .await;
         if let Some(peer) = result.source_peer {
             self.record_successful_bitswap_peer_from_fetch_source(
@@ -4814,6 +4831,14 @@ impl HttpRetriever {
                 .candidate_index
                 .map(|index| index as i64)
                 .unwrap_or(-1),
+            source_peer_addr_index = source_trace
+                .source_addr_index
+                .map(|index| index as i64)
+                .unwrap_or(-1),
+            source_peer_addr_known = source_trace.source_addr_known,
+            source_peer_addr_matches_candidate = source_trace.source_addr_matches_candidate,
+            source_peer_addr_transport = source_trace.source_addr_transport,
+            source_peer_addr_family = source_trace.source_addr_family,
             source_peer_request_mode = source_trace.request_mode,
             source_peer_force_want_block = source_trace.force_want_block,
             source_peer_force_want_have = source_trace.force_want_have,
@@ -5473,6 +5498,11 @@ fn bitswap_session_peer_quality_from_successes(
 #[derive(Debug, PartialEq, Eq)]
 struct BitswapSourcePeerTrace {
     candidate_index: Option<usize>,
+    source_addr_index: Option<usize>,
+    source_addr_known: bool,
+    source_addr_matches_candidate: bool,
+    source_addr_transport: &'static str,
+    source_addr_family: &'static str,
     request_mode: &'static str,
     skip_want_have: bool,
     force_want_block: bool,
@@ -5509,6 +5539,11 @@ impl Default for BitswapSourcePeerTrace {
     fn default() -> Self {
         Self {
             candidate_index: None,
+            source_addr_index: None,
+            source_addr_known: false,
+            source_addr_matches_candidate: false,
+            source_addr_transport: "unknown",
+            source_addr_family: "unknown",
             request_mode: "unknown",
             skip_want_have: false,
             force_want_block: false,
@@ -7120,15 +7155,19 @@ async fn run_shared_bitswap_swarm(
                     }
 
                     let max_dial_addr_count = bitswap_max_dial_addrs_per_command();
-                    let (dial_addrs, suppressed_dial_addr_count) =
+                    let (dial_addrs, suppressed_dial_addrs) =
                         limited_interleaved_bitswap_dials_with_limit(
                             &dial_candidates,
                             max_dial_addr_count,
                         );
                     let scheduled_dial_peers = dial_addrs
                         .iter()
-                        .map(|(peer, _)| *peer)
+                        .map(|dial| dial.peer)
                         .collect::<BTreeSet<_>>();
+                    let scheduled_dial_summary = tracing::enabled!(tracing::Level::INFO)
+                        .then(|| format_bitswap_dial_addrs(&dial_addrs));
+                    let suppressed_dial_summary = tracing::enabled!(tracing::Level::INFO)
+                        .then(|| format_bitswap_dial_addrs(&suppressed_dial_addrs));
                     let candidate_dial_peer_count = dial_candidates.len();
                     let suppressed_dial_peer_count = dial_candidates
                         .iter()
@@ -7168,16 +7207,20 @@ async fn run_shared_bitswap_swarm(
                         new_dial_peer_count = scheduled_dial_peers.len(),
                         new_dial_addr_count = dial_addrs.len(),
                         max_dial_addr_count,
-                        suppressed_dial_addr_count,
+                        suppressed_dial_addr_count = suppressed_dial_addrs.len(),
                         suppressed_dial_peer_count,
                         pending_dial_peer_count,
                         connected_peer_count,
                         preconnect_waiter_count,
-                        command_queued_ms
+                        command_queued_ms,
+                        scheduled_dials = %scheduled_dial_summary.as_deref().unwrap_or(""),
+                        suppressed_dials = %suppressed_dial_summary.as_deref().unwrap_or("")
                     );
 
                     let mut started_dial_peers = BTreeSet::new();
-                    for (peer_id, addr) in dial_addrs {
+                    for dial in dial_addrs {
+                        let peer_id = dial.peer;
+                        let addr = dial.addr;
                         let transport = bitswap_transport_label(&addr);
                         let dial_addr = addr.with_p2p(peer_id).unwrap_or_else(|addr| addr);
                         match swarm.dial(dial_addr) {
@@ -7281,15 +7324,19 @@ async fn run_shared_bitswap_swarm(
                     peer_plans.push((peer, already_connected, already_pending));
                 }
                 let max_dial_addr_count = bitswap_max_dial_addrs_per_command();
-                let (dial_addrs, suppressed_dial_addr_count) =
+                let (dial_addrs, suppressed_dial_addrs) =
                     limited_interleaved_bitswap_dials_with_limit(
                         &dial_candidates,
                         max_dial_addr_count,
                     );
                 let scheduled_dial_peers = dial_addrs
                     .iter()
-                    .map(|(peer, _)| *peer)
+                    .map(|dial| dial.peer)
                     .collect::<BTreeSet<_>>();
+                let scheduled_dial_summary = tracing::enabled!(tracing::Level::INFO)
+                    .then(|| format_bitswap_dial_addrs(&dial_addrs));
+                let suppressed_dial_summary = tracing::enabled!(tracing::Level::INFO)
+                    .then(|| format_bitswap_dial_addrs(&suppressed_dial_addrs));
                 let candidate_dial_peer_count = dial_candidates.len();
                 let suppressed_dial_peer_count = dial_candidates
                     .iter()
@@ -7338,7 +7385,7 @@ async fn run_shared_bitswap_swarm(
                     new_dial_peer_count = scheduled_dial_peers.len(),
                     new_dial_addr_count = dial_addrs.len(),
                     max_dial_addr_count,
-                    suppressed_dial_addr_count,
+                    suppressed_dial_addr_count = suppressed_dial_addrs.len(),
                     suppressed_dial_peer_count,
                     pending_dial_peer_count,
                     connected_peer_count,
@@ -7347,11 +7394,15 @@ async fn run_shared_bitswap_swarm(
                     zero_http_provider = command_context.zero_http_provider,
                     command_queued_ms,
                     direct_untrusted_want_block_limit = bitswap_direct_want_block_untrusted_peer_limit(),
-                    targets = %target_summary.as_deref().unwrap_or("")
+                    targets = %target_summary.as_deref().unwrap_or(""),
+                    scheduled_dials = %scheduled_dial_summary.as_deref().unwrap_or(""),
+                    suppressed_dials = %suppressed_dial_summary.as_deref().unwrap_or("")
                 );
 
                 let mut started_dial_peers = BTreeSet::new();
-                for (peer_id, addr) in dial_addrs {
+                for dial in dial_addrs {
+                    let peer_id = dial.peer;
+                    let addr = dial.addr;
                     let transport = bitswap_transport_label(&addr);
                     let dial_addr = addr.with_p2p(peer_id).unwrap_or_else(|addr| addr);
                     match swarm.dial(dial_addr) {
@@ -8025,6 +8076,7 @@ fn format_bitswap_peers(peers: &[BitswapPeer]) -> String {
 
 fn bitswap_source_peer_trace_from_peers(
     source_peer: Option<PeerId>,
+    source_addr: Option<&Multiaddr>,
     peers: &[BitswapPeer],
 ) -> BitswapSourcePeerTrace {
     let Some(source_peer) = source_peer else {
@@ -8041,8 +8093,18 @@ fn bitswap_source_peer_trace_from_peers(
             &mut direct_untrusted_want_block_count,
         );
         if peer.id == source_peer {
+            let source_addr_index = bitswap_source_addr_index(source_addr, peer);
             return BitswapSourcePeerTrace {
                 candidate_index: Some(index),
+                source_addr_index,
+                source_addr_known: source_addr.is_some(),
+                source_addr_matches_candidate: source_addr_index.is_some(),
+                source_addr_transport: source_addr
+                    .map(bitswap_transport_label)
+                    .unwrap_or("unknown"),
+                source_addr_family: source_addr
+                    .map(bitswap_addr_family_label)
+                    .unwrap_or("unknown"),
                 request_mode: if prefer_want_have {
                     "want_have"
                 } else {
@@ -8057,6 +8119,14 @@ fn bitswap_source_peer_trace_from_peers(
         }
     }
     BitswapSourcePeerTrace::default()
+}
+
+fn bitswap_source_addr_index(source_addr: Option<&Multiaddr>, peer: &BitswapPeer) -> Option<usize> {
+    let source_addr = source_addr?;
+    let normalized_source_addr = bitswap_session_addr_from_remote_addr(source_addr);
+    peer.addrs
+        .iter()
+        .position(|candidate| candidate == &normalized_source_addr)
 }
 
 fn format_cids(cids: &[Cid]) -> String {
@@ -8533,7 +8603,15 @@ fn merge_bitswap_peer(peers: &mut Vec<BitswapPeer>, id: PeerId, addrs: Vec<Multi
     }
 }
 
-fn interleaved_bitswap_dials(peers: &[BitswapPeer]) -> Vec<(PeerId, Multiaddr)> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BitswapDialAddress {
+    peer: PeerId,
+    peer_index: usize,
+    addr_index: usize,
+    addr: Multiaddr,
+}
+
+fn interleaved_bitswap_dials(peers: &[BitswapPeer]) -> Vec<BitswapDialAddress> {
     let max_addrs = peers
         .iter()
         .map(|peer| peer.addrs.len())
@@ -8541,9 +8619,14 @@ fn interleaved_bitswap_dials(peers: &[BitswapPeer]) -> Vec<(PeerId, Multiaddr)> 
         .unwrap_or_default();
     let mut dials = Vec::new();
     for addr_index in 0..max_addrs {
-        for peer in peers {
+        for (peer_index, peer) in peers.iter().enumerate() {
             if let Some(addr) = peer.addrs.get(addr_index) {
-                dials.push((peer.id, addr.clone()));
+                dials.push(BitswapDialAddress {
+                    peer: peer.id,
+                    peer_index,
+                    addr_index,
+                    addr: addr.clone(),
+                });
             }
         }
     }
@@ -8553,13 +8636,30 @@ fn interleaved_bitswap_dials(peers: &[BitswapPeer]) -> Vec<(PeerId, Multiaddr)> 
 fn limited_interleaved_bitswap_dials_with_limit(
     peers: &[BitswapPeer],
     limit: usize,
-) -> (Vec<(PeerId, Multiaddr)>, usize) {
-    let all_dials = interleaved_bitswap_dials(peers);
-    let suppressed_dial_count = all_dials.len().saturating_sub(limit);
-    (
-        all_dials.into_iter().take(limit).collect(),
-        suppressed_dial_count,
-    )
+) -> (Vec<BitswapDialAddress>, Vec<BitswapDialAddress>) {
+    let mut all_dials = interleaved_bitswap_dials(peers);
+    let split_at = limit.min(all_dials.len());
+    let suppressed_dials = all_dials.split_off(split_at);
+    (all_dials, suppressed_dials)
+}
+
+fn format_bitswap_dial_addrs(dials: &[BitswapDialAddress]) -> String {
+    dials
+        .iter()
+        .take(MAX_BITSWAP_FAILURE_DETAILS)
+        .map(|dial| {
+            format!(
+                "peer_index={} addr_index={} peer={} transport={} family={} addr={}",
+                dial.peer_index,
+                dial.addr_index,
+                dial.peer,
+                bitswap_transport_label(&dial.addr),
+                bitswap_addr_family_label(&dial.addr),
+                dial.addr
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[derive(Default)]
@@ -8623,6 +8723,29 @@ fn bitswap_transport_label(addr: &Multiaddr) -> &'static str {
         "tcp"
     } else {
         "other"
+    }
+}
+
+fn bitswap_addr_family_label(addr: &Multiaddr) -> &'static str {
+    let mut has_ip4 = false;
+    let mut has_ip6 = false;
+    let mut has_dns = false;
+    for protocol in addr.iter() {
+        match protocol {
+            Protocol::Ip4(_) => has_ip4 = true,
+            Protocol::Ip6(_) => has_ip6 = true,
+            Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => {
+                has_dns = true
+            }
+            _ => {}
+        }
+    }
+    match (has_ip4, has_ip6, has_dns) {
+        (true, true, _) => "mixed_ip",
+        (true, false, _) => "ip4",
+        (false, true, _) => "ip6",
+        (false, false, true) => "dns",
+        _ => "other",
     }
 }
 
@@ -11269,13 +11392,18 @@ mod bitswap_tests {
         ];
 
         let dials = interleaved_bitswap_dials(&peers);
-        let peer_order = dials.iter().map(|(peer, _)| *peer).collect::<Vec<_>>();
+        let peer_order = dials.iter().map(|dial| dial.peer).collect::<Vec<_>>();
         let addr_order = dials
             .iter()
-            .map(|(_, addr)| addr.to_string())
+            .map(|dial| dial.addr.to_string())
+            .collect::<Vec<_>>();
+        let indexes = dials
+            .iter()
+            .map(|dial| (dial.peer_index, dial.addr_index))
             .collect::<Vec<_>>();
 
         assert_eq!(peer_order, vec![first, second, first, second]);
+        assert_eq!(indexes, vec![(0, 0), (1, 0), (0, 1), (1, 1)]);
         assert_eq!(
             addr_order,
             vec![
@@ -11319,11 +11447,15 @@ mod bitswap_tests {
         );
         let addr_order = dials
             .iter()
-            .map(|(_, addr)| addr.to_string())
+            .map(|dial| dial.addr.to_string())
+            .collect::<Vec<_>>();
+        let indexes = dials
+            .iter()
+            .map(|dial| (dial.peer_index, dial.addr_index))
             .collect::<Vec<_>>();
 
         assert_eq!(dials.len(), MAX_BITSWAP_DIAL_ADDRS_PER_COMMAND);
-        assert_eq!(suppressed, 11);
+        assert_eq!(suppressed.len(), 11);
         assert_eq!(
             addr_order,
             vec![
@@ -11334,6 +11466,9 @@ mod bitswap_tests {
                 "/ip4/127.0.0.1/tcp/1002",
             ]
         );
+        assert_eq!(indexes, vec![(0, 0), (1, 0), (2, 0), (3, 0), (0, 1)]);
+        assert_eq!(suppressed[0].peer_index, 1);
+        assert_eq!(suppressed[0].addr_index, 1);
     }
 
     #[test]
@@ -11364,11 +11499,15 @@ mod bitswap_tests {
         let (dials, suppressed) = limited_interleaved_bitswap_dials_with_limit(&peers, 6);
         let addr_order = dials
             .iter()
-            .map(|(_, addr)| addr.to_string())
+            .map(|dial| dial.addr.to_string())
+            .collect::<Vec<_>>();
+        let indexes = dials
+            .iter()
+            .map(|dial| (dial.peer_index, dial.addr_index))
             .collect::<Vec<_>>();
 
         assert_eq!(dials.len(), 6);
-        assert_eq!(suppressed, 3);
+        assert_eq!(suppressed.len(), 3);
         assert_eq!(
             addr_order,
             vec![
@@ -11379,6 +11518,10 @@ mod bitswap_tests {
                 "/ip4/127.0.0.2/tcp/1002",
                 "/ip4/127.0.0.3/tcp/1002",
             ]
+        );
+        assert_eq!(
+            indexes,
+            vec![(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)]
         );
     }
 
@@ -11468,10 +11611,14 @@ mod bitswap_tests {
         let second = parse_peer_id("12D3KooWGU3fJrHaWtRSWyrrzCpdgFX5bxbS69hqL1MSdKMGez12").unwrap();
         let third = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
         let fourth = parse_peer_id("12D3KooWGtYkBAaqJMJEmywMxaCiNP7LCEFUAFiLEBASe232c2VH").unwrap();
+        let first_addr = Multiaddr::from_str("/ip4/127.0.0.1/tcp/1001").unwrap();
+        let first_alt_addr = Multiaddr::from_str("/ip4/127.0.0.1/tcp/1002").unwrap();
+        let fourth_addr = Multiaddr::from_str("/ip6/::1/tcp/4001").unwrap();
+        let unknown_addr = Multiaddr::from_str("/ip4/127.0.0.9/tcp/9999").unwrap();
         let peers = vec![
             BitswapPeer {
                 id: first,
-                addrs: Vec::new(),
+                addrs: vec![first_addr, first_alt_addr.clone()],
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -11492,23 +11639,35 @@ mod bitswap_tests {
             },
             BitswapPeer {
                 id: fourth,
-                addrs: Vec::new(),
+                addrs: vec![fourth_addr],
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
             },
         ];
 
-        let first_trace = bitswap_source_peer_trace_from_peers(Some(first), &peers);
+        let first_trace =
+            bitswap_source_peer_trace_from_peers(Some(first), Some(&first_alt_addr), &peers);
         assert_eq!(first_trace.candidate_index, Some(0));
+        assert_eq!(first_trace.source_addr_index, Some(1));
+        assert!(first_trace.source_addr_known);
+        assert!(first_trace.source_addr_matches_candidate);
+        assert_eq!(first_trace.source_addr_transport, "tcp");
+        assert_eq!(first_trace.source_addr_family, "ip4");
         assert_eq!(first_trace.request_mode, "want_block");
 
-        let fourth_trace = bitswap_source_peer_trace_from_peers(Some(fourth), &peers);
+        let fourth_trace =
+            bitswap_source_peer_trace_from_peers(Some(fourth), Some(&unknown_addr), &peers);
         assert_eq!(fourth_trace.candidate_index, Some(3));
+        assert_eq!(fourth_trace.source_addr_index, None);
+        assert!(fourth_trace.source_addr_known);
+        assert!(!fourth_trace.source_addr_matches_candidate);
+        assert_eq!(fourth_trace.source_addr_transport, "tcp");
+        assert_eq!(fourth_trace.source_addr_family, "ip4");
         assert_eq!(fourth_trace.request_mode, "want_have");
 
         assert_eq!(
-            bitswap_source_peer_trace_from_peers(None, &peers),
+            bitswap_source_peer_trace_from_peers(None, None, &peers),
             BitswapSourcePeerTrace::default()
         );
     }
@@ -14030,7 +14189,7 @@ mod bitswap_tests {
                 None,
                 Some("/ipns/en.wikipedia-on-ipfs.org".to_owned()),
             ),
-            retriever.bitswap_source_peer_trace(Some(peer), &peers),
+            retriever.bitswap_source_peer_trace(Some(peer), None, &peers),
         )
         .await;
 
