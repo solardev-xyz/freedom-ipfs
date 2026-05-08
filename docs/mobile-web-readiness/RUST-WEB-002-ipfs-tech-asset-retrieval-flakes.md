@@ -42875,3 +42875,161 @@ to separate:
 Next useful work remains a scoped lab/policy for connection-error backoff
 threshold `1`, limited to the subresource zero-HTTP shape if live traces confirm
 that is where the repeated failures occur.
+
+## 2026-05-08: Scoped Zero-HTTP Subresource Backoff Lab Is Inconclusive
+
+Branch/head before change: `codex/kubo-session-performance-20260506` at
+`66e9115`.
+
+Purpose:
+
+The focused bad-window run showed a possible narrow improvement from immediate
+Bitswap connection-error suppression, but the global threshold guardrail was
+not promotion evidence. This lab adds an opt-in scoped threshold so future live
+runs can test the precise shape without changing defaults:
+
+- gateway subresource request
+- zero HTTP providers from delegated routing
+- concrete Bitswap connection error
+
+Change:
+
+- Added
+  `FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_CONNECTION_ERROR_BACKOFF=1`.
+- When enabled, only `gateway_subresource && zero_http_provider` Bitswap dial
+  contexts use connection-error backoff threshold `1`.
+- All other contexts still use
+  `FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD` or the default
+  threshold `2`.
+- Kept the knob disabled by default. This is a lab control, not a promoted
+  default behavior.
+
+Focused validation:
+
+```sh
+cargo fmt --all
+cargo test -p freedom-ipfs-retrieval scoped_zero_http_subresource_backoff_threshold -- --nocapture
+cargo test -p freedom-ipfs-retrieval connection_error_backoff_can_use_explicit_threshold -- --nocapture
+cargo test -p freedom-ipfs-retrieval bitswap_command_context -- --nocapture
+cargo fmt --all --check
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo test -p freedom-ipfs-retrieval scoped_zero_http_subresource_backoff_threshold -- --nocapture
+cargo test -p freedom-ipfs-retrieval connection_error_backoff_can_use_explicit_threshold -- --nocapture
+cargo test -p freedom-ipfs-retrieval backs_off_repeated_connection_error_peers -- --nocapture
+```
+
+Result:
+
+- All commands passed.
+
+Opt-in live run:
+
+```sh
+timeout 1200s env FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_CONNECTION_ERROR_BACKOFF=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/scoped-zero-http-subresource-backoff-ipfs-tech-r5-20260508T013057Z-trace.jsonl \
+  --comparison-output /tmp/scoped-zero-http-subresource-backoff-ipfs-tech-r5-20260508T013057Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/p90/p95/max `35/35/35/35`, duplicate blocks `0`,
+  messages p50/p90/max `58/221/221`, peers p50/p90/max `6/28/28`.
+- `ipfs.tech` root: Rust `757/1087ms`; Kubo `1266/1791ms`.
+- `ipfs.tech` assets: Rust `121/485ms`; Kubo `80/370ms`.
+- `meaningful_kubo_wins`: `2`, both asset p95 TTFB/total by `115ms`
+  (`1.31x`).
+- Resource max: Rust `57536KiB` RSS and `29` FDs vs Kubo `175748KiB` RSS
+  and `125` FDs.
+
+Rust trace:
+
+- HTTP-provider blocks: `139`, p50/p90/p95/max `184/266/333/1134ms`.
+- Bitswap blocks: `60`, p50/p90/p95/max `113/198/216/264ms`.
+- Delegated provider lookup: events `174`, successes `174`, failures `0`,
+  p50/p90/p95/max `21/47/53/622ms`.
+- Delegated provider distribution: zero `9`, single `96`, multi `69`.
+- Request classifications: `zero_http_provider_bitswap=8`,
+  `cold_bitswap_peer_expand=5`, `zero_http_provider_cold_bitswap=5`.
+- Classified zero-HTTP provider latency: p50/p90/p95/max
+  `208/412/412/412ms`, statuses `200=8`.
+- No Bitswap connection errors/backoffs were present in the raw trace.
+- The slow Kubo-winning assets were HTTP-provider-heavy, with Sia-backed
+  single-provider rows dominating the visible tail.
+
+Immediate no-env post-control:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/scoped-zero-http-subresource-backoff-post-control-ipfs-tech-r5-20260508T013409Z-trace.jsonl \
+  --comparison-output /tmp/scoped-zero-http-subresource-backoff-post-control-ipfs-tech-r5-20260508T013409Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/p90/p95/max `35/38/38/38`, duplicate blocks
+  p50/p90/p95/max `0/3/3/3`, messages p50/p90/max `38/143/143`, peers
+  p50/p90/max `8/31/31`.
+- `ipfs.tech` root: Rust `568/724ms`; Kubo `1291/1827ms`.
+- `ipfs.tech` assets: Rust `119/483ms`; Kubo `66/453ms`.
+- `meaningful_kubo_wins`: `2`, both asset p50 TTFB/total by `53ms`
+  (`1.80x`).
+- Resource max: Rust `56840KiB` RSS and `34` FDs vs Kubo `181020KiB` RSS
+  and `140` FDs.
+
+Rust trace:
+
+- HTTP-provider blocks: `140`, p50/p90/p95/max `181/241/284/427ms`.
+- Bitswap blocks: `60`, p50/p90/p95/max `105/194/217/333ms`.
+- Delegated provider lookup: events `174`, successes `174`, failures `0`,
+  p50/p90/p95/max `19/43/49/194ms`.
+- Delegated provider distribution: zero `10`, single `94`, multi `70`.
+- Request classifications: `zero_http_provider_bitswap=10`,
+  `cold_bitswap_peer_expand=9`, `zero_http_provider_cold_bitswap=9`.
+- Classified zero-HTTP provider latency: p50/p90/p95/max
+  `201/335/491/491ms`, statuses `200=10`.
+- No Bitswap connection errors/backoffs were present in the raw trace.
+- HTTP provider fetches were the clear differentiator:
+  `https://ipfs-bridge.sia.dev/` p50/p90/p95/max `184/245/278/405ms`
+  versus `https://dag.w3s.link/` p50/p90/p95/max `43/81/83/106ms`.
+
+Decision:
+
+Keep the scoped env-gated lab hook because it is narrow, tested, and useful for
+future bad-window reproduction, but do not promote any behavior from this run.
+The paired run did not exercise the Bitswap connection-error path at all, so it
+cannot prove the scoped policy improves the remaining gap.
+
+The current active gap in this window is not zero-HTTP connection errors. It is
+single-provider HTTP tail latency, especially slow Sia-backed rows where Kubo
+serves assets faster than our HTTP-provider path.
+
+Next useful work:
+
+1. Use the existing HTTP provider race/self-hedge traces to classify when Sia is
+   the only scored or only usable provider for slow assets.
+2. Test a scoped single-provider HTTP policy that is page-session-aware and
+   resource-bounded, rather than a broad hedge for every single-provider block.
+3. Validate against the same `ipfs.tech` same-window r5 harness plus the broader
+   DAICO/Vitalik/`ipfs.tech` guardrail before considering promotion.

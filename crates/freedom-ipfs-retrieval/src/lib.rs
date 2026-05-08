@@ -116,6 +116,8 @@ const BITSWAP_CONNECTION_ERROR_BACKOFF_TTL: Duration = Duration::from_secs(30);
 const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD: usize = 2;
 const BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD";
+const ENABLE_ZERO_HTTP_SUBRESOURCE_CONNECTION_ERROR_BACKOFF_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_CONNECTION_ERROR_BACKOFF";
 const ENABLE_BITSWAP_INCOMING_READ_TIMEOUT_BACKOFF_ENV: &str =
     "FREEDOM_IPFS_ENABLE_BITSWAP_INCOMING_READ_TIMEOUT_BACKOFF";
 const ENABLE_BITSWAP_INCOMING_SOURCE_ADDR_SESSION_PEERS_ENV: &str =
@@ -7650,11 +7652,16 @@ async fn run_shared_bitswap_swarm(
                         if let Some(peer_id) = peer_id {
                             let dial_context = connection_dial_contexts.get(&peer_id);
                             record_dial_error(&dial_errors, peer_id, error_detail.clone()).await;
-                            if let Some(backoff) = record_connection_error_backoff(
+                            let backoff_threshold =
+                                bitswap_connection_error_backoff_threshold_for_context(
+                                    dial_context,
+                                );
+                            if let Some(backoff) = record_connection_error_backoff_with_threshold(
                                 &mut connection_error_backoff,
                                 peer_id,
                                 &error_detail,
                                 Instant::now(),
+                                backoff_threshold,
                             ) {
                                 tracing::info!(
                                     phase = "bitswap_connection_error_backoff",
@@ -7669,7 +7676,7 @@ async fn run_shared_bitswap_swarm(
                                         .is_some_and(|context| context.command.zero_http_provider),
                                     error_class = backoff.class,
                                     count = backoff.count,
-                                    threshold = bitswap_connection_error_backoff_threshold(),
+                                    threshold = backoff_threshold,
                                     ttl_ms = BITSWAP_CONNECTION_ERROR_BACKOFF_TTL.as_millis()
                                 );
                             }
@@ -7779,11 +7786,28 @@ fn connection_error_backoff_remaining_ms(
         })
 }
 
+#[cfg(test)]
 fn record_connection_error_backoff<'a>(
     backoff: &'a mut HashMap<PeerId, ConnectionErrorBackoff>,
     peer: PeerId,
     detail: &str,
     now: Instant,
+) -> Option<&'a ConnectionErrorBackoff> {
+    record_connection_error_backoff_with_threshold(
+        backoff,
+        peer,
+        detail,
+        now,
+        bitswap_connection_error_backoff_threshold(),
+    )
+}
+
+fn record_connection_error_backoff_with_threshold<'a>(
+    backoff: &'a mut HashMap<PeerId, ConnectionErrorBackoff>,
+    peer: PeerId,
+    detail: &str,
+    now: Instant,
+    threshold: usize,
 ) -> Option<&'a ConnectionErrorBackoff> {
     let class = bitswap_connection_error_backoff_class(detail)?;
     let state = backoff.entry(peer).or_insert(ConnectionErrorBackoff {
@@ -7803,7 +7827,7 @@ fn record_connection_error_backoff<'a>(
     }
     state.count += 1;
     state.last_seen = now;
-    if state.count >= bitswap_connection_error_backoff_threshold() {
+    if state.count >= threshold.max(1) {
         state.suppress_until = Some(now + BITSWAP_CONNECTION_ERROR_BACKOFF_TTL);
         Some(state)
     } else {
@@ -7850,6 +7874,30 @@ fn bitswap_connection_error_backoff_threshold() -> usize {
     let override_value = std::env::var_os(BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD_ENV);
     let override_value = override_value.as_ref().map(|value| value.to_string_lossy());
     bitswap_connection_error_backoff_threshold_from_env_value(override_value.as_deref())
+}
+
+fn bitswap_connection_error_backoff_threshold_for_context(
+    context: Option<&BitswapDialContext>,
+) -> usize {
+    bitswap_connection_error_backoff_threshold_for_context_from_values(
+        bitswap_connection_error_backoff_threshold(),
+        std::env::var_os(ENABLE_ZERO_HTTP_SUBRESOURCE_CONNECTION_ERROR_BACKOFF_ENV).is_some(),
+        context.map(|context| &context.command),
+    )
+}
+
+fn bitswap_connection_error_backoff_threshold_for_context_from_values(
+    default_threshold: usize,
+    zero_http_subresource_enabled: bool,
+    context: Option<&BitswapCommandContext>,
+) -> usize {
+    if zero_http_subresource_enabled
+        && context.is_some_and(|context| context.gateway_subresource && context.zero_http_provider)
+    {
+        1
+    } else {
+        default_threshold.max(1)
+    }
 }
 
 fn bitswap_connection_error_backoff_threshold_from_env_value(value: Option<&str>) -> usize {
@@ -15082,6 +15130,83 @@ mod bitswap_tests {
             bitswap_connection_error_backoff_threshold_from_env_value(Some("not-a-number")),
             BITSWAP_CONNECTION_ERROR_BACKOFF_THRESHOLD
         );
+    }
+
+    #[test]
+    fn scoped_zero_http_subresource_backoff_threshold_is_opt_in() {
+        let top_level_zero_http = BitswapCommandContext {
+            top_level_path: Some("/ipns/ipfs.tech/".to_owned()),
+            gateway_subresource: false,
+            zero_http_provider: true,
+        };
+        let subresource_http_backed = BitswapCommandContext {
+            top_level_path: Some("/ipns/ipfs.tech/".to_owned()),
+            gateway_subresource: true,
+            zero_http_provider: false,
+        };
+        let subresource_zero_http = BitswapCommandContext {
+            top_level_path: Some("/ipns/ipfs.tech/".to_owned()),
+            gateway_subresource: true,
+            zero_http_provider: true,
+        };
+
+        assert_eq!(
+            bitswap_connection_error_backoff_threshold_for_context_from_values(
+                2,
+                false,
+                Some(&subresource_zero_http),
+            ),
+            2
+        );
+        assert_eq!(
+            bitswap_connection_error_backoff_threshold_for_context_from_values(
+                2,
+                true,
+                Some(&top_level_zero_http),
+            ),
+            2
+        );
+        assert_eq!(
+            bitswap_connection_error_backoff_threshold_for_context_from_values(
+                2,
+                true,
+                Some(&subresource_http_backed),
+            ),
+            2
+        );
+        assert_eq!(
+            bitswap_connection_error_backoff_threshold_for_context_from_values(
+                2,
+                true,
+                Some(&subresource_zero_http),
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn connection_error_backoff_can_use_explicit_threshold() {
+        let peer = parse_peer_id("12D3KooWNDpFqyse9kR7aZwgEzh4U1mL6Zz6jEuRNFXJxL5D2KPP").unwrap();
+        let mut backoff = HashMap::new();
+        let now = Instant::now();
+
+        let state = record_connection_error_backoff_with_threshold(
+            &mut backoff,
+            peer,
+            "Transport failed: Connection refused",
+            now,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(state.count, 1);
+        assert_eq!(state.class, "connection_refused");
+        assert!(connection_error_backoff_remaining_ms(
+            &backoff,
+            &peer,
+            now + Duration::from_millis(1)
+        )
+        .is_some());
     }
 
     #[test]
