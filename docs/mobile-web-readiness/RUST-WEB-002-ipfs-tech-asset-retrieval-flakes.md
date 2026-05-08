@@ -45045,3 +45045,91 @@ Use this as a regression watch item only. If it repeats as an aggregate loss in
 a future same-window run, investigate parent-directory source selection for
 single-HTTP-provider UnixFS parent blocks rather than changing global
 subresource scheduling.
+
+## 2026-05-08: Current Selected R10 Guardrail
+
+Branch/head: `codex/kubo-session-performance-20260506` at `b7476d4`.
+
+Purpose:
+
+After the focused r10 removed the active aggregate Kubo gap, widen back to the
+six selected cases at `repeat=10` to check whether the earlier selected r5
+Wikipedia and asset tails recur in the current window.
+
+Command:
+
+```sh
+timeout 4800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-selected-r10-b7476d4-20260508T050000Z-trace.jsonl \
+  --comparison-output /tmp/current-selected-r10-b7476d4-20260508T050000Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `10/10` for every selected case.
+- DAICO page root: Rust `279/353ms`; Kubo `1255/2958ms`.
+- Vitalik range root: Rust `102/137ms`; Kubo `2171/4978ms`.
+- `ipfs.tech` range root: Rust `648/1186ms`; Kubo `1001/2664ms`.
+- `ipfs.tech` page root: Rust `3/4ms`; Kubo `2/58ms`.
+- `ipfs.tech` assets: Rust TTFB/total `100/309ms`; Kubo TTFB/total
+  `346/422ms`.
+- `ipfs.tech` developers hero: Rust `122/134ms`; Kubo `416/448ms`.
+- Wikipedia root: Rust `589/715ms`; Kubo `710/776ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `53456KiB` RSS and `31` FDs vs Kubo `238380KiB`
+  RSS and `277` FDs.
+
+Path-local `ipfs.tech` asset Kubo wins remained:
+
+- `_nuxt/8Bs0wEmG.js`: Rust p50/p95 `184/995ms`; Kubo `335/357ms`;
+- `_nuxt/BfUTpfA9.js`: Rust p50/p95 `121/586ms`; Kubo `346/359ms`;
+- `favicon.ico`: Rust p50/p95 `121/173ms`; Kubo `56/86ms`.
+
+Trace summary:
+
+- HTTP-provider blocks: `275`, p50/p90/p95/max `104/230/254/431ms`.
+- Bitswap blocks: `155`, p50/p90/p95/max `91/419/494/990ms`.
+- Delegated lookup p50/p90/p95/max: `17/44/47/206ms`.
+- Bitswap DNS expansion: `130` events, `90` cached, `40` uncached,
+  `55` failed, `1418` records, `5` IPs.
+- `bitswap_want_have_probe` events: `2`, both
+  `timeout_fallback_want_block`, p50/p95 `501/501ms`.
+- Request classifications:
+  `zero_http_provider_bitswap=30`,
+  `cold_bitswap_peer_expand=21`,
+  `zero_http_provider_cold_bitswap=21`,
+  `top_level_zero_http_provider_bitswap=20`,
+  `top_level_zero_http_provider_cold_bitswap=16`.
+
+Decision:
+
+No behavior change from this run. The current selected r10 confirms the same
+status as the focused r10:
+
+- the aggregate Rust-vs-Kubo goal is met on the selected suite in this window;
+- Wikipedia is not currently an aggregate gap;
+- cold roots/ranges/assets remain well ahead with far lower RSS/FD use;
+- the remaining work is path-local `ipfs.tech` asset tail polish, especially
+  rare zero-HTTP/cold Bitswap rows and small HTTP-provider rows where Kubo wins
+  a single path metric despite losing the aggregate case.
+
+Do not revisit global `WANT_HAVE`, DNS timeout, direct-WANT, or preconnect
+knobs based on this run. The next useful work should either:
+
+- improve source-quality diagnostics for the rare path-local rows; or
+- find a very narrow source-selection rule that preserves the current selected
+  r10 aggregate wins and resource profile.
