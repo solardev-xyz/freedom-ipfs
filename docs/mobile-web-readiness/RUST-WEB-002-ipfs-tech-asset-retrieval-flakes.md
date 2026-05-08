@@ -45325,3 +45325,197 @@ continue or overlap a trusted same-page shortcut after the `100ms` post-lookup
 timeout while broad provider expansion starts. It must be scoped to active
 gateway requests, bounded by existing request timeouts, and guardrailed against
 the selected r10 resource profile.
+
+## 2026-05-08: Rejected Zero-HTTP Post-Lookup Timeout Shortcut Race
+
+Branch/head: `codex/kubo-session-performance-20260506` at `0ebae15`, with a
+dirty env-gated lab patch that was intentionally reverted after the experiment.
+The discarded patch is archived at:
+
+- `/tmp/rejected-zero-http-post-lookup-timeout-race.patch`
+
+Purpose:
+
+Test the narrow follow-up proposed by the r10 baseline above: when a zero-HTTP
+request has an active same-page Bitswap shortcut but the fixed post-lookup wait
+times out after `100ms`, keep that shortcut alive and race it against provider
+list Bitswap instead of cancelling it immediately. The lab patch had separate
+off-by-default gates for top-level and subresource requests:
+
+- `FREEDOM_IPFS_ENABLE_ZERO_HTTP_TOP_LEVEL_POST_LOOKUP_TIMEOUT_SHORTCUT_RACE=1`
+- `FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_POST_LOOKUP_TIMEOUT_SHORTCUT_RACE=1`
+
+Validation before live runs:
+
+```sh
+cargo fmt --all
+cargo fmt --all --check
+git diff --check
+cargo test -p freedom-ipfs-retrieval zero_http_post_lookup_timeout_shortcut_race_is_scoped
+cargo test -p mobile-web-harness trace_summary_counts_post_lookup_race_outcomes
+```
+
+All passed.
+
+Subresource-only command:
+
+```sh
+timeout 3000s env \
+  FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_POST_LOOKUP_TIMEOUT_SHORTCUT_RACE=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-subresource-timeout-race-focused-r5-0ebae15-20260508T041328Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-subresource-timeout-race-focused-r5-0ebae15-20260508T041328Z.json
+```
+
+Result:
+
+- The new timeout-race hook did not fire: `0`
+  `bitswap_session_shortcut_post_lookup_timeout_race` events.
+- `ipfs.tech` root: Rust `647/1514ms`; Kubo `1581/2639ms`.
+- `ipfs.tech` assets: Rust `65/249ms`; Kubo `94/452ms`.
+- Wikipedia root: Rust `173/722ms`; Kubo `257/404ms`.
+- Meaningful aggregate Kubo wins: `2`, both Wikipedia p95 TTFB/total.
+- Resource max: Rust `50496KiB` RSS and `23` FDs vs Kubo `257028KiB`
+  RSS and `190` FDs.
+
+Top-level-only command before the DNS-prefetch timeout path was wired:
+
+```sh
+timeout 3000s env \
+  FREEDOM_IPFS_ENABLE_ZERO_HTTP_TOP_LEVEL_POST_LOOKUP_TIMEOUT_SHORTCUT_RACE=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-top-level-timeout-race-focused-r5-0ebae15-20260508T041659Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-top-level-timeout-race-focused-r5-0ebae15-20260508T041659Z.json
+```
+
+Result:
+
+- The new timeout-race hook did not fire: `0`
+  `bitswap_session_shortcut_post_lookup_timeout_race` events.
+- `ipfs.tech` root: Rust `699/938ms`; Kubo `1397/2035ms`.
+- `ipfs.tech` assets: Rust `85/246ms`; Kubo `84/394ms`.
+- Wikipedia root: Rust `379/529ms`; Kubo `102/684ms`.
+- Meaningful aggregate Kubo wins: `2`, both Wikipedia p50 TTFB/total.
+- Resource max: Rust `49832KiB` RSS and `25` FDs vs Kubo `318832KiB`
+  RSS and `574` FDs.
+
+Top-level-only command after wiring the DNS-prefetch timeout path:
+
+```sh
+timeout 3000s env \
+  FREEDOM_IPFS_ENABLE_ZERO_HTTP_TOP_LEVEL_POST_LOOKUP_TIMEOUT_SHORTCUT_RACE=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-top-level-timeout-race2-focused-r5-0ebae15-20260508T042051Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-top-level-timeout-race2-focused-r5-0ebae15-20260508T042051Z.json
+```
+
+Result:
+
+- The new timeout-race hook still did not fire: `0`
+  `bitswap_session_shortcut_post_lookup_timeout_race` events in this window.
+- `ipfs.tech` root: Rust `676/717ms`; Kubo `1382/2199ms`.
+- `ipfs.tech` assets: Rust `83/217ms`; Kubo `61/350ms`.
+- Wikipedia root: Rust `258/432ms`; Kubo `185/1126ms`.
+- Meaningful aggregate Kubo wins: `2`, both Wikipedia p50 TTFB/total.
+- Resource max: Rust `51260KiB` RSS and `20` FDs vs Kubo `244924KiB`
+  RSS and `212` FDs.
+
+Combined top-level plus subresource command:
+
+```sh
+timeout 3000s env \
+  FREEDOM_IPFS_ENABLE_ZERO_HTTP_TOP_LEVEL_POST_LOOKUP_TIMEOUT_SHORTCUT_RACE=1 \
+  FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_POST_LOOKUP_TIMEOUT_SHORTCUT_RACE=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-timeout-race-both-focused-r5-0ebae15-20260508T042241Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-timeout-race-both-focused-r5-0ebae15-20260508T042241Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5` for both focused cases.
+- The hook finally fired: `8`
+  `bitswap_session_shortcut_post_lookup_timeout_race` events, all
+  `bitswap_won`.
+- Those wins were limited to two `ipfs.tech` JS assets:
+  - `/ipns/ipfs.tech/_nuxt/DBHrpFkY.js`: `4` timeout-race wins at
+    `345/346/347/383ms`;
+  - `/ipns/ipfs.tech/_nuxt/hfYlCurB.js`: `4` timeout-race wins at
+    `335/337/337/345ms`.
+- `ipfs.tech` root: Rust `585/689ms`; Kubo `2840/3213ms`.
+- `ipfs.tech` assets: Rust `141/468ms`; Kubo `107/241ms`.
+- Wikipedia root: Rust `903/2121ms`; Kubo `246/449ms`.
+- Meaningful aggregate Kubo wins: `6`: ipfs.tech asset p95 TTFB/total plus
+  all Wikipedia root p50/p95 TTFB/total metrics.
+- Resource max stayed good: Rust `50812KiB` RSS and `21` FDs vs Kubo
+  `280632KiB` RSS and `398` FDs.
+- Trace source latencies:
+  - Bitswap: `50` blocks, p50/p90/p95/max `137/476/646/1925ms`;
+  - HTTP provider: `135` blocks, p50/p90/p95/max `181/236/248/468ms`.
+- Request classifications:
+  `zero_http_provider_bitswap=15`,
+  `cold_bitswap_peer_expand=13`,
+  `zero_http_provider_cold_bitswap=13`,
+  `top_level_zero_http_provider_bitswap=5`,
+  `top_level_zero_http_provider_cold_bitswap=5`.
+- The slowest Wikipedia root block had a `1922ms`
+  `bitswap_session_shortcut`, a `1874ms`
+  `bitswap_session_shortcut_post_lookup_race`, and an incoming Bitswap stream
+  read timeout at `6001ms`.
+
+Decision:
+
+Reject and revert. The hook produced real `bitswap_won` events, but the wins
+were too slow to help the target shape and the combined gate made the aggregate
+result materially worse than the clean r10 baseline: `ipfs.tech` asset p95
+regressed from Rust `326ms` vs Kubo `730ms` to Rust `468ms` vs Kubo `241ms`,
+while Wikipedia regressed from Rust `378/816ms` vs Kubo `149/597ms` to Rust
+`903/2121ms` vs Kubo `246/449ms`. The resource profile remained mobile-friendly,
+so the failure is latency and scheduling, not RSS/FD pressure.
+
+Do not repeat this broad "keep timed-out shortcut alive and wait for it to win"
+shape. If this area is revisited, the next attempt must be materially different:
+for example, use the trace to identify a peer/source quality predicate that
+predicts sub-200ms completion before allowing late shortcut overlap, or overlap
+provider-list fetch without making a slow shortcut capable of delaying the
+request tail.
