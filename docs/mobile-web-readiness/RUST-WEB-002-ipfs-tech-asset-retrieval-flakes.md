@@ -47525,20 +47525,102 @@ Guardrail result:
   - source candidate indexes `0=5`;
   - source request modes `want_block=5`.
 
+Larger opt-in guardrail command:
+
+```sh
+timeout 4200s env \
+  FREEDOM_IPFS_ENABLE_ZERO_HTTP_TOP_LEVEL_DIRECT_WANT_BLOCK=1 \
+  FREEDOM_IPFS_ZERO_HTTP_TOP_LEVEL_DIRECT_WANT_BLOCK_PEERS=5 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case daicowtf-page-assets \
+    --case ipfs-tech-page-assets \
+    --case vitalik-root-html-range \
+    --repeat 10 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 300 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/top-level-zero-http-direct5-guardrail-r10-5ae6685-20260508Tnext-trace.jsonl \
+    --comparison-output /tmp/top-level-zero-http-direct5-guardrail-r10-5ae6685-20260508Tnext.json
+```
+
+Larger opt-in guardrail result:
+
+- Rust/Kubo passed `10/10` for DAICO, Vitalik, and `ipfs.tech`.
+- DAICO root: Rust `285/351ms`; Kubo `1237/2227ms`.
+- Vitalik range/root: Rust `104/127ms`; Kubo `2171/4822ms`.
+- `ipfs.tech` root: Rust `576/1313ms`; Kubo `769/3741ms`.
+- `ipfs.tech` assets: Rust `114/310ms`; Kubo `355/830ms`.
+- Case-level `meaningful_kubo_wins`: none.
+- Resource max: Rust `61880KiB` RSS and `41` FDs vs Kubo `302068KiB`
+  RSS and `351` FDs.
+- Top-level zero-HTTP root classifications:
+  - requests `10`;
+  - elapsed p50/p90/p95/max `574/932/1311/1311ms`;
+  - source candidate indexes `0=10`;
+  - source request modes `want_block=10`.
+- The opt-in again forced the top-level zero-HTTP root source to candidate
+  index `0` in `want_block` mode, but this window also had many more zero-HTTP
+  Bitswap classifications than the later no-env control.
+
+Larger immediate no-env post-control command:
+
+```sh
+timeout 4200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case ipfs-tech-page-assets \
+  --case vitalik-root-html-range \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/top-level-zero-http-direct5-guardrail-postcontrol-r10-5ae6685-20260508Tnext-trace.jsonl \
+  --comparison-output /tmp/top-level-zero-http-direct5-guardrail-postcontrol-r10-5ae6685-20260508Tnext.json
+```
+
+Larger post-control result:
+
+- Rust/Kubo passed `10/10` for DAICO, Vitalik, and `ipfs.tech`.
+- DAICO root: Rust `285/431ms`; Kubo `2133/2187ms`.
+- Vitalik range/root: Rust `103/153ms`; Kubo `2231/13552ms`.
+- `ipfs.tech` root: Rust `611/845ms`; Kubo `741/848ms`.
+- `ipfs.tech` assets: Rust `192/483ms`; Kubo `392/882ms`.
+- Case-level `meaningful_kubo_wins`: none.
+- Resource max: Rust `60036KiB` RSS and `40` FDs vs Kubo `253508KiB`
+  RSS and `282` FDs.
+- Top-level zero-HTTP root classifications:
+  - requests `1`;
+  - elapsed `604ms`;
+  - source candidate indexes `0=1`;
+  - source request modes `want_block=1`.
+- This no-env control had only `3` zero-HTTP cold Bitswap requests overall and
+  no candidate-index-4 top-level root tail. Its slow `ipfs.tech` samples were
+  dominated by HTTP-provider work through `ipfs-bridge.sia.dev`, not by the
+  prior late `want_have` root pattern.
+
 Decision:
 
 Keep the top-level-only direct-WANT switch as a disabled lab control. The A/B
-pair strongly supports the mechanism in this public-network window: the opt-in
-removed the top-level root candidate-index-4 `want_have` tail, cut Rust root
-p95 from `2475ms` to `1272ms`, improved aggregate asset p95 from `355ms` to
-`293ms`, and kept the resource profile far below Kubo.
+pair strongly supports the mechanism in the original focused public-network
+window: the opt-in removed the top-level root candidate-index-4 `want_have`
+tail, cut Rust root p95 from `2475ms` to `1272ms`, improved aggregate asset p95
+from `355ms` to `293ms`, and kept the resource profile far below Kubo. The
+larger selected r10 guardrail also passed all cases and improved `ipfs.tech`
+asset p95 versus the immediate no-env control (`310ms` vs `483ms`).
 
 Do **not** promote it as a default yet. This is still a static direct-WANT peer
 count, and prior global/static direct-WANT experiments showed that fixed fanout
-can regress other windows. The small opt-in guardrail did not show an obvious
-resource or case-level regression, but `ipfs.tech` root p95 remained close to
-Kubo in that five-run window, so the next step should run a larger selected
-multi-case guardrail and, if it keeps winning, investigate an adaptive promotion
-rule such as enabling the top-level direct budget only when the provider set has
-repeated late `want_have` root tails or when earlier direct candidates are stuck
-in connection setup.
+can regress other windows. The larger no-env control did not reproduce the
+candidate-index-4 root tail, and control root p95 on `ipfs.tech` was better
+than the opt-in in that later window (`845ms` vs `1313ms`). Treat the lab as a
+diagnostic and design an adaptive rule before any default promotion: enable the
+top-level direct budget only after observing the specific late `want_have` root
+shape, repeated zero-HTTP top-level tails, or earlier direct candidates stuck in
+connection setup.
