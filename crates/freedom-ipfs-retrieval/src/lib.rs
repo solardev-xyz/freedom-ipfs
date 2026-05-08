@@ -184,6 +184,11 @@ const ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_ENV: &str =
     "FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK";
 const BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS";
+const BITSWAP_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK_PEERS: usize = 5;
+const ENABLE_BITSWAP_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK_ENV: &str =
+    "FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK";
+const BITSWAP_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK_PEERS_ENV: &str =
+    "FREEDOM_IPFS_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK_PEERS";
 const BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS";
 const BITSWAP_HIGH_PROVIDER_ZERO_HTTP_DIRECT_WANT_BLOCK_MIN_PROVIDERS_ENV: &str =
@@ -374,6 +379,7 @@ struct MissingBlockRange {
 pub struct RetrievalRequestContext {
     gateway_subresource: bool,
     top_level_path: Option<String>,
+    zero_http_post_lookup_shortcut_timeout: bool,
 }
 
 impl RetrievalRequestContext {
@@ -388,6 +394,7 @@ impl RetrievalRequestContext {
         Self {
             gateway_subresource: parent_request_id.is_some(),
             top_level_path,
+            zero_http_post_lookup_shortcut_timeout: false,
         }
     }
 
@@ -397,6 +404,15 @@ impl RetrievalRequestContext {
 
     pub fn top_level_path(&self) -> Option<&str> {
         self.top_level_path.as_deref()
+    }
+
+    fn with_zero_http_post_lookup_shortcut_timeout(mut self) -> Self {
+        self.zero_http_post_lookup_shortcut_timeout = true;
+        self
+    }
+
+    fn zero_http_post_lookup_shortcut_timeout(&self) -> bool {
+        self.zero_http_post_lookup_shortcut_timeout
     }
 }
 
@@ -574,6 +590,8 @@ impl HttpRetriever {
         cid: &Cid,
         context: Option<RetrievalRequestContext>,
     ) -> Result<(Block, RetrievalSource)> {
+        let mut context = context;
+        let mut zero_http_post_lookup_shortcut_timeout = false;
         let provider_cache_started = Instant::now();
         let providers = match self.cached_providers(cid)? {
             Some(providers) => {
@@ -738,9 +756,15 @@ impl HttpRetriever {
                                                             ) => {
                                                                 return Ok((block, source));
                                                             }
-                                                            ZeroHttpPostLookupDnsPrefetchOutcome::ContinueAfterWait => {}
+                                                            ZeroHttpPostLookupDnsPrefetchOutcome::ContinueAfterWait {
+                                                                shortcut_timed_out,
+                                                            } => {
+                                                                if http_provider_count == 0 && shortcut_timed_out {
+                                                                    zero_http_post_lookup_shortcut_timeout = true;
+                                                                }
+                                                            }
                                                             ZeroHttpPostLookupDnsPrefetchOutcome::NotAttempted => {
-                                                                if let Some(block) = self
+                                                                match self
                                                                     .wait_for_session_shortcut_post_lookup(
                                                                         cid,
                                                                         &providers,
@@ -749,10 +773,18 @@ impl HttpRetriever {
                                                                     )
                                                                     .await?
                                                                 {
-                                                                    return Ok((
-                                                                        block,
-                                                                        RetrievalSource::Bitswap,
-                                                                    ));
+                                                                    SessionShortcutPostLookupWait::Hit(block) => {
+                                                                        return Ok((
+                                                                            block,
+                                                                            RetrievalSource::Bitswap,
+                                                                        ));
+                                                                    }
+                                                                    SessionShortcutPostLookupWait::Miss => {}
+                                                                    SessionShortcutPostLookupWait::Timeout => {
+                                                                        if http_provider_count == 0 {
+                                                                            zero_http_post_lookup_shortcut_timeout = true;
+                                                                        }
+                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -922,9 +954,15 @@ impl HttpRetriever {
                                                         ) => {
                                                             return Ok((block, source));
                                                         }
-                                                        ZeroHttpPostLookupDnsPrefetchOutcome::ContinueAfterWait => {}
+                                                        ZeroHttpPostLookupDnsPrefetchOutcome::ContinueAfterWait {
+                                                            shortcut_timed_out,
+                                                        } => {
+                                                            if http_provider_count == 0 && shortcut_timed_out {
+                                                                zero_http_post_lookup_shortcut_timeout = true;
+                                                            }
+                                                        }
                                                         ZeroHttpPostLookupDnsPrefetchOutcome::NotAttempted => {
-                                                            if let Some(block) = self
+                                                            match self
                                                                 .wait_for_session_shortcut_post_lookup(
                                                                     cid,
                                                                     &providers,
@@ -933,10 +971,18 @@ impl HttpRetriever {
                                                                 )
                                                                 .await?
                                                             {
-                                                                return Ok((
-                                                                    block,
-                                                                    RetrievalSource::Bitswap,
-                                                                ));
+                                                                SessionShortcutPostLookupWait::Hit(block) => {
+                                                                    return Ok((
+                                                                        block,
+                                                                        RetrievalSource::Bitswap,
+                                                                    ));
+                                                                }
+                                                                SessionShortcutPostLookupWait::Miss => {}
+                                                                SessionShortcutPostLookupWait::Timeout => {
+                                                                    if http_provider_count == 0 {
+                                                                        zero_http_post_lookup_shortcut_timeout = true;
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -973,6 +1019,11 @@ impl HttpRetriever {
                 providers
             }
         };
+        if zero_http_post_lookup_shortcut_timeout {
+            if let Some(current_context) = context.take() {
+                context = Some(current_context.with_zero_http_post_lookup_shortcut_timeout());
+            }
+        }
         if let Some(block) = self.recheck_block_store(cid)? {
             return Ok((block, RetrievalSource::Cache));
         }
@@ -2096,7 +2147,7 @@ impl HttpRetriever {
         providers: &[Provider],
         http_provider_count: usize,
         mut shortcut: Pin<&mut F>,
-    ) -> Result<Option<Block>>
+    ) -> Result<SessionShortcutPostLookupWait>
     where
         F: Future<Output = Result<Option<Block>>>,
     {
@@ -2114,7 +2165,7 @@ impl HttpRetriever {
                         provider_count = providers.len(),
                         http_provider_count
                     );
-                    Ok(Some(block))
+                    Ok(SessionShortcutPostLookupWait::Hit(block))
                 }
                 Ok(None) => {
                     tracing::info!(
@@ -2126,7 +2177,7 @@ impl HttpRetriever {
                         provider_count = providers.len(),
                         http_provider_count
                     );
-                    Ok(None)
+                    Ok(SessionShortcutPostLookupWait::Miss)
                 }
                 Err(err) => {
                     tracing::info!(
@@ -2152,7 +2203,7 @@ impl HttpRetriever {
                     provider_count = providers.len(),
                     http_provider_count
                 );
-                Ok(None)
+                Ok(SessionShortcutPostLookupWait::Timeout)
             }
         }
     }
@@ -2321,7 +2372,9 @@ impl HttpRetriever {
                     fetch_elapsed_ms = fetch_started.elapsed().as_millis(),
                     elapsed_ms = started.elapsed().as_millis()
                 );
-                Ok(ZeroHttpPostLookupDnsPrefetchOutcome::ContinueAfterWait)
+                Ok(ZeroHttpPostLookupDnsPrefetchOutcome::ContinueAfterWait {
+                    shortcut_timed_out: wait_timed_out,
+                })
             }
         }
     }
@@ -3833,8 +3886,11 @@ impl HttpRetriever {
                 .as_ref()
                 .is_some_and(RetrievalRequestContext::gateway_subresource),
         };
+        let zero_http_post_lookup_shortcut_timeout = context
+            .as_ref()
+            .is_some_and(RetrievalRequestContext::zero_http_post_lookup_shortcut_timeout);
         let zero_http_direct_want_block_limit =
-            bitswap_zero_http_direct_want_block_peers(providers.len(), context);
+            bitswap_zero_http_direct_want_block_peers(providers.len(), context.as_ref());
         let zero_http_direct_want_block_peer_count =
             maybe_force_zero_http_direct_want_block_peers_with_limit(
                 providers,
@@ -3854,6 +3910,7 @@ impl HttpRetriever {
             session_peer_count,
             trusted_peer_count,
             gateway_subresource = gateway_context.gateway_subresource,
+            zero_http_post_lookup_shortcut_timeout,
             zero_http_direct_want_block_peer_count,
             zero_http_direct_want_block_limit = zero_http_direct_want_block_limit
                 .map(|limit| limit as i64)
@@ -5924,8 +5981,19 @@ fn zero_http_post_lookup_dns_prefetch_allows_from_values(
 
 fn bitswap_zero_http_direct_want_block_peers(
     provider_count: usize,
-    context: Option<RetrievalRequestContext>,
+    context: Option<&RetrievalRequestContext>,
 ) -> Option<usize> {
+    let post_lookup_timeout_override =
+        std::env::var_os(BITSWAP_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK_PEERS_ENV);
+    let post_lookup_timeout_config = PostLookupTimeoutDirectWantBlockConfig {
+        enabled: std::env::var_os(
+            ENABLE_BITSWAP_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK_ENV,
+        )
+        .is_some(),
+        override_value: post_lookup_timeout_override
+            .as_deref()
+            .and_then(|value| value.to_str()),
+    };
     bitswap_zero_http_direct_want_block_peers_from_values(
         std::env::var_os(ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_ENV).is_some(),
         std::env::var_os(BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS_ENV)
@@ -5935,6 +6003,7 @@ fn bitswap_zero_http_direct_want_block_peers(
             .as_deref()
             .and_then(|value| value.to_str()),
         bitswap_high_provider_zero_http_direct_want_block_min_providers(),
+        post_lookup_timeout_config,
         provider_count,
         context,
     )
@@ -5946,13 +6015,37 @@ fn bitswap_zero_http_direct_want_block_peers_from_env_value(value: Option<&str>)
         .filter(|value| *value > 0)
 }
 
+#[derive(Clone, Copy)]
+struct PostLookupTimeoutDirectWantBlockConfig<'a> {
+    enabled: bool,
+    override_value: Option<&'a str>,
+}
+
+#[cfg(test)]
+impl PostLookupTimeoutDirectWantBlockConfig<'_> {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            override_value: None,
+        }
+    }
+
+    fn enabled(override_value: Option<&str>) -> PostLookupTimeoutDirectWantBlockConfig<'_> {
+        PostLookupTimeoutDirectWantBlockConfig {
+            enabled: true,
+            override_value,
+        }
+    }
+}
+
 fn bitswap_zero_http_direct_want_block_peers_from_values(
     subresource_enabled: bool,
     override_value: Option<&str>,
     high_provider_override_value: Option<&str>,
     high_provider_min_providers: Option<usize>,
+    post_lookup_timeout_config: PostLookupTimeoutDirectWantBlockConfig<'_>,
     provider_count: usize,
-    context: Option<RetrievalRequestContext>,
+    context: Option<&RetrievalRequestContext>,
 ) -> Option<usize> {
     bitswap_zero_http_direct_want_block_peers_from_env_value(override_value).or_else(|| {
         if high_provider_min_providers.is_some_and(|minimum| provider_count >= minimum) {
@@ -5962,12 +6055,24 @@ fn bitswap_zero_http_direct_want_block_peers_from_values(
                 return Some(limit);
             }
         }
+        if post_lookup_timeout_config.enabled
+            && context.is_some_and(|context| {
+                context.gateway_subresource() && context.zero_http_post_lookup_shortcut_timeout()
+            })
+        {
+            return bitswap_zero_http_direct_want_block_peers_from_env_value(
+                post_lookup_timeout_config.override_value,
+            )
+            .or(Some(
+                BITSWAP_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK_PEERS,
+            ));
+        }
         if !subresource_enabled {
             return None;
         }
         context
-            .filter(RetrievalRequestContext::gateway_subresource)
-            .map(|_| BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS)
+            .is_some_and(RetrievalRequestContext::gateway_subresource)
+            .then_some(BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS)
     })
 }
 
@@ -6508,6 +6613,12 @@ enum MultiHttpFailedDirectIpBitswapFallbackResult {
     DirectIp(Result<Block>),
 }
 
+enum SessionShortcutPostLookupWait {
+    Hit(Block),
+    Miss,
+    Timeout,
+}
+
 #[derive(Clone, Copy)]
 struct MultiHttpFailedDirectIpBitswapTrace {
     provider_count: usize,
@@ -6519,7 +6630,7 @@ struct MultiHttpFailedDirectIpBitswapTrace {
 
 enum ZeroHttpPostLookupDnsPrefetchOutcome {
     NotAttempted,
-    ContinueAfterWait,
+    ContinueAfterWait { shortcut_timed_out: bool },
     Fetched(Block, RetrievalSource),
 }
 
@@ -13413,7 +13524,13 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                false, None, None, None, 64, None
+                false,
+                None,
+                None,
+                None,
+                PostLookupTimeoutDirectWantBlockConfig::disabled(),
+                64,
+                None
             ),
             None
         );
@@ -13423,8 +13540,9 @@ mod bitswap_tests {
                 None,
                 None,
                 None,
+                PostLookupTimeoutDirectWantBlockConfig::disabled(),
                 64,
-                Some(RetrievalRequestContext::gateway_request(Some(1))),
+                Some(&RetrievalRequestContext::gateway_request(Some(1))),
             ),
             None
         );
@@ -13434,8 +13552,9 @@ mod bitswap_tests {
                 None,
                 None,
                 None,
+                PostLookupTimeoutDirectWantBlockConfig::disabled(),
                 64,
-                Some(RetrievalRequestContext::gateway_request(Some(1))),
+                Some(&RetrievalRequestContext::gateway_request(Some(1))),
             ),
             Some(BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS)
         );
@@ -13445,8 +13564,9 @@ mod bitswap_tests {
                 None,
                 None,
                 None,
+                PostLookupTimeoutDirectWantBlockConfig::disabled(),
                 64,
-                Some(RetrievalRequestContext::gateway_request(None)),
+                Some(&RetrievalRequestContext::gateway_request(None)),
             ),
             None
         );
@@ -13456,8 +13576,9 @@ mod bitswap_tests {
                 Some("5"),
                 None,
                 None,
+                PostLookupTimeoutDirectWantBlockConfig::disabled(),
                 64,
-                Some(RetrievalRequestContext::gateway_request(None)),
+                Some(&RetrievalRequestContext::gateway_request(None)),
             ),
             Some(5)
         );
@@ -13467,8 +13588,9 @@ mod bitswap_tests {
                 Some("5"),
                 Some("8"),
                 Some(32),
+                PostLookupTimeoutDirectWantBlockConfig::disabled(),
                 64,
-                Some(RetrievalRequestContext::gateway_request(Some(1))),
+                Some(&RetrievalRequestContext::gateway_request(Some(1))),
             ),
             Some(5)
         );
@@ -13478,8 +13600,9 @@ mod bitswap_tests {
                 None,
                 Some("8"),
                 Some(32),
+                PostLookupTimeoutDirectWantBlockConfig::disabled(),
                 64,
-                Some(RetrievalRequestContext::gateway_request(None)),
+                Some(&RetrievalRequestContext::gateway_request(None)),
             ),
             Some(8)
         );
@@ -13489,8 +13612,9 @@ mod bitswap_tests {
                 None,
                 Some("8"),
                 Some(32),
+                PostLookupTimeoutDirectWantBlockConfig::disabled(),
                 16,
-                Some(RetrievalRequestContext::gateway_request(None)),
+                Some(&RetrievalRequestContext::gateway_request(None)),
             ),
             None
         );
@@ -13500,10 +13624,93 @@ mod bitswap_tests {
                 None,
                 Some("bad"),
                 Some(32),
+                PostLookupTimeoutDirectWantBlockConfig::disabled(),
                 64,
-                Some(RetrievalRequestContext::gateway_request(Some(1))),
+                Some(&RetrievalRequestContext::gateway_request(Some(1))),
             ),
             Some(BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS)
+        );
+    }
+
+    #[test]
+    fn zero_http_post_lookup_timeout_direct_want_block_is_scoped() {
+        let timed_out_subresource = RetrievalRequestContext::gateway_request(Some(1))
+            .with_zero_http_post_lookup_shortcut_timeout();
+        let timed_out_top_level = RetrievalRequestContext::gateway_request(None)
+            .with_zero_http_post_lookup_shortcut_timeout();
+        let normal_subresource = RetrievalRequestContext::gateway_request(Some(1));
+
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                false,
+                None,
+                None,
+                None,
+                PostLookupTimeoutDirectWantBlockConfig::enabled(None),
+                16,
+                Some(&timed_out_subresource),
+            ),
+            Some(BITSWAP_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK_PEERS)
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                false,
+                None,
+                None,
+                None,
+                PostLookupTimeoutDirectWantBlockConfig::enabled(Some("3")),
+                16,
+                Some(&timed_out_subresource),
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                false,
+                Some("2"),
+                None,
+                None,
+                PostLookupTimeoutDirectWantBlockConfig::enabled(Some("3")),
+                16,
+                Some(&timed_out_subresource),
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                false,
+                None,
+                None,
+                None,
+                PostLookupTimeoutDirectWantBlockConfig::disabled(),
+                16,
+                Some(&timed_out_subresource),
+            ),
+            None
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                false,
+                None,
+                None,
+                None,
+                PostLookupTimeoutDirectWantBlockConfig::enabled(None),
+                16,
+                Some(&timed_out_top_level),
+            ),
+            None
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                false,
+                None,
+                None,
+                None,
+                PostLookupTimeoutDirectWantBlockConfig::enabled(None),
+                16,
+                Some(&normal_subresource),
+            ),
+            None
         );
     }
 

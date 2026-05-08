@@ -43610,3 +43610,139 @@ subresources. Useful candidate directions are:
   fast rows for the same CID before changing fanout;
 - avoid revisiting broad direct-WANT, broad preconnect, or global dial-cap
   changes unless a new trace contradicts the prior rejected evidence.
+
+## 2026-05-08: Scoped Post-Lookup Timeout Direct-WANT Lab
+
+Branch/head before change: `codex/kubo-session-performance-20260506` at
+`0fb3952`.
+
+Purpose:
+
+Test a narrower form of direct `WANT_BLOCK` widening than the previously
+rejected broad sweeps. The source-address baseline showed the remaining slow
+asset row timing out a zero-HTTP post-lookup session shortcut, then selecting a
+late untrusted `WANT_HAVE` provider. This lab only widens direct `WANT_BLOCK`
+after that exact shape:
+
+- gateway subresource;
+- zero HTTP providers;
+- post-lookup session-shortcut wait timed out.
+
+Code shape:
+
+- disabled by default;
+- enable with
+  `FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK=1`;
+- default direct peer limit `5`;
+- tune with
+  `FREEDOM_IPFS_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK_PEERS=<n>`;
+- trace field:
+  `zero_http_post_lookup_shortcut_timeout`.
+
+Validation before live runs:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval zero_http_direct --lib -- --nocapture
+cargo test -p freedom-ipfs-retrieval zero_http_post_lookup --lib -- --nocapture
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+All passed.
+
+Opt-in command:
+
+```sh
+timeout 1200s env FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/zero-http-postlookup-timeout-direct5-ipfs-tech-r5-20260508T022107Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-postlookup-timeout-direct5-ipfs-tech-r5-20260508T022107Z.json
+```
+
+Opt-in result:
+
+- Rust/Kubo passed `5/5`.
+- Root: Rust `857/4048ms`; Kubo `1367/1509ms`.
+- Assets: Rust `118/436ms`; Kubo `79/165ms`.
+- `meaningful_kubo_wins`: `4`, root p95 and asset p95 TTFB/total.
+- Resource max: Rust `57956KiB` RSS and `43` FDs vs Kubo `139372KiB`
+  RSS and `77` FDs.
+- The lab gate fired `7` times:
+  `zero_http_post_lookup_shortcut_timeout=true`,
+  `zero_http_direct_want_block_peer_count=5`.
+- Bitswap successes in the opt-in run used only `want_block`: count `12`,
+  p50/p90/p95/max `208/265/295/485ms`, source indexes `0=11`, `4=1`.
+- Post-lookup shortcut waits were balanced: `7` hits and `7` timeouts.
+
+Immediate no-env post-control:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/zero-http-postlookup-timeout-direct5-post-control-ipfs-tech-r5-20260508T022219Z-trace.jsonl \
+  --comparison-output /tmp/zero-http-postlookup-timeout-direct5-post-control-ipfs-tech-r5-20260508T022219Z.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `5/5`.
+- Root: Rust `2102/2766ms`; Kubo `1427/1926ms`.
+- Assets: Rust `149/537ms`; Kubo `117/511ms`.
+- `meaningful_kubo_wins`: `4`, root p50/p95 TTFB/total.
+- Resource max: Rust `57924KiB` RSS and `45` FDs vs Kubo `157776KiB`
+  RSS and `104` FDs.
+- The same timeout context was observed but the disabled gate did not widen
+  direct wants: `13` post-lookup timeouts with
+  `zero_http_direct_want_block_peer_count=0`.
+- Bitswap successes were slower and included late `WANT_HAVE`: count `18`,
+  p50/p90/p95/max `302/1698/1709/1744ms`, source indexes
+  `0=6, 1=4, 2=1, 3=3, 4=2, 8=2`, request modes
+  `want_block=11, want_have=7`.
+
+Interpretation:
+
+The scoped gate works mechanically and improves the exact zero-HTTP Bitswap
+shape versus the immediate no-env control:
+
+- aggregate asset p50 moved `149ms -> 118ms`;
+- aggregate asset p95 moved `537ms -> 436ms`;
+- successful Bitswap p95 moved `1709ms -> 295ms`;
+- late `WANT_HAVE` disappeared from the triggered path.
+
+Do **not** promote it yet:
+
+- it still did not beat a fast Kubo asset p95 window (`436ms` vs `165ms`);
+- the opt-in run had a root p95 outlier dominated by a top-level delegated
+  lookup/self-hedge path, not the subresource gate;
+- the remaining worst path-local wins were now often HTTP-provider/Sia-backed
+  or top-level zero-HTTP root rows, so this lab is only a partial fix;
+- broad direct-WANT remains rejected; this code must stay env-gated unless a
+  multi-case guardrail shows a clear same-window win.
+
+Next lead:
+
+Keep this disabled lab for future comparisons, then focus on the two residual
+families it does not solve:
+
+- single-provider/Sia HTTP-provider latency where Kubo is still much faster on
+  small `_nuxt` rows;
+- top-level zero-HTTP root blocks that still select late `WANT_HAVE` peers and
+  can dominate root p50/p95 in some windows.
