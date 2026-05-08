@@ -45219,3 +45219,109 @@ fresh r5 keeps the current aggregate status intact: Rust still beats Kubo for
 the focused `ipfs.tech` page and remains much lighter on RSS/FDs. The window did
 not reproduce the rare WANT_HAVE fallback rows, so the new diagnostics are a
 guardrail for the next same-window sample that does hit them.
+
+## 2026-05-08: Post-Diagnostic Focused R10 Baseline
+
+Branch/head: `codex/kubo-session-performance-20260506` at `9a37ec2`.
+
+Purpose:
+
+Record the larger focused current-head baseline after the WANT_HAVE diagnostic
+trace enrichment. The previous r5 kept aggregate Rust wins but did not reproduce
+any explicit `bitswap_want_have_probe` events. This r10 asks whether the
+diagnostic fields capture the rare late-probe rows and whether the remaining
+gap is still aggregate-visible or only path-local.
+
+Command:
+
+```sh
+timeout 3600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/wanthave-tracefields-focused-r10-9a37ec2-20260508T040003Z-trace.jsonl \
+  --comparison-output /tmp/wanthave-tracefields-focused-r10-9a37ec2-20260508T040003Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `10/10` for both focused cases.
+- `ipfs.tech` page root: Rust `710/1275ms`; Kubo `1398/5180ms`.
+- `ipfs.tech` assets: Rust TTFB/total `83/326ms`; Kubo TTFB/total
+  `159/730ms` and `159/731ms`.
+- Wikipedia root: Rust `378/816ms`; Kubo `149/597ms`.
+- Meaningful aggregate Kubo wins: `4`, all Wikipedia root p50/p95 TTFB/total.
+- Resource max: Rust `50124KiB` RSS and `37` FDs vs Kubo `308232KiB`
+  RSS and `576` FDs.
+- Trace source latencies:
+  - Bitswap: `223` blocks, p50/p90/p95/max `63/287/333/868ms`;
+  - HTTP provider: `147` blocks, p50/p90/p95/max `107/256/299/933ms`.
+- Delegated provider lookup: `352` events, p50/p90/p95/max
+  `18/47/52/205ms`; `44` zero-HTTP, `169` single-HTTP, `139` multi-HTTP.
+- Request classifications:
+  `zero_http_provider_bitswap=44`,
+  `cold_bitswap_peer_expand=24`,
+  `zero_http_provider_cold_bitswap=24`,
+  `top_level_zero_http_provider_bitswap=11`,
+  `top_level_zero_http_provider_cold_bitswap=3`.
+- Bitswap connection setup remained a tail factor:
+  `63` established connections at p50/p90/p95/max `337/630/750/789ms`;
+  `11` connection errors.
+- `bitswap_want_have_probe` events: `1`, outcome
+  `timeout_fallback_want_block`, elapsed `500ms`.
+  The enriched fields identified it as candidate index `7`, request mode
+  `want_have`, first address `tcp`/`ip6`, peer address count `2`, target peer
+  count `9`.
+
+Path-local `ipfs.tech` asset Kubo wins inside the aggregate Rust asset win:
+
+- `/ipns/ipfs.tech/_nuxt/entry.C4ErMpWu.css`: Rust p50/p95 `514/871ms`;
+  Kubo `141/915ms`; Kubo only won p50.
+- `/ipns/ipfs.tech/_nuxt/hfYlCurB.js`: Rust p50/p95 `234/561ms`;
+  Kubo `99/414ms`; Kubo won p50 and p95.
+- `/ipns/ipfs.tech/_nuxt/BXkYzPrD.js`: Rust p50/p95 `192/780ms`;
+  Kubo `105/730ms`; Kubo only won p50 by the meaningful threshold.
+
+Trace diagnosis for the explicit WANT_HAVE row:
+
+- The row was `/ipns/ipfs.tech/_nuxt/entry.C4ErMpWu.css`.
+- The first shortcut path used an already trusted same-page Bitswap peer, then
+  timed out the zero-HTTP post-lookup wait after about `101ms`.
+- Broader provider expansion then selected nine peer targets; the single
+  explicit WANT_HAVE probe was a late untrusted candidate at index `7`.
+- The final winning block still arrived from the original trusted peer in
+  `want_block` mode, with the full request around `870ms`.
+
+Interpretation:
+
+This r10 reintroduced an aggregate Wikipedia p50/p95 loss in the same broad
+shape already seen in earlier selected windows: sparse zero-HTTP Bitswap roots
+where connection/source startup can cost more than Kubo's higher-resource
+approach. The WANT_HAVE enrichment worked, but the single timeout fallback was
+not the winning source and should not drive another global WANT_HAVE timeout
+change.
+
+The actionable shape is narrower:
+
+- zero-HTTP top-level/root rows where session shortcut and provider-list
+  Bitswap both depend on cold connection/source quality;
+- occasional `ipfs.tech` subresource rows where an already trusted page peer is
+  useful but loses time around the fixed post-lookup wait and broader expansion;
+- slow single-HTTP-provider rows, especially `ipfs-bridge.sia.dev`, remain a
+  separate tail but were not the main WANT_HAVE signal here.
+
+Next lead:
+
+Do not revisit global `WANT_HAVE`, DNS timeout, direct-WANT, or preconnect
+knobs based on this sample. Inspect whether a very narrow zero-HTTP policy can
+continue or overlap a trusted same-page shortcut after the `100ms` post-lookup
+timeout while broad provider expansion starts. It must be scoped to active
+gateway requests, bounded by existing request timeouts, and guardrailed against
+the selected r10 resource profile.
