@@ -2845,7 +2845,7 @@ fn format_trace_bitswap_want_have_probes(
         return None;
     }
     Some(format!(
-        "bitswap WANT_HAVE probes: events={} ok={} failures={} have={} dont_have={} block={} want_block_followups={} no_presence={} bytes={} extra_blocks={} max_timeout={}ms elapsed={} outcomes={} peers={}",
+        "bitswap WANT_HAVE probes: events={} ok={} failures={} have={} dont_have={} block={} want_block_followups={} no_presence={} bytes={} extra_blocks={} max_timeout={}ms elapsed={} outcomes={} peers={} candidate_indexes={} request_modes={} first_addr_transports={} first_addr_families={} target_peer_counts={} peer_addr_counts={}",
         probes.events,
         probes.ok,
         probes.failures,
@@ -2859,7 +2859,13 @@ fn format_trace_bitswap_want_have_probes(
         probes.max_timeout_ms,
         probes.elapsed_ms,
         format_trace_counts(&probes.outcomes),
-        format_trace_counts(&probes.peers)
+        format_trace_counts(&probes.peers),
+        format_trace_counts(&probes.candidate_indexes),
+        format_trace_counts(&probes.request_modes),
+        format_trace_counts(&probes.first_addr_transports),
+        format_trace_counts(&probes.first_addr_families),
+        format_trace_counts(&probes.target_peer_counts),
+        format_trace_counts(&probes.peer_addr_counts)
     ))
 }
 
@@ -7825,6 +7831,12 @@ struct TraceBitswapWantHaveProbeAggregate {
     elapsed_ms: LatencySummary,
     outcomes: Vec<TraceValueCount>,
     peers: Vec<TraceValueCount>,
+    candidate_indexes: Vec<TraceValueCount>,
+    request_modes: Vec<TraceValueCount>,
+    first_addr_transports: Vec<TraceValueCount>,
+    first_addr_families: Vec<TraceValueCount>,
+    target_peer_counts: Vec<TraceValueCount>,
+    peer_addr_counts: Vec<TraceValueCount>,
 }
 
 impl TraceBitswapWantHaveProbeAggregate {
@@ -8896,6 +8908,12 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_want_have_probe_elapsed_values = Vec::<u128>::new();
     let mut bitswap_want_have_probe_outcomes = BTreeMap::<String, usize>::new();
     let mut bitswap_want_have_probe_peers = BTreeMap::<String, usize>::new();
+    let mut bitswap_want_have_probe_candidate_indexes = BTreeMap::<String, usize>::new();
+    let mut bitswap_want_have_probe_request_modes = BTreeMap::<String, usize>::new();
+    let mut bitswap_want_have_probe_first_addr_transports = BTreeMap::<String, usize>::new();
+    let mut bitswap_want_have_probe_first_addr_families = BTreeMap::<String, usize>::new();
+    let mut bitswap_want_have_probe_target_peer_counts = BTreeMap::<String, usize>::new();
+    let mut bitswap_want_have_probe_peer_addr_counts = BTreeMap::<String, usize>::new();
     let mut bitswap_dial_plans = TraceBitswapDialPlanAggregate::default();
     let mut bitswap_incoming_blocks = TraceBitswapIncomingBlockAggregate::default();
     let mut bitswap_incoming_reads = TraceBitswapIncomingReadAggregate::default();
@@ -9719,6 +9737,48 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             if let Some(peer) = json_detail_string(value.get("peer")) {
                 *bitswap_want_have_probe_peers.entry(peer).or_default() += 1;
             }
+            if let Some(index) = json_detail_string(value.get("probe_peer_candidate_index")) {
+                if index != "-1" {
+                    *bitswap_want_have_probe_candidate_indexes
+                        .entry(index)
+                        .or_default() += 1;
+                }
+            }
+            if let Some(mode) = json_detail_string(value.get("probe_peer_request_mode")) {
+                if !mode.is_empty() {
+                    *bitswap_want_have_probe_request_modes
+                        .entry(mode)
+                        .or_default() += 1;
+                }
+            }
+            if let Some(transport) =
+                json_detail_string(value.get("probe_peer_first_addr_transport"))
+            {
+                if !transport.is_empty() && transport != "none" && transport != "unknown" {
+                    *bitswap_want_have_probe_first_addr_transports
+                        .entry(transport)
+                        .or_default() += 1;
+                }
+            }
+            if let Some(family) = json_detail_string(value.get("probe_peer_first_addr_family")) {
+                if !family.is_empty() && family != "none" && family != "unknown" {
+                    *bitswap_want_have_probe_first_addr_families
+                        .entry(family)
+                        .or_default() += 1;
+                }
+            }
+            if let Some(target_peer_count) =
+                json_detail_string(value.get("probe_target_peer_count"))
+            {
+                *bitswap_want_have_probe_target_peer_counts
+                    .entry(target_peer_count)
+                    .or_default() += 1;
+            }
+            if let Some(peer_addr_count) = json_detail_string(value.get("probe_peer_addr_count")) {
+                *bitswap_want_have_probe_peer_addr_counts
+                    .entry(peer_addr_count)
+                    .or_default() += 1;
+            }
         }
         if phase == "bitswap_dial_plan" {
             if let Some(cid) = json_detail_string(value.get("cid")) {
@@ -10275,6 +10335,14 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
             elapsed_ms: LatencySummary::from_values(bitswap_want_have_probe_elapsed_values),
             outcomes: sorted_trace_counts(bitswap_want_have_probe_outcomes),
             peers: sorted_trace_counts(bitswap_want_have_probe_peers),
+            candidate_indexes: sorted_trace_counts(bitswap_want_have_probe_candidate_indexes),
+            request_modes: sorted_trace_counts(bitswap_want_have_probe_request_modes),
+            first_addr_transports: sorted_trace_counts(
+                bitswap_want_have_probe_first_addr_transports,
+            ),
+            first_addr_families: sorted_trace_counts(bitswap_want_have_probe_first_addr_families),
+            target_peer_counts: sorted_trace_counts(bitswap_want_have_probe_target_peer_counts),
+            peer_addr_counts: sorted_trace_counts(bitswap_want_have_probe_peer_addr_counts),
         },
         bitswap_dial_plans,
         bitswap_incoming_blocks,
@@ -13616,8 +13684,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "{\"phase\":\"bitswap_want_have_probe\",\"elapsed_ms\":25,\"cid\":\"cid-a\",\"peer\":\"peer-a\",\"ok\":true,\"outcome\":\"have_then_want_block\",\"has_have\":true,\"has_dont_have\":false,\"presence_count\":1}\n",
-                "{\"phase\":\"bitswap_want_have_probe\",\"elapsed_ms\":750,\"cid\":\"cid-b\",\"peer\":\"peer-b\",\"ok\":false,\"outcome\":\"timeout_fallback_want_block\",\"timeout_ms\":750}\n",
+                "{\"phase\":\"bitswap_want_have_probe\",\"elapsed_ms\":25,\"cid\":\"cid-a\",\"peer\":\"peer-a\",\"ok\":true,\"outcome\":\"have_then_want_block\",\"has_have\":true,\"has_dont_have\":false,\"presence_count\":1,\"probe_peer_candidate_index\":0,\"probe_peer_request_mode\":\"want_have\",\"probe_peer_first_addr_transport\":\"tcp\",\"probe_peer_first_addr_family\":\"ip4\",\"probe_target_peer_count\":4,\"probe_peer_addr_count\":2}\n",
+                "{\"phase\":\"bitswap_want_have_probe\",\"elapsed_ms\":750,\"cid\":\"cid-b\",\"peer\":\"peer-b\",\"ok\":false,\"outcome\":\"timeout_fallback_want_block\",\"timeout_ms\":750,\"probe_peer_candidate_index\":3,\"probe_peer_request_mode\":\"want_have\",\"probe_peer_first_addr_transport\":\"quic-v1\",\"probe_peer_first_addr_family\":\"ip6\",\"probe_target_peer_count\":4,\"probe_peer_addr_count\":1}\n",
                 "{\"phase\":\"bitswap_want_have_probe\",\"elapsed_ms\":12,\"cid\":\"cid-c\",\"peer\":\"peer-c\",\"ok\":false,\"outcome\":\"dont_have\",\"has_have\":false,\"has_dont_have\":true,\"presence_count\":1}\n",
                 "{\"phase\":\"bitswap_want_have_probe\",\"elapsed_ms\":5,\"cid\":\"cid-d\",\"peer\":\"peer-a\",\"ok\":true,\"outcome\":\"block\",\"bytes\":42,\"extra_blocks\":2}\n",
                 "{\"phase\":\"bitswap_want_have_probe\",\"elapsed_ms\":18,\"cid\":\"cid-e\",\"peer\":\"peer-d\",\"ok\":false,\"outcome\":\"no_presence_fallback_want_block\",\"presence_count\":0}\n",
@@ -13648,6 +13716,19 @@ mod tests {
         assert_eq!(probes.outcomes[4].value, "timeout_fallback_want_block");
         assert_eq!(probes.peers[0].value, "peer-a");
         assert_eq!(probes.peers[0].count, 2);
+        assert_eq!(trace_value_count(&probes.candidate_indexes, "0"), 1);
+        assert_eq!(trace_value_count(&probes.candidate_indexes, "3"), 1);
+        assert_eq!(trace_value_count(&probes.request_modes, "want_have"), 2);
+        assert_eq!(trace_value_count(&probes.first_addr_transports, "tcp"), 1);
+        assert_eq!(
+            trace_value_count(&probes.first_addr_transports, "quic-v1"),
+            1
+        );
+        assert_eq!(trace_value_count(&probes.first_addr_families, "ip4"), 1);
+        assert_eq!(trace_value_count(&probes.first_addr_families, "ip6"), 1);
+        assert_eq!(trace_value_count(&probes.target_peer_counts, "4"), 2);
+        assert_eq!(trace_value_count(&probes.peer_addr_counts, "1"), 1);
+        assert_eq!(trace_value_count(&probes.peer_addr_counts, "2"), 1);
     }
 
     #[test]
@@ -13678,12 +13759,36 @@ mod tests {
                 value: "peer-a".to_string(),
                 count: 2,
             }],
+            candidate_indexes: vec![TraceValueCount {
+                value: "3".to_string(),
+                count: 1,
+            }],
+            request_modes: vec![TraceValueCount {
+                value: "want_have".to_string(),
+                count: 2,
+            }],
+            first_addr_transports: vec![TraceValueCount {
+                value: "tcp".to_string(),
+                count: 1,
+            }],
+            first_addr_families: vec![TraceValueCount {
+                value: "ip4".to_string(),
+                count: 1,
+            }],
+            target_peer_counts: vec![TraceValueCount {
+                value: "4".to_string(),
+                count: 2,
+            }],
+            peer_addr_counts: vec![TraceValueCount {
+                value: "1".to_string(),
+                count: 1,
+            }],
         })
         .unwrap();
 
         assert_eq!(
             line,
-            "bitswap WANT_HAVE probes: events=2 ok=1 failures=1 have=1 dont_have=0 block=0 want_block_followups=2 no_presence=1 bytes=0 extra_blocks=0 max_timeout=750ms elapsed=p50=25ms p90=750ms p95=750ms max=750ms outcomes=timeout_fallback_want_block=1 peers=peer-a=2"
+            "bitswap WANT_HAVE probes: events=2 ok=1 failures=1 have=1 dont_have=0 block=0 want_block_followups=2 no_presence=1 bytes=0 extra_blocks=0 max_timeout=750ms elapsed=p50=25ms p90=750ms p95=750ms max=750ms outcomes=timeout_fallback_want_block=1 peers=peer-a=2 candidate_indexes=3=1 request_modes=want_have=2 first_addr_transports=tcp=1 first_addr_families=ip4=1 target_peer_counts=4=2 peer_addr_counts=1=1"
         );
     }
 

@@ -45133,3 +45133,89 @@ knobs based on this run. The next useful work should either:
 - improve source-quality diagnostics for the rare path-local rows; or
 - find a very narrow source-selection rule that preserves the current selected
   r10 aggregate wins and resource profile.
+
+### WANT_HAVE Probe Source-Quality Diagnostics
+
+Branch/head before patch: `codex/kubo-session-performance-20260506` at
+`d9c56f5`.
+
+Purpose:
+
+The focused and selected r10 guardrails above showed rare
+`bitswap_want_have_probe` timeout-fallback rows, but those events only recorded
+peer/outcome/timing. Successful `bitswap_fetch` events already expose source
+candidate index, request mode, address family, and transport, so the remaining
+diagnostic gap was specific to WANT_HAVE probes.
+
+Change:
+
+Behavior-neutral trace enrichment only:
+
+- carry each Bitswap peer target's original candidate index into the outgoing
+  request path;
+- add structured fields to every `bitswap_want_have_probe` event:
+  `probe_peer_candidate_index`, `probe_peer_addr_count`,
+  `probe_peer_first_addr_transport`, `probe_peer_first_addr_family`,
+  `probe_peer_request_mode`, `probe_peer_skip_want_have`,
+  `probe_peer_force_want_block`, `probe_peer_force_want_have`, and
+  `probe_target_peer_count`;
+- extend the mobile web harness trace summary with aggregate WANT_HAVE probe
+  distributions for candidate indexes, request modes, first-address
+  transports/families, target peer counts, and peer address counts.
+
+Validation:
+
+```sh
+cargo test -p mobile-web-harness bitswap_want_have_probe
+cargo test -p freedom-ipfs-retrieval traces_bitswap_source_peer_candidate_mode
+```
+
+Both passed.
+
+Fresh same-window r5 command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/wanthave-tracefields-focused-r5-d9c56f5-20260508T035212Z-trace.jsonl \
+  --comparison-output /tmp/wanthave-tracefields-focused-r5-d9c56f5-20260508T035212Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5` for both cases.
+- `ipfs.tech` root: Rust `928/1164ms`; Kubo `1490/1951ms`.
+- `ipfs.tech` assets: Rust TTFB/total `84/280ms`; Kubo TTFB/total
+  `227/844ms`.
+- Wikipedia root: Rust `368/853ms`; Kubo `552/834ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `49424KiB` RSS and `29` FDs vs Kubo `262716KiB`
+  RSS and `320` FDs.
+- Trace source latencies:
+  - Bitswap: `118` blocks, p50/p90/p95/max `78/275/345/491ms`;
+  - HTTP provider: `67` blocks, p50/p90/p95/max `91/251/276/775ms`.
+- Request classifications:
+  `zero_http_provider_bitswap=14`,
+  `cold_bitswap_peer_expand=9`,
+  `zero_http_provider_cold_bitswap=9`,
+  `top_level_zero_http_provider_bitswap=9`,
+  `top_level_zero_http_provider_cold_bitswap=7`.
+- `bitswap_want_have_probe` events: `0` in this network window, with the new
+  summary fields present and empty in the JSON.
+
+Interpretation:
+
+No behavior changed and no new default should be inferred from this run. The
+fresh r5 keeps the current aggregate status intact: Rust still beats Kubo for
+the focused `ipfs.tech` page and remains much lighter on RSS/FDs. The window did
+not reproduce the rare WANT_HAVE fallback rows, so the new diagnostics are a
+guardrail for the next same-window sample that does hit them.

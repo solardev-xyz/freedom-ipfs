@@ -6799,6 +6799,8 @@ fn prune_http_provider_scores(scores: &mut HashMap<String, HttpProviderScore>, n
 struct BitswapPeerTarget {
     id: PeerId,
     addrs: Vec<Multiaddr>,
+    candidate_index: usize,
+    target_peer_count: usize,
     skip_want_have: bool,
     force_want_block: bool,
     force_want_have: bool,
@@ -6816,6 +6818,38 @@ enum BitswapPeerFailureKind {
 struct BitswapProtocolFailure {
     kind: BitswapPeerFailureKind,
     detail: String,
+}
+
+#[derive(Clone, Copy)]
+struct BitswapWantHaveProbeTrace {
+    peer_candidate_index: usize,
+    target_peer_count: usize,
+    peer_addr_count: usize,
+    peer_first_addr_transport: &'static str,
+    peer_first_addr_family: &'static str,
+    prefer_want_have: bool,
+    skip_want_have: bool,
+    force_want_block: bool,
+    force_want_have: bool,
+}
+
+impl BitswapWantHaveProbeTrace {
+    fn request_mode(self) -> &'static str {
+        if self.prefer_want_have {
+            "want_have"
+        } else {
+            "want_block"
+        }
+    }
+}
+
+struct BitswapOutgoingStreamRequest {
+    peer_id: PeerId,
+    addrs: Vec<Multiaddr>,
+    prefer_want_have: bool,
+    request_timeouts: BitswapRequestTimeouts,
+    want_have_probe_trace: BitswapWantHaveProbeTrace,
+    peer_transports: PeerTransportLog,
 }
 
 impl BitswapProtocolFailure {
@@ -7399,7 +7433,7 @@ async fn run_shared_bitswap_swarm(
 
                 let mut peer_plans = Vec::new();
                 let mut dial_candidates = Vec::new();
-                for peer in command.peers {
+                for (candidate_index, peer) in command.peers.into_iter().enumerate() {
                     if let Some(remaining_ms) = connection_error_backoff_remaining_ms(
                         &connection_error_backoff,
                         &peer.id,
@@ -7432,7 +7466,7 @@ async fn run_shared_bitswap_swarm(
                     if should_dial {
                         dial_candidates.push(peer.clone());
                     }
-                    peer_plans.push((peer, already_connected, already_pending));
+                    peer_plans.push((candidate_index, peer, already_connected, already_pending));
                 }
                 let max_dial_addr_count = bitswap_max_dial_addrs_per_command();
                 let (dial_addrs, suppressed_dial_addrs) =
@@ -7457,7 +7491,7 @@ async fn run_shared_bitswap_swarm(
                 let mut connected_peer_count = 0usize;
                 let mut pending_dial_peer_count = 0usize;
                 let candidate_peer_count = peer_plans.len();
-                for (peer, already_connected, already_pending) in peer_plans {
+                for (candidate_index, peer, already_connected, already_pending) in peer_plans {
                     let connection_ready = if already_connected {
                         connected_peer_count += 1;
                         None
@@ -7477,6 +7511,8 @@ async fn run_shared_bitswap_swarm(
                     peer_targets.push(BitswapPeerTarget {
                         id: peer.id,
                         addrs: peer.addrs,
+                        candidate_index,
+                        target_peer_count: 0,
                         skip_want_have: peer.skip_want_have,
                         force_want_block: peer.force_want_block,
                         force_want_have: peer.force_want_have,
@@ -9709,8 +9745,10 @@ async fn fetch_bitswap_batch_over_outgoing_streams(
         stream_read: stream_read_timeout,
     };
     let target_summary = format_bitswap_targets(&peers);
+    let target_peer_count = peers.len();
     let mut direct_untrusted_want_block_count = 0usize;
-    for peer in peers {
+    for mut peer in peers {
+        peer.target_peer_count = target_peer_count;
         let prefer_want_have = bitswap_prefer_want_have(
             has_multiple_peers,
             peer.skip_want_have,
@@ -9841,10 +9879,12 @@ async fn request_bitswap_blocks_after_connection(
     let BitswapPeerTarget {
         id: peer_id,
         addrs,
+        candidate_index,
+        target_peer_count,
         connection_ready,
+        skip_want_have,
         force_want_block,
         force_want_have,
-        ..
     } = peer;
 
     let attempt_started = Instant::now();
@@ -9852,6 +9892,20 @@ async fn request_bitswap_blocks_after_connection(
     let cid_count = cids.len();
     let cid_summary = tracing::enabled!(tracing::Level::INFO).then(|| format_cids(&cids));
     let connection_ready_timeout = bitswap_connection_ready_timeout();
+    let want_have_probe_trace = BitswapWantHaveProbeTrace {
+        peer_candidate_index: candidate_index,
+        target_peer_count,
+        peer_addr_count: addrs.len(),
+        peer_first_addr_transport: addrs.first().map(bitswap_transport_label).unwrap_or("none"),
+        peer_first_addr_family: addrs
+            .first()
+            .map(bitswap_addr_family_label)
+            .unwrap_or("none"),
+        prefer_want_have,
+        skip_want_have,
+        force_want_block,
+        force_want_have,
+    };
     tracing::info!(
         phase = "bitswap_peer_attempt_start",
         cid = %primary_cid,
@@ -9928,12 +9982,15 @@ async fn request_bitswap_blocks_after_connection(
     }
     let result = request_bitswap_blocks(
         control,
-        peer_id,
-        addrs,
         cids,
-        prefer_want_have,
-        request_timeouts,
-        peer_transports,
+        BitswapOutgoingStreamRequest {
+            peer_id,
+            addrs,
+            prefer_want_have,
+            request_timeouts,
+            want_have_probe_trace,
+            peer_transports,
+        },
     )
     .await;
     match &result {
@@ -9994,13 +10051,17 @@ fn bitswap_peer_failure_kind_label(kind: BitswapPeerFailureKind) -> &'static str
 
 async fn request_bitswap_blocks(
     mut control: StreamControl,
-    peer_id: PeerId,
-    addrs: Vec<Multiaddr>,
     cids: Vec<Cid>,
-    prefer_want_have: bool,
-    request_timeouts: BitswapRequestTimeouts,
-    peer_transports: PeerTransportLog,
+    request: BitswapOutgoingStreamRequest,
 ) -> std::result::Result<BitswapFetchBatchResult, BitswapPeerFailure> {
+    let BitswapOutgoingStreamRequest {
+        peer_id,
+        addrs,
+        prefer_want_have,
+        request_timeouts,
+        want_have_probe_trace,
+        peer_transports,
+    } = request;
     let mut failures = Vec::new();
     let primary_cid = cids[0];
     let cid_count = cids.len();
@@ -10037,6 +10098,7 @@ async fn request_bitswap_blocks(
                 peer_id,
                 &protocol_name,
                 request_timeouts,
+                want_have_probe_trace,
             )
             .await
             {
@@ -10125,6 +10187,7 @@ async fn request_bitswap_block_after_want_have<T>(
     peer_id: PeerId,
     protocol_name: &str,
     request_timeouts: BitswapRequestTimeouts,
+    probe_trace: BitswapWantHaveProbeTrace,
 ) -> std::result::Result<BitswapFetchResult, WantHaveFailure>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -10135,6 +10198,15 @@ where
             phase = "bitswap_want_have_probe",
             cid = %cid,
             peer = %peer_id,
+            probe_peer_candidate_index = probe_trace.peer_candidate_index as i64,
+            probe_peer_addr_count = probe_trace.peer_addr_count,
+            probe_peer_first_addr_transport = probe_trace.peer_first_addr_transport,
+            probe_peer_first_addr_family = probe_trace.peer_first_addr_family,
+            probe_peer_request_mode = probe_trace.request_mode(),
+            probe_peer_skip_want_have = probe_trace.skip_want_have,
+            probe_peer_force_want_block = probe_trace.force_want_block,
+            probe_peer_force_want_have = probe_trace.force_want_have,
+            probe_target_peer_count = probe_trace.target_peer_count,
             protocol = protocol_name,
             ok = false,
             outcome = "write_failed",
@@ -10154,6 +10226,15 @@ where
                 phase = "bitswap_want_have_probe",
                 cid = %cid,
                 peer = %peer_id,
+                probe_peer_candidate_index = probe_trace.peer_candidate_index as i64,
+                probe_peer_addr_count = probe_trace.peer_addr_count,
+                probe_peer_first_addr_transport = probe_trace.peer_first_addr_transport,
+                probe_peer_first_addr_family = probe_trace.peer_first_addr_family,
+                probe_peer_request_mode = probe_trace.request_mode(),
+                probe_peer_skip_want_have = probe_trace.skip_want_have,
+                probe_peer_force_want_block = probe_trace.force_want_block,
+                probe_peer_force_want_have = probe_trace.force_want_have,
+                probe_target_peer_count = probe_trace.target_peer_count,
                 protocol = protocol_name,
                 ok = false,
                 outcome = "read_failed",
@@ -10171,6 +10252,15 @@ where
                 phase = "bitswap_want_have_probe",
                 cid = %cid,
                 peer = %peer_id,
+                probe_peer_candidate_index = probe_trace.peer_candidate_index as i64,
+                probe_peer_addr_count = probe_trace.peer_addr_count,
+                probe_peer_first_addr_transport = probe_trace.peer_first_addr_transport,
+                probe_peer_first_addr_family = probe_trace.peer_first_addr_family,
+                probe_peer_request_mode = probe_trace.request_mode(),
+                probe_peer_skip_want_have = probe_trace.skip_want_have,
+                probe_peer_force_want_block = probe_trace.force_want_block,
+                probe_peer_force_want_have = probe_trace.force_want_have,
+                probe_target_peer_count = probe_trace.target_peer_count,
                 protocol = protocol_name,
                 ok = false,
                 outcome = "timeout_fallback_want_block",
@@ -10195,6 +10285,15 @@ where
             phase = "bitswap_want_have_probe",
             cid = %cid,
             peer = %peer_id,
+            probe_peer_candidate_index = probe_trace.peer_candidate_index as i64,
+            probe_peer_addr_count = probe_trace.peer_addr_count,
+            probe_peer_first_addr_transport = probe_trace.peer_first_addr_transport,
+            probe_peer_first_addr_family = probe_trace.peer_first_addr_family,
+            probe_peer_request_mode = probe_trace.request_mode(),
+            probe_peer_skip_want_have = probe_trace.skip_want_have,
+            probe_peer_force_want_block = probe_trace.force_want_block,
+            probe_peer_force_want_have = probe_trace.force_want_have,
+            probe_target_peer_count = probe_trace.target_peer_count,
             protocol = protocol_name,
             ok = true,
             outcome = "block",
@@ -10213,6 +10312,15 @@ where
             phase = "bitswap_want_have_probe",
             cid = %cid,
             peer = %peer_id,
+            probe_peer_candidate_index = probe_trace.peer_candidate_index as i64,
+            probe_peer_addr_count = probe_trace.peer_addr_count,
+            probe_peer_first_addr_transport = probe_trace.peer_first_addr_transport,
+            probe_peer_first_addr_family = probe_trace.peer_first_addr_family,
+            probe_peer_request_mode = probe_trace.request_mode(),
+            probe_peer_skip_want_have = probe_trace.skip_want_have,
+            probe_peer_force_want_block = probe_trace.force_want_block,
+            probe_peer_force_want_have = probe_trace.force_want_have,
+            probe_target_peer_count = probe_trace.target_peer_count,
             protocol = protocol_name,
             ok = false,
             outcome = "dont_have",
@@ -10229,6 +10337,15 @@ where
         phase = "bitswap_want_have_probe",
         cid = %cid,
         peer = %peer_id,
+        probe_peer_candidate_index = probe_trace.peer_candidate_index as i64,
+        probe_peer_addr_count = probe_trace.peer_addr_count,
+        probe_peer_first_addr_transport = probe_trace.peer_first_addr_transport,
+        probe_peer_first_addr_family = probe_trace.peer_first_addr_family,
+        probe_peer_request_mode = probe_trace.request_mode(),
+        probe_peer_skip_want_have = probe_trace.skip_want_have,
+        probe_peer_force_want_block = probe_trace.force_want_block,
+        probe_peer_force_want_have = probe_trace.force_want_have,
+        probe_target_peer_count = probe_trace.target_peer_count,
         protocol = protocol_name,
         ok = true,
         outcome = if has_have {
