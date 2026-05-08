@@ -44572,3 +44572,147 @@ not fixed by this combo:
 - sparse zero-HTTP Bitswap rows where the source is already `WANT_BLOCK`, so
   the remaining tax is peer/address connection startup or source quality rather
   than `WANT_HAVE` timeout length.
+
+## 2026-05-08: Scoped Zero-HTTP DNS Timeout Default Probe
+
+Branch/head before the probe: `codex/kubo-session-performance-20260506` at
+`849e29d`.
+
+Hypothesis:
+
+The earlier `FREEDOM_IPFS_BITSWAP_DNS_LOOKUP_TIMEOUT_MS=50` labs showed that
+short DNS expansion caps can reduce runaway DNS work during zero-HTTP
+post-lookup Bitswap paths, but a global cap looked too broad. This probe tested
+whether the same `50ms` cap should instead become a scoped default only for the
+zero-HTTP post-lookup DNS prefetch path, leaving normal Bitswap provider
+expansion on the existing env-controlled behavior.
+
+Implementation sketch tested locally, then rejected:
+
+- added a `50ms` scoped default for zero-HTTP post-lookup DNS prefetch;
+- allowed rollback with `FREEDOM_IPFS_ZERO_HTTP_POST_LOOKUP_DNS_TIMEOUT_MS=0`;
+- kept the existing `FREEDOM_IPFS_BITSWAP_DNS_LOOKUP_TIMEOUT_MS` behavior for
+  normal Bitswap DNS expansion.
+
+Scoped default command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/scoped-zero-http-dns50-selected-r5-849e29d-20260508T031443Z-trace.jsonl \
+  --comparison-output /tmp/scoped-zero-http-dns50-selected-r5-849e29d-20260508T031443Z.json
+```
+
+Scoped default result:
+
+- Rust/Kubo passed `5/5` all selected cases.
+- DAICO root: Rust `283/1031ms`; Kubo `2416/3391ms`.
+- Vitalik range root: Rust `105/109ms`; Kubo `3427/4011ms`.
+- `ipfs.tech` range root: Rust `662/1291ms`; Kubo `1168/1336ms`.
+- `ipfs.tech` page root: Rust `3/4ms`; Kubo `2/3ms`.
+- `ipfs.tech` assets: Rust TTFB/total `109/415ms`; Kubo TTFB/total
+  `357/518ms`.
+- `ipfs.tech` developers hero: Rust `101/146ms`; Kubo `440/466ms`.
+- Wikipedia root: Rust `611/703ms`; Kubo `718/741ms`.
+- Meaningful Kubo wins: none.
+- Resource max: Rust `52284KiB` RSS and `32` FDs vs Kubo `168072KiB`
+  RSS and `254` FDs.
+- Block fetch source p50/p90/p95/max:
+  - HTTP provider: `105/238/406/964ms` across `132` blocks;
+  - Bitswap: `93/297/493/613ms` across `83` blocks.
+- Delegated lookup p50/p90/p95/max: `17/45/48/100ms`.
+- Bitswap DNS expansion: `42` events, `25` cached, `17` uncached,
+  `19` failed, `251` records, `5` IPs.
+- Request classifications:
+  `zero_http_provider_bitswap=17`,
+  `cold_bitswap_peer_expand=12`,
+  `zero_http_provider_cold_bitswap=12`,
+  `top_level_zero_http_provider_bitswap=8`,
+  `top_level_zero_http_provider_cold_bitswap=5`.
+
+Immediate rollback control command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_ZERO_HTTP_POST_LOOKUP_DNS_TIMEOUT_MS=0 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/scoped-zero-http-dns50-disable-control-r5-849e29d-20260508T031736Z-trace.jsonl \
+  --comparison-output /tmp/scoped-zero-http-dns50-disable-control-r5-849e29d-20260508T031736Z.json
+```
+
+Rollback control result:
+
+- Rust/Kubo passed `5/5` all selected cases.
+- DAICO root: Rust `271/521ms`; Kubo `2210/2474ms`.
+- Vitalik range root: Rust `118/146ms`; Kubo `2201/2495ms`.
+- `ipfs.tech` range root: Rust `577/701ms`; Kubo `744/1022ms`.
+- `ipfs.tech` page root: Rust `3/3ms`; Kubo `2/2ms`.
+- `ipfs.tech` assets: Rust TTFB/total `87/249ms`; Kubo TTFB/total
+  `355/436ms`.
+- `ipfs.tech` developers hero: Rust `109/122ms`; Kubo `449/456ms`.
+- Wikipedia root: Rust `385/756ms`; Kubo `738/758ms`.
+- Meaningful Kubo wins: none.
+- Resource max: Rust `52236KiB` RSS and `37` FDs vs Kubo `169760KiB`
+  RSS and `275` FDs.
+- Block fetch source p50/p90/p95/max:
+  - HTTP provider: `98/226/243/427ms` across `99` blocks;
+  - Bitswap: `68/259/307/498ms` across `116` blocks.
+- Delegated lookup p50/p90/p95/max: `18/44/48/262ms`.
+- Bitswap DNS expansion: `54` events, `33` cached, `21` uncached,
+  `21` failed, `515` records, `5` IPs.
+- Request classifications:
+  `zero_http_provider_bitswap=20`,
+  `cold_bitswap_peer_expand=11`,
+  `zero_http_provider_cold_bitswap=11`,
+  `top_level_zero_http_provider_bitswap=10`,
+  `top_level_zero_http_provider_cold_bitswap=7`.
+
+Decision:
+
+Reject the scoped default.
+
+The scoped cap did reduce DNS work (`251` DNS records vs `515` in the rollback
+control), but the latency tradeoff was wrong for the active target workload:
+
+- `ipfs.tech` asset p95 regressed from `249/250ms` to `415/415ms`;
+- Bitswap p95 regressed from `307ms` to `493ms`;
+- HTTP-provider p95 regressed from `243ms` to `406ms`;
+- DAICO and `ipfs.tech` range-root p95 were also worse under the scoped cap.
+
+This suggests the DNS expansion work is not pure overhead in the current
+selected window. Some of those extra records likely improve peer/source quality
+enough to beat the smaller DNS workload. Keep DNS capping as an opt-in lab knob,
+but do not make a scoped `50ms` default.
+
+Next lead:
+
+Continue classifying the residual slow rows by source quality rather than only
+DNS volume. In this pair, the rollback control did more DNS work but achieved
+better Bitswap and HTTP-provider tails, which points back toward peer/address
+quality, source selection, and hedging policy instead of a simple DNS cap.
