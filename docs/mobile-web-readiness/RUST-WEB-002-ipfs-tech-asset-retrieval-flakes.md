@@ -43230,3 +43230,182 @@ startup for zero-HTTP subresources:
   provider choice;
 - add trace fields for selected candidate multiaddr/transport ordering if the
   current trace is not enough to explain the 500ms connection setup tax.
+
+## 2026-05-08: Global Bitswap Dial Address Cap Is Not A Clean Promotion Path
+
+Branch/head: `codex/kubo-session-performance-20260506` at `756e9f2`.
+
+Purpose:
+
+The BfUT zero-HTTP tail above suggested that the default Bitswap dial-address cap
+may be suppressing useful alternate addresses. The captured dial plan for the
+bad window showed providers with additional TCP/QUIC addresses behind the first
+per-peer address. This tested whether simply widening the global
+`FREEDOM_IPFS_BITSWAP_MAX_DIAL_ADDRS_PER_COMMAND` cap could close the tail.
+
+First probe, global cap `8`:
+
+```sh
+timeout 1200s env FREEDOM_IPFS_BITSWAP_MAX_DIAL_ADDRS_PER_COMMAND=8 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/bitswap-dial-addrs8-ipfs-tech-r5-20260508T014309Z-trace.jsonl \
+  --comparison-output /tmp/bitswap-dial-addrs8-ipfs-tech-r5-20260508T014309Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/p90/p95/max `35/35/35/35`, data max `793822`,
+  duplicate blocks max `0`, messages p50/p90/max `77/122/122`, peers
+  p50/p90/max `10/27/27`.
+- Root: Rust `562/703ms`; Kubo `1355/1719ms`.
+- Assets: Rust `105/422ms`; Kubo `68/136ms`.
+- `meaningful_kubo_wins`: `2`, both asset p95 TTFB/total by `286ms`
+  (`3.10x`).
+- Resource max: Rust `57468KiB` RSS and `36` FDs vs Kubo `174412KiB` RSS
+  and `135` FDs.
+
+Rust trace:
+
+- HTTP-provider blocks: `103`, p50/p90/p95/max `177/242/263/490ms`.
+- Bitswap blocks: `95`, p50/p90/p95/max `81/189/230/353ms`.
+- Zero-HTTP Bitswap classifications: `7`, p50/p90/p95/max
+  `312/563/563/563ms`.
+- Bitswap dial plans: `122` events, `171` peer targets, `44` new dial peers,
+  `52` new dial addresses, `30` suppressed addresses, max queued `44ms`.
+- Bitswap peer attempts: `170`.
+- Bitswap connections established: `23`, p50/p90/p95/max
+  `338/544/551/568ms`, all TCP.
+- Bitswap source peers for the zero-HTTP wins were mostly
+  `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT`; source transports
+  remained TCP. The run did not prove a QUIC win.
+- No Bitswap connection errors were observed.
+
+Immediate no-env post-control:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/bitswap-dial-addrs8-post-control-ipfs-tech-r5-20260508T014309Z-trace.jsonl \
+  --comparison-output /tmp/bitswap-dial-addrs8-post-control-ipfs-tech-r5-20260508T014309Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/p90/p95/max `35/37/37/37`, data max `794090`,
+  duplicate blocks max `1`, messages p50/p90/max `73/189/189`, peers
+  p50/p90/max `29/33/33`.
+- Root: Rust `627/782ms`; Kubo `1637/1993ms`.
+- Assets: Rust `181/415ms`; Kubo `186/1270ms`.
+- `meaningful_kubo_wins`: none.
+- Resource max: Rust `57768KiB` RSS and `40` FDs vs Kubo `237584KiB` RSS
+  and `293` FDs.
+
+Control trace:
+
+- HTTP-provider blocks: `144`, p50/p90/p95/max `181/253/285/425ms`.
+- Bitswap blocks: `54`, p50/p90/p95/max `138/331/339/439ms`.
+- Zero-HTTP Bitswap classifications: `10`, p50/p90/p95/max
+  `341/642/779/779ms`.
+- `_nuxt/BfUTpfA9.js` itself was about `337/341ms`, but top-level
+  zero-HTTP/root requests produced the `779ms` classified tail.
+- Bitswap dial plans: `174` events, `223` peer targets, `41` new dial peers,
+  `45` new dial addresses, `57` suppressed addresses, max queued `50ms`.
+- Bitswap peer attempts: `223`.
+- Bitswap connections established: `22`, p50/p90/p95/max
+  `325/549/571/592ms`, all TCP.
+- One Bitswap connection error was observed, `no_route_to_host` on an IPv6
+  address.
+
+Interpretation:
+
+The cap-8 probe showed a real-looking internal improvement in Rust Bitswap block
+latency and asset median compared with this no-env control (`105ms` vs
+`181ms`). However, same-window Kubo behavior moved even more: Kubo had a very
+fast asset p95 in the cap-8 run (`136ms`) and a very slow p95 in the control
+(`1270ms`). That means the global cap-8 run is useful signal, but not promotion
+evidence. It also did not fully close Kubo's p95 when Kubo was in a fast window.
+
+Follow-up probe, global cap `6`:
+
+```sh
+timeout 1200s env FREEDOM_IPFS_BITSWAP_MAX_DIAL_ADDRS_PER_COMMAND=6 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/bitswap-dial-addrs6-ipfs-tech-r5-20260508T014830Z-trace.jsonl \
+  --comparison-output /tmp/bitswap-dial-addrs6-ipfs-tech-r5-20260508T014830Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/p90/p95/max `35/35/35/35`, duplicate blocks max `0`,
+  messages p50/p90/max `39/45/45`, peers p50/p90/max `7/11/11`.
+- Root: Rust `535/725ms`; Kubo `1240/1412ms`.
+- Assets: Rust `118/468ms`; Kubo `80/220ms`.
+- `meaningful_kubo_wins`: `2`, both asset p95 TTFB/total by `248ms`
+  (`2.13x`).
+- Resource max: Rust `57104KiB` RSS and `33` FDs vs Kubo `135552KiB` RSS
+  and `65` FDs.
+
+Rust trace:
+
+- HTTP-provider blocks: `150`, p50/p90/p95/max `182/247/294/457ms`.
+- Bitswap blocks: `50`, p50/p90/p95/max `123/239/260/322ms`.
+- Zero-HTTP Bitswap classifications: `6`, p50/p90/p95/max
+  `203/631/631/631ms`.
+- Bitswap dial plans: `95` events, `120` peer targets, `30` new dial peers,
+  `30` new dial addresses, `36` suppressed addresses, max queued `42ms`.
+- Bitswap peer attempts: `120`.
+- Bitswap connections established: `15`, p50/p90/p95/max
+  `314/582/638/638ms`, all TCP.
+- No Bitswap connection errors were observed.
+
+Decision:
+
+Do not promote a global Bitswap dial-address cap increase. Cap `8` may improve
+some zero-HTTP median/block behavior, but did not beat a fast Kubo p95 and the
+immediate no-env control was already aggregate-clean because public-network
+variance dominated Kubo's tail. Cap `6` was clearly not enough and regressed the
+active asset p95 gap.
+
+Next lead:
+
+Continue with finer peer/address selection instead of broad fanout:
+
+- trace the selected multiaddr, address index, peer index, address family, and
+  rejected/suppressed reason for the block-winning peer, not only the peer id;
+- distinguish "alternate address for already-selected peer" from "more peers"
+  in the dial cap, because cap `8` may have helped by trying a second TCP
+  address rather than by increasing provider diversity;
+- consider scoped experiments for zero-HTTP gateway subresources only, but keep
+  them disabled until same-window controls beat Kubo in a fast Kubo window and
+  preserve RSS/FD bounds;
+- study whether Kubo avoids the slow IPv6/TCP or slow protocol-negotiation
+  addresses earlier than we do.
