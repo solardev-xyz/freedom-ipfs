@@ -689,6 +689,7 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         | "bitswap_incoming_block"
         | "bitswap_incoming_batch"
         | "bitswap_peer_attempt"
+        | "bitswap_peer_attempt_cancelled"
         | "bitswap_peer_attempt_start"
         | "bitswap_peer_expand"
         | "bitswap_dial_plan"

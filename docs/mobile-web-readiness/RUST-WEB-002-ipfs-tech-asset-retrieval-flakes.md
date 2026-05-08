@@ -45927,3 +45927,132 @@ zero-HTTP cold Bitswap pattern. Avoid replaying broad direct-WANT, DNS timeout,
 or global grace knobs; prior guardrails rejected those shapes. Look for a
 narrow source-quality or page-session rule that can clip the `1s+` zero-HTTP
 subresource tail without increasing the normal selected-suite RSS/FD profile.
+
+## 2026-05-08: Keep Diagnostic - Bitswap Peer Attempt Cancellation Stages
+
+Branch/head before patch: `codex/kubo-session-performance-20260506` at
+`66f7e8b`.
+
+Hypothesis:
+
+The current zero-HTTP cold Bitswap traces show which peer eventually delivered
+the block, but not what happened to the other scheduled peer attempts when an
+incoming block wins. That makes it hard to decide whether the next experiment
+should add peer/address fanout, change peer ordering, change address ordering,
+or avoid touching scheduling at all.
+
+Change:
+
+- Add `bitswap_peer_attempt_cancelled` diagnostics when a peer attempt future is
+  dropped before outgoing completion.
+- Include the cancellation stage:
+  - `waiting_connection`
+  - `requesting_blocks`
+- Include candidate index, request mode, first address transport/family, target
+  peer count, and timeout budgets.
+- Extend the mobile web harness summary so future runs print cancellation
+  stages, candidate indexes, request modes, and first address transport/family.
+- Map the new trace phase to the existing `fetching_bitswap` progress bucket in
+  the Rust mobile progress mapper and harness progress summary. This keeps the
+  mobile-facing progress vocabulary stable; no ABI or Swift surface changed.
+
+This is diagnostic-only. It does not change provider selection, peer ordering,
+dial fanout, timeouts, request modes, caching, verification, or fallback policy.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo test -p freedom-ipfs-retrieval bitswap --lib -- --nocapture
+cargo check -p mobile-web-harness --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+cargo test -p mobile-web-harness bitswap_peer_attempt -- --nocapture
+cargo check -p freedom-ipfs-mobile --all-targets
+cargo test -p freedom-ipfs-mobile progress -- --nocapture
+cargo clippy -p freedom-ipfs-mobile --all-targets -- -D warnings
+git diff --check
+```
+
+Result:
+
+- Formatting passed after applying `cargo fmt --all`.
+- Retrieval bitswap-focused tests passed: `153` passed, `1` ignored.
+- Mobile harness bitswap-attempt tests passed: `2` passed.
+- Mobile progress tests passed: `7` passed.
+- Retrieval, harness, and mobile check/clippy passed.
+- Diff whitespace check passed.
+
+Live focused r5:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/peer-attempt-cancel-diag-ipfs-tech-r5-66f7e8b-20260508Tdiag-trace.jsonl \
+  --comparison-output /tmp/peer-attempt-cancel-diag-ipfs-tech-r5-66f7e8b-20260508Tdiag.json
+```
+
+Live result:
+
+- Rust/Kubo passed `5/5`.
+- Root: Rust p50/p95 `1342/1614ms`; Kubo `1796/1926ms`.
+- Assets: Rust p50/p95 `91/285ms`; Kubo `108/431ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `50132KiB` RSS and `25` FDs vs Kubo `205628KiB` RSS
+  and `214` FDs.
+- Request classifications:
+  - `zero_http_provider_bitswap=10`
+  - `cold_bitswap_peer_expand=6`
+  - `zero_http_provider_cold_bitswap=6`
+- Bitswap source candidate indexes:
+  - `0=4`
+  - `1=1`
+  - `5=1`
+- Bitswap max source latency: `1022ms`.
+
+Trace findings:
+
+- The new diagnostic emitted `159` `bitswap_peer_attempt_cancelled` events.
+- Cancellation stages:
+  - `requesting_blocks=136`
+  - `waiting_connection=23`
+- The slowest zero-HTTP cold Bitswap row moved to
+  `/ipns/ipfs.tech/_nuxt/DBHrpFkY.js`, max `1025ms`.
+- Its block `bafkreielvcebwofknsv45gt7avlw5jy5bdyhza74tlwdp3b4zdx2qobvuy`
+  was fetched by Bitswap in `829ms` from candidate index `5`, request mode
+  `want_have`, over TCP.
+- For that same CID, cancelled attempts showed a mixed state:
+  - several candidates were already in `requesting_blocks`;
+  - several were still `waiting_connection`;
+  - the eventual candidate `5` was also in `requesting_blocks` before the
+    incoming block won.
+- The recurring CSS CID
+  `bafkreifmja74h3c7zpdcahxkmzyyhlyugnm3z6ey5ztt46leyiu3otdgmi` was no longer
+  a `1s+` outlier in this window. It maxed near `250ms`, and all five fetches
+  came from candidate index `0`.
+
+Decision:
+
+Keep. The diagnostic is low risk, default-neutral, tested, and immediately
+useful. It shows that the residual zero-HTTP tail is not just "we did not dial
+enough peers": many non-winning peers are already past connection and waiting
+on block reads when a late source wins. The next performance experiment should
+therefore be cautious about broad fanout and focus on source quality:
+
+- late candidate promotion only when earlier scheduled peers are still stuck;
+- better ranking of zero-HTTP candidate peers before the first subresource
+  Bitswap source exists;
+- or a narrow zero-HTTP subresource hedge that is triggered by in-flight stage
+  evidence, not a fixed unconditional dial-cap increase.
+
+Do not treat this focused r5 as proof that any behavior change is ready. It is
+a measurement improvement that narrows the next hypothesis.

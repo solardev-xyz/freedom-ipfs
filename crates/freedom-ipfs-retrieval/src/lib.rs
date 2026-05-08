@@ -6843,6 +6843,84 @@ impl BitswapWantHaveProbeTrace {
     }
 }
 
+struct BitswapPeerAttemptCancelTrace {
+    started: Instant,
+    primary_cid: Cid,
+    cid_summary: String,
+    cid_count: usize,
+    peer_id: PeerId,
+    probe: BitswapWantHaveProbeTrace,
+    connection_ready_timeout: Duration,
+    want_have_timeout: Duration,
+    stream_read_timeout: Duration,
+    stage: &'static str,
+    completed: bool,
+}
+
+impl BitswapPeerAttemptCancelTrace {
+    fn new(
+        primary_cid: Cid,
+        cid_summary: String,
+        cid_count: usize,
+        peer_id: PeerId,
+        probe: BitswapWantHaveProbeTrace,
+        request_timeouts: BitswapRequestTimeouts,
+        connection_ready_timeout: Duration,
+    ) -> Self {
+        Self {
+            started: Instant::now(),
+            primary_cid,
+            cid_summary,
+            cid_count,
+            peer_id,
+            probe,
+            connection_ready_timeout,
+            want_have_timeout: request_timeouts.want_have,
+            stream_read_timeout: request_timeouts.stream_read,
+            stage: "starting",
+            completed: false,
+        }
+    }
+
+    fn set_stage(&mut self, stage: &'static str) {
+        self.stage = stage;
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for BitswapPeerAttemptCancelTrace {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        tracing::info!(
+            phase = "bitswap_peer_attempt_cancelled",
+            cid = %self.primary_cid,
+            cids = %self.cid_summary,
+            cid_count = self.cid_count,
+            peer = %self.peer_id,
+            stage = self.stage,
+            prefer_want_have = self.probe.prefer_want_have,
+            force_want_block = self.probe.force_want_block,
+            force_want_have = self.probe.force_want_have,
+            probe_peer_candidate_index = self.probe.peer_candidate_index as i64,
+            probe_peer_addr_count = self.probe.peer_addr_count,
+            probe_peer_first_addr_transport = self.probe.peer_first_addr_transport,
+            probe_peer_first_addr_family = self.probe.peer_first_addr_family,
+            probe_peer_request_mode = self.probe.request_mode(),
+            probe_peer_skip_want_have = self.probe.skip_want_have,
+            probe_target_peer_count = self.probe.target_peer_count,
+            connection_ready_timeout_ms = self.connection_ready_timeout.as_millis(),
+            want_have_timeout_ms = self.want_have_timeout.as_millis(),
+            stream_read_timeout_ms = self.stream_read_timeout.as_millis(),
+            elapsed_ms = self.started.elapsed().as_millis()
+        );
+    }
+}
+
 struct BitswapOutgoingStreamRequest {
     peer_id: PeerId,
     addrs: Vec<Multiaddr>,
@@ -9920,7 +9998,18 @@ async fn request_bitswap_blocks_after_connection(
         stream_read_timeout_ms = request_timeouts.stream_read.as_millis()
     );
 
+    let mut cancel_trace = BitswapPeerAttemptCancelTrace::new(
+        primary_cid,
+        cid_summary.clone().unwrap_or_else(|| format_cids(&cids)),
+        cid_count,
+        peer_id,
+        want_have_probe_trace,
+        request_timeouts,
+        connection_ready_timeout,
+    );
+
     if let Some(connection_ready) = connection_ready {
+        cancel_trace.set_stage("waiting_connection");
         match timeout(connection_ready_timeout, connection_ready).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
@@ -9940,13 +10029,15 @@ async fn request_bitswap_blocks_after_connection(
                     stream_read_timeout_ms = request_timeouts.stream_read.as_millis(),
                     elapsed_ms = attempt_started.elapsed().as_millis()
                 );
-                return Err(BitswapPeerFailure {
+                let failure = BitswapPeerFailure {
                     id: peer_id,
                     kind: BitswapPeerFailureKind::Other,
                     detail: format!(
                         "{peer_id}: bitswap connection waiter was dropped before connection"
                     ),
-                });
+                };
+                cancel_trace.complete();
+                return Err(failure);
             }
             Err(_) => {
                 let recent_dial_errors = recent_dial_errors(&dial_errors, peer_id).await;
@@ -9966,7 +10057,7 @@ async fn request_bitswap_blocks_after_connection(
                     stream_read_timeout_ms = request_timeouts.stream_read.as_millis(),
                     elapsed_ms = attempt_started.elapsed().as_millis()
                 );
-                return Err(BitswapPeerFailure {
+                let failure = BitswapPeerFailure {
                     id: peer_id,
                     kind: BitswapPeerFailureKind::ConnectionTimeout,
                     detail: format!(
@@ -9976,10 +10067,13 @@ async fn request_bitswap_blocks_after_connection(
                         format_multiaddrs(&addrs),
                         recent_dial_errors
                     ),
-                });
+                };
+                cancel_trace.complete();
+                return Err(failure);
             }
         }
     }
+    cancel_trace.set_stage("requesting_blocks");
     let result = request_bitswap_blocks(
         control,
         cids,
@@ -10038,6 +10132,7 @@ async fn request_bitswap_blocks_after_connection(
             );
         }
     }
+    cancel_trace.complete();
     result
 }
 

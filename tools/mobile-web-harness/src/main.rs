@@ -2826,7 +2826,7 @@ fn format_trace_bitswap_peer_attempts(
         return None;
     }
     Some(format!(
-        "bitswap peer attempts: starts={} outgoing_completed={} successes={} failures={} connection_timeouts={} read_timeouts={} other_failures={} prefer_want_have={}",
+        "bitswap peer attempts: starts={} outgoing_completed={} successes={} failures={} connection_timeouts={} read_timeouts={} other_failures={} prefer_want_have={} cancelled={} cancelled_prefer_want_have={} cancelled_stages={} cancelled_candidate_indexes={} cancelled_modes={} cancelled_first_addr_transports={} cancelled_first_addr_families={}",
         attempts.starts,
         attempts.outgoing_completed,
         attempts.successes,
@@ -2834,7 +2834,14 @@ fn format_trace_bitswap_peer_attempts(
         attempts.connection_timeouts,
         attempts.read_timeouts,
         attempts.other_failures,
-        attempts.prefer_want_have
+        attempts.prefer_want_have,
+        attempts.cancelled,
+        attempts.cancelled_prefer_want_have,
+        format_trace_counts(&attempts.cancelled_stages),
+        format_trace_counts(&attempts.cancelled_candidate_indexes),
+        format_trace_counts(&attempts.cancelled_request_modes),
+        format_trace_counts(&attempts.cancelled_first_addr_transports),
+        format_trace_counts(&attempts.cancelled_first_addr_families)
     ))
 }
 
@@ -7807,11 +7814,18 @@ struct TraceBitswapPeerAttemptAggregate {
     read_timeouts: usize,
     other_failures: usize,
     prefer_want_have: usize,
+    cancelled: usize,
+    cancelled_prefer_want_have: usize,
+    cancelled_stages: Vec<TraceValueCount>,
+    cancelled_candidate_indexes: Vec<TraceValueCount>,
+    cancelled_request_modes: Vec<TraceValueCount>,
+    cancelled_first_addr_transports: Vec<TraceValueCount>,
+    cancelled_first_addr_families: Vec<TraceValueCount>,
 }
 
 impl TraceBitswapPeerAttemptAggregate {
     fn has_events(&self) -> bool {
-        self.starts > 0 || self.outgoing_completed > 0
+        self.starts > 0 || self.outgoing_completed > 0 || self.cancelled > 0
     }
 }
 
@@ -8894,6 +8908,11 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     let mut bitswap_dns_expansion = TraceBitswapDnsExpansionAggregate::default();
     let mut bitswap_session = TraceBitswapSessionAggregate::default();
     let mut bitswap_peer_attempts = TraceBitswapPeerAttemptAggregate::default();
+    let mut bitswap_peer_attempt_cancelled_stages = BTreeMap::<String, usize>::new();
+    let mut bitswap_peer_attempt_cancelled_candidate_indexes = BTreeMap::<String, usize>::new();
+    let mut bitswap_peer_attempt_cancelled_request_modes = BTreeMap::<String, usize>::new();
+    let mut bitswap_peer_attempt_cancelled_first_addr_transports = BTreeMap::<String, usize>::new();
+    let mut bitswap_peer_attempt_cancelled_first_addr_families = BTreeMap::<String, usize>::new();
     let mut bitswap_want_have_probe_events = 0usize;
     let mut bitswap_want_have_probe_ok = 0usize;
     let mut bitswap_want_have_probe_failures = 0usize;
@@ -9678,6 +9697,46 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
                 }
             }
         }
+        if phase == "bitswap_peer_attempt_cancelled" {
+            bitswap_peer_attempts.cancelled += 1;
+            if value
+                .get("prefer_want_have")
+                .and_then(|prefer| prefer.as_bool())
+                == Some(true)
+            {
+                bitswap_peer_attempts.cancelled_prefer_want_have += 1;
+            }
+            if let Some(stage) = json_detail_string(value.get("stage")) {
+                *bitswap_peer_attempt_cancelled_stages
+                    .entry(stage)
+                    .or_default() += 1;
+            }
+            if let Some(index) = value
+                .get("probe_peer_candidate_index")
+                .and_then(|index| json_detail_string(Some(index)))
+            {
+                *bitswap_peer_attempt_cancelled_candidate_indexes
+                    .entry(index)
+                    .or_default() += 1;
+            }
+            if let Some(mode) = json_detail_string(value.get("probe_peer_request_mode")) {
+                *bitswap_peer_attempt_cancelled_request_modes
+                    .entry(mode)
+                    .or_default() += 1;
+            }
+            if let Some(transport) =
+                json_detail_string(value.get("probe_peer_first_addr_transport"))
+            {
+                *bitswap_peer_attempt_cancelled_first_addr_transports
+                    .entry(transport)
+                    .or_default() += 1;
+            }
+            if let Some(family) = json_detail_string(value.get("probe_peer_first_addr_family")) {
+                *bitswap_peer_attempt_cancelled_first_addr_families
+                    .entry(family)
+                    .or_default() += 1;
+            }
+        }
         if phase == "bitswap_want_have_probe" {
             bitswap_want_have_probe_events += 1;
             match value.get("ok").and_then(|ok| ok.as_bool()) {
@@ -10253,6 +10312,16 @@ fn summarize_trace_output(path: &PathBuf) -> Result<TraceSummary> {
     bitswap_session.finish();
     http_provider_races.finish();
     block_range_batch_fetches.finish();
+    bitswap_peer_attempts.cancelled_stages =
+        sorted_trace_counts(bitswap_peer_attempt_cancelled_stages);
+    bitswap_peer_attempts.cancelled_candidate_indexes =
+        sorted_trace_counts(bitswap_peer_attempt_cancelled_candidate_indexes);
+    bitswap_peer_attempts.cancelled_request_modes =
+        sorted_trace_counts(bitswap_peer_attempt_cancelled_request_modes);
+    bitswap_peer_attempts.cancelled_first_addr_transports =
+        sorted_trace_counts(bitswap_peer_attempt_cancelled_first_addr_transports);
+    bitswap_peer_attempts.cancelled_first_addr_families =
+        sorted_trace_counts(bitswap_peer_attempt_cancelled_first_addr_families);
 
     Ok(TraceSummary {
         line_count,
@@ -11048,6 +11117,7 @@ fn trace_progress_phase<'a>(raw_phase: &'a str, value: &serde_json::Value) -> &'
         | "bitswap_incoming_block"
         | "bitswap_incoming_batch"
         | "bitswap_peer_attempt"
+        | "bitswap_peer_attempt_cancelled"
         | "bitswap_peer_attempt_start"
         | "bitswap_peer_expand"
         | "bitswap_dial_plan"
@@ -13538,6 +13608,7 @@ mod tests {
                 "{\"phase\":\"bitswap_peer_attempt_start\",\"cid\":\"cid-a\",\"peer\":\"peer-c\",\"prefer_want_have\":true}\n",
                 "{\"phase\":\"bitswap_peer_attempt\",\"elapsed_ms\":10000,\"cid\":\"cid-a\",\"peer\":\"peer-c\",\"ok\":false,\"prefer_want_have\":true,\"failure_kind\":\"read_timeout\",\"error\":\"read timed out\"}\n",
                 "{\"phase\":\"bitswap_peer_attempt_start\",\"cid\":\"cid-b\",\"peer\":\"peer-d\",\"prefer_want_have\":true}\n",
+                "{\"phase\":\"bitswap_peer_attempt_cancelled\",\"elapsed_ms\":12,\"cid\":\"cid-b\",\"peer\":\"peer-d\",\"stage\":\"waiting_connection\",\"prefer_want_have\":true,\"probe_peer_candidate_index\":2,\"probe_peer_request_mode\":\"want_have\",\"probe_peer_first_addr_transport\":\"tcp\",\"probe_peer_first_addr_family\":\"ip6\"}\n",
                 "{\"phase\":\"bitswap_fetch\",\"elapsed_ms\":40,\"cid\":\"cid-b\",\"peer_count\":2,\"trusted_peer_count\":0,\"ok\":true,\"source_peer\":\"peer-d\",\"source_transport\":\"tcp\",\"bitswap_delivery\":\"incoming\",\"source_peer_trusted\":false,\"extra_blocks\":0,\"bytes\":128}\n",
                 "{\"phase\":\"bitswap_fetch_cancelled\",\"cid\":\"cid-a\",\"cids\":\"cid-a,cid-b,cid-c\",\"cid_count\":3}\n",
                 "{\"phase\":\"bitswap_batch_failed\",\"cid\":\"cid-a\",\"cids\":\"cid-a,cid-b,cid-c\",\"cid_count\":3,\"failure_count\":2}\n",
@@ -13567,6 +13638,20 @@ mod tests {
         assert_eq!(summary.bitswap_peer_attempts.read_timeouts, 1);
         assert_eq!(summary.bitswap_peer_attempts.other_failures, 0);
         assert_eq!(summary.bitswap_peer_attempts.prefer_want_have, 2);
+        assert_eq!(summary.bitswap_peer_attempts.cancelled, 1);
+        assert_eq!(summary.bitswap_peer_attempts.cancelled_prefer_want_have, 1);
+        assert_eq!(
+            summary.bitswap_peer_attempts.cancelled_stages[0].value,
+            "waiting_connection"
+        );
+        assert_eq!(
+            summary.bitswap_peer_attempts.cancelled_candidate_indexes[0].value,
+            "2"
+        );
+        assert_eq!(
+            summary.bitswap_peer_attempts.cancelled_request_modes[0].value,
+            "want_have"
+        );
         assert_eq!(summary.bitswap_batches.commands, 1);
         assert_eq!(summary.bitswap_batches.multi_cid_commands, 1);
         assert_eq!(summary.bitswap_batches.total_cids, 3);
@@ -13661,12 +13746,34 @@ mod tests {
             read_timeouts: 0,
             other_failures: 0,
             prefer_want_have: 2,
+            cancelled: 2,
+            cancelled_prefer_want_have: 1,
+            cancelled_stages: vec![TraceValueCount {
+                value: "requesting_blocks".to_string(),
+                count: 2,
+            }],
+            cancelled_candidate_indexes: vec![TraceValueCount {
+                value: "0".to_string(),
+                count: 2,
+            }],
+            cancelled_request_modes: vec![TraceValueCount {
+                value: "want_block".to_string(),
+                count: 2,
+            }],
+            cancelled_first_addr_transports: vec![TraceValueCount {
+                value: "tcp".to_string(),
+                count: 2,
+            }],
+            cancelled_first_addr_families: vec![TraceValueCount {
+                value: "ip4".to_string(),
+                count: 2,
+            }],
         })
         .unwrap();
 
         assert_eq!(
             line,
-            "bitswap peer attempts: starts=3 outgoing_completed=2 successes=1 failures=1 connection_timeouts=1 read_timeouts=0 other_failures=0 prefer_want_have=2"
+            "bitswap peer attempts: starts=3 outgoing_completed=2 successes=1 failures=1 connection_timeouts=1 read_timeouts=0 other_failures=0 prefer_want_have=2 cancelled=2 cancelled_prefer_want_have=1 cancelled_stages=requesting_blocks=2 cancelled_candidate_indexes=0=2 cancelled_modes=want_block=2 cancelled_first_addr_transports=tcp=2 cancelled_first_addr_families=ip4=2"
         );
     }
 
