@@ -45626,3 +45626,91 @@ zero-HTTP tails. The next useful lead remains source quality and scheduling:
 the current default run has no aggregate Kubo wins, but its slow rows still
 cluster around top-level zero-HTTP Bitswap plus `ipfs-bridge.sia.dev`
 single-provider roots and rare late candidate/source rows.
+
+## 2026-05-08: Current Selected R5 Guardrail After DNS-Prefetch Recheck
+
+Branch/head: `codex/kubo-session-performance-20260506` at `c454e6e`.
+
+Purpose:
+
+Widen back from the focused DNS-prefetch rollback pair to the selected six-case
+guardrail corpus. The focused default run had no meaningful aggregate Kubo wins,
+so this run asks whether the broader selected corpus still has a live target
+gap before starting another behavior experiment.
+
+Command:
+
+```sh
+timeout 4200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-selected-r5-c454e6e-20260508T043506Z-trace.jsonl \
+  --comparison-output /tmp/current-selected-r5-c454e6e-20260508T043506Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5` for every selected case.
+- DAICO page root: Rust `275/324ms`; Kubo `2135/2204ms`.
+- Vitalik range root: Rust `98/144ms`; Kubo `2451/3917ms`.
+- `ipfs.tech` range root: Rust `653/800ms`; Kubo `842/1606ms`.
+- `ipfs.tech` page root: Rust `3/3ms`; Kubo `2/2ms`.
+- `ipfs.tech` assets: Rust TTFB/total `71/220ms`; Kubo TTFB/total
+  `351/448ms`.
+- `ipfs.tech` developers hero: Rust `94/110ms`; Kubo `438/460ms`.
+- Wikipedia root: Rust `139/556ms`; Kubo `556/710ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `51720KiB` RSS and `25` FDs vs Kubo `179288KiB`
+  RSS and `362` FDs.
+- Trace source latencies:
+  - Bitswap: `153` blocks, p50/p90/p95/max `58/148/246/355ms`;
+  - HTTP provider: `62` blocks, p50/p90/p95/max `100/228/238/256ms`.
+- Delegated provider lookup p50/p90/p95/max: `17/44/46/92ms`.
+- Request classifications:
+  `top_level_zero_http_provider_bitswap=8`,
+  `zero_http_provider_bitswap=8`,
+  `cold_bitswap_peer_expand=6`,
+  `top_level_zero_http_provider_cold_bitswap=6`,
+  `zero_http_provider_cold_bitswap=6`.
+- Bitswap DNS expansion was small in this window:
+  `4` events, `2` cached, `2` uncached, `0` failed, `103` records, `0` IPs.
+
+Path-local Kubo win:
+
+- `/ipns/ipfs.tech/_nuxt/DlAUqK2U.js`: Rust p50/p95 `54/101ms`; Kubo
+  `33/42ms`; Kubo won p95 TTFB/total by `59ms`.
+
+Trace diagnosis for `DlAUqK2U.js`:
+
+- The asset block was always served by Bitswap from the existing page-session
+  shortcut path.
+- The slowest Rust sample completed in `99ms`.
+- In that sample, delegated provider lookup took `92ms`, then
+  `bitswap_session_shortcut_post_lookup_race` returned `bitswap_won` `1ms`
+  later.
+- Faster samples completed around `43-53ms`; the `99ms` p95 row is mostly a
+  one-sample provider-lookup scheduling artifact inside an aggregate
+  `ipfs.tech` asset win of Rust `220ms` vs Kubo `448ms`.
+
+Decision:
+
+No behavior change from this guardrail. The selected corpus has no meaningful
+aggregate Kubo wins and keeps the mobile resource advantage. The only path-local
+miss is too small and already uses the intended session shortcut path; the
+shortcut is running from request start, so a pre-lookup grace or broad timeout
+change would not create a meaningful improvement and would revisit rejected
+knob shapes. Keep `DlAUqK2U.js` as a regression watch item, but use the next
+behavior experiment only if a fresh selected/focused run shows a repeated
+aggregate gap or a larger path-local family.
