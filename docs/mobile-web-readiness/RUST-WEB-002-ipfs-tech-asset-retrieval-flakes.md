@@ -47125,3 +47125,94 @@ two current shapes directly:
 - mixed HTTP/Bitswap `_nuxt` assets where `ipfs-bridge.sia.dev` or repeated
   per-asset source choice keeps Rust medians above Kubo even though case-level
   p95 and resources favor Rust.
+
+## 2026-05-08: Single-HTTP Bitswap Hedge With Top-Level Included Helps Aggregate, But Is Not Promotion Evidence
+
+Branch/head: `codex/kubo-session-performance-20260506` at `37041b3`.
+
+Purpose:
+
+Retest the existing disabled single-HTTP-provider Bitswap hedge lab against the
+current c6 page-load shape, this time allowing the hedge to spend a small
+top-level budget. The prior direct5 recheck did not explain the current
+path-local gaps. The remaining `_nuxt` losses often involved
+`ipfs-bridge.sia.dev` single-provider wins around `180-300ms`, so the question
+was whether a narrow Bitswap hedge could recover enough small asset medians
+without losing the mobile resource advantage.
+
+Opt-in command:
+
+```sh
+timeout 2400s env \
+  FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_INCLUDE_TOP_LEVEL=1 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MAX_PER_TOP_LEVEL=4 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_MIN_SCORE_MS=180 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS=0 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --repeat 10 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 300 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/single-http-include-top-level-hedge0-score180-ipfs-tech-c6-r10-37041b3-20260508Tnext-trace.jsonl \
+    --comparison-output /tmp/single-http-include-top-level-hedge0-score180-ipfs-tech-c6-r10-37041b3-20260508Tnext.json
+```
+
+Result:
+
+- Rust/Kubo passed `10/10`.
+- Root: Rust `652/1016ms`; Kubo `1813/3109ms`.
+- Assets: Rust `182/444ms`; Kubo `217/620ms`.
+- Case-level `meaningful_kubo_wins`: none.
+- Resource max: Rust `59648KiB` RSS and `46` FDs vs Kubo `243120KiB`
+  RSS and `303` FDs.
+- Block fetch totals:
+  - HTTP provider `319` blocks, p50/p90/p95/max `184/256/279/581ms`;
+  - Bitswap `80` blocks, p50/p90/p95/max `132/213/243/385ms`.
+- Hedge behavior:
+  - `http_provider_bitswap_hedge` fired `40` times, all reason
+    `slow_single_http_provider`;
+  - `http_provider_bitswap_hedge_result` recorded `108` results;
+  - HTTP provider still won `104`; Bitswap won only `4`;
+  - skip reasons were `top_level_budget_exhausted=125`,
+    `provider_score_below_threshold=33`, and `provider_unscored=10`.
+- Relative to the immediate no-env post-control from the direct5 recheck, this
+  sample had much better root p95 (`1016ms` vs `2095ms`) and better aggregate
+  asset p50/p95 (`182/444ms` vs `144/422ms` for control, while Kubo in this
+  window was slower at `217/620ms`). Because the public-network window also
+  moved, this is not enough to attribute the aggregate root win to the hedge.
+- Path-local Kubo wins remained:
+  - `entry.C4ErMpWu.css` p50 Rust/Kubo `388/185ms`;
+  - `BXkYzPrD.js` p50 `285/189ms`;
+  - `mHWTJadT.js` p50 `206/129ms`;
+  - `Duo5E1ke.js` p50 `204/130ms`;
+  - `DIs1UAle.js` p50 `194/130ms`.
+
+Decision:
+
+Do not promote this top-level-included single-HTTP Bitswap hedge from the
+current evidence. It is a useful diagnostic and the aggregate run was healthy,
+but the intended mechanism barely won: only `4/108` hedge result events used
+Bitswap. Most remaining Kubo path-local wins are still either HTTP-provider
+source-choice/overlap problems or repeated small `_nuxt` path work, not simply
+single-provider cases where a Bitswap hedge reliably beats the provider.
+
+Keep the knob disabled. Future hedge work should first classify the Sia-backed
+assets more precisely and should avoid spending a broad per-page budget unless a
+fresh trace shows repeatable Bitswap hedge wins for the same top-level/content
+root.
+
+Next lead:
+
+- compare slow Sia-backed `_nuxt` assets by provider score, provider rank, and
+  first-byte/body split, because `ipfs-bridge.sia.dev` is consistently slower
+  than `dag.w3s.link` but still often wins single-provider races;
+- inspect whether per-asset UnixFS `file_size`/path work can be overlapped or
+  coalesced for these page assets without broad prefetch;
+- keep zero-HTTP root `WANT_HAVE` tail as a separate focused lead, since this
+  run had only one zero-HTTP top-level sample and it completed in `572ms`.
