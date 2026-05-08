@@ -45519,3 +45519,110 @@ for example, use the trace to identify a peer/source quality predicate that
 predicts sub-200ms completion before allowing late shortcut overlap, or overlap
 provider-list fetch without making a slow shortcut capable of delaying the
 request tail.
+
+## 2026-05-08: Zero-HTTP DNS-Prefetch Rollback Recheck
+
+Branch/head: `codex/kubo-session-performance-20260506` at `039bfe9`.
+
+Purpose:
+
+After the rejected timeout-shortcut race, recheck whether the promoted
+zero-HTTP post-lookup DNS-prefetch default is still helping the current focused
+target shape. The latest slow Wikipedia traces put this path in the critical
+section, so this same-window pair tests the built-in rollback env before adding
+new behavior.
+
+Rollback command:
+
+```sh
+timeout 3000s env \
+  FREEDOM_IPFS_DISABLE_ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/disable-zero-http-dns-prefetch-focused-r5-039bfe9-20260508T043047Z-trace.jsonl \
+  --comparison-output /tmp/disable-zero-http-dns-prefetch-focused-r5-039bfe9-20260508T043047Z.json
+```
+
+Rollback result:
+
+- Rust/Kubo passed `5/5` for both focused cases.
+- `ipfs.tech` root: Rust `791/1298ms`; Kubo `1327/2393ms`.
+- `ipfs.tech` assets: Rust `66/233ms`; Kubo `88/525ms`.
+- Wikipedia root: Rust `222/622ms`; Kubo `105/1353ms`.
+- Meaningful aggregate Kubo wins: `2`, both Wikipedia p50 TTFB/total.
+- Resource max: Rust `49980KiB` RSS and `24` FDs vs Kubo `307464KiB`
+  RSS and `269` FDs.
+- Trace source latencies:
+  - Bitswap: `145` blocks, p50/p90/p95/max `52/183/282/396ms`;
+  - HTTP provider: `40` blocks, p50/p90/p95/max `186/253/288/847ms`.
+- Request classifications:
+  `zero_http_provider_bitswap=11`,
+  `top_level_zero_http_provider_bitswap=9`,
+  `cold_bitswap_peer_expand=7`,
+  `zero_http_provider_cold_bitswap=7`,
+  `top_level_zero_http_provider_cold_bitswap=6`.
+
+Default command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/default-zero-http-dns-prefetch-focused-r5-039bfe9-20260508T043047Z-trace.jsonl \
+  --comparison-output /tmp/default-zero-http-dns-prefetch-focused-r5-039bfe9-20260508T043047Z.json
+```
+
+Default result:
+
+- Rust/Kubo passed `5/5` for both focused cases.
+- `ipfs.tech` root: Rust `690/887ms`; Kubo `1412/4377ms`.
+- `ipfs.tech` assets: Rust `65/211ms`; Kubo `110/417ms`.
+- Wikipedia root: Rust `183/533ms`; Kubo `283/494ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `51512KiB` RSS and `23` FDs vs Kubo `320568KiB`
+  RSS and `525` FDs.
+- Trace source latencies:
+  - Bitswap: `150` blocks, p50/p90/p95/max `52/110/253/452ms`;
+  - HTTP provider: `35` blocks, p50/p90/p95/max `190/240/248/382ms`.
+- Request classifications:
+  `top_level_zero_http_provider_bitswap=9`,
+  `zero_http_provider_bitswap=9`,
+  `cold_bitswap_peer_expand=7`,
+  `top_level_zero_http_provider_cold_bitswap=7`,
+  `zero_http_provider_cold_bitswap=7`.
+- Default prefetch activation was visible:
+  `4` `zero_http_post_lookup_dns_prefetch_start` events,
+  `2` `zero_http_post_lookup_dns_prefetch_ready` events, and
+  `2` successful `zero_http_post_lookup_dns_prefetch_result` events.
+
+Decision:
+
+Keep the promoted zero-HTTP DNS-prefetch default. Disabling it reduced neither
+the target Kubo gap nor the path-local asset tails in this same-window pair. It
+reintroduced a meaningful Wikipedia p50 loss, increased `ipfs.tech` root p95
+from `887ms` to `1298ms`, raised Bitswap p90/p95 from `110/253ms` to
+`183/282ms`, and exposed a much worse HTTP-provider max (`847ms` vs `382ms`).
+
+Do not spend another broad rollback run on this specific toggle unless a future
+baseline shows the prefetch result itself dominating multiple top-level
+zero-HTTP tails. The next useful lead remains source quality and scheduling:
+the current default run has no aggregate Kubo wins, but its slow rows still
+cluster around top-level zero-HTTP Bitswap plus `ipfs-bridge.sia.dev`
+single-provider roots and rare late candidate/source rows.
