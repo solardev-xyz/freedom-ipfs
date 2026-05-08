@@ -46911,3 +46911,107 @@ meaningful cold `ipfs.tech` asset/subresource Kubo gap, and the only broad-suite
 Kubo win is the previously rejected artificial range-first/full-read ordering.
 The next useful agent step is to broaden or extend the live search for a fresh
 real gap rather than promote one of the disabled lab controls.
+
+## 2026-05-08: Longer `ipfs.tech` c6 r20 - Path-Local Median Asset Wins Remain
+
+Branch/head: `codex/kubo-session-performance-20260506` at `9a30665`.
+
+Purpose:
+
+Run a longer focused same-window sample after the current-head refresh. The
+short r5/r10 samples no longer reproduced a meaningful aggregate Kubo win, but
+the remaining optimization target is narrow enough that path-local rows can be
+more useful than aggregate case thresholds.
+
+Command:
+
+```sh
+timeout 4800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 20 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-ipfs-tech-c6-r20-9a30665-20260508T061453Z-trace.jsonl \
+  --comparison-output /tmp/current-ipfs-tech-c6-r20-9a30665-20260508T061453Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `20/20`.
+- Root still favored Rust: Rust `616/1759ms`; Kubo `1342/2052ms`.
+- Aggregate assets were mixed: Rust p50 `121ms` vs Kubo `83ms`, but Rust p95
+  `276ms` vs Kubo `381ms`.
+- Case-level `meaningful_kubo_wins`: none.
+- Resource max remained strongly in Rust's favor: Rust `58384KiB` RSS and `46`
+  FDs vs Kubo `205960KiB` RSS and `111` FDs.
+- Trace block fetch totals:
+  - Bitswap: `479` blocks, p50/p90/p95/max `113/209/297/1437ms`.
+  - HTTP provider: `307` blocks, p50/p90/p95/max `89/234/252/426ms`.
+  - Cache: `2` blocks.
+- Delegated provider lookup was not the bottleneck: `696/696` successes,
+  elapsed p50/p90/p95/max `23/47/52/92ms`.
+
+Path-local Kubo wins worth tracking:
+
+- `/ipns/ipfs.tech/_nuxt/BfUTpfA9.js`: Rust/Kubo p50 `204/83ms`, delta
+  `121ms`, ratio `2.46x`; Rust p95 `315ms`. Trace shape: 20 requests, block
+  sources `bitswap=20`, `cache=1`, no HTTP fetches; request elapsed
+  p50/p90/p95/max `203/263/315/338ms`; repeated zero-HTTP Bitswap source from
+  peer `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT`.
+- `/ipns/ipfs.tech/_nuxt/BXkYzPrD.js`: Rust/Kubo p50 `217/108ms`, delta
+  `109ms`, ratio `2.01x`; Rust p95 `360ms`. Trace shape: block sources
+  `bitswap=22`, `http_provider=3`; HTTP provider was `https://ipfs-bridge.sia.dev/`.
+- `/ipns/ipfs.tech/_nuxt/Duo5E1ke.js`: Rust/Kubo p95 `353/250ms`, delta
+  `103ms`; sources `bitswap=17`, `http_provider=6`, again mostly
+  `https://ipfs-bridge.sia.dev/`.
+- `/ipns/ipfs.tech/_nuxt/mHWTJadT.js`: Rust/Kubo p50 `162/68ms`, delta
+  `94ms`; sources `bitswap=19`, `http_provider=5`, with one `500ms`
+  request where both directory/file data came from HTTP provider fetches.
+
+Classification:
+
+This run reopens a current, narrow path-local asset median gap, but not the old
+broad default-grace failure. Rust wins root latency, asset tail latency, and
+resources; Kubo's advantage is concentrated in several individual `_nuxt`
+assets where Rust spends roughly `100-250ms` resolving and fetching one or two
+blocks inside each fresh page process.
+
+Two shapes appear:
+
+- zero-HTTP Bitswap-only assets, especially `BfUTpfA9.js`, where the winning
+  source is usually a same-top-level trusted Bitswap peer but request p50 still
+  lands near `200ms`;
+- HTTP-provider-backed assets where `ipfs-bridge.sia.dev` wins but is often
+  `180-310ms`, so Kubo's lower median likely comes from different source choice,
+  warmer session state, or better overlap rather than from faster delegated
+  lookup.
+
+Important non-leads:
+
+- Do not rerun broad raw-link `Tsize` fast headers from this evidence alone.
+  That lab is already documented above as default-off/rejected: it removes
+  pre-response file-size work but shifts the same network cost into the body and
+  did not close the asset median gap.
+- Do not promote broad direct `WANT_BLOCK` fanout or broad HTML prefetch/range
+  warming. Those paths already have rejected evidence because they increase
+  fanout/background work or regress p50/p95/RSS.
+
+Next lead:
+
+Inspect request-local and page-session source choice for these `_nuxt` assets:
+
+- whether the same successful root/session Bitswap peer is being used too
+  serially for small zero-HTTP subresources;
+- whether single HTTP-provider winners from `ipfs-bridge.sia.dev` should get a
+  narrower adaptive hedge only after that provider's current score is slow for
+  the same top-level page;
+- whether UnixFS path/file-size work is still causing repeated per-asset
+  foreground fetches that can be overlapped without broad prefetch.
+
+Any code experiment should stay narrow, env-gated first, and validate against
+this r20 shape plus the current selected multi-case guardrail.
