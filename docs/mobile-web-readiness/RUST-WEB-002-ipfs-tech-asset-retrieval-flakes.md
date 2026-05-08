@@ -44856,3 +44856,152 @@ the repeated slow families are now:
   and provider-list Bitswap path can stall for seconds;
 - small `ipfs.tech` assets where Kubo occasionally wins one path-local p95 even
   though Rust still wins the aggregate asset p50/p95.
+
+## 2026-05-08: Focused R10 Baseline And WANT_HAVE 250ms Recheck
+
+Branch/head: `codex/kubo-session-performance-20260506` at `dcb2448`.
+
+Purpose:
+
+After the selected r5 direct-WANT recheck showed a volatile Wikipedia tail,
+rerun a larger focused no-env sample for the two active cases:
+`ipfs-tech-page-assets` and `wikipedia-on-ipfs-root`. If the current no-env
+trace actually emits `bitswap_want_have_probe` timeouts, recheck the existing
+`FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS=250` lab knob in the same window.
+
+No-env command:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-focused-ipfs-tech-wikipedia-r10-dcb2448-20260508T043000Z-trace.jsonl \
+  --comparison-output /tmp/current-focused-ipfs-tech-wikipedia-r10-dcb2448-20260508T043000Z.json
+```
+
+No-env result:
+
+- Rust/Kubo passed `10/10` for both cases.
+- `ipfs.tech` page root: Rust `638/988ms`; Kubo `1506/4647ms`.
+- `ipfs.tech` assets: Rust TTFB/total `63/221ms`; Kubo TTFB/total
+  `175/692ms`.
+- Wikipedia root: Rust `188/517ms`; Kubo `144/740ms`.
+- Meaningful aggregate Kubo wins: none.
+- Path-local `ipfs.tech` asset Kubo wins: `2`, both
+  `_nuxt/index.CZYCeseQ.css` p95 TTFB/total, Rust `232ms` vs Kubo `175ms`.
+- Resource max: Rust `50340KiB` RSS and `28` FDs vs Kubo `310328KiB`
+  RSS and `773` FDs.
+- Block fetch source p50/p90/p95/max:
+  - Bitswap: `53/154/277/1050ms` across `283` blocks;
+  - HTTP provider: `100/246/269/376ms` across `87` blocks.
+- Delegated lookup p50/p90/p95/max: `19/43/47/129ms`.
+- Bitswap DNS expansion: `19` events, `6` cached, `13` uncached, `5` failed,
+  `143` records, `0` IPs.
+- Request classifications:
+  `zero_http_provider_bitswap=33`,
+  `cold_bitswap_peer_expand=16`,
+  `zero_http_provider_cold_bitswap=16`,
+  `top_level_zero_http_provider_bitswap=15`,
+  `top_level_zero_http_provider_cold_bitswap=11`.
+- `bitswap_want_have_probe` events: `2`, both
+  `timeout_fallback_want_block`, p50/p95 about `500/501ms`.
+
+Interpretation:
+
+This r10 removes the active aggregate gap. Wikipedia p95 is a Rust win again,
+and `ipfs.tech` root/assets are strong aggregate wins with much lower resource
+use. The only interesting remaining focused signal is the small path-local CSS
+p95 loss plus two `WANT_HAVE` timeout fallbacks on a slow `ipfs.tech` Bitswap
+asset.
+
+WANT_HAVE `250ms` command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_BITSWAP_WANT_HAVE_TIMEOUT_MS=250 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --case wikipedia-on-ipfs-root \
+  --repeat 10 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/wanthave250-focused-ipfs-tech-wikipedia-r10-dcb2448-20260508T043000Z-trace.jsonl \
+  --comparison-output /tmp/wanthave250-focused-ipfs-tech-wikipedia-r10-dcb2448-20260508T043000Z.json
+```
+
+WANT_HAVE `250ms` result:
+
+- Rust/Kubo passed `10/10` for both cases.
+- `ipfs.tech` page root: Rust `638/1977ms`; Kubo `1381/5514ms`.
+- `ipfs.tech` assets: Rust TTFB/total `105/422ms`; Kubo TTFB/total
+  `103/558ms`.
+- Wikipedia root: Rust `463/806ms`; Kubo `434/1274ms`.
+- Meaningful aggregate Kubo wins: none.
+- Path-local `ipfs.tech` asset Kubo wins: `40`.
+  Top examples:
+  - `_nuxt/BfUTpfA9.js`: Rust p50/p95 `201/1040ms`; Kubo `100/357ms`;
+  - `_nuxt/DBHrpFkY.js`: Rust p50/p95 `493/797ms`; Kubo `103/704ms`;
+  - `_nuxt/8Bs0wEmG.js`: Rust p50/p95 `350/749ms`; Kubo `92/360ms`.
+- Resource max: Rust `50664KiB` RSS and `33` FDs vs Kubo `324300KiB`
+  RSS and `648` FDs.
+- Block fetch source p50/p90/p95/max:
+  - HTTP provider: `114/237/293/509ms` across `234` blocks;
+  - Bitswap: `116/489/722/1544ms` across `136` blocks.
+- Delegated lookup p50/p90/p95/max: `18/44/47/96ms`.
+- Bitswap DNS expansion: `84` events, `48` cached, `36` uncached,
+  `40` failed, `872` records, `0` IPs.
+- Request classifications:
+  `zero_http_provider_bitswap=40`,
+  `cold_bitswap_peer_expand=31`,
+  `zero_http_provider_cold_bitswap=31`,
+  `top_level_zero_http_provider_bitswap=20`,
+  `top_level_zero_http_provider_cold_bitswap=13`.
+- `bitswap_want_have_probe` events: `17`, all
+  `timeout_fallback_want_block`, p50/p95 about `251/252ms`.
+
+Decision:
+
+Reject `WANT_HAVE=250ms` for this focused shape.
+
+This was the right time to retest the knob because the no-env baseline finally
+had real `WANT_HAVE` probe events, but shortening the timeout made the system
+substantially worse:
+
+- `ipfs.tech` asset median regressed from `63ms` to `105ms`, landing at Kubo
+  parity instead of a clear win;
+- `ipfs.tech` asset p95 regressed from `221ms` to `422ms`;
+- path-local Kubo wins grew from `2` to `40`;
+- Bitswap p95 regressed from `277ms` to `722ms`;
+- DNS expansion work grew from `143` records to `872`;
+- FDs rose from `28` to `33`.
+
+The shorter timeout appears to push more peers through timeout-fallback
+`WANT_BLOCK`, increasing cold Bitswap/DNS work and worsening source quality.
+Keep the existing `WANT_HAVE` timeout behavior. Future work should target
+peer/source selection for the rare late candidate rows, not globally shortening
+the probe budget.
+
+Next lead:
+
+The current no-env focused r10 is already an aggregate Rust win. The remaining
+actionable gap is narrow and path-local:
+
+- occasional `ipfs.tech` asset p95 rows where Rust loses by tens of
+  milliseconds despite aggregate asset p95 winning by hundreds;
+- rare zero-HTTP cold Bitswap rows where a late candidate index wins after
+  `WANT_HAVE` fallback.
+
+Prefer diagnostics or very scoped source-quality changes over global timeout,
+DNS, preconnect, or direct-WANT knobs.
