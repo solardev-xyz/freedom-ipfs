@@ -46056,3 +46056,129 @@ therefore be cautious about broad fanout and focus on source quality:
 
 Do not treat this focused r5 as proof that any behavior change is ready. It is
 a measurement improvement that narrows the next hypothesis.
+
+## 2026-05-08: Keep Lab Control - Tunable Zero-HTTP Subresource Direct Peers
+
+Branch/head before patch: `codex/kubo-session-performance-20260506` at
+`5de6d91`.
+
+Hypothesis:
+
+The fixed opt-in
+`FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK=1` control uses
+`2` direct WANT_BLOCK peers for zero-HTTP gateway subresources. The latest
+cancellation diagnostic showed occasional slow source peers at later candidate
+indexes, so a subresource-only direct5/direct6 experiment may be useful even
+though broader/global direct-WANT experiments were rejected.
+
+Change:
+
+- Add a default-neutral lab override:
+  `FREEDOM_IPFS_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS=<n>`.
+- The override only applies when
+  `FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK=1` is also set
+  and the request is a gateway subresource.
+- Invalid or zero values fall back to the existing fixed `2` peer control.
+- Global zero-HTTP direct-WANT overrides keep precedence.
+- No default behavior changes.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval zero_http_direct --lib -- --nocapture
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Result:
+
+- Formatting passed.
+- Focused zero-HTTP/direct parser tests passed: `2` passed.
+- Retrieval all-target check passed.
+- Retrieval all-target clippy passed with `-D warnings`.
+
+Same-window no-env control:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/subresource-direct-knob-control-ipfs-tech-r5-5de6d91-wip-20260508Tcontrol-trace.jsonl \
+  --comparison-output /tmp/subresource-direct-knob-control-ipfs-tech-r5-5de6d91-wip-20260508Tcontrol.json
+```
+
+Control result:
+
+- Rust/Kubo passed `5/5`.
+- Root: Rust p50/p95 `882/1807ms`; Kubo `1444/2859ms`.
+- Assets: Rust p50/p95 `127/313ms`; Kubo `89/485ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `49624KiB` RSS and `20` FDs vs Kubo `219480KiB`
+  RSS and `262` FDs.
+- Zero-HTTP Bitswap classifications:
+  - `zero_http_provider_bitswap=6`
+  - `cold_bitswap_peer_expand=5`
+  - `zero_http_provider_cold_bitswap=5`
+- Bitswap totals: `44` blocks, p50/p90/p95/max `78/271/289/358ms`.
+- Zero-HTTP Bitswap source candidate indexes: `1=5`.
+- Top path-local Kubo wins were mostly HTTP-provider rows
+  (`Grid.CfsFuo-l.css`, `BXkYzPrD.js`) plus the recurring
+  `hfYlCurB.js` zero-HTTP Bitswap row.
+
+Opt-in direct6 variant:
+
+```sh
+timeout 1800s env \
+  FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK=1 \
+  FREEDOM_IPFS_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS=6 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --case ipfs-tech-page-assets \
+    --repeat 5 \
+    --asset-concurrency 1 \
+    --timeout-secs 120 \
+    --run-timeout-secs 300 \
+    --dht-query-timeout-secs 3 \
+    --trace-output /tmp/subresource-direct6-ipfs-tech-r5-5de6d91-wip-20260508Tvariant-trace.jsonl \
+    --comparison-output /tmp/subresource-direct6-ipfs-tech-r5-5de6d91-wip-20260508Tvariant.json
+```
+
+Variant result:
+
+- Rust/Kubo passed `5/5`.
+- Root: Rust p50/p95 `646/945ms`; Kubo `1367/2324ms`.
+- Assets: Rust p50/p95 `181/330ms`; Kubo `177/1102ms`.
+- Meaningful aggregate Kubo wins: none.
+- Resource max: Rust `49388KiB` RSS and `21` FDs vs Kubo `270268KiB`
+  RSS and `380` FDs.
+- Zero-HTTP Bitswap classifications:
+  - `zero_http_provider_bitswap=5`
+  - `cold_bitswap_peer_expand=5`
+  - `zero_http_provider_cold_bitswap=5`
+- Bitswap totals: `17` blocks, p50/p90/p95/max `105/296/326/326ms`.
+- Zero-HTTP Bitswap source candidate indexes: `1=5`.
+- Bitswap peer attempts stayed bounded:
+  - starts `75`
+  - cancelled `75`
+  - cancelled stages `requesting_blocks=55`, `waiting_connection=20`
+  - cancelled candidate indexes `0=55`, `1=5`, `2=5`, `3=5`, `4=5`
+
+Decision:
+
+Keep the override as a lab control only. Do **not** promote direct6 as a
+default. In this same-window run, direct6 improved root p50/p95 versus the
+control but worsened Rust asset median (`181ms` vs `127ms`) and did not remove
+the recurring zero-HTTP `hfYlCurB.js` median loss. The experiment reinforces the
+previous conclusion: fixed fanout is too blunt. The next performance work should
+use this knob for controlled probes, but a real promotion candidate should be
+adaptive and source-quality aware, not a static wider direct-WANT peer count.

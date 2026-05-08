@@ -182,6 +182,8 @@ const ZERO_HTTP_POST_LOOKUP_DNS_PREFETCH_MIN_PROVIDERS: usize = 32;
 const BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS: usize = 2;
 const ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_ENV: &str =
     "FREEDOM_IPFS_ENABLE_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK";
+const BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS_ENV: &str =
+    "FREEDOM_IPFS_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS";
 const BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS";
 const BITSWAP_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK_PEERS: usize = 5;
@@ -5995,7 +5997,15 @@ fn bitswap_zero_http_direct_want_block_peers(
             .and_then(|value| value.to_str()),
     };
     bitswap_zero_http_direct_want_block_peers_from_values(
-        std::env::var_os(ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_ENV).is_some(),
+        SubresourceDirectWantBlockConfig {
+            enabled: std::env::var_os(ENABLE_BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_ENV)
+                .is_some(),
+            override_value: std::env::var_os(
+                BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS_ENV,
+            )
+            .as_deref()
+            .and_then(|value| value.to_str()),
+        },
         std::env::var_os(BITSWAP_ZERO_HTTP_DIRECT_WANT_BLOCK_PEERS_ENV)
             .as_deref()
             .and_then(|value| value.to_str()),
@@ -6038,8 +6048,31 @@ impl PostLookupTimeoutDirectWantBlockConfig<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SubresourceDirectWantBlockConfig<'a> {
+    enabled: bool,
+    override_value: Option<&'a str>,
+}
+
+#[cfg(test)]
+impl SubresourceDirectWantBlockConfig<'_> {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            override_value: None,
+        }
+    }
+
+    fn enabled(override_value: Option<&str>) -> SubresourceDirectWantBlockConfig<'_> {
+        SubresourceDirectWantBlockConfig {
+            enabled: true,
+            override_value,
+        }
+    }
+}
+
 fn bitswap_zero_http_direct_want_block_peers_from_values(
-    subresource_enabled: bool,
+    subresource_config: SubresourceDirectWantBlockConfig<'_>,
     override_value: Option<&str>,
     high_provider_override_value: Option<&str>,
     high_provider_min_providers: Option<usize>,
@@ -6067,12 +6100,16 @@ fn bitswap_zero_http_direct_want_block_peers_from_values(
                 BITSWAP_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK_PEERS,
             ));
         }
-        if !subresource_enabled {
+        if !subresource_config.enabled {
             return None;
         }
-        context
-            .is_some_and(RetrievalRequestContext::gateway_subresource)
-            .then_some(BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS)
+        if context.is_some_and(RetrievalRequestContext::gateway_subresource) {
+            return bitswap_zero_http_direct_want_block_peers_from_env_value(
+                subresource_config.override_value,
+            )
+            .or(Some(BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS));
+        }
+        None
     })
 }
 
@@ -13736,7 +13773,7 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                false,
+                SubresourceDirectWantBlockConfig::disabled(),
                 None,
                 None,
                 None,
@@ -13748,7 +13785,7 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                false,
+                SubresourceDirectWantBlockConfig::disabled(),
                 None,
                 None,
                 None,
@@ -13760,7 +13797,7 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                true,
+                SubresourceDirectWantBlockConfig::enabled(None),
                 None,
                 None,
                 None,
@@ -13772,7 +13809,31 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                true,
+                SubresourceDirectWantBlockConfig::enabled(Some("6")),
+                None,
+                None,
+                None,
+                PostLookupTimeoutDirectWantBlockConfig::disabled(),
+                64,
+                Some(&RetrievalRequestContext::gateway_request(Some(1))),
+            ),
+            Some(6)
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                SubresourceDirectWantBlockConfig::enabled(Some("0")),
+                None,
+                None,
+                None,
+                PostLookupTimeoutDirectWantBlockConfig::disabled(),
+                64,
+                Some(&RetrievalRequestContext::gateway_request(Some(1))),
+            ),
+            Some(BITSWAP_ZERO_HTTP_SUBRESOURCE_DIRECT_WANT_BLOCK_PEERS)
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                SubresourceDirectWantBlockConfig::enabled(Some("bad")),
                 None,
                 None,
                 None,
@@ -13784,7 +13845,19 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                false,
+                SubresourceDirectWantBlockConfig::enabled(None),
+                None,
+                None,
+                None,
+                PostLookupTimeoutDirectWantBlockConfig::disabled(),
+                64,
+                Some(&RetrievalRequestContext::gateway_request(None)),
+            ),
+            None
+        );
+        assert_eq!(
+            bitswap_zero_http_direct_want_block_peers_from_values(
+                SubresourceDirectWantBlockConfig::disabled(),
                 Some("5"),
                 None,
                 None,
@@ -13796,7 +13869,7 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                true,
+                SubresourceDirectWantBlockConfig::enabled(Some("6")),
                 Some("5"),
                 Some("8"),
                 Some(32),
@@ -13808,7 +13881,7 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                false,
+                SubresourceDirectWantBlockConfig::disabled(),
                 None,
                 Some("8"),
                 Some(32),
@@ -13820,7 +13893,7 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                false,
+                SubresourceDirectWantBlockConfig::disabled(),
                 None,
                 Some("8"),
                 Some(32),
@@ -13832,7 +13905,7 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                true,
+                SubresourceDirectWantBlockConfig::enabled(None),
                 None,
                 Some("bad"),
                 Some(32),
@@ -13854,7 +13927,7 @@ mod bitswap_tests {
 
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                false,
+                SubresourceDirectWantBlockConfig::disabled(),
                 None,
                 None,
                 None,
@@ -13866,7 +13939,7 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                false,
+                SubresourceDirectWantBlockConfig::disabled(),
                 None,
                 None,
                 None,
@@ -13878,7 +13951,7 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                false,
+                SubresourceDirectWantBlockConfig::disabled(),
                 Some("2"),
                 None,
                 None,
@@ -13890,7 +13963,7 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                false,
+                SubresourceDirectWantBlockConfig::disabled(),
                 None,
                 None,
                 None,
@@ -13902,7 +13975,7 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                false,
+                SubresourceDirectWantBlockConfig::disabled(),
                 None,
                 None,
                 None,
@@ -13914,7 +13987,7 @@ mod bitswap_tests {
         );
         assert_eq!(
             bitswap_zero_http_direct_want_block_peers_from_values(
-                false,
+                SubresourceDirectWantBlockConfig::disabled(),
                 None,
                 None,
                 None,
