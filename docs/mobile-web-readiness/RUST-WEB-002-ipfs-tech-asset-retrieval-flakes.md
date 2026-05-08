@@ -41645,3 +41645,229 @@ safe candidate would need to target one of two explicitly observed shapes:
   milestones and no faster provider wins the race.
 - Pure zero-HTTP cold Bitswap rows where `bitswap_fetch_max` and connection
   setup show the source/dial is actually the path tail.
+
+## 2026-05-08: Per-Path UnixFS Cache Diagnostics And Late Single-HTTP Bitswap Hedge
+
+Branch/head before this follow-up:
+
+- `codex/kubo-session-performance-20260506`
+- `0c8420d`
+
+Purpose:
+
+The HTTP/Bitswap milestone diagnostics showed several asset Kubo-win rows where
+the longest printed phases were `unixfs_file_size` and `unixfs_resource`. That
+could mean repeated local UnixFS metadata/path/file-size work, or it could simply
+mean the UnixFS layer is waiting on the same slow underlying block fetch. Before
+changing retrieval policy, make the harness explain this per path.
+
+Change 1:
+
+- `tools/mobile-web-harness` now records request-local
+  `unixfs_metadata_cache` deltas into per-path `rust_trace=` rows.
+- Per-path and slow-request summaries now print metadata/path/file-size cache
+  hits, misses, inserts, evictions, and capacities where applicable.
+- Default gateway/retrieval behavior is unchanged.
+
+Validation for change 1:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness -- --nocapture
+cargo check -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Validation result:
+
+- `cargo fmt --all --check`: passed.
+- `cargo test -p mobile-web-harness -- --nocapture`: passed, `59` tests.
+- `cargo check -p mobile-web-harness`: passed.
+- `cargo clippy -p mobile-web-harness --all-targets -- -D warnings`: passed.
+
+Committed as:
+
+- `02fd5c2 Add per-path UnixFS cache trace details`
+
+UnixFS-cache detail r3 command:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/ipfs-tech-unixfs-cache-details-r3-20260508T001802Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-unixfs-cache-details-r3-20260508T001802Z.json
+```
+
+UnixFS-cache detail r3 result:
+
+- Rust/Kubo passed `3/3`.
+- `ipfs.tech` root: Rust `762/1459ms`; Kubo `1599/2895ms`.
+- `ipfs.tech` assets: Rust `187/672ms`; Kubo `98/192ms`.
+- `meaningful_kubo_wins`: `4`, the asset p50/p95 TTFB/total aggregates.
+- Resource max: Rust `55996KiB` RSS and `30` FDs vs Kubo `235828KiB` RSS
+  and `144` FDs.
+
+UnixFS-cache detail findings:
+
+- Global UnixFS metadata cache aggregate:
+  `events=99`, metadata hits/misses/inserts `970/75/21`, path
+  hits/misses/inserts `0/530/536`, file-size hits/misses/inserts
+  `0/533/531`.
+- The worst asset row, `_nuxt/BXkYzPrD.js`, was backed by
+  `https://ipfs-bridge.sia.dev/` in all three runs. It had HTTP max `1170ms`,
+  header max `618ms`, body max `1139ms`, and per-path UnixFS cache details
+  `events=3 metadata=96/0/0 path=0/48/55 file_size=0/55/54`.
+- `_nuxt/AKg0Znx-.js` had Sia header/first-chunk/body maxima around
+  `600-640ms`, with per-path cache details
+  `events=3 metadata=48/0/0 path=0/24/29 file_size=0/29/29`.
+- `_nuxt/DzK6mLCt.js` was a mixed HTTP/Bitswap row with one Bitswap block.
+
+UnixFS-cache decision:
+
+Keep the diagnostics. The slow rows are not explained by expensive repeated
+local UnixFS metadata decoding. In fresh-gateway runs with distinct asset paths,
+zero path/file-size hits are expected; the `unixfs_file_size` and
+`unixfs_resource` phases mostly wrap the slow underlying raw leaf/block fetch.
+This reinforces the earlier rejection of raw-link `Tsize` header shortcuts: they
+can move timing between headers and body, but they do not eliminate the slow
+provider/block fetch that dominates these rows.
+
+Change 2:
+
+- Added the opt-in lab knob
+  `FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS=<ms>`.
+- This only affects the existing opt-in
+  `FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1` path.
+- Default behavior is unchanged. The existing single-HTTP Bitswap hedge remains
+  disabled unless explicitly enabled, and its default delay remains `150ms` when
+  enabled without the new delay override.
+
+Validation for change 2:
+
+```sh
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval single_http_bitswap_hedge_after_env_value_parses_override -- --nocapture
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Validation result:
+
+- `cargo fmt --all --check`: passed.
+- Focused retrieval parser test: passed.
+- `cargo check -p freedom-ipfs-retrieval --all-targets`: passed.
+- `cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings`:
+  passed.
+
+Committed as:
+
+- `25ed513 Add single HTTP Bitswap hedge delay knob`
+
+Late single-HTTP Bitswap hedge command:
+
+```sh
+timeout 1200s env \
+  FREEDOM_IPFS_ENABLE_SINGLE_HTTP_BITSWAP_HEDGE=1 \
+  FREEDOM_IPFS_SINGLE_HTTP_BITSWAP_HEDGE_AFTER_MS=500 \
+  cargo run -p mobile-web-harness -- \
+    --compare-kubo \
+    --build-gateway \
+    --fresh-gateway-per-run \
+    --repeat 3 \
+    --asset-concurrency 6 \
+    --timeout-secs 120 \
+    --run-timeout-secs 240 \
+    --dht-query-timeout-secs 3 \
+    --case ipfs-tech-page-assets \
+    --trace-output /tmp/ipfs-tech-single-http-bitswap-hedge500-r3-20260508T002337Z-trace.jsonl \
+    --comparison-output /tmp/ipfs-tech-single-http-bitswap-hedge500-r3-20260508T002337Z.json
+```
+
+Late single-HTTP Bitswap hedge result:
+
+- Rust/Kubo passed `3/3`.
+- `ipfs.tech` root: Rust `596/1574ms`; Kubo `1228/2309ms`.
+- `ipfs.tech` assets: Rust `97/886ms`; Kubo `118/417ms`.
+- `meaningful_kubo_wins`: `2`, the asset p95 TTFB/total aggregates.
+- Resource max: Rust `58080KiB` RSS and `42` FDs vs Kubo `215532KiB` RSS
+  and `156` FDs.
+
+Late single-HTTP Bitswap hedge trace:
+
+- HTTP provider races reported `bitswap hedge starts=7`,
+  `timeout_max=500ms`, `results=38`, with sources
+  `http_provider=36` and `bitswap=2`.
+- Bitswap pressure rose materially: `95` peer attempts, `49` Bitswap commands,
+  and `10` established Bitswap connections in this sample.
+- `cold_bitswap_peer_expand=8`, with request elapsed p50/p95/max
+  `907/1571/1571ms`.
+- The worst rows were not fixed:
+  `_nuxt/DzK6mLCt.js` p95 around `1203ms`,
+  `_nuxt/BXkYzPrD.js` p95 around `970ms`, and `_nuxt/ZT0_SuSb.js` p95 around
+  `909ms`.
+
+Immediate no-env post-control command:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/ipfs-tech-single-http-bitswap-hedge500-post-control-r3-20260508T002337Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-single-http-bitswap-hedge500-post-control-r3-20260508T002337Z.json
+```
+
+Immediate no-env post-control result:
+
+- Rust/Kubo passed `3/3`.
+- `ipfs.tech` root: Rust `517/656ms`; Kubo `1213/1410ms`.
+- `ipfs.tech` assets: Rust `124/483ms`; Kubo `60/123ms`.
+- `meaningful_kubo_wins`: `4`, the asset p50/p95 TTFB/total aggregates.
+- Resource max: Rust `57804KiB` RSS and `34` FDs vs Kubo `129332KiB` RSS
+  and `55` FDs.
+
+Immediate no-env post-control trace:
+
+- The single-HTTP Bitswap hedge stayed disabled: provider-race `hedges=0`.
+- The existing same-provider HTTP self-hedge fired in `14` result rows, but the
+  initial HTTP attempt still won each fired self-hedge.
+- HTTP-provider totals: `104` block fetches, p50/p95/max
+  `186/303/772ms`.
+- Bitswap totals: `16` block fetches, p50/p95/max `75/258/258ms`.
+- The slowest printed asset row remained `_nuxt/BXkYzPrD.js`, with
+  `https://ipfs-bridge.sia.dev/` HTTP max `724ms`, header max `218ms`, body max
+  `683ms`, and UnixFS cache details
+  `events=3 metadata=50/4/1 path=0/26/30 file_size=0/30/30`.
+
+Late hedge decision:
+
+Do not promote the 500ms single-HTTP Bitswap hedge. It improved asset median in
+one sample, but the immediate no-env post-control had a much better asset tail
+(`483ms` p95 vs `886ms` p95), lower FD pressure (`34` vs `42`), and far less
+Bitswap work. The new delay knob is useful as a lab control, but default mobile
+behavior should not cold-expand Bitswap simply because a single HTTP provider is
+slow.
+
+The next safe lever needs a stronger signal than "single HTTP provider is
+slow". Candidate conditions:
+
+- Only race Bitswap when a trusted/session peer is already available before the
+  slow single-provider request.
+- Avoid cold peer expansion in this fallback path unless provider lookup also
+  yields a high-confidence direct peer.
+- Continue studying why Kubo serves the Sia-only asset CIDs faster without
+  paying Kubo-like RSS/FD costs.
