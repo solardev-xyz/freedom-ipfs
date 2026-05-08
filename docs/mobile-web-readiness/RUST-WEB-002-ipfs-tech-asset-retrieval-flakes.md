@@ -43494,3 +43494,119 @@ Decision:
 Keep this diagnostic. It is low risk, tested, and gives future experiments the
 missing evidence needed to decide between peer ordering, address-family ordering,
 and scoped fanout changes.
+
+## 2026-05-08: Source-Address Diagnostic Baseline
+
+Branch/head: `codex/kubo-session-performance-20260506` at `4590a37`.
+
+Purpose:
+
+Run a fresh no-env same-window baseline after adding Bitswap source-address and
+dial-plan diagnostics. This establishes the current residual gap before changing
+peer/address selection behavior.
+
+Command:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/source-addr-diagnostics-baseline-ipfs-tech-r5-20260508T020231Z-trace.jsonl \
+  --comparison-output /tmp/source-addr-diagnostics-baseline-ipfs-tech-r5-20260508T020231Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `5/5`.
+- Kubo Bitswap blocks p50/p90/p95/max `35/39/39/39`, data max `795454`,
+  duplicate blocks max `4`, messages p50/p90/max `32/66/66`, peers
+  p50/p90/max `6/13/13`.
+- Root: Rust `734/875ms`; Kubo `1290/1930ms`.
+- Assets: Rust `101/495ms`; Kubo `68/145ms`.
+- `meaningful_kubo_wins`: `2`, both asset p95 TTFB/total by `350ms`
+  (`3.41x`).
+- Resource max: Rust `58224KiB` RSS and `35` FDs vs Kubo `151048KiB` RSS
+  and `56` FDs.
+
+Rust trace:
+
+- HTTP-provider blocks: `140`, p50/p90/p95/max `187/267/400/642ms`.
+- Bitswap blocks: `60`, p50/p90/p95/max `83/182/248/1513ms`.
+- Delegated provider lookup: `174` successes, p50/p90/p95/max
+  `21/45/51/65ms`.
+- Request classifications:
+  - `zero_http_provider_bitswap=14`
+  - `cold_bitswap_peer_expand=8`
+  - `zero_http_provider_cold_bitswap=8`
+- Classified zero-HTTP latency p50/p90/p95/max:
+  `141/516/1516/1516ms`.
+- Classified cold zero-HTTP latency p50/p90/p95/max:
+  `296/1516/1516/1516ms`.
+- Bitswap source candidate indexes: `0=5`, `1=2`, `5=1`.
+- Bitswap source address indexes: `0=6`, `1=2`.
+- Bitswap source address families: `ip4=6`, `ip6=2`.
+- Bitswap source address matches: `matched=8`.
+- Bitswap dial plans: `87` events, `122` peer targets, `141` candidates,
+  `40` new peers, `40` new addrs, `19` suppressed peers, `61` suppressed
+  addrs, `0` pending peers, `82` already-connected peers, max queued `19ms`.
+- Bitswap WANT_HAVE probes: `1`, outcome `timeout_fallback_want_block`,
+  elapsed `500ms`.
+- Bitswap connections established: `8`, p50/p90/p95/max
+  `107/531/531/531ms`, all TCP.
+
+Slow request finding:
+
+- Worst request: `/ipns/ipfs.tech/_nuxt/DBHrpFkY.js`, progress id `117`,
+  elapsed `1516ms`.
+- Classification:
+  `cold_bitswap_peer_expand`, `zero_http_provider_bitswap`,
+  `zero_http_provider_cold_bitswap`.
+- Bitswap elapsed `1355ms`.
+- Source peer: `12D3KooWKuSzGoorvsBB8zdXCYVMEfybYKa7sDgXT3AkofAzX3FV`.
+- Source peer details:
+  candidate index `5`, address index `0`, address family `ip4`, address
+  `/ip4/174.26.19.15/tcp/4001`, request mode `want_have`,
+  `source_peer_trusted=false`, no previous success.
+- The dial plan had one connected/trusted peer
+  `12D3KooWDpp7U7W9Q8feMZPPEpPP5FKXTUakLgnVLbavfjb9mzrT` plus new scheduled
+  dials. The eventual source peer sat behind the first three direct untrusted
+  `WANT_BLOCK` candidates and paid the `500ms` `WANT_HAVE` timeout before the
+  block arrived.
+- Other `DBHrpFkY.js` samples in the same r5 were fast, usually from the
+  connected/trusted `12D3KooWDpp...` peer at about `41-160ms`.
+
+Interpretation:
+
+The current no-env branch remains a strong aggregate win on roots, RSS, and FDs,
+but the remaining `ipfs.tech` p95 miss is a sparse zero-HTTP Bitswap
+source-selection tail. The source-address diagnostics narrow the shape:
+
+- the slow row was not an IPv6-only or unknown-address problem; the winning
+  address was a known IPv4/TCP candidate;
+- the slow row was not broad delegated-routing latency; lookup p95 was `51ms`;
+- the visible cost was late peer selection plus `WANT_HAVE` fallback on an
+  untrusted candidate at index `5`;
+- static direct-`WANT_BLOCK` peer-count experiments have already been rejected
+  elsewhere in this notebook, so the next useful work should not repeat a broad
+  direct-want sweep.
+
+Next lead:
+
+Focus on peer-quality and page-session source selection for zero-HTTP
+subresources. Useful candidate directions are:
+
+- prefer peers that have already served the same top-level page/root when a
+  zero-HTTP subresource has no HTTP-provider fallback;
+- suppress or demote late untrusted `WANT_HAVE` candidates that have no
+  page-session evidence when a connected trusted session peer is available;
+- use the new source address and dial-plan fields to compare slow rows against
+  fast rows for the same CID before changing fanout;
+- avoid revisiting broad direct-WANT, broad preconnect, or global dial-cap
+  changes unless a new trace contradicts the prior rejected evidence.
