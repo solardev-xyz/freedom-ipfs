@@ -44075,3 +44075,193 @@ Move away from broad single-provider hedging and back to source selection:
   `WANT_BLOCK`;
 - keep comparing against immediate same-window no-env controls, because the
   default branch is already winning many aggregate Kubo guardrails.
+
+## 2026-05-08: Bitswap DNS Timeout 50ms Selected Recheck
+
+Branch/head: `codex/kubo-session-performance-20260506` at `a740db6`.
+
+Purpose:
+
+Recheck the disabled Bitswap DNS lookup timeout knob against the current head's
+remaining selected-case gap. The fresh no-env baseline showed the active
+case-level Kubo win had moved to `wikipedia-on-ipfs-root` p95, where slow rows
+included zero-HTTP Bitswap retrieval and repeated DNS expansion work. Earlier
+experiments kept this knob disabled, so this run uses an immediate opt-in plus
+post-control instead of assuming the old conclusion still applies.
+
+Fresh current-head no-env selected baseline:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/current-head-selected-r5-a740db6-20260508T024257Z-trace.jsonl \
+  --comparison-output /tmp/current-head-selected-r5-a740db6-20260508T024257Z.json
+```
+
+Baseline result:
+
+- Rust/Kubo passed `5/5` all selected cases.
+- DAICO root: Rust `417/445ms`; Kubo `1256/2588ms`.
+- Vitalik range root: Rust `99/111ms`; Kubo `3353/4912ms`.
+- `ipfs.tech` range root: Rust `550/637ms`; Kubo `933/1219ms`.
+- `ipfs.tech` page root: Rust `3/3ms`; Kubo `2/208ms`.
+- `ipfs.tech` assets: Rust TTFB/total `92/263ms` and `92/264ms`;
+  Kubo TTFB/total `356/447ms`.
+- `ipfs.tech` developers hero: Rust `108/144ms`; Kubo `420/483ms`.
+- Wikipedia root: Rust `319/780ms`; Kubo `412/510ms`.
+- Meaningful Kubo wins: Wikipedia root p95 TTFB and total
+  (`780ms` Rust vs `510ms` Kubo).
+- Resource max: Rust `52088KiB` RSS and `28` FDs vs Kubo `155504KiB`
+  RSS and `185` FDs.
+- Block fetch source p50/p90/p95/max:
+  - HTTP provider: `112/225/238/465ms` across `133` blocks;
+  - Bitswap: `81/261/285/605ms` across `82` blocks.
+- Delegated lookup p50/p90/p95/max: `17/43/50/79ms`.
+- Bitswap DNS expansion: `24` events, `16` cached, `8` uncached,
+  `10` failed, `272` records, `0` IPs.
+- Leading request classifications:
+  `zero_http_provider_bitswap=14`,
+  `top_level_zero_http_provider_bitswap=9`,
+  `cold_bitswap_peer_expand=8`,
+  `zero_http_provider_cold_bitswap=8`,
+  `top_level_zero_http_provider_cold_bitswap=6`.
+
+Opt-in command:
+
+```sh
+timeout 3000s env FREEDOM_IPFS_BITSWAP_DNS_LOOKUP_TIMEOUT_MS=50 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/dns-timeout50-selected-r5-a740db6-20260508T024556Z-trace.jsonl \
+  --comparison-output /tmp/dns-timeout50-selected-r5-a740db6-20260508T024556Z.json
+```
+
+Opt-in result:
+
+- Rust/Kubo passed `5/5` all selected cases.
+- DAICO root: Rust `421/471ms`; Kubo `1193/1255ms`.
+- Vitalik range root: Rust `102/215ms`; Kubo `3071/3362ms`.
+- `ipfs.tech` range root: Rust `534/621ms`; Kubo `824/1046ms`.
+- `ipfs.tech` page root: Rust `3/4ms`; Kubo `2/2ms`.
+- `ipfs.tech` assets: Rust TTFB/total `87/288ms`; Kubo TTFB/total
+  `345/444ms`.
+- `ipfs.tech` developers hero: Rust `103/130ms`; Kubo `436/446ms`.
+- Wikipedia root: Rust `168/639ms`; Kubo `531/662ms`.
+- Meaningful Kubo wins: none.
+- Resource max: Rust `52068KiB` RSS and `26` FDs vs Kubo `149188KiB`
+  RSS and `193` FDs.
+- Block fetch source p50/p90/p95/max:
+  - HTTP provider: `152/236/265/294ms` across `117` blocks;
+  - Bitswap: `61/196/285/537ms` across `98` blocks.
+- Delegated lookup p50/p90/p95/max: `17/45/50/113ms`.
+- Bitswap DNS expansion: `17` events, `8` cached, `9` uncached,
+  `10` failed, `20` records, `0` IPs.
+- Leading request classifications:
+  `zero_http_provider_bitswap=13`,
+  `cold_bitswap_peer_expand=6`,
+  `zero_http_provider_cold_bitswap=6`,
+  `top_level_zero_http_provider_bitswap=4`,
+  `top_level_zero_http_provider_cold_bitswap=1`.
+
+Immediate no-env post-control:
+
+```sh
+timeout 3000s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case daicowtf-page-assets \
+  --case vitalik-root-html-range \
+  --case ipfs-tech-root-html-range \
+  --case ipfs-tech-page-assets \
+  --case ipfs-tech-developers-hero-range \
+  --case wikipedia-on-ipfs-root \
+  --repeat 5 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/dns-timeout50-selected-post-control-r5-a740db6-20260508T025030Z-trace.jsonl \
+  --comparison-output /tmp/dns-timeout50-selected-post-control-r5-a740db6-20260508T025030Z.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `5/5` all selected cases.
+- DAICO root: Rust `429/442ms`; Kubo `2630/2830ms`.
+- Vitalik range root: Rust `102/135ms`; Kubo `2759/4750ms`.
+- `ipfs.tech` range root: Rust `796/845ms`; Kubo `748/1002ms`.
+- `ipfs.tech` page root: Rust `3/5ms`; Kubo `2/397ms`.
+- `ipfs.tech` assets: Rust TTFB/total `97/282ms` and `97/283ms`;
+  Kubo TTFB/total `359/421ms`.
+- `ipfs.tech` developers hero: Rust `95/124ms`; Kubo `422/448ms`.
+- Wikipedia root: Rust `380/845ms`; Kubo `459/625ms`.
+- Meaningful Kubo wins: Wikipedia root p95 TTFB and total
+  (`845ms` Rust vs `625/626ms` Kubo).
+- Resource max: Rust `52532KiB` RSS and `28` FDs vs Kubo `175564KiB`
+  RSS and `264` FDs.
+- Block fetch source p50/p90/p95/max:
+  - HTTP provider: `151/232/255/535ms` across `133` blocks;
+  - Bitswap: `55/266/309/619ms` across `82` blocks.
+- Delegated lookup p50/p90/p95/max: `17/42/47/70ms`.
+- Bitswap DNS expansion: `52` events, `27` cached, `25` uncached,
+  `9` failed, `262` records, `15` IPs.
+- Leading request classifications:
+  `zero_http_provider_bitswap=10`,
+  `cold_bitswap_peer_expand=7`,
+  `zero_http_provider_cold_bitswap=7`.
+
+Decision:
+
+Promising, but not promoted from this R5 alone.
+
+The opt-in run removed the selected-case Kubo win and cut Wikipedia p95 from
+the no-env samples (`780ms` and `845ms`) to `639ms`, while preserving the
+mobile resource advantage and keeping `ipfs.tech` aggregate assets ahead of
+Kubo. The immediate no-env post-control reintroduced the Wikipedia p95 Kubo
+win, which makes this a stronger signal than the earlier single-provider hedge
+labs.
+
+The risk is blast radius: `FREEDOM_IPFS_BITSWAP_DNS_LOOKUP_TIMEOUT_MS` is a
+global Bitswap DNS cap. Promoting it directly could drop useful DNS-expanded
+providers on networks where DNS is slower but valuable. Before changing the
+default, run a larger same-window confirmation and consider whether the safer
+implementation is a scoped cap for zero-HTTP/high-provider gateway prefetch
+rather than all Bitswap DNS lookups.
+
+Next lead:
+
+- Run an R10 selected confirmation comparing DNS `50ms` against an immediate
+  no-env control.
+- If confirmed, prefer a scoped implementation for zero-HTTP gateway DNS
+  prefetch or cold Bitswap peer expansion, then guardrail it against
+  `ipfs.tech` assets and Wikipedia.
+- Watch for regressions on Vitalik p95 and HTTP-provider-heavy assets; the
+  current opt-in run increased Vitalik p95 (`215ms` vs `111/135ms` no-env),
+  although Rust still beat Kubo comfortably.
