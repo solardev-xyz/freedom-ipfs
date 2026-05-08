@@ -47216,3 +47216,152 @@ Next lead:
   coalesced for these page assets without broad prefetch;
 - keep zero-HTTP root `WANT_HAVE` tail as a separate focused lead, since this
   run had only one zero-HTTP top-level sample and it completed in `572ms`.
+
+## 2026-05-08: Keep Lab Control - Subresource-Only Single-HTTP Post-Lookup Grace
+
+Branch/head before change:
+
+- `codex/kubo-session-performance-20260506`
+- `bee5959`
+
+Hypothesis:
+
+The global single-HTTP post-lookup grace sweep previously showed that shorter
+waits can improve `ipfs.tech` asset tails, but the default was kept at `125ms`
+because broad/root evidence was mixed. The current c6 traces again show small
+`_nuxt` subresources stuck behind single HTTP-provider rows. A narrower lab
+knob should let experiments shorten the grace only for gateway subresources,
+leaving top-level/root behavior unchanged.
+
+Change:
+
+- Added disabled lab override
+  `FREEDOM_IPFS_BITSWAP_SESSION_SUBRESOURCE_SINGLE_HTTP_POST_LOOKUP_GRACE_MS`.
+- The override applies only when the retrieval context is a gateway subresource
+  and provider lookup returned exactly one HTTP provider.
+- Top-level requests continue to use
+  `FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS` or the
+  current `125ms` default.
+- Zero-HTTP and multi-HTTP provider sets keep their existing width-specific
+  behavior.
+- Default behavior is unchanged when the new env var is absent.
+
+Validation:
+
+```sh
+cargo fmt --all
+cargo test -p freedom-ipfs-retrieval post_lookup_grace_overrides_are_http_width_scoped -- --nocapture
+cargo test -p freedom-ipfs-retrieval post_lookup_grace_env_value_parses_override -- --nocapture
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo fmt --all --check
+cargo test -p freedom-ipfs-retrieval --lib -- --nocapture
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+```
+
+Validation result:
+
+- Formatting applied successfully.
+- `post_lookup_grace_overrides_are_http_width_scoped`: passed.
+- `post_lookup_grace_env_value_parses_override`: passed.
+- `cargo check -p freedom-ipfs-retrieval --all-targets`: passed.
+- Final `cargo fmt --all --check`: passed.
+- Full retrieval lib tests: passed, `156` passed, `1` ignored.
+- `cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings`:
+  passed.
+
+Opt-in command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_BITSWAP_SESSION_SUBRESOURCE_SINGLE_HTTP_POST_LOOKUP_GRACE_MS=50 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/subresource-single-http-grace50-ipfs-tech-c6-r10-bee5959-dirty-20260508Tnext-trace.jsonl \
+  --comparison-output /tmp/subresource-single-http-grace50-ipfs-tech-c6-r10-bee5959-dirty-20260508Tnext.json
+```
+
+Opt-in result:
+
+- Rust/Kubo passed `10/10`.
+- Root: Rust `593/963ms`; Kubo `1334/4370ms`.
+- Assets: Rust `114/251ms`; Kubo `124/444ms`.
+- Case-level `meaningful_kubo_wins`: none.
+- Resource max: Rust `57452KiB` RSS and `30` FDs vs Kubo `282760KiB`
+  RSS and `372` FDs.
+- Block fetch totals:
+  - Bitswap `244` blocks, p50/p90/p95/max `96/184/231/355ms`;
+  - HTTP provider `150` blocks, p50/p90/p95/max `98/303/609/1034ms`.
+- Post-lookup race summary:
+  - events `294`, provider wins `101`, Bitswap wins `193`;
+  - race elapsed p50/p90/p95/max `65/138/174/376ms`;
+  - HTTP provider counts in races: single `169`, multi `125`.
+- The run had a good aggregate shape, but a first-page burst still produced
+  large path-local p95 Kubo wins, led by:
+  - `B1ETkkRH.js` p95 Rust/Kubo `1719/306ms`;
+  - `entry.C4ErMpWu.css` p95 `942/248ms`;
+  - `index.CZYCeseQ.css` p95 `810/322ms`.
+
+Immediate no-env post-control command:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/subresource-single-http-grace50-postcontrol-ipfs-tech-c6-r10-bee5959-dirty-20260508Tnext-trace.jsonl \
+  --comparison-output /tmp/subresource-single-http-grace50-postcontrol-ipfs-tech-c6-r10-bee5959-dirty-20260508Tnext.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `10/10`.
+- Root: Rust `600/2268ms`; Kubo `1543/2781ms`.
+- Assets: Rust `121/326ms`; Kubo `183/432ms`.
+- Case-level `meaningful_kubo_wins`: none.
+- Resource max: Rust `58768KiB` RSS and `34` FDs vs Kubo `210452KiB`
+  RSS and `259` FDs.
+- Block fetch totals:
+  - HTTP provider `203` blocks, p50/p90/p95/max `112/238/275/485ms`;
+  - Bitswap `192` blocks, p50/p90/p95/max `105/185/243/1924ms`.
+- Post-lookup race summary:
+  - events `329`, provider wins `178`, Bitswap wins `151`;
+  - race elapsed p50/p90/p95/max `75/181/193/460ms`;
+  - HTTP provider counts in races: single `189`, multi `140`.
+- The control's main tail was the already-known top-level zero-HTTP root
+  `WANT_HAVE` shape, with root p95 `2268ms` and slow root samples using source
+  index `4` in `want_have` mode.
+
+Decision:
+
+Keep the new subresource-only grace knob as a disabled lab control, but do not
+promote a default change from this single A/B pair. The opt-in materially
+improved aggregate asset p50/p95 in the same run shape and kept resources low,
+but isolated path-local p95 rows remained. The control confirms the root tail is
+not caused by the new subresource override, yet also shows the active gap is now
+split between:
+
+- subresource source/scheduling bursts where several assets in the same page
+  wait behind slow provider/session outcomes; and
+- top-level zero-HTTP `WANT_HAVE` root tails when candidate index `4` wins late.
+
+Next follow-up:
+
+- run a longer `50ms` or `75ms` subresource-only sweep only if current traces
+  continue to show aggregate asset wins without FD/RSS pressure;
+- inspect why the opt-in's first page had several subresources blocked behind
+  the same slow root/path CID cluster despite the aggregate win;
+- keep top-level zero-HTTP root `WANT_HAVE` as a separate candidate, not a
+  reason to reject this subresource-only lab.

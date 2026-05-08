@@ -144,6 +144,8 @@ const BITSWAP_SESSION_MULTI_HTTP_POST_LOOKUP_GRACE_MS_ENV: &str =
 const BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE: Duration = Duration::from_millis(125);
 const BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS_ENV: &str =
     "FREEDOM_IPFS_BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE_MS";
+const BITSWAP_SESSION_SUBRESOURCE_SINGLE_HTTP_POST_LOOKUP_GRACE_MS_ENV: &str =
+    "FREEDOM_IPFS_BITSWAP_SESSION_SUBRESOURCE_SINGLE_HTTP_POST_LOOKUP_GRACE_MS";
 const TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE: Duration = Duration::from_millis(150);
 const ENABLE_TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE_ENV: &str =
     "FREEDOM_IPFS_ENABLE_TOP_LEVEL_SINGLE_HTTP_PROVIDER_WIN_BITSWAP_GRACE";
@@ -775,6 +777,7 @@ impl HttpRetriever {
                                                                         cid,
                                                                         &providers,
                                                                         http_provider_count,
+                                                                        context.as_ref(),
                                                                         shortcut.as_mut(),
                                                                     )
                                                                     .await?
@@ -973,6 +976,7 @@ impl HttpRetriever {
                                                                     cid,
                                                                     &providers,
                                                                     http_provider_count,
+                                                                    context.as_ref(),
                                                                     shortcut.as_mut(),
                                                                 )
                                                                 .await?
@@ -1960,7 +1964,7 @@ impl HttpRetriever {
     where
         F: Future<Output = Result<Option<Block>>>,
     {
-        let post_lookup_grace = bitswap_session_post_lookup_grace(providers);
+        let post_lookup_grace = bitswap_session_post_lookup_grace(providers, context.as_ref());
         let http_provider_count = provider_http_url_count(providers);
         let provider_fetch = self.fetch_from_providers_with_source(cid, providers, context.clone());
         tokio::pin!(provider_fetch);
@@ -2155,12 +2159,13 @@ impl HttpRetriever {
         cid: &Cid,
         providers: &[Provider],
         http_provider_count: usize,
+        context: Option<&RetrievalRequestContext>,
         mut shortcut: Pin<&mut F>,
     ) -> Result<SessionShortcutPostLookupWait>
     where
         F: Future<Output = Result<Option<Block>>>,
     {
-        let post_lookup_grace = bitswap_session_post_lookup_grace(providers);
+        let post_lookup_grace = bitswap_session_post_lookup_grace(providers, context);
         let post_lookup_started = Instant::now();
         match timeout(post_lookup_grace, &mut shortcut).await {
             Ok(shortcut_result) => match shortcut_result {
@@ -2227,7 +2232,7 @@ impl HttpRetriever {
     where
         F: Future<Output = Result<Option<Block>>>,
     {
-        let post_lookup_grace = bitswap_session_post_lookup_grace(providers);
+        let post_lookup_grace = bitswap_session_post_lookup_grace(providers, context.as_ref());
         let http_provider_count = provider_http_url_count(providers);
         let provider_count = providers.len();
         if !zero_http_post_lookup_dns_prefetch_enabled() {
@@ -5110,7 +5115,10 @@ fn single_http_provider_base(providers: &[Provider]) -> Option<&Url> {
     }
 }
 
-fn bitswap_session_post_lookup_grace(providers: &[Provider]) -> Duration {
+fn bitswap_session_post_lookup_grace(
+    providers: &[Provider],
+    context: Option<&RetrievalRequestContext>,
+) -> Duration {
     let zero_http_override = std::env::var_os(BITSWAP_SESSION_ZERO_HTTP_POST_LOOKUP_GRACE_MS_ENV);
     let zero_http_override = zero_http_override
         .as_ref()
@@ -5120,6 +5128,11 @@ fn bitswap_session_post_lookup_grace(providers: &[Provider]) -> Duration {
     let single_http_override = single_http_override
         .as_ref()
         .map(|value| value.to_string_lossy());
+    let subresource_single_http_override =
+        std::env::var_os(BITSWAP_SESSION_SUBRESOURCE_SINGLE_HTTP_POST_LOOKUP_GRACE_MS_ENV);
+    let subresource_single_http_override = subresource_single_http_override
+        .as_ref()
+        .map(|value| value.to_string_lossy());
     let multi_http_override = std::env::var_os(BITSWAP_SESSION_MULTI_HTTP_POST_LOOKUP_GRACE_MS_ENV);
     let multi_http_override = multi_http_override
         .as_ref()
@@ -5127,26 +5140,40 @@ fn bitswap_session_post_lookup_grace(providers: &[Provider]) -> Duration {
 
     bitswap_session_post_lookup_grace_from_env_value(
         providers,
+        context,
         zero_http_override.as_deref(),
         single_http_override.as_deref(),
+        subresource_single_http_override.as_deref(),
         multi_http_override.as_deref(),
     )
 }
 
 fn bitswap_session_post_lookup_grace_from_env_value(
     providers: &[Provider],
+    context: Option<&RetrievalRequestContext>,
     zero_http_grace_ms: Option<&str>,
     single_http_grace_ms: Option<&str>,
+    subresource_single_http_grace_ms: Option<&str>,
     multi_http_grace_ms: Option<&str>,
 ) -> Duration {
     match provider_http_url_count(providers) {
         0 => {
             post_lookup_grace_from_env_value(zero_http_grace_ms, BITSWAP_SESSION_POST_LOOKUP_GRACE)
         }
-        1 => post_lookup_grace_from_env_value(
-            single_http_grace_ms,
-            BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE,
-        ),
+        1 => {
+            let subresource_request = context
+                .map(RetrievalRequestContext::gateway_subresource)
+                .unwrap_or(false);
+            let grace_ms = if subresource_request {
+                subresource_single_http_grace_ms.or(single_http_grace_ms)
+            } else {
+                single_http_grace_ms
+            };
+            post_lookup_grace_from_env_value(
+                grace_ms,
+                BITSWAP_SESSION_SINGLE_HTTP_POST_LOOKUP_GRACE,
+            )
+        }
         _ => {
             post_lookup_grace_from_env_value(multi_http_grace_ms, BITSWAP_SESSION_POST_LOOKUP_GRACE)
         }
@@ -16604,12 +16631,41 @@ mod bitswap_tests {
             vec!["/ip4/127.0.0.1/tcp/4001".into()],
         )
         .unwrap()];
+        let top_level_context = RetrievalRequestContext::gateway_request(None);
+        let subresource_context = RetrievalRequestContext::gateway_request_with_top_level(
+            Some(1),
+            Some("/ipns/site/".into()),
+        );
 
         assert_eq!(
             bitswap_session_post_lookup_grace_from_env_value(
                 &single_http,
+                Some(&top_level_context),
                 Some("25"),
                 Some("125"),
+                Some("50"),
+                Some("0")
+            ),
+            Duration::from_millis(125)
+        );
+        assert_eq!(
+            bitswap_session_post_lookup_grace_from_env_value(
+                &single_http,
+                Some(&subresource_context),
+                Some("25"),
+                Some("125"),
+                Some("50"),
+                Some("0")
+            ),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            bitswap_session_post_lookup_grace_from_env_value(
+                &single_http,
+                Some(&subresource_context),
+                Some("25"),
+                Some("125"),
+                None,
                 Some("0")
             ),
             Duration::from_millis(125)
@@ -16617,8 +16673,10 @@ mod bitswap_tests {
         assert_eq!(
             bitswap_session_post_lookup_grace_from_env_value(
                 &multi_http,
+                Some(&subresource_context),
                 Some("25"),
                 Some("125"),
+                Some("50"),
                 None
             ),
             BITSWAP_SESSION_POST_LOOKUP_GRACE
@@ -16626,8 +16684,10 @@ mod bitswap_tests {
         assert_eq!(
             bitswap_session_post_lookup_grace_from_env_value(
                 &multi_http,
+                Some(&subresource_context),
                 Some("25"),
                 Some("125"),
+                Some("50"),
                 Some("0")
             ),
             Duration::from_millis(0)
@@ -16635,8 +16695,10 @@ mod bitswap_tests {
         assert_eq!(
             bitswap_session_post_lookup_grace_from_env_value(
                 &bitswap_only,
+                Some(&subresource_context),
                 Some("25"),
                 Some("125"),
+                Some("50"),
                 Some("0")
             ),
             Duration::from_millis(25)
@@ -16644,8 +16706,10 @@ mod bitswap_tests {
         assert_eq!(
             bitswap_session_post_lookup_grace_from_env_value(
                 &bitswap_only,
+                Some(&subresource_context),
                 Some("not-a-number"),
                 Some("125"),
+                Some("50"),
                 Some("0")
             ),
             BITSWAP_SESSION_POST_LOOKUP_GRACE

@@ -252,6 +252,11 @@ conditional revalidations get their own request IDs plus
 `X-Freedom-Parent-Request-ID`. This lets trace output and mobile progress
 snapshots group subresource work under the top-level page load without changing
 gateway retrieval behavior.
+For page-asset session tuning, the disabled lab knob
+`FREEDOM_IPFS_BITSWAP_SESSION_SUBRESOURCE_SINGLE_HTTP_POST_LOOKUP_GRACE_MS`
+overrides the single-HTTP post-lookup Bitswap session grace only for gateway
+subresources. Top-level requests and non-single-HTTP provider sets keep the
+normal grace unless their existing width-specific overrides are set.
 
 The harness can also spawn Kubo as a comparison engine when a Kubo `ipfs`
 binary is available:
