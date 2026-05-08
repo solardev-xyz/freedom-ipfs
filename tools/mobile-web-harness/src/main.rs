@@ -1768,7 +1768,8 @@ fn format_comparison_asset_trace_details(trace: Option<&TraceRequestPathAggregat
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let bitswap_details = if trace.bitswap_source_candidate_indexes.is_empty()
+    let bitswap_details = if trace.bitswap_fetches == 0
+        && trace.bitswap_source_candidate_indexes.is_empty()
         && trace.bitswap_source_request_modes.is_empty()
         && trace.bitswap_source_transports.is_empty()
     {
@@ -1790,7 +1791,13 @@ fn format_comparison_asset_trace_details(trace: Option<&TraceRequestPathAggregat
             format_trace_counts(&trace.bitswap_source_transports)
         };
         format!(
-            " bitswap_indexes={source_indexes} bitswap_modes={source_modes} bitswap_transports={source_transports}"
+            " bitswap_fetches={} bitswap_max={}ms bitswap_bytes={} bitswap_indexes={} bitswap_modes={} bitswap_transports={}",
+            trace.bitswap_fetches,
+            trace.bitswap_fetch_max_ms,
+            trace.bitswap_fetch_bytes,
+            source_indexes,
+            source_modes,
+            source_transports
         )
     };
     let dht_details = format_trace_path_dht_details(trace);
@@ -6170,6 +6177,9 @@ struct TraceRequestPathAggregate {
     http_provider_fetch_body_max_ms: u128,
     http_provider_fetch_providers: Vec<TraceValueCount>,
     http_provider_fetch_error_classes: Vec<TraceValueCount>,
+    bitswap_fetches: usize,
+    bitswap_fetch_max_ms: u128,
+    bitswap_fetch_bytes: u128,
     bitswap_source_candidate_indexes: Vec<TraceValueCount>,
     bitswap_source_request_modes: Vec<TraceValueCount>,
     bitswap_source_peers: Vec<TraceValueCount>,
@@ -7715,6 +7725,9 @@ struct TraceRequestAggregate {
     http_provider_fetch_body_elapsed_ms: LatencySummary,
     http_provider_fetch_providers: Vec<TraceValueCount>,
     http_provider_fetch_error_classes: Vec<TraceValueCount>,
+    bitswap_fetches: usize,
+    bitswap_fetch_elapsed_ms: LatencySummary,
+    bitswap_fetch_bytes: u128,
     bitswap_source_candidate_indexes: Vec<TraceValueCount>,
     bitswap_source_request_modes: Vec<TraceValueCount>,
     bitswap_source_peers: Vec<TraceValueCount>,
@@ -7798,6 +7811,9 @@ struct TraceRequestBuilder {
     http_provider_fetch_body_elapsed_values: Vec<u128>,
     http_provider_fetch_providers: BTreeMap<String, usize>,
     http_provider_fetch_error_classes: BTreeMap<String, usize>,
+    bitswap_fetches: usize,
+    bitswap_fetch_elapsed_values: Vec<u128>,
+    bitswap_fetch_bytes: u128,
     bitswap_source_candidate_indexes: BTreeMap<String, usize>,
     bitswap_source_request_modes: BTreeMap<String, usize>,
     bitswap_source_peers: BTreeMap<String, usize>,
@@ -7839,6 +7855,9 @@ struct TraceRequestPathBuilder {
     http_provider_fetch_body_max_ms: u128,
     http_provider_fetch_providers: BTreeMap<String, usize>,
     http_provider_fetch_error_classes: BTreeMap<String, usize>,
+    bitswap_fetches: usize,
+    bitswap_fetch_max_ms: u128,
+    bitswap_fetch_bytes: u128,
     bitswap_source_candidate_indexes: BTreeMap<String, usize>,
     bitswap_source_request_modes: BTreeMap<String, usize>,
     bitswap_source_peers: BTreeMap<String, usize>,
@@ -7916,6 +7935,11 @@ impl TraceRequestPathBuilder {
             &mut self.http_provider_fetch_error_classes,
             &request.http_provider_fetch_error_classes,
         );
+        self.bitswap_fetches += request.bitswap_fetches;
+        self.bitswap_fetch_bytes += request.bitswap_fetch_bytes;
+        self.bitswap_fetch_max_ms = self
+            .bitswap_fetch_max_ms
+            .max(request.bitswap_fetch_elapsed_ms.max_ms.unwrap_or_default());
         merge_trace_counts(
             &mut self.bitswap_source_candidate_indexes,
             &request.bitswap_source_candidate_indexes,
@@ -7984,6 +8008,9 @@ impl TraceRequestPathBuilder {
             http_provider_fetch_error_classes: sorted_trace_counts(
                 self.http_provider_fetch_error_classes,
             ),
+            bitswap_fetches: self.bitswap_fetches,
+            bitswap_fetch_max_ms: self.bitswap_fetch_max_ms,
+            bitswap_fetch_bytes: self.bitswap_fetch_bytes,
             bitswap_source_candidate_indexes: sorted_trace_counts(
                 self.bitswap_source_candidate_indexes,
             ),
@@ -8035,6 +8062,9 @@ impl TraceRequestBuilder {
             http_provider_fetch_body_elapsed_values: Vec::new(),
             http_provider_fetch_providers: BTreeMap::new(),
             http_provider_fetch_error_classes: BTreeMap::new(),
+            bitswap_fetches: 0,
+            bitswap_fetch_elapsed_values: Vec::new(),
+            bitswap_fetch_bytes: 0,
             bitswap_source_candidate_indexes: BTreeMap::new(),
             bitswap_source_request_modes: BTreeMap::new(),
             bitswap_source_peers: BTreeMap::new(),
@@ -8191,6 +8221,11 @@ impl TraceRequestBuilder {
             }
         }
         if phase == "bitswap_fetch" && value.get("ok").and_then(|ok| ok.as_bool()) == Some(true) {
+            self.bitswap_fetches += 1;
+            self.bitswap_fetch_bytes += value.get("bytes").and_then(json_u128).unwrap_or_default();
+            if let Some(elapsed_ms) = elapsed_ms {
+                self.bitswap_fetch_elapsed_values.push(elapsed_ms);
+            }
             if let Some(index) = json_detail_string(value.get("source_peer_candidate_index")) {
                 if index != "-1" {
                     *self
@@ -8360,6 +8395,11 @@ impl TraceRequestBuilder {
             http_provider_fetch_error_classes: sorted_trace_counts(
                 self.http_provider_fetch_error_classes,
             ),
+            bitswap_fetches: self.bitswap_fetches,
+            bitswap_fetch_elapsed_ms: LatencySummary::from_values(
+                self.bitswap_fetch_elapsed_values,
+            ),
+            bitswap_fetch_bytes: self.bitswap_fetch_bytes,
             bitswap_source_candidate_indexes: sorted_trace_counts(
                 self.bitswap_source_candidate_indexes,
             ),
@@ -10762,6 +10802,7 @@ fn format_request_classification_details(request: &TraceRequestAggregate) -> Str
     if request.classifications.is_empty()
         && request.delegated_zero_http_provider_lookups == 0
         && request.bitswap_block_fetches == 0
+        && request.bitswap_fetches == 0
         && request.cold_bitswap_peer_expands == 0
         && request.provider_diversity_low_events == 0
         && request.dht_provider_lookup_events == 0
@@ -10790,10 +10831,13 @@ fn format_request_classification_details(request: &TraceRequestAggregate) -> Str
     };
     let dht_details = format_trace_request_dht_details(request);
     format!(
-        " classifications={} zero_http_lookups={} bitswap_blocks={} cold_expands={} max_peers={} max_session_peers={} source_indexes={} source_modes={} source_transports={}{}",
+        " classifications={} zero_http_lookups={} bitswap_blocks={} bitswap_fetches={} bitswap_elapsed={} bitswap_bytes={} cold_expands={} max_peers={} max_session_peers={} source_indexes={} source_modes={} source_transports={}{}",
         classifications,
         request.delegated_zero_http_provider_lookups,
         request.bitswap_block_fetches,
+        request.bitswap_fetches,
+        request.bitswap_fetch_elapsed_ms,
+        request.bitswap_fetch_bytes,
         request.cold_bitswap_peer_expands,
         request.max_bitswap_peer_count,
         request.max_bitswap_session_peer_count,
@@ -12529,6 +12573,9 @@ mod tests {
         assert_eq!(request.path, "/ipns/site/");
         assert_eq!(request.delegated_zero_http_provider_lookups, 1);
         assert_eq!(request.bitswap_block_fetches, 1);
+        assert_eq!(request.bitswap_fetches, 1);
+        assert_eq!(request.bitswap_fetch_elapsed_ms.max_ms, Some(1494));
+        assert_eq!(request.bitswap_fetch_bytes, 1362);
         assert_eq!(request.cold_bitswap_peer_expands, 1);
         assert_eq!(request.max_bitswap_peer_count, 5);
         assert_eq!(request.max_bitswap_session_peer_count, 0);
@@ -12563,6 +12610,10 @@ mod tests {
         assert_eq!(requirement_results[0].actual_count, 1);
         assert!(requirement_results[0].passed);
         assert!(trace_requirement_failure_messages(&requirement_results).is_empty());
+        let request_path = &summary.request_paths[0];
+        assert_eq!(request_path.bitswap_fetches, 1);
+        assert_eq!(request_path.bitswap_fetch_max_ms, 1494);
+        assert_eq!(request_path.bitswap_fetch_bytes, 1362);
         let requirements = vec!["top_level_zero_http_provider_cold_bitswap=2".to_string()];
         let requirement_results =
             request_classification_requirement_results(Some(&summary), &requirements).unwrap();
@@ -12657,6 +12708,9 @@ mod tests {
             trace_value_count(&request.bitswap_source_transports, "wss"),
             1
         );
+        assert_eq!(request.bitswap_fetches, 1);
+        assert_eq!(request.bitswap_fetch_elapsed_ms.max_ms, Some(382));
+        assert_eq!(request.bitswap_fetch_bytes, 1362);
 
         let request_path = &summary.request_paths[0];
         assert_eq!(request_path.provider_diversity_low_events, 1);
@@ -12667,6 +12721,9 @@ mod tests {
             trace_value_count(&request_path.bitswap_source_transports, "wss"),
             1
         );
+        assert_eq!(request_path.bitswap_fetches, 1);
+        assert_eq!(request_path.bitswap_fetch_max_ms, 382);
+        assert_eq!(request_path.bitswap_fetch_bytes, 1362);
 
         let classified_latency = summary
             .request_classification_latencies

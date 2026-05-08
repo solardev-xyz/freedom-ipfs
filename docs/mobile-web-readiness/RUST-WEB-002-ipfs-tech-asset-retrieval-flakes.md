@@ -41494,3 +41494,154 @@ Bitswap race outcome for asset Kubo-win rows. The current asset `rust_trace=`
 summary identifies source/provider and total fetch latency, but it is still too
 coarse to know whether the next safe lever is provider scoring, self-hedge
 timing, Bitswap-vs-HTTP race policy, or UnixFS/resource scheduling.
+
+## 2026-05-08: Per-Path HTTP/Bitswap Milestone Diagnostics
+
+Branch/head before diagnostics:
+
+- `codex/kubo-session-performance-20260506`
+- `19b3402`
+
+Purpose:
+
+The broad guardrail identified two active `ipfs.tech` path-local tails:
+
+- mixed HTTP-provider/Bitswap asset rows involving `https://ipfs-bridge.sia.dev/`;
+- pure zero-HTTP cold Bitswap asset rows where the previous `rust_trace=` row
+  showed only the aggregate `block_fetch_total` cost.
+
+Before changing retrieval policy again, make the harness tell us whether a
+Kubo-winning asset path is waiting on HTTP-provider headers, first chunk/body,
+or successful Bitswap source fetch latency.
+
+Change:
+
+- Per-path `rust_trace=` rows now include HTTP-provider response bytes,
+  first-chunk count, and header/first-chunk/body maxima.
+- Slow request summaries now include the same HTTP milestone latency summaries.
+- Per-path `rust_trace=` rows now include successful Bitswap fetch count, bytes,
+  and max latency.
+- Slow request classification details now include successful Bitswap fetch
+  latency and bytes.
+- Default gateway/retrieval behavior is unchanged.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness -- --nocapture
+cargo check -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+```
+
+Validation result:
+
+- `cargo fmt --all --check`: passed.
+- `cargo test -p mobile-web-harness -- --nocapture`: passed, `59` tests.
+- `cargo check -p mobile-web-harness`: passed.
+- `cargo clippy -p mobile-web-harness --all-targets -- -D warnings`: passed.
+
+HTTP-milestone r5 command:
+
+```sh
+timeout 1800s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 5 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/ipfs-tech-http-milestones-r5-20260508T011500Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-http-milestones-r5-20260508T011500Z.json
+```
+
+HTTP-milestone r5 result:
+
+- Rust/Kubo passed `5/5`.
+- `ipfs.tech` root: Rust `816/936ms`; Kubo `1227/1585ms`.
+- `ipfs.tech` assets: Rust `135/450ms`; Kubo `75/149ms`.
+- `meaningful_kubo_wins`: `4`, the asset p50/p95 TTFB/total aggregates.
+- Resource max: Rust `59548KiB` RSS and `38` FDs vs Kubo `181836KiB` RSS and
+  `122` FDs.
+- Path-local asset wins were severe in this network window: `84` path/metric
+  pairs.
+
+HTTP-milestone findings:
+
+- The worst pure Bitswap rows were zero-HTTP cold subresources:
+  `_nuxt/DBHrpFkY.js` p95 around `756ms` and `_nuxt/BfUTpfA9.js` p95 around
+  `737ms`, with no HTTP-provider fetches.
+- Mixed HTTP rows showed `ipfs-bridge.sia.dev` milestone cost clearly:
+  `_nuxt/entry.C4ErMpWu.css` had HTTP max `392ms`, header/first-chunk max
+  `202ms`, and body max `389ms`.
+- Global HTTP-provider provider split showed the same shape:
+  `ipfs-bridge.sia.dev` single-provider winners around p50 `186ms`, while
+  multi-provider winners were much faster.
+- Bitswap source rows were TCP-only; connection establishment p50/p95/max was
+  `314/563/574ms`, so the pure Bitswap rows still need source/dial visibility
+  before a behavior change.
+
+Bitswap-milestone r3 command:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/ipfs-tech-bitswap-milestones-r3-20260508T012500Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-bitswap-milestones-r3-20260508T012500Z.json
+```
+
+Bitswap-milestone r3 result:
+
+- Rust/Kubo passed `3/3`.
+- `ipfs.tech` root: Rust `527/801ms`; Kubo `2554/2558ms`.
+- `ipfs.tech` assets: Rust `134/471ms`; Kubo `194/417ms`.
+- `meaningful_kubo_wins`: `2`, both asset p95 TTFB/total by about `54-55ms`.
+- Resource max: Rust `58100KiB` RSS and `36` FDs vs Kubo `194452KiB` RSS and
+  `101` FDs.
+
+Bitswap-milestone r3 findings:
+
+- This shorter window did not reproduce the severe pure Bitswap path wins from
+  the r5 sample; the printed top Kubo-win rows were mostly HTTP-provider rows.
+- HTTP-provider rows now clearly show Sia bridge timing:
+  `ipfs-bridge.sia.dev` p50 `184ms`, p95 `240ms`, max `432ms`, with body max
+  `418ms`.
+- Bitswap itself was healthy in this window: `35` Bitswap block fetches,
+  p50/p95/max `114/233/245ms`; successful peer fetch max `167ms`.
+- Bitswap connections still showed non-trivial cold setup: established
+  p50/p95/max `287/537/537ms`, but this did not dominate the top printed asset
+  rows in this sample.
+
+Decision:
+
+Keep these diagnostics. They do not change behavior and they close the biggest
+observability gap in `asset_kubo_wins`: HTTP-provider rows now show whether the
+tail is headers/first chunk/body, and pure Bitswap rows can show successful
+source fetch count/bytes/max when that path fires.
+
+Do not promote any retrieval behavior from these samples alone. The current
+`ipfs.tech` gap is volatile by network window:
+
+- In one r5, pure zero-HTTP Bitswap subresources were the worst rows.
+- In the immediate r3, aggregate Rust beat Kubo at asset p50 and only narrowly
+  lost p95, with top rows mostly dominated by `ipfs-bridge.sia.dev` and UnixFS
+  resource timing.
+
+Next behavior work should use the new fields on a larger same-window sample. A
+safe candidate would need to target one of two explicitly observed shapes:
+
+- HTTP-provider rows where a single Sia bridge response has slow header/body
+  milestones and no faster provider wins the race.
+- Pure zero-HTTP cold Bitswap rows where `bitswap_fetch_max` and connection
+  setup show the source/dial is actually the path tail.
