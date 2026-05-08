@@ -46182,3 +46182,122 @@ the recurring zero-HTTP `hfYlCurB.js` median loss. The experiment reinforces the
 previous conclusion: fixed fanout is too blunt. The next performance work should
 use this knob for controlled probes, but a real promotion candidate should be
 adaptive and source-quality aware, not a static wider direct-WANT peer count.
+
+## 2026-05-08: Keep Diagnostic - HTTP Provider Candidate Cancellation Stages
+
+Branch/head before patch: `codex/kubo-session-performance-20260506` at
+`897abfe`.
+
+Hypothesis:
+
+The remaining visible `ipfs.tech` path-local losses often involve
+HTTP-provider-backed rows, especially single-provider `ipfs-bridge.sia.dev`
+responses. Existing traces report the HTTP-provider winner and whether a
+same-provider self-hedge fired, but not what happened to the losing candidate
+when the race future was dropped. Without that, it is hard to tell whether an
+earlier same-provider hedge might help, or whether the duplicate attempt is
+usually still waiting on headers/body and therefore just extra mobile fanout.
+
+Change:
+
+- Add diagnostic-only `http_provider_candidate_cancelled` events when an
+  in-flight HTTP-provider candidate is dropped before normal completion.
+- Include:
+  - `stage`: `waiting_limiter`, `waiting_headers`, `reading_body`,
+    `verifying_block`, or `storing_block`;
+  - provider URL;
+  - provider/attempt/original-provider indexes and ranks;
+  - provider score if known;
+  - elapsed time.
+- Extend the mobile web harness HTTP-provider race summary with cancellation
+  counts by stage, attempt index, and provider.
+- Map the new phase to the existing `fetching_http_provider` mobile progress
+  bucket. No mobile ABI or Swift surface changed.
+
+This is diagnostic-only. It does not change HTTP-provider ordering, self-hedge
+timing, Bitswap racing, provider scoring, verification, caching, or fallback
+policy.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness http_provider_fetches -- --nocapture
+cargo test -p mobile-web-harness trace_summary_derives_mobile_progress_phases -- --nocapture
+cargo test -p freedom-ipfs-mobile progress_phase_maps_trace_events_to_ui_states -- --nocapture
+cargo check -p freedom-ipfs-retrieval --all-targets
+cargo clippy -p freedom-ipfs-retrieval --all-targets -- -D warnings
+cargo check -p mobile-web-harness --all-targets
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+cargo check -p freedom-ipfs-mobile --all-targets
+cargo clippy -p freedom-ipfs-mobile --all-targets -- -D warnings
+```
+
+Result:
+
+- Formatting passed.
+- Focused mobile web harness HTTP-provider summary test passed.
+- Focused mobile web harness progress phase test passed.
+- Focused mobile progress mapper test passed.
+- Retrieval, harness, and mobile check/clippy passed with `-D warnings`.
+
+Live diagnostic smoke:
+
+```sh
+timeout 900s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 2 \
+  --asset-concurrency 1 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/http-candidate-cancel-diag-ipfs-tech-r2-897abfe-wip-20260508Tsmoke-trace.jsonl \
+  --comparison-output /tmp/http-candidate-cancel-diag-ipfs-tech-r2-897abfe-wip-20260508Tsmoke.json
+```
+
+Smoke result:
+
+- Rust/Kubo passed `2/2`.
+- Root: Rust p50/p95 `1387/1440ms`; Kubo `1223/1258ms`.
+- Assets: Rust p50/p95 `185/427ms`; Kubo `101/405ms`.
+- Meaningful aggregate Kubo wins: `6`, covering root p50/p95 and asset p50
+  TTFB/total. Treat this as a diagnostic smoke, not a promotion-quality sample.
+- Resource max: Rust `49640KiB` RSS and `18` FDs vs Kubo `196368KiB`
+  RSS and `112` FDs.
+
+Trace findings:
+
+- HTTP-provider races:
+  - events `69`;
+  - single-provider `41`;
+  - multi-provider `28`;
+  - results `67`, all successful;
+  - same-provider self-hedges `7`;
+  - self-hedge fired results `7`, all won by the initial attempt.
+- New cancellation diagnostics:
+  - `http_provider_candidate_cancelled=37`;
+  - stages: `waiting_headers=37`;
+  - attempt indexes: initial attempt `0=30`, self-hedge/duplicate `1=7`;
+  - providers:
+    `caliberation-pdp.infrafolio.com=18`,
+    `ipfs-bridge.sia.dev=8`,
+    `calib2.ezpdpz.net=6`,
+    `calib.ezpdpz.net=2`,
+    `indexer.storacha.network=2`,
+    `dag.w3s.link=1`.
+- `ipfs-bridge.sia.dev` remained the single-provider slow side:
+  single-provider winner p50/p90/p95/max `160/377/552/657ms`.
+- `dag.w3s.link` was fast in the same run:
+  p50/p90/p95/max `43/73/75/96ms`.
+
+Decision:
+
+Keep. The diagnostic is low risk, tested, and immediately useful. This smoke
+argues against simply moving same-provider HTTP self-hedge earlier: every fired
+self-hedge still lost to the initial request, and the cancelled duplicate was
+still waiting for headers. The remaining HTTP-provider work should focus on
+source/provider selection and avoiding slow single-provider rows, not increasing
+duplicate same-provider pressure blindly.

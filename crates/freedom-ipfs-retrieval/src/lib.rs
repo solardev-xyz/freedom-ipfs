@@ -3258,8 +3258,14 @@ impl HttpRetriever {
         attempt_index: usize,
     ) -> HttpProviderCandidateResult {
         let base = candidate.base;
+        let trace = HttpProviderCandidateTrace {
+            provider_index,
+            attempt_index,
+            original_provider_index: candidate.original_index,
+            score_elapsed: candidate.score_elapsed,
+        };
         let result = self
-            .fetch_from_http_provider_candidate(cid, base.clone())
+            .fetch_from_http_provider_candidate(cid, base.clone(), trace)
             .await;
         HttpProviderCandidateResult {
             provider_index,
@@ -3271,8 +3277,15 @@ impl HttpRetriever {
         }
     }
 
-    async fn fetch_from_http_provider_candidate(&self, cid: Cid, base: Url) -> Result<Block> {
+    async fn fetch_from_http_provider_candidate(
+        &self,
+        cid: Cid,
+        base: Url,
+        trace: HttpProviderCandidateTrace,
+    ) -> Result<Block> {
+        let mut cancel_trace = HttpProviderCandidateCancelTrace::new(cid, base.clone(), trace);
         let limiter_started = Instant::now();
+        cancel_trace.set_stage("waiting_limiter");
         let _permit = match self
             .http_provider_fetch_limiter
             .clone()
@@ -3291,6 +3304,7 @@ impl HttpRetriever {
                 permit
             }
             Err(err) => {
+                cancel_trace.complete();
                 tracing::info!(
                     phase = "http_provider_fetch_limiter",
                     cid = %cid,
@@ -3306,8 +3320,12 @@ impl HttpRetriever {
             }
         };
         let started = Instant::now();
-        match self.fetch_from_http_provider(&cid, &base).await {
+        match self
+            .fetch_from_http_provider(&cid, &base, &mut cancel_trace)
+            .await
+        {
             Ok((block, stats)) => {
+                cancel_trace.complete();
                 self.record_http_provider_success(&base, stats.body_elapsed)
                     .await;
                 tracing::info!(
@@ -3329,6 +3347,7 @@ impl HttpRetriever {
                 Ok(block)
             }
             Err(err) => {
+                cancel_trace.complete();
                 tracing::info!(
                     phase = "http_provider_fetch",
                     cid = %cid,
@@ -3551,25 +3570,36 @@ impl HttpRetriever {
         &self,
         cid: &Cid,
         base: &Url,
+        cancel_trace: &mut HttpProviderCandidateCancelTrace,
     ) -> Result<(Block, HttpProviderResponseStats)> {
         let started = Instant::now();
         let url = base
             .join(&format!("/ipfs/{cid}?format=raw"))
             .map_err(RetrievalError::Url)?;
-        let response = self
+        cancel_trace.set_stage("waiting_headers");
+        let response = match self
             .client
             .get(url)
             .header("accept", "application/vnd.ipld.raw")
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+        {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => response,
+                Err(err) => return Err(err.into()),
+            },
+            Err(err) => return Err(err.into()),
+        };
         let headers_elapsed = started.elapsed();
+        cancel_trace.set_stage("reading_body");
         let LimitedResponseBytes {
             bytes,
             stats: body_stats,
         } = limited_response_bytes(response, DEFAULT_MAX_BLOCK_SIZE).await?;
         let body_elapsed = started.elapsed();
+        cancel_trace.set_stage("verifying_block");
         verify_block(cid, &bytes)?;
+        cancel_trace.set_stage("storing_block");
         let bytes = self
             .store_block_with_trace(*cid, bytes, "http_provider", true)
             .await?;
@@ -5657,6 +5687,71 @@ struct HttpProviderResponseStats {
     headers_elapsed: Duration,
     first_chunk_elapsed: Option<Duration>,
     body_elapsed: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct HttpProviderCandidateTrace {
+    provider_index: usize,
+    attempt_index: usize,
+    original_provider_index: usize,
+    score_elapsed: Option<Duration>,
+}
+
+struct HttpProviderCandidateCancelTrace {
+    started: Instant,
+    cid: Cid,
+    provider: Url,
+    candidate: HttpProviderCandidateTrace,
+    stage: &'static str,
+    completed: bool,
+}
+
+impl HttpProviderCandidateCancelTrace {
+    fn new(cid: Cid, provider: Url, candidate: HttpProviderCandidateTrace) -> Self {
+        Self {
+            started: Instant::now(),
+            cid,
+            provider,
+            candidate,
+            stage: "starting",
+            completed: false,
+        }
+    }
+
+    fn set_stage(&mut self, stage: &'static str) {
+        self.stage = stage;
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for HttpProviderCandidateCancelTrace {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        tracing::info!(
+            phase = "http_provider_candidate_cancelled",
+            cid = %self.cid,
+            provider = %self.provider,
+            stage = self.stage,
+            provider_index = self.candidate.provider_index,
+            attempt_index = self.candidate.attempt_index,
+            original_provider_index = self.candidate.original_provider_index,
+            provider_rank = self.candidate.provider_index + 1,
+            attempt_rank = self.candidate.attempt_index + 1,
+            original_provider_rank = self.candidate.original_provider_index + 1,
+            provider_scored = self.candidate.score_elapsed.is_some(),
+            provider_score_ms = self
+                .candidate
+                .score_elapsed
+                .map(|elapsed| elapsed.as_millis())
+                .unwrap_or_default(),
+            elapsed_ms = self.started.elapsed().as_millis()
+        );
+    }
 }
 
 #[derive(Clone)]

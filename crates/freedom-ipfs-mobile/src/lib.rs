@@ -560,6 +560,7 @@ fn progress_source(raw_phase: &str, fields: &ProgressFields) -> Option<String> {
             Some("cache".into())
         }
         "http_provider_fetch"
+        | "http_provider_candidate_cancelled"
         | "http_provider_hedge"
         | "http_provider_race"
         | "http_provider_self_hedge_skip"
@@ -672,6 +673,7 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         | "bitswap_dnsaddr_expand"
         | "bitswap_dns_multiaddr_expand" => "provider_lookup",
         "http_provider_fetch"
+        | "http_provider_candidate_cancelled"
         | "http_provider_hedge"
         | "http_provider_race"
         | "http_provider_self_hedge_skip"
@@ -2682,6 +2684,14 @@ mod tests {
             progress_phase(
                 "http_provider_race",
                 &progress_fields([("phase", "http_provider_race")]),
+                "active",
+            ),
+            "fetching_http_provider"
+        );
+        assert_eq!(
+            progress_phase(
+                "http_provider_candidate_cancelled",
+                &progress_fields([("phase", "http_provider_candidate_cancelled")]),
                 "active",
             ),
             "fetching_http_provider"
