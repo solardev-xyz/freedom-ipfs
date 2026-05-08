@@ -42085,3 +42085,79 @@ Keep this diagnostic. Future same-window comparisons should include the
 `kubo_bitswap` line when interpreting a Kubo asset win. The next optimization
 candidate should be judged against both Rust trace source details and Kubo's
 Bitswap block/data counts, not only aggregate TTFB.
+
+## 2026-05-08: Current No-Env Baseline With Kubo Bitswap Stats
+
+Purpose:
+
+Refresh the focused `ipfs.tech` comparison after adding Kubo-side Bitswap stats
+to the harness.
+
+Command:
+
+```sh
+timeout 1200s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/ipfs-tech-kubo-bitswap-baseline-r3-20260508T004418Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-kubo-bitswap-baseline-r3-20260508T004418Z.json
+```
+
+Result:
+
+- Rust/Kubo passed `3/3`.
+- `ipfs.tech` root: Rust `805/920ms`; Kubo `1486/2728ms`.
+- `ipfs.tech` assets: Rust `110/559ms`; Kubo `63/131ms`.
+- `meaningful_kubo_wins`: `2`, both asset p95 TTFB/total.
+- Resource max: Rust `58648KiB` RSS and `34` FDs vs Kubo `178364KiB` RSS
+  and `104` FDs.
+- Kubo Bitswap stats per measured run: `blocks_received=35`,
+  `data_received=793822`, `messages_received` p50/p90/max `47/77/77`,
+  peers p50/p90/max `11/20/20`, and zero duplicate blocks/data.
+
+Rust trace:
+
+- HTTP-provider blocks: `77`, p50/p95/max `185/528/673ms`.
+- Bitswap blocks: `42`, p50/p95/max `106/303/322ms`.
+- Zero-HTTP provider Bitswap classifications: `9`.
+- Cold Bitswap peer expansion classifications: `7`.
+- Bitswap peer attempts/connections: `140` attempts, `9` established
+  connections.
+- Provider expansion was not the main tail in this window:
+  p50/p90/max `24/78/78ms`.
+- Single-provider Sia rows were still visible:
+  `https://ipfs-bridge.sia.dev/` p50/p95/max `186/512/622ms`, with header and
+  body max both about `620ms`.
+
+Path-local findings:
+
+- The aggregate remaining win was p95 only, but path-local Kubo wins were still
+  large.
+- Worst HTTP-provider row: `_nuxt/DBHrpFkY.js`, Rust p95 `867ms` vs Kubo
+  `79ms`, with Sia HTTP max/header/body about `622/620/622ms`.
+- Worst mixed/zero-HTTP row: `_nuxt/entry.C4ErMpWu.css`, Rust p50 `499ms` vs
+  Kubo `62ms`, with `cold_bitswap_peer_expand=3`,
+  `zero_http_provider_bitswap=3`, Bitswap max `196ms`, and UnixFS wrapper max
+  about `553ms`.
+
+Interpretation:
+
+Kubo's asset win is now explicitly associated with substantial Kubo Bitswap
+activity: it received the page's blocks over Bitswap while Rust often chose
+single HTTP-provider fetches for Sia-backed rows and only sometimes used
+Bitswap. The remaining gap is still not local UnixFS CPU/cache work. It is
+source selection and scheduling across these two shapes:
+
+- single-provider Sia HTTP rows with occasional `500-620ms` header/body tails;
+- zero-HTTP Bitswap rows where Rust's successful Bitswap fetch is not huge, but
+  the full request still waits around the UnixFS/block-fetch wrapper path.
+
+Next experiment should target one of those shapes directly and must preserve the
+RSS/FD advantage shown in this baseline.
