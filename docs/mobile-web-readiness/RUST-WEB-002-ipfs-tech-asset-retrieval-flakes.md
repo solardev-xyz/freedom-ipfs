@@ -42001,3 +42001,87 @@ resource spike, but it does not close the active `ipfs.tech` gap because the
 target single-HTTP Sia-backed asset rows usually have no recent session peer
 available. The remaining work is still provider/source selection for those
 single-provider HTTP rows, not another generic Bitswap hedge.
+
+## 2026-05-08: Keep Diagnostic - Kubo Bitswap Stats In Harness Reports
+
+Purpose:
+
+The remaining `ipfs.tech` asset wins show Rust waiting in HTTP-provider/UnixFS
+rows while Kubo often serves the same assets much faster. Before guessing at
+another retrieval policy, capture whether Kubo's own run is actually Bitswap
+driven.
+
+Change:
+
+- For spawned Kubo harness runs, collect
+  `ipfs --api /ip4/127.0.0.1/tcp/<api> --enc=json stats bitswap` after each
+  run.
+- Store per-run Kubo Bitswap stats in JSON reports.
+- Summarize Kubo blocks/data received and sent, duplicate blocks/data,
+  messages, peer count, and wantlist length in text output.
+- Rust behavior and gateway behavior are unchanged.
+
+Validation:
+
+```sh
+cargo fmt --all --check
+cargo test -p mobile-web-harness kubo_bitswap -- --nocapture
+cargo test -p mobile-web-harness repeat_summary_aggregates_measured_resource_metrics -- --nocapture
+cargo check -p mobile-web-harness
+cargo clippy -p mobile-web-harness --all-targets -- -D warnings
+cargo test -p mobile-web-harness -- --nocapture
+```
+
+Validation result:
+
+- `cargo fmt --all --check`: passed.
+- Kubo Bitswap parser test: passed.
+- Repeat-summary aggregation test: passed.
+- `cargo check -p mobile-web-harness`: passed.
+- `cargo clippy -p mobile-web-harness --all-targets -- -D warnings`: passed.
+- Full harness test package: passed, `60` tests.
+
+Smoke command:
+
+```sh
+timeout 600s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --repeat 1 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 240 \
+  --dht-query-timeout-secs 3 \
+  --case ipfs-tech-page-assets \
+  --trace-output /tmp/ipfs-tech-kubo-bitswap-stats-smoke-20260508T003409Z-trace.jsonl \
+  --comparison-output /tmp/ipfs-tech-kubo-bitswap-stats-smoke-20260508T003409Z.json
+```
+
+Smoke result:
+
+- Rust/Kubo passed `1/1`.
+- `ipfs.tech` root: Rust `1022/1022ms`; Kubo `1987/1987ms`.
+- `ipfs.tech` assets: Rust `214/785ms`; Kubo `97/232ms`.
+- Resource max: Rust `51744KiB` RSS and `29` FDs vs Kubo `207848KiB` RSS
+  and `117` FDs.
+- New Kubo stats line appeared:
+  `blocks_received=40`, `data_received=796542`, `dup_blocks_received=5`,
+  `dup_data_received=2720`, `messages_received=90`, `peers=27`,
+  `wantlist=0`.
+
+Diagnostic finding:
+
+In this smoke window Kubo's faster asset load was indeed backed by substantial
+Bitswap activity, while Rust's printed slow rows were HTTP-provider rows through
+`https://ipfs-bridge.sia.dev/` wrapped by UnixFS file-size/resource work. This
+supports the current direction: the gap is not local UnixFS CPU work and not
+another broad hedge; it is source selection/scheduling for single-provider HTTP
+rows where Kubo is willing to spend more Bitswap peer work.
+
+Decision:
+
+Keep this diagnostic. Future same-window comparisons should include the
+`kubo_bitswap` line when interpreting a Kubo asset win. The next optimization
+candidate should be judged against both Rust trace source details and Kubo's
+Bitswap block/data counts, not only aggregate TTFB.

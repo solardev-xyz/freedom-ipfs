@@ -849,6 +849,13 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
                 .as_ref()
                 .and_then(|gateway| gateway.bitswap_seed_connect_elapsed_ms)
         };
+        let kubo_bitswap_stats = if let Some(gateway) = run_gateway.as_ref() {
+            gateway.kubo_bitswap_stats().await
+        } else if let Some(gateway) = persistent_gateway.as_ref() {
+            gateway.kubo_bitswap_stats().await
+        } else {
+            None
+        };
         let passed = results.iter().all(|result| result.passed);
         runs.push(RunResult {
             phase,
@@ -861,6 +868,7 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             gateway_storage_bytes,
             gateway_storage_path,
             bitswap_seed_connect_elapsed_ms,
+            kubo_bitswap_stats,
             passed,
             results,
         });
@@ -1246,6 +1254,20 @@ fn print_summary(report: &RunReport) {
             report.summary.bitswap_seed_connect_ms
         );
     }
+    if report.summary.kubo_bitswap.has_values() {
+        println!(
+            "kubo_bitswap: blocks_received={} data_received={} blocks_sent={} data_sent={} dup_blocks_received={} dup_data_received={} messages_received={} peers={} wantlist={}",
+            report.summary.kubo_bitswap.blocks_received,
+            report.summary.kubo_bitswap.data_received,
+            report.summary.kubo_bitswap.blocks_sent,
+            report.summary.kubo_bitswap.data_sent,
+            report.summary.kubo_bitswap.dup_blocks_received,
+            report.summary.kubo_bitswap.dup_data_received,
+            report.summary.kubo_bitswap.messages_received,
+            report.summary.kubo_bitswap.peers_len,
+            report.summary.kubo_bitswap.wantlist_len
+        );
+    }
 
     for case in &report.summary.cases {
         println!(
@@ -1604,6 +1626,20 @@ fn print_comparison_summary(report: &ComparisonReport) {
             "bitswap seed connect: rust={} kubo={}",
             report.rust.summary.bitswap_seed_connect_ms,
             report.kubo.summary.bitswap_seed_connect_ms
+        );
+    }
+    if report.kubo.summary.kubo_bitswap.has_values() {
+        println!(
+            "kubo_bitswap: blocks_received={} data_received={} blocks_sent={} data_sent={} dup_blocks_received={} dup_data_received={} messages_received={} peers={} wantlist={}",
+            report.kubo.summary.kubo_bitswap.blocks_received,
+            report.kubo.summary.kubo_bitswap.data_received,
+            report.kubo.summary.kubo_bitswap.blocks_sent,
+            report.kubo.summary.kubo_bitswap.data_sent,
+            report.kubo.summary.kubo_bitswap.dup_blocks_received,
+            report.kubo.summary.kubo_bitswap.dup_data_received,
+            report.kubo.summary.kubo_bitswap.messages_received,
+            report.kubo.summary.kubo_bitswap.peers_len,
+            report.kubo.summary.kubo_bitswap.wantlist_len
         );
     }
     for case in &report.cases {
@@ -4417,6 +4453,8 @@ struct SpawnedGateway {
     stdout_task: Option<JoinHandle<()>>,
     stderr_task: Option<JoinHandle<()>>,
     bitswap_seed_connect_elapsed_ms: Option<u128>,
+    kubo_bin: Option<PathBuf>,
+    kubo_api_port: Option<u16>,
 }
 
 impl SpawnedGateway {
@@ -4509,6 +4547,8 @@ impl SpawnedGateway {
                     stdout_task: None,
                     stderr_task: Some(stderr_task),
                     bitswap_seed_connect_elapsed_ms: None,
+                    kubo_bin: None,
+                    kubo_api_port: None,
                 });
             }
             eprintln!("gateway: {line}");
@@ -4588,7 +4628,28 @@ impl SpawnedGateway {
             stdout_task,
             stderr_task,
             bitswap_seed_connect_elapsed_ms,
+            kubo_bin: Some(kubo.clone()),
+            kubo_api_port: Some(api_port),
         })
+    }
+
+    async fn kubo_bitswap_stats(&self) -> Option<KuboBitswapStats> {
+        let kubo = self.kubo_bin.as_ref()?;
+        let api_port = self.kubo_api_port?;
+        let api = format!("/ip4/127.0.0.1/tcp/{api_port}");
+        let output = Command::new(kubo)
+            .arg("--api")
+            .arg(api)
+            .arg("--enc=json")
+            .arg("stats")
+            .arg("bitswap")
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_kubo_bitswap_stats(&output.stdout).ok()
     }
 
     async fn stop(&mut self) {
@@ -4934,6 +4995,34 @@ async fn wait_for_kubo_api(child: &mut Child, api_port: u16) -> Result<()> {
     }
 }
 
+fn parse_kubo_bitswap_stats(bytes: &[u8]) -> Result<KuboBitswapStats> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("parse Kubo bitswap stats JSON")?;
+    Ok(KuboBitswapStats {
+        blocks_received: json_u64_field(&value, "BlocksReceived"),
+        data_received: json_u64_field(&value, "DataReceived"),
+        blocks_sent: json_u64_field(&value, "BlocksSent"),
+        data_sent: json_u64_field(&value, "DataSent"),
+        dup_blocks_received: json_u64_field(&value, "DupBlksReceived")
+            .or_else(|| json_u64_field(&value, "DupBlocksReceived")),
+        dup_data_received: json_u64_field(&value, "DupDataReceived"),
+        messages_received: json_u64_field(&value, "MessagesReceived"),
+        wantlist_len: json_array_len_field(&value, "Wantlist"),
+        peers_len: json_array_len_field(&value, "Peers"),
+    })
+}
+
+fn json_u64_field(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value.get(key)?.as_u64()
+}
+
+fn json_array_len_field(value: &serde_json::Value, key: &str) -> Option<u64> {
+    value
+        .get(key)?
+        .as_array()
+        .and_then(|items| u64::try_from(items.len()).ok())
+}
+
 fn storage_path_size_bytes(path: &Path) -> std::io::Result<u64> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.is_file() {
@@ -5070,8 +5159,22 @@ struct RunResult {
     gateway_storage_bytes: Option<u64>,
     gateway_storage_path: Option<String>,
     bitswap_seed_connect_elapsed_ms: Option<u128>,
+    kubo_bitswap_stats: Option<KuboBitswapStats>,
     passed: bool,
     results: Vec<CaseResult>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct KuboBitswapStats {
+    blocks_received: Option<u64>,
+    data_received: Option<u64>,
+    blocks_sent: Option<u64>,
+    data_sent: Option<u64>,
+    dup_blocks_received: Option<u64>,
+    dup_data_received: Option<u64>,
+    messages_received: Option<u64>,
+    wantlist_len: Option<u64>,
+    peers_len: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5770,6 +5873,7 @@ struct RepeatSummary {
     gateway_child_process_count: ResourceSummary,
     gateway_storage_bytes: ResourceSummary,
     bitswap_seed_connect_ms: LatencySummary,
+    kubo_bitswap: KuboBitswapSummary,
     cases: Vec<CaseAggregate>,
 }
 
@@ -5820,6 +5924,7 @@ impl RepeatSummary {
                 .filter_map(|run| run.bitswap_seed_connect_elapsed_ms)
                 .collect::<Vec<_>>(),
         );
+        let kubo_bitswap = KuboBitswapSummary::from_runs(&measured);
 
         let mut case_ids = Vec::new();
         for run in &measured {
@@ -5846,6 +5951,7 @@ impl RepeatSummary {
             gateway_child_process_count,
             gateway_storage_bytes,
             bitswap_seed_connect_ms,
+            kubo_bitswap,
             cases,
         }
     }
@@ -5856,6 +5962,84 @@ impl RepeatSummary {
             || self.gateway_fd_count.count > 0
             || self.gateway_child_process_count.count > 0
             || self.gateway_storage_bytes.count > 0
+            || self.kubo_bitswap.has_values()
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct KuboBitswapSummary {
+    blocks_received: ResourceSummary,
+    data_received: ResourceSummary,
+    blocks_sent: ResourceSummary,
+    data_sent: ResourceSummary,
+    dup_blocks_received: ResourceSummary,
+    dup_data_received: ResourceSummary,
+    messages_received: ResourceSummary,
+    wantlist_len: ResourceSummary,
+    peers_len: ResourceSummary,
+}
+
+impl KuboBitswapSummary {
+    fn from_runs(runs: &[&RunResult]) -> Self {
+        Self {
+            blocks_received: ResourceSummary::from_values(
+                runs.iter()
+                    .filter_map(|run| run.kubo_bitswap_stats.as_ref()?.blocks_received)
+                    .collect(),
+            ),
+            data_received: ResourceSummary::from_values(
+                runs.iter()
+                    .filter_map(|run| run.kubo_bitswap_stats.as_ref()?.data_received)
+                    .collect(),
+            ),
+            blocks_sent: ResourceSummary::from_values(
+                runs.iter()
+                    .filter_map(|run| run.kubo_bitswap_stats.as_ref()?.blocks_sent)
+                    .collect(),
+            ),
+            data_sent: ResourceSummary::from_values(
+                runs.iter()
+                    .filter_map(|run| run.kubo_bitswap_stats.as_ref()?.data_sent)
+                    .collect(),
+            ),
+            dup_blocks_received: ResourceSummary::from_values(
+                runs.iter()
+                    .filter_map(|run| run.kubo_bitswap_stats.as_ref()?.dup_blocks_received)
+                    .collect(),
+            ),
+            dup_data_received: ResourceSummary::from_values(
+                runs.iter()
+                    .filter_map(|run| run.kubo_bitswap_stats.as_ref()?.dup_data_received)
+                    .collect(),
+            ),
+            messages_received: ResourceSummary::from_values(
+                runs.iter()
+                    .filter_map(|run| run.kubo_bitswap_stats.as_ref()?.messages_received)
+                    .collect(),
+            ),
+            wantlist_len: ResourceSummary::from_values(
+                runs.iter()
+                    .filter_map(|run| run.kubo_bitswap_stats.as_ref()?.wantlist_len)
+                    .collect(),
+            ),
+            peers_len: ResourceSummary::from_values(
+                runs.iter()
+                    .filter_map(|run| run.kubo_bitswap_stats.as_ref()?.peers_len)
+                    .collect(),
+            ),
+        }
+    }
+
+    fn has_values(&self) -> bool {
+        self.blocks_received.count > 0
+            || self.data_received.count > 0
+            || self.blocks_sent.count > 0
+            || self.data_sent.count > 0
+            || self.dup_blocks_received.count > 0
+            || self.dup_data_received.count > 0
+            || self.messages_received.count > 0
+            || self.wantlist_len.count > 0
+            || self.peers_len.count > 0
     }
 }
 
@@ -13615,6 +13799,18 @@ mod tests {
         runs[0].bitswap_seed_connect_elapsed_ms = Some(999);
         runs[1].bitswap_seed_connect_elapsed_ms = Some(42);
         runs[2].bitswap_seed_connect_elapsed_ms = Some(21);
+        runs[1].kubo_bitswap_stats = Some(KuboBitswapStats {
+            blocks_received: Some(10),
+            data_received: Some(1000),
+            peers_len: Some(4),
+            ..KuboBitswapStats::default()
+        });
+        runs[2].kubo_bitswap_stats = Some(KuboBitswapStats {
+            blocks_received: Some(30),
+            data_received: Some(3000),
+            peers_len: Some(6),
+            ..KuboBitswapStats::default()
+        });
 
         let summary = RepeatSummary::from_runs(&runs);
 
@@ -13632,6 +13828,11 @@ mod tests {
         assert_eq!(summary.bitswap_seed_connect_ms.count, 2);
         assert_eq!(summary.bitswap_seed_connect_ms.p50_ms, Some(21));
         assert_eq!(summary.bitswap_seed_connect_ms.max_ms, Some(42));
+        assert_eq!(summary.kubo_bitswap.blocks_received.count, 2);
+        assert_eq!(summary.kubo_bitswap.blocks_received.p50, Some(10));
+        assert_eq!(summary.kubo_bitswap.blocks_received.max, Some(30));
+        assert_eq!(summary.kubo_bitswap.data_received.max, Some(3000));
+        assert_eq!(summary.kubo_bitswap.peers_len.max, Some(6));
         assert_eq!(summary.cases.len(), 1);
         assert_eq!(summary.cases[0].root_ttfb_ms.count, 2);
     }
@@ -13651,6 +13852,34 @@ mod tests {
         for file in [&path, &wal, &shm] {
             let _ = std::fs::remove_file(file);
         }
+    }
+
+    #[test]
+    fn parses_kubo_bitswap_stats_json() {
+        let stats = parse_kubo_bitswap_stats(
+            br#"{
+                "BlocksReceived": 12,
+                "DataReceived": 3456,
+                "BlocksSent": 2,
+                "DataSent": 128,
+                "DupBlksReceived": 1,
+                "DupDataReceived": 64,
+                "MessagesReceived": 9,
+                "Wantlist": [{"/": "bafywant"}],
+                "Peers": ["12D3KooWpeer1", "12D3KooWpeer2"]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(stats.blocks_received, Some(12));
+        assert_eq!(stats.data_received, Some(3456));
+        assert_eq!(stats.blocks_sent, Some(2));
+        assert_eq!(stats.data_sent, Some(128));
+        assert_eq!(stats.dup_blocks_received, Some(1));
+        assert_eq!(stats.dup_data_received, Some(64));
+        assert_eq!(stats.messages_received, Some(9));
+        assert_eq!(stats.wantlist_len, Some(1));
+        assert_eq!(stats.peers_len, Some(2));
     }
 
     #[test]
@@ -15446,6 +15675,7 @@ mod tests {
             gateway_storage_bytes,
             gateway_storage_path: None,
             bitswap_seed_connect_elapsed_ms: None,
+            kubo_bitswap_stats: None,
             passed: true,
             results: vec![CaseResult {
                 id: "case".to_string(),
