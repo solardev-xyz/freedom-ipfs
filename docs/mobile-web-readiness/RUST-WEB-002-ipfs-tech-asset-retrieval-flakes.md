@@ -47015,3 +47015,113 @@ Inspect request-local and page-session source choice for these `_nuxt` assets:
 
 Any code experiment should stay narrow, env-gated first, and validate against
 this r20 shape plus the current selected multi-case guardrail.
+
+## 2026-05-08: Recheck - Zero-HTTP Post-Timeout Direct5 Does Not Close Current c6 Shape
+
+Branch/head: `codex/kubo-session-performance-20260506` at `50dd025`.
+
+Purpose:
+
+Re-test the existing disabled
+`FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK=1` lab
+against the newly documented c6 path-local gap. The prior direct5 lab improved
+some zero-HTTP post-lookup timeout rows, but was not promotion-worthy. The r20
+trace again showed zero-HTTP subresources with timed-out post-lookup waits, so
+this run checked whether the old lab was relevant in the current public-network
+window.
+
+Opt-in command:
+
+```sh
+timeout 2400s env FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK=1 \
+  cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-posttimeout-direct5-ipfs-tech-c6-r10-50dd025-20260508Tnext-trace.jsonl \
+  --comparison-output /tmp/zero-http-posttimeout-direct5-ipfs-tech-c6-r10-50dd025-20260508Tnext.json
+```
+
+Opt-in result:
+
+- Rust/Kubo passed `10/10`.
+- Root: Rust `553/1294ms`; Kubo `1292/1995ms`.
+- Assets: Rust `121/383ms`; Kubo `99/390ms`.
+- Case-level `meaningful_kubo_wins`: none.
+- Resource max: Rust `57536KiB` RSS and `40` FDs vs Kubo `196620KiB`
+  RSS and `231` FDs.
+- The direct5 gate barely exercised:
+  - `zero_http_direct_want_block_peer_count=5` appeared once;
+  - the only fired example was `/ipns/ipfs.tech/_nuxt/BfUTpfA9.js`;
+  - Bitswap source modes were all `want_block`, source index `0`.
+- Block fetch totals:
+  - Bitswap `221` blocks, p50/p90/p95/max `114/191/258/804ms`;
+  - HTTP provider `172` blocks, p50/p90/p95/max `100/269/540/965ms`.
+- Worst path-local rows shifted away from the direct5 target:
+  - `BXkYzPrD.js` p95 Rust/Kubo `1180/373ms`;
+  - `ZT0_SuSb.js` p95 `1152/390ms`;
+  - `mHWTJadT.js` p95 `977/266ms`;
+  - `CarouselCards.BIZdE3Oc.css` p95 `880/261ms`.
+  These were mixed HTTP/Bitswap or HTTP-provider-backed rows, not zero-HTTP
+  post-timeout direct-WANT rows.
+
+Immediate no-env post-control:
+
+```sh
+timeout 2400s cargo run -p mobile-web-harness -- \
+  --compare-kubo \
+  --build-gateway \
+  --fresh-gateway-per-run \
+  --case ipfs-tech-page-assets \
+  --repeat 10 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 300 \
+  --dht-query-timeout-secs 3 \
+  --trace-output /tmp/zero-http-posttimeout-direct5-postcontrol-ipfs-tech-c6-r10-50dd025-20260508Tnext-trace.jsonl \
+  --comparison-output /tmp/zero-http-posttimeout-direct5-postcontrol-ipfs-tech-c6-r10-50dd025-20260508Tnext.json
+```
+
+Post-control result:
+
+- Rust/Kubo passed `10/10`.
+- Root: Rust `614/2095ms`; Kubo `1413/1943ms`.
+- Assets: Rust `144/422ms`; Kubo `151/764ms`.
+- Case-level `meaningful_kubo_wins`: none.
+- Resource max: Rust `57760KiB` RSS and `35` FDs vs Kubo `200600KiB`
+  RSS and `118` FDs.
+- Block fetch totals:
+  - HTTP provider `253` blocks, p50/p90/p95/max `179/251/277/496ms`;
+  - Bitswap `142` blocks, p50/p90/p95/max `110/244/306/1792ms`.
+- The control's main bad shape was top-level zero-HTTP root tail:
+  source indexes `0=7, 4=2, 3=1`, request modes `want_block=7,
+  want_have=3`, with max root around `2092ms`.
+- Path-local asset median losses remained, but without the opt-in's extreme
+  p95 rows:
+  - `BXkYzPrD.js` p50 Rust/Kubo `305/148ms`;
+  - `AKg0Znx-.js` p50 `212/83ms`;
+  - `HA10ncnn.js` p50 `176/54ms`.
+
+Decision:
+
+Do not promote or retune this direct5 lab from the current evidence. The opt-in
+aggregate looked slightly better than the immediate control, but the gate fired
+only once in ten page loads, so the aggregate delta is not attributable to the
+intended mechanism. It also did not address the dominant current path-local
+HTTP-provider/Sia rows, and its worst per-path p95 losses were larger than the
+control's.
+
+Keep `FREEDOM_IPFS_ENABLE_ZERO_HTTP_POST_LOOKUP_TIMEOUT_DIRECT_WANT_BLOCK=1`
+as a diagnostic only. The next useful optimization should target the remaining
+two current shapes directly:
+
+- top-level zero-HTTP root blocks that fall through to late `WANT_HAVE` peers;
+- mixed HTTP/Bitswap `_nuxt` assets where `ipfs-bridge.sia.dev` or repeated
+  per-asset source choice keeps Rust medians above Kubo even though case-level
+  p95 and resources favor Rust.
