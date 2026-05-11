@@ -554,6 +554,125 @@ impl GatewayState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayNamespace {
+    Ipfs,
+    Ipns,
+}
+
+impl GatewayNamespace {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ipfs => "ipfs",
+            Self::Ipns => "ipns",
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Ipfs => "/ipfs",
+            Self::Ipns => "/ipns",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GatewayCoreRequest {
+    pub namespace: GatewayNamespace,
+    pub path: String,
+    pub method: Method,
+    pub headers: HeaderMap,
+}
+
+impl GatewayCoreRequest {
+    pub fn ipfs(path: impl Into<String>, method: Method, headers: HeaderMap) -> Self {
+        Self {
+            namespace: GatewayNamespace::Ipfs,
+            path: normalize_namespace_path(path.into()),
+            method,
+            headers,
+        }
+    }
+
+    pub fn ipns(path: impl Into<String>, method: Method, headers: HeaderMap) -> Self {
+        Self {
+            namespace: GatewayNamespace::Ipns,
+            path: normalize_namespace_path(path.into()),
+            method,
+            headers,
+        }
+    }
+
+    fn request_path(&self) -> String {
+        format!(
+            "{}{path}",
+            self.namespace.prefix(),
+            path = prefixed_path(&self.path)
+        )
+    }
+}
+
+#[derive(Clone)]
+pub struct GatewayCore {
+    state: GatewayState,
+}
+
+impl GatewayCore {
+    pub fn new(store: SqliteBlockStore) -> Self {
+        Self::with_provider(Arc::new(store))
+    }
+
+    pub fn with_provider(provider: Arc<dyn BlockProvider>) -> Self {
+        Self::from_state(GatewayState::with_provider(provider))
+    }
+
+    pub fn with_provider_config(provider: Arc<dyn BlockProvider>, config: GatewayConfig) -> Self {
+        Self::from_state(GatewayState::with_provider_config(provider, config))
+    }
+
+    pub fn with_provider_and_name_resolver(
+        provider: Arc<dyn BlockProvider>,
+        name_resolver: Arc<dyn NameResolver>,
+    ) -> Self {
+        Self::from_state(GatewayState::with_provider_and_name_resolver(
+            provider,
+            name_resolver,
+        ))
+    }
+
+    pub fn with_provider_and_name_resolver_config(
+        provider: Arc<dyn BlockProvider>,
+        name_resolver: Arc<dyn NameResolver>,
+        config: GatewayConfig,
+    ) -> Self {
+        Self::from_state(GatewayState::with_provider_and_name_resolver_config(
+            provider,
+            name_resolver,
+            config,
+        ))
+    }
+
+    fn from_state(state: GatewayState) -> Self {
+        Self { state }
+    }
+
+    pub async fn handle(&self, request: GatewayCoreRequest) -> Response {
+        handle_gateway_core_request(self.state.clone(), request).await
+    }
+}
+
+fn prefixed_path(path: &str) -> String {
+    if path.is_empty() || path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
+fn normalize_namespace_path(path: String) -> String {
+    path.trim_start_matches('/').to_string()
+}
+
 pub fn router(store: SqliteBlockStore) -> Router {
     router_with_provider(Arc::new(store))
 }
@@ -739,105 +858,9 @@ async fn ipfs_get(
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    let process_id = std::process::id();
-    let request_path = format!("/ipfs/{path}");
-    let range = header_value_for_trace(headers.get(RANGE));
-    let progress_request_id = header_u64_for_trace(&headers, X_FREEDOM_REQUEST_ID);
-    let parent_request_id = header_u64_for_trace(&headers, X_FREEDOM_PARENT_REQUEST_ID);
-    let top_level_path = header_value_for_trace(headers.get(X_FREEDOM_TOP_LEVEL_PATH));
-    let span = tracing::info_span!(
-        "gateway_request",
-        process_id,
-        request_id,
-        progress_request_id = progress_request_id.unwrap_or_default(),
-        parent_request_id = parent_request_id.unwrap_or_default(),
-        top_level_path = %top_level_path,
-        namespace = "ipfs",
-        path = %request_path,
-        range = %range
-    );
-
-    async move {
-        let request_started = Instant::now();
-        tracing::info!(phase = "request_start", request_id, path = %request_path);
-
-        let Some(_permit) =
-            acquire_gateway_request_permit(state.request_limiter.clone(), request_id).await
-        else {
-            let response = gateway_error(GatewayError::Busy);
-            tracing::info!(
-                phase = "request_done",
-                request_id,
-                status = response.status().as_u16(),
-                body_mode = gateway_body_mode(&response),
-                elapsed_ms = request_started.elapsed().as_millis()
-            );
-            return response;
-        };
-
-        let context_top_level_path = if top_level_path.is_empty() {
-            request_path.clone()
-        } else {
-            top_level_path.clone()
-        };
-        let retrieval_context = RetrievalRequestContext::gateway_request_with_top_level(
-            parent_request_id,
-            Some(context_top_level_path),
-        );
-        let response_features = GatewayResponseFeatures {
-            small_body_cache: state.small_body_cache.clone(),
-            html_prefetch: html_prefetch_runtime(
-                &state,
-                method == Method::HEAD,
-                headers.get(RANGE),
-                parent_request_id,
-            ),
-            html_directory_prefetch: html_directory_prefetch_runtime(
-                &state,
-                method == Method::HEAD,
-                headers.get(RANGE),
-                parent_request_id,
-            ),
-            html_range_warm: html_range_warm_runtime(
-                &state,
-                method == Method::HEAD,
-                headers.get(RANGE),
-                parent_request_id,
-            ),
-            raw_link_tsize_fast_headers: state.raw_link_tsize_fast_headers,
-            stream_small_bodies: state.stream_small_bodies,
-        };
-        let response = with_retrieval_request_context(retrieval_context, async {
-            match serve_ipfs_path(
-                state.provider.clone(),
-                state.unixfs.clone(),
-                response_features,
-                &path,
-                GatewayRequestHeaders {
-                    range: headers.get(RANGE),
-                    if_none_match: headers.get(IF_NONE_MATCH),
-                    is_head: method == Method::HEAD,
-                },
-            )
-            .await
-            {
-                Ok(response) => response,
-                Err(err) => gateway_error(err),
-            }
-        })
-        .await;
-        tracing::info!(
-            phase = "request_done",
-            request_id,
-            status = response.status().as_u16(),
-            body_mode = gateway_body_mode(&response),
-            elapsed_ms = request_started.elapsed().as_millis()
-        );
-        response
-    }
-    .instrument(span)
-    .await
+    GatewayCore::from_state(state)
+        .handle(GatewayCoreRequest::ipfs(path, method, headers))
+        .await
 }
 
 async fn ipns_get(
@@ -846,13 +869,19 @@ async fn ipns_get(
     method: Method,
     headers: HeaderMap,
 ) -> Response {
+    GatewayCore::from_state(state)
+        .handle(GatewayCoreRequest::ipns(path, method, headers))
+        .await
+}
+
+async fn handle_gateway_core_request(state: GatewayState, request: GatewayCoreRequest) -> Response {
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let process_id = std::process::id();
-    let request_path = format!("/ipns/{path}");
-    let range = header_value_for_trace(headers.get(RANGE));
-    let progress_request_id = header_u64_for_trace(&headers, X_FREEDOM_REQUEST_ID);
-    let parent_request_id = header_u64_for_trace(&headers, X_FREEDOM_PARENT_REQUEST_ID);
-    let top_level_path = header_value_for_trace(headers.get(X_FREEDOM_TOP_LEVEL_PATH));
+    let request_path = request.request_path();
+    let range = header_value_for_trace(request.headers.get(RANGE));
+    let progress_request_id = header_u64_for_trace(&request.headers, X_FREEDOM_REQUEST_ID);
+    let parent_request_id = header_u64_for_trace(&request.headers, X_FREEDOM_PARENT_REQUEST_ID);
+    let top_level_path = header_value_for_trace(request.headers.get(X_FREEDOM_TOP_LEVEL_PATH));
     let span = tracing::info_span!(
         "gateway_request",
         process_id,
@@ -860,7 +889,7 @@ async fn ipns_get(
         progress_request_id = progress_request_id.unwrap_or_default(),
         parent_request_id = parent_request_id.unwrap_or_default(),
         top_level_path = %top_level_path,
-        namespace = "ipns",
+        namespace = request.namespace.as_str(),
         path = %request_path,
         range = %range
     );
@@ -892,49 +921,58 @@ async fn ipns_get(
             parent_request_id,
             Some(context_top_level_path),
         );
+        let range = request.headers.get(RANGE);
+        let is_head = request.method == Method::HEAD;
         let response_features = GatewayResponseFeatures {
             small_body_cache: state.small_body_cache.clone(),
-            html_prefetch: html_prefetch_runtime(
-                &state,
-                method == Method::HEAD,
-                headers.get(RANGE),
-                parent_request_id,
-            ),
+            html_prefetch: html_prefetch_runtime(&state, is_head, range, parent_request_id),
             html_directory_prefetch: html_directory_prefetch_runtime(
                 &state,
-                method == Method::HEAD,
-                headers.get(RANGE),
+                is_head,
+                range,
                 parent_request_id,
             ),
-            html_range_warm: html_range_warm_runtime(
-                &state,
-                method == Method::HEAD,
-                headers.get(RANGE),
-                parent_request_id,
-            ),
+            html_range_warm: html_range_warm_runtime(&state, is_head, range, parent_request_id),
             raw_link_tsize_fast_headers: state.raw_link_tsize_fast_headers,
             stream_small_bodies: state.stream_small_bodies,
         };
         let response = with_retrieval_request_context(retrieval_context, async {
-            match serve_ipns_path(
-                state.provider.clone(),
-                state.unixfs.clone(),
-                response_features,
-                state.name_resolver.as_ref(),
-                &path,
-                GatewayRequestHeaders {
-                    range: headers.get(RANGE),
-                    if_none_match: headers.get(IF_NONE_MATCH),
-                    is_head: method == Method::HEAD,
-                },
-            )
-            .await
-            {
-                Ok(response) => response,
-                Err(err) => gateway_error(err),
-            }
+            let request_headers = GatewayRequestHeaders {
+                range,
+                if_none_match: request.headers.get(IF_NONE_MATCH),
+                is_head,
+            };
+            let result = match request.namespace {
+                GatewayNamespace::Ipfs => {
+                    serve_ipfs_path(
+                        state.provider.clone(),
+                        state.unixfs.clone(),
+                        response_features,
+                        &request.path,
+                        request_headers,
+                    )
+                    .await
+                }
+                GatewayNamespace::Ipns => {
+                    serve_ipns_path(
+                        state.provider.clone(),
+                        state.unixfs.clone(),
+                        response_features,
+                        state.name_resolver.as_ref(),
+                        &request.path,
+                        request_headers,
+                    )
+                    .await
+                }
+            };
+            result.unwrap_or_else(gateway_error)
         })
         .await;
+        let response = if is_head {
+            head_response_without_body(response)
+        } else {
+            response
+        };
         tracing::info!(
             phase = "request_done",
             request_id,
@@ -1064,6 +1102,11 @@ fn header_u64_for_trace(headers: &HeaderMap, name: &'static str) -> Option<u64> 
         .get(name)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn head_response_without_body(response: Response) -> Response {
+    let (parts, _body) = response.into_parts();
+    Response::from_parts(parts, Body::empty())
 }
 
 #[derive(Clone)]
@@ -3339,11 +3382,15 @@ fn html_error_response(status: StatusCode, title: &str, detail: &str) -> Respons
         title = escape_html(title),
         detail = escape_html(detail)
     );
+    let len = body.len();
     let mut response = (status, body).into_response();
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
+    if let Ok(value) = HeaderValue::from_str(&len.to_string()) {
+        response.headers_mut().insert(CONTENT_LENGTH, value);
+    }
     response
 }
 
@@ -3373,15 +3420,231 @@ fn is_timeout_error(err: &UnixfsError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
+    use axum::http::header::{LAST_MODIFIED, LOCATION};
     use freedom_ipfs_core::{
         cid_from_data, Block, CoreError, Result as CoreResult, CODEC_DAG_PB, CODEC_RAW,
     };
     use freedom_ipfs_namesys::{NamesysError, Result as NamesysResult};
+    use futures::StreamExt;
     use prost::Message;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn gateway_core_serves_cached_raw_block_without_tcp() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let data = b"<html>core</html>";
+        let cid = cid_from_data(CODEC_RAW, data);
+        store.put_block(&cid, data).unwrap();
+
+        let core = GatewayCore::new(store);
+        let response = core
+            .handle(GatewayCoreRequest::ipfs(
+                cid.to_string(),
+                Method::GET,
+                HeaderMap::new(),
+            ))
+            .await;
+        let (status, headers, body) = collect_core_response(response).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get(CONTENT_LENGTH).unwrap(),
+            HeaderValue::from_static("17")
+        );
+        assert_eq!(body, Bytes::from_static(data));
+    }
+
+    #[tokio::test]
+    async fn gateway_core_matches_http_adapter_for_browser_semantics() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let raw = b"0123456789";
+        let raw_cid = cid_from_data(CODEC_RAW, raw);
+        store.put_block(&raw_cid, raw).unwrap();
+
+        let index = b"<!doctype html><title>core parity</title>";
+        let index_block = test_pb_file(index);
+        let index_cid = cid_from_data(CODEC_DAG_PB, &index_block);
+        store.put_block(&index_cid, &index_block).unwrap();
+        let plain = b"plain listing";
+        let plain_cid = cid_from_data(CODEC_RAW, plain);
+        store.put_block(&plain_cid, plain).unwrap();
+
+        let index_dir_block = test_pb_directory(vec![test_link("index.html", &index_cid)]);
+        let index_dir_cid = cid_from_data(CODEC_DAG_PB, &index_dir_block);
+        store.put_block(&index_dir_cid, &index_dir_block).unwrap();
+        let listing_dir_block = test_pb_directory(vec![test_link("plain.txt", &plain_cid)]);
+        let listing_dir_cid = cid_from_data(CODEC_DAG_PB, &listing_dir_block);
+        store
+            .put_block(&listing_dir_cid, &listing_dir_block)
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router_with_provider_and_name_resolver(
+            Arc::new(store.clone()),
+            Arc::new(StaticNameResolver {
+                name: "example.com".to_string(),
+                target: format!("/ipfs/{index_dir_cid}"),
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let core = GatewayCore::with_provider_and_name_resolver(
+            Arc::new(store),
+            Arc::new(StaticNameResolver {
+                name: "example.com".to_string(),
+                target: format!("/ipfs/{index_dir_cid}"),
+            }),
+        );
+        let client = reqwest::Client::new();
+        let base_url = format!("http://{addr}");
+
+        assert_core_http_parity(
+            "ipfs file mime",
+            &core,
+            &client,
+            &base_url,
+            GatewayCoreRequest::ipfs(
+                format!("{index_dir_cid}/index.html"),
+                Method::GET,
+                HeaderMap::new(),
+            ),
+        )
+        .await;
+        assert_core_http_parity(
+            "ipfs head",
+            &core,
+            &client,
+            &base_url,
+            GatewayCoreRequest::ipfs(
+                format!("{index_dir_cid}/index.html"),
+                Method::HEAD,
+                HeaderMap::new(),
+            ),
+        )
+        .await;
+
+        let mut range_headers = HeaderMap::new();
+        range_headers.insert(RANGE, HeaderValue::from_static("bytes=2-5"));
+        assert_core_http_parity(
+            "ipfs range",
+            &core,
+            &client,
+            &base_url,
+            GatewayCoreRequest::ipfs(raw_cid.to_string(), Method::GET, range_headers),
+        )
+        .await;
+
+        let mut not_modified_headers = HeaderMap::new();
+        not_modified_headers.insert(
+            IF_NONE_MATCH,
+            HeaderValue::from_str(&file_etag(&raw_cid, "", raw.len() as u64)).unwrap(),
+        );
+        assert_core_http_parity(
+            "ipfs if-none-match",
+            &core,
+            &client,
+            &base_url,
+            GatewayCoreRequest::ipfs(raw_cid.to_string(), Method::GET, not_modified_headers),
+        )
+        .await;
+
+        let mut invalid_range_headers = HeaderMap::new();
+        invalid_range_headers.insert(RANGE, HeaderValue::from_static("bytes=99-200"));
+        assert_core_http_parity(
+            "ipfs invalid range",
+            &core,
+            &client,
+            &base_url,
+            GatewayCoreRequest::ipfs(raw_cid.to_string(), Method::GET, invalid_range_headers),
+        )
+        .await;
+
+        assert_core_http_parity(
+            "ipfs missing path",
+            &core,
+            &client,
+            &base_url,
+            GatewayCoreRequest::ipfs(
+                format!("{index_dir_cid}/missing.js"),
+                Method::GET,
+                HeaderMap::new(),
+            ),
+        )
+        .await;
+        assert_core_http_parity(
+            "ipfs directory listing",
+            &core,
+            &client,
+            &base_url,
+            GatewayCoreRequest::ipfs(listing_dir_cid.to_string(), Method::GET, HeaderMap::new()),
+        )
+        .await;
+        assert_core_http_parity(
+            "ipns resolved file",
+            &core,
+            &client,
+            &base_url,
+            GatewayCoreRequest::ipns("example.com/index.html", Method::GET, HeaderMap::new()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn gateway_core_streams_large_ranges_incrementally_and_stops_on_drop() {
+        let len = (GATEWAY_STREAM_CHUNK_SIZE * 3) as usize;
+        let data = (0..len)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let cid = cid_from_data(CODEC_RAW, &data);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingProvider {
+            cid,
+            data,
+            calls: calls.clone(),
+        });
+        let core = GatewayCore::with_provider(provider);
+        let mut headers = HeaderMap::new();
+        let range_end = GATEWAY_STREAM_CHUNK_SIZE * 2 + 9;
+        headers.insert(
+            RANGE,
+            HeaderValue::from_str(&format!("bytes=0-{range_end}")).unwrap(),
+        );
+
+        let response = core
+            .handle(GatewayCoreRequest::ipfs(
+                cid.to_string(),
+                Method::GET,
+                headers,
+            ))
+            .await;
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(gateway_body_mode(&response), "stream");
+        let calls_before_body = calls.load(Ordering::SeqCst);
+        let mut body = response.into_body().into_data_stream();
+        let first = body.next().await.unwrap().unwrap();
+        assert_eq!(first.len() as u64, GATEWAY_STREAM_CHUNK_SIZE);
+        let calls_after_first = calls.load(Ordering::SeqCst);
+        assert!(
+            calls_after_first <= calls_before_body + 2,
+            "core should not eagerly read the entire response before the first chunk"
+        );
+
+        drop(body);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            calls_after_first,
+            "dropping the native body stream should stop further range reads"
+        );
+    }
 
     #[tokio::test]
     async fn serves_cached_raw_block_through_gateway() {
@@ -4883,6 +5146,66 @@ mod tests {
 
         let first = first.await.unwrap();
         assert_eq!(first.status(), StatusCode::OK);
+    }
+
+    async fn collect_core_response(response: Response) -> (StatusCode, HeaderMap, Bytes) {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, headers, body)
+    }
+
+    async fn collect_http_response(
+        client: &reqwest::Client,
+        base_url: &str,
+        request: &GatewayCoreRequest,
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        let url = format!(
+            "{}{}",
+            base_url.trim_end_matches('/'),
+            request.request_path()
+        );
+        let mut builder = client.request(request.method.clone(), url);
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
+        let response = builder.send().await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.bytes().await.unwrap();
+        (status, headers, body)
+    }
+
+    async fn assert_core_http_parity(
+        label: &str,
+        core: &GatewayCore,
+        client: &reqwest::Client,
+        base_url: &str,
+        request: GatewayCoreRequest,
+    ) {
+        let (core_status, core_headers, core_body) =
+            collect_core_response(core.handle(request.clone()).await).await;
+        let (http_status, http_headers, http_body) =
+            collect_http_response(client, base_url, &request).await;
+
+        assert_eq!(core_status, http_status, "{label}: status");
+        for header in [
+            CONTENT_TYPE.as_str(),
+            CONTENT_LENGTH.as_str(),
+            ACCEPT_RANGES.as_str(),
+            CONTENT_RANGE.as_str(),
+            ETAG.as_str(),
+            CACHE_CONTROL.as_str(),
+            LAST_MODIFIED.as_str(),
+            LOCATION.as_str(),
+        ] {
+            assert_eq!(
+                core_headers.get(header),
+                http_headers.get(header),
+                "{label}: header {header}"
+            );
+        }
+        assert_eq!(core_body, http_body, "{label}: body");
     }
 
     struct StaticNameResolver {

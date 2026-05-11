@@ -2287,7 +2287,16 @@ name = "mobile-web-harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "axum",
+ "bytes",
  "clap",
+ "freedom-ipfs-gateway",
+ "freedom-ipfs-namesys",
+ "freedom-ipfs-retrieval",
+ "freedom-ipfs-routing",
+ "freedom-ipfs-store",
+ "http",
  "reqwest",
  "serde",
  "serde_json",

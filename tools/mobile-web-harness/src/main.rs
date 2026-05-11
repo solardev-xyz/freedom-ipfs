@@ -1,5 +1,21 @@
 use anyhow::{anyhow, bail, Context, Result};
+use axum::body::to_bytes;
 use clap::{Parser, ValueEnum};
+use freedom_ipfs_gateway::{
+    GatewayConfig, GatewayCore, GatewayCoreRequest, GatewayHtmlDirectoryPrefetchConfig,
+    GatewayHtmlPrefetchConfig, GatewayHtmlRangeWarmConfig, PersistentNameResolver,
+};
+use freedom_ipfs_namesys::{
+    CachedNameResolver, CloudflareDohResolver, DefaultNameResolver, DelegatedIpnsResolver,
+    FallbackIpnsResolver, IpnsRecord, IpnsResolver, NamesysError,
+};
+use freedom_ipfs_retrieval::FetchingBlockProvider;
+use freedom_ipfs_routing::{
+    AutoRoutingClient, DelegatedRoutingClient, DhtIpnsResolver, LightDhtClient,
+    ProviderRoutingClient, DEFAULT_DELEGATED_ROUTER,
+};
+use freedom_ipfs_store::SqliteBlockStore;
+use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use reqwest::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
     RANGE,
@@ -38,22 +54,43 @@ const SYNTHETIC_MULTIBLOCK_RANGE_BYTES: usize = 64 * 1024;
 const X_FREEDOM_REQUEST_ID: &str = "X-Freedom-Request-ID";
 const X_FREEDOM_PARENT_REQUEST_ID: &str = "X-Freedom-Parent-Request-ID";
 const X_FREEDOM_TOP_LEVEL_PATH: &str = "X-Freedom-Top-Level-Path";
+const HTML_PREFETCH_MAX_ASSETS_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_ASSETS";
+const HTML_PREFETCH_MAX_BYTES_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_MAX_BYTES";
+const HTML_PREFETCH_CONCURRENCY_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_PREFETCH_CONCURRENCY";
+const HTML_DIRECTORY_PREFETCH_MAX_DIRS_ENV: &str =
+    "FREEDOM_IPFS_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_DIRS";
+const HTML_DIRECTORY_PREFETCH_MAX_BYTES_ENV: &str =
+    "FREEDOM_IPFS_GATEWAY_HTML_DIRECTORY_PREFETCH_MAX_BYTES";
+const HTML_DIRECTORY_PREFETCH_CONCURRENCY_ENV: &str =
+    "FREEDOM_IPFS_GATEWAY_HTML_DIRECTORY_PREFETCH_CONCURRENCY";
+const HTML_RANGE_WARM_MAX_BYTES_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_RANGE_WARM_MAX_BYTES";
+const HTML_RANGE_WARM_CONCURRENCY_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_RANGE_WARM_CONCURRENCY";
+const RAW_LINK_TSIZE_FAST_HEADERS_ENV: &str = "FREEDOM_IPFS_ENABLE_RAW_LINK_TSIZE_FAST_HEADERS";
+const STREAM_SMALL_BODIES_ENV: &str = "FREEDOM_IPFS_GATEWAY_STREAM_SMALL_BODIES";
 
 static NEXT_HARNESS_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 enum HarnessEngine {
-    Rust,
+    #[value(name = "rust-http", alias = "rust")]
+    RustHttp,
+    #[value(name = "rust-native")]
+    RustNative,
     Kubo,
 }
 
 impl HarnessEngine {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Rust => "rust",
+            Self::RustHttp => "rust-http",
+            Self::RustNative => "rust-native",
             Self::Kubo => "kubo",
         }
+    }
+
+    fn is_rust(self) -> bool {
+        matches!(self, Self::RustHttp | Self::RustNative)
     }
 }
 
@@ -68,7 +105,7 @@ struct Args {
     #[arg(long, env = "GATEWAY_URL")]
     gateway_url: Option<String>,
     /// Gateway engine to spawn when --gateway-url is not provided.
-    #[arg(long, value_enum, default_value_t = HarnessEngine::Rust)]
+    #[arg(long, value_enum, default_value_t = HarnessEngine::RustHttp)]
     engine: HarnessEngine,
     /// Standalone gateway binary to spawn when --gateway-url is not provided.
     #[arg(long, env = "FREEDOM_IPFS_GATEWAY_BIN")]
@@ -263,7 +300,7 @@ async fn run_comparison(args: &Args, corpus: &Corpus) -> Result<ComparisonReport
         bail!("--compare-kubo cannot be used with --gateway-url");
     }
     let mut rust_args = args.clone();
-    rust_args.engine = HarnessEngine::Rust;
+    rust_args.engine = HarnessEngine::RustHttp;
     rust_args.compare_kubo = false;
     rust_args.comparison_output = None;
 
@@ -608,7 +645,7 @@ async fn run_offline_replay(args: &Args, corpus: &Corpus) -> Result<OfflineRepla
     if args.gateway_url.is_some() {
         bail!("--offline-replay cannot be used with --gateway-url");
     }
-    if args.engine != HarnessEngine::Rust {
+    if args.engine != HarnessEngine::RustHttp {
         bail!("--offline-replay is only supported for --engine rust");
     }
     if args.fresh_gateway_per_run {
@@ -668,6 +705,9 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
     if args.gateway_url.is_some() && args.fresh_gateway_per_run {
         bail!("--fresh-gateway-per-run cannot be used with --gateway-url");
     }
+    if args.gateway_url.is_some() && args.engine == HarnessEngine::RustNative {
+        bail!("--gateway-url cannot be used with --engine rust-native");
+    }
     if args.gateway_url.is_some() && args.gateway_db.is_some() {
         bail!("--gateway-db can only be used when the harness spawns the gateway");
     }
@@ -683,17 +723,20 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
     if args.gateway_import_car.is_some() && args.bitswap_seed_car.is_some() {
         bail!("--gateway-import-car cannot be combined with --bitswap-seed-car; the seed mode should exercise network retrieval");
     }
-    if args.build_gateway && args.engine != HarnessEngine::Rust {
-        bail!("--build-gateway only applies to --engine rust");
+    if args.build_gateway && args.engine != HarnessEngine::RustHttp {
+        bail!("--build-gateway only applies to --engine rust-http");
     }
     if args.build_gateway && args.gateway_bin.is_some() {
         bail!("--build-gateway cannot be combined with --gateway-bin");
     }
-    if args.engine == HarnessEngine::Kubo && args.gateway_db.is_some() {
-        bail!("--gateway-db only applies to --engine rust");
+    if args.gateway_bin.is_some() && args.engine != HarnessEngine::RustHttp {
+        bail!("--gateway-bin only applies to --engine rust-http");
     }
-    if args.engine == HarnessEngine::Kubo && args.trace_output.is_some() {
-        bail!("--trace-output is only supported for --engine rust");
+    if !args.engine.is_rust() && args.gateway_db.is_some() {
+        bail!("--gateway-db only applies to Rust engines");
+    }
+    if args.engine != HarnessEngine::RustHttp && args.trace_output.is_some() {
+        bail!("--trace-output is currently only supported for --engine rust-http");
     }
     if !args.require_request_classifications.is_empty() && args.trace_output.is_none() {
         bail!("--require-request-classification requires --trace-output");
@@ -716,6 +759,9 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
                 seed_car.display()
             );
         }
+    }
+    if args.engine == HarnessEngine::RustNative {
+        return run_native_harness(args, corpus).await;
     }
     if args.build_gateway {
         build_default_rust_gateway().await?;
@@ -905,7 +951,9 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
         conditional_revalidate: args.conditional_revalidate,
         run_timeout_secs: (args.run_timeout_secs > 0).then_some(args.run_timeout_secs),
         engine: args.engine,
-        small_body_cache_max_bytes: (args.engine == HarnessEngine::Rust)
+        small_body_cache_max_bytes: args
+            .engine
+            .is_rust()
             .then_some(args.small_body_cache_max_bytes),
         gateway_db: args
             .gateway_db
@@ -936,6 +984,151 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
     })
 }
 
+async fn run_native_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
+    let run_timeout =
+        (args.run_timeout_secs > 0).then(|| Duration::from_secs(args.run_timeout_secs));
+    let measured_runs = args.repeat.max(1);
+    let total_runs = args.warmup_runs + measured_runs;
+    let gateway_url = "http://freedom-ipfs-native.local".to_string();
+    let mut persistent_gateway = None;
+    let mut persistent_seed = None;
+    let persistent_gateway_url = if args.fresh_gateway_per_run {
+        None
+    } else {
+        persistent_seed = BitswapSeed::start_optional(args).await?;
+        let gateway = NativeGateway::start(args, persistent_seed.as_ref()).await?;
+        persistent_gateway = Some(gateway);
+        Some(gateway_url.clone())
+    };
+
+    let mut runs = Vec::new();
+    for sequence in 0..total_runs {
+        let phase = if sequence < args.warmup_runs {
+            RunPhase::Warmup
+        } else {
+            RunPhase::Measured
+        };
+        let run_index = match phase {
+            RunPhase::Warmup => sequence + 1,
+            RunPhase::Measured => sequence - args.warmup_runs + 1,
+        };
+
+        let mut run_gateway = None;
+        let mut run_seed = None;
+        let gateway = if let Some(gateway) = &persistent_gateway {
+            gateway.clone()
+        } else {
+            run_seed = BitswapSeed::start_optional(args).await?;
+            let gateway = NativeGateway::start(args, run_seed.as_ref()).await?;
+            run_gateway = Some(gateway.clone());
+            gateway
+        };
+        let client = GatewayClient::Native(gateway);
+
+        let started = Instant::now();
+        let run = run_corpus_once_with_client(
+            &client,
+            &gateway_url,
+            corpus,
+            args.engine,
+            args.asset_concurrency,
+            args.conditional_revalidate,
+            &args.cases,
+        );
+        let results = if let Some(run_timeout) = run_timeout {
+            match tokio::time::timeout(run_timeout, run).await {
+                Ok(results) => results?,
+                Err(_) => {
+                    run_timeout_failure_results(&gateway_url, corpus, &args.cases, run_timeout)?
+                }
+            }
+        } else {
+            run.await?
+        };
+        let elapsed_ms = started.elapsed().as_millis();
+        let gateway_storage_bytes = if let Some(gateway) = run_gateway.as_ref() {
+            gateway.storage_bytes()
+        } else {
+            persistent_gateway
+                .as_ref()
+                .and_then(NativeGateway::storage_bytes)
+        };
+        let gateway_storage_path = if let Some(gateway) = run_gateway.as_ref() {
+            gateway.storage_path()
+        } else {
+            persistent_gateway
+                .as_ref()
+                .and_then(NativeGateway::storage_path)
+        };
+        let passed = results.iter().all(|result| result.passed);
+        runs.push(RunResult {
+            phase,
+            run_index,
+            gateway_url: gateway_url.clone(),
+            elapsed_ms,
+            gateway_rss_kib: None,
+            gateway_fd_count: None,
+            gateway_child_process_count: None,
+            gateway_storage_bytes,
+            gateway_storage_path,
+            bitswap_seed_connect_elapsed_ms: None,
+            kubo_bitswap_stats: None,
+            passed,
+            results,
+        });
+
+        if let Some(mut gateway) = run_gateway {
+            gateway.stop().await;
+        }
+        if let Some(mut seed) = run_seed {
+            seed.stop().await;
+        }
+    }
+
+    if let Some(mut gateway) = persistent_gateway {
+        gateway.stop().await;
+    }
+    if let Some(mut seed) = persistent_seed {
+        seed.stop().await;
+    }
+
+    let summary = RepeatSummary::from_runs(&runs);
+    let trace_summary = None;
+    let trace_requirements = trace_requirements_report(trace_summary.as_ref(), args)?;
+    Ok(RunReport {
+        gateway_url: persistent_gateway_url,
+        generated_at_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        repeat: measured_runs,
+        warmup_runs: args.warmup_runs,
+        fresh_gateway_per_run: args.fresh_gateway_per_run,
+        asset_concurrency: args.asset_concurrency,
+        conditional_revalidate: args.conditional_revalidate,
+        run_timeout_secs: (args.run_timeout_secs > 0).then_some(args.run_timeout_secs),
+        engine: args.engine,
+        small_body_cache_max_bytes: Some(args.small_body_cache_max_bytes),
+        gateway_db: args
+            .gateway_db
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        gateway_import_car: args
+            .gateway_import_car
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        bitswap_seed_car: args
+            .bitswap_seed_car
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        bitswap_seed_connection_setup: bitswap_seed_connection_setup(args),
+        kubo_repo: None,
+        trace_output: None,
+        trace_span_list: None,
+        trace_summary,
+        trace_requirements,
+        summary,
+        runs,
+    })
+}
+
 async fn run_corpus_once(
     gateway_url: &str,
     corpus: &Corpus,
@@ -945,10 +1138,28 @@ async fn run_corpus_once(
     conditional_revalidate: bool,
     cases: &[String],
 ) -> Result<Vec<CaseResult>> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .context("build reqwest client")?;
+    let client = GatewayClient::http(timeout)?;
+    run_corpus_once_with_client(
+        &client,
+        gateway_url,
+        corpus,
+        engine,
+        asset_concurrency,
+        conditional_revalidate,
+        cases,
+    )
+    .await
+}
+
+async fn run_corpus_once_with_client(
+    client: &GatewayClient,
+    gateway_url: &str,
+    corpus: &Corpus,
+    engine: HarnessEngine,
+    asset_concurrency: usize,
+    conditional_revalidate: bool,
+    cases: &[String],
+) -> Result<Vec<CaseResult>> {
     let mut results = Vec::new();
     for entry in &corpus.entries {
         if !entry_selected(entry, cases) {
@@ -956,7 +1167,7 @@ async fn run_corpus_once(
         }
         results.push(
             run_case(
-                &client,
+                client,
                 gateway_url,
                 entry,
                 engine,
@@ -1005,7 +1216,7 @@ fn entry_selected(entry: &CorpusEntry, cases: &[String]) -> bool {
 }
 
 async fn run_case(
-    client: &reqwest::Client,
+    client: &GatewayClient,
     gateway_url: &str,
     entry: &CorpusEntry,
     engine: HarnessEngine,
@@ -1197,7 +1408,7 @@ async fn run_case(
 }
 
 fn gateway_specific_header_expectations_enabled(engine: HarnessEngine) -> bool {
-    matches!(engine, HarnessEngine::Rust)
+    engine.is_rust()
 }
 
 fn print_summary(report: &RunReport) {
@@ -3251,6 +3462,203 @@ fn next_harness_request_id() -> u64 {
     NEXT_HARNESS_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+#[derive(Clone)]
+enum GatewayClient {
+    Http(reqwest::Client),
+    Native(NativeGateway),
+}
+
+impl GatewayClient {
+    fn http(timeout: Duration) -> Result<Self> {
+        Ok(Self::Http(
+            reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .context("build reqwest client")?,
+        ))
+    }
+
+    async fn fetch_response(
+        &self,
+        url: &str,
+        method: &str,
+        range: Option<&str>,
+        if_none_match: Option<&str>,
+        correlation: Option<&RequestCorrelation>,
+    ) -> std::result::Result<FetchResponse, String> {
+        match self {
+            Self::Http(client) => {
+                fetch_http_response(client, url, method, range, if_none_match, correlation).await
+            }
+            Self::Native(native) => {
+                native
+                    .fetch_response(url, method, range, if_none_match, correlation)
+                    .await
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NativeGateway {
+    core: GatewayCore,
+    storage_path: Option<PathBuf>,
+    remove_storage_on_stop: bool,
+}
+
+impl NativeGateway {
+    async fn start(args: &Args, bitswap_seed: Option<&BitswapSeed>) -> Result<Self> {
+        let store = if let Some(path) = &args.gateway_db {
+            SqliteBlockStore::open(path, 256 * 1024 * 1024)
+                .with_context(|| format!("open native gateway DB {}", path.display()))?
+        } else {
+            SqliteBlockStore::in_memory(256 * 1024 * 1024)?
+        };
+
+        if let Some(import_car) = &args.gateway_import_car {
+            let bytes = std::fs::read(import_car)
+                .with_context(|| format!("read {}", import_car.display()))?;
+            let imported = store.import_car(&bytes)?;
+            eprintln!("native gateway imported {} CAR blocks", imported.len());
+        }
+
+        let config = native_gateway_config(args);
+        let routing_mode = if bitswap_seed.is_some() {
+            NativeRoutingMode::Delegated
+        } else {
+            parse_native_routing_mode(&args.routing_mode)?
+        };
+        let core = if routing_mode == NativeRoutingMode::Offline {
+            GatewayCore::with_provider_and_name_resolver_config(
+                Arc::new(store.clone()),
+                Arc::new(PersistentNameResolver::cache_only(store)),
+                config,
+            )
+        } else {
+            let delegated_router_list = if let Some(seed) = bitswap_seed {
+                seed.router_endpoint.clone()
+            } else {
+                args.delegated_router
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_DELEGATED_ROUTER.to_string())
+            };
+            let delegated_router_endpoints = delegated_router_endpoints(&delegated_router_list);
+            let delegated =
+                DelegatedRoutingClient::with_endpoints(delegated_router_endpoints.clone());
+            let dht = LightDhtClient::default()
+                .with_query_timeout(Duration::from_secs(args.dht_query_timeout_secs))
+                .with_max_providers(args.dht_max_providers);
+            let routing = match routing_mode {
+                NativeRoutingMode::Auto => {
+                    ProviderRoutingClient::from(AutoRoutingClient::new(delegated, dht.clone()))
+                }
+                NativeRoutingMode::Delegated => ProviderRoutingClient::from(delegated),
+                NativeRoutingMode::LightDht => ProviderRoutingClient::from(dht.clone()),
+                NativeRoutingMode::Offline => ProviderRoutingClient::Offline,
+            };
+            let provider = FetchingBlockProvider::new(store.clone(), routing);
+            let name_resolver = CachedNameResolver::new(PersistentNameResolver::new(
+                DefaultNameResolver::new(
+                    CloudflareDohResolver::default(),
+                    native_ipns_resolver(routing_mode, delegated_router_endpoints, dht),
+                ),
+                store,
+            ));
+            GatewayCore::with_provider_and_name_resolver_config(
+                Arc::new(provider),
+                Arc::new(name_resolver),
+                config,
+            )
+        };
+
+        Ok(Self {
+            core,
+            storage_path: args.gateway_db.clone(),
+            remove_storage_on_stop: false,
+        })
+    }
+
+    async fn fetch_response(
+        &self,
+        url: &str,
+        method: &str,
+        range: Option<&str>,
+        if_none_match: Option<&str>,
+        correlation: Option<&RequestCorrelation>,
+    ) -> std::result::Result<FetchResponse, String> {
+        let started = Instant::now();
+        let method = gateway_method(method)?;
+        let (namespace, path) = native_gateway_url_path(url)?;
+        let mut headers = HeaderMap::new();
+        if let Some(range) = range {
+            headers.insert(
+                RANGE,
+                HeaderValue::from_str(range).map_err(|err| err.to_string())?,
+            );
+        }
+        if let Some(if_none_match) = if_none_match {
+            headers.insert(
+                IF_NONE_MATCH,
+                HeaderValue::from_str(if_none_match).map_err(|err| err.to_string())?,
+            );
+        }
+        apply_correlation_header_map(&mut headers, correlation)?;
+        let request = match namespace {
+            NativeGatewayNamespace::Ipfs => GatewayCoreRequest::ipfs(path, method, headers),
+            NativeGatewayNamespace::Ipns => GatewayCoreRequest::ipns(path, method, headers),
+        };
+        let response = self.core.handle(request).await;
+        let ttfb_ms = started.elapsed().as_millis();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map_err(|err| format!("body error: {err}"))?
+            .to_vec();
+        Ok(fetch_response_from_parts(
+            status,
+            &headers,
+            body,
+            ttfb_ms,
+            started.elapsed().as_millis(),
+        ))
+    }
+
+    async fn stop(&mut self) {
+        if self.remove_storage_on_stop {
+            if let Some(path) = &self.storage_path {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    fn storage_bytes(&self) -> Option<u64> {
+        self.storage_path
+            .as_ref()
+            .and_then(|path| storage_path_size_bytes(path).ok())
+    }
+
+    fn storage_path(&self) -> Option<String> {
+        self.storage_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NativeGatewayNamespace {
+    Ipfs,
+    Ipns,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeRoutingMode {
+    Auto,
+    Delegated,
+    LightDht,
+    Offline,
+}
+
 fn apply_correlation_headers(
     mut request: reqwest::RequestBuilder,
     correlation: Option<&RequestCorrelation>,
@@ -3269,11 +3677,49 @@ fn apply_correlation_headers(
     request
 }
 
+fn apply_correlation_header_map(
+    headers: &mut HeaderMap,
+    correlation: Option<&RequestCorrelation>,
+) -> std::result::Result<(), String> {
+    let Some(correlation) = correlation else {
+        return Ok(());
+    };
+    headers.insert(
+        X_FREEDOM_REQUEST_ID,
+        HeaderValue::from_str(&correlation.request_id.to_string())
+            .map_err(|err| err.to_string())?,
+    );
+    headers.insert(
+        X_FREEDOM_TOP_LEVEL_PATH,
+        HeaderValue::from_str(&correlation.top_level_path).map_err(|err| err.to_string())?,
+    );
+    if let Some(parent_id) = correlation.parent_id {
+        headers.insert(
+            X_FREEDOM_PARENT_REQUEST_ID,
+            HeaderValue::from_str(&parent_id.to_string()).map_err(|err| err.to_string())?,
+        );
+    }
+    Ok(())
+}
+
 async fn fetch_response(
+    client: &GatewayClient,
+    url: &str,
+    method: &str,
+    range: Option<&str>,
+    correlation: Option<&RequestCorrelation>,
+) -> std::result::Result<FetchResponse, String> {
+    client
+        .fetch_response(url, method, range, None, correlation)
+        .await
+}
+
+async fn fetch_http_response(
     client: &reqwest::Client,
     url: &str,
     method: &str,
     range: Option<&str>,
+    if_none_match: Option<&str>,
     correlation: Option<&RequestCorrelation>,
 ) -> std::result::Result<FetchResponse, String> {
     let started = Instant::now();
@@ -3282,6 +3728,9 @@ async fn fetch_response(
             let mut request = client.get(url);
             if let Some(range) = range {
                 request = request.header(RANGE, range);
+            }
+            if let Some(if_none_match) = if_none_match {
+                request = request.header(IF_NONE_MATCH, if_none_match);
             }
             let request = apply_correlation_headers(request, correlation);
             request.send().await
@@ -3300,37 +3749,8 @@ async fn fetch_response(
     .map_err(|err| err.to_string())?;
 
     let ttfb_ms = started.elapsed().as_millis();
-    let status = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let content_range = response
-        .headers()
-        .get(CONTENT_RANGE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let content_length = response
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
-    let accept_ranges = response
-        .headers()
-        .get(ACCEPT_RANGES)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let etag = response
-        .headers()
-        .get(ETAG)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let cache_control = response
-        .headers()
-        .get(CACHE_CONTROL)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
+    let status = response.status();
+    let headers = response.headers().clone();
     let body = response
         .bytes()
         .await
@@ -3338,22 +3758,187 @@ async fn fetch_response(
         .to_vec();
     let total_ms = started.elapsed().as_millis();
 
-    Ok(FetchResponse {
-        status,
-        content_type,
-        content_range,
-        content_length,
-        accept_ranges,
-        etag,
-        cache_control,
+    Ok(fetch_response_from_parts(
+        status, &headers, body, ttfb_ms, total_ms,
+    ))
+}
+
+fn fetch_response_from_parts(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: Vec<u8>,
+    ttfb_ms: u128,
+    total_ms: u128,
+) -> FetchResponse {
+    FetchResponse {
+        status: status.as_u16(),
+        content_type: header_string(headers, CONTENT_TYPE.as_str()),
+        content_range: header_string(headers, CONTENT_RANGE.as_str()),
+        content_length: header_string(headers, CONTENT_LENGTH.as_str())
+            .and_then(|value| value.parse::<u64>().ok()),
+        accept_ranges: header_string(headers, ACCEPT_RANGES.as_str()),
+        etag: header_string(headers, ETAG.as_str()),
+        cache_control: header_string(headers, CACHE_CONTROL.as_str()),
         body,
         ttfb_ms,
         total_ms,
-    })
+    }
+}
+
+fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+fn gateway_method(method: &str) -> std::result::Result<Method, String> {
+    match method {
+        "GET" => Ok(Method::GET),
+        "HEAD" => Ok(Method::HEAD),
+        other => Err(format!(
+            "unsupported method {other}; only GET and HEAD are supported"
+        )),
+    }
+}
+
+fn native_gateway_url_path(
+    url: &str,
+) -> std::result::Result<(NativeGatewayNamespace, String), String> {
+    let url = Url::parse(url).map_err(|err| err.to_string())?;
+    let decoded = percent_decode_path(url.path())?;
+    let path = decoded.trim_start_matches('/');
+    if let Some(rest) = path.strip_prefix("ipfs/") {
+        return Ok((NativeGatewayNamespace::Ipfs, rest.to_string()));
+    }
+    if let Some(rest) = path.strip_prefix("ipns/") {
+        return Ok((NativeGatewayNamespace::Ipns, rest.to_string()));
+    }
+    Err(format!(
+        "native gateway URL path must start with /ipfs/ or /ipns/: {url}"
+    ))
+}
+
+fn percent_decode_path(path: &str) -> std::result::Result<String, String> {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(format!("invalid percent encoding in path {path:?}"));
+            }
+            let high = hex_value(bytes[index + 1])
+                .ok_or_else(|| format!("invalid percent encoding in path {path:?}"))?;
+            let low = hex_value(bytes[index + 2])
+                .ok_or_else(|| format!("invalid percent encoding in path {path:?}"))?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|err| err.to_string())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn parse_native_routing_mode(value: &str) -> Result<NativeRoutingMode> {
+    match value {
+        "auto" => Ok(NativeRoutingMode::Auto),
+        "delegated" => Ok(NativeRoutingMode::Delegated),
+        "light-dht" | "light_dht" => Ok(NativeRoutingMode::LightDht),
+        "offline" => Ok(NativeRoutingMode::Offline),
+        other => bail!(
+            "unsupported routing mode {other:?}; expected auto, delegated, light-dht, or offline"
+        ),
+    }
+}
+
+fn native_gateway_config(args: &Args) -> GatewayConfig {
+    GatewayConfig::new(args.max_concurrent_requests)
+        .with_small_body_cache_max_bytes(args.small_body_cache_max_bytes)
+        .with_html_prefetch(GatewayHtmlPrefetchConfig::new(
+            env_usize(HTML_PREFETCH_MAX_ASSETS_ENV, 0),
+            env_u64(HTML_PREFETCH_MAX_BYTES_ENV, 64 * 1024),
+            env_usize(HTML_PREFETCH_CONCURRENCY_ENV, 2),
+        ))
+        .with_html_directory_prefetch(GatewayHtmlDirectoryPrefetchConfig::new(
+            env_usize(HTML_DIRECTORY_PREFETCH_MAX_DIRS_ENV, 0),
+            env_u64(HTML_DIRECTORY_PREFETCH_MAX_BYTES_ENV, 64 * 1024),
+            env_usize(HTML_DIRECTORY_PREFETCH_CONCURRENCY_ENV, 1),
+        ))
+        .with_html_range_warm(GatewayHtmlRangeWarmConfig::new(
+            env_u64(HTML_RANGE_WARM_MAX_BYTES_ENV, 0),
+            env_usize(HTML_RANGE_WARM_CONCURRENCY_ENV, 1),
+        ))
+        .with_raw_link_tsize_fast_headers(
+            std::env::var_os(RAW_LINK_TSIZE_FAST_HEADERS_ENV).is_some(),
+        )
+        .with_stream_small_bodies(std::env::var_os(STREAM_SMALL_BODIES_ENV).is_some())
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn delegated_router_endpoints(delegated_routers: &str) -> Vec<String> {
+    delegated_routers
+        .split(',')
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn native_ipns_resolver(
+    routing_mode: NativeRoutingMode,
+    delegated_routers: Vec<String>,
+    dht: LightDhtClient,
+) -> Arc<dyn IpnsResolver> {
+    match routing_mode {
+        NativeRoutingMode::Auto => Arc::new(FallbackIpnsResolver::new(
+            DelegatedIpnsResolver::with_endpoints(delegated_routers),
+            DhtIpnsResolver::new(dht),
+        )),
+        NativeRoutingMode::Delegated => {
+            Arc::new(DelegatedIpnsResolver::with_endpoints(delegated_routers))
+        }
+        NativeRoutingMode::LightDht => Arc::new(DhtIpnsResolver::new(dht)),
+        NativeRoutingMode::Offline => Arc::new(NativeOfflineIpnsResolver),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NativeOfflineIpnsResolver;
+
+#[async_trait::async_trait]
+impl IpnsResolver for NativeOfflineIpnsResolver {
+    async fn resolve_ipns(&self, name: &str) -> freedom_ipfs_namesys::Result<IpnsRecord> {
+        Err(NamesysError::NotFound(name.to_string()))
+    }
 }
 
 async fn maybe_revalidate_response(
-    client: &reqwest::Client,
+    client: &GatewayClient,
     url: &str,
     method: &str,
     range: Option<&str>,
@@ -3385,14 +3970,16 @@ async fn maybe_revalidate_response(
 }
 
 async fn fetch_revalidation(
-    client: &reqwest::Client,
+    client: &GatewayClient,
     url: &str,
     etag: &str,
     correlation: Option<&RequestCorrelation>,
 ) -> RevalidationResult {
     let started = Instant::now();
-    let request = client.get(url).header(IF_NONE_MATCH, etag);
-    let response = match apply_correlation_headers(request, correlation).send().await {
+    let response = match client
+        .fetch_response(url, "GET", None, Some(etag), correlation)
+        .await
+    {
         Ok(response) => response,
         Err(err) => {
             return RevalidationResult {
@@ -3408,51 +3995,24 @@ async fn fetch_revalidation(
         }
     };
 
-    let ttfb_ms = started.elapsed().as_millis();
-    let status = response.status().as_u16();
-    let response_etag = response
-        .headers()
-        .get(ETAG)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let cache_control = response
-        .headers()
-        .get(CACHE_CONTROL)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let body = match response.bytes().await {
-        Ok(body) => body,
-        Err(err) => {
-            return RevalidationResult {
-                status: Some(status),
-                etag: response_etag,
-                cache_control,
-                body_bytes: 0,
-                ttfb_ms,
-                total_ms: started.elapsed().as_millis(),
-                passed: false,
-                failures: vec![format!("body error: {err}")],
-            };
-        }
-    };
     let total_ms = started.elapsed().as_millis();
     let mut failures = Vec::new();
-    if status != 304 {
-        failures.push(format!("status {status}, expected 304"));
+    if response.status != 304 {
+        failures.push(format!("status {}, expected 304", response.status));
     }
-    if !body.is_empty() {
+    if !response.body.is_empty() {
         failures.push(format!(
             "body {} bytes, expected empty 304 body",
-            body.len()
+            response.body.len()
         ));
     }
 
     RevalidationResult {
-        status: Some(status),
-        etag: response_etag,
-        cache_control,
-        body_bytes: body.len(),
-        ttfb_ms,
+        status: Some(response.status),
+        etag: response.etag,
+        cache_control: response.cache_control,
+        body_bytes: response.body.len(),
+        ttfb_ms: response.ttfb_ms,
         total_ms,
         passed: failures.is_empty(),
         failures,
@@ -3460,7 +4020,7 @@ async fn fetch_revalidation(
 }
 
 async fn run_page_crawl(
-    client: &reqwest::Client,
+    client: &GatewayClient,
     page_url: &str,
     page_body: &[u8],
     config: &CrawlConfig,
@@ -3554,7 +4114,7 @@ async fn run_page_crawl(
 }
 
 async fn fetch_assets(
-    client: &reqwest::Client,
+    client: &GatewayClient,
     assets: Vec<DiscoveredAsset>,
     concurrency: usize,
     max_bytes: usize,
@@ -3590,7 +4150,7 @@ async fn fetch_assets(
 }
 
 async fn fetch_asset(
-    client: &reqwest::Client,
+    client: &GatewayClient,
     asset: DiscoveredAsset,
     max_bytes: usize,
     conditional_revalidate: bool,
@@ -4494,7 +5054,8 @@ struct SpawnedGateway {
 impl SpawnedGateway {
     async fn start(args: &Args, bitswap_seed: Option<&BitswapSeed>) -> Result<Self> {
         match args.engine {
-            HarnessEngine::Rust => Self::start_rust(args, bitswap_seed).await,
+            HarnessEngine::RustHttp => Self::start_rust(args, bitswap_seed).await,
+            HarnessEngine::RustNative => bail!("rust-native does not spawn a gateway process"),
             HarnessEngine::Kubo => Self::start_kubo(args, bitswap_seed).await,
         }
     }
@@ -5176,7 +5737,9 @@ impl BitswapSeedConnectionSetup {
 fn bitswap_seed_connection_setup(args: &Args) -> Option<BitswapSeedConnectionSetup> {
     args.bitswap_seed_car.as_ref()?;
     match args.engine {
-        HarnessEngine::Rust => Some(BitswapSeedConnectionSetup::DelegatedRouterProviderLookup),
+        HarnessEngine::RustHttp | HarnessEngine::RustNative => {
+            Some(BitswapSeedConnectionSetup::DelegatedRouterProviderLookup)
+        }
         HarnessEngine::Kubo => Some(BitswapSeedConnectionSetup::SwarmConnectBeforeRequest),
     }
 }
@@ -11908,7 +12471,10 @@ mod tests {
     #[test]
     fn gateway_specific_header_expectations_apply_only_to_rust() {
         assert!(gateway_specific_header_expectations_enabled(
-            HarnessEngine::Rust
+            HarnessEngine::RustHttp
+        ));
+        assert!(gateway_specific_header_expectations_enabled(
+            HarnessEngine::RustNative
         ));
         assert!(!gateway_specific_header_expectations_enabled(
             HarnessEngine::Kubo
@@ -12040,6 +12606,16 @@ mod tests {
     }
 
     #[test]
+    fn args_accept_native_and_legacy_rust_engines() {
+        let native = Args::try_parse_from(["mobile-web-harness", "--engine", "rust-native"])
+            .expect("parse rust-native engine");
+        assert_eq!(native.engine, HarnessEngine::RustNative);
+
+        let legacy = Args::try_parse_from(["mobile-web-harness", "--engine", "rust"]).unwrap();
+        assert_eq!(legacy.engine, HarnessEngine::RustHttp);
+    }
+
+    #[test]
     fn synthetic_multiblock_range_bytes_are_stable() {
         let data = synthetic_multiblock_range_bytes();
         let range_end = SYNTHETIC_MULTIBLOCK_RANGE_START + SYNTHETIC_MULTIBLOCK_RANGE_BYTES - 1;
@@ -12067,6 +12643,19 @@ mod tests {
         .unwrap();
         assert_eq!(
             bitswap_seed_connection_setup(&rust_args),
+            Some(BitswapSeedConnectionSetup::DelegatedRouterProviderLookup)
+        );
+
+        let native_args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--engine",
+            "rust-native",
+            "--bitswap-seed-car",
+            "/tmp/mobile-fixture.car",
+        ])
+        .unwrap();
+        assert_eq!(
+            bitswap_seed_connection_setup(&native_args),
             Some(BitswapSeedConnectionSetup::DelegatedRouterProviderLookup)
         );
 
@@ -14255,7 +14844,7 @@ mod tests {
         kubo_runs[1].bitswap_seed_connect_elapsed_ms = Some(70);
 
         let rust = run_report(
-            HarnessEngine::Rust,
+            HarnessEngine::RustHttp,
             Some(BitswapSeedConnectionSetup::DelegatedRouterProviderLookup),
             rust_runs,
         );
@@ -14333,7 +14922,7 @@ mod tests {
         kubo_runs[0].results[0].assets = vec![script_asset_result(5, 10)];
         kubo_runs[1].results[0].assets = vec![script_asset_result(10, 20)];
 
-        let rust = run_report(HarnessEngine::Rust, None, rust_runs);
+        let rust = run_report(HarnessEngine::RustHttp, None, rust_runs);
         let kubo = run_report(HarnessEngine::Kubo, None, kubo_runs);
 
         let cases = ComparisonCase::from_reports(&rust, &kubo);
@@ -14411,7 +15000,7 @@ mod tests {
             script_asset_result_for_path(70, 80, 5001, "/ipfs/root/style.css"),
         ];
 
-        let rust = run_report(HarnessEngine::Rust, None, rust_runs);
+        let rust = run_report(HarnessEngine::RustHttp, None, rust_runs);
         let kubo = run_report(HarnessEngine::Kubo, None, kubo_runs);
 
         let cases = ComparisonCase::from_reports(&rust, &kubo);
@@ -14498,7 +15087,7 @@ mod tests {
             "/ipfs/root/app.js",
         )];
 
-        let mut rust = run_report(HarnessEngine::Rust, None, rust_runs);
+        let mut rust = run_report(HarnessEngine::RustHttp, None, rust_runs);
         rust.trace_summary = Some(trace_summary);
         let kubo = run_report(HarnessEngine::Kubo, None, kubo_runs);
 
@@ -14582,7 +15171,7 @@ mod tests {
         kubo_runs[0].results[0].assets = vec![script_asset_result(1, 1)];
         kubo_runs[1].results[0].assets = vec![script_asset_result(1, 1)];
 
-        let rust = run_report(HarnessEngine::Rust, None, rust_runs);
+        let rust = run_report(HarnessEngine::RustHttp, None, rust_runs);
         let kubo = run_report(HarnessEngine::Kubo, None, kubo_runs);
 
         let cases = ComparisonCase::from_reports(&rust, &kubo);
@@ -14679,7 +15268,7 @@ mod tests {
 
     #[tokio::test]
     async fn conditional_revalidation_requires_etag_for_eligible_gets() {
-        let client = reqwest::Client::new();
+        let client = GatewayClient::http(Duration::from_secs(1)).unwrap();
         let response = FetchResponse {
             status: 200,
             content_type: Some("text/plain".to_string()),
@@ -14910,7 +15499,7 @@ mod tests {
             asset_concurrency: 1,
             conditional_revalidate: false,
             run_timeout_secs: None,
-            engine: HarnessEngine::Rust,
+            engine: HarnessEngine::RustHttp,
             small_body_cache_max_bytes: Some(DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES),
             gateway_db: Some("/tmp/replay.db".to_string()),
             gateway_import_car: None,
@@ -14991,7 +15580,7 @@ mod tests {
             asset_concurrency: 1,
             conditional_revalidate: false,
             run_timeout_secs: None,
-            engine: HarnessEngine::Rust,
+            engine: HarnessEngine::RustHttp,
             small_body_cache_max_bytes: Some(DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES),
             gateway_db: Some("/tmp/replay.db".to_string()),
             gateway_import_car: None,
@@ -15989,7 +16578,8 @@ mod tests {
             conditional_revalidate: false,
             run_timeout_secs: None,
             engine,
-            small_body_cache_max_bytes: (engine == HarnessEngine::Rust)
+            small_body_cache_max_bytes: engine
+                .is_rust()
                 .then_some(DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES),
             gateway_db: None,
             gateway_import_car: None,

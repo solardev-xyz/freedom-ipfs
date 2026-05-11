@@ -16,6 +16,15 @@ compatibility bugs, local fixes, and scenarios that should survive rebases.
 
 The black-box harness lives in `tools/mobile-web-harness`.
 
+The harness can exercise three gateway engines:
+
+- `rust-http`: current localhost HTTP gateway adapter.
+- `rust-native`: in-process `GatewayCore` adapter with no TCP listener and no
+  loopback HTTP requests.
+- `kubo`: external Kubo daemon/gateway comparison engine.
+
+`--engine rust` remains an alias for `rust-http` for older command lines.
+
 Use an already-running gateway:
 
 ```sh
@@ -34,6 +43,21 @@ Or let it spawn the standalone gateway:
 cargo build -p freedom-ipfs-gateway
 cargo run -p mobile-web-harness -- --output /tmp/mobile-web-run.json
 ```
+
+Run the native Rust adapter directly, without binding a localhost gateway port:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --engine rust-native \
+  --case ipfs-tech-page-assets \
+  --repeat 5
+```
+
+Use `rust-native` first with deterministic CAR-backed corpora when checking
+HTTP/native parity. Live `rust-native` runs use the same routing mode,
+delegated-router, DHT, request-concurrency, small-body-cache, and lab env knobs
+as spawned Rust HTTP gateways, but `--trace-output` is still restricted to
+`rust-http`.
 
 Run a focused case repeatedly and write an aggregate JSON report:
 
