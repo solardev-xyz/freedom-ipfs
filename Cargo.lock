@@ -943,6 +943,7 @@ dependencies = [
  "freedom-ipfs-retrieval",
  "freedom-ipfs-routing",
  "freedom-ipfs-store",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",

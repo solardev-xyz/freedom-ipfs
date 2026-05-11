@@ -16498,10 +16498,10 @@ mod bitswap_tests {
         let second = b"session head start second block";
         let first_cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, first);
         let second_cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, second);
-        let (peer_id, addr, swarm_task, stream_task) = spawn_multi_block_bitswap_peer(vec![
-            (first_cid, first.to_vec()),
-            (second_cid, second.to_vec()),
-        ])
+        let (peer_id, addr, swarm_task, stream_task) = spawn_delayed_multi_block_bitswap_peer(
+            vec![(first_cid, first.to_vec()), (second_cid, second.to_vec())],
+            Duration::from_millis(25),
+        )
         .await;
         let delegated_requests = Arc::new(AtomicU64::new(0));
         let (endpoint, routing_task) = spawn_counting_delegated_response(

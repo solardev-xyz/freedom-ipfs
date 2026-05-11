@@ -1,7 +1,9 @@
-use freedom_ipfs_core::parse_cid;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
+use freedom_ipfs_core::{parse_cid, BlockProvider};
+use freedom_ipfs_gateway::{GatewayCore, GatewayCoreRequest};
 use freedom_ipfs_namesys::{
     CachedNameResolver, CloudflareDohResolver, DefaultNameResolver, DelegatedIpnsResolver,
-    FallbackIpnsResolver, IpnsResolver,
+    FallbackIpnsResolver, IpnsResolver, NameResolver,
 };
 use freedom_ipfs_retrieval::FetchingBlockProvider;
 use freedom_ipfs_routing::{
@@ -9,7 +11,8 @@ use freedom_ipfs_routing::{
     ProviderRoutingClient, RoutingStatsHandle, DEFAULT_DELEGATED_ROUTER,
 };
 use freedom_ipfs_store::SqliteBlockStore;
-use serde::Serialize;
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ffi::{c_char, CStr, CString};
@@ -24,6 +27,7 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Id, Subscriber};
@@ -40,6 +44,17 @@ const ROUTING_MODE_LIGHT_DHT: u32 = 2;
 const ROUTING_MODE_OFFLINE: u32 = 3;
 const PRELOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_PROGRESS_EVENTS: usize = 512;
+const NATIVE_BODY_CHANNEL_CAPACITY: usize = 2;
+const X_FREEDOM_REQUEST_ID: &str = "X-Freedom-Request-ID";
+const X_FREEDOM_PARENT_REQUEST_ID: &str = "X-Freedom-Parent-Request-ID";
+const X_FREEDOM_TOP_LEVEL_PATH: &str = "X-Freedom-Top-Level-Path";
+
+const FREEDOM_IPFS_GATEWAY_READ_PENDING: u32 = 0;
+const FREEDOM_IPFS_GATEWAY_READ_BYTES: u32 = 1;
+const FREEDOM_IPFS_GATEWAY_READ_END: u32 = 2;
+const FREEDOM_IPFS_GATEWAY_READ_CANCELLED: u32 = 3;
+const FREEDOM_IPFS_GATEWAY_READ_FAILED: u32 = 4;
+const FREEDOM_IPFS_GATEWAY_READ_INVALID_HANDLE: u32 = 5;
 
 static PROGRESS_RECORDER: OnceLock<Arc<ProgressRecorder>> = OnceLock::new();
 static PROGRESS_TRACING_INIT: Once = Once::new();
@@ -60,12 +75,22 @@ pub struct FreedomIpfsNode {
     lifecycle_state: Mutex<LifecycleState>,
     next_preload_id: AtomicU64,
     preload_tasks: Mutex<HashMap<u64, JoinHandle<()>>>,
+    native_gateway: Mutex<GatewayCore>,
+    next_native_request_id: AtomicU64,
+    native_requests: Mutex<HashMap<u64, Arc<NativeGatewayRequest>>>,
 }
 
 #[repr(C)]
 pub struct FreedomIpfsBuffer {
     pub data: *mut u8,
     pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FreedomIpfsGatewayReadResult {
+    pub status: u32,
+    pub bytes_read: usize,
 }
 
 #[repr(C)]
@@ -104,6 +129,100 @@ pub struct FreedomIpfsDiagnostics {
     pub active_preload_count: u64,
     pub gateway_running: u64,
     pub lifecycle_background: u64,
+}
+
+struct NativeGatewayRequest {
+    meta: Arc<Mutex<NativeGatewayRequestMeta>>,
+    body_rx: Mutex<mpsc::Receiver<NativeBodyMessage>>,
+    pending: Mutex<VecDeque<u8>>,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl NativeGatewayRequest {
+    fn cancel(&self) {
+        if let Ok(mut meta) = self.meta.lock() {
+            meta.cancelled = true;
+        }
+        if let Ok(mut task) = self.task.lock() {
+            if let Some(task) = task.take() {
+                task.abort();
+            }
+        }
+    }
+}
+
+impl Drop for NativeGatewayRequest {
+    fn drop(&mut self) {
+        if let Ok(mut task) = self.task.lock() {
+            if let Some(task) = task.take() {
+                task.abort();
+            }
+        }
+    }
+}
+
+enum NativeBodyMessage {
+    Data(Vec<u8>),
+    Failed(NativeGatewayErrorJson),
+}
+
+#[derive(Default)]
+struct NativeGatewayRequestMeta {
+    method: String,
+    path: String,
+    namespace: String,
+    request_id: Option<u64>,
+    parent_request_id: Option<u64>,
+    top_level_path: Option<String>,
+    response: Option<NativeGatewayResponseMeta>,
+    completed: bool,
+    cancelled: bool,
+    error: Option<NativeGatewayErrorJson>,
+}
+
+#[derive(Clone)]
+struct NativeGatewayResponseMeta {
+    status: u16,
+    headers: Vec<NativeGatewayHeader>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct NativeGatewayHeader {
+    name: String,
+    value: String,
+}
+
+#[derive(Clone, Serialize)]
+struct NativeGatewayErrorJson {
+    code: String,
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct NativeGatewayStartRequest {
+    method: Option<String>,
+    path: String,
+    headers: Option<Vec<NativeGatewayHeader>>,
+    request_id: Option<u64>,
+    parent_request_id: Option<u64>,
+    top_level_path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NativeGatewayResponseJson {
+    handle: u64,
+    state: String,
+    method: String,
+    path: String,
+    namespace: String,
+    request_id: Option<u64>,
+    parent_request_id: Option<u64>,
+    top_level_path: Option<String>,
+    status: Option<u16>,
+    headers: Vec<NativeGatewayHeader>,
+    completed: bool,
+    cancelled: bool,
+    error: Option<NativeGatewayErrorJson>,
 }
 
 #[derive(Clone, Default)]
@@ -837,6 +956,7 @@ fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
         Ok(runtime) => runtime,
         Err(_) => return ptr::null_mut(),
     };
+    let native_gateway = cache_only_gateway_core(store.clone());
     Box::into_raw(Box::new(FreedomIpfsNode {
         runtime,
         store,
@@ -847,6 +967,9 @@ fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
         lifecycle_state: Mutex::new(LifecycleState::Foreground),
         next_preload_id: AtomicU64::new(1),
         preload_tasks: Mutex::new(HashMap::new()),
+        native_gateway: Mutex::new(native_gateway),
+        next_native_request_id: AtomicU64::new(1),
+        native_requests: Mutex::new(HashMap::new()),
     }))
 }
 
@@ -889,6 +1012,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_clear_progress(ptr: *mut FreedomIpfsN
 pub unsafe extern "C" fn freedom_ipfs_node_free(ptr: *mut FreedomIpfsNode) {
     if !ptr.is_null() {
         let node = &*ptr;
+        stop_native_gateway_requests(node);
         stop_gateway(node);
         stop_preloads(node);
         let _ = Box::from_raw(ptr);
@@ -1203,6 +1327,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_start_gateway(
 
     let store = node.store.clone();
     if start_gateway_with_router(node, addr, freedom_ipfs_gateway::router(store)) {
+        set_native_gateway_core(node, offline_gateway_core(node.store.clone()));
         clear_online_stats(node);
         true
     } else {
@@ -1300,6 +1425,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_start_gateway_online_with_config_v2(
     };
 
     if start_gateway_with_router(node, parts.addr, parts.router) {
+        set_native_gateway_core(node, parts.native_gateway);
         set_online_stats(node, parts.retrieval_provider, parts.routing_stats);
         true
     } else {
@@ -1348,6 +1474,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_restart_gateway_online_with_config_v2
     stop_preloads(node);
     stop_gateway(node);
     if start_gateway_with_router(node, parts.addr, parts.router) {
+        set_native_gateway_core(node, parts.native_gateway);
         set_online_stats(node, parts.retrieval_provider, parts.routing_stats);
         true
     } else {
@@ -1359,6 +1486,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_restart_gateway_online_with_config_v2
 struct OnlineGatewayParts {
     addr: SocketAddr,
     router: axum::Router,
+    native_gateway: GatewayCore,
     retrieval_provider: FetchingBlockProvider,
     routing_stats: RoutingStatsHandle,
 }
@@ -1384,16 +1512,24 @@ unsafe fn gateway_router_for_routing_mode(
             node.store.clone(),
             ProviderRoutingClient::Offline.with_stats(routing_stats.clone()),
         );
-        let name_resolver =
-            freedom_ipfs_gateway::PersistentNameResolver::cache_only(node.store.clone());
+        let provider_arc: Arc<dyn BlockProvider> = Arc::new(provider.clone());
+        let name_resolver: Arc<dyn NameResolver> = Arc::new(
+            freedom_ipfs_gateway::PersistentNameResolver::cache_only(node.store.clone()),
+        );
         let router = freedom_ipfs_gateway::router_with_provider_and_name_resolver_config(
-            Arc::new(provider.clone()),
-            Arc::new(name_resolver),
+            provider_arc.clone(),
+            name_resolver.clone(),
+            gateway_config.clone(),
+        );
+        let native_gateway = GatewayCore::with_provider_and_name_resolver_config(
+            provider_arc,
+            name_resolver,
             gateway_config,
         );
         return Some(OnlineGatewayParts {
             addr,
             router,
+            native_gateway,
             retrieval_provider: provider,
             routing_stats,
         });
@@ -1419,6 +1555,7 @@ unsafe fn gateway_router_for_routing_mode(
     let routing_stats = RoutingStatsHandle::default();
     let routing = routing.with_stats(routing_stats.clone());
     let provider = FetchingBlockProvider::new(node.store.clone(), routing);
+    let provider_arc: Arc<dyn BlockProvider> = Arc::new(provider.clone());
     let name_resolver = CachedNameResolver::new(freedom_ipfs_gateway::PersistentNameResolver::new(
         DefaultNameResolver::new(
             CloudflareDohResolver::default(),
@@ -1426,14 +1563,21 @@ unsafe fn gateway_router_for_routing_mode(
         ),
         node.store.clone(),
     ));
+    let name_resolver: Arc<dyn NameResolver> = Arc::new(name_resolver);
     let router = freedom_ipfs_gateway::router_with_provider_and_name_resolver_config(
-        Arc::new(provider.clone()),
-        Arc::new(name_resolver),
+        provider_arc.clone(),
+        name_resolver.clone(),
+        gateway_config.clone(),
+    );
+    let native_gateway = GatewayCore::with_provider_and_name_resolver_config(
+        provider_arc,
+        name_resolver,
         gateway_config,
     );
     Some(OnlineGatewayParts {
         addr,
         router,
+        native_gateway,
         retrieval_provider: provider,
         routing_stats,
     })
@@ -1557,6 +1701,507 @@ pub unsafe extern "C" fn freedom_ipfs_node_gateway_url(ptr: *mut FreedomIpfsNode
 
 /// # Safety
 ///
+/// `ptr` must be a valid node pointer. `request_json` must point to a
+/// NUL-terminated UTF-8 JSON request for the duration of this call. Returns 0
+/// when the request cannot be parsed or queued.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_gateway_request_start(
+    ptr: *mut FreedomIpfsNode,
+    request_json: *const c_char,
+) -> u64 {
+    if ptr.is_null() || request_json.is_null() {
+        return 0;
+    }
+    let node = &*ptr;
+    let request_json = match CStr::from_ptr(request_json).to_str() {
+        Ok(request_json) => request_json,
+        Err(_) => return 0,
+    };
+    let parsed = match parse_native_gateway_start_request(request_json) {
+        Some(parsed) => parsed,
+        None => return 0,
+    };
+    let core = match node.native_gateway.lock() {
+        Ok(core) => core.clone(),
+        Err(_) => return 0,
+    };
+    let handle = node.next_native_request_id.fetch_add(1, Ordering::Relaxed);
+    if handle == 0 {
+        return 0;
+    }
+    let (body_tx, body_rx) = mpsc::channel(NATIVE_BODY_CHANNEL_CAPACITY);
+    let meta = Arc::new(Mutex::new(NativeGatewayRequestMeta {
+        method: parsed.method_label,
+        path: parsed.rendered_path,
+        namespace: parsed.namespace_label,
+        request_id: parsed.request_id,
+        parent_request_id: parsed.parent_request_id,
+        top_level_path: parsed.top_level_path,
+        response: None,
+        completed: false,
+        cancelled: false,
+        error: None,
+    }));
+    let task_meta = meta.clone();
+    let task = node.runtime.spawn(async move {
+        run_native_gateway_request(core, parsed.request, task_meta, body_tx).await;
+    });
+    let request = Arc::new(NativeGatewayRequest {
+        meta,
+        body_rx: Mutex::new(body_rx),
+        pending: Mutex::new(VecDeque::new()),
+        task: Mutex::new(Some(task)),
+    });
+    let Ok(mut requests) = node.native_requests.lock() else {
+        request.cancel();
+        return 0;
+    };
+    requests.insert(handle, request);
+    handle
+}
+
+/// # Safety
+///
+/// `ptr` must be a valid node pointer. The returned string is UTF-8 JSON and
+/// must be released with `freedom_ipfs_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_gateway_request_response_json(
+    ptr: *mut FreedomIpfsNode,
+    request_handle: u64,
+) -> *mut c_char {
+    if ptr.is_null() || request_handle == 0 {
+        return native_gateway_json_string(native_gateway_invalid_handle_json(request_handle));
+    }
+    let node = &*ptr;
+    let Some(request) = native_gateway_request(node, request_handle) else {
+        return native_gateway_json_string(native_gateway_invalid_handle_json(request_handle));
+    };
+    native_gateway_json_string(native_gateway_response_json(request_handle, &request))
+}
+
+/// # Safety
+///
+/// `ptr` must be a valid node pointer. `buffer` must point to `buffer_len`
+/// writable bytes for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_gateway_request_read(
+    ptr: *mut FreedomIpfsNode,
+    request_handle: u64,
+    buffer: *mut u8,
+    buffer_len: usize,
+) -> FreedomIpfsGatewayReadResult {
+    if ptr.is_null() || request_handle == 0 {
+        return gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_INVALID_HANDLE, 0);
+    }
+    let node = &*ptr;
+    let Some(request) = native_gateway_request(node, request_handle) else {
+        return gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_INVALID_HANDLE, 0);
+    };
+    if buffer.is_null() || buffer_len == 0 {
+        return gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_FAILED, 0);
+    }
+    native_gateway_read(&request, std::slice::from_raw_parts_mut(buffer, buffer_len))
+}
+
+/// # Safety
+///
+/// `ptr` must be a valid node pointer. `request_handle` must be a handle
+/// returned by `freedom_ipfs_gateway_request_start`.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_gateway_request_cancel(
+    ptr: *mut FreedomIpfsNode,
+    request_handle: u64,
+) -> bool {
+    if ptr.is_null() || request_handle == 0 {
+        return false;
+    }
+    let node = &*ptr;
+    let Some(request) = native_gateway_request(node, request_handle) else {
+        return false;
+    };
+    request.cancel();
+    true
+}
+
+/// # Safety
+///
+/// `ptr` must be a valid node pointer. `request_handle` must be a handle
+/// returned by `freedom_ipfs_gateway_request_start` and must not be freed more
+/// than once.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_gateway_request_free(
+    ptr: *mut FreedomIpfsNode,
+    request_handle: u64,
+) -> bool {
+    if ptr.is_null() || request_handle == 0 {
+        return false;
+    }
+    let node = &*ptr;
+    let Ok(mut requests) = node.native_requests.lock() else {
+        return false;
+    };
+    let Some(request) = requests.remove(&request_handle) else {
+        return false;
+    };
+    request.cancel();
+    true
+}
+
+struct ParsedNativeGatewayRequest {
+    request: GatewayCoreRequest,
+    method_label: String,
+    rendered_path: String,
+    namespace_label: String,
+    request_id: Option<u64>,
+    parent_request_id: Option<u64>,
+    top_level_path: Option<String>,
+}
+
+fn parse_native_gateway_start_request(request_json: &str) -> Option<ParsedNativeGatewayRequest> {
+    let request: NativeGatewayStartRequest = serde_json::from_str(request_json).ok()?;
+    let method_label = request.method.unwrap_or_else(|| "GET".to_string());
+    let method = match method_label.to_ascii_uppercase().as_str() {
+        "GET" => Method::GET,
+        "HEAD" => Method::HEAD,
+        _ => return None,
+    };
+    let path = normalize_gateway_request_path(&request.path)?;
+    let (namespace, path_without_namespace, rendered_path) = split_gateway_namespace_path(&path)?;
+    let mut headers = HeaderMap::new();
+    if let Some(request_headers) = request.headers {
+        for header in request_headers {
+            insert_native_header(&mut headers, &header.name, &header.value)?;
+        }
+    }
+    if let Some(request_id) = request.request_id {
+        insert_native_header(&mut headers, X_FREEDOM_REQUEST_ID, &request_id.to_string())?;
+    }
+    if let Some(parent_request_id) = request.parent_request_id {
+        insert_native_header(
+            &mut headers,
+            X_FREEDOM_PARENT_REQUEST_ID,
+            &parent_request_id.to_string(),
+        )?;
+    }
+    if let Some(top_level_path) = request
+        .top_level_path
+        .as_ref()
+        .filter(|top_level_path| !top_level_path.is_empty())
+    {
+        insert_native_header(&mut headers, X_FREEDOM_TOP_LEVEL_PATH, top_level_path)?;
+    }
+    let gateway_request = match namespace {
+        "ipfs" => GatewayCoreRequest::ipfs(path_without_namespace, method, headers),
+        "ipns" => GatewayCoreRequest::ipns(path_without_namespace, method, headers),
+        _ => return None,
+    };
+    Some(ParsedNativeGatewayRequest {
+        request: gateway_request,
+        method_label: method_label.to_ascii_uppercase(),
+        rendered_path,
+        namespace_label: namespace.to_string(),
+        request_id: request.request_id,
+        parent_request_id: request.parent_request_id,
+        top_level_path: request.top_level_path,
+    })
+}
+
+fn normalize_gateway_request_path(path: &str) -> Option<String> {
+    let path = normalize_preload_path(path)?;
+    let end = path.find(['?', '#']).unwrap_or(path.len());
+    let path = &path[..end];
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+fn split_gateway_namespace_path(path: &str) -> Option<(&'static str, String, String)> {
+    if let Some(path) = path.strip_prefix("/ipfs/") {
+        return (!path.is_empty()).then(|| ("ipfs", path.to_string(), format!("/ipfs/{path}")));
+    }
+    if let Some(path) = path.strip_prefix("/ipns/") {
+        return (!path.is_empty()).then(|| ("ipns", path.to_string(), format!("/ipns/{path}")));
+    }
+    None
+}
+
+fn insert_native_header(headers: &mut HeaderMap, name: &str, value: &str) -> Option<()> {
+    let name = HeaderName::from_bytes(name.as_bytes()).ok()?;
+    let value = HeaderValue::from_str(value).ok()?;
+    headers.insert(name, value);
+    Some(())
+}
+
+async fn run_native_gateway_request(
+    core: GatewayCore,
+    request: GatewayCoreRequest,
+    meta: Arc<Mutex<NativeGatewayRequestMeta>>,
+    body_tx: mpsc::Sender<NativeBodyMessage>,
+) {
+    let response = core.handle(request).await;
+    let status = response.status().as_u16();
+    let headers = native_gateway_headers(response.headers());
+    if let Ok(mut meta) = meta.lock() {
+        if !meta.cancelled {
+            meta.response = Some(NativeGatewayResponseMeta { status, headers });
+        }
+    }
+    let mut body = response.into_body().into_data_stream();
+    while let Some(chunk) = body.next().await {
+        match chunk {
+            Ok(chunk) => {
+                if body_tx
+                    .send(NativeBodyMessage::Data(chunk.to_vec()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(err) => {
+                let error = NativeGatewayErrorJson {
+                    code: "body_stream_error".to_string(),
+                    message: err.to_string(),
+                };
+                if let Ok(mut meta) = meta.lock() {
+                    meta.error = Some(error.clone());
+                }
+                let _ = body_tx.send(NativeBodyMessage::Failed(error)).await;
+                return;
+            }
+        }
+    }
+    if let Ok(mut meta) = meta.lock() {
+        if !meta.cancelled && meta.error.is_none() {
+            meta.completed = true;
+        }
+    }
+}
+
+fn native_gateway_headers(headers: &HeaderMap) -> Vec<NativeGatewayHeader> {
+    headers
+        .iter()
+        .map(|(name, value)| NativeGatewayHeader {
+            name: name.as_str().to_string(),
+            value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
+        })
+        .collect()
+}
+
+fn native_gateway_request(
+    node: &FreedomIpfsNode,
+    request_handle: u64,
+) -> Option<Arc<NativeGatewayRequest>> {
+    let requests = node.native_requests.lock().ok()?;
+    requests.get(&request_handle).cloned()
+}
+
+fn native_gateway_read(
+    request: &NativeGatewayRequest,
+    buffer: &mut [u8],
+) -> FreedomIpfsGatewayReadResult {
+    if native_gateway_request_is_cancelled(request) {
+        return gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_CANCELLED, 0);
+    }
+    match drain_native_pending(request, buffer) {
+        Ok(Some(bytes_read)) => {
+            return gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_BYTES, bytes_read);
+        }
+        Ok(None) => {}
+        Err(()) => return gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_FAILED, 0),
+    }
+    let message = {
+        let Ok(mut body_rx) = request.body_rx.lock() else {
+            return gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_FAILED, 0);
+        };
+        body_rx.try_recv()
+    };
+    match message {
+        Ok(NativeBodyMessage::Data(chunk)) => {
+            let bytes_read = copy_native_chunk(request, &chunk, buffer);
+            gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_BYTES, bytes_read)
+        }
+        Ok(NativeBodyMessage::Failed(error)) => {
+            if let Ok(mut meta) = request.meta.lock() {
+                meta.error = Some(error);
+            }
+            gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_FAILED, 0)
+        }
+        Err(mpsc::error::TryRecvError::Empty) => native_gateway_empty_read_status(request),
+        Err(mpsc::error::TryRecvError::Disconnected) => {
+            native_gateway_disconnected_read_status(request)
+        }
+    }
+}
+
+fn drain_native_pending(
+    request: &NativeGatewayRequest,
+    buffer: &mut [u8],
+) -> Result<Option<usize>, ()> {
+    let mut pending = request.pending.lock().map_err(|_| ())?;
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    let bytes_read = pending.len().min(buffer.len());
+    for byte in buffer.iter_mut().take(bytes_read) {
+        if let Some(value) = pending.pop_front() {
+            *byte = value;
+        }
+    }
+    Ok(Some(bytes_read))
+}
+
+fn copy_native_chunk(request: &NativeGatewayRequest, chunk: &[u8], buffer: &mut [u8]) -> usize {
+    let bytes_read = chunk.len().min(buffer.len());
+    buffer[..bytes_read].copy_from_slice(&chunk[..bytes_read]);
+    if bytes_read < chunk.len() {
+        if let Ok(mut pending) = request.pending.lock() {
+            pending.extend(chunk[bytes_read..].iter().copied());
+        }
+    }
+    bytes_read
+}
+
+fn native_gateway_empty_read_status(
+    request: &NativeGatewayRequest,
+) -> FreedomIpfsGatewayReadResult {
+    if native_gateway_request_is_cancelled(request) {
+        gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_CANCELLED, 0)
+    } else if native_gateway_request_has_error(request) {
+        gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_FAILED, 0)
+    } else if native_gateway_request_is_completed(request) {
+        gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_END, 0)
+    } else {
+        gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_PENDING, 0)
+    }
+}
+
+fn native_gateway_disconnected_read_status(
+    request: &NativeGatewayRequest,
+) -> FreedomIpfsGatewayReadResult {
+    if native_gateway_request_is_cancelled(request) {
+        gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_CANCELLED, 0)
+    } else if native_gateway_request_has_error(request) {
+        gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_FAILED, 0)
+    } else {
+        gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_END, 0)
+    }
+}
+
+fn native_gateway_response_json(
+    handle: u64,
+    request: &NativeGatewayRequest,
+) -> NativeGatewayResponseJson {
+    let Ok(meta) = request.meta.lock() else {
+        return NativeGatewayResponseJson {
+            handle,
+            state: "failed".to_string(),
+            method: String::new(),
+            path: String::new(),
+            namespace: String::new(),
+            request_id: None,
+            parent_request_id: None,
+            top_level_path: None,
+            status: None,
+            headers: Vec::new(),
+            completed: false,
+            cancelled: false,
+            error: Some(NativeGatewayErrorJson {
+                code: "metadata_unavailable".to_string(),
+                message: "request metadata is unavailable".to_string(),
+            }),
+        };
+    };
+    let state = if meta.cancelled {
+        "cancelled"
+    } else if meta.error.is_some() {
+        "failed"
+    } else if meta.completed {
+        "completed"
+    } else if meta.response.is_some() {
+        "streaming"
+    } else {
+        "pending"
+    };
+    NativeGatewayResponseJson {
+        handle,
+        state: state.to_string(),
+        method: meta.method.clone(),
+        path: meta.path.clone(),
+        namespace: meta.namespace.clone(),
+        request_id: meta.request_id,
+        parent_request_id: meta.parent_request_id,
+        top_level_path: meta.top_level_path.clone(),
+        status: meta.response.as_ref().map(|response| response.status),
+        headers: meta
+            .response
+            .as_ref()
+            .map(|response| response.headers.clone())
+            .unwrap_or_default(),
+        completed: meta.completed,
+        cancelled: meta.cancelled,
+        error: meta.error.clone(),
+    }
+}
+
+fn native_gateway_invalid_handle_json(handle: u64) -> NativeGatewayResponseJson {
+    NativeGatewayResponseJson {
+        handle,
+        state: "failed".to_string(),
+        method: String::new(),
+        path: String::new(),
+        namespace: String::new(),
+        request_id: None,
+        parent_request_id: None,
+        top_level_path: None,
+        status: None,
+        headers: Vec::new(),
+        completed: false,
+        cancelled: false,
+        error: Some(NativeGatewayErrorJson {
+            code: "invalid_handle".to_string(),
+            message: "native gateway request handle was not found".to_string(),
+        }),
+    }
+}
+
+fn native_gateway_json_string(response: NativeGatewayResponseJson) -> *mut c_char {
+    let json = serde_json::to_string(&response).unwrap_or_else(|_| {
+        "{\"state\":\"failed\",\"error\":{\"code\":\"json_encode_failed\",\"message\":\"failed to encode native gateway response\"}}".to_string()
+    });
+    CString::new(json)
+        .unwrap_or_else(|_| CString::new("{\"state\":\"failed\"}").unwrap())
+        .into_raw()
+}
+
+fn native_gateway_request_is_cancelled(request: &NativeGatewayRequest) -> bool {
+    request
+        .meta
+        .lock()
+        .map(|meta| meta.cancelled)
+        .unwrap_or(true)
+}
+
+fn native_gateway_request_has_error(request: &NativeGatewayRequest) -> bool {
+    request
+        .meta
+        .lock()
+        .map(|meta| meta.error.is_some())
+        .unwrap_or(true)
+}
+
+fn native_gateway_request_is_completed(request: &NativeGatewayRequest) -> bool {
+    request
+        .meta
+        .lock()
+        .map(|meta| meta.completed)
+        .unwrap_or(false)
+}
+
+fn gateway_read_result(status: u32, bytes_read: usize) -> FreedomIpfsGatewayReadResult {
+    FreedomIpfsGatewayReadResult { status, bytes_read }
+}
+
+/// # Safety
+///
 /// `ptr` must be a valid node pointer. `path` must point to a NUL-terminated
 /// UTF-8 path or URI for the duration of this call. Accepted inputs are
 /// `/ipfs/...`, `/ipns/...`, `ipfs://...`, `ipns://...`, or a bare CID. Returns
@@ -1676,6 +2321,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_stop_gateway(ptr: *mut FreedomIpfsNod
 }
 
 fn stop_gateway(node: &FreedomIpfsNode) {
+    stop_native_gateway_requests(node);
     if let Ok(mut gateway_task) = node.gateway_task.lock() {
         if let Some(task) = gateway_task.take() {
             task.abort();
@@ -1684,7 +2330,18 @@ fn stop_gateway(node: &FreedomIpfsNode) {
     if let Ok(mut gateway_addr) = node.gateway_addr.lock() {
         *gateway_addr = None;
     }
+    if let Ok(mut native_gateway) = node.native_gateway.lock() {
+        *native_gateway = cache_only_gateway_core(node.store.clone());
+    }
     clear_online_stats(node);
+}
+
+fn stop_native_gateway_requests(node: &FreedomIpfsNode) {
+    if let Ok(mut requests) = node.native_requests.lock() {
+        for (_, request) in requests.drain() {
+            request.cancel();
+        }
+    }
 }
 
 fn stop_preloads(node: &FreedomIpfsNode) {
@@ -1735,6 +2392,25 @@ fn clear_online_stats(node: &FreedomIpfsNode) {
     }
 }
 
+fn set_native_gateway_core(node: &FreedomIpfsNode, core: GatewayCore) {
+    stop_native_gateway_requests(node);
+    if let Ok(mut native_gateway) = node.native_gateway.lock() {
+        *native_gateway = core;
+    }
+}
+
+fn offline_gateway_core(store: SqliteBlockStore) -> GatewayCore {
+    GatewayCore::new(store)
+}
+
+fn cache_only_gateway_core(store: SqliteBlockStore) -> GatewayCore {
+    let provider: Arc<dyn BlockProvider> = Arc::new(store.clone());
+    let name_resolver: Arc<dyn NameResolver> = Arc::new(
+        freedom_ipfs_gateway::PersistentNameResolver::cache_only(store),
+    );
+    GatewayCore::with_provider_and_name_resolver(provider, name_resolver)
+}
+
 fn normalize_preload_path(path: &str) -> Option<String> {
     let path = path.trim();
     if path.starts_with("/ipfs/") || path.starts_with("/ipns/") {
@@ -1760,6 +2436,7 @@ mod tests {
     use super::*;
     use freedom_ipfs_core::{cid_from_data, parse_car_v1, CODEC_RAW};
     use freedom_ipfs_store::CachedProviderRecord;
+    use serde_json::json;
     use std::io::{Read, Write};
 
     #[test]
@@ -3177,6 +3854,175 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_gateway_request_reads_full_body_and_metadata() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let data = b"native gateway ffi body";
+            let cid = cid_from_data(CODEC_RAW, data);
+            (*node).store.put_block(&cid, data).unwrap();
+            let path = format!("/ipfs/{cid}");
+            let handle = start_native_gateway_request(
+                node,
+                json!({
+                    "method": "GET",
+                    "path": path,
+                    "request_id": 9001,
+                    "parent_request_id": 77,
+                    "top_level_path": "/ipfs/top"
+                }),
+            );
+
+            let metadata = wait_native_gateway_response(node, handle);
+            assert_eq!(metadata["handle"], handle);
+            assert!(
+                metadata["state"] == "streaming" || metadata["state"] == "completed",
+                "{metadata}"
+            );
+            assert_eq!(metadata["status"], 200);
+            assert_eq!(metadata["path"], path);
+            assert_eq!(metadata["namespace"], "ipfs");
+            assert_eq!(metadata["request_id"], 9001);
+            assert_eq!(metadata["parent_request_id"], 77);
+            assert_eq!(metadata["top_level_path"], "/ipfs/top");
+            let content_length = data.len().to_string();
+            assert!(metadata["headers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|header| {
+                    header["name"] == "content-length" && header["value"] == content_length
+                }));
+
+            let body = read_native_gateway_body(node, handle, 4);
+            assert_eq!(body, data);
+            let metadata = native_gateway_response_json(node, handle);
+            assert_eq!(metadata["state"], "completed");
+            assert!(freedom_ipfs_gateway_request_free(node, handle));
+            assert_eq!(
+                freedom_ipfs_gateway_request_read(node, handle, [0u8; 1].as_mut_ptr(), 1).status,
+                FREEDOM_IPFS_GATEWAY_READ_INVALID_HANDLE
+            );
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
+    fn native_gateway_request_supports_head_and_range() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let data = b"0123456789abcdef";
+            let cid = cid_from_data(CODEC_RAW, data);
+            (*node).store.put_block(&cid, data).unwrap();
+            let path = format!("/ipfs/{cid}");
+
+            let head_handle = start_native_gateway_request(
+                node,
+                json!({
+                    "method": "HEAD",
+                    "path": path
+                }),
+            );
+            let head = wait_native_gateway_response(node, head_handle);
+            assert_eq!(head["status"], 200);
+            let content_length = data.len().to_string();
+            assert!(head["headers"].as_array().unwrap().iter().any(|header| {
+                header["name"] == "content-length" && header["value"] == content_length
+            }));
+            assert_eq!(
+                read_native_gateway_status(node, head_handle),
+                FREEDOM_IPFS_GATEWAY_READ_END
+            );
+            assert!(freedom_ipfs_gateway_request_free(node, head_handle));
+
+            let range_handle = start_native_gateway_request(
+                node,
+                json!({
+                    "method": "GET",
+                    "path": path,
+                    "headers": [
+                        { "name": "Range", "value": "bytes=2-5" }
+                    ]
+                }),
+            );
+            let range = wait_native_gateway_response(node, range_handle);
+            assert_eq!(range["status"], 206);
+            assert!(range["headers"].as_array().unwrap().iter().any(|header| {
+                header["name"] == "content-range" && header["value"] == "bytes 2-5/16"
+            }));
+            assert_eq!(read_native_gateway_body(node, range_handle, 2), b"2345");
+            assert!(freedom_ipfs_gateway_request_free(node, range_handle));
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
+    fn native_gateway_request_cancel_and_free_are_safe() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let data = vec![42u8; 512 * 1024];
+            let cid = cid_from_data(CODEC_RAW, &data);
+            (*node).store.put_block(&cid, &data).unwrap();
+            let path = format!("/ipfs/{cid}");
+            let handle = start_native_gateway_request(
+                node,
+                json!({
+                    "method": "GET",
+                    "path": path
+                }),
+            );
+            let _ = wait_native_gateway_response(node, handle);
+            let mut buffer = [0u8; 4096];
+            let first = poll_native_gateway_read(node, handle, &mut buffer);
+            assert_eq!(first.status, FREEDOM_IPFS_GATEWAY_READ_BYTES);
+            assert!(first.bytes_read > 0);
+
+            assert!(freedom_ipfs_gateway_request_cancel(node, handle));
+            assert_eq!(
+                read_native_gateway_status(node, handle),
+                FREEDOM_IPFS_GATEWAY_READ_CANCELLED
+            );
+            let metadata = native_gateway_response_json(node, handle);
+            assert_eq!(metadata["state"], "cancelled");
+            assert!(freedom_ipfs_gateway_request_free(node, handle));
+            assert!(!freedom_ipfs_gateway_request_free(node, handle));
+            assert!(!freedom_ipfs_gateway_request_cancel(node, handle));
+
+            for _ in 0..8 {
+                let handle = start_native_gateway_request(
+                    node,
+                    json!({
+                        "method": "GET",
+                        "path": path
+                    }),
+                );
+                assert!(freedom_ipfs_gateway_request_cancel(node, handle));
+                assert!(freedom_ipfs_gateway_request_free(node, handle));
+            }
+            assert_eq!((*node).native_requests.lock().unwrap().len(), 0);
+
+            let mut buffer = [0u8; 8];
+            assert_eq!(
+                freedom_ipfs_gateway_request_read(node, 987_654, buffer.as_mut_ptr(), buffer.len())
+                    .status,
+                FREEDOM_IPFS_GATEWAY_READ_INVALID_HANDLE
+            );
+            let invalid = native_gateway_response_json(node, 987_654);
+            assert_eq!(invalid["state"], "failed");
+            assert_eq!(invalid["error"]["code"], "invalid_handle");
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
     unsafe fn assert_gateway_health(node: *mut FreedomIpfsNode) {
         let response = gateway_response(node, "/health");
         assert!(response.contains("200 OK"));
@@ -3233,6 +4079,94 @@ mod tests {
         let snapshot = CStr::from_ptr(snapshot_ptr).to_str().unwrap().to_string();
         freedom_ipfs_string_free(snapshot_ptr);
         snapshot
+    }
+
+    unsafe fn start_native_gateway_request(
+        node: *mut FreedomIpfsNode,
+        request: serde_json::Value,
+    ) -> u64 {
+        let request = CString::new(request.to_string()).unwrap();
+        let handle = freedom_ipfs_gateway_request_start(node, request.as_ptr());
+        assert!(handle > 0);
+        handle
+    }
+
+    unsafe fn native_gateway_response_json(
+        node: *mut FreedomIpfsNode,
+        handle: u64,
+    ) -> serde_json::Value {
+        let metadata_ptr = freedom_ipfs_gateway_request_response_json(node, handle);
+        assert!(!metadata_ptr.is_null());
+        let metadata = CStr::from_ptr(metadata_ptr).to_str().unwrap().to_string();
+        freedom_ipfs_string_free(metadata_ptr);
+        serde_json::from_str(&metadata).unwrap()
+    }
+
+    unsafe fn wait_native_gateway_response(
+        node: *mut FreedomIpfsNode,
+        handle: u64,
+    ) -> serde_json::Value {
+        for _ in 0..1_000 {
+            let metadata = native_gateway_response_json(node, handle);
+            if metadata["state"] != "pending" {
+                return metadata;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("native gateway response metadata did not become ready");
+    }
+
+    unsafe fn read_native_gateway_body(
+        node: *mut FreedomIpfsNode,
+        handle: u64,
+        buffer_len: usize,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut buffer = vec![0u8; buffer_len];
+        for _ in 0..5_000 {
+            let result =
+                freedom_ipfs_gateway_request_read(node, handle, buffer.as_mut_ptr(), buffer.len());
+            match result.status {
+                FREEDOM_IPFS_GATEWAY_READ_BYTES => {
+                    body.extend_from_slice(&buffer[..result.bytes_read]);
+                }
+                FREEDOM_IPFS_GATEWAY_READ_END => return body,
+                FREEDOM_IPFS_GATEWAY_READ_PENDING => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                status => panic!("unexpected native gateway read status {status}"),
+            }
+        }
+        panic!("native gateway body did not finish");
+    }
+
+    unsafe fn read_native_gateway_status(node: *mut FreedomIpfsNode, handle: u64) -> u32 {
+        let mut buffer = [0u8; 8];
+        for _ in 0..1_000 {
+            let result =
+                freedom_ipfs_gateway_request_read(node, handle, buffer.as_mut_ptr(), buffer.len());
+            if result.status != FREEDOM_IPFS_GATEWAY_READ_PENDING {
+                return result.status;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("native gateway read did not leave pending state");
+    }
+
+    unsafe fn poll_native_gateway_read(
+        node: *mut FreedomIpfsNode,
+        handle: u64,
+        buffer: &mut [u8],
+    ) -> FreedomIpfsGatewayReadResult {
+        for _ in 0..1_000 {
+            let result =
+                freedom_ipfs_gateway_request_read(node, handle, buffer.as_mut_ptr(), buffer.len());
+            if result.status != FREEDOM_IPFS_GATEWAY_READ_PENDING {
+                return result;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("native gateway read did not produce a non-pending status");
     }
 
     fn progress_fields(
