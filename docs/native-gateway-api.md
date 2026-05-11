@@ -224,6 +224,12 @@ passed to `freedom_ipfs_gateway_request_free`.
 - `cancelled`: caller cancelled the request
 - `failed`: handle/request failed; see `error.code` and `error.message`
 
+`completed` means Rust has finished producing the body into the internal
+bounded request channel. It does not mean the Swift caller has consumed all
+bytes. A WebKit adapter should call `WKURLSchemeTask.didFinish()` only after
+`freedom_ipfs_gateway_request_read` returns
+`FREEDOM_IPFS_GATEWAY_READ_END`.
+
 The returned JSON string uses the existing `freedom_ipfs_string_free`
 ownership rule.
 

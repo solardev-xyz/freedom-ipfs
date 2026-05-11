@@ -75,9 +75,8 @@ pub struct FreedomIpfsNode {
     lifecycle_state: Mutex<LifecycleState>,
     next_preload_id: AtomicU64,
     preload_tasks: Mutex<HashMap<u64, JoinHandle<()>>>,
-    native_gateway: Mutex<GatewayCore>,
+    native_gateway_state: Mutex<NativeGatewayState>,
     next_native_request_id: AtomicU64,
-    native_requests: Mutex<HashMap<u64, Arc<NativeGatewayRequest>>>,
 }
 
 #[repr(C)]
@@ -129,6 +128,11 @@ pub struct FreedomIpfsDiagnostics {
     pub active_preload_count: u64,
     pub gateway_running: u64,
     pub lifecycle_background: u64,
+}
+
+struct NativeGatewayState {
+    core: GatewayCore,
+    requests: HashMap<u64, Arc<NativeGatewayRequest>>,
 }
 
 struct NativeGatewayRequest {
@@ -967,9 +971,11 @@ fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
         lifecycle_state: Mutex::new(LifecycleState::Foreground),
         next_preload_id: AtomicU64::new(1),
         preload_tasks: Mutex::new(HashMap::new()),
-        native_gateway: Mutex::new(native_gateway),
+        native_gateway_state: Mutex::new(NativeGatewayState {
+            core: native_gateway,
+            requests: HashMap::new(),
+        }),
         next_native_request_id: AtomicU64::new(1),
-        native_requests: Mutex::new(HashMap::new()),
     }))
 }
 
@@ -1721,15 +1727,15 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_start(
         Some(parsed) => parsed,
         None => return 0,
     };
-    let core = match node.native_gateway.lock() {
-        Ok(core) => core.clone(),
-        Err(_) => return 0,
-    };
     let handle = node.next_native_request_id.fetch_add(1, Ordering::Relaxed);
     if handle == 0 {
         return 0;
     }
     let (body_tx, body_rx) = mpsc::channel(NATIVE_BODY_CHANNEL_CAPACITY);
+    let Ok(mut native_state) = node.native_gateway_state.lock() else {
+        return 0;
+    };
+    let core = native_state.core.clone();
     let meta = Arc::new(Mutex::new(NativeGatewayRequestMeta {
         method: parsed.method_label,
         path: parsed.rendered_path,
@@ -1752,11 +1758,7 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_start(
         pending: Mutex::new(VecDeque::new()),
         task: Mutex::new(Some(task)),
     });
-    let Ok(mut requests) = node.native_requests.lock() else {
-        request.cancel();
-        return 0;
-    };
-    requests.insert(handle, request);
+    native_state.requests.insert(handle, request);
     handle
 }
 
@@ -1837,10 +1839,10 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_free(
         return false;
     }
     let node = &*ptr;
-    let Ok(mut requests) = node.native_requests.lock() else {
+    let Ok(mut native_state) = node.native_gateway_state.lock() else {
         return false;
     };
-    let Some(request) = requests.remove(&request_handle) else {
+    let Some(request) = native_state.requests.remove(&request_handle) else {
         return false;
     };
     request.cancel();
@@ -1990,8 +1992,8 @@ fn native_gateway_request(
     node: &FreedomIpfsNode,
     request_handle: u64,
 ) -> Option<Arc<NativeGatewayRequest>> {
-    let requests = node.native_requests.lock().ok()?;
-    requests.get(&request_handle).cloned()
+    let native_state = node.native_gateway_state.lock().ok()?;
+    native_state.requests.get(&request_handle).cloned()
 }
 
 fn native_gateway_read(
@@ -2330,17 +2332,22 @@ fn stop_gateway(node: &FreedomIpfsNode) {
     if let Ok(mut gateway_addr) = node.gateway_addr.lock() {
         *gateway_addr = None;
     }
-    if let Ok(mut native_gateway) = node.native_gateway.lock() {
-        *native_gateway = cache_only_gateway_core(node.store.clone());
-    }
+    set_native_gateway_core(node, cache_only_gateway_core(node.store.clone()));
     clear_online_stats(node);
 }
 
 fn stop_native_gateway_requests(node: &FreedomIpfsNode) {
-    if let Ok(mut requests) = node.native_requests.lock() {
-        for (_, request) in requests.drain() {
-            request.cancel();
-        }
+    let requests = if let Ok(mut native_state) = node.native_gateway_state.lock() {
+        native_state
+            .requests
+            .drain()
+            .map(|(_, request)| request)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for request in requests {
+        request.cancel();
     }
 }
 
@@ -2393,9 +2400,19 @@ fn clear_online_stats(node: &FreedomIpfsNode) {
 }
 
 fn set_native_gateway_core(node: &FreedomIpfsNode, core: GatewayCore) {
-    stop_native_gateway_requests(node);
-    if let Ok(mut native_gateway) = node.native_gateway.lock() {
-        *native_gateway = core;
+    let requests = if let Ok(mut native_state) = node.native_gateway_state.lock() {
+        let requests = native_state
+            .requests
+            .drain()
+            .map(|(_, request)| request)
+            .collect();
+        native_state.core = core;
+        requests
+    } else {
+        Vec::new()
+    };
+    for request in requests {
+        request.cancel();
     }
 }
 
@@ -4007,7 +4024,10 @@ mod tests {
                 assert!(freedom_ipfs_gateway_request_cancel(node, handle));
                 assert!(freedom_ipfs_gateway_request_free(node, handle));
             }
-            assert_eq!((*node).native_requests.lock().unwrap().len(), 0);
+            assert_eq!(
+                (*node).native_gateway_state.lock().unwrap().requests.len(),
+                0
+            );
 
             let mut buffer = [0u8; 8];
             assert_eq!(
@@ -4018,6 +4038,44 @@ mod tests {
             let invalid = native_gateway_response_json(node, 987_654);
             assert_eq!(invalid["state"], "failed");
             assert_eq!(invalid["error"]["code"], "invalid_handle");
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
+    fn native_gateway_stop_cancels_registered_requests() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let data = vec![7u8; 512 * 1024];
+            let cid = cid_from_data(CODEC_RAW, &data);
+            (*node).store.put_block(&cid, &data).unwrap();
+            let handle = start_native_gateway_request(
+                node,
+                json!({
+                    "method": "GET",
+                    "path": format!("/ipfs/{cid}")
+                }),
+            );
+            let _ = wait_native_gateway_response(node, handle);
+            assert_eq!(
+                (*node).native_gateway_state.lock().unwrap().requests.len(),
+                1
+            );
+
+            assert!(freedom_ipfs_node_stop_gateway(node));
+            assert_eq!(
+                (*node).native_gateway_state.lock().unwrap().requests.len(),
+                0
+            );
+            let mut buffer = [0u8; 8];
+            assert_eq!(
+                freedom_ipfs_gateway_request_read(node, handle, buffer.as_mut_ptr(), buffer.len())
+                    .status,
+                FREEDOM_IPFS_GATEWAY_READ_INVALID_HANDLE
+            );
 
             freedom_ipfs_node_free(node);
         }
