@@ -104,6 +104,10 @@ maximum chunk size, maximum bytes buffered by the harness adapter, and
 completion/cancellation flags. Case summaries aggregate those stream metrics so
 `rust-native` can be checked for incremental behavior without reading every
 individual result row.
+The harness still retains response bodies when needed for corpus validation,
+hashing, previews, or asset discovery; `stream.max_buffered_bytes` is the
+largest per-read adapter buffer/chunk, while `body_bytes` is the retained
+validation body size.
 
 When testing local gateway or retrieval changes, pass `--build-gateway` so the
 harness runs `cargo build -p freedom-ipfs-gateway` before spawning the default

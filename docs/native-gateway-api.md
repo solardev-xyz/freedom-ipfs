@@ -119,6 +119,12 @@ Case summaries aggregate root/asset first-byte, chunk-count, and max-buffered
 metrics so `rust-native` and `rust-http` can be compared without manually
 inspecting individual rows.
 
+`body_bytes` still reports the full body retained by the harness for corpus
+validation, hashing, asset discovery, and previews. `stream.max_buffered_bytes`
+tracks the largest per-read adapter buffer/chunk observed while consuming the
+body incrementally; it is the signal that native mode is not waiting for a
+whole-body `to_bytes` collection before observing body data.
+
 ## Current Boundaries
 
 - The native harness path is Linux/Rust testable and does not require iOS or
