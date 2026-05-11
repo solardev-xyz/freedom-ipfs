@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use axum::body::to_bytes;
+use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use freedom_ipfs_gateway::{
     GatewayConfig, GatewayCore, GatewayCoreRequest, GatewayHtmlDirectoryPrefetchConfig,
@@ -15,6 +15,7 @@ use freedom_ipfs_routing::{
     ProviderRoutingClient, DEFAULT_DELEGATED_ROUTER,
 };
 use freedom_ipfs_store::SqliteBlockStore;
+use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use reqwest::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
@@ -67,6 +68,8 @@ const HTML_RANGE_WARM_MAX_BYTES_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_RANGE_WAR
 const HTML_RANGE_WARM_CONCURRENCY_ENV: &str = "FREEDOM_IPFS_GATEWAY_HTML_RANGE_WARM_CONCURRENCY";
 const RAW_LINK_TSIZE_FAST_HEADERS_ENV: &str = "FREEDOM_IPFS_ENABLE_RAW_LINK_TSIZE_FAST_HEADERS";
 const STREAM_SMALL_BODIES_ENV: &str = "FREEDOM_IPFS_GATEWAY_STREAM_SMALL_BODIES";
+const DEFAULT_NATIVE_TRACE_FILTER: &str =
+    "freedom_ipfs_gateway=info,freedom_ipfs_retrieval=info,freedom_ipfs_namesys=info,freedom_ipfs_routing=info,warn";
 
 static NEXT_HARNESS_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -735,8 +738,8 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
     if !args.engine.is_rust() && args.gateway_db.is_some() {
         bail!("--gateway-db only applies to Rust engines");
     }
-    if args.engine != HarnessEngine::RustHttp && args.trace_output.is_some() {
-        bail!("--trace-output is currently only supported for --engine rust-http");
+    if !args.engine.is_rust() && args.trace_output.is_some() {
+        bail!("--trace-output is only supported for Rust engines");
     }
     if !args.require_request_classifications.is_empty() && args.trace_output.is_none() {
         bail!("--require-request-classification requires --trace-output");
@@ -759,9 +762,6 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
                 seed_car.display()
             );
         }
-    }
-    if args.engine == HarnessEngine::RustNative {
-        return run_native_harness(args, corpus).await;
     }
     if args.build_gateway {
         build_default_rust_gateway().await?;
@@ -787,6 +787,9 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
                 }
             }
         }
+    }
+    if args.engine == HarnessEngine::RustNative {
+        return run_native_harness(args, corpus).await;
     }
 
     let timeout = Duration::from_secs(args.timeout_secs);
@@ -985,6 +988,7 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
 }
 
 async fn run_native_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
+    init_native_trace_output(args)?;
     let run_timeout =
         (args.run_timeout_secs > 0).then(|| Duration::from_secs(args.run_timeout_secs));
     let measured_runs = args.repeat.max(1);
@@ -1093,7 +1097,11 @@ async fn run_native_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
     }
 
     let summary = RepeatSummary::from_runs(&runs);
-    let trace_summary = None;
+    let trace_summary = args
+        .trace_output
+        .as_ref()
+        .map(summarize_trace_output)
+        .transpose()?;
     let trace_requirements = trace_requirements_report(trace_summary.as_ref(), args)?;
     Ok(RunReport {
         gateway_url: persistent_gateway_url,
@@ -1120,8 +1128,11 @@ async fn run_native_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             .map(|path| path.display().to_string()),
         bitswap_seed_connection_setup: bitswap_seed_connection_setup(args),
         kubo_repo: None,
-        trace_output: None,
-        trace_span_list: None,
+        trace_output: args
+            .trace_output
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        trace_span_list: args.trace_output.as_ref().map(|_| args.trace_span_list),
         trace_summary,
         trace_requirements,
         summary,
@@ -1181,6 +1192,44 @@ async fn run_corpus_once_with_client(
         bail!("no corpus entries matched the requested case filters");
     }
     Ok(results)
+}
+
+#[derive(Clone)]
+struct HarnessTraceFileWriter(Arc<std::fs::File>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for HarnessTraceFileWriter {
+    type Writer = &'a std::fs::File;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.0.as_ref()
+    }
+}
+
+fn init_native_trace_output(args: &Args) -> Result<()> {
+    let Some(trace_output) = args.trace_output.as_deref() else {
+        return Ok(());
+    };
+    let filter = if let Some(trace_filter) = args.trace_filter.as_deref() {
+        tracing_subscriber::EnvFilter::try_new(trace_filter)
+            .with_context(|| format!("parse trace filter {trace_filter:?}"))?
+    } else {
+        tracing_subscriber::EnvFilter::new(DEFAULT_NATIVE_TRACE_FILTER)
+    };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(trace_output)
+        .with_context(|| format!("open native trace output {}", trace_output.display()))?;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .json()
+        .flatten_event(true)
+        .with_current_span(true)
+        .with_span_list(args.trace_span_list)
+        .with_writer(HarnessTraceFileWriter(Arc::new(file)))
+        .try_init()
+        .map_err(|err| anyhow!("initialize native trace subscriber: {err}"))?;
+    Ok(())
 }
 
 fn run_timeout_failure_results(
@@ -1398,6 +1447,7 @@ async fn run_case(
         body_bytes: response.body.len(),
         ttfb_ms: response.ttfb_ms,
         total_ms: response.total_ms,
+        stream: response.stream,
         body_preview,
         revalidation,
         asset_summary,
@@ -1482,15 +1532,21 @@ fn print_summary(report: &RunReport) {
 
     for case in &report.summary.cases {
         println!(
-            "case {}: passed={} failed={} pass_rate={:.1}% root_ttfb={} root_total={} asset_ttfb={} asset_total={}",
+            "case {}: passed={} failed={} pass_rate={:.1}% root_ttfb={} root_total={} root_stream_first_byte={} root_stream_chunks={} root_stream_max_buffered={} asset_ttfb={} asset_total={} asset_stream_first_byte={} asset_stream_chunks={} asset_stream_max_buffered={}",
             case.id,
             case.pass_count,
             case.fail_count,
             case.pass_rate * 100.0,
             case.root_ttfb_ms,
             case.root_total_ms,
+            case.root_stream_first_byte_ms,
+            case.root_stream_chunks,
+            case.root_stream_max_buffered_bytes,
             case.asset_ttfb_ms,
-            case.asset_total_ms
+            case.asset_total_ms,
+            case.asset_stream_first_byte_ms,
+            case.asset_stream_chunks,
+            case.asset_stream_max_buffered_bytes
         );
         if !case.asset_kind_failures.is_empty() {
             let failures = case
@@ -3316,6 +3372,18 @@ fn print_trace_connection_backoff(trace: &TraceSummary) {
     );
 }
 
+fn format_stream_metrics(stream: FetchStreamMetrics) -> String {
+    format!(
+        "chunks={} first_byte={} max_chunk={} max_buffered={} completed={} cancelled={}",
+        stream.chunk_count,
+        display_option_ms(stream.first_byte_ms),
+        stream.max_chunk_bytes,
+        stream.max_buffered_bytes,
+        stream.completed,
+        stream.cancelled
+    )
+}
+
 fn display_option_ms(value: Option<u128>) -> String {
     value
         .map(|value| format!("{value}ms"))
@@ -3359,7 +3427,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn print_case_result(result: &CaseResult) {
     let mark = if result.passed { "PASS" } else { "FAIL" };
     println!(
-        "{mark} {:32} status={} type={} content_length={} accept_ranges={} bytes={} ttfb={}ms total={}ms etag={} cache_control={}",
+        "{mark} {:32} status={} type={} content_length={} accept_ranges={} bytes={} ttfb={}ms total={}ms stream=[{}] etag={} cache_control={}",
         result.id,
         result
             .status
@@ -3374,6 +3442,7 @@ fn print_case_result(result: &CaseResult) {
         result.body_bytes,
         result.ttfb_ms,
         result.total_ms,
+        format_stream_metrics(result.stream),
         result.etag.as_deref().unwrap_or("-"),
         result.cache_control.as_deref().unwrap_or("-")
     );
@@ -3396,7 +3465,7 @@ fn print_case_result(result: &CaseResult) {
         );
         for asset in result.assets.iter().filter(|asset| !asset.passed).take(8) {
             println!(
-                "    - {} {} status={} type={} bytes={} total={}ms",
+                "    - {} {} status={} type={} bytes={} total={}ms stream=[{}]",
                 asset.kind,
                 asset.url,
                 asset
@@ -3405,7 +3474,8 @@ fn print_case_result(result: &CaseResult) {
                     .unwrap_or_else(|| "-".to_string()),
                 asset.content_type.as_deref().unwrap_or("-"),
                 asset.body_bytes,
-                asset.total_ms
+                asset.total_ms,
+                format_stream_metrics(asset.stream)
             );
             for failure in &asset.failures {
                 println!("      - {failure}");
@@ -3420,7 +3490,7 @@ fn print_case_result(result: &CaseResult) {
 fn print_revalidation_result(prefix: &str, result: &RevalidationResult) {
     let mark = if result.passed { "PASS" } else { "FAIL" };
     println!(
-        "{prefix}: {mark} status={} bytes={} ttfb={}ms total={}ms etag={} cache_control={}",
+        "{prefix}: {mark} status={} bytes={} ttfb={}ms total={}ms stream=[{}] etag={} cache_control={}",
         result
             .status
             .map(|status| status.to_string())
@@ -3428,6 +3498,7 @@ fn print_revalidation_result(prefix: &str, result: &RevalidationResult) {
         result.body_bytes,
         result.ttfb_ms,
         result.total_ms,
+        format_stream_metrics(result.stream),
         result.etag.as_deref().unwrap_or("-"),
         result.cache_control.as_deref().unwrap_or("-")
     );
@@ -3611,16 +3682,57 @@ impl NativeGateway {
         let ttfb_ms = started.elapsed().as_millis();
         let status = response.status();
         let headers = response.headers().clone();
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .map_err(|err| format!("body error: {err}"))?
-            .to_vec();
+        let (body, stream) =
+            collect_body_stream(response.into_body().into_data_stream(), started, None).await?;
         Ok(fetch_response_from_parts(
             status,
             &headers,
             body,
             ttfb_ms,
             started.elapsed().as_millis(),
+            stream,
+        ))
+    }
+
+    #[cfg(test)]
+    async fn fetch_response_and_drop_after_chunks(
+        &self,
+        url: &str,
+        method: &str,
+        range: Option<&str>,
+        max_chunks: usize,
+    ) -> std::result::Result<FetchResponse, String> {
+        let started = Instant::now();
+        let method = gateway_method(method)?;
+        let (namespace, path) = native_gateway_url_path(url)?;
+        let mut headers = HeaderMap::new();
+        if let Some(range) = range {
+            headers.insert(
+                RANGE,
+                HeaderValue::from_str(range).map_err(|err| err.to_string())?,
+            );
+        }
+        let request = match namespace {
+            NativeGatewayNamespace::Ipfs => GatewayCoreRequest::ipfs(path, method, headers),
+            NativeGatewayNamespace::Ipns => GatewayCoreRequest::ipns(path, method, headers),
+        };
+        let response = self.core.handle(request).await;
+        let ttfb_ms = started.elapsed().as_millis();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let (body, stream) = collect_body_stream(
+            response.into_body().into_data_stream(),
+            started,
+            Some(max_chunks),
+        )
+        .await?;
+        Ok(fetch_response_from_parts(
+            status,
+            &headers,
+            body,
+            ttfb_ms,
+            started.elapsed().as_millis(),
+            stream,
         ))
     }
 
@@ -3751,16 +3863,42 @@ async fn fetch_http_response(
     let ttfb_ms = started.elapsed().as_millis();
     let status = response.status();
     let headers = response.headers().clone();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|err| format!("body error: {err}"))?
-        .to_vec();
+    let (body, stream) = collect_body_stream(response.bytes_stream(), started, None).await?;
     let total_ms = started.elapsed().as_millis();
 
     Ok(fetch_response_from_parts(
-        status, &headers, body, ttfb_ms, total_ms,
+        status, &headers, body, ttfb_ms, total_ms, stream,
     ))
+}
+
+async fn collect_body_stream<S, E>(
+    stream: S,
+    started: Instant,
+    stop_after_chunks: Option<usize>,
+) -> std::result::Result<(Vec<u8>, FetchStreamMetrics), String>
+where
+    S: futures::Stream<Item = std::result::Result<Bytes, E>>,
+    E: std::fmt::Display,
+{
+    let mut stream = Box::pin(stream);
+    let mut body = Vec::new();
+    let mut metrics = FetchStreamMetrics::default();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| format!("body error: {err}"))?;
+        if metrics.chunk_count == 0 {
+            metrics.first_byte_ms = Some(started.elapsed().as_millis());
+        }
+        metrics.chunk_count += 1;
+        metrics.max_chunk_bytes = metrics.max_chunk_bytes.max(chunk.len());
+        metrics.max_buffered_bytes = metrics.max_buffered_bytes.max(chunk.len());
+        body.extend_from_slice(&chunk);
+        if stop_after_chunks.is_some_and(|limit| metrics.chunk_count >= limit) {
+            metrics.cancelled = true;
+            return Ok((body, metrics));
+        }
+    }
+    metrics.completed = true;
+    Ok((body, metrics))
 }
 
 fn fetch_response_from_parts(
@@ -3769,6 +3907,7 @@ fn fetch_response_from_parts(
     body: Vec<u8>,
     ttfb_ms: u128,
     total_ms: u128,
+    stream: FetchStreamMetrics,
 ) -> FetchResponse {
     FetchResponse {
         status: status.as_u16(),
@@ -3782,6 +3921,7 @@ fn fetch_response_from_parts(
         body,
         ttfb_ms,
         total_ms,
+        stream,
     }
 }
 
@@ -3961,6 +4101,7 @@ async fn maybe_revalidate_response(
             body_bytes: 0,
             ttfb_ms: 0,
             total_ms: 0,
+            stream: FetchStreamMetrics::default(),
             passed: false,
             failures: vec!["response omitted ETag".to_string()],
         });
@@ -3989,6 +4130,7 @@ async fn fetch_revalidation(
                 body_bytes: 0,
                 ttfb_ms: started.elapsed().as_millis(),
                 total_ms: started.elapsed().as_millis(),
+                stream: FetchStreamMetrics::default(),
                 passed: false,
                 failures: vec![format!("request error: {err}")],
             };
@@ -4014,6 +4156,7 @@ async fn fetch_revalidation(
         body_bytes: response.body.len(),
         ttfb_ms: response.ttfb_ms,
         total_ms,
+        stream: response.stream,
         passed: failures.is_empty(),
         failures,
     }
@@ -4174,6 +4317,7 @@ async fn fetch_asset(
         body_bytes: 0,
         ttfb_ms: 0,
         total_ms: 0,
+        stream: FetchStreamMetrics::default(),
         body_preview: String::new(),
         revalidation: None,
         passed: false,
@@ -4201,6 +4345,7 @@ async fn fetch_asset(
     result.body_bytes = response.body.len();
     result.ttfb_ms = response.ttfb_ms;
     result.total_ms = response.total_ms;
+    result.stream = response.stream;
     result.body_preview =
         String::from_utf8_lossy(&response.body.iter().copied().take(180).collect::<Vec<_>>())
             .replace('\n', "\\n");
@@ -6650,8 +6795,14 @@ struct CaseAggregate {
     pass_rate: f64,
     root_ttfb_ms: LatencySummary,
     root_total_ms: LatencySummary,
+    root_stream_first_byte_ms: LatencySummary,
+    root_stream_chunks: ResourceSummary,
+    root_stream_max_buffered_bytes: ResourceSummary,
     asset_ttfb_ms: LatencySummary,
     asset_total_ms: LatencySummary,
+    asset_stream_first_byte_ms: LatencySummary,
+    asset_stream_chunks: ResourceSummary,
+    asset_stream_max_buffered_bytes: ResourceSummary,
     root_revalidation_attempts: usize,
     root_revalidation_passed: usize,
     root_revalidation_failed: usize,
@@ -6670,8 +6821,14 @@ impl CaseAggregate {
         let mut pass_count = 0usize;
         let mut root_ttfb = Vec::new();
         let mut root_total = Vec::new();
+        let mut root_stream_first_byte = Vec::new();
+        let mut root_stream_chunks = Vec::new();
+        let mut root_stream_max_buffered_bytes = Vec::new();
         let mut asset_ttfb = Vec::new();
         let mut asset_total = Vec::new();
+        let mut asset_stream_first_byte = Vec::new();
+        let mut asset_stream_chunks = Vec::new();
+        let mut asset_stream_max_buffered_bytes = Vec::new();
         let mut root_revalidation_attempts = 0usize;
         let mut root_revalidation_passed = 0usize;
         let mut root_revalidation_ttfb = Vec::new();
@@ -6691,6 +6848,15 @@ impl CaseAggregate {
             }
             root_ttfb.push(result.ttfb_ms);
             root_total.push(result.total_ms);
+            if let Some(first_byte_ms) = result.stream.first_byte_ms {
+                root_stream_first_byte.push(first_byte_ms);
+            }
+            if let Ok(chunk_count) = u64::try_from(result.stream.chunk_count) {
+                root_stream_chunks.push(chunk_count);
+            }
+            if let Ok(max_buffered) = u64::try_from(result.stream.max_buffered_bytes) {
+                root_stream_max_buffered_bytes.push(max_buffered);
+            }
             if let Some(revalidation) = &result.revalidation {
                 root_revalidation_attempts += 1;
                 if revalidation.passed {
@@ -6710,6 +6876,15 @@ impl CaseAggregate {
             for asset in &result.assets {
                 asset_ttfb.push(asset.ttfb_ms);
                 asset_total.push(asset.total_ms);
+                if let Some(first_byte_ms) = asset.stream.first_byte_ms {
+                    asset_stream_first_byte.push(first_byte_ms);
+                }
+                if let Ok(chunk_count) = u64::try_from(asset.stream.chunk_count) {
+                    asset_stream_chunks.push(chunk_count);
+                }
+                if let Ok(max_buffered) = u64::try_from(asset.stream.max_buffered_bytes) {
+                    asset_stream_max_buffered_bytes.push(max_buffered);
+                }
                 if let Some(revalidation) = &asset.revalidation {
                     asset_revalidation_attempts += 1;
                     if revalidation.passed {
@@ -6768,8 +6943,18 @@ impl CaseAggregate {
             pass_rate: rate(pass_count, run_count),
             root_ttfb_ms: LatencySummary::from_values(root_ttfb),
             root_total_ms: LatencySummary::from_values(root_total),
+            root_stream_first_byte_ms: LatencySummary::from_values(root_stream_first_byte),
+            root_stream_chunks: ResourceSummary::from_values(root_stream_chunks),
+            root_stream_max_buffered_bytes: ResourceSummary::from_values(
+                root_stream_max_buffered_bytes,
+            ),
             asset_ttfb_ms: LatencySummary::from_values(asset_ttfb),
             asset_total_ms: LatencySummary::from_values(asset_total),
+            asset_stream_first_byte_ms: LatencySummary::from_values(asset_stream_first_byte),
+            asset_stream_chunks: ResourceSummary::from_values(asset_stream_chunks),
+            asset_stream_max_buffered_bytes: ResourceSummary::from_values(
+                asset_stream_max_buffered_bytes,
+            ),
             root_revalidation_attempts,
             root_revalidation_passed,
             root_revalidation_failed: root_revalidation_attempts
@@ -12308,6 +12493,7 @@ struct CaseResult {
     body_bytes: usize,
     ttfb_ms: u128,
     total_ms: u128,
+    stream: FetchStreamMetrics,
     body_preview: String,
     revalidation: Option<RevalidationResult>,
     asset_summary: Option<AssetSummary>,
@@ -12333,6 +12519,7 @@ impl CaseResult {
             body_bytes: 0,
             ttfb_ms: 0,
             total_ms: 0,
+            stream: FetchStreamMetrics::default(),
             body_preview: String::new(),
             revalidation: None,
             asset_summary: None,
@@ -12341,6 +12528,16 @@ impl CaseResult {
             failures,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+struct FetchStreamMetrics {
+    chunk_count: usize,
+    max_chunk_bytes: usize,
+    max_buffered_bytes: usize,
+    first_byte_ms: Option<u128>,
+    completed: bool,
+    cancelled: bool,
 }
 
 struct FetchResponse {
@@ -12354,6 +12551,7 @@ struct FetchResponse {
     body: Vec<u8>,
     ttfb_ms: u128,
     total_ms: u128,
+    stream: FetchStreamMetrics,
 }
 
 #[derive(Debug, Serialize)]
@@ -12364,6 +12562,7 @@ struct RevalidationResult {
     body_bytes: usize,
     ttfb_ms: u128,
     total_ms: u128,
+    stream: FetchStreamMetrics,
     passed: bool,
     failures: Vec<String>,
 }
@@ -12423,6 +12622,7 @@ struct AssetResult {
     body_bytes: usize,
     ttfb_ms: u128,
     total_ms: u128,
+    stream: FetchStreamMetrics,
     body_preview: String,
     revalidation: Option<RevalidationResult>,
     passed: bool,
@@ -12467,6 +12667,10 @@ impl ParsedTag {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freedom_ipfs_core::{
+        cid_from_data, Block, BlockProvider, CoreError, Result as CoreResult, CODEC_RAW,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     #[test]
     fn gateway_specific_header_expectations_apply_only_to_rust() {
@@ -15216,6 +15420,7 @@ mod tests {
             body_bytes: 0,
             ttfb_ms: 3,
             total_ms: 3,
+            stream: FetchStreamMetrics::default(),
             passed: true,
             failures: Vec::new(),
         });
@@ -15233,6 +15438,7 @@ mod tests {
             body_bytes: 128,
             ttfb_ms: 5,
             total_ms: 6,
+            stream: FetchStreamMetrics::default(),
             body_preview: String::new(),
             revalidation: Some(RevalidationResult {
                 status: Some(200),
@@ -15241,6 +15447,7 @@ mod tests {
                 body_bytes: 128,
                 ttfb_ms: 4,
                 total_ms: 5,
+                stream: FetchStreamMetrics::default(),
                 passed: false,
                 failures: vec!["status 200, expected 304".to_string()],
             }),
@@ -15280,6 +15487,7 @@ mod tests {
             body: b"hello".to_vec(),
             ttfb_ms: 1,
             total_ms: 1,
+            stream: FetchStreamMetrics::default(),
         };
 
         let revalidation = maybe_revalidate_response(
@@ -15435,6 +15643,74 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn collect_body_stream_records_incremental_metrics() {
+        let chunks = vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"abc")),
+            Ok(Bytes::from_static(b"defgh")),
+        ];
+        let (body, metrics) =
+            collect_body_stream(futures::stream::iter(chunks), Instant::now(), None)
+                .await
+                .unwrap();
+
+        assert_eq!(body, b"abcdefgh");
+        assert_eq!(metrics.chunk_count, 2);
+        assert_eq!(metrics.max_chunk_bytes, 5);
+        assert_eq!(metrics.max_buffered_bytes, 5);
+        assert!(metrics.first_byte_ms.is_some());
+        assert!(metrics.completed);
+        assert!(!metrics.cancelled);
+    }
+
+    #[tokio::test]
+    async fn native_gateway_fetch_can_drop_after_first_stream_chunk() {
+        let stream_chunk_bytes = 64 * 1024usize;
+        let len = stream_chunk_bytes * 3;
+        let data = (0..len)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let cid = cid_from_data(CODEC_RAW, &data);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(CountingBlockProvider {
+            cid,
+            data,
+            calls: calls.clone(),
+        });
+        let native = NativeGateway {
+            core: GatewayCore::with_provider(provider),
+            storage_path: None,
+            remove_storage_on_stop: false,
+        };
+        let range_end = stream_chunk_bytes * 2 + 9;
+        let response = native
+            .fetch_response_and_drop_after_chunks(
+                &format!("http://freedom-ipfs-native.local/ipfs/{cid}"),
+                "GET",
+                Some(&format!("bytes=0-{range_end}")),
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, StatusCode::PARTIAL_CONTENT.as_u16());
+        assert_eq!(response.stream.chunk_count, 1);
+        assert_eq!(response.body.len(), response.stream.max_chunk_bytes);
+        assert!(response.body.len() <= stream_chunk_bytes);
+        assert!(response.stream.first_byte_ms.is_some());
+        assert!(response.stream.cancelled);
+        assert!(!response.stream.completed);
+        assert!(response.stream.max_buffered_bytes <= stream_chunk_bytes);
+
+        let calls_after_drop = calls.load(AtomicOrdering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            calls_after_drop,
+            "dropping the native body stream should stop further range reads"
+        );
+    }
+
     #[test]
     fn offline_replay_summary_collects_failed_roots_and_assets() {
         let mut run = run_result(
@@ -15464,6 +15740,7 @@ mod tests {
                 body_bytes: 0,
                 ttfb_ms: 10,
                 total_ms: 10,
+                stream: FetchStreamMetrics::default(),
                 body_preview: String::new(),
                 revalidation: None,
                 passed: false,
@@ -15483,6 +15760,7 @@ mod tests {
                 body_bytes: 128,
                 ttfb_ms: 5,
                 total_ms: 5,
+                stream: FetchStreamMetrics::default(),
                 body_preview: String::new(),
                 revalidation: None,
                 passed: true,
@@ -16632,6 +16910,7 @@ mod tests {
                 body_bytes: 5,
                 ttfb_ms: elapsed_ms / 2,
                 total_ms: elapsed_ms,
+                stream: FetchStreamMetrics::default(),
                 body_preview: "hello".to_string(),
                 revalidation: None,
                 asset_summary: None,
@@ -16657,6 +16936,7 @@ mod tests {
             body_bytes: 128,
             ttfb_ms,
             total_ms,
+            stream: FetchStreamMetrics::default(),
             body_preview: String::new(),
             revalidation: None,
             passed: true,
@@ -16679,6 +16959,22 @@ mod tests {
             .to_string();
         asset.url = format!("http://127.0.0.1:{port}{path}");
         asset
+    }
+
+    struct CountingBlockProvider {
+        cid: cid::Cid,
+        data: Vec<u8>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl BlockProvider for CountingBlockProvider {
+        fn get_block(&self, cid: &cid::Cid) -> CoreResult<Option<Block>> {
+            if cid != &self.cid {
+                return Err(CoreError::Storage(format!("unexpected cid {cid}")));
+            }
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Some(Block::unchecked(*cid, self.data.clone())))
+        }
     }
 
     fn corpus_entry(id: &str, path: &str) -> CorpusEntry {

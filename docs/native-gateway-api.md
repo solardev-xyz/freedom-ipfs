@@ -28,6 +28,9 @@ Adapters:
 The native harness adapter is deliberately HTTP-shaped internally because
 browser resource loading still needs status codes, headers, and byte streams.
 It does not bind a TCP port and does not make loopback HTTP requests.
+It consumes response bodies incrementally and records stream metrics in the
+harness report rather than proving success by collecting through an unbounded
+whole-body adapter.
 
 ## Rust API
 
@@ -90,16 +93,78 @@ cargo run -p mobile-web-harness -- \
   --fresh-gateway-per-run
 ```
 
+Native runs can also write gateway/retrieval trace JSONL directly from the
+in-process Rust stack:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --engine rust-native \
+  --gateway-import-car /tmp/mobile-web-multiblock.car \
+  --corpus /tmp/mobile-web-multiblock-corpus.json \
+  --fresh-gateway-per-run \
+  --trace-output /tmp/native-gateway-trace.jsonl
+```
+
+The normal harness report includes per-response stream metrics for roots,
+assets, and revalidations:
+
+- `stream.chunk_count`
+- `stream.first_byte_ms`
+- `stream.max_chunk_bytes`
+- `stream.max_buffered_bytes`
+- `stream.completed`
+- `stream.cancelled`
+
+Case summaries aggregate root/asset first-byte, chunk-count, and max-buffered
+metrics so `rust-native` and `rust-http` can be compared without manually
+inspecting individual rows.
+
 ## Current Boundaries
 
 - The native harness path is Linux/Rust testable and does not require iOS or
   Xcode.
 - The local HTTP gateway and `cargo run -p freedom-ipfs-gateway` remain intact.
-- Native trace output is not wired yet; `--trace-output` is still restricted to
-  `rust-http`.
-- No mobile FFI request ABI has been added yet. That should remain phase-gated
-  until `GatewayCore` and native harness parity are reviewed.
+- Native trace output is wired for `rust-native` through the in-process tracing
+  subscriber. Kubo still does not produce Rust trace output.
+- No mobile FFI request ABI has been added yet. The shape below is the current
+  design target, not an implemented ABI.
 - WebKit response URL/origin policy remains a Swift adapter responsibility.
+
+## Experimental Mobile FFI Design
+
+The native request ABI should stay handle-based and polling/read-oriented. It
+must not expose Rust async tasks, `Stream`, futures, `Bytes`, or owned Rust
+containers across the C boundary.
+
+Proposed shape:
+
+```text
+freedom_ipfs_gateway_request_start(node, request_json) -> request_handle
+freedom_ipfs_gateway_request_response_json(node, request_handle) -> char*
+freedom_ipfs_gateway_request_read(node, request_handle, buffer, buffer_len) -> read_result
+freedom_ipfs_gateway_request_cancel(node, request_handle) -> status
+freedom_ipfs_gateway_request_free(node, request_handle)
+```
+
+`request_json` should contain method, `/ipfs/...` or `/ipns/...` path, request
+headers, optional request ID, optional parent request ID, and optional
+top-level path. Response metadata JSON should contain status, headers,
+correlation IDs, and a stable error code/message if metadata creation fails.
+
+`read_result` should distinguish:
+
+- pending/not-ready
+- bytes read
+- end of stream
+- cancelled
+- failed
+- invalid handle
+
+The Rust owner for each request handle must bound in-memory state, allow
+prompt cancellation when Swift/WebKit stops loading, and make repeated
+start/cancel/free cycles safe. The Swift wrapper can later map this to
+`WKURLSchemeTask.didReceive(response)`, repeated `didReceive(data)`, and
+`didFinish()`/`didFailWithError()`.
 
 ## Validation Added
 
@@ -115,3 +180,5 @@ Gateway unit tests now cover direct core serving and HTTP-vs-core parity for:
 - fake IPNS resolution
 
 The harness test suite covers the new engine enum and existing report logic.
+It also covers the incremental body collector and native drop-after-first-chunk
+behavior so native mode cannot silently regress to whole-body buffering.

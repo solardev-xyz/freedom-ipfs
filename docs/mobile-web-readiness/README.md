@@ -56,8 +56,10 @@ cargo run -p mobile-web-harness -- \
 Use `rust-native` first with deterministic CAR-backed corpora when checking
 HTTP/native parity. Live `rust-native` runs use the same routing mode,
 delegated-router, DHT, request-concurrency, small-body-cache, and lab env knobs
-as spawned Rust HTTP gateways, but `--trace-output` is still restricted to
-`rust-http`.
+as spawned Rust HTTP gateways. `--trace-output` works for both Rust engines:
+`rust-http` forwards trace settings to the spawned gateway process, while
+`rust-native` installs an in-process trace subscriber and writes the same JSONL
+summary input.
 
 Run a focused case repeatedly and write an aggregate JSON report:
 
@@ -96,6 +98,12 @@ process count, and storage bytes so resource regressions are visible without
 manual per-run JSON parsing. Rust-vs-Kubo comparison output prints p50 and p95
 root/asset TTFB ratios plus max RSS, FD, and storage ratios for quick terminal
 triage.
+Rust engine reports also include per-response stream metrics for root requests,
+assets, and conditional revalidations: first body byte timing, chunk count,
+maximum chunk size, maximum bytes buffered by the harness adapter, and
+completion/cancellation flags. Case summaries aggregate those stream metrics so
+`rust-native` can be checked for incremental behavior without reading every
+individual result row.
 
 When testing local gateway or retrieval changes, pass `--build-gateway` so the
 harness runs `cargo build -p freedom-ipfs-gateway` before spawning the default
@@ -164,10 +172,12 @@ deep, first-chunk-boundary, and suffix range cases for the same CAR root. Run it
 without `--case` to cover all five shapes, or select a single case such as
 `multiblock-unixfs-range`.
 
-For gateway phase tracing, pass `--trace-output /tmp/run.jsonl`. When the
-harness spawns the Rust gateway it forwards this path to the gateway, parses the
-JSONL events, and adds raw phase and mobile-style progress phase summaries to
-the report. This is the preferred way to distinguish DNSLink/name resolution,
+For gateway phase tracing, pass `--trace-output /tmp/run.jsonl`. For
+`rust-http`, the harness forwards this path to the spawned gateway. For
+`rust-native`, it writes trace events from the in-process `GatewayCore` stack.
+The harness parses the JSONL events and adds raw phase and mobile-style progress
+phase summaries to the report. This is the preferred way to distinguish
+DNSLink/name resolution,
 provider lookup, cache checks, Bitswap fetch, HTTP-provider fetch, retry,
 UnixFS path traversal, MIME sniffing, conditional `304` handling, and gateway
 limiter behavior during live runs.

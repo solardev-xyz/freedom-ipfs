@@ -3464,6 +3464,11 @@ mod tests {
         let raw = b"0123456789";
         let raw_cid = cid_from_data(CODEC_RAW, raw);
         store.put_block(&raw_cid, raw).unwrap();
+        let streamed_raw = (0..((GATEWAY_STREAM_CHUNK_SIZE * 2 + 17) as usize))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let streamed_raw_cid = cid_from_data(CODEC_RAW, &streamed_raw);
+        store.put_block(&streamed_raw_cid, &streamed_raw).unwrap();
 
         let index = b"<!doctype html><title>core parity</title>";
         let index_block = test_pb_file(index);
@@ -3538,6 +3543,14 @@ mod tests {
             &client,
             &base_url,
             GatewayCoreRequest::ipfs(raw_cid.to_string(), Method::GET, range_headers),
+        )
+        .await;
+        assert_core_http_parity(
+            "ipfs streamed full file",
+            &core,
+            &client,
+            &base_url,
+            GatewayCoreRequest::ipfs(streamed_raw_cid.to_string(), Method::GET, HeaderMap::new()),
         )
         .await;
 
