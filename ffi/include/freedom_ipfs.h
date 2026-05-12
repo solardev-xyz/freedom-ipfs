@@ -121,11 +121,23 @@ uint64_t freedom_ipfs_gateway_request_start(
 char *freedom_ipfs_gateway_request_response_json(
     FreedomIpfsNode *ptr,
     uint64_t request_handle);
+/* Waits up to timeout_ms for metadata or a terminal state; timeout_ms=0 is nonblocking. */
+char *freedom_ipfs_gateway_request_response_json_wait(
+    FreedomIpfsNode *ptr,
+    uint64_t request_handle,
+    uint64_t timeout_ms);
 FreedomIpfsGatewayReadResult freedom_ipfs_gateway_request_read(
     FreedomIpfsNode *ptr,
     uint64_t request_handle,
     uint8_t *buffer,
     size_t buffer_len);
+/* Waits up to timeout_ms for bytes or a terminal state; timeout_ms=0 is nonblocking. */
+FreedomIpfsGatewayReadResult freedom_ipfs_gateway_request_read_wait(
+    FreedomIpfsNode *ptr,
+    uint64_t request_handle,
+    uint8_t *buffer,
+    size_t buffer_len,
+    uint64_t timeout_ms);
 bool freedom_ipfs_gateway_request_cancel(
     FreedomIpfsNode *ptr,
     uint64_t request_handle);

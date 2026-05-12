@@ -22,9 +22,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -137,6 +137,7 @@ struct NativeGatewayState {
 
 struct NativeGatewayRequest {
     meta: Arc<Mutex<NativeGatewayRequestMeta>>,
+    wake: Arc<NativeGatewayRequestWake>,
     body_rx: Mutex<mpsc::Receiver<NativeBodyMessage>>,
     pending: Mutex<VecDeque<u8>>,
     task: Mutex<Option<JoinHandle<()>>>,
@@ -152,6 +153,7 @@ impl NativeGatewayRequest {
                 task.abort();
             }
         }
+        self.wake.notify();
     }
 }
 
@@ -168,6 +170,27 @@ impl Drop for NativeGatewayRequest {
 enum NativeBodyMessage {
     Data(Vec<u8>),
     Failed(NativeGatewayErrorJson),
+}
+
+struct NativeGatewayRequestWake {
+    generation: Mutex<u64>,
+    condvar: Condvar,
+}
+
+impl NativeGatewayRequestWake {
+    fn new() -> Self {
+        Self {
+            generation: Mutex::new(0),
+            condvar: Condvar::new(),
+        }
+    }
+
+    fn notify(&self) {
+        if let Ok(mut generation) = self.generation.lock() {
+            *generation = generation.wrapping_add(1);
+            self.condvar.notify_all();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1736,6 +1759,7 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_start(
         return 0;
     };
     let core = native_state.core.clone();
+    let wake = Arc::new(NativeGatewayRequestWake::new());
     let meta = Arc::new(Mutex::new(NativeGatewayRequestMeta {
         method: parsed.method_label,
         path: parsed.rendered_path,
@@ -1749,11 +1773,13 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_start(
         error: None,
     }));
     let task_meta = meta.clone();
+    let task_wake = wake.clone();
     let task = node.runtime.spawn(async move {
-        run_native_gateway_request(core, parsed.request, task_meta, body_tx).await;
+        run_native_gateway_request(core, parsed.request, task_meta, task_wake, body_tx).await;
     });
     let request = Arc::new(NativeGatewayRequest {
         meta,
+        wake,
         body_rx: Mutex::new(body_rx),
         pending: Mutex::new(VecDeque::new()),
         task: Mutex::new(Some(task)),
@@ -1783,6 +1809,33 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_response_json(
 
 /// # Safety
 ///
+/// `ptr` must be a valid node pointer. The returned string is UTF-8 JSON and
+/// must be released with `freedom_ipfs_string_free`. Blocks up to
+/// `timeout_ms` for response metadata, failure, completion, cancellation, or
+/// handle invalidation. A zero timeout performs the same immediate check as
+/// `freedom_ipfs_gateway_request_response_json`.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_gateway_request_response_json_wait(
+    ptr: *mut FreedomIpfsNode,
+    request_handle: u64,
+    timeout_ms: u64,
+) -> *mut c_char {
+    if ptr.is_null() || request_handle == 0 {
+        return native_gateway_json_string(native_gateway_invalid_handle_json(request_handle));
+    }
+    let node = &*ptr;
+    let Some(request) = native_gateway_request(node, request_handle) else {
+        return native_gateway_json_string(native_gateway_invalid_handle_json(request_handle));
+    };
+    native_gateway_json_string(native_gateway_response_json_wait(
+        request_handle,
+        &request,
+        timeout_ms,
+    ))
+}
+
+/// # Safety
+///
 /// `ptr` must be a valid node pointer. `buffer` must point to `buffer_len`
 /// writable bytes for the duration of this call.
 #[no_mangle]
@@ -1803,6 +1856,37 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_read(
         return gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_FAILED, 0);
     }
     native_gateway_read(&request, std::slice::from_raw_parts_mut(buffer, buffer_len))
+}
+
+/// # Safety
+///
+/// `ptr` must be a valid node pointer. `buffer` must point to `buffer_len`
+/// writable bytes for the duration of this call. Blocks up to `timeout_ms` for
+/// bytes, end, failure, cancellation, or handle invalidation. A zero timeout
+/// performs the same immediate check as `freedom_ipfs_gateway_request_read`.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_gateway_request_read_wait(
+    ptr: *mut FreedomIpfsNode,
+    request_handle: u64,
+    buffer: *mut u8,
+    buffer_len: usize,
+    timeout_ms: u64,
+) -> FreedomIpfsGatewayReadResult {
+    if ptr.is_null() || request_handle == 0 {
+        return gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_INVALID_HANDLE, 0);
+    }
+    let node = &*ptr;
+    let Some(request) = native_gateway_request(node, request_handle) else {
+        return gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_INVALID_HANDLE, 0);
+    };
+    if buffer.is_null() || buffer_len == 0 {
+        return gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_FAILED, 0);
+    }
+    native_gateway_read_wait(
+        &request,
+        std::slice::from_raw_parts_mut(buffer, buffer_len),
+        timeout_ms,
+    )
 }
 
 /// # Safety
@@ -1936,6 +2020,7 @@ async fn run_native_gateway_request(
     core: GatewayCore,
     request: GatewayCoreRequest,
     meta: Arc<Mutex<NativeGatewayRequestMeta>>,
+    wake: Arc<NativeGatewayRequestWake>,
     body_tx: mpsc::Sender<NativeBodyMessage>,
 ) {
     let response = core.handle(request).await;
@@ -1946,6 +2031,7 @@ async fn run_native_gateway_request(
             meta.response = Some(NativeGatewayResponseMeta { status, headers });
         }
     }
+    wake.notify();
     let mut body = response.into_body().into_data_stream();
     while let Some(chunk) = body.next().await {
         match chunk {
@@ -1957,6 +2043,7 @@ async fn run_native_gateway_request(
                 {
                     return;
                 }
+                wake.notify();
             }
             Err(err) => {
                 let error = NativeGatewayErrorJson {
@@ -1967,6 +2054,7 @@ async fn run_native_gateway_request(
                     meta.error = Some(error.clone());
                 }
                 let _ = body_tx.send(NativeBodyMessage::Failed(error)).await;
+                wake.notify();
                 return;
             }
         }
@@ -1976,6 +2064,7 @@ async fn run_native_gateway_request(
             meta.completed = true;
         }
     }
+    wake.notify();
 }
 
 fn native_gateway_headers(headers: &HeaderMap) -> Vec<NativeGatewayHeader> {
@@ -2032,6 +2121,92 @@ fn native_gateway_read(
             native_gateway_disconnected_read_status(request)
         }
     }
+}
+
+fn native_gateway_response_json_wait(
+    handle: u64,
+    request: &NativeGatewayRequest,
+    timeout_ms: u64,
+) -> NativeGatewayResponseJson {
+    if timeout_ms == 0 {
+        return native_gateway_response_json(handle, request);
+    }
+    let deadline = native_gateway_wait_deadline(timeout_ms);
+    let Ok(mut generation) = request.wake.generation.lock() else {
+        return native_gateway_response_json(handle, request);
+    };
+    loop {
+        let response = native_gateway_response_json(handle, request);
+        if response.state != "pending" {
+            return response;
+        }
+        let Some(remaining) = native_gateway_wait_remaining(deadline) else {
+            return response;
+        };
+        let observed = *generation;
+        match request
+            .wake
+            .condvar
+            .wait_timeout_while(generation, remaining, |generation| *generation == observed)
+        {
+            Ok((next_generation, wait_result)) => {
+                generation = next_generation;
+                if wait_result.timed_out() {
+                    return native_gateway_response_json(handle, request);
+                }
+            }
+            Err(_) => return native_gateway_response_json(handle, request),
+        }
+    }
+}
+
+fn native_gateway_read_wait(
+    request: &NativeGatewayRequest,
+    buffer: &mut [u8],
+    timeout_ms: u64,
+) -> FreedomIpfsGatewayReadResult {
+    if timeout_ms == 0 {
+        return native_gateway_read(request, buffer);
+    }
+    let deadline = native_gateway_wait_deadline(timeout_ms);
+    let Ok(mut generation) = request.wake.generation.lock() else {
+        return native_gateway_read(request, buffer);
+    };
+    loop {
+        let result = native_gateway_read(request, buffer);
+        if result.status != FREEDOM_IPFS_GATEWAY_READ_PENDING {
+            return result;
+        }
+        let Some(remaining) = native_gateway_wait_remaining(deadline) else {
+            return result;
+        };
+        let observed = *generation;
+        match request
+            .wake
+            .condvar
+            .wait_timeout_while(generation, remaining, |generation| *generation == observed)
+        {
+            Ok((next_generation, wait_result)) => {
+                generation = next_generation;
+                if wait_result.timed_out() {
+                    return native_gateway_read(request, buffer);
+                }
+            }
+            Err(_) => return native_gateway_read(request, buffer),
+        }
+    }
+}
+
+fn native_gateway_wait_deadline(timeout_ms: u64) -> Instant {
+    let now = Instant::now();
+    now.checked_add(Duration::from_millis(timeout_ms))
+        .or_else(|| now.checked_add(Duration::from_secs(365 * 24 * 60 * 60)))
+        .unwrap_or(now)
+}
+
+fn native_gateway_wait_remaining(deadline: Instant) -> Option<Duration> {
+    let now = Instant::now();
+    (now < deadline).then(|| deadline.saturating_duration_since(now))
 }
 
 fn drain_native_pending(
@@ -4081,6 +4256,140 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_gateway_wait_api_returns_metadata_and_bytes() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let data = b"native wait api body";
+            let cid = cid_from_data(CODEC_RAW, data);
+            (*node).store.put_block(&cid, data).unwrap();
+            let path = format!("/ipfs/{cid}");
+            let handle = start_native_gateway_request(
+                node,
+                json!({
+                    "method": "GET",
+                    "path": path
+                }),
+            );
+
+            let metadata = native_gateway_response_json_wait_ffi(node, handle, 5_000);
+            assert!(
+                metadata["state"] == "streaming" || metadata["state"] == "completed",
+                "{metadata}"
+            );
+            assert_eq!(metadata["status"], 200);
+
+            let mut buffer = [0u8; 3];
+            let first = native_gateway_read_wait_ffi(node, handle, &mut buffer, 5_000);
+            assert_eq!(first.status, FREEDOM_IPFS_GATEWAY_READ_BYTES);
+            assert!(first.bytes_read > 0);
+
+            let mut body = Vec::from(&buffer[..first.bytes_read]);
+            body.extend(read_native_gateway_body_wait(node, handle, 3));
+            assert_eq!(body, data);
+            assert!(freedom_ipfs_gateway_request_free(node, handle));
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
+    fn native_gateway_wait_api_timeout_zero_matches_nonblocking() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let (handle, _body_tx) = insert_pending_native_gateway_request(node, false);
+            let metadata = native_gateway_response_json_wait_ffi(node, handle, 0);
+            assert_eq!(metadata["state"], "pending");
+            let metadata = native_gateway_response_json_wait_ffi(node, handle, 10);
+            assert_eq!(metadata["state"], "pending");
+
+            let mut buffer = [0u8; 8];
+            assert_eq!(
+                native_gateway_read_wait_ffi(node, handle, &mut buffer, 0).status,
+                FREEDOM_IPFS_GATEWAY_READ_PENDING
+            );
+            assert_eq!(
+                native_gateway_read_wait_ffi(node, handle, &mut buffer, 10).status,
+                FREEDOM_IPFS_GATEWAY_READ_PENDING
+            );
+            assert!(freedom_ipfs_gateway_request_free(node, handle));
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
+    fn native_gateway_wait_api_cancel_and_free_wake_waiters() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+            let node_addr = node as usize;
+
+            let (response_handle, _response_tx) =
+                insert_pending_native_gateway_request(node, false);
+            let response_waiter = std::thread::spawn(move || {
+                native_gateway_response_json_wait_ffi(
+                    node_addr as *mut FreedomIpfsNode,
+                    response_handle,
+                    5_000,
+                )
+            });
+            std::thread::sleep(Duration::from_millis(25));
+            assert!(freedom_ipfs_gateway_request_cancel(node, response_handle));
+            let metadata = response_waiter.join().unwrap();
+            assert_eq!(metadata["state"], "cancelled");
+            assert!(freedom_ipfs_gateway_request_free(node, response_handle));
+
+            let node_addr = node as usize;
+            let (read_handle, _read_tx) = insert_pending_native_gateway_request(node, true);
+            let read_waiter = std::thread::spawn(move || {
+                let mut buffer = [0u8; 8];
+                native_gateway_read_wait_ffi(
+                    node_addr as *mut FreedomIpfsNode,
+                    read_handle,
+                    &mut buffer,
+                    5_000,
+                )
+            });
+            std::thread::sleep(Duration::from_millis(25));
+            assert!(freedom_ipfs_gateway_request_cancel(node, read_handle));
+            assert_eq!(
+                read_waiter.join().unwrap().status,
+                FREEDOM_IPFS_GATEWAY_READ_CANCELLED
+            );
+            assert!(freedom_ipfs_gateway_request_free(node, read_handle));
+
+            let node_addr = node as usize;
+            let (free_handle, _free_tx) = insert_pending_native_gateway_request(node, true);
+            let free_waiter = std::thread::spawn(move || {
+                let mut buffer = [0u8; 8];
+                native_gateway_read_wait_ffi(
+                    node_addr as *mut FreedomIpfsNode,
+                    free_handle,
+                    &mut buffer,
+                    5_000,
+                )
+            });
+            std::thread::sleep(Duration::from_millis(25));
+            assert!(freedom_ipfs_gateway_request_free(node, free_handle));
+            assert_eq!(
+                free_waiter.join().unwrap().status,
+                FREEDOM_IPFS_GATEWAY_READ_CANCELLED
+            );
+            let mut buffer = [0u8; 8];
+            assert_eq!(
+                native_gateway_read_wait_ffi(node, free_handle, &mut buffer, 0).status,
+                FREEDOM_IPFS_GATEWAY_READ_INVALID_HANDLE
+            );
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
     unsafe fn assert_gateway_health(node: *mut FreedomIpfsNode) {
         let response = gateway_response(node, "/health");
         assert!(response.contains("200 OK"));
@@ -4160,18 +4469,29 @@ mod tests {
         serde_json::from_str(&metadata).unwrap()
     }
 
+    unsafe fn native_gateway_response_json_wait_ffi(
+        node: *mut FreedomIpfsNode,
+        handle: u64,
+        timeout_ms: u64,
+    ) -> serde_json::Value {
+        let metadata_ptr =
+            freedom_ipfs_gateway_request_response_json_wait(node, handle, timeout_ms);
+        assert!(!metadata_ptr.is_null());
+        let metadata = CStr::from_ptr(metadata_ptr).to_str().unwrap().to_string();
+        freedom_ipfs_string_free(metadata_ptr);
+        serde_json::from_str(&metadata).unwrap()
+    }
+
     unsafe fn wait_native_gateway_response(
         node: *mut FreedomIpfsNode,
         handle: u64,
     ) -> serde_json::Value {
-        for _ in 0..1_000 {
-            let metadata = native_gateway_response_json(node, handle);
-            if metadata["state"] != "pending" {
-                return metadata;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        panic!("native gateway response metadata did not become ready");
+        let metadata = native_gateway_response_json_wait_ffi(node, handle, 5_000);
+        assert_ne!(
+            metadata["state"], "pending",
+            "native gateway response metadata did not become ready"
+        );
+        metadata
     }
 
     unsafe fn read_native_gateway_body(
@@ -4192,6 +4512,26 @@ mod tests {
                 FREEDOM_IPFS_GATEWAY_READ_PENDING => {
                     std::thread::sleep(Duration::from_millis(2));
                 }
+                status => panic!("unexpected native gateway read status {status}"),
+            }
+        }
+        panic!("native gateway body did not finish");
+    }
+
+    unsafe fn read_native_gateway_body_wait(
+        node: *mut FreedomIpfsNode,
+        handle: u64,
+        buffer_len: usize,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut buffer = vec![0u8; buffer_len];
+        for _ in 0..5_000 {
+            let result = native_gateway_read_wait_ffi(node, handle, &mut buffer, 5_000);
+            match result.status {
+                FREEDOM_IPFS_GATEWAY_READ_BYTES => {
+                    body.extend_from_slice(&buffer[..result.bytes_read]);
+                }
+                FREEDOM_IPFS_GATEWAY_READ_END => return body,
                 status => panic!("unexpected native gateway read status {status}"),
             }
         }
@@ -4225,6 +4565,60 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         panic!("native gateway read did not produce a non-pending status");
+    }
+
+    unsafe fn native_gateway_read_wait_ffi(
+        node: *mut FreedomIpfsNode,
+        handle: u64,
+        buffer: &mut [u8],
+        timeout_ms: u64,
+    ) -> FreedomIpfsGatewayReadResult {
+        freedom_ipfs_gateway_request_read_wait(
+            node,
+            handle,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            timeout_ms,
+        )
+    }
+
+    unsafe fn insert_pending_native_gateway_request(
+        node: *mut FreedomIpfsNode,
+        response_ready: bool,
+    ) -> (u64, mpsc::Sender<NativeBodyMessage>) {
+        let (body_tx, body_rx) = mpsc::channel(NATIVE_BODY_CHANNEL_CAPACITY);
+        let handle = (*node)
+            .next_native_request_id
+            .fetch_add(1, Ordering::Relaxed);
+        let response = response_ready.then(|| NativeGatewayResponseMeta {
+            status: 200,
+            headers: Vec::new(),
+        });
+        let request = Arc::new(NativeGatewayRequest {
+            meta: Arc::new(Mutex::new(NativeGatewayRequestMeta {
+                method: "GET".to_string(),
+                path: "/ipfs/test".to_string(),
+                namespace: "ipfs".to_string(),
+                request_id: None,
+                parent_request_id: None,
+                top_level_path: None,
+                response,
+                completed: false,
+                cancelled: false,
+                error: None,
+            })),
+            wake: Arc::new(NativeGatewayRequestWake::new()),
+            body_rx: Mutex::new(body_rx),
+            pending: Mutex::new(VecDeque::new()),
+            task: Mutex::new(None),
+        });
+        (*node)
+            .native_gateway_state
+            .lock()
+            .unwrap()
+            .requests
+            .insert(handle, request);
+        (handle, body_tx)
     }
 
     fn progress_fields(

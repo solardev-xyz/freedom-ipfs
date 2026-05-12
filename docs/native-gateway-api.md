@@ -233,6 +233,12 @@ bytes. A WebKit adapter should call `WKURLSchemeTask.didFinish()` only after
 The returned JSON string uses the existing `freedom_ipfs_string_free`
 ownership rule.
 
+`freedom_ipfs_gateway_request_response_json_wait` has the same return schema
+and ownership rule, but blocks up to `timeout_ms` for response metadata,
+failure, completion, cancellation, or handle invalidation. A timeout with no
+metadata still returns `"state": "pending"`. `timeout_ms = 0` is the immediate
+nonblocking check and matches `freedom_ipfs_gateway_request_response_json`.
+
 `read_result` should distinguish:
 
 - `FREEDOM_IPFS_GATEWAY_READ_PENDING`
@@ -248,16 +254,33 @@ uses a bounded body channel plus per-handle remainder storage for chunks larger
 than the caller's buffer. It does not return Rust-owned byte buffers across the
 ABI.
 
+`freedom_ipfs_gateway_request_read_wait` has the same caller-owned-buffer
+contract and result statuses, but blocks up to `timeout_ms` for bytes, end,
+failure, cancellation, or handle invalidation. If the timeout expires with no
+data or terminal state, it returns `FREEDOM_IPFS_GATEWAY_READ_PENDING`.
+`timeout_ms = 0` matches `freedom_ipfs_gateway_request_read`.
+
+The wait functions are intended for background Swift tasks/threads, not the
+MainActor. They use request-local wakeups so Swift can avoid a short-sleep
+polling loop while still keeping cancellation and bounded memory behavior.
+
 `freedom_ipfs_gateway_request_cancel` aborts the background request task and
 makes later reads report `CANCELLED`. `freedom_ipfs_gateway_request_free`
 removes the handle and also cancels any remaining work. Invalid handles return
 safe errors rather than dereferencing freed state.
 
+`cancel` wakes response/read waiters and makes them report `cancelled` JSON or
+`FREEDOM_IPFS_GATEWAY_READ_CANCELLED`. `free` removes the handle for future
+calls, cancels remaining work, and wakes in-flight waiters that already hold the
+request; those in-flight waiters may safely observe `CANCELLED`.
+
 `ffi/swift/FreedomIpfsReader.swift` exposes a thin wrapper:
 
 - `startNativeGatewayRequest(json:)`
 - `nativeGatewayResponseJSON(requestHandle:)`
+- `nativeGatewayResponseJSON(requestHandle:timeoutMilliseconds:)`
 - `readNativeGatewayRequest(_:into:)`
+- `readNativeGatewayRequest(_:into:timeoutMilliseconds:)`
 - `cancelNativeGatewayRequest(_:)`
 - `freeNativeGatewayRequest(_:)`
 
@@ -293,3 +316,7 @@ behavior so native mode cannot silently regress to whole-body buffering.
 - free handles
 - invalid handle behavior
 - repeated start/cancel/free cycles without leaked handles
+- wait API metadata and body reads without Swift-style polling
+- short-timeout `PENDING` behavior
+- `timeout_ms = 0` equivalence with the nonblocking calls
+- cancel/free wakeup behavior for blocked waiters
