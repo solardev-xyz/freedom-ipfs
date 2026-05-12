@@ -9,7 +9,8 @@ use freedom_ipfs_mobile::{
     freedom_ipfs_gateway_request_cancel, freedom_ipfs_gateway_request_free,
     freedom_ipfs_gateway_request_read, freedom_ipfs_gateway_request_response_json,
     freedom_ipfs_gateway_request_start, freedom_ipfs_gateway_wait_next_event,
-    freedom_ipfs_node_free, freedom_ipfs_node_import_car, freedom_ipfs_node_new_with_data_dir,
+    freedom_ipfs_node_free, freedom_ipfs_node_import_car,
+    freedom_ipfs_node_native_gateway_stats_json, freedom_ipfs_node_new_with_data_dir,
     freedom_ipfs_node_start_gateway_online_with_config_v2, freedom_ipfs_node_stop_gateway,
     freedom_ipfs_string_free, FreedomIpfsGatewayReadResult, FreedomIpfsNode,
 };
@@ -4193,6 +4194,22 @@ impl NativeFfiNode {
         })
         .join();
     }
+
+    fn native_gateway_stats(&self) -> Option<NativeFfiMobileStats> {
+        let ptr = self.ptr();
+        if ptr.is_null() {
+            return None;
+        }
+        let stats_ptr = unsafe { freedom_ipfs_node_native_gateway_stats_json(ptr) };
+        if stats_ptr.is_null() {
+            return None;
+        }
+        let json = unsafe { CStr::from_ptr(stats_ptr).to_string_lossy().into_owned() };
+        unsafe {
+            freedom_ipfs_string_free(stats_ptr);
+        }
+        serde_json::from_str(&json).ok()
+    }
 }
 
 impl Drop for NativeFfiNode {
@@ -4500,6 +4517,10 @@ impl NativeFfiTransport {
         {
             return;
         }
+        if let Err(err) = self.ensure_response_metadata(handle) {
+            self.finish_request(handle, Err(err));
+            return;
+        }
 
         let mut buffer = vec![0u8; self.config.read_buffer_bytes];
         loop {
@@ -4568,6 +4589,28 @@ impl NativeFfiTransport {
             value
         };
         serde_json::from_str(&json).map_err(|err| format!("decode native FFI metadata: {err}"))
+    }
+
+    fn ensure_response_metadata(&self, handle: u64) -> std::result::Result<(), String> {
+        let needs_metadata = self
+            .state
+            .lock()
+            .map(|state| {
+                state
+                    .active
+                    .get(&handle)
+                    .is_some_and(|active| active.status.is_none())
+            })
+            .unwrap_or(false);
+        if !needs_metadata {
+            return Ok(());
+        }
+        let metadata = self.response_metadata(handle)?;
+        if metadata.state == "pending" && metadata.status.is_none() && metadata.error.is_none() {
+            return Ok(());
+        }
+        self.apply_response_metadata(handle, metadata);
+        Ok(())
     }
 
     fn apply_response_metadata(&self, handle: u64, metadata: NativeFfiResponseJson) {
@@ -4802,6 +4845,7 @@ impl NativeFfiTransport {
             cancel_after_ms: self.config.cancel_after_ms,
             stop_node_mid_run_ms: self.config.stop_node_mid_run_ms,
             max_active_request_limit: self.config.max_active_request_limit,
+            mobile_layer: self.node.native_gateway_stats(),
             requests_started: stats
                 .map(|stats| stats.requests_started)
                 .unwrap_or_default(),
@@ -7248,6 +7292,7 @@ struct NativeFfiTransportReport {
     cancel_after_ms: Option<u64>,
     stop_node_mid_run_ms: Option<u64>,
     max_active_request_limit: Option<usize>,
+    mobile_layer: Option<NativeFfiMobileStats>,
     requests_started: u64,
     responses_received: u64,
     bodies_completed: u64,
@@ -7275,6 +7320,27 @@ struct NativeFfiTransportReport {
     max_retained_response_body_bytes: u64,
     last_error_code: Option<String>,
     last_error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct NativeFfiMobileStats {
+    active_native_handles: u64,
+    total_started: u64,
+    total_completed: u64,
+    total_failed: u64,
+    total_cancelled: u64,
+    total_freed: u64,
+    bytes_read: u64,
+    max_active_handles: u64,
+    events_enqueued: u64,
+    events_delivered: u64,
+    events_coalesced: u64,
+    max_event_queue_depth: u64,
+    pending_event_queue_depth: u64,
+    pending_event_handle_count: u64,
+    stop_generation: u64,
+    last_native_error_code: Option<String>,
+    last_native_error_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -17201,6 +17267,14 @@ mod tests {
         assert!(native.events_received > 0);
         assert!(native.read_calls > 0);
         assert_eq!(native.bytes_read, data.len() as u64);
+        let mobile = native.mobile_layer.as_ref().unwrap();
+        assert_eq!(mobile.active_native_handles, 0);
+        assert_eq!(mobile.total_started, 1);
+        assert_eq!(mobile.total_completed, 1);
+        assert_eq!(mobile.total_freed, 1);
+        assert_eq!(mobile.bytes_read, data.len() as u64);
+        assert!(mobile.events_enqueued > 0);
+        assert!(mobile.events_delivered > 0);
     }
 
     #[tokio::test]
@@ -17324,6 +17398,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_ffi_engine_reports_missing_path_error_response() {
+        let _guard = native_ffi_harness_test_guard().await;
+        let missing_cid = cid_from_data(CODEC_RAW, b"not imported into native ffi cache");
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--engine",
+            "rust-native-ffi",
+            "--routing-mode",
+            "offline",
+            "--native-dispatchers",
+            "1",
+            "--native-read-buffer-bytes",
+            "11",
+        ])
+        .unwrap();
+        let corpus = Corpus {
+            entries: vec![CorpusEntry {
+                id: "native-ffi-missing".to_string(),
+                description: None,
+                path: format!("/ipfs/{missing_cid}"),
+                default_enabled: Some(true),
+                method: Some("GET".to_string()),
+                range: None,
+                crawl: None,
+                expect_status: Some(502),
+                expect_content_type_prefix: Some("text/html".to_string()),
+                expect_content_range_prefix: None,
+                expect_content_length: None,
+                expect_accept_ranges: None,
+                expect_etag_prefix: None,
+                expect_cache_control: None,
+                expect_body_contains: None,
+                expect_body_bytes: None,
+                expect_body_sha256: None,
+                min_bytes: Some(1),
+                max_ttfb_ms: None,
+            }],
+        };
+
+        let report = run_harness(&args, &corpus).await.unwrap();
+        assert_eq!(
+            report.summary.fail_count, 0,
+            "failures: {:?}",
+            report.runs[0].results[0].failures
+        );
+        assert_eq!(report.runs[0].results[0].status, Some(502));
+        let native = report.runs[0].native_ffi.as_ref().unwrap();
+        assert_eq!(native.active_handles_at_end, 0);
+        let mobile = native.mobile_layer.as_ref().unwrap();
+        assert_eq!(mobile.active_native_handles, 0);
+        assert_eq!(mobile.total_started, 1);
+        assert_eq!(mobile.total_completed, 1);
+        assert_eq!(mobile.total_freed, 1);
+    }
+
+    #[tokio::test]
     async fn native_ffi_engine_drives_browser_fixture_with_one_and_four_dispatchers() {
         let _guard = native_ffi_harness_test_guard().await;
         let asset_count = 50usize;
@@ -17348,12 +17478,14 @@ mod tests {
             assert_eq!(
                 report.summary.pass_count,
                 1,
-                "failures: {:?}; first asset: {:?}",
+                "failures: {:?}; failed assets: {:?}",
                 report.runs[0].results[0].failures,
                 report.runs[0].results[0]
                     .assets
-                    .first()
-                    .map(|asset| &asset.failures)
+                    .iter()
+                    .filter(|asset| !asset.passed)
+                    .map(|asset| (&asset.url, &asset.failures))
+                    .collect::<Vec<_>>()
             );
             assert_eq!(report.summary.fail_count, 0);
             let result = &report.runs[0].results[0];
@@ -17369,6 +17501,14 @@ mod tests {
             assert_eq!(native.active_handles_at_end, 0);
             assert_eq!(native.bytes_read, expected_body_bytes as u64);
             assert!(native.max_active_handles > 1);
+            let mobile = native.mobile_layer.as_ref().unwrap();
+            assert_eq!(mobile.active_native_handles, 0);
+            assert_eq!(mobile.total_started, (asset_count + 1) as u64);
+            assert_eq!(mobile.total_completed, (asset_count + 1) as u64);
+            assert_eq!(mobile.total_freed, (asset_count + 1) as u64);
+            assert_eq!(mobile.bytes_read, expected_body_bytes as u64);
+            assert!(mobile.max_active_handles > 1);
+            assert!(mobile.max_event_queue_depth > 0);
         }
 
         let _ = std::fs::remove_file(&car_path);
@@ -17407,6 +17547,9 @@ mod tests {
         assert_eq!(native.slow_consumer_ms, 1);
         assert_eq!(native.active_handles_at_end, 0);
         assert!(native.read_calls > native.requests_started);
+        let mobile = native.mobile_layer.as_ref().unwrap();
+        assert_eq!(mobile.active_native_handles, 0);
+        assert!(mobile.events_enqueued >= native.requests_started);
     }
 
     #[tokio::test]
@@ -17467,6 +17610,167 @@ mod tests {
         assert_eq!(native.active_handles_at_end, 0);
         assert!(native.freed_handles >= 1);
         assert!(native.bytes_read > 0);
+        let mobile = native.mobile_layer.as_ref().unwrap();
+        assert_eq!(mobile.active_native_handles, 0);
+        assert_eq!(mobile.total_started, 1);
+        assert!(mobile.total_cancelled >= 1);
+        assert!(mobile.total_freed >= 1);
+        assert!(mobile.bytes_read > 0);
+    }
+
+    #[tokio::test]
+    async fn native_ffi_engine_cancellation_storm_returns_active_handles_to_zero() {
+        let _guard = native_ffi_harness_test_guard().await;
+        let request_count = 20usize;
+        let store = SqliteBlockStore::in_memory(16 * 1024 * 1024).unwrap();
+        let mut paths = Vec::new();
+        for index in 0..request_count {
+            let data = vec![index as u8; 64 * 1024];
+            let cid = cid_from_data(CODEC_RAW, &data);
+            store.put_block(&cid, &data).unwrap();
+            paths.push(format!("/ipfs/{cid}"));
+        }
+        let car_path = unique_temp_path("native-ffi-cancel-storm.car");
+        std::fs::write(&car_path, store.export_car().unwrap()).unwrap();
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--engine",
+            "rust-native-ffi",
+            "--routing-mode",
+            "offline",
+            "--gateway-import-car",
+            car_path.to_str().unwrap(),
+            "--native-dispatchers",
+            "1",
+            "--native-read-buffer-bytes",
+            "1024",
+            "--native-cancel-after-first-byte",
+        ])
+        .unwrap();
+        let mut gateway = NativeFfiGateway::start(&args, None).await.unwrap();
+        let client = GatewayClient::NativeFfi(gateway.clone());
+        let mut tasks = JoinSet::new();
+        for path in paths {
+            let client = client.clone();
+            tasks.spawn(async move {
+                let correlation = RequestCorrelation::root(path.clone());
+                client
+                    .fetch_response(
+                        &format!("http://freedom-ipfs-native-ffi.local{path}"),
+                        "GET",
+                        None,
+                        None,
+                        Some(&correlation),
+                    )
+                    .await
+            });
+        }
+        let mut cancelled = 0usize;
+        while let Some(result) = tasks.join_next().await {
+            let result = result.unwrap();
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|err| err.contains("cancelled"))
+            {
+                cancelled += 1;
+            }
+        }
+        assert_eq!(cancelled, request_count);
+        let native = gateway.report();
+        assert_eq!(native.dispatcher_count, 1);
+        assert_eq!(native.requests_started, request_count as u64);
+        assert_eq!(native.active_handles_at_end, 0);
+        assert_eq!(native.cancelled_requests, request_count as u64);
+        assert_eq!(native.freed_handles, request_count as u64);
+        let mobile = native.mobile_layer.as_ref().unwrap();
+        assert_eq!(mobile.active_native_handles, 0);
+        assert_eq!(mobile.total_started, request_count as u64);
+        assert_eq!(mobile.total_cancelled, request_count as u64);
+        assert_eq!(mobile.total_freed, request_count as u64);
+        assert!(mobile.bytes_read > 0);
+        gateway.stop().await;
+        let _ = std::fs::remove_file(&car_path);
+    }
+
+    #[tokio::test]
+    async fn native_ffi_engine_node_stop_wakes_active_request() {
+        let _guard = native_ffi_harness_test_guard().await;
+        let data = vec![7u8; 2 * 1024 * 1024];
+        let cid = cid_from_data(CODEC_RAW, &data);
+        let store = SqliteBlockStore::in_memory(8 * 1024 * 1024).unwrap();
+        store.put_block(&cid, &data).unwrap();
+        let car_path = unique_temp_path("native-ffi-node-stop.car");
+        std::fs::write(&car_path, store.export_car().unwrap()).unwrap();
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--engine",
+            "rust-native-ffi",
+            "--routing-mode",
+            "offline",
+            "--gateway-import-car",
+            car_path.to_str().unwrap(),
+            "--native-dispatchers",
+            "1",
+            "--native-read-buffer-bytes",
+            "1",
+            "--native-slow-consumer-ms",
+            "25",
+        ])
+        .unwrap();
+        let mut gateway = NativeFfiGateway::start(&args, None).await.unwrap();
+        let client = GatewayClient::NativeFfi(gateway.clone());
+        let path = format!("/ipfs/{cid}");
+        let correlation = RequestCorrelation::root(path.clone());
+        let request = tokio::spawn(async move {
+            client
+                .fetch_response(
+                    &format!("http://freedom-ipfs-native-ffi.local{path}"),
+                    "GET",
+                    None,
+                    None,
+                    Some(&correlation),
+                )
+                .await
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if gateway.report().active_handles_at_end > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            gateway.report().active_handles_at_end > 0,
+            "native FFI request did not become active before node-stop stress"
+        );
+        gateway.stop_node();
+        let result = request.await.unwrap();
+        let native = gateway.report();
+        assert!(
+            result.as_ref().err().is_some_and(|err| {
+                err.contains("gateway stopped")
+                    || err.contains("cancelled")
+                    || err.contains("invalid handle")
+            }),
+            "native FFI request unexpectedly completed during node-stop stress: status={:?} body_bytes={:?} stream={:?} native={:?}",
+            result.as_ref().ok().map(|response| response.status),
+            result.as_ref().ok().map(|response| response.body.len()),
+            result.as_ref().ok().map(|response| response.stream),
+            native,
+        );
+        assert_eq!(native.active_handles_at_end, 0);
+        assert!(
+            native.gateway_stopped_events > 0
+                || native.cancelled_requests > 0
+                || native.failed_requests > 0
+        );
+        let mobile = native.mobile_layer.as_ref().unwrap();
+        assert_eq!(mobile.active_native_handles, 0);
+        assert!(mobile.stop_generation > 0);
+        assert!(mobile.total_cancelled > 0);
+        gateway.stop().await;
+        let _ = std::fs::remove_file(&car_path);
     }
 
     fn native_ffi_browser_fixture(asset_count: usize) -> (PathBuf, Corpus, usize) {

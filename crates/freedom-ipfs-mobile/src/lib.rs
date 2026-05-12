@@ -89,6 +89,7 @@ pub struct FreedomIpfsNode {
     preload_tasks: Mutex<HashMap<u64, JoinHandle<()>>>,
     native_gateway_state: Mutex<NativeGatewayState>,
     native_gateway_events: Arc<NativeGatewayEventMux>,
+    native_gateway_stats: Arc<NativeGatewayStats>,
     next_native_request_id: AtomicU64,
 }
 
@@ -161,15 +162,30 @@ struct NativeGatewayRequest {
     meta: Arc<Mutex<NativeGatewayRequestMeta>>,
     wake: Arc<NativeGatewayRequestWake>,
     events: Arc<NativeGatewayEventMux>,
+    stats: Arc<NativeGatewayStats>,
     body_rx: Mutex<mpsc::Receiver<NativeBodyMessage>>,
     pending: Mutex<VecDeque<u8>>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl NativeGatewayRequest {
+    fn is_terminal(&self) -> bool {
+        self.meta
+            .lock()
+            .map(|meta| meta.cancelled || meta.completed || meta.error.is_some())
+            .unwrap_or(true)
+    }
+
     fn cancel(&self) {
+        let mut newly_cancelled = false;
         if let Ok(mut meta) = self.meta.lock() {
-            meta.cancelled = true;
+            if !meta.cancelled {
+                meta.cancelled = true;
+                newly_cancelled = true;
+            }
+        }
+        if newly_cancelled {
+            self.stats.total_cancelled.fetch_add(1, Ordering::Relaxed);
         }
         if let Ok(mut task) = self.task.lock() {
             if let Some(task) = task.take() {
@@ -195,6 +211,116 @@ impl Drop for NativeGatewayRequest {
 enum NativeBodyMessage {
     Data(Vec<u8>),
     Failed(NativeGatewayErrorJson),
+}
+
+struct NativeGatewayTask {
+    core: GatewayCore,
+    request: GatewayCoreRequest,
+    request_handle: u64,
+    meta: Arc<Mutex<NativeGatewayRequestMeta>>,
+    wake: Arc<NativeGatewayRequestWake>,
+    events: Arc<NativeGatewayEventMux>,
+    stats: Arc<NativeGatewayStats>,
+    body_tx: mpsc::Sender<NativeBodyMessage>,
+}
+
+#[derive(Default)]
+struct NativeGatewayStats {
+    total_started: AtomicU64,
+    total_completed: AtomicU64,
+    total_failed: AtomicU64,
+    total_cancelled: AtomicU64,
+    total_freed: AtomicU64,
+    bytes_read: AtomicU64,
+    max_active_handles: AtomicU64,
+    last_error: Mutex<Option<NativeGatewayErrorJson>>,
+}
+
+#[derive(Serialize)]
+struct NativeGatewayStatsSnapshot {
+    active_native_handles: u64,
+    total_started: u64,
+    total_completed: u64,
+    total_failed: u64,
+    total_cancelled: u64,
+    total_freed: u64,
+    bytes_read: u64,
+    max_active_handles: u64,
+    events_enqueued: u64,
+    events_delivered: u64,
+    events_coalesced: u64,
+    max_event_queue_depth: u64,
+    pending_event_queue_depth: u64,
+    pending_event_handle_count: u64,
+    stop_generation: u64,
+    last_native_error_code: Option<String>,
+    last_native_error_message: Option<String>,
+}
+
+#[derive(Default)]
+struct NativeGatewayEventMuxSnapshot {
+    events_enqueued: u64,
+    events_delivered: u64,
+    events_coalesced: u64,
+    max_event_queue_depth: u64,
+    pending_event_queue_depth: u64,
+    pending_event_handle_count: u64,
+    stop_generation: u64,
+}
+
+impl NativeGatewayStats {
+    fn record_started(&self, active_handles: usize) {
+        self.total_started.fetch_add(1, Ordering::Relaxed);
+        update_atomic_max(&self.max_active_handles, active_handles as u64);
+    }
+
+    fn record_active_handles(&self, active_handles: usize) {
+        update_atomic_max(&self.max_active_handles, active_handles as u64);
+    }
+
+    fn record_failed(&self, error: &NativeGatewayErrorJson) {
+        self.total_failed.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut last_error) = self.last_error.lock() {
+            *last_error = Some(error.clone());
+        }
+    }
+
+    fn snapshot(
+        &self,
+        active_native_handles: usize,
+        events: NativeGatewayEventMuxSnapshot,
+    ) -> NativeGatewayStatsSnapshot {
+        let last_error = self.last_error.lock().ok().and_then(|error| error.clone());
+        NativeGatewayStatsSnapshot {
+            active_native_handles: active_native_handles as u64,
+            total_started: self.total_started.load(Ordering::Relaxed),
+            total_completed: self.total_completed.load(Ordering::Relaxed),
+            total_failed: self.total_failed.load(Ordering::Relaxed),
+            total_cancelled: self.total_cancelled.load(Ordering::Relaxed),
+            total_freed: self.total_freed.load(Ordering::Relaxed),
+            bytes_read: self.bytes_read.load(Ordering::Relaxed),
+            max_active_handles: self.max_active_handles.load(Ordering::Relaxed),
+            events_enqueued: events.events_enqueued,
+            events_delivered: events.events_delivered,
+            events_coalesced: events.events_coalesced,
+            max_event_queue_depth: events.max_event_queue_depth,
+            pending_event_queue_depth: events.pending_event_queue_depth,
+            pending_event_handle_count: events.pending_event_handle_count,
+            stop_generation: events.stop_generation,
+            last_native_error_code: last_error.as_ref().map(|error| error.code.clone()),
+            last_native_error_message: last_error.map(|error| error.message),
+        }
+    }
+}
+
+fn update_atomic_max(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
 }
 
 struct NativeGatewayRequestWake {
@@ -231,6 +357,10 @@ struct NativeGatewayEventMuxState {
     queue: VecDeque<u64>,
     pending: HashMap<u64, u32>,
     stop_generation: u64,
+    events_enqueued: u64,
+    events_delivered: u64,
+    events_coalesced: u64,
+    max_event_queue_depth: u64,
 }
 
 impl NativeGatewayEventMux {
@@ -244,6 +374,10 @@ impl NativeGatewayEventMux {
         let pending = state.pending.get(&request_handle).copied().unwrap_or(0);
         if pending == 0 {
             state.queue.push_back(request_handle);
+            state.events_enqueued = state.events_enqueued.saturating_add(1);
+            state.max_event_queue_depth = state.max_event_queue_depth.max(state.queue.len() as u64);
+        } else {
+            state.events_coalesced = state.events_coalesced.saturating_add(1);
         }
         state.pending.insert(request_handle, pending | events);
         self.condvar.notify_all();
@@ -266,6 +400,7 @@ impl NativeGatewayEventMux {
             while let Some(request_handle) = state.queue.pop_front() {
                 let events = state.pending.remove(&request_handle).unwrap_or(0);
                 if events != 0 {
+                    state.events_delivered = state.events_delivered.saturating_add(1);
                     return gateway_event_result(
                         FREEDOM_IPFS_GATEWAY_EVENT_STATUS_OK,
                         events,
@@ -302,6 +437,21 @@ impl NativeGatewayEventMux {
                     );
                 }
             }
+        }
+    }
+
+    fn snapshot(&self) -> NativeGatewayEventMuxSnapshot {
+        let Ok(state) = self.state.lock() else {
+            return NativeGatewayEventMuxSnapshot::default();
+        };
+        NativeGatewayEventMuxSnapshot {
+            events_enqueued: state.events_enqueued,
+            events_delivered: state.events_delivered,
+            events_coalesced: state.events_coalesced,
+            max_event_queue_depth: state.max_event_queue_depth,
+            pending_event_queue_depth: state.queue.len() as u64,
+            pending_event_handle_count: state.pending.len() as u64,
+            stop_generation: state.stop_generation,
         }
     }
 }
@@ -1098,6 +1248,7 @@ fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
     };
     let native_gateway = cache_only_gateway_core(store.clone());
     let native_gateway_events = Arc::new(NativeGatewayEventMux::default());
+    let native_gateway_stats = Arc::new(NativeGatewayStats::default());
     Box::into_raw(Box::new(FreedomIpfsNode {
         runtime,
         store,
@@ -1113,6 +1264,7 @@ fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
             requests: HashMap::new(),
         }),
         native_gateway_events,
+        native_gateway_stats,
         next_native_request_id: AtomicU64::new(1),
     }))
 }
@@ -1134,6 +1286,31 @@ pub unsafe extern "C" fn freedom_ipfs_node_progress_snapshot_json(
     CString::new(progress_recorder().snapshot_json())
         .unwrap_or_else(|_| CString::new("{\"active\":[],\"events\":[]}").unwrap())
         .into_raw()
+}
+
+/// # Safety
+///
+/// `ptr` must be a valid node pointer. The returned string is UTF-8 JSON and
+/// must be released with `freedom_ipfs_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_node_native_gateway_stats_json(
+    ptr: *mut FreedomIpfsNode,
+) -> *mut c_char {
+    if ptr.is_null() {
+        return native_gateway_stats_json_string(
+            NativeGatewayStats::default().snapshot(0, NativeGatewayEventMuxSnapshot::default()),
+        );
+    }
+    let node = &*ptr;
+    let active_native_handles = node
+        .native_gateway_state
+        .lock()
+        .map(|state| state.requests.len())
+        .unwrap_or_default();
+    native_gateway_stats_json_string(
+        node.native_gateway_stats
+            .snapshot(active_native_handles, node.native_gateway_events.snapshot()),
+    )
 }
 
 /// # Safety
@@ -1876,6 +2053,7 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_start(
     let core = native_state.core.clone();
     let wake = Arc::new(NativeGatewayRequestWake::new());
     let events = node.native_gateway_events.clone();
+    let stats = node.native_gateway_stats.clone();
     let meta = Arc::new(Mutex::new(NativeGatewayRequestMeta {
         method: parsed.method_label,
         path: parsed.rendered_path,
@@ -1891,20 +2069,22 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_start(
     let task_meta = meta.clone();
     let task_wake = wake.clone();
     let task_events = events.clone();
+    let task_stats = stats.clone();
     let (registered_tx, registered_rx) = oneshot::channel();
     let task = node.runtime.spawn(async move {
         if registered_rx.await.is_err() {
             return;
         }
-        run_native_gateway_request(
+        run_native_gateway_request(NativeGatewayTask {
             core,
-            parsed.request,
-            handle,
-            task_meta,
-            task_wake,
-            task_events,
+            request: parsed.request,
+            request_handle: handle,
+            meta: task_meta,
+            wake: task_wake,
+            events: task_events,
+            stats: task_stats,
             body_tx,
-        )
+        })
         .await;
     });
     let request = Arc::new(NativeGatewayRequest {
@@ -1912,12 +2092,15 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_start(
         meta,
         wake,
         events,
+        stats: stats.clone(),
         body_rx: Mutex::new(body_rx),
         pending: Mutex::new(VecDeque::new()),
         task: Mutex::new(Some(task)),
     });
     native_state.requests.insert(handle, request);
+    let active_handles = native_state.requests.len();
     drop(native_state);
+    stats.record_started(active_handles);
     let _ = registered_tx.send(());
     handle
 }
@@ -2081,7 +2264,15 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_free(
     let Some(request) = native_state.requests.remove(&request_handle) else {
         return false;
     };
-    request.cancel();
+    let active_handles = native_state.requests.len();
+    node.native_gateway_stats
+        .total_freed
+        .fetch_add(1, Ordering::Relaxed);
+    node.native_gateway_stats
+        .record_active_handles(active_handles);
+    if !request.is_terminal() {
+        request.cancel();
+    }
     node.native_gateway_events
         .push(request_handle, FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED);
     true
@@ -2170,15 +2361,17 @@ fn insert_native_header(headers: &mut HeaderMap, name: &str, value: &str) -> Opt
     Some(())
 }
 
-async fn run_native_gateway_request(
-    core: GatewayCore,
-    request: GatewayCoreRequest,
-    request_handle: u64,
-    meta: Arc<Mutex<NativeGatewayRequestMeta>>,
-    wake: Arc<NativeGatewayRequestWake>,
-    events: Arc<NativeGatewayEventMux>,
-    body_tx: mpsc::Sender<NativeBodyMessage>,
-) {
+async fn run_native_gateway_request(task: NativeGatewayTask) {
+    let NativeGatewayTask {
+        core,
+        request,
+        request_handle,
+        meta,
+        wake,
+        events,
+        stats,
+        body_tx,
+    } = task;
     let response = core.handle(request).await;
     let status = response.status().as_u16();
     let headers = native_gateway_headers(response.headers());
@@ -2211,6 +2404,7 @@ async fn run_native_gateway_request(
                 if let Ok(mut meta) = meta.lock() {
                     meta.error = Some(error.clone());
                 }
+                stats.record_failed(&error);
                 let _ = body_tx.send(NativeBodyMessage::Failed(error)).await;
                 wake.notify();
                 events.push(request_handle, FREEDOM_IPFS_GATEWAY_EVENT_FAILED);
@@ -2221,6 +2415,7 @@ async fn run_native_gateway_request(
     if let Ok(mut meta) = meta.lock() {
         if !meta.cancelled && meta.error.is_none() {
             meta.completed = true;
+            stats.total_completed.fetch_add(1, Ordering::Relaxed);
         }
     }
     wake.notify();
@@ -2254,6 +2449,10 @@ fn native_gateway_read(
     }
     match drain_native_pending(request, buffer) {
         Ok(Some(bytes_read)) => {
+            request
+                .stats
+                .bytes_read
+                .fetch_add(bytes_read as u64, Ordering::Relaxed);
             return gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_BYTES, bytes_read);
         }
         Ok(None) => {}
@@ -2268,6 +2467,10 @@ fn native_gateway_read(
     match message {
         Ok(NativeBodyMessage::Data(chunk)) => {
             let bytes_read = copy_native_chunk(request, &chunk, buffer);
+            request
+                .stats
+                .bytes_read
+                .fetch_add(bytes_read as u64, Ordering::Relaxed);
             gateway_read_result(FREEDOM_IPFS_GATEWAY_READ_BYTES, bytes_read)
         }
         Ok(NativeBodyMessage::Failed(error)) => {
@@ -2525,6 +2728,15 @@ fn native_gateway_json_string(response: NativeGatewayResponseJson) -> *mut c_cha
         .into_raw()
 }
 
+fn native_gateway_stats_json_string(snapshot: NativeGatewayStatsSnapshot) -> *mut c_char {
+    let json = serde_json::to_string(&snapshot).unwrap_or_else(|_| {
+        "{\"active_native_handles\":0,\"total_started\":0,\"total_completed\":0,\"total_failed\":0,\"total_cancelled\":0,\"total_freed\":0,\"bytes_read\":0,\"max_active_handles\":0,\"events_enqueued\":0,\"events_delivered\":0,\"events_coalesced\":0,\"max_event_queue_depth\":0,\"pending_event_queue_depth\":0,\"pending_event_handle_count\":0,\"stop_generation\":0}".to_string()
+    });
+    CString::new(json)
+        .unwrap_or_else(|_| CString::new("{\"active_native_handles\":0}").unwrap())
+        .into_raw()
+}
+
 fn native_gateway_request_is_cancelled(request: &NativeGatewayRequest) -> bool {
     request
         .meta
@@ -2706,6 +2918,7 @@ fn stop_native_gateway_requests(node: &FreedomIpfsNode) {
     } else {
         Vec::new()
     };
+    node.native_gateway_stats.record_active_handles(0);
     for request in requests {
         request.cancel();
     }
@@ -2771,6 +2984,7 @@ fn set_native_gateway_core(node: &FreedomIpfsNode, core: GatewayCore) {
     } else {
         Vec::new()
     };
+    node.native_gateway_stats.record_active_handles(0);
     let cancelled_requests = !requests.is_empty();
     for request in requests {
         request.cancel();
@@ -4737,6 +4951,57 @@ mod tests {
     }
 
     #[test]
+    fn native_gateway_stats_json_reports_transport_counters() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let (noisy_handle, _noisy_tx) = insert_pending_native_gateway_request(node, true);
+            let (small_handle, _small_tx) = insert_pending_native_gateway_request(node, true);
+            for _ in 0..5 {
+                native_gateway_push_event(
+                    node,
+                    noisy_handle,
+                    FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY,
+                );
+            }
+            native_gateway_push_event(
+                node,
+                small_handle,
+                FREEDOM_IPFS_GATEWAY_EVENT_RESPONSE_READY,
+            );
+
+            let stats = native_gateway_stats_json(node);
+            assert_eq!(stats["active_native_handles"], 2);
+            assert_eq!(stats["total_started"], 2);
+            assert_eq!(stats["events_enqueued"], 2);
+            assert!(stats["events_coalesced"].as_u64().unwrap() >= 4);
+            assert_eq!(stats["max_event_queue_depth"], 2);
+            assert_eq!(stats["pending_event_queue_depth"], 2);
+            assert_eq!(stats["pending_event_handle_count"], 2);
+
+            let first = native_gateway_next_event(node, 1_000);
+            assert_eq!(first.request_handle, noisy_handle);
+            let second = native_gateway_next_event(node, 1_000);
+            assert_eq!(second.request_handle, small_handle);
+            let stats = native_gateway_stats_json(node);
+            assert_eq!(stats["events_delivered"], 2);
+            assert_eq!(stats["pending_event_queue_depth"], 0);
+            assert_eq!(stats["pending_event_handle_count"], 0);
+
+            assert!(freedom_ipfs_gateway_request_free(node, noisy_handle));
+            assert!(freedom_ipfs_gateway_request_free(node, small_handle));
+            let stats = native_gateway_stats_json(node);
+            assert_eq!(stats["active_native_handles"], 0);
+            assert_eq!(stats["total_freed"], 2);
+            assert_eq!(stats["total_cancelled"], 2);
+            assert_eq!(stats["max_active_handles"], 2);
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
     fn native_gateway_event_api_preserves_head_range_and_not_modified() {
         unsafe {
             let node = freedom_ipfs_node_new_in_memory();
@@ -5239,17 +5504,25 @@ mod tests {
             })),
             wake: Arc::new(NativeGatewayRequestWake::new()),
             events: (*node).native_gateway_events.clone(),
+            stats: (*node).native_gateway_stats.clone(),
             body_rx: Mutex::new(body_rx),
             pending: Mutex::new(VecDeque::new()),
             task: Mutex::new(None),
         });
-        (*node)
-            .native_gateway_state
-            .lock()
-            .unwrap()
-            .requests
-            .insert(handle, request);
+        let active_handles = {
+            let mut native_state = (*node).native_gateway_state.lock().unwrap();
+            native_state.requests.insert(handle, request);
+            native_state.requests.len()
+        };
+        (*node).native_gateway_stats.record_started(active_handles);
         (handle, body_tx)
+    }
+
+    unsafe fn native_gateway_stats_json(node: *mut FreedomIpfsNode) -> serde_json::Value {
+        let stats_ptr = freedom_ipfs_node_native_gateway_stats_json(node);
+        let stats = CStr::from_ptr(stats_ptr).to_string_lossy().into_owned();
+        freedom_ipfs_string_free(stats_ptr);
+        serde_json::from_str(&stats).unwrap()
     }
 
     #[derive(Default)]

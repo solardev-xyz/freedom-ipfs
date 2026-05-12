@@ -636,6 +636,14 @@ public final class FreedomIpfsReader {
         return String(cString: ptr)
     }
 
+    public var nativeGatewayStatsJSON: String {
+        guard let handle, let ptr = freedom_ipfs_node_native_gateway_stats_json(handle) else {
+            return "{\"active_native_handles\":0}"
+        }
+        defer { freedom_ipfs_string_free(ptr) }
+        return String(cString: ptr)
+    }
+
     public func clearProgress() -> Bool {
         guard let handle else {
             return false

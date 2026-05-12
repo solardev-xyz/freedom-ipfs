@@ -163,10 +163,13 @@ Useful stress knobs:
 `RunResult.native_ffi` records simulator counters such as started requests,
 responses, completed bodies, cancellations, freed handles, active handles at
 shutdown, events by flag, read calls, bytes read, max active handles, and the
-largest response body retained by the harness for validation. Event-queue depth
-and body-channel occupancy are not yet exported by the mobile layer; use the
-per-response stream metrics plus native FFI counters as the current boundedness
-signals.
+largest response body retained by the harness for validation. It also embeds a
+`mobile_layer` snapshot from `freedom-ipfs-mobile` with active-handle counts,
+total started/completed/failed/cancelled/freed requests, native read bytes,
+event mux enqueue/delivery/coalescing counts, pending event queue depth, max
+event queue depth, stop generation, and last sanitized native error metadata.
+Body-channel occupancy is not yet exported; use per-response stream metrics,
+caller buffer size, and native FFI counters as the current boundedness signals.
 
 ## Current Boundaries
 
@@ -323,6 +326,8 @@ typedef struct FreedomIpfsGatewayEvent {
 FreedomIpfsGatewayEvent freedom_ipfs_gateway_wait_next_event(
     FreedomIpfsNode *ptr,
     uint64_t timeout_ms);
+
+char *freedom_ipfs_node_native_gateway_stats_json(FreedomIpfsNode *ptr);
 ```
 
 `status` is one of:
@@ -382,6 +387,35 @@ per-handle response/read APIs return invalid-handle results after free. Gateway
 stop or lifecycle core swaps wake node-level event waiters with
 `GATEWAY_STOPPED`.
 
+`freedom_ipfs_node_native_gateway_stats_json` returns a compact diagnostics
+snapshot for TestFlight logging and Linux simulator reports:
+
+```json
+{
+  "active_native_handles": 0,
+  "total_started": 51,
+  "total_completed": 51,
+  "total_failed": 0,
+  "total_cancelled": 0,
+  "total_freed": 51,
+  "bytes_read": 12345,
+  "max_active_handles": 7,
+  "events_enqueued": 118,
+  "events_delivered": 118,
+  "events_coalesced": 12,
+  "max_event_queue_depth": 9,
+  "pending_event_queue_depth": 0,
+  "pending_event_handle_count": 0,
+  "stop_generation": 0,
+  "last_native_error_code": null,
+  "last_native_error_message": null
+}
+```
+
+This is observability only. It does not transfer ownership of requests or body
+bytes, and it should not be used as the source of truth for a specific WebKit
+task. Per-request state still comes from the response/read/event APIs.
+
 `ffi/swift/FreedomIpfsReader.swift` exposes a thin wrapper:
 
 - `startNativeGatewayRequest(json:)`
@@ -390,6 +424,7 @@ stop or lifecycle core swaps wake node-level event waiters with
 - `readNativeGatewayRequest(_:into:)`
 - `readNativeGatewayRequest(_:into:timeoutMilliseconds:)`
 - `waitNextNativeGatewayEvent(timeoutMilliseconds:)`
+- `nativeGatewayStatsJSON`
 - `cancelNativeGatewayRequest(_:)`
 - `freeNativeGatewayRequest(_:)`
 
@@ -416,7 +451,8 @@ It also covers the incremental body collector and native drop-after-first-chunk
 behavior so native mode cannot silently regress to whole-body buffering.
 It now also covers the `rust-native-ffi` simulator with CAR-backed fixtures,
 one-dispatcher and four-dispatcher browser-like loads, slow consumers, and
-cancel-after-first-byte behavior.
+cancel-after-first-byte, cancellation-storm, missing-path error response, and
+node-stop wakeup behavior.
 
 `freedom-ipfs-mobile` tests cover the experimental FFI API:
 

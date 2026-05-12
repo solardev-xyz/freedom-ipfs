@@ -148,7 +148,11 @@ native engines can be checked for incremental behavior without reading every
 individual result row. `rust-native-ffi` additionally attaches a
 `native_ffi` object to each run with request, event, read, cancellation, free,
 active-handle, and retained-body counters for debugging the mobile transport
-without Xcode.
+without Xcode. The nested `native_ffi.mobile_layer` object is the Rust mobile
+layer's own diagnostics snapshot: active handles, total started/completed/
+failed/cancelled/freed requests, native read bytes, event enqueue/delivery/
+coalescing counts, max and pending event queue depth, stop generation, and last
+sanitized native error metadata.
 The harness still retains response bodies when needed for corpus validation,
 hashing, previews, or asset discovery; `stream.max_buffered_bytes` is the
 largest per-read adapter buffer/chunk, while `body_bytes` is the retained

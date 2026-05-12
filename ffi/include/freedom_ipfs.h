@@ -96,6 +96,7 @@ FreedomIpfsRoutingStats freedom_ipfs_node_routing_stats(FreedomIpfsNode *ptr);
 uint64_t freedom_ipfs_node_active_preload_count(FreedomIpfsNode *ptr);
 FreedomIpfsDiagnostics freedom_ipfs_node_diagnostics(FreedomIpfsNode *ptr);
 char *freedom_ipfs_node_progress_snapshot_json(FreedomIpfsNode *ptr);
+char *freedom_ipfs_node_native_gateway_stats_json(FreedomIpfsNode *ptr);
 bool freedom_ipfs_node_clear_progress(FreedomIpfsNode *ptr);
 bool freedom_ipfs_node_clear_cache(FreedomIpfsNode *ptr);
 bool freedom_ipfs_node_trim_cache(FreedomIpfsNode *ptr, uint64_t max_bytes);
