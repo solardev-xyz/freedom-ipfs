@@ -27,7 +27,7 @@ use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Id, Subscriber};
@@ -1891,7 +1891,11 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_start(
     let task_meta = meta.clone();
     let task_wake = wake.clone();
     let task_events = events.clone();
+    let (registered_tx, registered_rx) = oneshot::channel();
     let task = node.runtime.spawn(async move {
+        if registered_rx.await.is_err() {
+            return;
+        }
         run_native_gateway_request(
             core,
             parsed.request,
@@ -1913,6 +1917,8 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_start(
         task: Mutex::new(Some(task)),
     });
     native_state.requests.insert(handle, request);
+    drop(native_state);
+    let _ = registered_tx.send(());
     handle
 }
 
@@ -4807,6 +4813,130 @@ mod tests {
     #[test]
     fn native_gateway_event_api_drives_50_requests_with_four_dispatchers() {
         native_gateway_event_api_drives_many_requests(4);
+    }
+
+    #[test]
+    fn native_gateway_event_api_registers_cache_hot_handles_before_events() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let mut fixtures = Vec::new();
+            let mut expected = HashMap::new();
+            for index in 0..50 {
+                let data = format!("cache hot native event body {index:02}").into_bytes();
+                let cid = cid_from_data(CODEC_RAW, &data);
+                (*node).store.put_block(&cid, &data).unwrap();
+                fixtures.push((cid, data));
+            }
+
+            let node_addr = node as usize;
+            let dispatcher =
+                std::thread::spawn(move || -> Result<HashMap<u64, Vec<u8>>, String> {
+                    let mut states: HashMap<u64, EventDrivenRequestState> = HashMap::new();
+                    let mut completed = 0usize;
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let mut buffer = [0u8; 7];
+                    while completed < 50 {
+                        if Instant::now() >= deadline {
+                            return Err(format!(
+                                "dispatcher timed out after completing {completed} requests"
+                            ));
+                        }
+                        let event = freedom_ipfs_gateway_wait_next_event(
+                            node_addr as *mut FreedomIpfsNode,
+                            100,
+                        );
+                        match event.status {
+                            FREEDOM_IPFS_GATEWAY_EVENT_STATUS_TIMEOUT => continue,
+                            FREEDOM_IPFS_GATEWAY_EVENT_STATUS_OK => {}
+                            status => return Err(format!("unexpected event status {status}")),
+                        }
+                        let state = states.entry(event.request_handle).or_default();
+                        if state.done {
+                            continue;
+                        }
+                        if event.events & FREEDOM_IPFS_GATEWAY_EVENT_RESPONSE_READY != 0 {
+                            let metadata = native_gateway_response_json(
+                                node_addr as *mut FreedomIpfsNode,
+                                event.request_handle,
+                            );
+                            if metadata["error"]["code"] == "invalid_handle" {
+                                return Err(format!(
+                                    "received event before handle {} was registered",
+                                    event.request_handle
+                                ));
+                            }
+                            state.status = metadata["status"].as_u64().map(|status| status as u16);
+                        }
+                        if event.events
+                            & (FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY
+                                | FREEDOM_IPFS_GATEWAY_EVENT_END
+                                | FREEDOM_IPFS_GATEWAY_EVENT_FAILED
+                                | FREEDOM_IPFS_GATEWAY_EVENT_CANCELLED
+                                | FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED)
+                            != 0
+                        {
+                            loop {
+                                let read = freedom_ipfs_gateway_request_read(
+                                    node_addr as *mut FreedomIpfsNode,
+                                    event.request_handle,
+                                    buffer.as_mut_ptr(),
+                                    buffer.len(),
+                                );
+                                match read.status {
+                                    FREEDOM_IPFS_GATEWAY_READ_BYTES => {
+                                        state.body.extend_from_slice(&buffer[..read.bytes_read]);
+                                    }
+                                    FREEDOM_IPFS_GATEWAY_READ_PENDING => break,
+                                    FREEDOM_IPFS_GATEWAY_READ_END => {
+                                        state.done = true;
+                                        completed += 1;
+                                        break;
+                                    }
+                                    status => {
+                                        return Err(format!(
+                                            "request {} read failed with status {status}",
+                                            event.request_handle
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(states
+                        .into_iter()
+                        .map(|(handle, state)| (handle, state.body))
+                        .collect())
+                });
+
+            let mut handles = Vec::new();
+            for (cid, data) in fixtures {
+                let handle = start_native_gateway_request(
+                    node,
+                    json!({
+                        "method": "GET",
+                        "path": format!("/ipfs/{cid}")
+                    }),
+                );
+                expected.insert(handle, data);
+                handles.push(handle);
+            }
+
+            let results = dispatcher
+                .join()
+                .expect("event dispatcher panicked")
+                .expect("event dispatcher failed");
+            assert_eq!(results.len(), expected.len());
+            for (handle, expected_body) in expected {
+                assert_eq!(results.get(&handle), Some(&expected_body));
+            }
+            for handle in handles {
+                assert!(freedom_ipfs_gateway_request_free(node, handle));
+            }
+
+            freedom_ipfs_node_free(node);
+        }
     }
 
     fn native_gateway_event_api_drives_many_requests(dispatchers: usize) {
