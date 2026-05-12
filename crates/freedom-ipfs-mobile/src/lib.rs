@@ -56,6 +56,18 @@ const FREEDOM_IPFS_GATEWAY_READ_CANCELLED: u32 = 3;
 const FREEDOM_IPFS_GATEWAY_READ_FAILED: u32 = 4;
 const FREEDOM_IPFS_GATEWAY_READ_INVALID_HANDLE: u32 = 5;
 
+const FREEDOM_IPFS_GATEWAY_EVENT_STATUS_OK: u32 = 0;
+const FREEDOM_IPFS_GATEWAY_EVENT_STATUS_TIMEOUT: u32 = 1;
+const FREEDOM_IPFS_GATEWAY_EVENT_STATUS_INVALID_NODE: u32 = 2;
+const FREEDOM_IPFS_GATEWAY_EVENT_STATUS_GATEWAY_STOPPED: u32 = 3;
+
+const FREEDOM_IPFS_GATEWAY_EVENT_RESPONSE_READY: u32 = 1 << 0;
+const FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY: u32 = 1 << 1;
+const FREEDOM_IPFS_GATEWAY_EVENT_END: u32 = 1 << 2;
+const FREEDOM_IPFS_GATEWAY_EVENT_FAILED: u32 = 1 << 3;
+const FREEDOM_IPFS_GATEWAY_EVENT_CANCELLED: u32 = 1 << 4;
+const FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED: u32 = 1 << 5;
+
 static PROGRESS_RECORDER: OnceLock<Arc<ProgressRecorder>> = OnceLock::new();
 static PROGRESS_TRACING_INIT: Once = Once::new();
 
@@ -76,6 +88,7 @@ pub struct FreedomIpfsNode {
     next_preload_id: AtomicU64,
     preload_tasks: Mutex<HashMap<u64, JoinHandle<()>>>,
     native_gateway_state: Mutex<NativeGatewayState>,
+    native_gateway_events: Arc<NativeGatewayEventMux>,
     next_native_request_id: AtomicU64,
 }
 
@@ -90,6 +103,14 @@ pub struct FreedomIpfsBuffer {
 pub struct FreedomIpfsGatewayReadResult {
     pub status: u32,
     pub bytes_read: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FreedomIpfsGatewayEvent {
+    pub status: u32,
+    pub events: u32,
+    pub request_handle: u64,
 }
 
 #[repr(C)]
@@ -136,8 +157,10 @@ struct NativeGatewayState {
 }
 
 struct NativeGatewayRequest {
+    handle: u64,
     meta: Arc<Mutex<NativeGatewayRequestMeta>>,
     wake: Arc<NativeGatewayRequestWake>,
+    events: Arc<NativeGatewayEventMux>,
     body_rx: Mutex<mpsc::Receiver<NativeBodyMessage>>,
     pending: Mutex<VecDeque<u8>>,
     task: Mutex<Option<JoinHandle<()>>>,
@@ -154,6 +177,8 @@ impl NativeGatewayRequest {
             }
         }
         self.wake.notify();
+        self.events
+            .push(self.handle, FREEDOM_IPFS_GATEWAY_EVENT_CANCELLED);
     }
 }
 
@@ -173,22 +198,110 @@ enum NativeBodyMessage {
 }
 
 struct NativeGatewayRequestWake {
-    generation: Mutex<u64>,
+    generation: AtomicU64,
+    wait_mutex: Mutex<()>,
     condvar: Condvar,
 }
 
 impl NativeGatewayRequestWake {
     fn new() -> Self {
         Self {
-            generation: Mutex::new(0),
+            generation: AtomicU64::new(0),
+            wait_mutex: Mutex::new(()),
             condvar: Condvar::new(),
         }
     }
 
     fn notify(&self) {
-        if let Ok(mut generation) = self.generation.lock() {
-            *generation = generation.wrapping_add(1);
+        let guard = self.wait_mutex.lock().ok();
+        self.generation.fetch_add(1, Ordering::Release);
+        drop(guard);
+        self.condvar.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct NativeGatewayEventMux {
+    state: Mutex<NativeGatewayEventMuxState>,
+    condvar: Condvar,
+}
+
+#[derive(Default)]
+struct NativeGatewayEventMuxState {
+    queue: VecDeque<u64>,
+    pending: HashMap<u64, u32>,
+    stop_generation: u64,
+}
+
+impl NativeGatewayEventMux {
+    fn push(&self, request_handle: u64, events: u32) {
+        if request_handle == 0 || events == 0 {
+            return;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let pending = state.pending.get(&request_handle).copied().unwrap_or(0);
+        if pending == 0 {
+            state.queue.push_back(request_handle);
+        }
+        state.pending.insert(request_handle, pending | events);
+        self.condvar.notify_all();
+    }
+
+    fn signal_gateway_stopped(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.stop_generation = state.stop_generation.wrapping_add(1);
             self.condvar.notify_all();
+        }
+    }
+
+    fn wait_next(&self, timeout_ms: u64) -> FreedomIpfsGatewayEvent {
+        let deadline = native_gateway_wait_deadline(timeout_ms);
+        let Ok(mut state) = self.state.lock() else {
+            return gateway_event_result(FREEDOM_IPFS_GATEWAY_EVENT_STATUS_GATEWAY_STOPPED, 0, 0);
+        };
+        let observed_stop_generation = state.stop_generation;
+        loop {
+            while let Some(request_handle) = state.queue.pop_front() {
+                let events = state.pending.remove(&request_handle).unwrap_or(0);
+                if events != 0 {
+                    return gateway_event_result(
+                        FREEDOM_IPFS_GATEWAY_EVENT_STATUS_OK,
+                        events,
+                        request_handle,
+                    );
+                }
+            }
+            if state.stop_generation != observed_stop_generation {
+                return gateway_event_result(
+                    FREEDOM_IPFS_GATEWAY_EVENT_STATUS_GATEWAY_STOPPED,
+                    0,
+                    0,
+                );
+            }
+            let Some(remaining) = native_gateway_wait_remaining(deadline) else {
+                return gateway_event_result(FREEDOM_IPFS_GATEWAY_EVENT_STATUS_TIMEOUT, 0, 0);
+            };
+            match self.condvar.wait_timeout(state, remaining) {
+                Ok((next_state, wait_result)) => {
+                    state = next_state;
+                    if wait_result.timed_out() {
+                        return gateway_event_result(
+                            FREEDOM_IPFS_GATEWAY_EVENT_STATUS_TIMEOUT,
+                            0,
+                            0,
+                        );
+                    }
+                }
+                Err(_) => {
+                    return gateway_event_result(
+                        FREEDOM_IPFS_GATEWAY_EVENT_STATUS_GATEWAY_STOPPED,
+                        0,
+                        0,
+                    );
+                }
+            }
         }
     }
 }
@@ -984,6 +1097,7 @@ fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
         Err(_) => return ptr::null_mut(),
     };
     let native_gateway = cache_only_gateway_core(store.clone());
+    let native_gateway_events = Arc::new(NativeGatewayEventMux::default());
     Box::into_raw(Box::new(FreedomIpfsNode {
         runtime,
         store,
@@ -998,6 +1112,7 @@ fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
             core: native_gateway,
             requests: HashMap::new(),
         }),
+        native_gateway_events,
         next_native_request_id: AtomicU64::new(1),
     }))
 }
@@ -1760,6 +1875,7 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_start(
     };
     let core = native_state.core.clone();
     let wake = Arc::new(NativeGatewayRequestWake::new());
+    let events = node.native_gateway_events.clone();
     let meta = Arc::new(Mutex::new(NativeGatewayRequestMeta {
         method: parsed.method_label,
         path: parsed.rendered_path,
@@ -1774,12 +1890,24 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_start(
     }));
     let task_meta = meta.clone();
     let task_wake = wake.clone();
+    let task_events = events.clone();
     let task = node.runtime.spawn(async move {
-        run_native_gateway_request(core, parsed.request, task_meta, task_wake, body_tx).await;
+        run_native_gateway_request(
+            core,
+            parsed.request,
+            handle,
+            task_meta,
+            task_wake,
+            task_events,
+            body_tx,
+        )
+        .await;
     });
     let request = Arc::new(NativeGatewayRequest {
+        handle,
         meta,
         wake,
+        events,
         body_rx: Mutex::new(body_rx),
         pending: Mutex::new(VecDeque::new()),
         task: Mutex::new(Some(task)),
@@ -1891,6 +2019,24 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_read_wait(
 
 /// # Safety
 ///
+/// `ptr` must be a valid node pointer. Blocks up to `timeout_ms` for readiness
+/// from any active native gateway request. A zero timeout performs an immediate
+/// nonblocking check. Events are readiness bitflags only; body bytes still flow
+/// through `freedom_ipfs_gateway_request_read`.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_gateway_wait_next_event(
+    ptr: *mut FreedomIpfsNode,
+    timeout_ms: u64,
+) -> FreedomIpfsGatewayEvent {
+    if ptr.is_null() {
+        return gateway_event_result(FREEDOM_IPFS_GATEWAY_EVENT_STATUS_INVALID_NODE, 0, 0);
+    }
+    let node = &*ptr;
+    node.native_gateway_events.wait_next(timeout_ms)
+}
+
+/// # Safety
+///
 /// `ptr` must be a valid node pointer. `request_handle` must be a handle
 /// returned by `freedom_ipfs_gateway_request_start`.
 #[no_mangle]
@@ -1930,6 +2076,8 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_free(
         return false;
     };
     request.cancel();
+    node.native_gateway_events
+        .push(request_handle, FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED);
     true
 }
 
@@ -2019,8 +2167,10 @@ fn insert_native_header(headers: &mut HeaderMap, name: &str, value: &str) -> Opt
 async fn run_native_gateway_request(
     core: GatewayCore,
     request: GatewayCoreRequest,
+    request_handle: u64,
     meta: Arc<Mutex<NativeGatewayRequestMeta>>,
     wake: Arc<NativeGatewayRequestWake>,
+    events: Arc<NativeGatewayEventMux>,
     body_tx: mpsc::Sender<NativeBodyMessage>,
 ) {
     let response = core.handle(request).await;
@@ -2032,6 +2182,7 @@ async fn run_native_gateway_request(
         }
     }
     wake.notify();
+    events.push(request_handle, FREEDOM_IPFS_GATEWAY_EVENT_RESPONSE_READY);
     let mut body = response.into_body().into_data_stream();
     while let Some(chunk) = body.next().await {
         match chunk {
@@ -2044,6 +2195,7 @@ async fn run_native_gateway_request(
                     return;
                 }
                 wake.notify();
+                events.push(request_handle, FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY);
             }
             Err(err) => {
                 let error = NativeGatewayErrorJson {
@@ -2055,6 +2207,7 @@ async fn run_native_gateway_request(
                 }
                 let _ = body_tx.send(NativeBodyMessage::Failed(error)).await;
                 wake.notify();
+                events.push(request_handle, FREEDOM_IPFS_GATEWAY_EVENT_FAILED);
                 return;
             }
         }
@@ -2065,6 +2218,7 @@ async fn run_native_gateway_request(
         }
     }
     wake.notify();
+    events.push(request_handle, FREEDOM_IPFS_GATEWAY_EVENT_END);
 }
 
 fn native_gateway_headers(headers: &HeaderMap) -> Vec<NativeGatewayHeader> {
@@ -2132,10 +2286,12 @@ fn native_gateway_response_json_wait(
         return native_gateway_response_json(handle, request);
     }
     let deadline = native_gateway_wait_deadline(timeout_ms);
-    let Ok(mut generation) = request.wake.generation.lock() else {
-        return native_gateway_response_json(handle, request);
-    };
     loop {
+        let response = native_gateway_response_json(handle, request);
+        if response.state != "pending" {
+            return response;
+        }
+        let observed = request.wake.generation.load(Ordering::Acquire);
         let response = native_gateway_response_json(handle, request);
         if response.state != "pending" {
             return response;
@@ -2143,18 +2299,20 @@ fn native_gateway_response_json_wait(
         let Some(remaining) = native_gateway_wait_remaining(deadline) else {
             return response;
         };
-        let observed = *generation;
-        match request
-            .wake
-            .condvar
-            .wait_timeout_while(generation, remaining, |generation| *generation == observed)
-        {
-            Ok((next_generation, wait_result)) => {
-                generation = next_generation;
-                if wait_result.timed_out() {
-                    return native_gateway_response_json(handle, request);
-                }
+        if request.wake.generation.load(Ordering::Acquire) != observed {
+            continue;
+        }
+        let Ok(guard) = request.wake.wait_mutex.lock() else {
+            return native_gateway_response_json(handle, request);
+        };
+        if request.wake.generation.load(Ordering::Acquire) != observed {
+            continue;
+        }
+        match request.wake.condvar.wait_timeout(guard, remaining) {
+            Ok((_, wait_result)) if wait_result.timed_out() => {
+                return native_gateway_response_json(handle, request);
             }
+            Ok(_) => {}
             Err(_) => return native_gateway_response_json(handle, request),
         }
     }
@@ -2169,10 +2327,12 @@ fn native_gateway_read_wait(
         return native_gateway_read(request, buffer);
     }
     let deadline = native_gateway_wait_deadline(timeout_ms);
-    let Ok(mut generation) = request.wake.generation.lock() else {
-        return native_gateway_read(request, buffer);
-    };
     loop {
+        let result = native_gateway_read(request, buffer);
+        if result.status != FREEDOM_IPFS_GATEWAY_READ_PENDING {
+            return result;
+        }
+        let observed = request.wake.generation.load(Ordering::Acquire);
         let result = native_gateway_read(request, buffer);
         if result.status != FREEDOM_IPFS_GATEWAY_READ_PENDING {
             return result;
@@ -2180,18 +2340,20 @@ fn native_gateway_read_wait(
         let Some(remaining) = native_gateway_wait_remaining(deadline) else {
             return result;
         };
-        let observed = *generation;
-        match request
-            .wake
-            .condvar
-            .wait_timeout_while(generation, remaining, |generation| *generation == observed)
-        {
-            Ok((next_generation, wait_result)) => {
-                generation = next_generation;
-                if wait_result.timed_out() {
-                    return native_gateway_read(request, buffer);
-                }
+        if request.wake.generation.load(Ordering::Acquire) != observed {
+            continue;
+        }
+        let Ok(guard) = request.wake.wait_mutex.lock() else {
+            return native_gateway_read(request, buffer);
+        };
+        if request.wake.generation.load(Ordering::Acquire) != observed {
+            continue;
+        }
+        match request.wake.condvar.wait_timeout(guard, remaining) {
+            Ok((_, wait_result)) if wait_result.timed_out() => {
+                return native_gateway_read(request, buffer);
             }
+            Ok(_) => {}
             Err(_) => return native_gateway_read(request, buffer),
         }
     }
@@ -2223,6 +2385,11 @@ fn drain_native_pending(
             *byte = value;
         }
     }
+    if !pending.is_empty() {
+        request
+            .events
+            .push(request.handle, FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY);
+    }
     Ok(Some(bytes_read))
 }
 
@@ -2233,6 +2400,9 @@ fn copy_native_chunk(request: &NativeGatewayRequest, chunk: &[u8], buffer: &mut 
         if let Ok(mut pending) = request.pending.lock() {
             pending.extend(chunk[bytes_read..].iter().copied());
         }
+        request
+            .events
+            .push(request.handle, FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY);
     }
     bytes_read
 }
@@ -2377,6 +2547,14 @@ fn gateway_read_result(status: u32, bytes_read: usize) -> FreedomIpfsGatewayRead
     FreedomIpfsGatewayReadResult { status, bytes_read }
 }
 
+fn gateway_event_result(status: u32, events: u32, request_handle: u64) -> FreedomIpfsGatewayEvent {
+    FreedomIpfsGatewayEvent {
+        status,
+        events,
+        request_handle,
+    }
+}
+
 /// # Safety
 ///
 /// `ptr` must be a valid node pointer. `path` must point to a NUL-terminated
@@ -2499,6 +2677,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_stop_gateway(ptr: *mut FreedomIpfsNod
 
 fn stop_gateway(node: &FreedomIpfsNode) {
     stop_native_gateway_requests(node);
+    node.native_gateway_events.signal_gateway_stopped();
     if let Ok(mut gateway_task) = node.gateway_task.lock() {
         if let Some(task) = gateway_task.take() {
             task.abort();
@@ -2586,8 +2765,12 @@ fn set_native_gateway_core(node: &FreedomIpfsNode, core: GatewayCore) {
     } else {
         Vec::new()
     };
+    let cancelled_requests = !requests.is_empty();
     for request in requests {
         request.cancel();
+    }
+    if cancelled_requests {
+        node.native_gateway_events.signal_gateway_stopped();
     }
 }
 
@@ -4390,6 +4573,280 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_gateway_event_api_reports_readiness_and_lifecycle_events() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let idle = native_gateway_next_event(node, 0);
+            assert_eq!(idle.status, FREEDOM_IPFS_GATEWAY_EVENT_STATUS_TIMEOUT);
+            assert_eq!(
+                freedom_ipfs_gateway_wait_next_event(ptr::null_mut(), 0).status,
+                FREEDOM_IPFS_GATEWAY_EVENT_STATUS_INVALID_NODE
+            );
+
+            let (response_handle, body_tx) = insert_pending_native_gateway_request(node, true);
+            native_gateway_push_event(
+                node,
+                response_handle,
+                FREEDOM_IPFS_GATEWAY_EVENT_RESPONSE_READY,
+            );
+            let event = native_gateway_next_event(node, 1_000);
+            assert_eq!(event.status, FREEDOM_IPFS_GATEWAY_EVENT_STATUS_OK);
+            assert_eq!(event.request_handle, response_handle);
+            assert_event_contains(event, FREEDOM_IPFS_GATEWAY_EVENT_RESPONSE_READY);
+            let metadata = native_gateway_response_json(node, response_handle);
+            assert_eq!(metadata["status"], 200);
+
+            body_tx
+                .try_send(NativeBodyMessage::Data(b"ready".to_vec()))
+                .unwrap();
+            native_gateway_push_event(node, response_handle, FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY);
+            let event = native_gateway_next_event(node, 1_000);
+            assert_eq!(event.request_handle, response_handle);
+            assert_event_contains(event, FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY);
+            let mut buffer = [0u8; 8];
+            let read = freedom_ipfs_gateway_request_read(
+                node,
+                response_handle,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+            );
+            assert_eq!(read.status, FREEDOM_IPFS_GATEWAY_READ_BYTES);
+            assert_eq!(&buffer[..read.bytes_read], b"ready");
+
+            complete_pending_native_gateway_request(node, response_handle);
+            let event = native_gateway_next_event(node, 1_000);
+            assert_eq!(event.request_handle, response_handle);
+            assert_event_contains(event, FREEDOM_IPFS_GATEWAY_EVENT_END);
+            assert_eq!(
+                freedom_ipfs_gateway_request_read(
+                    node,
+                    response_handle,
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                )
+                .status,
+                FREEDOM_IPFS_GATEWAY_READ_END
+            );
+            assert!(freedom_ipfs_gateway_request_free(node, response_handle));
+            let event = native_gateway_next_event(node, 1_000);
+            assert_eq!(event.request_handle, response_handle);
+            assert_event_contains(event, FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED);
+
+            let (failed_handle, _failed_tx) = insert_pending_native_gateway_request(node, true);
+            fail_pending_native_gateway_request(node, failed_handle);
+            let event = native_gateway_next_event(node, 1_000);
+            assert_eq!(event.request_handle, failed_handle);
+            assert_event_contains(event, FREEDOM_IPFS_GATEWAY_EVENT_FAILED);
+            assert!(freedom_ipfs_gateway_request_free(node, failed_handle));
+            let event = native_gateway_next_event(node, 1_000);
+            assert_eq!(event.request_handle, failed_handle);
+            assert_event_contains(event, FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED);
+
+            let (cancel_handle, _cancel_tx) = insert_pending_native_gateway_request(node, true);
+            assert!(freedom_ipfs_gateway_request_cancel(node, cancel_handle));
+            let event = native_gateway_next_event(node, 1_000);
+            assert_eq!(event.request_handle, cancel_handle);
+            assert_event_contains(event, FREEDOM_IPFS_GATEWAY_EVENT_CANCELLED);
+            assert!(freedom_ipfs_gateway_request_free(node, cancel_handle));
+            let event = native_gateway_next_event(node, 1_000);
+            assert_eq!(event.request_handle, cancel_handle);
+            assert_event_contains(event, FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED);
+
+            let node_addr = node as usize;
+            let (free_handle, _free_tx) = insert_pending_native_gateway_request(node, true);
+            let free_waiter =
+                std::thread::spawn(move || native_gateway_next_event(node_addr as *mut _, 5_000));
+            std::thread::sleep(Duration::from_millis(25));
+            assert!(freedom_ipfs_gateway_request_free(node, free_handle));
+            let mut event = free_waiter.join().unwrap();
+            assert_eq!(event.request_handle, free_handle);
+            assert!(
+                event.events
+                    & (FREEDOM_IPFS_GATEWAY_EVENT_CANCELLED
+                        | FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED)
+                    != 0,
+                "unexpected free waiter event {event:?}"
+            );
+            if event.events & FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED == 0 {
+                event = native_gateway_next_event(node, 1_000);
+                assert_eq!(event.request_handle, free_handle);
+                assert_event_contains(event, FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED);
+            }
+
+            let node_addr = node as usize;
+            let waiter =
+                std::thread::spawn(move || native_gateway_next_event(node_addr as *mut _, 5_000));
+            std::thread::sleep(Duration::from_millis(25));
+            assert!(freedom_ipfs_node_stop_gateway(node));
+            let event = waiter.join().unwrap();
+            assert_eq!(
+                event.status,
+                FREEDOM_IPFS_GATEWAY_EVENT_STATUS_GATEWAY_STOPPED
+            );
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
+    fn native_gateway_event_api_coalesces_and_preserves_fairness() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let (noisy_handle, _noisy_tx) = insert_pending_native_gateway_request(node, true);
+            let (small_handle, _small_tx) = insert_pending_native_gateway_request(node, true);
+
+            for _ in 0..10 {
+                native_gateway_push_event(
+                    node,
+                    noisy_handle,
+                    FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY,
+                );
+            }
+            native_gateway_push_event(
+                node,
+                small_handle,
+                FREEDOM_IPFS_GATEWAY_EVENT_RESPONSE_READY,
+            );
+
+            let first = native_gateway_next_event(node, 1_000);
+            assert_eq!(first.request_handle, noisy_handle);
+            assert_event_contains(first, FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY);
+
+            let second = native_gateway_next_event(node, 1_000);
+            assert_eq!(second.request_handle, small_handle);
+            assert_event_contains(second, FREEDOM_IPFS_GATEWAY_EVENT_RESPONSE_READY);
+
+            let idle = native_gateway_next_event(node, 0);
+            assert_eq!(idle.status, FREEDOM_IPFS_GATEWAY_EVENT_STATUS_TIMEOUT);
+
+            assert!(freedom_ipfs_gateway_request_free(node, noisy_handle));
+            assert!(freedom_ipfs_gateway_request_free(node, small_handle));
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
+    fn native_gateway_event_api_preserves_head_range_and_not_modified() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let data = b"0123456789abcdef";
+            let cid = cid_from_data(CODEC_RAW, data);
+            (*node).store.put_block(&cid, data).unwrap();
+            let path = format!("/ipfs/{cid}");
+
+            let get = run_single_event_request(
+                node,
+                json!({
+                    "method": "GET",
+                    "path": path
+                }),
+            );
+            assert_eq!(get.status, Some(200));
+            assert_eq!(get.body, data);
+            let etag = get
+                .header("etag")
+                .expect("GET response should include ETag");
+
+            let head = run_single_event_request(
+                node,
+                json!({
+                    "method": "HEAD",
+                    "path": path
+                }),
+            );
+            assert_eq!(head.status, Some(200));
+            assert!(head.body.is_empty());
+            assert_eq!(head.header("content-length").as_deref(), Some("16"));
+
+            let range = run_single_event_request(
+                node,
+                json!({
+                    "method": "GET",
+                    "path": path,
+                    "headers": [
+                        { "name": "Range", "value": "bytes=2-5" }
+                    ]
+                }),
+            );
+            assert_eq!(range.status, Some(206));
+            assert_eq!(range.body, b"2345");
+            assert_eq!(
+                range.header("content-range").as_deref(),
+                Some("bytes 2-5/16")
+            );
+
+            let not_modified = run_single_event_request(
+                node,
+                json!({
+                    "method": "GET",
+                    "path": path,
+                    "headers": [
+                        { "name": "If-None-Match", "value": etag }
+                    ]
+                }),
+            );
+            assert_eq!(not_modified.status, Some(304));
+            assert!(not_modified.body.is_empty());
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
+    fn native_gateway_event_api_drives_50_requests_with_one_dispatcher() {
+        native_gateway_event_api_drives_many_requests(1);
+    }
+
+    #[test]
+    fn native_gateway_event_api_drives_50_requests_with_four_dispatchers() {
+        native_gateway_event_api_drives_many_requests(4);
+    }
+
+    fn native_gateway_event_api_drives_many_requests(dispatchers: usize) {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let mut expected = HashMap::new();
+            let mut handles = Vec::new();
+            for index in 0..50 {
+                let data = format!("native event body {index:02}").into_bytes();
+                let cid = cid_from_data(CODEC_RAW, &data);
+                (*node).store.put_block(&cid, &data).unwrap();
+                let handle = start_native_gateway_request(
+                    node,
+                    json!({
+                        "method": "GET",
+                        "path": format!("/ipfs/{cid}")
+                    }),
+                );
+                expected.insert(handle, data);
+                handles.push(handle);
+            }
+
+            let results = drive_event_requests(node, &handles, dispatchers);
+            assert_eq!(results.len(), expected.len());
+            for (handle, expected_body) in expected {
+                assert_eq!(
+                    results.get(&handle).map(|result| &result.body),
+                    Some(&expected_body)
+                );
+            }
+            for handle in handles {
+                assert!(freedom_ipfs_gateway_request_free(node, handle));
+            }
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
     unsafe fn assert_gateway_health(node: *mut FreedomIpfsNode) {
         let response = gateway_response(node, "/health");
         assert!(response.contains("200 OK"));
@@ -4582,6 +5039,48 @@ mod tests {
         )
     }
 
+    unsafe fn native_gateway_next_event(
+        node: *mut FreedomIpfsNode,
+        timeout_ms: u64,
+    ) -> FreedomIpfsGatewayEvent {
+        freedom_ipfs_gateway_wait_next_event(node, timeout_ms)
+    }
+
+    unsafe fn native_gateway_push_event(node: *mut FreedomIpfsNode, handle: u64, events: u32) {
+        (*node).native_gateway_events.push(handle, events);
+    }
+
+    fn assert_event_contains(event: FreedomIpfsGatewayEvent, expected: u32) {
+        assert_eq!(
+            event.events & expected,
+            expected,
+            "event {event:?} did not contain expected bit {expected}"
+        );
+    }
+
+    unsafe fn complete_pending_native_gateway_request(node: *mut FreedomIpfsNode, handle: u64) {
+        let request = native_gateway_request(&*node, handle).expect("request should exist");
+        if let Ok(mut meta) = request.meta.lock() {
+            meta.completed = true;
+        }
+        request.wake.notify();
+        request.events.push(handle, FREEDOM_IPFS_GATEWAY_EVENT_END);
+    }
+
+    unsafe fn fail_pending_native_gateway_request(node: *mut FreedomIpfsNode, handle: u64) {
+        let request = native_gateway_request(&*node, handle).expect("request should exist");
+        if let Ok(mut meta) = request.meta.lock() {
+            meta.error = Some(NativeGatewayErrorJson {
+                code: "test_failure".to_string(),
+                message: "test failure".to_string(),
+            });
+        }
+        request.wake.notify();
+        request
+            .events
+            .push(handle, FREEDOM_IPFS_GATEWAY_EVENT_FAILED);
+    }
+
     unsafe fn insert_pending_native_gateway_request(
         node: *mut FreedomIpfsNode,
         response_ready: bool,
@@ -4595,6 +5094,7 @@ mod tests {
             headers: Vec::new(),
         });
         let request = Arc::new(NativeGatewayRequest {
+            handle,
             meta: Arc::new(Mutex::new(NativeGatewayRequestMeta {
                 method: "GET".to_string(),
                 path: "/ipfs/test".to_string(),
@@ -4608,6 +5108,7 @@ mod tests {
                 error: None,
             })),
             wake: Arc::new(NativeGatewayRequestWake::new()),
+            events: (*node).native_gateway_events.clone(),
             body_rx: Mutex::new(body_rx),
             pending: Mutex::new(VecDeque::new()),
             task: Mutex::new(None),
@@ -4619,6 +5120,163 @@ mod tests {
             .requests
             .insert(handle, request);
         (handle, body_tx)
+    }
+
+    #[derive(Default)]
+    struct EventDrivenRequestState {
+        status: Option<u16>,
+        headers: Vec<NativeGatewayHeader>,
+        body: Vec<u8>,
+        done: bool,
+        failed_status: Option<u32>,
+    }
+
+    struct EventDrivenResponse {
+        status: Option<u16>,
+        headers: Vec<NativeGatewayHeader>,
+        body: Vec<u8>,
+    }
+
+    impl EventDrivenResponse {
+        fn header(&self, name: &str) -> Option<String> {
+            self.headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case(name))
+                .map(|header| header.value.clone())
+        }
+    }
+
+    unsafe fn run_single_event_request(
+        node: *mut FreedomIpfsNode,
+        request: serde_json::Value,
+    ) -> EventDrivenResponse {
+        let handle = start_native_gateway_request(node, request);
+        let mut results = drive_event_requests(node, &[handle], 1);
+        assert!(freedom_ipfs_gateway_request_free(node, handle));
+        results.remove(&handle).expect("request should complete")
+    }
+
+    unsafe fn drive_event_requests(
+        node: *mut FreedomIpfsNode,
+        handles: &[u64],
+        dispatcher_count: usize,
+    ) -> HashMap<u64, EventDrivenResponse> {
+        let dispatcher_count = dispatcher_count.max(1);
+        let mut states = HashMap::new();
+        for handle in handles {
+            states.insert(
+                *handle,
+                Arc::new(Mutex::new(EventDrivenRequestState::default())),
+            );
+        }
+        let states = Arc::new(states);
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let total = handles.len();
+        let node_addr = node as usize;
+        let mut workers = Vec::new();
+        for _ in 0..dispatcher_count {
+            let states = states.clone();
+            let completed = completed.clone();
+            workers.push(std::thread::spawn(move || -> Result<(), String> {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut buffer = [0u8; 5];
+                while completed.load(Ordering::Acquire) < total {
+                    if Instant::now() >= deadline {
+                        return Err("event dispatcher timed out".to_string());
+                    }
+                    let event = unsafe {
+                        freedom_ipfs_gateway_wait_next_event(node_addr as *mut FreedomIpfsNode, 100)
+                    };
+                    match event.status {
+                        FREEDOM_IPFS_GATEWAY_EVENT_STATUS_TIMEOUT => continue,
+                        FREEDOM_IPFS_GATEWAY_EVENT_STATUS_OK => {}
+                        status => {
+                            return Err(format!("unexpected event status {status}"));
+                        }
+                    }
+                    let Some(state) = states.get(&event.request_handle).cloned() else {
+                        continue;
+                    };
+                    let mut state = state.lock().map_err(|_| "state poisoned".to_string())?;
+                    if state.done {
+                        continue;
+                    }
+                    if event.events & FREEDOM_IPFS_GATEWAY_EVENT_RESPONSE_READY != 0 {
+                        let metadata = unsafe {
+                            native_gateway_response_json(
+                                node_addr as *mut FreedomIpfsNode,
+                                event.request_handle,
+                            )
+                        };
+                        state.status = metadata["status"].as_u64().map(|status| status as u16);
+                        state.headers = serde_json::from_value(metadata["headers"].clone())
+                            .map_err(|err| format!("failed to decode response headers: {err}"))?;
+                    }
+                    if event.events
+                        & (FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY
+                            | FREEDOM_IPFS_GATEWAY_EVENT_END
+                            | FREEDOM_IPFS_GATEWAY_EVENT_FAILED
+                            | FREEDOM_IPFS_GATEWAY_EVENT_CANCELLED
+                            | FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED)
+                        != 0
+                    {
+                        loop {
+                            let read = unsafe {
+                                freedom_ipfs_gateway_request_read(
+                                    node_addr as *mut FreedomIpfsNode,
+                                    event.request_handle,
+                                    buffer.as_mut_ptr(),
+                                    buffer.len(),
+                                )
+                            };
+                            match read.status {
+                                FREEDOM_IPFS_GATEWAY_READ_BYTES => {
+                                    state.body.extend_from_slice(&buffer[..read.bytes_read]);
+                                }
+                                FREEDOM_IPFS_GATEWAY_READ_PENDING => break,
+                                FREEDOM_IPFS_GATEWAY_READ_END => {
+                                    state.done = true;
+                                    completed.fetch_add(1, Ordering::AcqRel);
+                                    break;
+                                }
+                                status => {
+                                    state.done = true;
+                                    state.failed_status = Some(status);
+                                    completed.fetch_add(1, Ordering::AcqRel);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .expect("event dispatcher panicked")
+                .expect("event dispatcher failed");
+        }
+        let mut results = HashMap::new();
+        for (handle, state) in states.iter() {
+            let state = state.lock().unwrap();
+            assert_eq!(
+                state.failed_status, None,
+                "request {handle} failed with {:?}",
+                state.failed_status
+            );
+            assert!(state.done, "request {handle} did not finish");
+            results.insert(
+                *handle,
+                EventDrivenResponse {
+                    status: state.status,
+                    headers: state.headers.clone(),
+                    body: state.body.clone(),
+                },
+            );
+        }
+        results
     }
 
     fn progress_fields(

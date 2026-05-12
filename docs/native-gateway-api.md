@@ -264,6 +264,63 @@ The wait functions are intended for background Swift tasks/threads, not the
 MainActor. They use request-local wakeups so Swift can avoid a short-sleep
 polling loop while still keeping cancellation and bounded memory behavior.
 
+For high-subresource pages, the per-request wait API still implies one blocked
+Swift worker per active resource. The event multiplexer provides a node-level
+dispatcher API so one to four Swift workers can drive many handles:
+
+```c
+typedef struct FreedomIpfsGatewayEvent {
+    uint32_t status;
+    uint32_t events;
+    uint64_t request_handle;
+} FreedomIpfsGatewayEvent;
+
+FreedomIpfsGatewayEvent freedom_ipfs_gateway_wait_next_event(
+    FreedomIpfsNode *ptr,
+    uint64_t timeout_ms);
+```
+
+`status` is one of:
+
+- `FREEDOM_IPFS_GATEWAY_EVENT_STATUS_OK`
+- `FREEDOM_IPFS_GATEWAY_EVENT_STATUS_TIMEOUT`
+- `FREEDOM_IPFS_GATEWAY_EVENT_STATUS_INVALID_NODE`
+- `FREEDOM_IPFS_GATEWAY_EVENT_STATUS_GATEWAY_STOPPED`
+
+When `status` is `OK`, `events` is a bitmask over:
+
+- `FREEDOM_IPFS_GATEWAY_EVENT_RESPONSE_READY`
+- `FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY`
+- `FREEDOM_IPFS_GATEWAY_EVENT_END`
+- `FREEDOM_IPFS_GATEWAY_EVENT_FAILED`
+- `FREEDOM_IPFS_GATEWAY_EVENT_CANCELLED`
+- `FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED`
+
+The event API does not transfer body bytes. It only says which handle is worth
+servicing. Response metadata still comes from
+`freedom_ipfs_gateway_request_response_json`, and body bytes still come from
+`freedom_ipfs_gateway_request_read` or `read_wait` into caller-owned buffers.
+
+Events are coalesced by request handle. If a handle already has unobserved
+`BODY_READY`, Rust will not enqueue unlimited duplicate body events for that
+handle. New readiness after the dispatcher services a handle may enqueue
+another event. This bounds event growth to ready handles instead of ready
+chunks.
+
+`END` is readiness, not permission to finish WebKit immediately. A WebKit
+adapter should still call `didFinish()` only after `read` or `read_wait` returns
+`FREEDOM_IPFS_GATEWAY_READ_END`.
+
+Recommended Swift shape:
+
+```text
+start many native gateway requests
+run 1-4 dispatcher tasks
+dispatcher waits on waitNextNativeGatewayEvent(timeoutMilliseconds:)
+dispatcher routes the returned handle to the matching WebKit task
+task fetches metadata and drains read/read_wait until PENDING or END
+```
+
 `freedom_ipfs_gateway_request_cancel` aborts the background request task and
 makes later reads report `CANCELLED`. `freedom_ipfs_gateway_request_free`
 removes the handle and also cancels any remaining work. Invalid handles return
@@ -274,6 +331,12 @@ safe errors rather than dereferencing freed state.
 calls, cancels remaining work, and wakes in-flight waiters that already hold the
 request; those in-flight waiters may safely observe `CANCELLED`.
 
+`cancel` also produces a native gateway event with `CANCELLED`. `free` produces
+`HANDLE_FREED` for event waiters and stale events for freed handles are safe:
+per-handle response/read APIs return invalid-handle results after free. Gateway
+stop or lifecycle core swaps wake node-level event waiters with
+`GATEWAY_STOPPED`.
+
 `ffi/swift/FreedomIpfsReader.swift` exposes a thin wrapper:
 
 - `startNativeGatewayRequest(json:)`
@@ -281,6 +344,7 @@ request; those in-flight waiters may safely observe `CANCELLED`.
 - `nativeGatewayResponseJSON(requestHandle:timeoutMilliseconds:)`
 - `readNativeGatewayRequest(_:into:)`
 - `readNativeGatewayRequest(_:into:timeoutMilliseconds:)`
+- `waitNextNativeGatewayEvent(timeoutMilliseconds:)`
 - `cancelNativeGatewayRequest(_:)`
 - `freeNativeGatewayRequest(_:)`
 
@@ -320,3 +384,9 @@ behavior so native mode cannot silently regress to whole-body buffering.
 - short-timeout `PENDING` behavior
 - `timeout_ms = 0` equivalence with the nonblocking calls
 - cancel/free wakeup behavior for blocked waiters
+- event API idle timeout, metadata, body, end, failure, cancel, free, and
+  gateway-stop readiness
+- event coalescing and fairness across noisy and quiet handles
+- event-driven `HEAD`, `Range`, and `If-None-Match` / `304`
+- 50 concurrent native requests driven by one dispatcher and by four
+  dispatchers without per-handle waiters

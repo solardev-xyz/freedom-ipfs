@@ -18,6 +18,11 @@ typedef struct FreedomIpfsGatewayReadResult {
     uint32_t status;
     size_t bytes_read;
 } FreedomIpfsGatewayReadResult;
+typedef struct FreedomIpfsGatewayEvent {
+    uint32_t status;
+    uint32_t events;
+    uint64_t request_handle;
+} FreedomIpfsGatewayEvent;
 typedef struct FreedomIpfsRetrievalStats {
     uint64_t cache_hits;
     uint64_t http_provider_blocks;
@@ -59,6 +64,18 @@ typedef struct FreedomIpfsDiagnostics {
 #define FREEDOM_IPFS_GATEWAY_READ_CANCELLED ((uint32_t)3)
 #define FREEDOM_IPFS_GATEWAY_READ_FAILED ((uint32_t)4)
 #define FREEDOM_IPFS_GATEWAY_READ_INVALID_HANDLE ((uint32_t)5)
+
+#define FREEDOM_IPFS_GATEWAY_EVENT_STATUS_OK ((uint32_t)0)
+#define FREEDOM_IPFS_GATEWAY_EVENT_STATUS_TIMEOUT ((uint32_t)1)
+#define FREEDOM_IPFS_GATEWAY_EVENT_STATUS_INVALID_NODE ((uint32_t)2)
+#define FREEDOM_IPFS_GATEWAY_EVENT_STATUS_GATEWAY_STOPPED ((uint32_t)3)
+
+#define FREEDOM_IPFS_GATEWAY_EVENT_RESPONSE_READY ((uint32_t)(1u << 0))
+#define FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY ((uint32_t)(1u << 1))
+#define FREEDOM_IPFS_GATEWAY_EVENT_END ((uint32_t)(1u << 2))
+#define FREEDOM_IPFS_GATEWAY_EVENT_FAILED ((uint32_t)(1u << 3))
+#define FREEDOM_IPFS_GATEWAY_EVENT_CANCELLED ((uint32_t)(1u << 4))
+#define FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED ((uint32_t)(1u << 5))
 
 char *freedom_ipfs_version(void);
 void freedom_ipfs_string_free(char *ptr);
@@ -137,6 +154,10 @@ FreedomIpfsGatewayReadResult freedom_ipfs_gateway_request_read_wait(
     uint64_t request_handle,
     uint8_t *buffer,
     size_t buffer_len,
+    uint64_t timeout_ms);
+/* Waits up to timeout_ms for any native request readiness; timeout_ms=0 is nonblocking. */
+FreedomIpfsGatewayEvent freedom_ipfs_gateway_wait_next_event(
+    FreedomIpfsNode *ptr,
     uint64_t timeout_ms);
 bool freedom_ipfs_gateway_request_cancel(
     FreedomIpfsNode *ptr,
