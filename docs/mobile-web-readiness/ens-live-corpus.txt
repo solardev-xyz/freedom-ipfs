@@ -1,0 +1,48 @@
+# Opt-in live ENS corpus for the mobile web harness.
+#
+# The harness resolves these names outside the gateway, then tests the resulting
+# /ipfs or /ipns paths. Keep this list out of default deterministic tests because
+# ENS records and public provider availability are live-network inputs.
+dapprank.eth
+defluencer.eth
+justw.eth
+beta.walletbeat.eth
+hugomrdias.eth
+inkahacker.eth
+slasha.vitalik.eth
+thebluepill.eth
+tokenlist.kleros.eth
+nullradix.eth
+v1rtl.eth
+the-mesh.eth
+baboya.eth
+kzg.eth
+takens.eth
+vitalik.eth
+webhash.eth
+kassandra.eth
+luc.eth
+siwe.dimakush.eth
+earthfast.eth
+swix.eth
+hid.eth
+jsonapi.eth
+ethereumr1.eth
+nicknameservice.eth
+anybt.eth
+2.horswap.eth
+cowswap.eth
+eternalsafe.eth
+nedtzo.eth
+recovery.fluidkey.eth
+app.klerosscout.eth
+cryptopunks.eth
+etherphunks.eth
+seedit.eth
+sendslow.eth
+unipeer.eth
+meetfocil.eth
+1inch.eth
+reality.eth
+nexumcodex.eth
+ipfs.eth

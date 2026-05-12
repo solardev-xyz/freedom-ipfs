@@ -17,6 +17,7 @@ cid.workspace = true
 clap = { workspace = true, features = ["env"] }
 freedom-ipfs-core.workspace = true
 freedom-ipfs-gateway.workspace = true
+freedom-ipfs-mobile.workspace = true
 freedom-ipfs-namesys.workspace = true
 freedom-ipfs-retrieval.workspace = true
 freedom-ipfs-routing.workspace = true

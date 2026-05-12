@@ -23,6 +23,7 @@ GatewayCore
 Adapters:
   Axum HTTP gateway  -> GatewayCore
   mobile-web-harness rust-native -> GatewayCore
+  mobile-web-harness rust-native-ffi -> freedom-ipfs-mobile C ABI/event mux
 ```
 
 The native harness adapter is deliberately HTTP-shaped internally because
@@ -62,11 +63,13 @@ body later.
 
 ## Harness Usage
 
-The mobile web harness supports three engines:
+The mobile web harness supports four engines:
 
 ```text
 rust-http      localhost HTTP gateway adapter
 rust-native    direct GatewayCore adapter, no TCP listener
+rust-native-ffi
+               mobile FFI/event-mux adapter, no TCP listener
 kubo           external Kubo gateway
 ```
 
@@ -125,6 +128,46 @@ tracks the largest per-read adapter buffer/chunk observed while consuming the
 body incrementally; it is the signal that native mode is not waiting for a
 whole-body `to_bytes` collection before observing body data.
 
+The `rust-native-ffi` engine is the Linux-side simulator for the iOS native
+transport. It creates a `FreedomIpfsNode`, imports optional CAR fixtures through
+the mobile FFI, starts native gateway request handles, waits on
+`freedom_ipfs_gateway_wait_next_event`, then reads ready handles through
+`freedom_ipfs_gateway_request_read`. It does not call `GatewayCore` directly and
+does not make loopback HTTP requests.
+
+Example native FFI simulator run:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --engine rust-native-ffi \
+  --gateway-import-car /tmp/mobile-web-multiblock.car \
+  --corpus /tmp/mobile-web-multiblock-corpus.json \
+  --routing-mode offline \
+  --native-dispatchers 1 \
+  --native-read-buffer-bytes 65536
+```
+
+Useful stress knobs:
+
+- `--native-dispatchers 1|4`: number of event dispatcher workers.
+- `--native-read-buffer-bytes N`: caller-owned read buffer size.
+- `--native-slow-consumer-ms N`: delay after each read to model slow Swift/WebKit consumption.
+- `--native-cancel-after-first-byte`: cancel each request after the first body bytes.
+- `--native-cancel-after-ms N`: cancel each request after a time limit.
+- `--native-stop-node-mid-run-ms N`: stop the node while requests are active.
+- `--native-max-active-requests N`: lab-only cap before starting FFI handles.
+- `--ens-corpus docs/mobile-web-readiness/ens-live-corpus.txt`: resolve an
+  opt-in live ENS name list outside the gateway and append the resulting `/ipfs`
+  or `/ipns` targets to the run corpus.
+
+`RunResult.native_ffi` records simulator counters such as started requests,
+responses, completed bodies, cancellations, freed handles, active handles at
+shutdown, events by flag, read calls, bytes read, max active handles, and the
+largest response body retained by the harness for validation. Event-queue depth
+and body-channel occupancy are not yet exported by the mobile layer; use the
+per-response stream metrics plus native FFI counters as the current boundedness
+signals.
+
 ## Current Boundaries
 
 - The native harness path is Linux/Rust testable and does not require iOS or
@@ -133,8 +176,10 @@ whole-body `to_bytes` collection before observing body data.
 - Native trace output is wired for `rust-native` through the in-process tracing
   subscriber. Kubo still does not produce Rust trace output.
 - An experimental mobile FFI request ABI exists in `freedom-ipfs-mobile`. It is
-  Linux-tested through Rust unit tests, but it is not wired into the iOS
-  `WKURLSchemeHandler` yet.
+  Linux-tested through Rust unit tests and through the `rust-native-ffi` harness
+  engine. The iOS app has also proven the native path under a feature-flagged
+  integration; Linux simulator coverage remains the first place to harden
+  transport behavior.
 - WebKit response URL/origin policy remains a Swift adapter responsibility.
 
 ## Experimental Mobile FFI API
@@ -369,6 +414,9 @@ Gateway unit tests now cover direct core serving and HTTP-vs-core parity for:
 The harness test suite covers the new engine enum and existing report logic.
 It also covers the incremental body collector and native drop-after-first-chunk
 behavior so native mode cannot silently regress to whole-body buffering.
+It now also covers the `rust-native-ffi` simulator with CAR-backed fixtures,
+one-dispatcher and four-dispatcher browser-like loads, slow consumers, and
+cancel-after-first-byte behavior.
 
 `freedom-ipfs-mobile` tests cover the experimental FFI API:
 

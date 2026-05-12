@@ -2295,6 +2295,7 @@ dependencies = [
  "clap",
  "freedom-ipfs-core",
  "freedom-ipfs-gateway",
+ "freedom-ipfs-mobile",
  "freedom-ipfs-namesys",
  "freedom-ipfs-retrieval",
  "freedom-ipfs-routing",

@@ -5,6 +5,14 @@ use freedom_ipfs_gateway::{
     GatewayConfig, GatewayCore, GatewayCoreRequest, GatewayHtmlDirectoryPrefetchConfig,
     GatewayHtmlPrefetchConfig, GatewayHtmlRangeWarmConfig, PersistentNameResolver,
 };
+use freedom_ipfs_mobile::{
+    freedom_ipfs_gateway_request_cancel, freedom_ipfs_gateway_request_free,
+    freedom_ipfs_gateway_request_read, freedom_ipfs_gateway_request_response_json,
+    freedom_ipfs_gateway_request_start, freedom_ipfs_gateway_wait_next_event,
+    freedom_ipfs_node_free, freedom_ipfs_node_import_car, freedom_ipfs_node_new_with_data_dir,
+    freedom_ipfs_node_start_gateway_online_with_config_v2, freedom_ipfs_node_stop_gateway,
+    freedom_ipfs_string_free, FreedomIpfsGatewayReadResult, FreedomIpfsNode,
+};
 use freedom_ipfs_namesys::{
     CachedNameResolver, CloudflareDohResolver, DefaultNameResolver, DelegatedIpnsResolver,
     FallbackIpnsResolver, IpnsRecord, IpnsResolver, NamesysError,
@@ -16,7 +24,7 @@ use freedom_ipfs_routing::{
 };
 use freedom_ipfs_store::SqliteBlockStore;
 use futures::StreamExt;
-use http::{HeaderMap, HeaderValue, Method, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use reqwest::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
     RANGE,
@@ -24,17 +32,18 @@ use reqwest::header::{
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::ffi::OsStr;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ffi::{CStr, CString, OsStr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle as ThreadJoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
-use tokio::sync::Semaphore;
+use tokio::sync::{oneshot, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 
 const DEFAULT_CORPUS: &str = "tools/mobile-web-harness/corpus/mobile-web.json";
@@ -70,8 +79,36 @@ const RAW_LINK_TSIZE_FAST_HEADERS_ENV: &str = "FREEDOM_IPFS_ENABLE_RAW_LINK_TSIZ
 const STREAM_SMALL_BODIES_ENV: &str = "FREEDOM_IPFS_GATEWAY_STREAM_SMALL_BODIES";
 const DEFAULT_NATIVE_TRACE_FILTER: &str =
     "freedom_ipfs_gateway=info,freedom_ipfs_retrieval=info,freedom_ipfs_namesys=info,freedom_ipfs_routing=info,warn";
+const DEFAULT_NATIVE_FFI_DISPATCHERS: usize = 1;
+const DEFAULT_NATIVE_FFI_READ_BUFFER_BYTES: usize = 64 * 1024;
+const NATIVE_FFI_WAIT_TIMEOUT_MS: u64 = 100;
+
+const FREEDOM_IPFS_ROUTING_MODE_AUTO: u32 = 0;
+const FREEDOM_IPFS_ROUTING_MODE_DELEGATED: u32 = 1;
+const FREEDOM_IPFS_ROUTING_MODE_LIGHT_DHT: u32 = 2;
+const FREEDOM_IPFS_ROUTING_MODE_OFFLINE: u32 = 3;
+
+const FREEDOM_IPFS_GATEWAY_READ_PENDING: u32 = 0;
+const FREEDOM_IPFS_GATEWAY_READ_BYTES: u32 = 1;
+const FREEDOM_IPFS_GATEWAY_READ_END: u32 = 2;
+const FREEDOM_IPFS_GATEWAY_READ_CANCELLED: u32 = 3;
+const FREEDOM_IPFS_GATEWAY_READ_FAILED: u32 = 4;
+const FREEDOM_IPFS_GATEWAY_READ_INVALID_HANDLE: u32 = 5;
+
+const FREEDOM_IPFS_GATEWAY_EVENT_STATUS_OK: u32 = 0;
+const FREEDOM_IPFS_GATEWAY_EVENT_STATUS_TIMEOUT: u32 = 1;
+const FREEDOM_IPFS_GATEWAY_EVENT_STATUS_INVALID_NODE: u32 = 2;
+const FREEDOM_IPFS_GATEWAY_EVENT_STATUS_GATEWAY_STOPPED: u32 = 3;
+
+const FREEDOM_IPFS_GATEWAY_EVENT_RESPONSE_READY: u32 = 1 << 0;
+const FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY: u32 = 1 << 1;
+const FREEDOM_IPFS_GATEWAY_EVENT_END: u32 = 1 << 2;
+const FREEDOM_IPFS_GATEWAY_EVENT_FAILED: u32 = 1 << 3;
+const FREEDOM_IPFS_GATEWAY_EVENT_CANCELLED: u32 = 1 << 4;
+const FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED: u32 = 1 << 5;
 
 static NEXT_HARNESS_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_TEMP_PATH_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +117,8 @@ enum HarnessEngine {
     RustHttp,
     #[value(name = "rust-native")]
     RustNative,
+    #[value(name = "rust-native-ffi")]
+    RustNativeFfi,
     Kubo,
 }
 
@@ -88,12 +127,16 @@ impl HarnessEngine {
         match self {
             Self::RustHttp => "rust-http",
             Self::RustNative => "rust-native",
+            Self::RustNativeFfi => "rust-native-ffi",
             Self::Kubo => "kubo",
         }
     }
 
     fn is_rust(self) -> bool {
-        matches!(self, Self::RustHttp | Self::RustNative)
+        matches!(
+            self,
+            Self::RustHttp | Self::RustNative | Self::RustNativeFfi
+        )
     }
 }
 
@@ -149,6 +192,9 @@ struct Args {
     /// JSON corpus file.
     #[arg(long, default_value = DEFAULT_CORPUS)]
     corpus: PathBuf,
+    /// Optional newline-delimited ENS names to resolve into live /ipfs or /ipns corpus entries.
+    #[arg(long)]
+    ens_corpus: Option<PathBuf>,
     /// Optional case id filter; can be passed more than once.
     #[arg(long = "case")]
     cases: Vec<String>,
@@ -191,6 +237,27 @@ struct Args {
     /// Concurrent subresource fetches for page crawls.
     #[arg(long, default_value_t = DEFAULT_ASSET_CONCURRENCY)]
     asset_concurrency: usize,
+    /// Native FFI event dispatcher worker count for --engine rust-native-ffi.
+    #[arg(long, default_value_t = DEFAULT_NATIVE_FFI_DISPATCHERS)]
+    native_dispatchers: usize,
+    /// Caller-owned native FFI read buffer size for --engine rust-native-ffi.
+    #[arg(long, default_value_t = DEFAULT_NATIVE_FFI_READ_BUFFER_BYTES)]
+    native_read_buffer_bytes: usize,
+    /// Artificial delay after every native FFI read, to model a slow Swift/WebKit consumer.
+    #[arg(long, default_value_t = 0)]
+    native_slow_consumer_ms: u64,
+    /// Cancel every native FFI request after its first body bytes are read.
+    #[arg(long)]
+    native_cancel_after_first_byte: bool,
+    /// Cancel every native FFI request once this many milliseconds have elapsed.
+    #[arg(long)]
+    native_cancel_after_ms: Option<u64>,
+    /// Stop the native FFI node during each measured run after this many milliseconds.
+    #[arg(long)]
+    native_stop_node_mid_run_ms: Option<u64>,
+    /// Lab-only cap before starting native FFI handles; avoids starting handles that will not be drained.
+    #[arg(long)]
+    native_max_active_requests: Option<usize>,
     /// Re-fetch successful non-range GETs with If-None-Match when the first response has an ETag.
     #[arg(long)]
     conditional_revalidate: bool,
@@ -218,7 +285,10 @@ async fn main() -> Result<()> {
         prepare_synthetic_multiblock_range_fixture(&args.kubo_bin, fixture_dir)?;
         return Ok(());
     }
-    let corpus = Corpus::read(&args.corpus)?;
+    let mut corpus = Corpus::read(&args.corpus)?;
+    if let Some(ens_corpus) = &args.ens_corpus {
+        extend_corpus_with_ens_names(&mut corpus, ens_corpus).await?;
+    }
 
     if args.offline_replay {
         let report = run_offline_replay(&args, &corpus).await?;
@@ -708,8 +778,16 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
     if args.gateway_url.is_some() && args.fresh_gateway_per_run {
         bail!("--fresh-gateway-per-run cannot be used with --gateway-url");
     }
-    if args.gateway_url.is_some() && args.engine == HarnessEngine::RustNative {
-        bail!("--gateway-url cannot be used with --engine rust-native");
+    if args.gateway_url.is_some()
+        && matches!(
+            args.engine,
+            HarnessEngine::RustNative | HarnessEngine::RustNativeFfi
+        )
+    {
+        bail!(
+            "--gateway-url cannot be used with --engine {}",
+            args.engine.as_str()
+        );
     }
     if args.gateway_url.is_some() && args.gateway_db.is_some() {
         bail!("--gateway-db can only be used when the harness spawns the gateway");
@@ -788,8 +866,14 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             }
         }
     }
+    if args.native_read_buffer_bytes == 0 {
+        bail!("--native-read-buffer-bytes must be greater than zero");
+    }
     if args.engine == HarnessEngine::RustNative {
         return run_native_harness(args, corpus).await;
+    }
+    if args.engine == HarnessEngine::RustNativeFfi {
+        return run_native_ffi_harness(args, corpus).await;
     }
 
     let timeout = Duration::from_secs(args.timeout_secs);
@@ -918,6 +1002,7 @@ async fn run_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             gateway_storage_path,
             bitswap_seed_connect_elapsed_ms,
             kubo_bitswap_stats,
+            native_ffi: None,
             passed,
             results,
         });
@@ -1077,6 +1162,173 @@ async fn run_native_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
             gateway_storage_path,
             bitswap_seed_connect_elapsed_ms: None,
             kubo_bitswap_stats: None,
+            native_ffi: None,
+            passed,
+            results,
+        });
+
+        if let Some(mut gateway) = run_gateway {
+            gateway.stop().await;
+        }
+        if let Some(mut seed) = run_seed {
+            seed.stop().await;
+        }
+    }
+
+    if let Some(mut gateway) = persistent_gateway {
+        gateway.stop().await;
+    }
+    if let Some(mut seed) = persistent_seed {
+        seed.stop().await;
+    }
+
+    let summary = RepeatSummary::from_runs(&runs);
+    let trace_summary = args
+        .trace_output
+        .as_ref()
+        .map(summarize_trace_output)
+        .transpose()?;
+    let trace_requirements = trace_requirements_report(trace_summary.as_ref(), args)?;
+    Ok(RunReport {
+        gateway_url: persistent_gateway_url,
+        generated_at_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        repeat: measured_runs,
+        warmup_runs: args.warmup_runs,
+        fresh_gateway_per_run: args.fresh_gateway_per_run,
+        asset_concurrency: args.asset_concurrency,
+        conditional_revalidate: args.conditional_revalidate,
+        run_timeout_secs: (args.run_timeout_secs > 0).then_some(args.run_timeout_secs),
+        engine: args.engine,
+        small_body_cache_max_bytes: Some(args.small_body_cache_max_bytes),
+        gateway_db: args
+            .gateway_db
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        gateway_import_car: args
+            .gateway_import_car
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        bitswap_seed_car: args
+            .bitswap_seed_car
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        bitswap_seed_connection_setup: bitswap_seed_connection_setup(args),
+        kubo_repo: None,
+        trace_output: args
+            .trace_output
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        trace_span_list: args.trace_output.as_ref().map(|_| args.trace_span_list),
+        trace_summary,
+        trace_requirements,
+        summary,
+        runs,
+    })
+}
+
+async fn run_native_ffi_harness(args: &Args, corpus: &Corpus) -> Result<RunReport> {
+    init_native_trace_output(args)?;
+    let run_timeout =
+        (args.run_timeout_secs > 0).then(|| Duration::from_secs(args.run_timeout_secs));
+    let measured_runs = args.repeat.max(1);
+    let total_runs = args.warmup_runs + measured_runs;
+    let gateway_url = "http://freedom-ipfs-native.local".to_string();
+    let mut persistent_gateway = None;
+    let mut persistent_seed = None;
+    let persistent_gateway_url = if args.fresh_gateway_per_run {
+        None
+    } else {
+        persistent_seed = BitswapSeed::start_optional(args).await?;
+        let gateway = NativeFfiGateway::start(args, persistent_seed.as_ref()).await?;
+        persistent_gateway = Some(gateway);
+        Some(gateway_url.clone())
+    };
+
+    let mut runs = Vec::new();
+    for sequence in 0..total_runs {
+        let phase = if sequence < args.warmup_runs {
+            RunPhase::Warmup
+        } else {
+            RunPhase::Measured
+        };
+        let run_index = match phase {
+            RunPhase::Warmup => sequence + 1,
+            RunPhase::Measured => sequence - args.warmup_runs + 1,
+        };
+
+        let mut run_gateway = None;
+        let mut run_seed = None;
+        let gateway = if let Some(gateway) = &persistent_gateway {
+            gateway.clone()
+        } else {
+            run_seed = BitswapSeed::start_optional(args).await?;
+            let gateway = NativeFfiGateway::start(args, run_seed.as_ref()).await?;
+            run_gateway = Some(gateway.clone());
+            gateway
+        };
+        let client = GatewayClient::NativeFfi(gateway.clone());
+
+        let stop_task = args.native_stop_node_mid_run_ms.map(|delay_ms| {
+            let gateway = gateway.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                gateway.stop_node();
+            })
+        });
+
+        let started = Instant::now();
+        let run = run_corpus_once_with_client(
+            &client,
+            &gateway_url,
+            corpus,
+            args.engine,
+            args.asset_concurrency,
+            args.conditional_revalidate,
+            &args.cases,
+        );
+        let results = if let Some(run_timeout) = run_timeout {
+            match tokio::time::timeout(run_timeout, run).await {
+                Ok(results) => results?,
+                Err(_) => {
+                    run_timeout_failure_results(&gateway_url, corpus, &args.cases, run_timeout)?
+                }
+            }
+        } else {
+            run.await?
+        };
+        if let Some(stop_task) = stop_task {
+            stop_task.abort();
+        }
+        let elapsed_ms = started.elapsed().as_millis();
+        let gateway_storage_bytes = if let Some(gateway) = run_gateway.as_ref() {
+            gateway.storage_bytes()
+        } else {
+            persistent_gateway
+                .as_ref()
+                .and_then(NativeFfiGateway::storage_bytes)
+        };
+        let gateway_storage_path = if let Some(gateway) = run_gateway.as_ref() {
+            gateway.storage_path()
+        } else {
+            persistent_gateway
+                .as_ref()
+                .and_then(NativeFfiGateway::storage_path)
+        };
+        let native_ffi = Some(gateway.report());
+        let passed = results.iter().all(|result| result.passed);
+        runs.push(RunResult {
+            phase,
+            run_index,
+            gateway_url: gateway_url.clone(),
+            elapsed_ms,
+            gateway_rss_kib: None,
+            gateway_fd_count: None,
+            gateway_child_process_count: None,
+            gateway_storage_bytes,
+            gateway_storage_path,
+            bitswap_seed_connect_elapsed_ms: None,
+            kubo_bitswap_stats: None,
+            native_ffi,
             passed,
             results,
         });
@@ -3537,6 +3789,7 @@ fn next_harness_request_id() -> u64 {
 enum GatewayClient {
     Http(reqwest::Client),
     Native(NativeGateway),
+    NativeFfi(NativeFfiGateway),
 }
 
 impl GatewayClient {
@@ -3562,6 +3815,11 @@ impl GatewayClient {
                 fetch_http_response(client, url, method, range, if_none_match, correlation).await
             }
             Self::Native(native) => {
+                native
+                    .fetch_response(url, method, range, if_none_match, correlation)
+                    .await
+            }
+            Self::NativeFfi(native) => {
                 native
                     .fetch_response(url, method, range, if_none_match, correlation)
                     .await
@@ -3754,6 +4012,945 @@ impl NativeGateway {
         self.storage_path
             .as_ref()
             .map(|path| path.display().to_string())
+    }
+}
+
+#[derive(Clone)]
+struct NativeFfiGateway {
+    transport: Arc<NativeFfiTransport>,
+    start_limit: Option<Arc<Semaphore>>,
+}
+
+impl NativeFfiGateway {
+    async fn start(args: &Args, bitswap_seed: Option<&BitswapSeed>) -> Result<Self> {
+        let storage_path = args
+            .gateway_db
+            .clone()
+            .unwrap_or_else(|| unique_temp_path("freedom-ipfs-native-ffi"));
+        std::fs::create_dir_all(&storage_path)
+            .with_context(|| format!("create native FFI data dir {}", storage_path.display()))?;
+        let storage_arg = CString::new(storage_path.display().to_string())
+            .context("native FFI data dir contains NUL byte")?;
+        let node = unsafe { freedom_ipfs_node_new_with_data_dir(storage_arg.as_ptr(), 0) };
+        if node.is_null() {
+            bail!("create native FFI node");
+        }
+
+        if let Some(import_car) = &args.gateway_import_car {
+            let bytes = std::fs::read(import_car)
+                .with_context(|| format!("read {}", import_car.display()))?;
+            let imported =
+                unsafe { freedom_ipfs_node_import_car(node, bytes.as_ptr(), bytes.len()) };
+            if !imported {
+                unsafe {
+                    freedom_ipfs_node_free(node);
+                }
+                bail!("native FFI node failed to import {}", import_car.display());
+            }
+            eprintln!(
+                "native FFI gateway imported CAR from {}",
+                import_car.display()
+            );
+        }
+
+        let routing_mode = native_ffi_routing_mode(args, bitswap_seed)?;
+        let delegated_router = bitswap_seed
+            .map(|seed| seed.router_endpoint.clone())
+            .or_else(|| args.delegated_router.clone());
+        let delegated_router_c = delegated_router
+            .map(CString::new)
+            .transpose()
+            .context("delegated router contains NUL byte")?;
+        let gateway_addr = CString::new("127.0.0.1:0").expect("static address has no NUL");
+        let node_addr = node as usize;
+        let max_concurrent_requests = args.max_concurrent_requests;
+        let dht_query_timeout_secs = args.dht_query_timeout_secs;
+        let dht_max_providers = args.dht_max_providers;
+        let started = tokio::task::spawn_blocking(move || unsafe {
+            freedom_ipfs_node_start_gateway_online_with_config_v2(
+                node_addr as *mut FreedomIpfsNode,
+                gateway_addr.as_ptr(),
+                delegated_router_c
+                    .as_ref()
+                    .map(|value| value.as_ptr())
+                    .unwrap_or(std::ptr::null()),
+                routing_mode,
+                max_concurrent_requests,
+                dht_query_timeout_secs,
+                dht_max_providers,
+            )
+        })
+        .await
+        .map_err(|err| anyhow!("join native FFI gateway start: {err}"))?;
+        if !started {
+            unsafe {
+                freedom_ipfs_node_free(node);
+            }
+            bail!("start native FFI gateway core");
+        }
+
+        let config = NativeFfiConfig {
+            dispatcher_count: args.native_dispatchers.max(1),
+            read_buffer_bytes: args.native_read_buffer_bytes.max(1),
+            slow_consumer_ms: args.native_slow_consumer_ms,
+            cancel_after_first_byte: args.native_cancel_after_first_byte,
+            cancel_after_ms: args.native_cancel_after_ms,
+            stop_node_mid_run_ms: args.native_stop_node_mid_run_ms,
+            max_active_request_limit: args.native_max_active_requests,
+        };
+        let transport =
+            NativeFfiTransport::start(node, storage_path, args.gateway_db.is_none(), config);
+        Ok(Self {
+            transport,
+            start_limit: args
+                .native_max_active_requests
+                .map(|limit| Arc::new(Semaphore::new(limit.max(1)))),
+        })
+    }
+
+    async fn fetch_response(
+        &self,
+        url: &str,
+        method: &str,
+        range: Option<&str>,
+        if_none_match: Option<&str>,
+        correlation: Option<&RequestCorrelation>,
+    ) -> std::result::Result<FetchResponse, String> {
+        let _permit = if let Some(limit) = &self.start_limit {
+            Some(
+                limit
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|err| err.to_string())?,
+            )
+        } else {
+            None
+        };
+        self.transport
+            .fetch_response(url, method, range, if_none_match, correlation)
+            .await
+    }
+
+    fn report(&self) -> NativeFfiTransportReport {
+        self.transport.report()
+    }
+
+    fn stop_node(&self) {
+        self.transport.stop_node();
+    }
+
+    async fn stop(&mut self) {
+        self.transport.shutdown();
+    }
+
+    fn storage_bytes(&self) -> Option<u64> {
+        storage_path_size_bytes(&self.transport.storage_path).ok()
+    }
+
+    fn storage_path(&self) -> Option<String> {
+        Some(self.transport.storage_path.display().to_string())
+    }
+}
+
+struct NativeFfiNode {
+    ptr: AtomicU64,
+}
+
+unsafe impl Send for NativeFfiNode {}
+unsafe impl Sync for NativeFfiNode {}
+
+impl NativeFfiNode {
+    fn new(ptr: *mut FreedomIpfsNode) -> Self {
+        Self {
+            ptr: AtomicU64::new(ptr as usize as u64),
+        }
+    }
+
+    fn ptr(&self) -> *mut FreedomIpfsNode {
+        self.ptr.load(Ordering::Acquire) as usize as *mut FreedomIpfsNode
+    }
+
+    fn stop_gateway(&self) {
+        let ptr = self.ptr();
+        if !ptr.is_null() {
+            unsafe {
+                let _ = freedom_ipfs_node_stop_gateway(ptr);
+            }
+        }
+    }
+
+    fn free_on_thread(&self) {
+        let ptr = self.ptr.swap(0, Ordering::AcqRel) as usize as *mut FreedomIpfsNode;
+        if ptr.is_null() {
+            return;
+        }
+        let ptr_addr = ptr as usize;
+        let _ = std::thread::spawn(move || unsafe {
+            let ptr = ptr_addr as *mut FreedomIpfsNode;
+            let _ = freedom_ipfs_node_stop_gateway(ptr);
+            freedom_ipfs_node_free(ptr);
+        })
+        .join();
+    }
+}
+
+impl Drop for NativeFfiNode {
+    fn drop(&mut self) {
+        self.free_on_thread();
+    }
+}
+
+struct NativeFfiTransport {
+    node: Arc<NativeFfiNode>,
+    storage_path: PathBuf,
+    remove_storage_on_stop: bool,
+    config: NativeFfiConfig,
+    state: Mutex<NativeFfiTransportState>,
+    stats: Mutex<NativeFfiStats>,
+    shutdown: AtomicBool,
+    dispatchers: Mutex<Vec<ThreadJoinHandle<()>>>,
+}
+
+#[derive(Clone, Copy)]
+struct NativeFfiConfig {
+    dispatcher_count: usize,
+    read_buffer_bytes: usize,
+    slow_consumer_ms: u64,
+    cancel_after_first_byte: bool,
+    cancel_after_ms: Option<u64>,
+    stop_node_mid_run_ms: Option<u64>,
+    max_active_request_limit: Option<usize>,
+}
+
+#[derive(Default)]
+struct NativeFfiTransportState {
+    active: HashMap<u64, NativeFfiActiveRequest>,
+    stashed_events: HashMap<u64, u32>,
+}
+
+struct NativeFfiActiveRequest {
+    started: Instant,
+    status: Option<StatusCode>,
+    headers: HeaderMap,
+    body: Vec<u8>,
+    stream: FetchStreamMetrics,
+    sender: Option<oneshot::Sender<std::result::Result<FetchResponse, String>>>,
+    servicing: bool,
+    deferred_events: u32,
+    cancelled_by_policy: bool,
+}
+
+#[derive(Default)]
+struct NativeFfiStats {
+    requests_started: u64,
+    responses_received: u64,
+    bodies_completed: u64,
+    cancelled_requests: u64,
+    failed_requests: u64,
+    freed_handles: u64,
+    max_active_handles: u64,
+    events_received: u64,
+    response_ready_events: u64,
+    body_ready_events: u64,
+    end_events: u64,
+    failed_events: u64,
+    cancelled_events: u64,
+    handle_freed_events: u64,
+    gateway_stopped_events: u64,
+    timeout_events: u64,
+    invalid_node_events: u64,
+    unknown_handle_events: u64,
+    stashed_unknown_handle_events: u64,
+    stale_events: u64,
+    event_service_collisions: u64,
+    read_calls: u64,
+    bytes_read: u64,
+    max_retained_response_body_bytes: u64,
+    last_error_code: Option<String>,
+    last_error_message: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NativeFfiStartRequest {
+    method: String,
+    path: String,
+    headers: Vec<NativeFfiHeader>,
+    request_id: Option<u64>,
+    parent_request_id: Option<u64>,
+    top_level_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct NativeFfiHeader {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeFfiResponseJson {
+    state: String,
+    status: Option<u16>,
+    headers: Vec<NativeFfiHeader>,
+    error: Option<NativeFfiErrorJson>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct NativeFfiErrorJson {
+    code: String,
+    message: String,
+}
+
+impl NativeFfiTransport {
+    fn start(
+        node: *mut FreedomIpfsNode,
+        storage_path: PathBuf,
+        remove_storage_on_stop: bool,
+        config: NativeFfiConfig,
+    ) -> Arc<Self> {
+        let transport = Arc::new(Self {
+            node: Arc::new(NativeFfiNode::new(node)),
+            storage_path,
+            remove_storage_on_stop,
+            config,
+            state: Mutex::new(NativeFfiTransportState::default()),
+            stats: Mutex::new(NativeFfiStats::default()),
+            shutdown: AtomicBool::new(false),
+            dispatchers: Mutex::new(Vec::new()),
+        });
+        let mut dispatchers = Vec::new();
+        for _ in 0..config.dispatcher_count {
+            let transport_clone = transport.clone();
+            dispatchers.push(std::thread::spawn(move || {
+                transport_clone.dispatch_loop();
+            }));
+        }
+        if let Ok(mut slots) = transport.dispatchers.lock() {
+            *slots = dispatchers;
+        }
+        transport
+    }
+
+    async fn fetch_response(
+        self: &Arc<Self>,
+        url: &str,
+        method: &str,
+        range: Option<&str>,
+        if_none_match: Option<&str>,
+        correlation: Option<&RequestCorrelation>,
+    ) -> std::result::Result<FetchResponse, String> {
+        let request = native_ffi_start_request(url, method, range, if_none_match, correlation)?;
+        let request_json = serde_json::to_string(&request).map_err(|err| err.to_string())?;
+        let request_json = CString::new(request_json).map_err(|err| err.to_string())?;
+        let handle =
+            unsafe { freedom_ipfs_gateway_request_start(self.node.ptr(), request_json.as_ptr()) };
+        if handle == 0 {
+            return Err("native FFI request failed to start".to_string());
+        }
+
+        let (sender, receiver) = oneshot::channel();
+        let stashed = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "native FFI state lock poisoned".to_string())?;
+            state.active.insert(
+                handle,
+                NativeFfiActiveRequest {
+                    started: Instant::now(),
+                    status: None,
+                    headers: HeaderMap::new(),
+                    body: Vec::new(),
+                    stream: FetchStreamMetrics::default(),
+                    sender: Some(sender),
+                    servicing: false,
+                    deferred_events: 0,
+                    cancelled_by_policy: false,
+                },
+            );
+            let active_len = state.active.len() as u64;
+            let stashed = state.stashed_events.remove(&handle);
+            drop(state);
+            if let Ok(mut stats) = self.stats.lock() {
+                stats.requests_started = stats.requests_started.saturating_add(1);
+                stats.max_active_handles = stats.max_active_handles.max(active_len);
+            }
+            stashed
+        };
+        if let Some(events) = stashed {
+            self.handle_event(handle, events);
+        }
+
+        receiver
+            .await
+            .map_err(|_| "native FFI response channel closed".to_string())?
+    }
+
+    fn dispatch_loop(self: Arc<Self>) {
+        while !self.shutdown.load(Ordering::Acquire) {
+            let event = unsafe {
+                freedom_ipfs_gateway_wait_next_event(self.node.ptr(), NATIVE_FFI_WAIT_TIMEOUT_MS)
+            };
+            match event.status {
+                FREEDOM_IPFS_GATEWAY_EVENT_STATUS_OK => {
+                    self.record_event_flags(event.events);
+                    self.handle_event(event.request_handle, event.events);
+                }
+                FREEDOM_IPFS_GATEWAY_EVENT_STATUS_TIMEOUT => {
+                    if let Ok(mut stats) = self.stats.lock() {
+                        stats.timeout_events = stats.timeout_events.saturating_add(1);
+                    }
+                }
+                FREEDOM_IPFS_GATEWAY_EVENT_STATUS_GATEWAY_STOPPED => {
+                    if let Ok(mut stats) = self.stats.lock() {
+                        stats.gateway_stopped_events =
+                            stats.gateway_stopped_events.saturating_add(1);
+                    }
+                    self.fail_all_active("gateway_stopped", "native FFI gateway stopped");
+                    if self.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+                FREEDOM_IPFS_GATEWAY_EVENT_STATUS_INVALID_NODE => {
+                    if let Ok(mut stats) = self.stats.lock() {
+                        stats.invalid_node_events = stats.invalid_node_events.saturating_add(1);
+                    }
+                    self.fail_all_active("invalid_node", "native FFI node is invalid");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn handle_event(&self, handle: u64, mut events: u32) {
+        loop {
+            let should_service = {
+                let mut state = match self.state.lock() {
+                    Ok(state) => state,
+                    Err(_) => return,
+                };
+                let Some(active) = state.active.get_mut(&handle) else {
+                    state
+                        .stashed_events
+                        .entry(handle)
+                        .and_modify(|pending| *pending |= events)
+                        .or_insert(events);
+                    if let Ok(mut stats) = self.stats.lock() {
+                        stats.unknown_handle_events = stats.unknown_handle_events.saturating_add(1);
+                        stats.stashed_unknown_handle_events =
+                            stats.stashed_unknown_handle_events.saturating_add(1);
+                    }
+                    return;
+                };
+                if active.servicing {
+                    active.deferred_events |= events;
+                    if let Ok(mut stats) = self.stats.lock() {
+                        stats.event_service_collisions =
+                            stats.event_service_collisions.saturating_add(1);
+                    }
+                    false
+                } else {
+                    active.servicing = true;
+                    true
+                }
+            };
+            if !should_service {
+                return;
+            }
+
+            self.service_active_once(handle, events);
+
+            let next_events = {
+                let mut state = match self.state.lock() {
+                    Ok(state) => state,
+                    Err(_) => return,
+                };
+                let Some(active) = state.active.get_mut(&handle) else {
+                    return;
+                };
+                active.servicing = false;
+                let next = active.deferred_events;
+                active.deferred_events = 0;
+                (next != 0).then_some(next)
+            };
+            if let Some(next_events) = next_events {
+                events = next_events;
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn service_active_once(&self, handle: u64, events: u32) {
+        if events & FREEDOM_IPFS_GATEWAY_EVENT_RESPONSE_READY != 0 {
+            match self.response_metadata(handle) {
+                Ok(metadata) => self.apply_response_metadata(handle, metadata),
+                Err(err) => self.finish_request(handle, Err(err)),
+            }
+        }
+
+        if events
+            & (FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY
+                | FREEDOM_IPFS_GATEWAY_EVENT_END
+                | FREEDOM_IPFS_GATEWAY_EVENT_FAILED
+                | FREEDOM_IPFS_GATEWAY_EVENT_CANCELLED
+                | FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED)
+            == 0
+        {
+            return;
+        }
+
+        let mut buffer = vec![0u8; self.config.read_buffer_bytes];
+        loop {
+            let read = unsafe {
+                freedom_ipfs_gateway_request_read(
+                    self.node.ptr(),
+                    handle,
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                )
+            };
+            self.record_read_call(read);
+            match read.status {
+                FREEDOM_IPFS_GATEWAY_READ_BYTES => {
+                    self.apply_body_bytes(handle, &buffer[..read.bytes_read]);
+                    if self.should_cancel_after_read(handle) {
+                        self.cancel_request(handle);
+                        break;
+                    }
+                    if self.config.slow_consumer_ms > 0 {
+                        std::thread::sleep(Duration::from_millis(self.config.slow_consumer_ms));
+                    }
+                }
+                FREEDOM_IPFS_GATEWAY_READ_PENDING => break,
+                FREEDOM_IPFS_GATEWAY_READ_END => {
+                    self.finish_success(handle);
+                    break;
+                }
+                FREEDOM_IPFS_GATEWAY_READ_CANCELLED => {
+                    self.finish_request(handle, Err("native FFI request cancelled".to_string()));
+                    break;
+                }
+                FREEDOM_IPFS_GATEWAY_READ_FAILED => {
+                    let err = self
+                        .response_metadata(handle)
+                        .ok()
+                        .and_then(|metadata| metadata.error)
+                        .map(|error| format!("{}: {}", error.code, error.message))
+                        .unwrap_or_else(|| "native FFI request failed".to_string());
+                    self.finish_request(handle, Err(err));
+                    break;
+                }
+                FREEDOM_IPFS_GATEWAY_READ_INVALID_HANDLE => {
+                    self.finish_request(handle, Err("native FFI invalid handle".to_string()));
+                    break;
+                }
+                status => {
+                    self.finish_request(
+                        handle,
+                        Err(format!("native FFI unknown read status {status}")),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    fn response_metadata(&self, handle: u64) -> std::result::Result<NativeFfiResponseJson, String> {
+        let ptr = unsafe { freedom_ipfs_gateway_request_response_json(self.node.ptr(), handle) };
+        if ptr.is_null() {
+            return Err("native FFI response metadata returned null".to_string());
+        }
+        let json = unsafe {
+            let value = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+            freedom_ipfs_string_free(ptr);
+            value
+        };
+        serde_json::from_str(&json).map_err(|err| format!("decode native FFI metadata: {err}"))
+    }
+
+    fn apply_response_metadata(&self, handle: u64, metadata: NativeFfiResponseJson) {
+        if let Some(error) = metadata.error.clone() {
+            if metadata.status.is_none() && metadata.state == "failed" {
+                self.record_error(&error.code, &error.message);
+            }
+        }
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        let Some(active) = state.active.get_mut(&handle) else {
+            return;
+        };
+        if let Some(status) = metadata
+            .status
+            .and_then(|status| StatusCode::from_u16(status).ok())
+        {
+            active.status = Some(status);
+        }
+        let mut headers = HeaderMap::new();
+        for header in metadata.headers {
+            let Ok(name) = HeaderName::from_bytes(header.name.as_bytes()) else {
+                continue;
+            };
+            let Ok(value) = HeaderValue::from_str(&header.value) else {
+                continue;
+            };
+            headers.insert(name, value);
+        }
+        active.headers = headers;
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.responses_received = stats.responses_received.saturating_add(1);
+        }
+    }
+
+    fn apply_body_bytes(&self, handle: u64, bytes: &[u8]) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        let Some(active) = state.active.get_mut(&handle) else {
+            return;
+        };
+        if active.stream.chunk_count == 0 {
+            active.stream.first_byte_ms = Some(active.started.elapsed().as_millis());
+        }
+        active.stream.chunk_count += 1;
+        active.stream.max_chunk_bytes = active.stream.max_chunk_bytes.max(bytes.len());
+        active.stream.max_buffered_bytes = active.stream.max_buffered_bytes.max(bytes.len());
+        active.body.extend_from_slice(bytes);
+        let body_len = active.body.len() as u64;
+        drop(state);
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.bytes_read = stats.bytes_read.saturating_add(bytes.len() as u64);
+            stats.max_retained_response_body_bytes =
+                stats.max_retained_response_body_bytes.max(body_len);
+        }
+    }
+
+    fn should_cancel_after_read(&self, handle: u64) -> bool {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return false,
+        };
+        let Some(active) = state.active.get_mut(&handle) else {
+            return false;
+        };
+        if active.cancelled_by_policy {
+            return false;
+        }
+        let cancel_after_first_byte =
+            self.config.cancel_after_first_byte && !active.body.is_empty();
+        let cancel_after_ms = self
+            .config
+            .cancel_after_ms
+            .is_some_and(|limit| active.started.elapsed() >= Duration::from_millis(limit));
+        if cancel_after_first_byte || cancel_after_ms {
+            active.cancelled_by_policy = true;
+            return true;
+        }
+        false
+    }
+
+    fn cancel_request(&self, handle: u64) {
+        let cancelled = unsafe { freedom_ipfs_gateway_request_cancel(self.node.ptr(), handle) };
+        if cancelled {
+            if let Ok(mut stats) = self.stats.lock() {
+                stats.cancelled_requests = stats.cancelled_requests.saturating_add(1);
+            }
+        }
+    }
+
+    fn finish_success(&self, handle: u64) {
+        let active = {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            state.active.remove(&handle)
+        };
+        let Some(mut active) = active else {
+            return;
+        };
+        active.stream.completed = true;
+        let response = match active.status {
+            Some(status) => Ok(fetch_response_from_parts(
+                status,
+                &active.headers,
+                active.body,
+                active
+                    .stream
+                    .first_byte_ms
+                    .unwrap_or_else(|| active.started.elapsed().as_millis()),
+                active.started.elapsed().as_millis(),
+                active.stream,
+            )),
+            None => Err("native FFI completed without response metadata".to_string()),
+        };
+        self.free_handle(handle);
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.bodies_completed = stats.bodies_completed.saturating_add(1);
+        }
+        if let Some(sender) = active.sender.take() {
+            let _ = sender.send(response);
+        }
+    }
+
+    fn finish_request(&self, handle: u64, result: std::result::Result<FetchResponse, String>) {
+        let active = {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            state.active.remove(&handle)
+        };
+        if let Some(mut active) = active {
+            if let Err(err) = &result {
+                self.record_error("native_ffi_request_failed", err);
+            }
+            self.free_handle(handle);
+            if let Ok(mut stats) = self.stats.lock() {
+                stats.failed_requests = stats.failed_requests.saturating_add(1);
+            }
+            if let Some(sender) = active.sender.take() {
+                let _ = sender.send(result);
+            }
+        }
+    }
+
+    fn fail_all_active(&self, code: &str, message: &str) {
+        let active = {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            std::mem::take(&mut state.active)
+        };
+        self.record_error(code, message);
+        for (handle, mut active) in active {
+            if let Some(sender) = active.sender.take() {
+                let _ = sender.send(Err(message.to_string()));
+            }
+            self.free_handle(handle);
+        }
+    }
+
+    fn free_handle(&self, handle: u64) {
+        let freed = unsafe { freedom_ipfs_gateway_request_free(self.node.ptr(), handle) };
+        if freed {
+            if let Ok(mut stats) = self.stats.lock() {
+                stats.freed_handles = stats.freed_handles.saturating_add(1);
+            }
+        }
+    }
+
+    fn record_event_flags(&self, events: u32) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.events_received = stats.events_received.saturating_add(1);
+            if events & FREEDOM_IPFS_GATEWAY_EVENT_RESPONSE_READY != 0 {
+                stats.response_ready_events = stats.response_ready_events.saturating_add(1);
+            }
+            if events & FREEDOM_IPFS_GATEWAY_EVENT_BODY_READY != 0 {
+                stats.body_ready_events = stats.body_ready_events.saturating_add(1);
+            }
+            if events & FREEDOM_IPFS_GATEWAY_EVENT_END != 0 {
+                stats.end_events = stats.end_events.saturating_add(1);
+            }
+            if events & FREEDOM_IPFS_GATEWAY_EVENT_FAILED != 0 {
+                stats.failed_events = stats.failed_events.saturating_add(1);
+            }
+            if events & FREEDOM_IPFS_GATEWAY_EVENT_CANCELLED != 0 {
+                stats.cancelled_events = stats.cancelled_events.saturating_add(1);
+            }
+            if events & FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED != 0 {
+                stats.handle_freed_events = stats.handle_freed_events.saturating_add(1);
+            }
+        }
+    }
+
+    fn record_read_call(&self, _read: FreedomIpfsGatewayReadResult) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.read_calls = stats.read_calls.saturating_add(1);
+        }
+    }
+
+    fn record_error(&self, code: &str, message: &str) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.last_error_code = Some(code.to_string());
+            stats.last_error_message = Some(message.chars().take(240).collect());
+        }
+    }
+
+    fn stop_node(&self) {
+        self.node.stop_gateway();
+    }
+
+    fn report(&self) -> NativeFfiTransportReport {
+        let active_handles_at_end = self
+            .state
+            .lock()
+            .map(|state| state.active.len() as u64)
+            .unwrap_or_default();
+        let stats = self.stats.lock().ok();
+        let stats = stats.as_deref();
+        NativeFfiTransportReport {
+            dispatcher_count: self.config.dispatcher_count,
+            read_buffer_bytes: self.config.read_buffer_bytes,
+            slow_consumer_ms: self.config.slow_consumer_ms,
+            cancel_after_first_byte: self.config.cancel_after_first_byte,
+            cancel_after_ms: self.config.cancel_after_ms,
+            stop_node_mid_run_ms: self.config.stop_node_mid_run_ms,
+            max_active_request_limit: self.config.max_active_request_limit,
+            requests_started: stats
+                .map(|stats| stats.requests_started)
+                .unwrap_or_default(),
+            responses_received: stats
+                .map(|stats| stats.responses_received)
+                .unwrap_or_default(),
+            bodies_completed: stats
+                .map(|stats| stats.bodies_completed)
+                .unwrap_or_default(),
+            cancelled_requests: stats
+                .map(|stats| stats.cancelled_requests)
+                .unwrap_or_default(),
+            failed_requests: stats.map(|stats| stats.failed_requests).unwrap_or_default(),
+            freed_handles: stats.map(|stats| stats.freed_handles).unwrap_or_default(),
+            active_handles_at_end,
+            max_active_handles: stats
+                .map(|stats| stats.max_active_handles)
+                .unwrap_or_default(),
+            events_received: stats.map(|stats| stats.events_received).unwrap_or_default(),
+            response_ready_events: stats
+                .map(|stats| stats.response_ready_events)
+                .unwrap_or_default(),
+            body_ready_events: stats
+                .map(|stats| stats.body_ready_events)
+                .unwrap_or_default(),
+            end_events: stats.map(|stats| stats.end_events).unwrap_or_default(),
+            failed_events: stats.map(|stats| stats.failed_events).unwrap_or_default(),
+            cancelled_events: stats
+                .map(|stats| stats.cancelled_events)
+                .unwrap_or_default(),
+            handle_freed_events: stats
+                .map(|stats| stats.handle_freed_events)
+                .unwrap_or_default(),
+            gateway_stopped_events: stats
+                .map(|stats| stats.gateway_stopped_events)
+                .unwrap_or_default(),
+            timeout_events: stats.map(|stats| stats.timeout_events).unwrap_or_default(),
+            invalid_node_events: stats
+                .map(|stats| stats.invalid_node_events)
+                .unwrap_or_default(),
+            unknown_handle_events: stats
+                .map(|stats| stats.unknown_handle_events)
+                .unwrap_or_default(),
+            stashed_unknown_handle_events: stats
+                .map(|stats| stats.stashed_unknown_handle_events)
+                .unwrap_or_default(),
+            stale_events: stats.map(|stats| stats.stale_events).unwrap_or_default(),
+            event_service_collisions: stats
+                .map(|stats| stats.event_service_collisions)
+                .unwrap_or_default(),
+            read_calls: stats.map(|stats| stats.read_calls).unwrap_or_default(),
+            bytes_read: stats.map(|stats| stats.bytes_read).unwrap_or_default(),
+            max_retained_response_body_bytes: stats
+                .map(|stats| stats.max_retained_response_body_bytes)
+                .unwrap_or_default(),
+            last_error_code: stats.and_then(|stats| stats.last_error_code.clone()),
+            last_error_message: stats.and_then(|stats| stats.last_error_message.clone()),
+        }
+    }
+
+    fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.stop_node();
+        if let Ok(mut dispatchers) = self.dispatchers.lock() {
+            for dispatcher in dispatchers.drain(..) {
+                let _ = dispatcher.join();
+            }
+        }
+        self.fail_all_active("native_ffi_shutdown", "native FFI transport shut down");
+        self.node.free_on_thread();
+        if self.remove_storage_on_stop {
+            let _ = std::fs::remove_dir_all(&self.storage_path);
+        }
+    }
+}
+
+impl Drop for NativeFfiTransport {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.node.stop_gateway();
+        if let Ok(mut dispatchers) = self.dispatchers.lock() {
+            for dispatcher in dispatchers.drain(..) {
+                let _ = dispatcher.join();
+            }
+        }
+        self.node.free_on_thread();
+        if self.remove_storage_on_stop {
+            let _ = std::fs::remove_dir_all(&self.storage_path);
+        }
+    }
+}
+
+fn native_ffi_start_request(
+    url: &str,
+    method: &str,
+    range: Option<&str>,
+    if_none_match: Option<&str>,
+    correlation: Option<&RequestCorrelation>,
+) -> std::result::Result<NativeFfiStartRequest, String> {
+    let method = match method {
+        "GET" | "HEAD" => method,
+        other => {
+            return Err(format!(
+                "unsupported method {other}; only GET and HEAD are supported"
+            ))
+        }
+    };
+    let parsed = Url::parse(url).map_err(|err| err.to_string())?;
+    let path = percent_decode_path(parsed.path())?;
+    if !path.starts_with("/ipfs/") && !path.starts_with("/ipns/") {
+        return Err(format!(
+            "native FFI path must start with /ipfs/ or /ipns/: {url}"
+        ));
+    }
+    let mut headers = Vec::new();
+    if let Some(range) = range {
+        headers.push(NativeFfiHeader {
+            name: RANGE.as_str().to_string(),
+            value: range.to_string(),
+        });
+    }
+    if let Some(if_none_match) = if_none_match {
+        headers.push(NativeFfiHeader {
+            name: IF_NONE_MATCH.as_str().to_string(),
+            value: if_none_match.to_string(),
+        });
+    }
+    Ok(NativeFfiStartRequest {
+        method: method.to_string(),
+        path,
+        headers,
+        request_id: correlation.map(|correlation| correlation.request_id),
+        parent_request_id: correlation.and_then(|correlation| correlation.parent_id),
+        top_level_path: correlation.map(|correlation| correlation.top_level_path.clone()),
+    })
+}
+
+fn native_ffi_routing_mode(args: &Args, bitswap_seed: Option<&BitswapSeed>) -> Result<u32> {
+    if bitswap_seed.is_some() {
+        return Ok(FREEDOM_IPFS_ROUTING_MODE_DELEGATED);
+    }
+    match args.routing_mode.as_str() {
+        "auto" => Ok(FREEDOM_IPFS_ROUTING_MODE_AUTO),
+        "delegated" => Ok(FREEDOM_IPFS_ROUTING_MODE_DELEGATED),
+        "light-dht" | "light_dht" => Ok(FREEDOM_IPFS_ROUTING_MODE_LIGHT_DHT),
+        "offline" => Ok(FREEDOM_IPFS_ROUTING_MODE_OFFLINE),
+        other => bail!(
+            "unsupported routing mode {other:?}; expected auto, delegated, light-dht, or offline"
+        ),
     }
 }
 
@@ -5200,7 +6397,9 @@ impl SpawnedGateway {
     async fn start(args: &Args, bitswap_seed: Option<&BitswapSeed>) -> Result<Self> {
         match args.engine {
             HarnessEngine::RustHttp => Self::start_rust(args, bitswap_seed).await,
-            HarnessEngine::RustNative => bail!("rust-native does not spawn a gateway process"),
+            HarnessEngine::RustNative | HarnessEngine::RustNativeFfi => {
+                bail!("{} does not spawn a gateway process", args.engine.as_str())
+            }
             HarnessEngine::Kubo => Self::start_kubo(args, bitswap_seed).await,
         }
     }
@@ -5510,7 +6709,8 @@ fn unique_temp_path(prefix: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
-    std::env::temp_dir().join(format!("{prefix}-{}-{millis}", std::process::id()))
+    let id = NEXT_TEMP_PATH_ID.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{}-{millis}-{id}", std::process::id()))
 }
 
 fn offline_replay_trace_output(args: &Args, label: &str, temp_prefix: &str) -> Option<PathBuf> {
@@ -5805,6 +7005,138 @@ impl Corpus {
     }
 }
 
+async fn extend_corpus_with_ens_names(corpus: &mut Corpus, path: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read ENS corpus {}", path.display()))?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .context("build ENS resolver HTTP client")?;
+    let mut added = 0usize;
+    for line in text.lines() {
+        let name = line.split('#').next().unwrap_or("").trim();
+        if name.is_empty() {
+            continue;
+        }
+        match resolve_ens_contenthash_path(&client, name).await {
+            Ok(resolved_path) => {
+                eprintln!("resolved ENS corpus {name} -> {resolved_path}");
+                corpus
+                    .entries
+                    .push(ens_live_corpus_entry(name, &resolved_path));
+                added += 1;
+            }
+            Err(err) => {
+                eprintln!("skipping ENS corpus {name}: {err:#}");
+            }
+        }
+    }
+    if added == 0 {
+        bail!("no ENS corpus entries resolved from {}", path.display());
+    }
+    Ok(())
+}
+
+async fn resolve_ens_contenthash_path(client: &reqwest::Client, name: &str) -> Result<String> {
+    let url = format!("https://api.web3.bio/profile/ens/{name}");
+    let profile = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("request ENS profile for {name}"))?
+        .error_for_status()
+        .with_context(|| format!("ENS profile returned error for {name}"))?
+        .json::<EnsProfile>()
+        .await
+        .with_context(|| format!("decode ENS profile for {name}"))?;
+    let contenthash = profile
+        .contenthash
+        .with_context(|| format!("{name} has no contenthash"))?;
+    contenthash_to_gateway_path(&contenthash)
+        .with_context(|| format!("{name} has unsupported contenthash {contenthash}"))
+}
+
+fn contenthash_to_gateway_path(contenthash: &str) -> Option<String> {
+    let (namespace, path) = if let Some(path) = contenthash.strip_prefix("ipfs://") {
+        ("ipfs", path)
+    } else if let Some(path) = contenthash.strip_prefix("ipns://") {
+        ("ipns", path)
+    } else {
+        return None;
+    };
+    let path = path.trim_start_matches('/');
+    let path = path
+        .strip_prefix(&format!("{namespace}/"))
+        .unwrap_or(path)
+        .trim_start_matches('/');
+    if path.is_empty() {
+        None
+    } else {
+        Some(format!("/{namespace}/{path}"))
+    }
+}
+
+fn ens_live_corpus_entry(name: &str, path: &str) -> CorpusEntry {
+    CorpusEntry {
+        id: ens_live_case_id(name),
+        description: Some(format!(
+            "Live ENS contenthash target for {name}; resolved outside the gateway at harness startup."
+        )),
+        path: path.to_string(),
+        default_enabled: Some(true),
+        method: Some("GET".to_string()),
+        range: None,
+        crawl: Some(CrawlConfig {
+            max_assets: Some(32),
+            min_assets: Some(0),
+            max_failed_assets: Some(8),
+            same_origin_only: Some(true),
+            include_css_assets: Some(true),
+            asset_max_bytes: Some(2_000_000),
+        }),
+        expect_status: Some(200),
+        expect_content_type_prefix: None,
+        expect_content_range_prefix: None,
+        expect_content_length: None,
+        expect_accept_ranges: None,
+        expect_etag_prefix: None,
+        expect_cache_control: None,
+        expect_body_contains: None,
+        expect_body_bytes: None,
+        expect_body_sha256: None,
+        min_bytes: Some(1),
+        max_ttfb_ms: Some(120_000),
+    }
+}
+
+fn ens_live_case_id(name: &str) -> String {
+    let mut id = String::from("ens-");
+    let mut previous_dash = false;
+    for ch in name.chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            previous_dash = false;
+            Some(ch.to_ascii_lowercase())
+        } else if previous_dash {
+            None
+        } else {
+            previous_dash = true;
+            Some('-')
+        };
+        if let Some(ch) = next {
+            id.push(ch);
+        }
+    }
+    while id.ends_with('-') {
+        id.pop();
+    }
+    id
+}
+
+#[derive(Debug, Deserialize)]
+struct EnsProfile {
+    contenthash: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct CorpusEntry {
     id: String,
@@ -5882,7 +7214,7 @@ impl BitswapSeedConnectionSetup {
 fn bitswap_seed_connection_setup(args: &Args) -> Option<BitswapSeedConnectionSetup> {
     args.bitswap_seed_car.as_ref()?;
     match args.engine {
-        HarnessEngine::RustHttp | HarnessEngine::RustNative => {
+        HarnessEngine::RustHttp | HarnessEngine::RustNative | HarnessEngine::RustNativeFfi => {
             Some(BitswapSeedConnectionSetup::DelegatedRouterProviderLookup)
         }
         HarnessEngine::Kubo => Some(BitswapSeedConnectionSetup::SwarmConnectBeforeRequest),
@@ -5902,8 +7234,47 @@ struct RunResult {
     gateway_storage_path: Option<String>,
     bitswap_seed_connect_elapsed_ms: Option<u128>,
     kubo_bitswap_stats: Option<KuboBitswapStats>,
+    native_ffi: Option<NativeFfiTransportReport>,
     passed: bool,
     results: Vec<CaseResult>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct NativeFfiTransportReport {
+    dispatcher_count: usize,
+    read_buffer_bytes: usize,
+    slow_consumer_ms: u64,
+    cancel_after_first_byte: bool,
+    cancel_after_ms: Option<u64>,
+    stop_node_mid_run_ms: Option<u64>,
+    max_active_request_limit: Option<usize>,
+    requests_started: u64,
+    responses_received: u64,
+    bodies_completed: u64,
+    cancelled_requests: u64,
+    failed_requests: u64,
+    freed_handles: u64,
+    active_handles_at_end: u64,
+    max_active_handles: u64,
+    events_received: u64,
+    response_ready_events: u64,
+    body_ready_events: u64,
+    end_events: u64,
+    failed_events: u64,
+    cancelled_events: u64,
+    handle_freed_events: u64,
+    gateway_stopped_events: u64,
+    timeout_events: u64,
+    invalid_node_events: u64,
+    unknown_handle_events: u64,
+    stashed_unknown_handle_events: u64,
+    stale_events: u64,
+    event_service_collisions: u64,
+    read_calls: u64,
+    bytes_read: u64,
+    max_retained_response_body_bytes: u64,
+    last_error_code: Option<String>,
+    last_error_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -12815,8 +14186,61 @@ mod tests {
             .expect("parse rust-native engine");
         assert_eq!(native.engine, HarnessEngine::RustNative);
 
+        let ffi = Args::try_parse_from([
+            "mobile-web-harness",
+            "--engine",
+            "rust-native-ffi",
+            "--native-dispatchers",
+            "4",
+            "--native-read-buffer-bytes",
+            "8192",
+            "--native-slow-consumer-ms",
+            "3",
+            "--native-cancel-after-first-byte",
+            "--native-max-active-requests",
+            "12",
+            "--ens-corpus",
+            "docs/mobile-web-readiness/ens-live-corpus.txt",
+        ])
+        .expect("parse rust-native-ffi engine");
+        assert_eq!(ffi.engine, HarnessEngine::RustNativeFfi);
+        assert_eq!(ffi.native_dispatchers, 4);
+        assert_eq!(ffi.native_read_buffer_bytes, 8192);
+        assert_eq!(ffi.native_slow_consumer_ms, 3);
+        assert!(ffi.native_cancel_after_first_byte);
+        assert_eq!(ffi.native_max_active_requests, Some(12));
+        assert_eq!(
+            ffi.ens_corpus.as_deref(),
+            Some(Path::new("docs/mobile-web-readiness/ens-live-corpus.txt"))
+        );
+
         let legacy = Args::try_parse_from(["mobile-web-harness", "--engine", "rust"]).unwrap();
         assert_eq!(legacy.engine, HarnessEngine::RustHttp);
+    }
+
+    #[test]
+    fn ens_live_corpus_entries_use_gateway_paths() {
+        assert_eq!(
+            contenthash_to_gateway_path("ipfs://bafyroot/index.html").unwrap(),
+            "/ipfs/bafyroot/index.html"
+        );
+        assert_eq!(
+            contenthash_to_gateway_path("ipfs://ipfs/bafyroot").unwrap(),
+            "/ipfs/bafyroot"
+        );
+        assert_eq!(
+            contenthash_to_gateway_path("ipns://example.com").unwrap(),
+            "/ipns/example.com"
+        );
+        assert!(contenthash_to_gateway_path("https://example.com").is_none());
+
+        let entry = ens_live_corpus_entry("Beta.WalletBeat.eth", "/ipfs/bafyroot");
+        assert_eq!(entry.id, "ens-beta-walletbeat-eth");
+        assert_eq!(entry.path, "/ipfs/bafyroot");
+        assert_eq!(entry.default_enabled, Some(true));
+        assert_eq!(entry.expect_status, Some(200));
+        assert_eq!(entry.min_bytes, Some(1));
+        assert!(entry.crawl.is_some());
     }
 
     #[test]
@@ -15711,6 +17135,395 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn native_ffi_engine_fetches_imported_block_through_event_mux() {
+        let _guard = native_ffi_harness_test_guard().await;
+        let data = b"native ffi harness body".to_vec();
+        let cid = cid_from_data(CODEC_RAW, &data);
+        let store = SqliteBlockStore::in_memory(4 * 1024 * 1024).unwrap();
+        store.put_block(&cid, &data).unwrap();
+        let car = store.export_car().unwrap();
+        let car_path = unique_temp_path("native-ffi-harness.car");
+        std::fs::write(&car_path, car).unwrap();
+
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--engine",
+            "rust-native-ffi",
+            "--routing-mode",
+            "offline",
+            "--gateway-import-car",
+            car_path.to_str().unwrap(),
+            "--native-dispatchers",
+            "1",
+            "--native-read-buffer-bytes",
+            "5",
+        ])
+        .unwrap();
+        let corpus = Corpus {
+            entries: vec![CorpusEntry {
+                id: "native-ffi-raw-block".to_string(),
+                description: None,
+                path: format!("/ipfs/{cid}"),
+                default_enabled: Some(true),
+                method: Some("GET".to_string()),
+                range: None,
+                crawl: None,
+                expect_status: Some(200),
+                expect_content_type_prefix: None,
+                expect_content_range_prefix: None,
+                expect_content_length: Some(data.len() as u64),
+                expect_accept_ranges: Some("bytes".to_string()),
+                expect_etag_prefix: None,
+                expect_cache_control: None,
+                expect_body_contains: None,
+                expect_body_bytes: Some(data.len()),
+                expect_body_sha256: Some(sha256_hex(&data)),
+                min_bytes: None,
+                max_ttfb_ms: None,
+            }],
+        };
+
+        let report = run_harness(&args, &corpus).await.unwrap();
+        let _ = std::fs::remove_file(&car_path);
+        assert_eq!(report.engine, HarnessEngine::RustNativeFfi);
+        assert_eq!(report.summary.pass_count, 1);
+        assert_eq!(report.summary.fail_count, 0);
+        let native = report.runs[0]
+            .native_ffi
+            .as_ref()
+            .expect("native FFI report should be attached");
+        assert_eq!(native.dispatcher_count, 1);
+        assert_eq!(native.read_buffer_bytes, 5);
+        assert_eq!(native.requests_started, 1);
+        assert_eq!(native.bodies_completed, 1);
+        assert_eq!(native.active_handles_at_end, 0);
+        assert!(native.events_received > 0);
+        assert!(native.read_calls > 0);
+        assert_eq!(native.bytes_read, data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn native_ffi_engine_preserves_head_range_and_revalidation() {
+        let _guard = native_ffi_harness_test_guard().await;
+        let data = b"native ffi conditional and range body".to_vec();
+        let cid = cid_from_data(CODEC_RAW, &data);
+        let store = SqliteBlockStore::in_memory(4 * 1024 * 1024).unwrap();
+        store.put_block(&cid, &data).unwrap();
+        let car_path = unique_temp_path("native-ffi-headers-fixture.car");
+        std::fs::write(&car_path, store.export_car().unwrap()).unwrap();
+
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--engine",
+            "rust-native-ffi",
+            "--routing-mode",
+            "offline",
+            "--gateway-import-car",
+            car_path.to_str().unwrap(),
+            "--native-dispatchers",
+            "1",
+            "--native-read-buffer-bytes",
+            "4",
+            "--conditional-revalidate",
+        ])
+        .unwrap();
+        let path = format!("/ipfs/{cid}");
+        let corpus = Corpus {
+            entries: vec![
+                CorpusEntry {
+                    id: "native-ffi-conditional".to_string(),
+                    description: None,
+                    path: path.clone(),
+                    default_enabled: Some(true),
+                    method: Some("GET".to_string()),
+                    range: None,
+                    crawl: None,
+                    expect_status: Some(200),
+                    expect_content_type_prefix: None,
+                    expect_content_range_prefix: None,
+                    expect_content_length: Some(data.len() as u64),
+                    expect_accept_ranges: Some("bytes".to_string()),
+                    expect_etag_prefix: Some("\"fi1:".to_string()),
+                    expect_cache_control: Some("public, max-age=31536000, immutable".to_string()),
+                    expect_body_contains: None,
+                    expect_body_bytes: Some(data.len()),
+                    expect_body_sha256: Some(sha256_hex(&data)),
+                    min_bytes: None,
+                    max_ttfb_ms: None,
+                },
+                CorpusEntry {
+                    id: "native-ffi-range".to_string(),
+                    description: None,
+                    path: path.clone(),
+                    default_enabled: Some(true),
+                    method: Some("GET".to_string()),
+                    range: Some("bytes=3-10".to_string()),
+                    crawl: None,
+                    expect_status: Some(206),
+                    expect_content_type_prefix: None,
+                    expect_content_range_prefix: Some("bytes 3-10/".to_string()),
+                    expect_content_length: Some(8),
+                    expect_accept_ranges: Some("bytes".to_string()),
+                    expect_etag_prefix: Some("\"fi1:".to_string()),
+                    expect_cache_control: Some("public, max-age=31536000, immutable".to_string()),
+                    expect_body_contains: None,
+                    expect_body_bytes: Some(8),
+                    expect_body_sha256: Some(sha256_hex(&data[3..=10])),
+                    min_bytes: None,
+                    max_ttfb_ms: None,
+                },
+                CorpusEntry {
+                    id: "native-ffi-head".to_string(),
+                    description: None,
+                    path,
+                    default_enabled: Some(true),
+                    method: Some("HEAD".to_string()),
+                    range: None,
+                    crawl: None,
+                    expect_status: Some(200),
+                    expect_content_type_prefix: None,
+                    expect_content_range_prefix: None,
+                    expect_content_length: Some(data.len() as u64),
+                    expect_accept_ranges: Some("bytes".to_string()),
+                    expect_etag_prefix: Some("\"fi1:".to_string()),
+                    expect_cache_control: Some("public, max-age=31536000, immutable".to_string()),
+                    expect_body_contains: None,
+                    expect_body_bytes: Some(0),
+                    expect_body_sha256: None,
+                    min_bytes: None,
+                    max_ttfb_ms: None,
+                },
+            ],
+        };
+
+        let report = run_harness(&args, &corpus).await.unwrap();
+        let _ = std::fs::remove_file(&car_path);
+        assert_eq!(report.summary.fail_count, 0);
+        assert_eq!(report.runs[0].results.len(), 3);
+        assert!(
+            report.runs[0].results.iter().all(|result| result.passed),
+            "failures: {:?}",
+            report.runs[0]
+                .results
+                .iter()
+                .map(|result| (&result.id, &result.failures))
+                .collect::<Vec<_>>()
+        );
+        let conditional = report.runs[0]
+            .results
+            .iter()
+            .find(|result| result.id == "native-ffi-conditional")
+            .unwrap();
+        assert!(conditional.revalidation.as_ref().unwrap().passed);
+        assert_eq!(conditional.revalidation.as_ref().unwrap().status, Some(304));
+        let native = report.runs[0].native_ffi.as_ref().unwrap();
+        assert_eq!(native.requests_started, 4);
+        assert_eq!(native.bodies_completed, 4);
+        assert_eq!(native.active_handles_at_end, 0);
+    }
+
+    #[tokio::test]
+    async fn native_ffi_engine_drives_browser_fixture_with_one_and_four_dispatchers() {
+        let _guard = native_ffi_harness_test_guard().await;
+        let asset_count = 50usize;
+        let (car_path, corpus, expected_body_bytes) = native_ffi_browser_fixture(asset_count);
+
+        for dispatchers in [1usize, 4] {
+            let args = Args::try_parse_from([
+                "mobile-web-harness",
+                "--engine",
+                "rust-native-ffi",
+                "--routing-mode",
+                "offline",
+                "--gateway-import-car",
+                car_path.to_str().unwrap(),
+                "--native-dispatchers",
+                &dispatchers.to_string(),
+                "--native-read-buffer-bytes",
+                "7",
+            ])
+            .unwrap();
+            let report = run_harness(&args, &corpus).await.unwrap();
+            assert_eq!(
+                report.summary.pass_count,
+                1,
+                "failures: {:?}; first asset: {:?}",
+                report.runs[0].results[0].failures,
+                report.runs[0].results[0]
+                    .assets
+                    .first()
+                    .map(|asset| &asset.failures)
+            );
+            assert_eq!(report.summary.fail_count, 0);
+            let result = &report.runs[0].results[0];
+            assert_eq!(result.asset_summary.as_ref().unwrap().fetched, asset_count);
+            assert_eq!(result.asset_summary.as_ref().unwrap().failed, 0);
+            let native = report.runs[0]
+                .native_ffi
+                .as_ref()
+                .expect("native FFI report should be attached");
+            assert_eq!(native.dispatcher_count, dispatchers);
+            assert_eq!(native.requests_started, (asset_count + 1) as u64);
+            assert_eq!(native.bodies_completed, (asset_count + 1) as u64);
+            assert_eq!(native.active_handles_at_end, 0);
+            assert_eq!(native.bytes_read, expected_body_bytes as u64);
+            assert!(native.max_active_handles > 1);
+        }
+
+        let _ = std::fs::remove_file(&car_path);
+    }
+
+    #[tokio::test]
+    async fn native_ffi_engine_slow_consumer_completes_browser_fixture() {
+        let _guard = native_ffi_harness_test_guard().await;
+        let (car_path, corpus, _expected_body_bytes) = native_ffi_browser_fixture(20);
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--engine",
+            "rust-native-ffi",
+            "--routing-mode",
+            "offline",
+            "--gateway-import-car",
+            car_path.to_str().unwrap(),
+            "--native-dispatchers",
+            "1",
+            "--native-read-buffer-bytes",
+            "3",
+            "--native-slow-consumer-ms",
+            "1",
+        ])
+        .unwrap();
+        let report = run_harness(&args, &corpus).await.unwrap();
+        let _ = std::fs::remove_file(&car_path);
+        assert_eq!(
+            report.summary.pass_count, 1,
+            "failures: {:?}",
+            report.runs[0].results[0].failures
+        );
+        assert_eq!(report.summary.fail_count, 0);
+        let native = report.runs[0].native_ffi.as_ref().unwrap();
+        assert_eq!(native.dispatcher_count, 1);
+        assert_eq!(native.slow_consumer_ms, 1);
+        assert_eq!(native.active_handles_at_end, 0);
+        assert!(native.read_calls > native.requests_started);
+    }
+
+    #[tokio::test]
+    async fn native_ffi_engine_cancel_after_first_byte_returns_clean_terminal_state() {
+        let _guard = native_ffi_harness_test_guard().await;
+        let data = vec![42u8; 128 * 1024];
+        let cid = cid_from_data(CODEC_RAW, &data);
+        let store = SqliteBlockStore::in_memory(4 * 1024 * 1024).unwrap();
+        store.put_block(&cid, &data).unwrap();
+        let car_path = unique_temp_path("native-ffi-cancel-fixture.car");
+        std::fs::write(&car_path, store.export_car().unwrap()).unwrap();
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--engine",
+            "rust-native-ffi",
+            "--routing-mode",
+            "offline",
+            "--gateway-import-car",
+            car_path.to_str().unwrap(),
+            "--native-dispatchers",
+            "1",
+            "--native-read-buffer-bytes",
+            "4096",
+            "--native-cancel-after-first-byte",
+        ])
+        .unwrap();
+        let corpus = Corpus {
+            entries: vec![CorpusEntry {
+                id: "native-ffi-cancel".to_string(),
+                description: None,
+                path: format!("/ipfs/{cid}"),
+                default_enabled: Some(true),
+                method: Some("GET".to_string()),
+                range: None,
+                crawl: None,
+                expect_status: Some(200),
+                expect_content_type_prefix: None,
+                expect_content_range_prefix: None,
+                expect_content_length: Some(data.len() as u64),
+                expect_accept_ranges: Some("bytes".to_string()),
+                expect_etag_prefix: None,
+                expect_cache_control: None,
+                expect_body_contains: None,
+                expect_body_bytes: Some(data.len()),
+                expect_body_sha256: Some(sha256_hex(&data)),
+                min_bytes: None,
+                max_ttfb_ms: None,
+            }],
+        };
+
+        let report = run_harness(&args, &corpus).await.unwrap();
+        let _ = std::fs::remove_file(&car_path);
+        assert_eq!(report.summary.pass_count, 0);
+        assert_eq!(report.summary.fail_count, 1);
+        let native = report.runs[0].native_ffi.as_ref().unwrap();
+        assert_eq!(native.requests_started, 1);
+        assert!(native.cancelled_requests >= 1);
+        assert_eq!(native.active_handles_at_end, 0);
+        assert!(native.freed_handles >= 1);
+        assert!(native.bytes_read > 0);
+    }
+
+    fn native_ffi_browser_fixture(asset_count: usize) -> (PathBuf, Corpus, usize) {
+        let store = SqliteBlockStore::in_memory(16 * 1024 * 1024).unwrap();
+        let mut html = String::from("<!doctype html><title>native ffi fixture</title>\n");
+        let mut expected_body_bytes = 0usize;
+        for index in 0..asset_count {
+            let data = format!("native ffi asset {index:02}\n").into_bytes();
+            expected_body_bytes += data.len();
+            let cid = cid_from_data(CODEC_RAW, &data);
+            store.put_block(&cid, &data).unwrap();
+            html.push_str(&format!("<iframe src=\"/ipfs/{cid}\"></iframe>\n"));
+        }
+        let root = html.into_bytes();
+        expected_body_bytes += root.len();
+        let root_cid = cid_from_data(CODEC_RAW, &root);
+        store.put_block(&root_cid, &root).unwrap();
+        let car_path = unique_temp_path("native-ffi-browser-fixture.car");
+        std::fs::write(&car_path, store.export_car().unwrap()).unwrap();
+        let corpus = Corpus {
+            entries: vec![CorpusEntry {
+                id: "native-ffi-browser-fixture".to_string(),
+                description: Some("Synthetic browser-like native FFI fixture".to_string()),
+                path: format!("/ipfs/{root_cid}"),
+                default_enabled: Some(true),
+                method: Some("GET".to_string()),
+                range: None,
+                crawl: Some(CrawlConfig {
+                    max_assets: Some(asset_count),
+                    min_assets: Some(asset_count),
+                    max_failed_assets: Some(0),
+                    same_origin_only: Some(true),
+                    include_css_assets: Some(false),
+                    asset_max_bytes: Some(128 * 1024),
+                }),
+                expect_status: Some(200),
+                expect_content_type_prefix: None,
+                expect_content_range_prefix: None,
+                expect_content_length: Some(root.len() as u64),
+                expect_accept_ranges: Some("bytes".to_string()),
+                expect_etag_prefix: None,
+                expect_cache_control: None,
+                expect_body_contains: Some("native ffi fixture".to_string()),
+                expect_body_bytes: Some(root.len()),
+                expect_body_sha256: Some(sha256_hex(&root)),
+                min_bytes: None,
+                max_ttfb_ms: None,
+            }],
+        };
+        (car_path, corpus, expected_body_bytes)
+    }
+
+    async fn native_ffi_harness_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
+    }
+
     #[test]
     fn offline_replay_summary_collects_failed_roots_and_assets() {
         let mut run = run_result(
@@ -16894,6 +18707,7 @@ mod tests {
             gateway_storage_path: None,
             bitswap_seed_connect_elapsed_ms: None,
             kubo_bitswap_stats: None,
+            native_ffi: None,
             passed: true,
             results: vec![CaseResult {
                 id: "case".to_string(),
