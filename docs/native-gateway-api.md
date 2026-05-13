@@ -168,6 +168,9 @@ largest response body retained by the harness for validation. It also embeds a
 total started/completed/failed/cancelled/freed requests, native read bytes,
 event mux enqueue/delivery/coalescing counts, pending event queue depth, max
 event queue depth, stop generation, and last sanitized native error metadata.
+`stashed_event_handles_at_end` should be zero for normal successful runs; late
+events for handles already completed/freed are counted as stale instead of
+being retained in the app-side pre-registration stash.
 Body-channel occupancy is not yet exported; use per-response stream metrics,
 caller buffer size, and native FFI counters as the current boundedness signals.
 

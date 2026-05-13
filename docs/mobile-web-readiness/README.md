@@ -152,7 +152,9 @@ without Xcode. The nested `native_ffi.mobile_layer` object is the Rust mobile
 layer's own diagnostics snapshot: active handles, total started/completed/
 failed/cancelled/freed requests, native read bytes, event enqueue/delivery/
 coalescing counts, max and pending event queue depth, stop generation, and last
-sanitized native error metadata.
+sanitized native error metadata. `native_ffi.stashed_event_handles_at_end`
+should remain zero for normal successful runs; post-free readiness events are
+counted as stale rather than retained in the pre-registration stash.
 The harness still retains response bodies when needed for corpus validation,
 hashing, previews, or asset discovery; `stream.max_buffered_bytes` is the
 largest per-read adapter buffer/chunk, while `body_bytes` is the retained

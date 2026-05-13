@@ -83,6 +83,7 @@ const DEFAULT_NATIVE_TRACE_FILTER: &str =
 const DEFAULT_NATIVE_FFI_DISPATCHERS: usize = 1;
 const DEFAULT_NATIVE_FFI_READ_BUFFER_BYTES: usize = 64 * 1024;
 const NATIVE_FFI_WAIT_TIMEOUT_MS: u64 = 100;
+const NATIVE_FFI_COMPLETED_HANDLE_TOMBSTONE_LIMIT: usize = 4096;
 
 const FREEDOM_IPFS_ROUTING_MODE_AUTO: u32 = 0;
 const FREEDOM_IPFS_ROUTING_MODE_DELEGATED: u32 = 1;
@@ -4244,6 +4245,8 @@ struct NativeFfiConfig {
 struct NativeFfiTransportState {
     active: HashMap<u64, NativeFfiActiveRequest>,
     stashed_events: HashMap<u64, u32>,
+    completed_handles: HashSet<u64>,
+    completed_order: VecDeque<u64>,
 }
 
 struct NativeFfiActiveRequest {
@@ -4256,6 +4259,36 @@ struct NativeFfiActiveRequest {
     servicing: bool,
     deferred_events: u32,
     cancelled_by_policy: bool,
+}
+
+impl NativeFfiTransportState {
+    fn remove_active(&mut self, handle: u64) -> Option<NativeFfiActiveRequest> {
+        let active = self.active.remove(&handle);
+        if active.is_some() {
+            self.mark_completed(handle);
+        }
+        active
+    }
+
+    fn take_active(&mut self) -> HashMap<u64, NativeFfiActiveRequest> {
+        let active = std::mem::take(&mut self.active);
+        for handle in active.keys().copied() {
+            self.mark_completed(handle);
+        }
+        active
+    }
+
+    fn mark_completed(&mut self, handle: u64) {
+        self.stashed_events.remove(&handle);
+        if self.completed_handles.insert(handle) {
+            self.completed_order.push_back(handle);
+        }
+        while self.completed_order.len() > NATIVE_FFI_COMPLETED_HANDLE_TOMBSTONE_LIMIT {
+            if let Some(oldest) = self.completed_order.pop_front() {
+                self.completed_handles.remove(&oldest);
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -4448,6 +4481,17 @@ impl NativeFfiTransport {
                     Err(_) => return,
                 };
                 let Some(active) = state.active.get_mut(&handle) else {
+                    let completed_handle = state.completed_handles.contains(&handle);
+                    let free_without_registration =
+                        events & FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED != 0;
+                    if completed_handle || free_without_registration {
+                        if let Ok(mut stats) = self.stats.lock() {
+                            stats.unknown_handle_events =
+                                stats.unknown_handle_events.saturating_add(1);
+                            stats.stale_events = stats.stale_events.saturating_add(1);
+                        }
+                        return;
+                    }
                     state
                         .stashed_events
                         .entry(handle)
@@ -4711,7 +4755,7 @@ impl NativeFfiTransport {
                 Ok(state) => state,
                 Err(_) => return,
             };
-            state.active.remove(&handle)
+            state.remove_active(handle)
         };
         let Some(mut active) = active else {
             return;
@@ -4746,7 +4790,7 @@ impl NativeFfiTransport {
                 Ok(state) => state,
                 Err(_) => return,
             };
-            state.active.remove(&handle)
+            state.remove_active(handle)
         };
         if let Some(mut active) = active {
             if let Err(err) = &result {
@@ -4768,7 +4812,7 @@ impl NativeFfiTransport {
                 Ok(state) => state,
                 Err(_) => return,
             };
-            std::mem::take(&mut state.active)
+            state.take_active()
         };
         self.record_error(code, message);
         for (handle, mut active) in active {
@@ -4830,10 +4874,10 @@ impl NativeFfiTransport {
     }
 
     fn report(&self) -> NativeFfiTransportReport {
-        let active_handles_at_end = self
+        let (active_handles_at_end, stashed_event_handles_at_end) = self
             .state
             .lock()
-            .map(|state| state.active.len() as u64)
+            .map(|state| (state.active.len() as u64, state.stashed_events.len() as u64))
             .unwrap_or_default();
         let stats = self.stats.lock().ok();
         let stats = stats.as_deref();
@@ -4861,6 +4905,7 @@ impl NativeFfiTransport {
             failed_requests: stats.map(|stats| stats.failed_requests).unwrap_or_default(),
             freed_handles: stats.map(|stats| stats.freed_handles).unwrap_or_default(),
             active_handles_at_end,
+            stashed_event_handles_at_end,
             max_active_handles: stats
                 .map(|stats| stats.max_active_handles)
                 .unwrap_or_default(),
@@ -7300,6 +7345,7 @@ struct NativeFfiTransportReport {
     failed_requests: u64,
     freed_handles: u64,
     active_handles_at_end: u64,
+    stashed_event_handles_at_end: u64,
     max_active_handles: u64,
     events_received: u64,
     response_ready_events: u64,
@@ -17264,6 +17310,7 @@ mod tests {
         assert_eq!(native.requests_started, 1);
         assert_eq!(native.bodies_completed, 1);
         assert_eq!(native.active_handles_at_end, 0);
+        assert_eq!(native.stashed_event_handles_at_end, 0);
         assert!(native.events_received > 0);
         assert!(native.read_calls > 0);
         assert_eq!(native.bytes_read, data.len() as u64);
@@ -17275,6 +17322,69 @@ mod tests {
         assert_eq!(mobile.bytes_read, data.len() as u64);
         assert!(mobile.events_enqueued > 0);
         assert!(mobile.events_delivered > 0);
+    }
+
+    #[tokio::test]
+    async fn native_ffi_engine_drops_post_free_events_instead_of_stashing() {
+        let _guard = native_ffi_harness_test_guard().await;
+        let data = b"native ffi stale free event body".to_vec();
+        let cid = cid_from_data(CODEC_RAW, &data);
+        let store = SqliteBlockStore::in_memory(4 * 1024 * 1024).unwrap();
+        store.put_block(&cid, &data).unwrap();
+        let car_path = unique_temp_path("native-ffi-stale-free.car");
+        std::fs::write(&car_path, store.export_car().unwrap()).unwrap();
+
+        let args = Args::try_parse_from([
+            "mobile-web-harness",
+            "--engine",
+            "rust-native-ffi",
+            "--routing-mode",
+            "offline",
+            "--gateway-import-car",
+            car_path.to_str().unwrap(),
+            "--native-dispatchers",
+            "1",
+            "--native-read-buffer-bytes",
+            "5",
+        ])
+        .unwrap();
+        let mut gateway = NativeFfiGateway::start(&args, None).await.unwrap();
+        let client = GatewayClient::NativeFfi(gateway.clone());
+        let path = format!("/ipfs/{cid}");
+        let correlation = RequestCorrelation::root(path.clone());
+        let response = client
+            .fetch_response(
+                &format!("http://freedom-ipfs-native-ffi.local{path}"),
+                "GET",
+                None,
+                None,
+                Some(&correlation),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, data);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let native = loop {
+            let native = gateway.report();
+            if native.handle_freed_events > 0 || Instant::now() >= deadline {
+                break native;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(
+            native.handle_freed_events > 0,
+            "dispatcher did not observe post-free event: {native:?}"
+        );
+        assert_eq!(native.active_handles_at_end, 0);
+        assert_eq!(native.stashed_event_handles_at_end, 0);
+        assert!(
+            native.stale_events > 0,
+            "post-free event should be counted as stale instead of stashed: {native:?}"
+        );
+        gateway.stop().await;
+        let _ = std::fs::remove_file(&car_path);
     }
 
     #[tokio::test]
@@ -17395,6 +17505,7 @@ mod tests {
         assert_eq!(native.requests_started, 4);
         assert_eq!(native.bodies_completed, 4);
         assert_eq!(native.active_handles_at_end, 0);
+        assert_eq!(native.stashed_event_handles_at_end, 0);
     }
 
     #[tokio::test]
@@ -17446,6 +17557,7 @@ mod tests {
         assert_eq!(report.runs[0].results[0].status, Some(502));
         let native = report.runs[0].native_ffi.as_ref().unwrap();
         assert_eq!(native.active_handles_at_end, 0);
+        assert_eq!(native.stashed_event_handles_at_end, 0);
         let mobile = native.mobile_layer.as_ref().unwrap();
         assert_eq!(mobile.active_native_handles, 0);
         assert_eq!(mobile.total_started, 1);
@@ -17499,6 +17611,7 @@ mod tests {
             assert_eq!(native.requests_started, (asset_count + 1) as u64);
             assert_eq!(native.bodies_completed, (asset_count + 1) as u64);
             assert_eq!(native.active_handles_at_end, 0);
+            assert_eq!(native.stashed_event_handles_at_end, 0);
             assert_eq!(native.bytes_read, expected_body_bytes as u64);
             assert!(native.max_active_handles > 1);
             let mobile = native.mobile_layer.as_ref().unwrap();
@@ -17546,6 +17659,7 @@ mod tests {
         assert_eq!(native.dispatcher_count, 1);
         assert_eq!(native.slow_consumer_ms, 1);
         assert_eq!(native.active_handles_at_end, 0);
+        assert_eq!(native.stashed_event_handles_at_end, 0);
         assert!(native.read_calls > native.requests_started);
         let mobile = native.mobile_layer.as_ref().unwrap();
         assert_eq!(mobile.active_native_handles, 0);
@@ -17681,6 +17795,7 @@ mod tests {
         assert_eq!(native.dispatcher_count, 1);
         assert_eq!(native.requests_started, request_count as u64);
         assert_eq!(native.active_handles_at_end, 0);
+        assert_eq!(native.stashed_event_handles_at_end, 0);
         assert_eq!(native.cancelled_requests, request_count as u64);
         assert_eq!(native.freed_handles, request_count as u64);
         let mobile = native.mobile_layer.as_ref().unwrap();
@@ -17760,6 +17875,7 @@ mod tests {
             native,
         );
         assert_eq!(native.active_handles_at_end, 0);
+        assert_eq!(native.stashed_event_handles_at_end, 0);
         assert!(
             native.gateway_stopped_events > 0
                 || native.cancelled_requests > 0
