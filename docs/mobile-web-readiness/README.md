@@ -16,6 +16,17 @@ compatibility bugs, local fixes, and scenarios that should survive rebases.
 
 The black-box harness lives in `tools/mobile-web-harness`.
 
+The harness can exercise four gateway engines:
+
+- `rust-http`: current localhost HTTP gateway adapter.
+- `rust-native`: in-process `GatewayCore` adapter with no TCP listener and no
+  loopback HTTP requests.
+- `rust-native-ffi`: mobile FFI/event-mux adapter with no TCP listener and no
+  direct `GatewayCore` shortcut.
+- `kubo`: external Kubo daemon/gateway comparison engine.
+
+`--engine rust` remains an alias for `rust-http` for older command lines.
+
 Use an already-running gateway:
 
 ```sh
@@ -34,6 +45,63 @@ Or let it spawn the standalone gateway:
 cargo build -p freedom-ipfs-gateway
 cargo run -p mobile-web-harness -- --output /tmp/mobile-web-run.json
 ```
+
+Run the native Rust adapter directly, without binding a localhost gateway port:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --engine rust-native \
+  --case ipfs-tech-page-assets \
+  --repeat 5
+```
+
+Run the native FFI transport simulator, which drives the same request-handle and
+event-mux C ABI shape used by Swift:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --engine rust-native-ffi \
+  --gateway-import-car /tmp/mobile-web-multiblock.car \
+  --corpus /tmp/mobile-web-multiblock-corpus.json \
+  --routing-mode offline \
+  --native-dispatchers 1 \
+  --native-read-buffer-bytes 65536
+```
+
+Run the opt-in live ENS corpus by resolving ENS contenthashes outside the
+gateway and then loading the resulting `/ipfs` or `/ipns` paths:
+
+```sh
+cargo run -p mobile-web-harness -- \
+  --engine rust-native-ffi \
+  --ens-corpus docs/mobile-web-readiness/ens-live-corpus.txt \
+  --fresh-gateway-per-run \
+  --native-dispatchers 1 \
+  --repeat 3 \
+  --asset-concurrency 6 \
+  --timeout-secs 120 \
+  --run-timeout-secs 600 \
+  --output /tmp/native-ffi-ens-corpus.json
+```
+
+Native FFI stress knobs:
+
+- `--native-dispatchers 1|4` controls event dispatcher workers.
+- `--native-read-buffer-bytes N` controls the caller-owned read buffer.
+- `--native-slow-consumer-ms N` delays after each read.
+- `--native-cancel-after-first-byte` cancels after the first body bytes.
+- `--native-cancel-after-ms N` cancels by elapsed request time.
+- `--native-stop-node-mid-run-ms N` stops the node while requests are active.
+- `--native-max-active-requests N` is a lab-only cap before starting FFI handles.
+
+Use `rust-native` first with deterministic CAR-backed corpora when checking
+HTTP/native parity, then use `rust-native-ffi` to exercise the mobile transport
+layer itself. Live `rust-native` and `rust-native-ffi` runs use the same routing
+mode, delegated-router, DHT, request-concurrency, small-body-cache, and lab env
+knobs as spawned Rust HTTP gateways. `--trace-output` works for Rust engines:
+`rust-http` forwards trace settings to the spawned gateway process, while
+native engines install an in-process trace subscriber and write the same JSONL
+summary input.
 
 Run a focused case repeatedly and write an aggregate JSON report:
 
@@ -72,6 +140,25 @@ process count, and storage bytes so resource regressions are visible without
 manual per-run JSON parsing. Rust-vs-Kubo comparison output prints p50 and p95
 root/asset TTFB ratios plus max RSS, FD, and storage ratios for quick terminal
 triage.
+Rust engine reports also include per-response stream metrics for root requests,
+assets, and conditional revalidations: first body byte timing, chunk count,
+maximum chunk size, maximum bytes buffered by the harness adapter, and
+completion/cancellation flags. Case summaries aggregate those stream metrics so
+native engines can be checked for incremental behavior without reading every
+individual result row. `rust-native-ffi` additionally attaches a
+`native_ffi` object to each run with request, event, read, cancellation, free,
+active-handle, and retained-body counters for debugging the mobile transport
+without Xcode. The nested `native_ffi.mobile_layer` object is the Rust mobile
+layer's own diagnostics snapshot: active handles, total started/completed/
+failed/cancelled/freed requests, native read bytes, event enqueue/delivery/
+coalescing counts, max and pending event queue depth, stop generation, and last
+sanitized native error metadata. `native_ffi.stashed_event_handles_at_end`
+should remain zero for normal successful runs; post-free readiness events are
+counted as stale rather than retained in the pre-registration stash.
+The harness still retains response bodies when needed for corpus validation,
+hashing, previews, or asset discovery; `stream.max_buffered_bytes` is the
+largest per-read adapter buffer/chunk, while `body_bytes` is the retained
+validation body size.
 
 When testing local gateway or retrieval changes, pass `--build-gateway` so the
 harness runs `cargo build -p freedom-ipfs-gateway` before spawning the default
@@ -140,10 +227,12 @@ deep, first-chunk-boundary, and suffix range cases for the same CAR root. Run it
 without `--case` to cover all five shapes, or select a single case such as
 `multiblock-unixfs-range`.
 
-For gateway phase tracing, pass `--trace-output /tmp/run.jsonl`. When the
-harness spawns the Rust gateway it forwards this path to the gateway, parses the
-JSONL events, and adds raw phase and mobile-style progress phase summaries to
-the report. This is the preferred way to distinguish DNSLink/name resolution,
+For gateway phase tracing, pass `--trace-output /tmp/run.jsonl`. For
+`rust-http`, the harness forwards this path to the spawned gateway. For
+`rust-native`, it writes trace events from the in-process `GatewayCore` stack.
+The harness parses the JSONL events and adds raw phase and mobile-style progress
+phase summaries to the report. This is the preferred way to distinguish
+DNSLink/name resolution,
 provider lookup, cache checks, Bitswap fetch, HTTP-provider fetch, retry,
 UnixFS path traversal, MIME sniffing, conditional `304` handling, and gateway
 limiter behavior during live runs.

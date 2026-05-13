@@ -943,6 +943,7 @@ dependencies = [
  "freedom-ipfs-retrieval",
  "freedom-ipfs-routing",
  "freedom-ipfs-store",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",
@@ -2287,12 +2288,26 @@ name = "mobile-web-harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "axum",
+ "bytes",
+ "cid",
  "clap",
+ "freedom-ipfs-core",
+ "freedom-ipfs-gateway",
+ "freedom-ipfs-mobile",
+ "freedom-ipfs-namesys",
+ "freedom-ipfs-retrieval",
+ "freedom-ipfs-routing",
+ "freedom-ipfs-store",
+ "futures",
+ "http",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

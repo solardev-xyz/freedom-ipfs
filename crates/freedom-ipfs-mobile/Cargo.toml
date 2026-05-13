@@ -17,6 +17,7 @@ freedom-ipfs-namesys.workspace = true
 freedom-ipfs-retrieval.workspace = true
 freedom-ipfs-routing.workspace = true
 freedom-ipfs-store.workspace = true
+futures.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
