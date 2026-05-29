@@ -1804,6 +1804,47 @@ pub unsafe extern "C" fn freedom_ipfs_node_restart_gateway_online_with_config_v2
     }
 }
 
+/// # Safety
+///
+/// `ptr` must be a valid node pointer. `delegated_router` may be null to use
+/// the default delegated routing endpoint, otherwise it must point to a
+/// NUL-terminated UTF-8 URL string or comma-separated URL list.
+/// `routing_mode` must be one of the `FREEDOM_IPFS_ROUTING_MODE_*` constants
+/// from the C header. This configures the native request/event API for online
+/// retrieval without binding the loopback HTTP gateway.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_node_start_native_gateway_online_with_config_v2(
+    ptr: *mut FreedomIpfsNode,
+    delegated_router: *const c_char,
+    routing_mode: u32,
+    max_concurrent_requests: usize,
+    dht_query_timeout_secs: u64,
+    dht_max_providers: usize,
+) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
+    let node = &*ptr;
+    let addr = CString::new("127.0.0.1:0").expect("static addr has no nul");
+    let Some(parts) = gateway_router_for_routing_mode(
+        node,
+        addr.as_ptr(),
+        delegated_router,
+        routing_mode,
+        max_concurrent_requests,
+        dht_query_timeout_secs,
+        dht_max_providers,
+    ) else {
+        return false;
+    };
+
+    stop_preloads(node);
+    stop_gateway(node);
+    set_native_gateway_core(node, parts.native_gateway);
+    set_online_stats(node, parts.retrieval_provider, parts.routing_stats);
+    true
+}
+
 struct OnlineGatewayParts {
     addr: SocketAddr,
     router: axum::Router,
@@ -3140,6 +3181,50 @@ mod tests {
     }
 
     #[test]
+    fn starts_native_online_gateway_without_binding_http_gateway() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let data = b"native online gateway without loopback";
+            let cid = cid_from_data(CODEC_RAW, data);
+            (*node).store.put_block(&cid, data).unwrap();
+
+            assert!(
+                freedom_ipfs_node_start_native_gateway_online_with_config_v2(
+                    node,
+                    ptr::null(),
+                    ROUTING_MODE_OFFLINE,
+                    1,
+                    0,
+                    0,
+                )
+            );
+            assert!(freedom_ipfs_node_gateway_url(node).is_null());
+
+            let handle = start_native_gateway_request(
+                node,
+                json!({
+                    "method": "GET",
+                    "path": format!("/ipfs/{cid}")
+                }),
+            );
+            let metadata = wait_native_gateway_response(node, handle);
+            assert_eq!(metadata["status"], 200);
+            assert_eq!(read_native_gateway_body(node, handle, 8), data);
+            assert!(freedom_ipfs_gateway_request_free(node, handle));
+
+            let stats = native_gateway_stats_json(node);
+            assert_eq!(stats["active_native_handles"], 0);
+            assert_eq!(stats["total_started"], 1);
+            assert_eq!(stats["total_completed"], 1);
+            assert_eq!(stats["total_freed"], 1);
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
     fn offline_routing_mode_is_cache_only() {
         unsafe {
             let node = freedom_ipfs_node_new_in_memory();
@@ -3403,7 +3488,6 @@ mod tests {
             assert_eq!(value["event_count"].as_u64().unwrap(), events.len() as u64);
             assert!(
                 events.iter().any(|event| event["path"] == path
-                    && event["phase"] == "started"
                     && event["kind"] == "gateway_request"
                     && event["target_id"] == 4242
                     && event["parent_id"] == 7
@@ -3412,6 +3496,7 @@ mod tests {
             );
             assert!(
                 events.iter().any(|event| event["path"] == path
+                    && event["target_id"] == 4242
                     && event["phase"] == "completed"
                     && event["status"] == "completed"
                     && event["blocks_loaded"] == 0
