@@ -17,6 +17,11 @@
         "CLANG_CXX_LANGUAGE_STANDARD": "c++17",
         "MACOSX_DEPLOYMENT_TARGET": "11.0"
       },
+      "msvs_settings": {
+        "VCCLCompilerTool": {
+          "RuntimeLibrary": 2
+        }
+      },
       "conditions": [
         ["OS=='mac'", {
           "libraries": [
@@ -42,6 +47,8 @@
         ["OS=='win'", {
           "libraries": [
             "<(freedom_ipfs_rust_repo)/target/release/freedom_ipfs_mobile.lib",
+            "ucrt.lib",
+            "vcruntime.lib",
             "ws2_32.lib",
             "bcrypt.lib",
             "userenv.lib",
