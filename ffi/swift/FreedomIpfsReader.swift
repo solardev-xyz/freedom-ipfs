@@ -177,6 +177,14 @@ public final class FreedomIpfsReader {
         return String(cString: ptr)
     }
 
+    public static var buildInfoJSON: String {
+        guard let ptr = freedom_ipfs_build_info_json() else {
+            return "{}"
+        }
+        defer { freedom_ipfs_string_free(ptr) }
+        return String(cString: ptr)
+    }
+
     public func startGateway(address: String = "127.0.0.1:0") throws {
         guard let handle else {
             throw FreedomIpfsReaderError.invalidNode

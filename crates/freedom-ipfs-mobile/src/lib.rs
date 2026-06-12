@@ -35,6 +35,7 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Layer, Registry};
 
+const MOBILE_FFI_ABI_VERSION: u32 = 1;
 const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const LOW_MEMORY_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const CACHE_DB_FILE: &str = "freedom-ipfs.sqlite3";
@@ -1188,10 +1189,38 @@ pub extern "C" fn freedom_ipfs_version() -> *mut c_char {
         .into_raw()
 }
 
+#[no_mangle]
+pub extern "C" fn freedom_ipfs_build_info_json() -> *mut c_char {
+    let version = env!("CARGO_PKG_VERSION");
+    let json = serde_json::json!({
+        "name": "freedom-ipfs",
+        "version": version,
+        "release_tag": format!("v{version}"),
+        "mobile_ffi_abi_version": MOBILE_FFI_ABI_VERSION,
+        "git_commit": option_env!("FREEDOM_IPFS_GIT_COMMIT"),
+        "git_describe": option_env!("FREEDOM_IPFS_GIT_DESCRIBE"),
+        "target": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "family": std::env::consts::FAMILY
+        },
+        "features": {
+            "loopback_gateway": true,
+            "native_gateway": true,
+            "native_event_mux": true,
+            "native_gateway_stats": true,
+            "progress_snapshot": true
+        }
+    });
+    CString::new(json.to_string())
+        .expect("build info JSON has no nul")
+        .into_raw()
+}
+
 /// # Safety
 ///
-/// `ptr` must be a pointer returned by `freedom_ipfs_version` and must not be
-/// freed more than once.
+/// `ptr` must be a pointer returned by a Freedom IPFS string-returning
+/// function and must not be freed more than once.
 #[no_mangle]
 pub unsafe extern "C" fn freedom_ipfs_string_free(ptr: *mut c_char) {
     if !ptr.is_null() {
@@ -3074,6 +3103,39 @@ mod tests {
     use freedom_ipfs_store::CachedProviderRecord;
     use serde_json::json;
     use std::io::{Read, Write};
+
+    #[test]
+    fn version_and_build_info_match_release_contract() {
+        unsafe {
+            let version_ptr = freedom_ipfs_version();
+            assert!(!version_ptr.is_null());
+            let version = CStr::from_ptr(version_ptr).to_string_lossy().into_owned();
+            freedom_ipfs_string_free(version_ptr);
+
+            assert_eq!(version, env!("CARGO_PKG_VERSION"));
+
+            let build_info_ptr = freedom_ipfs_build_info_json();
+            assert!(!build_info_ptr.is_null());
+            let build_info_json = CStr::from_ptr(build_info_ptr)
+                .to_string_lossy()
+                .into_owned();
+            freedom_ipfs_string_free(build_info_ptr);
+
+            let build_info: serde_json::Value =
+                serde_json::from_str(&build_info_json).expect("build info should be JSON");
+            assert_eq!(build_info["name"], "freedom-ipfs");
+            assert_eq!(build_info["version"], version);
+            assert_eq!(build_info["release_tag"], format!("v{version}"));
+            assert_eq!(
+                build_info["mobile_ffi_abi_version"],
+                u64::from(MOBILE_FFI_ABI_VERSION)
+            );
+            assert_eq!(build_info["target"]["os"], std::env::consts::OS);
+            assert_eq!(build_info["target"]["arch"], std::env::consts::ARCH);
+            assert_eq!(build_info["features"]["native_gateway"], true);
+            assert_eq!(build_info["features"]["native_event_mux"], true);
+        }
+    }
 
     #[test]
     fn starts_gateway_and_reports_bound_url() {

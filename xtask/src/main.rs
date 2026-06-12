@@ -906,6 +906,7 @@ fn verify_exported_symbols(library: &Path) -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for symbol in [
         "freedom_ipfs_version",
+        "freedom_ipfs_build_info_json",
         "freedom_ipfs_node_new_with_data_dir",
         "freedom_ipfs_node_start_gateway_online_with_config_v2",
         "freedom_ipfs_node_restart_gateway_online_with_config_v2",

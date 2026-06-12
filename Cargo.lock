@@ -893,7 +893,7 @@ dependencies = [
 
 [[package]]
 name = "freedom-ipfs-core"
-version = "0.1.0"
+version = "0.4.1"
 dependencies = [
  "cid",
  "data-encoding",
@@ -905,7 +905,7 @@ dependencies = [
 
 [[package]]
 name = "freedom-ipfs-gateway"
-version = "0.1.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -934,7 +934,7 @@ dependencies = [
 
 [[package]]
 name = "freedom-ipfs-mobile"
-version = "0.1.0"
+version = "0.4.1"
 dependencies = [
  "axum",
  "freedom-ipfs-core",
@@ -955,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "freedom-ipfs-namesys"
-version = "0.1.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "cid",
@@ -975,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "freedom-ipfs-retrieval"
-version = "0.1.0"
+version = "0.4.1"
 dependencies = [
  "cid",
  "freedom-ipfs-core",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "freedom-ipfs-routing"
-version = "0.1.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "cid",
@@ -1024,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "freedom-ipfs-store"
-version = "0.1.0"
+version = "0.4.1"
 dependencies = [
  "cid",
  "freedom-ipfs-core",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "freedom-ipfs-unixfs"
-version = "0.1.0"
+version = "0.4.1"
 dependencies = [
  "cid",
  "freedom-ipfs-core",
@@ -2285,7 +2285,7 @@ dependencies = [
 
 [[package]]
 name = "mobile-web-harness"
-version = "0.1.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4620,7 +4620,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",

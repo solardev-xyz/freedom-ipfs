@@ -1,0 +1,74 @@
+name: Electron Addon
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/electron-addon.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "bindings/node/**"
+      - "crates/**"
+      - "ffi/**"
+      - "rust-toolchain.toml"
+      - "scripts/package-electron-addon.js"
+  pull_request:
+    paths:
+      - ".github/workflows/electron-addon.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "bindings/node/**"
+      - "crates/**"
+      - "ffi/**"
+      - "rust-toolchain.toml"
+      - "scripts/package-electron-addon.js"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Electron addon (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bindings/node/freedom-ipfs-node/package-lock.json
+
+      - name: Show toolchains
+        run: |
+          rustup show
+          cargo --version
+          rustc --version
+          node --version
+          npm --version
+
+      - name: Install addon dependencies
+        working-directory: bindings/node/freedom-ipfs-node
+        run: npm ci
+
+      - name: Build packaged addon
+        run: node scripts/package-electron-addon.js
+
+      - name: Smoke packaged addon
+        working-directory: bindings/node/freedom-ipfs-node
+        run: npm run smoke
+
+      - name: Upload addon artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: freedom-ipfs-node-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            target/electron-addon/freedom-ipfs-node-electron41-*.tar.gz
+            target/electron-addon/freedom-ipfs-node-electron41-*.tar.gz.sha256
+          if-no-files-found: error

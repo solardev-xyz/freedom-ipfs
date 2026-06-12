@@ -1,4 +1,6 @@
 /target/
+/bindings/node/freedom-ipfs-node/build/
+/bindings/node/freedom-ipfs-node/node_modules/
 /.idea/
 /.vscode/
 .DS_Store
