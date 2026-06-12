@@ -1,0 +1,20 @@
+{
+  "name": "@solardev-xyz/freedom-ipfs-node",
+  "version": "0.4.1",
+  "private": true,
+  "description": "Native Node/Electron binding for freedom-ipfs",
+  "license": "MIT OR Apache-2.0",
+  "gypfile": true,
+  "main": "build/Release/freedom_ipfs_native.node",
+  "scripts": {
+    "install": "node -e \"console.log('freedom-ipfs-node: install skips native build; run npm run build or scripts/package-electron-addon.js')\"",
+    "build": "node-gyp rebuild",
+    "smoke": "node smoke.js"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.5.0"
+  },
+  "devDependencies": {
+    "node-gyp": "^12.2.0"
+  }
+}
