@@ -78,6 +78,12 @@ function buildEnv() {
   if (process.platform === 'darwin' && !env.MACOSX_DEPLOYMENT_TARGET) {
     env.MACOSX_DEPLOYMENT_TARGET = '11.0';
   }
+  if (process.platform === 'win32') {
+    const staticCrtFlag = '-C target-feature=+crt-static';
+    env.RUSTFLAGS = env.RUSTFLAGS
+      ? `${env.RUSTFLAGS} ${staticCrtFlag}`
+      : staticCrtFlag;
+  }
   env.FREEDOM_IPFS_BUILD_GIT_COMMIT =
     env.FREEDOM_IPFS_BUILD_GIT_COMMIT || gitOutput(['rev-parse', '--short=12', 'HEAD']);
   env.FREEDOM_IPFS_BUILD_GIT_DESCRIBE =

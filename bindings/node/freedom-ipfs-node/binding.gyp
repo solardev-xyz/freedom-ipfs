@@ -19,7 +19,7 @@
       },
       "msvs_settings": {
         "VCCLCompilerTool": {
-          "RuntimeLibrary": 2
+          "RuntimeLibrary": 0
         }
       },
       "conditions": [
@@ -47,8 +47,6 @@
         ["OS=='win'", {
           "libraries": [
             "<(freedom_ipfs_rust_repo)/target/release/freedom_ipfs_mobile.lib",
-            "ucrt.lib",
-            "vcruntime.lib",
             "ws2_32.lib",
             "bcrypt.lib",
             "userenv.lib",
