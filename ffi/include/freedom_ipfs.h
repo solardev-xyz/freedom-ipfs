@@ -77,7 +77,16 @@ typedef struct FreedomIpfsDiagnostics {
 #define FREEDOM_IPFS_GATEWAY_EVENT_CANCELLED ((uint32_t)(1u << 4))
 #define FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED ((uint32_t)(1u << 5))
 
+/*
+ * Increment when the mobile/native C ABI changes incompatibly. Product release
+ * versions come from freedom_ipfs_version().
+ */
+#define FREEDOM_IPFS_MOBILE_FFI_ABI_VERSION ((uint32_t)1)
+
+/* Returns the canonical freedom-ipfs runtime version, matching the release tag without the leading "v". */
 char *freedom_ipfs_version(void);
+/* Returns compact JSON with runtime version, ABI version, target, optional git build metadata, and feature flags. */
+char *freedom_ipfs_build_info_json(void);
 void freedom_ipfs_string_free(char *ptr);
 
 FreedomIpfsNode *freedom_ipfs_node_new_in_memory(void);
