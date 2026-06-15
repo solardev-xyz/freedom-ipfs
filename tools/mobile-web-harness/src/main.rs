@@ -11,7 +11,7 @@ use freedom_ipfs_mobile::{
     freedom_ipfs_gateway_request_start, freedom_ipfs_gateway_wait_next_event,
     freedom_ipfs_node_free, freedom_ipfs_node_import_car,
     freedom_ipfs_node_native_gateway_stats_json, freedom_ipfs_node_new_with_data_dir,
-    freedom_ipfs_node_start_gateway_online_with_config_v3, freedom_ipfs_node_stop_gateway,
+    freedom_ipfs_node_start_native_gateway_online_with_config_v3, freedom_ipfs_node_stop_gateway,
     freedom_ipfs_string_free, FreedomIpfsGatewayReadResult, FreedomIpfsNode,
 };
 use freedom_ipfs_namesys::{
@@ -4048,9 +4048,7 @@ impl NativeFfiGateway {
             let imported =
                 unsafe { freedom_ipfs_node_import_car(node, bytes.as_ptr(), bytes.len()) };
             if !imported {
-                unsafe {
-                    freedom_ipfs_node_free(node);
-                }
+                free_native_ffi_node_on_thread(node);
                 bail!("native FFI node failed to import {}", import_car.display());
             }
             eprintln!(
@@ -4067,16 +4065,14 @@ impl NativeFfiGateway {
             .map(CString::new)
             .transpose()
             .context("delegated router contains NUL byte")?;
-        let gateway_addr = CString::new("127.0.0.1:0").expect("static address has no NUL");
         let node_addr = node as usize;
         let max_concurrent_requests = args.max_concurrent_requests;
         let dht_query_timeout_secs = args.dht_query_timeout_secs;
         let dht_max_providers = args.dht_max_providers;
         let request_queue_timeout_ms = args.request_queue_timeout_ms;
         let started = tokio::task::spawn_blocking(move || unsafe {
-            freedom_ipfs_node_start_gateway_online_with_config_v3(
+            freedom_ipfs_node_start_native_gateway_online_with_config_v3(
                 node_addr as *mut FreedomIpfsNode,
-                gateway_addr.as_ptr(),
                 delegated_router_c
                     .as_ref()
                     .map(|value| value.as_ptr())
@@ -4091,9 +4087,7 @@ impl NativeFfiGateway {
         .await
         .map_err(|err| anyhow!("join native FFI gateway start: {err}"))?;
         if !started {
-            unsafe {
-                freedom_ipfs_node_free(node);
-            }
+            free_native_ffi_node_on_thread(node);
             bail!("start native FFI gateway core");
         }
 
@@ -4167,6 +4161,17 @@ struct NativeFfiNode {
 
 unsafe impl Send for NativeFfiNode {}
 unsafe impl Sync for NativeFfiNode {}
+
+fn free_native_ffi_node_on_thread(ptr: *mut FreedomIpfsNode) {
+    if ptr.is_null() {
+        return;
+    }
+    let ptr_addr = ptr as usize;
+    let _ = std::thread::spawn(move || unsafe {
+        freedom_ipfs_node_free(ptr_addr as *mut FreedomIpfsNode);
+    })
+    .join();
+}
 
 impl NativeFfiNode {
     fn new(ptr: *mut FreedomIpfsNode) -> Self {
@@ -7385,6 +7390,7 @@ struct NativeFfiMobileStats {
     total_failed: u64,
     total_cancelled: u64,
     total_freed: u64,
+    total_gateway_busy_responses: u64,
     bytes_read: u64,
     max_active_handles: u64,
     events_enqueued: u64,
@@ -17328,6 +17334,7 @@ mod tests {
         assert_eq!(mobile.total_started, 1);
         assert_eq!(mobile.total_completed, 1);
         assert_eq!(mobile.total_freed, 1);
+        assert_eq!(mobile.total_gateway_busy_responses, 0);
         assert_eq!(mobile.bytes_read, data.len() as u64);
         assert!(mobile.events_enqueued > 0);
         assert!(mobile.events_delivered > 0);
@@ -17628,6 +17635,7 @@ mod tests {
             assert_eq!(mobile.total_started, (asset_count + 1) as u64);
             assert_eq!(mobile.total_completed, (asset_count + 1) as u64);
             assert_eq!(mobile.total_freed, (asset_count + 1) as u64);
+            assert_eq!(mobile.total_gateway_busy_responses, 0);
             assert_eq!(mobile.bytes_read, expected_body_bytes as u64);
             assert!(mobile.max_active_handles > 1);
             assert!(mobile.max_event_queue_depth > 0);

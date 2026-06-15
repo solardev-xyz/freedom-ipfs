@@ -3411,6 +3411,32 @@ mod tests {
     }
 
     #[test]
+    fn starts_native_online_gateway_v3_from_data_dir_with_delegated_routing() {
+        unsafe {
+            let tempdir = tempfile::tempdir().unwrap();
+            let data_dir = CString::new(tempdir.path().to_str().unwrap()).unwrap();
+            let node = freedom_ipfs_node_new_with_data_dir(data_dir.as_ptr(), 0);
+            assert!(!node.is_null());
+
+            let router = CString::new("http://127.0.0.1:9/routing/v1").unwrap();
+            assert!(
+                freedom_ipfs_node_start_native_gateway_online_with_config_v3(
+                    node,
+                    router.as_ptr(),
+                    ROUTING_MODE_DELEGATED,
+                    1,
+                    5,
+                    2,
+                    50,
+                )
+            );
+
+            assert!(freedom_ipfs_node_gateway_url(node).is_null());
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
     fn starts_native_online_gateway_without_binding_http_gateway() {
         unsafe {
             let node = freedom_ipfs_node_new_in_memory();
@@ -3449,6 +3475,47 @@ mod tests {
             assert_eq!(stats["total_started"], 1);
             assert_eq!(stats["total_completed"], 1);
             assert_eq!(stats["total_freed"], 1);
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
+    fn starts_native_online_gateway_v3_from_data_dir_without_binding_http_gateway() {
+        unsafe {
+            let tempdir = tempfile::tempdir().unwrap();
+            let data_dir = CString::new(tempdir.path().to_str().unwrap()).unwrap();
+            let node = freedom_ipfs_node_new_with_data_dir(data_dir.as_ptr(), 1024 * 1024);
+            assert!(!node.is_null());
+
+            let data = b"native online gateway v3 data dir";
+            let cid = cid_from_data(CODEC_RAW, data);
+            (*node).store.put_block(&cid, data).unwrap();
+
+            assert!(
+                freedom_ipfs_node_start_native_gateway_online_with_config_v3(
+                    node,
+                    ptr::null(),
+                    ROUTING_MODE_OFFLINE,
+                    1,
+                    0,
+                    0,
+                    50,
+                )
+            );
+            assert!(freedom_ipfs_node_gateway_url(node).is_null());
+
+            let handle = start_native_gateway_request(
+                node,
+                json!({
+                    "method": "GET",
+                    "path": format!("/ipfs/{cid}")
+                }),
+            );
+            let metadata = wait_native_gateway_response(node, handle);
+            assert_eq!(metadata["status"], 200);
+            assert_eq!(read_native_gateway_body(node, handle, 8), data);
+            assert!(freedom_ipfs_gateway_request_free(node, handle));
 
             freedom_ipfs_node_free(node);
         }
