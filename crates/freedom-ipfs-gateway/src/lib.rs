@@ -2,7 +2,7 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
-    RANGE,
+    RANGE, RETRY_AFTER,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -30,7 +30,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
 pub const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
-const GATEWAY_REQUEST_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+pub const DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT_MS: u64 = 2_000;
+pub const DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 const GATEWAY_STREAM_CHUNK_SIZE: u64 = 64 * 1024;
 const GATEWAY_SMALL_BODY_CACHE_MAX_ENTRY_BYTES: usize = GATEWAY_STREAM_CHUNK_SIZE as usize;
 pub const DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -48,6 +49,7 @@ const GATEWAY_HTML_RANGE_WARM_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 const X_FREEDOM_REQUEST_ID: &str = "x-freedom-request-id";
 const X_FREEDOM_PARENT_REQUEST_ID: &str = "x-freedom-parent-request-id";
 const X_FREEDOM_TOP_LEVEL_PATH: &str = "x-freedom-top-level-path";
+const X_FREEDOM_IPFS_ERROR_CODE: &str = "x-freedom-ipfs-error-code";
 const CACHE_CONTROL_IPFS_FILE: &str = "public, max-age=31536000, immutable";
 const CACHE_CONTROL_IPNS_FILE: &str = "no-cache";
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -182,6 +184,7 @@ fn touch_small_body_cache_order(inner: &mut SmallBodyCacheInner, key: &SmallBody
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     max_concurrent_requests: usize,
+    request_queue_timeout: Duration,
     unixfs_metadata_cache_capacity: usize,
     small_body_cache_max_bytes: usize,
     html_prefetch: GatewayHtmlPrefetchConfig,
@@ -195,6 +198,7 @@ impl GatewayConfig {
     pub fn new(max_concurrent_requests: usize) -> Self {
         Self {
             max_concurrent_requests: max_concurrent_requests.max(1),
+            request_queue_timeout: DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT,
             unixfs_metadata_cache_capacity: DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY,
             small_body_cache_max_bytes: DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
             html_prefetch: GatewayHtmlPrefetchConfig::default(),
@@ -207,6 +211,15 @@ impl GatewayConfig {
 
     pub fn max_concurrent_requests(&self) -> usize {
         self.max_concurrent_requests
+    }
+
+    pub fn request_queue_timeout(&self) -> Duration {
+        self.request_queue_timeout
+    }
+
+    pub fn with_request_queue_timeout(mut self, timeout: Duration) -> Self {
+        self.request_queue_timeout = timeout;
+        self
     }
 
     pub fn unixfs_metadata_cache_capacity(&self) -> usize {
@@ -479,6 +492,7 @@ pub struct GatewayState {
     name_resolver: Arc<dyn NameResolver>,
     unixfs: UnixfsResolver,
     request_limiter: Arc<Semaphore>,
+    request_queue_timeout: Duration,
     small_body_cache: Arc<SmallBodyCache>,
     html_prefetch: HtmlPrefetchRuntime,
     html_directory_prefetch: HtmlDirectoryPrefetchRuntime,
@@ -542,6 +556,7 @@ impl GatewayState {
             name_resolver,
             unixfs,
             request_limiter: Arc::new(Semaphore::new(config.max_concurrent_requests())),
+            request_queue_timeout: config.request_queue_timeout(),
             small_body_cache: Arc::new(SmallBodyCache::new(config.small_body_cache_max_bytes())),
             html_prefetch: HtmlPrefetchRuntime::new(config.html_prefetch()),
             html_directory_prefetch: HtmlDirectoryPrefetchRuntime::new(
@@ -898,8 +913,12 @@ async fn handle_gateway_core_request(state: GatewayState, request: GatewayCoreRe
         let request_started = Instant::now();
         tracing::info!(phase = "request_start", request_id, path = %request_path);
 
-        let Some(_permit) =
-            acquire_gateway_request_permit(state.request_limiter.clone(), request_id).await
+        let Some(_permit) = acquire_gateway_request_permit(
+            state.request_limiter.clone(),
+            state.request_queue_timeout,
+            request_id,
+        )
+        .await
         else {
             let response = gateway_error(GatewayError::Busy);
             tracing::info!(
@@ -1039,16 +1058,17 @@ fn html_range_warm_runtime(
 
 async fn acquire_gateway_request_permit(
     limiter: Arc<Semaphore>,
+    timeout: Duration,
     request_id: u64,
 ) -> Option<OwnedSemaphorePermit> {
     let limiter_started = Instant::now();
-    match tokio::time::timeout(GATEWAY_REQUEST_QUEUE_TIMEOUT, limiter.acquire_owned()).await {
+    match tokio::time::timeout(timeout, limiter.acquire_owned()).await {
         Ok(Ok(permit)) => {
             tracing::info!(
                 phase = "gateway_limiter",
                 request_id,
                 acquired = true,
-                timeout_ms = GATEWAY_REQUEST_QUEUE_TIMEOUT.as_millis(),
+                timeout_ms = timeout.as_millis(),
                 elapsed_ms = limiter_started.elapsed().as_millis()
             );
             Some(permit)
@@ -1059,7 +1079,7 @@ async fn acquire_gateway_request_permit(
                 request_id,
                 acquired = false,
                 error = %err,
-                timeout_ms = GATEWAY_REQUEST_QUEUE_TIMEOUT.as_millis(),
+                timeout_ms = timeout.as_millis(),
                 elapsed_ms = limiter_started.elapsed().as_millis()
             );
             None
@@ -1069,7 +1089,7 @@ async fn acquire_gateway_request_permit(
                 phase = "gateway_limiter",
                 request_id,
                 acquired = false,
-                timeout_ms = GATEWAY_REQUEST_QUEUE_TIMEOUT.as_millis(),
+                timeout_ms = timeout.as_millis(),
                 elapsed_ms = limiter_started.elapsed().as_millis()
             );
             None
@@ -3332,47 +3352,75 @@ enum GatewayError {
 }
 
 fn gateway_error(err: GatewayError) -> Response {
-    let (status, title, detail) = match err {
-        GatewayError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "Bad Request", msg),
-        GatewayError::NotFound(msg) => (StatusCode::NOT_FOUND, "Not Found", msg),
+    let (status, title, detail, error_code, retry_after) = match err {
+        GatewayError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "Bad Request", msg, None, None),
+        GatewayError::NotFound(msg) => (StatusCode::NOT_FOUND, "Not Found", msg, None, None),
         GatewayError::Unixfs(UnixfsError::NotFound(_))
-        | GatewayError::Unixfs(UnixfsError::PathNotFound(_)) => {
-            (StatusCode::NOT_FOUND, "Not Found", "not found".into())
-        }
+        | GatewayError::Unixfs(UnixfsError::PathNotFound(_)) => (
+            StatusCode::NOT_FOUND,
+            "Not Found",
+            "not found".into(),
+            None,
+            None,
+        ),
         GatewayError::Unixfs(UnixfsError::IsDirectory) => (
             StatusCode::BAD_REQUEST,
             "Bad Request",
             "directory path could not be served".into(),
+            None,
+            None,
         ),
         GatewayError::Unixfs(err) if is_timeout_error(&err) => (
             StatusCode::GATEWAY_TIMEOUT,
             "Gateway Timeout",
             format!("retrieval timeout: {err}"),
+            None,
+            None,
         ),
         GatewayError::Unixfs(err) => (
             StatusCode::BAD_GATEWAY,
             "Bad Gateway",
             format!("unixfs error: {err}"),
+            None,
+            None,
         ),
         GatewayError::RangeNotSatisfiable => (
             StatusCode::RANGE_NOT_SATISFIABLE,
             "Range Not Satisfiable",
             "range not satisfiable".into(),
+            None,
+            None,
         ),
         GatewayError::Busy => (
             StatusCode::SERVICE_UNAVAILABLE,
             "Service Unavailable",
             "gateway busy".into(),
+            Some("gateway_busy"),
+            Some("1"),
         ),
-        GatewayError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, "Bad Gateway", msg),
+        GatewayError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, "Bad Gateway", msg, None, None),
         GatewayError::Internal(msg) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Internal Server Error",
             msg,
+            None,
+            None,
         ),
     };
 
-    html_error_response(status, title, &detail)
+    let mut response = html_error_response(status, title, &detail);
+    if let Some(error_code) = error_code {
+        response.headers_mut().insert(
+            X_FREEDOM_IPFS_ERROR_CODE,
+            HeaderValue::from_static(error_code),
+        );
+    }
+    if let Some(retry_after) = retry_after {
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static(retry_after));
+    }
+    response
 }
 
 fn html_error_response(status: StatusCode, title: &str, detail: &str) -> Response {
@@ -5125,14 +5173,18 @@ mod tests {
         let data = b"limited gateway";
         let cid = cid_from_data(CODEC_RAW, data);
         let entered = Arc::new(AtomicBool::new(false));
+        let queue_timeout = Duration::from_millis(50);
         let provider = Arc::new(SlowProvider {
             cid,
             data: data.to_vec(),
             entered: entered.clone(),
-            delay: GATEWAY_REQUEST_QUEUE_TIMEOUT + Duration::from_millis(250),
+            delay: queue_timeout + Duration::from_millis(100),
         });
 
-        let state = GatewayState::with_provider_config(provider, GatewayConfig::new(1));
+        let state = GatewayState::with_provider_config(
+            provider,
+            GatewayConfig::new(1).with_request_queue_timeout(queue_timeout),
+        );
         let first = tokio::spawn(ipfs_get(
             State(state.clone()),
             Path(cid.to_string()),
@@ -5156,6 +5208,65 @@ mod tests {
         )
         .await;
         assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            second
+                .headers()
+                .get(X_FREEDOM_IPFS_ERROR_CODE)
+                .and_then(|value| value.to_str().ok()),
+            Some("gateway_busy")
+        );
+        assert_eq!(
+            second
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+
+        let first = first.await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_request_succeeds_when_queue_timeout_allows_it() {
+        let data = b"queued gateway";
+        let cid = cid_from_data(CODEC_RAW, data);
+        let entered = Arc::new(AtomicBool::new(false));
+        let provider_delay = Duration::from_millis(75);
+        let provider = Arc::new(SlowProvider {
+            cid,
+            data: data.to_vec(),
+            entered: entered.clone(),
+            delay: provider_delay,
+        });
+
+        let state = GatewayState::with_provider_config(
+            provider,
+            GatewayConfig::new(1).with_request_queue_timeout(Duration::from_millis(500)),
+        );
+        let first = tokio::spawn(ipfs_get(
+            State(state.clone()),
+            Path(cid.to_string()),
+            Method::GET,
+            HeaderMap::new(),
+        ));
+
+        for _ in 0..50 {
+            if entered.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(entered.load(Ordering::SeqCst));
+
+        let second = ipfs_get(
+            State(state),
+            Path(cid.to_string()),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
 
         let first = first.await.unwrap();
         assert_eq!(first.status(), StatusCode::OK);

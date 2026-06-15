@@ -151,6 +151,8 @@ Useful stress knobs:
 
 - `--native-dispatchers 1|4`: number of event dispatcher workers.
 - `--native-read-buffer-bytes N`: caller-owned read buffer size.
+- `--request-queue-timeout-ms N`: gateway admission wait before a saturated
+  gateway returns `503 gateway_busy`.
 - `--native-slow-consumer-ms N`: delay after each read to model slow Swift/WebKit consumption.
 - `--native-cancel-after-first-byte`: cancel each request after the first body bytes.
 - `--native-cancel-after-ms N`: cancel each request after a time limit.
@@ -166,8 +168,9 @@ shutdown, events by flag, read calls, bytes read, max active handles, and the
 largest response body retained by the harness for validation. It also embeds a
 `mobile_layer` snapshot from `freedom-ipfs-mobile` with active-handle counts,
 total started/completed/failed/cancelled/freed requests, native read bytes,
-event mux enqueue/delivery/coalescing counts, pending event queue depth, max
-event queue depth, stop generation, and last sanitized native error metadata.
+`total_gateway_busy_responses`, event mux enqueue/delivery/coalescing counts,
+pending event queue depth, max event queue depth, stop generation, and last
+sanitized native error metadata.
 `stashed_event_handles_at_end` should be zero for normal successful runs; late
 events for handles already completed/freed are counted as stale instead of
 being retained in the app-side pre-registration stash.
@@ -471,6 +474,7 @@ node-stop wakeup behavior.
 - short-timeout `PENDING` behavior
 - `timeout_ms = 0` equivalence with the nonblocking calls
 - cancel/free wakeup behavior for blocked waiters
+- machine-readable gateway-busy responses and native busy counters
 - event API idle timeout, metadata, body, end, failure, cancel, free, and
   gateway-stop readiness
 - event coalescing and fairness across noisy and quiet handles

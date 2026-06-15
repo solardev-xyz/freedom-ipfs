@@ -232,6 +232,7 @@ struct NativeGatewayStats {
     total_failed: AtomicU64,
     total_cancelled: AtomicU64,
     total_freed: AtomicU64,
+    total_gateway_busy_responses: AtomicU64,
     bytes_read: AtomicU64,
     max_active_handles: AtomicU64,
     last_error: Mutex<Option<NativeGatewayErrorJson>>,
@@ -245,6 +246,7 @@ struct NativeGatewayStatsSnapshot {
     total_failed: u64,
     total_cancelled: u64,
     total_freed: u64,
+    total_gateway_busy_responses: u64,
     bytes_read: u64,
     max_active_handles: u64,
     events_enqueued: u64,
@@ -286,6 +288,17 @@ impl NativeGatewayStats {
         }
     }
 
+    fn record_gateway_busy_response(&self) {
+        self.total_gateway_busy_responses
+            .fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut last_error) = self.last_error.lock() {
+            *last_error = Some(NativeGatewayErrorJson {
+                code: "gateway_busy".to_string(),
+                message: "gateway busy".to_string(),
+            });
+        }
+    }
+
     fn snapshot(
         &self,
         active_native_handles: usize,
@@ -299,6 +312,7 @@ impl NativeGatewayStats {
             total_failed: self.total_failed.load(Ordering::Relaxed),
             total_cancelled: self.total_cancelled.load(Ordering::Relaxed),
             total_freed: self.total_freed.load(Ordering::Relaxed),
+            total_gateway_busy_responses: self.total_gateway_busy_responses.load(Ordering::Relaxed),
             bytes_read: self.bytes_read.load(Ordering::Relaxed),
             max_active_handles: self.max_active_handles.load(Ordering::Relaxed),
             events_enqueued: events.events_enqueued,
@@ -1755,6 +1769,39 @@ pub unsafe extern "C" fn freedom_ipfs_node_start_gateway_online_with_config_v2(
     dht_query_timeout_secs: u64,
     dht_max_providers: usize,
 ) -> bool {
+    freedom_ipfs_node_start_gateway_online_with_config_v3(
+        ptr,
+        addr,
+        delegated_router,
+        routing_mode,
+        max_concurrent_requests,
+        dht_query_timeout_secs,
+        dht_max_providers,
+        0,
+    )
+}
+
+/// # Safety
+///
+/// `ptr` must be a valid node pointer. `addr` must point to a NUL-terminated
+/// UTF-8 loopback socket address string for the duration of this call.
+/// `delegated_router` may be null to use the default delegated routing
+/// endpoint, otherwise it must point to a NUL-terminated UTF-8 URL string or
+/// comma-separated URL list.
+/// `routing_mode` must be one of the `FREEDOM_IPFS_ROUTING_MODE_*` constants
+/// from the C header. `dht_*` values may be 0 to use the built-in mobile
+/// defaults. `request_queue_timeout_ms` may be 0 to use the gateway default.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_node_start_gateway_online_with_config_v3(
+    ptr: *mut FreedomIpfsNode,
+    addr: *const c_char,
+    delegated_router: *const c_char,
+    routing_mode: u32,
+    max_concurrent_requests: usize,
+    dht_query_timeout_secs: u64,
+    dht_max_providers: usize,
+    request_queue_timeout_ms: u64,
+) -> bool {
     if ptr.is_null() || addr.is_null() {
         return false;
     }
@@ -1766,10 +1813,13 @@ pub unsafe extern "C" fn freedom_ipfs_node_start_gateway_online_with_config_v2(
         node,
         addr,
         delegated_router,
-        routing_mode,
-        max_concurrent_requests,
-        dht_query_timeout_secs,
-        dht_max_providers,
+        GatewayStartConfig {
+            routing_mode,
+            max_concurrent_requests,
+            dht_query_timeout_secs,
+            dht_max_providers,
+            request_queue_timeout_ms,
+        },
     ) else {
         return false;
     };
@@ -1805,6 +1855,42 @@ pub unsafe extern "C" fn freedom_ipfs_node_restart_gateway_online_with_config_v2
     dht_query_timeout_secs: u64,
     dht_max_providers: usize,
 ) -> bool {
+    freedom_ipfs_node_restart_gateway_online_with_config_v3(
+        ptr,
+        addr,
+        delegated_router,
+        routing_mode,
+        max_concurrent_requests,
+        dht_query_timeout_secs,
+        dht_max_providers,
+        0,
+    )
+}
+
+/// # Safety
+///
+/// `ptr` must be a valid node pointer. `addr` must point to a NUL-terminated
+/// UTF-8 loopback socket address string for the duration of this call.
+/// `delegated_router` may be null to use the default delegated routing
+/// endpoint, otherwise it must point to a NUL-terminated UTF-8 URL string or
+/// comma-separated URL list.
+/// `routing_mode` must be one of the `FREEDOM_IPFS_ROUTING_MODE_*` constants
+/// from the C header. `dht_*` values may be 0 to use the built-in mobile
+/// defaults. `request_queue_timeout_ms` may be 0 to use the gateway default. On
+/// success this cancels active preloads, stops the current gateway, and starts a
+/// new online gateway with the supplied routing configuration. On validation
+/// failure the currently running gateway is left untouched.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_node_restart_gateway_online_with_config_v3(
+    ptr: *mut FreedomIpfsNode,
+    addr: *const c_char,
+    delegated_router: *const c_char,
+    routing_mode: u32,
+    max_concurrent_requests: usize,
+    dht_query_timeout_secs: u64,
+    dht_max_providers: usize,
+    request_queue_timeout_ms: u64,
+) -> bool {
     if ptr.is_null() || addr.is_null() {
         return false;
     }
@@ -1813,10 +1899,13 @@ pub unsafe extern "C" fn freedom_ipfs_node_restart_gateway_online_with_config_v2
         node,
         addr,
         delegated_router,
-        routing_mode,
-        max_concurrent_requests,
-        dht_query_timeout_secs,
-        dht_max_providers,
+        GatewayStartConfig {
+            routing_mode,
+            max_concurrent_requests,
+            dht_query_timeout_secs,
+            dht_max_providers,
+            request_queue_timeout_ms,
+        },
     ) else {
         return false;
     };
@@ -1850,6 +1939,36 @@ pub unsafe extern "C" fn freedom_ipfs_node_start_native_gateway_online_with_conf
     dht_query_timeout_secs: u64,
     dht_max_providers: usize,
 ) -> bool {
+    freedom_ipfs_node_start_native_gateway_online_with_config_v3(
+        ptr,
+        delegated_router,
+        routing_mode,
+        max_concurrent_requests,
+        dht_query_timeout_secs,
+        dht_max_providers,
+        0,
+    )
+}
+
+/// # Safety
+///
+/// `ptr` must be a valid node pointer. `delegated_router` may be null to use
+/// the default delegated routing endpoint, otherwise it must point to a
+/// NUL-terminated UTF-8 URL string or comma-separated URL list.
+/// `routing_mode` must be one of the `FREEDOM_IPFS_ROUTING_MODE_*` constants
+/// from the C header. `request_queue_timeout_ms` may be 0 to use the gateway
+/// default. This configures the native request/event API for online retrieval
+/// without binding the loopback HTTP gateway.
+#[no_mangle]
+pub unsafe extern "C" fn freedom_ipfs_node_start_native_gateway_online_with_config_v3(
+    ptr: *mut FreedomIpfsNode,
+    delegated_router: *const c_char,
+    routing_mode: u32,
+    max_concurrent_requests: usize,
+    dht_query_timeout_secs: u64,
+    dht_max_providers: usize,
+    request_queue_timeout_ms: u64,
+) -> bool {
     if ptr.is_null() {
         return false;
     }
@@ -1859,10 +1978,13 @@ pub unsafe extern "C" fn freedom_ipfs_node_start_native_gateway_online_with_conf
         node,
         addr.as_ptr(),
         delegated_router,
-        routing_mode,
-        max_concurrent_requests,
-        dht_query_timeout_secs,
-        dht_max_providers,
+        GatewayStartConfig {
+            routing_mode,
+            max_concurrent_requests,
+            dht_query_timeout_secs,
+            dht_max_providers,
+            request_queue_timeout_ms,
+        },
     ) else {
         return false;
     };
@@ -1882,22 +2004,33 @@ struct OnlineGatewayParts {
     routing_stats: RoutingStatsHandle,
 }
 
-unsafe fn gateway_router_for_routing_mode(
-    node: &FreedomIpfsNode,
-    addr: *const c_char,
-    delegated_router: *const c_char,
+#[derive(Clone, Copy)]
+struct GatewayStartConfig {
     routing_mode: u32,
     max_concurrent_requests: usize,
     dht_query_timeout_secs: u64,
     dht_max_providers: usize,
+    request_queue_timeout_ms: u64,
+}
+
+unsafe fn gateway_router_for_routing_mode(
+    node: &FreedomIpfsNode,
+    addr: *const c_char,
+    delegated_router: *const c_char,
+    start_config: GatewayStartConfig,
 ) -> Option<OnlineGatewayParts> {
     let addr = parse_loopback_gateway_addr(addr)?;
-    let gateway_config = if max_concurrent_requests == 0 {
+    let mut gateway_config = if start_config.max_concurrent_requests == 0 {
         freedom_ipfs_gateway::GatewayConfig::default()
     } else {
-        freedom_ipfs_gateway::GatewayConfig::new(max_concurrent_requests)
+        freedom_ipfs_gateway::GatewayConfig::new(start_config.max_concurrent_requests)
     };
-    if routing_mode == ROUTING_MODE_OFFLINE {
+    if start_config.request_queue_timeout_ms > 0 {
+        gateway_config = gateway_config.with_request_queue_timeout(Duration::from_millis(
+            start_config.request_queue_timeout_ms,
+        ));
+    }
+    if start_config.routing_mode == ROUTING_MODE_OFFLINE {
         let routing_stats = RoutingStatsHandle::default();
         let provider = FetchingBlockProvider::new(
             node.store.clone(),
@@ -1934,8 +2067,11 @@ unsafe fn gateway_router_for_routing_mode(
 
     let delegated = delegated_routing_client(&delegated_routers);
     let delegated_router_endpoints = delegated_router_endpoints(&delegated_routers);
-    let dht = light_dht_client(dht_query_timeout_secs, dht_max_providers);
-    let routing = match routing_mode {
+    let dht = light_dht_client(
+        start_config.dht_query_timeout_secs,
+        start_config.dht_max_providers,
+    );
+    let routing = match start_config.routing_mode {
         ROUTING_MODE_AUTO => {
             ProviderRoutingClient::from(AutoRoutingClient::new(delegated, dht.clone()))
         }
@@ -1950,7 +2086,7 @@ unsafe fn gateway_router_for_routing_mode(
     let name_resolver = CachedNameResolver::new(freedom_ipfs_gateway::PersistentNameResolver::new(
         DefaultNameResolver::new(
             CloudflareDohResolver::default(),
-            ipns_resolver(routing_mode, delegated_router_endpoints, dht),
+            ipns_resolver(start_config.routing_mode, delegated_router_endpoints, dht),
         ),
         node.store.clone(),
     ));
@@ -2445,6 +2581,9 @@ async fn run_native_gateway_request(task: NativeGatewayTask) {
     let response = core.handle(request).await;
     let status = response.status().as_u16();
     let headers = native_gateway_headers(response.headers());
+    if native_gateway_is_busy_response(status, &headers) {
+        stats.record_gateway_busy_response();
+    }
     if let Ok(mut meta) = meta.lock() {
         if !meta.cancelled {
             meta.response = Some(NativeGatewayResponseMeta { status, headers });
@@ -2500,6 +2639,16 @@ fn native_gateway_headers(headers: &HeaderMap) -> Vec<NativeGatewayHeader> {
             value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
         })
         .collect()
+}
+
+fn native_gateway_is_busy_response(status: u16, headers: &[NativeGatewayHeader]) -> bool {
+    status == 503
+        && headers.iter().any(|header| {
+            header
+                .name
+                .eq_ignore_ascii_case("x-freedom-ipfs-error-code")
+                && header.value == "gateway_busy"
+        })
 }
 
 fn native_gateway_request(
@@ -2800,7 +2949,7 @@ fn native_gateway_json_string(response: NativeGatewayResponseJson) -> *mut c_cha
 
 fn native_gateway_stats_json_string(snapshot: NativeGatewayStatsSnapshot) -> *mut c_char {
     let json = serde_json::to_string(&snapshot).unwrap_or_else(|_| {
-        "{\"active_native_handles\":0,\"total_started\":0,\"total_completed\":0,\"total_failed\":0,\"total_cancelled\":0,\"total_freed\":0,\"bytes_read\":0,\"max_active_handles\":0,\"events_enqueued\":0,\"events_delivered\":0,\"events_coalesced\":0,\"max_event_queue_depth\":0,\"pending_event_queue_depth\":0,\"pending_event_handle_count\":0,\"stop_generation\":0}".to_string()
+        "{\"active_native_handles\":0,\"total_started\":0,\"total_completed\":0,\"total_failed\":0,\"total_cancelled\":0,\"total_freed\":0,\"total_gateway_busy_responses\":0,\"bytes_read\":0,\"max_active_handles\":0,\"events_enqueued\":0,\"events_delivered\":0,\"events_coalesced\":0,\"max_event_queue_depth\":0,\"pending_event_queue_depth\":0,\"pending_event_handle_count\":0,\"stop_generation\":0}".to_string()
     });
     CString::new(json)
         .unwrap_or_else(|_| CString::new("{\"active_native_handles\":0}").unwrap())
@@ -3099,10 +3248,29 @@ fn normalize_preload_path(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freedom_ipfs_core::{cid_from_data, parse_car_v1, CODEC_RAW};
+    use cid::Cid;
+    use freedom_ipfs_core::{cid_from_data, parse_car_v1, Block, CODEC_RAW};
     use freedom_ipfs_store::CachedProviderRecord;
     use serde_json::json;
     use std::io::{Read, Write};
+
+    struct SlowTestProvider {
+        cid: Cid,
+        data: Vec<u8>,
+        entered: Arc<std::sync::atomic::AtomicBool>,
+        delay: Duration,
+    }
+
+    impl BlockProvider for SlowTestProvider {
+        fn get_block(&self, cid: &Cid) -> freedom_ipfs_core::Result<Option<Block>> {
+            if *cid != self.cid {
+                return Ok(None);
+            }
+            self.entered.store(true, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            Ok(Some(Block::new(self.cid, self.data.clone())?))
+        }
+    }
 
     #[test]
     fn version_and_build_info_match_release_contract() {
@@ -3243,6 +3411,32 @@ mod tests {
     }
 
     #[test]
+    fn starts_native_online_gateway_v3_from_data_dir_with_delegated_routing() {
+        unsafe {
+            let tempdir = tempfile::tempdir().unwrap();
+            let data_dir = CString::new(tempdir.path().to_str().unwrap()).unwrap();
+            let node = freedom_ipfs_node_new_with_data_dir(data_dir.as_ptr(), 0);
+            assert!(!node.is_null());
+
+            let router = CString::new("http://127.0.0.1:9/routing/v1").unwrap();
+            assert!(
+                freedom_ipfs_node_start_native_gateway_online_with_config_v3(
+                    node,
+                    router.as_ptr(),
+                    ROUTING_MODE_DELEGATED,
+                    1,
+                    5,
+                    2,
+                    50,
+                )
+            );
+
+            assert!(freedom_ipfs_node_gateway_url(node).is_null());
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
     fn starts_native_online_gateway_without_binding_http_gateway() {
         unsafe {
             let node = freedom_ipfs_node_new_in_memory();
@@ -3281,6 +3475,47 @@ mod tests {
             assert_eq!(stats["total_started"], 1);
             assert_eq!(stats["total_completed"], 1);
             assert_eq!(stats["total_freed"], 1);
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
+    fn starts_native_online_gateway_v3_from_data_dir_without_binding_http_gateway() {
+        unsafe {
+            let tempdir = tempfile::tempdir().unwrap();
+            let data_dir = CString::new(tempdir.path().to_str().unwrap()).unwrap();
+            let node = freedom_ipfs_node_new_with_data_dir(data_dir.as_ptr(), 1024 * 1024);
+            assert!(!node.is_null());
+
+            let data = b"native online gateway v3 data dir";
+            let cid = cid_from_data(CODEC_RAW, data);
+            (*node).store.put_block(&cid, data).unwrap();
+
+            assert!(
+                freedom_ipfs_node_start_native_gateway_online_with_config_v3(
+                    node,
+                    ptr::null(),
+                    ROUTING_MODE_OFFLINE,
+                    1,
+                    0,
+                    0,
+                    50,
+                )
+            );
+            assert!(freedom_ipfs_node_gateway_url(node).is_null());
+
+            let handle = start_native_gateway_request(
+                node,
+                json!({
+                    "method": "GET",
+                    "path": format!("/ipfs/{cid}")
+                }),
+            );
+            let metadata = wait_native_gateway_response(node, handle);
+            assert_eq!(metadata["status"], 200);
+            assert_eq!(read_native_gateway_body(node, handle, 8), data);
+            assert!(freedom_ipfs_gateway_request_free(node, handle));
 
             freedom_ipfs_node_free(node);
         }
@@ -4840,6 +5075,81 @@ mod tests {
             body.extend(read_native_gateway_body_wait(node, handle, 3));
             assert_eq!(body, data);
             assert!(freedom_ipfs_gateway_request_free(node, handle));
+
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
+    fn native_gateway_busy_response_is_machine_readable_and_counted() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let data = b"native busy fixture".to_vec();
+            let cid = cid_from_data(CODEC_RAW, &data);
+            let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let provider: Arc<dyn BlockProvider> = Arc::new(SlowTestProvider {
+                cid,
+                data,
+                entered: entered.clone(),
+                delay: Duration::from_millis(150),
+            });
+            let core = GatewayCore::with_provider_config(
+                provider,
+                freedom_ipfs_gateway::GatewayConfig::new(1)
+                    .with_request_queue_timeout(Duration::from_millis(25)),
+            );
+            set_native_gateway_core(&*node, core);
+
+            let request = json!({
+                "method": "GET",
+                "path": format!("/ipfs/{cid}")
+            });
+            let first = start_native_gateway_request(node, request.clone());
+            for _ in 0..50 {
+                if entered.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(entered.load(Ordering::SeqCst));
+
+            let second = start_native_gateway_request(node, request);
+            let second_metadata = native_gateway_response_json_wait_ffi(node, second, 5_000);
+            assert_eq!(second_metadata["status"], 503);
+            let headers = second_metadata["headers"].as_array().unwrap();
+            assert!(headers.iter().any(|header| {
+                header["name"]
+                    .as_str()
+                    .map(|name| name.eq_ignore_ascii_case("x-freedom-ipfs-error-code"))
+                    .unwrap_or(false)
+                    && header["value"] == "gateway_busy"
+            }));
+            assert!(headers.iter().any(|header| {
+                header["name"]
+                    .as_str()
+                    .map(|name| name.eq_ignore_ascii_case("retry-after"))
+                    .unwrap_or(false)
+                    && header["value"] == "1"
+            }));
+
+            let second_body = read_native_gateway_body_wait(node, second, 64);
+            assert!(
+                String::from_utf8_lossy(&second_body).contains("gateway busy"),
+                "busy body should remain HTTP-compatible"
+            );
+            assert!(freedom_ipfs_gateway_request_free(node, second));
+
+            let first_metadata = wait_native_gateway_response(node, first);
+            assert_eq!(first_metadata["status"], 200);
+            let first_body = read_native_gateway_body_wait(node, first, 64);
+            assert_eq!(first_body, b"native busy fixture");
+            assert!(freedom_ipfs_gateway_request_free(node, first));
+
+            let stats = native_gateway_stats_json(node);
+            assert_eq!(stats["total_gateway_busy_responses"], 1);
+            assert_eq!(stats["last_native_error_code"], "gateway_busy");
 
             freedom_ipfs_node_free(node);
         }

@@ -6,7 +6,7 @@ use freedom_ipfs_gateway::{
     router_with_provider_and_name_resolver_config, GatewayConfig,
     GatewayHtmlDirectoryPrefetchConfig, GatewayHtmlPrefetchConfig, GatewayHtmlRangeWarmConfig,
     PersistentNameResolver, DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
-    DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
+    DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT_MS, DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
 };
 use freedom_ipfs_namesys::{
     CachedNameResolver, CloudflareDohResolver, DefaultNameResolver, DelegatedIpnsResolver,
@@ -63,6 +63,8 @@ struct Args {
     routing_mode: RoutingMode,
     #[arg(long, default_value_t = DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS)]
     max_concurrent_requests: usize,
+    #[arg(long, default_value_t = DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT_MS)]
+    request_queue_timeout_ms: u64,
     #[arg(long, default_value_t = DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES)]
     small_body_cache_max_bytes: usize,
     #[arg(long, default_value_t = DEFAULT_DHT_QUERY_TIMEOUT.as_secs())]
@@ -118,6 +120,7 @@ async fn main() -> Result<()> {
     }
 
     let gateway_config = GatewayConfig::new(args.max_concurrent_requests)
+        .with_request_queue_timeout(Duration::from_millis(args.request_queue_timeout_ms))
         .with_small_body_cache_max_bytes(args.small_body_cache_max_bytes)
         .with_html_prefetch(gateway_html_prefetch_config())
         .with_html_directory_prefetch(gateway_html_directory_prefetch_config())
