@@ -118,7 +118,9 @@ grouped by status/error. Use `--warmup-runs` to separate warm-cache behavior, or
 `--fresh-gateway-per-run` when measuring repeated cold gateways. Spawning uses
 the same routing, delegated-router, DHT, request-concurrency, and
 asset-concurrency knobs as the single-run harness, with an 8-request gateway
-default and a 6-asset crawl default to model bounded browser pressure.
+default, a 2s gateway request admission wait, and a 6-asset crawl default to
+model bounded browser pressure. Use `--request-queue-timeout-ms N` to test
+burst-heavy browser behavior without changing the active request cap.
 Use `--delegated-router` to pass a single endpoint or comma-separated endpoint
 list through to spawned Rust gateways during provider-quality experiments.
 
@@ -150,9 +152,10 @@ individual result row. `rust-native-ffi` additionally attaches a
 active-handle, and retained-body counters for debugging the mobile transport
 without Xcode. The nested `native_ffi.mobile_layer` object is the Rust mobile
 layer's own diagnostics snapshot: active handles, total started/completed/
-failed/cancelled/freed requests, native read bytes, event enqueue/delivery/
-coalescing counts, max and pending event queue depth, stop generation, and last
-sanitized native error metadata. `native_ffi.stashed_event_handles_at_end`
+failed/cancelled/freed requests, gateway-busy response count, native read bytes,
+event enqueue/delivery/coalescing counts, max and pending event queue depth,
+stop generation, and last sanitized native error metadata.
+`native_ffi.stashed_event_handles_at_end`
 should remain zero for normal successful runs; post-free readiness events are
 counted as stale rather than retained in the pre-registration stash.
 The harness still retains response bodies when needed for corpus validation,
@@ -263,7 +266,10 @@ Reports also include
 help quantify user-visible loading states, cache/Bitswap/HTTP-provider mix, and
 peer reuse during provider/session experiments. Gateway response statuses and
 limiter denials are aggregated as well, making overload or `503` pressure
-visible in the normal report. Correlated traces also include
+visible in the normal report. Gateway-busy responses also carry
+`X-Freedom-IPFS-Error-Code: gateway_busy` and `Retry-After: 1` so native clients
+can treat admission pressure as retryable without parsing the HTML error body.
+Correlated traces also include
 `progress_request_groups`, which group root, asset, and revalidation requests by
 top-level path and root progress ID with status counts, phase counts, elapsed
 latencies, and the slowest member requests. Trace errors are grouped by phase

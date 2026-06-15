@@ -135,10 +135,15 @@ Napi::Value NodeStartNativeGatewayOnline(const Napi::CallbackInfo& info) {
   if (info.Length() > 5 && info[5].IsNumber()) {
     dht_max_providers = static_cast<size_t>(info[5].As<Napi::Number>().Uint32Value());
   }
+  uint64_t request_queue_timeout_ms = 0;
+  if (info.Length() > 6 && !info[6].IsUndefined() && !info[6].IsNull()) {
+    request_queue_timeout_ms = Uint64FromValue(info[6], &ok);
+    if (!ok) return ThrowTypeError(env, "requestQueueTimeoutMs must be an integer");
+  }
 
-  const bool started = freedom_ipfs_node_start_native_gateway_online_with_config_v2(
+  const bool started = freedom_ipfs_node_start_native_gateway_online_with_config_v3(
       node, delegated_router_ptr, routing_mode, max_concurrent_requests,
-      dht_query_timeout_secs, dht_max_providers);
+      dht_query_timeout_secs, dht_max_providers, request_queue_timeout_ms);
   return Napi::Boolean::New(env, started);
 }
 

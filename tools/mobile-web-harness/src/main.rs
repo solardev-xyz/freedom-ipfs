@@ -11,7 +11,7 @@ use freedom_ipfs_mobile::{
     freedom_ipfs_gateway_request_start, freedom_ipfs_gateway_wait_next_event,
     freedom_ipfs_node_free, freedom_ipfs_node_import_car,
     freedom_ipfs_node_native_gateway_stats_json, freedom_ipfs_node_new_with_data_dir,
-    freedom_ipfs_node_start_gateway_online_with_config_v2, freedom_ipfs_node_stop_gateway,
+    freedom_ipfs_node_start_gateway_online_with_config_v3, freedom_ipfs_node_stop_gateway,
     freedom_ipfs_string_free, FreedomIpfsGatewayReadResult, FreedomIpfsNode,
 };
 use freedom_ipfs_namesys::{
@@ -50,6 +50,7 @@ use tokio::task::{JoinHandle, JoinSet};
 const DEFAULT_CORPUS: &str = "tools/mobile-web-harness/corpus/mobile-web.json";
 const DEFAULT_KUBO_BIN: &str = "target/tools/kubo/kubo/ipfs";
 const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
+const DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT_MS: u64 = 2_000;
 const DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_ASSET_CONCURRENCY: usize = 6;
 const MEANINGFUL_KUBO_WIN_MIN_DELTA_MS: u128 = 50;
@@ -221,6 +222,9 @@ struct Args {
     /// Gateway request concurrency budget when spawning a gateway.
     #[arg(long, alias = "gateway-max-concurrent-requests", default_value_t = DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS)]
     max_concurrent_requests: usize,
+    /// Gateway request admission wait before returning 503 gateway_busy.
+    #[arg(long, default_value_t = DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT_MS)]
+    request_queue_timeout_ms: u64,
     /// Small in-memory full-body response cache byte budget for spawned Rust gateways.
     #[arg(long, default_value_t = DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES)]
     small_body_cache_max_bytes: usize,
@@ -4068,8 +4072,9 @@ impl NativeFfiGateway {
         let max_concurrent_requests = args.max_concurrent_requests;
         let dht_query_timeout_secs = args.dht_query_timeout_secs;
         let dht_max_providers = args.dht_max_providers;
+        let request_queue_timeout_ms = args.request_queue_timeout_ms;
         let started = tokio::task::spawn_blocking(move || unsafe {
-            freedom_ipfs_node_start_gateway_online_with_config_v2(
+            freedom_ipfs_node_start_gateway_online_with_config_v3(
                 node_addr as *mut FreedomIpfsNode,
                 gateway_addr.as_ptr(),
                 delegated_router_c
@@ -4080,6 +4085,7 @@ impl NativeFfiGateway {
                 max_concurrent_requests,
                 dht_query_timeout_secs,
                 dht_max_providers,
+                request_queue_timeout_ms,
             )
         })
         .await
@@ -5291,6 +5297,7 @@ fn parse_native_routing_mode(value: &str) -> Result<NativeRoutingMode> {
 
 fn native_gateway_config(args: &Args) -> GatewayConfig {
     GatewayConfig::new(args.max_concurrent_requests)
+        .with_request_queue_timeout(Duration::from_millis(args.request_queue_timeout_ms))
         .with_small_body_cache_max_bytes(args.small_body_cache_max_bytes)
         .with_html_prefetch(GatewayHtmlPrefetchConfig::new(
             env_usize(HTML_PREFETCH_MAX_ASSETS_ENV, 0),
@@ -6511,6 +6518,8 @@ impl SpawnedGateway {
             .arg(routing_mode)
             .arg("--max-concurrent-requests")
             .arg(args.max_concurrent_requests.to_string())
+            .arg("--request-queue-timeout-ms")
+            .arg(args.request_queue_timeout_ms.to_string())
             .arg("--small-body-cache-max-bytes")
             .arg(args.small_body_cache_max_bytes.to_string())
             .arg("--dht-query-timeout-secs")

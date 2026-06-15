@@ -203,7 +203,8 @@ public final class FreedomIpfsReader {
         routingMode: FreedomIpfsRoutingMode = .auto,
         maxConcurrentRequests: Int = 0,
         dhtQueryTimeoutSeconds: UInt64 = 0,
-        dhtMaxProviders: Int = 0
+        dhtMaxProviders: Int = 0,
+        requestQueueTimeoutMilliseconds: UInt64 = 0
     ) throws {
         guard let handle else {
             throw FreedomIpfsReaderError.invalidNode
@@ -211,25 +212,27 @@ public final class FreedomIpfsReader {
         let ok = address.withCString { addressPtr in
             if let delegatedRouter {
                 return delegatedRouter.withCString { routerPtr in
-                    freedom_ipfs_node_start_gateway_online_with_config_v2(
+                    freedom_ipfs_node_start_gateway_online_with_config_v3(
                         handle,
                         addressPtr,
                         routerPtr,
                         routingMode.rawValue,
                         maxConcurrentRequests,
                         dhtQueryTimeoutSeconds,
-                        dhtMaxProviders
+                        dhtMaxProviders,
+                        requestQueueTimeoutMilliseconds
                     )
                 }
             }
-            return freedom_ipfs_node_start_gateway_online_with_config_v2(
+            return freedom_ipfs_node_start_gateway_online_with_config_v3(
                 handle,
                 addressPtr,
                 nil,
                 routingMode.rawValue,
                 maxConcurrentRequests,
                 dhtQueryTimeoutSeconds,
-                dhtMaxProviders
+                dhtMaxProviders,
+                requestQueueTimeoutMilliseconds
             )
         }
         guard ok else {
@@ -243,7 +246,8 @@ public final class FreedomIpfsReader {
         routingMode: FreedomIpfsRoutingMode = .auto,
         maxConcurrentRequests: Int = 0,
         dhtQueryTimeoutSeconds: UInt64 = 0,
-        dhtMaxProviders: Int = 0
+        dhtMaxProviders: Int = 0,
+        requestQueueTimeoutMilliseconds: UInt64 = 0
     ) throws {
         let routerList = delegatedRouters
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -255,7 +259,8 @@ public final class FreedomIpfsReader {
             routingMode: routingMode,
             maxConcurrentRequests: maxConcurrentRequests,
             dhtQueryTimeoutSeconds: dhtQueryTimeoutSeconds,
-            dhtMaxProviders: dhtMaxProviders
+            dhtMaxProviders: dhtMaxProviders,
+            requestQueueTimeoutMilliseconds: requestQueueTimeoutMilliseconds
         )
     }
 
@@ -265,7 +270,8 @@ public final class FreedomIpfsReader {
         routingMode: FreedomIpfsRoutingMode = .auto,
         maxConcurrentRequests: Int = 0,
         dhtQueryTimeoutSeconds: UInt64 = 0,
-        dhtMaxProviders: Int = 0
+        dhtMaxProviders: Int = 0,
+        requestQueueTimeoutMilliseconds: UInt64 = 0
     ) throws {
         guard let handle else {
             throw FreedomIpfsReaderError.invalidNode
@@ -273,25 +279,27 @@ public final class FreedomIpfsReader {
         let ok = address.withCString { addressPtr in
             if let delegatedRouter {
                 return delegatedRouter.withCString { routerPtr in
-                    freedom_ipfs_node_restart_gateway_online_with_config_v2(
+                    freedom_ipfs_node_restart_gateway_online_with_config_v3(
                         handle,
                         addressPtr,
                         routerPtr,
                         routingMode.rawValue,
                         maxConcurrentRequests,
                         dhtQueryTimeoutSeconds,
-                        dhtMaxProviders
+                        dhtMaxProviders,
+                        requestQueueTimeoutMilliseconds
                     )
                 }
             }
-            return freedom_ipfs_node_restart_gateway_online_with_config_v2(
+            return freedom_ipfs_node_restart_gateway_online_with_config_v3(
                 handle,
                 addressPtr,
                 nil,
                 routingMode.rawValue,
                 maxConcurrentRequests,
                 dhtQueryTimeoutSeconds,
-                dhtMaxProviders
+                dhtMaxProviders,
+                requestQueueTimeoutMilliseconds
             )
         }
         guard ok else {
@@ -305,7 +313,8 @@ public final class FreedomIpfsReader {
         routingMode: FreedomIpfsRoutingMode = .auto,
         maxConcurrentRequests: Int = 0,
         dhtQueryTimeoutSeconds: UInt64 = 0,
-        dhtMaxProviders: Int = 0
+        dhtMaxProviders: Int = 0,
+        requestQueueTimeoutMilliseconds: UInt64 = 0
     ) throws {
         let routerList = delegatedRouters
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -317,7 +326,8 @@ public final class FreedomIpfsReader {
             routingMode: routingMode,
             maxConcurrentRequests: maxConcurrentRequests,
             dhtQueryTimeoutSeconds: dhtQueryTimeoutSeconds,
-            dhtMaxProviders: dhtMaxProviders
+            dhtMaxProviders: dhtMaxProviders,
+            requestQueueTimeoutMilliseconds: requestQueueTimeoutMilliseconds
         )
     }
 
@@ -326,14 +336,16 @@ public final class FreedomIpfsReader {
         delegatedRouters: [String] = [],
         maxConcurrentRequests: Int = 0,
         dhtQueryTimeoutSeconds: UInt64 = 0,
-        dhtMaxProviders: Int = 0
+        dhtMaxProviders: Int = 0,
+        requestQueueTimeoutMilliseconds: UInt64 = 0
     ) throws {
         try restartOnlineGateway(
             delegatedRouters: delegatedRouters,
             routingMode: routingMode,
             maxConcurrentRequests: maxConcurrentRequests,
             dhtQueryTimeoutSeconds: dhtQueryTimeoutSeconds,
-            dhtMaxProviders: dhtMaxProviders
+            dhtMaxProviders: dhtMaxProviders,
+            requestQueueTimeoutMilliseconds: requestQueueTimeoutMilliseconds
         )
     }
 
