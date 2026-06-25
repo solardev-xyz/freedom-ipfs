@@ -57,6 +57,12 @@ The archive contains `freedom_ipfs_native.node` at its root. Freedom Browser's
 download script installs that file into its local `prebuilds/{os}-{arch}`
 directory.
 
-The GitHub `Electron Addon` workflow builds the addon on macOS, Linux, and
-Windows. Release assets can include all supported operating systems under the
-same `vX.Y.Z` tag alongside the iOS XCFramework artifact.
+The GitHub `Electron Addon` workflow builds the addon for:
+
+- `darwin-arm64`
+- `linux-x64`
+- `linux-arm64`
+- `win32-x64`
+
+Release assets must include all supported Electron addon archives and their
+checksums under the same `vX.Y.Z` tag alongside the iOS XCFramework artifact.
