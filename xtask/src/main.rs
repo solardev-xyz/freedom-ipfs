@@ -20,7 +20,6 @@ struct Args {
 enum XtaskCommand {
     BuildXcframework,
     VerifyXcframework,
-    #[command(name = "build-android-arm64")]
     BuildAndroidArm64,
     #[command(name = "build-android-x86_64")]
     BuildAndroidX8664,
@@ -726,22 +725,19 @@ const ANDROID_NDK_API_LEVEL: &str = "26";
 fn build_android(targets: &[&str]) -> Result<()> {
     ensure_cargo_ndk()?;
     for target in targets {
-        let status = Command::new("rustup")
-            .args(["target", "add", target])
-            .status()
-            .with_context(|| format!("rustup target add {target}"))?;
-        if !status.success() {
-            bail!("rustup target add {target} failed");
-        }
+        run(
+            Command::new("rustup").args(["target", "add", target]),
+            &format!("rustup target add {target}"),
+        )?;
 
         // `rustc --crate-type cdylib` overrides the `[lib]` crate-type
         // list for this build only, so Android emits just the `.so`
         // while Cargo.toml keeps rlib + staticlib for the iOS and
-        // desktop slices (same pattern as ant's xtask). The explicit
-        // max-page-size keeps the artifact loadable on 16 KB-page
-        // Android 15+ devices regardless of cargo-ndk/NDK defaults.
-        let status = Command::new("cargo")
-            .args([
+        // desktop slices (same pattern as ant's xtask). The 16 KB
+        // max-page-size link flag comes from `.cargo/config.toml`, so
+        // it also covers builds that bypass this xtask.
+        run(
+            Command::new("cargo").args([
                 "ndk",
                 "-t",
                 target,
@@ -754,15 +750,9 @@ fn build_android(targets: &[&str]) -> Result<()> {
                 "--release",
                 "--crate-type",
                 "cdylib",
-                "--",
-                "-C",
-                "link-arg=-Wl,-z,max-page-size=16384",
-            ])
-            .status()
-            .with_context(|| format!("spawn `cargo ndk -t {target}`"))?;
-        if !status.success() {
-            bail!("cargo ndk -t {target} failed");
-        }
+            ]),
+            &format!("cargo ndk -t {target}"),
+        )?;
 
         let lib = PathBuf::from("target")
             .join(target)
@@ -810,29 +800,24 @@ fn build_xcframework() -> Result<()> {
     ];
 
     for target in targets {
-        let status = Command::new("rustup")
-            .args(["target", "add", target])
-            .status()
-            .with_context(|| format!("rustup target add {target}"))?;
-        if !status.success() {
-            bail!("rustup target add {target} failed");
-        }
+        run(
+            Command::new("rustup").args(["target", "add", target]),
+            &format!("rustup target add {target}"),
+        )?;
 
-        let status = Command::new("cargo")
-            .args([
-                "build",
-                "-p",
-                "freedom-ipfs-mobile",
-                "--release",
-                "--target",
-                target,
-            ])
-            .env("IPHONEOS_DEPLOYMENT_TARGET", "16.0")
-            .status()
-            .with_context(|| format!("cargo build for {target}"))?;
-        if !status.success() {
-            bail!("cargo build for {target} failed");
-        }
+        run(
+            Command::new("cargo")
+                .args([
+                    "build",
+                    "-p",
+                    "freedom-ipfs-mobile",
+                    "--release",
+                    "--target",
+                    target,
+                ])
+                .env("IPHONEOS_DEPLOYMENT_TARGET", "16.0"),
+            &format!("cargo build for {target}"),
+        )?;
     }
 
     let out_dir = PathBuf::from("target/ios-xcframework");
