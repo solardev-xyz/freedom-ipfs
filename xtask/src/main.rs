@@ -20,6 +20,11 @@ struct Args {
 enum XtaskCommand {
     BuildXcframework,
     VerifyXcframework,
+    #[command(name = "build-android-arm64")]
+    BuildAndroidArm64,
+    #[command(name = "build-android-x86_64")]
+    BuildAndroidX8664,
+    BuildAndroidAll,
     GenerateMobileWebFixture {
         #[arg(long)]
         car: PathBuf,
@@ -47,6 +52,11 @@ fn main() -> Result<()> {
     match args.command {
         XtaskCommand::BuildXcframework => build_xcframework(),
         XtaskCommand::VerifyXcframework => verify_xcframework_command(),
+        XtaskCommand::BuildAndroidArm64 => build_android(&[ANDROID_ARM64_TARGET]),
+        XtaskCommand::BuildAndroidX8664 => build_android(&[ANDROID_X86_64_TARGET]),
+        XtaskCommand::BuildAndroidAll => {
+            build_android(&[ANDROID_ARM64_TARGET, ANDROID_X86_64_TARGET])
+        }
         XtaskCommand::GenerateMobileWebFixture {
             car,
             corpus,
@@ -704,6 +714,85 @@ fn parse_csv_record(line: &str) -> Result<Vec<String>> {
     }
     fields.push(field);
     Ok(fields)
+}
+
+const ANDROID_ARM64_TARGET: &str = "aarch64-linux-android";
+const ANDROID_X86_64_TARGET: &str = "x86_64-linux-android";
+
+/// Android NDK API level (cargo-ndk `-P`). Matches the `minSdk = 26`
+/// declared by freedom-browser-android — bump both in lock-step.
+const ANDROID_NDK_API_LEVEL: &str = "26";
+
+fn build_android(targets: &[&str]) -> Result<()> {
+    ensure_cargo_ndk()?;
+    for target in targets {
+        let status = Command::new("rustup")
+            .args(["target", "add", target])
+            .status()
+            .with_context(|| format!("rustup target add {target}"))?;
+        if !status.success() {
+            bail!("rustup target add {target} failed");
+        }
+
+        // `rustc --crate-type cdylib` overrides the `[lib]` crate-type
+        // list for this build only, so Android emits just the `.so`
+        // while Cargo.toml keeps rlib + staticlib for the iOS and
+        // desktop slices (same pattern as ant's xtask). The explicit
+        // max-page-size keeps the artifact loadable on 16 KB-page
+        // Android 15+ devices regardless of cargo-ndk/NDK defaults.
+        let status = Command::new("cargo")
+            .args([
+                "ndk",
+                "-t",
+                target,
+                "-P",
+                ANDROID_NDK_API_LEVEL,
+                "--",
+                "rustc",
+                "-p",
+                "freedom-ipfs-mobile",
+                "--release",
+                "--crate-type",
+                "cdylib",
+                "--",
+                "-C",
+                "link-arg=-Wl,-z,max-page-size=16384",
+            ])
+            .status()
+            .with_context(|| format!("spawn `cargo ndk -t {target}`"))?;
+        if !status.success() {
+            bail!("cargo ndk -t {target} failed");
+        }
+
+        let lib = PathBuf::from("target")
+            .join(target)
+            .join("release")
+            .join("libfreedom_ipfs_mobile.so");
+        if !lib.exists() {
+            bail!("expected {} after build, but it is missing", lib.display());
+        }
+        println!("{}", lib.display());
+    }
+    Ok(())
+}
+
+/// cargo-ndk resolves the NDK itself (ANDROID_NDK_HOME / ANDROID_HOME).
+/// Not installed automatically so restricted-network operators aren't
+/// surprised by a hidden `cargo install`.
+fn ensure_cargo_ndk() -> Result<()> {
+    let out = Command::new("cargo")
+        .args(["ndk", "--version"])
+        .output()
+        .context("`cargo` is not on PATH; install Rust via rustup")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    bail!(
+        "`cargo ndk --version` failed. Install cargo-ndk (`cargo install cargo-ndk`), \
+         the Android NDK (r26+), and export ANDROID_NDK_HOME or ANDROID_HOME.\n{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 
 fn build_xcframework() -> Result<()> {
