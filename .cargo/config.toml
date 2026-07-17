@@ -1,0 +1,16 @@
+# Android .so files must be loadable on 16 KB-page devices (Android 15+).
+# Kept here rather than only in xtask so build paths that bypass it —
+# CI calling cargo-ndk directly, ad-hoc developer builds — also emit
+# compliant artifacts. cargo-ndk sets the linker via
+# CARGO_TARGET_<T>_LINKER, which composes with these.
+#
+# Caveat: cargo ignores config-level rustflags entirely whenever
+# RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS is set in the environment (env
+# replaces, not merges). `cargo xtask build-android-*` therefore
+# re-verifies the LOAD alignment on the built .so and fails the build
+# if the flag was lost; if you export RUSTFLAGS, include this link-arg.
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

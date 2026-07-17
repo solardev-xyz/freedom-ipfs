@@ -1,7 +1,7 @@
 LIVE_ENS ?= vitalik.eth,daicowtf.eth
 KUBO_BIN ?= target/tools/kubo/kubo/ipfs
 
-.PHONY: test fmt clippy verify validate-ios-device-evidence local-soak live-smoke live-corpus live-soak kubo-parity kubo-bitswap build-xcframework verify-xcframework clean
+.PHONY: test fmt clippy verify validate-ios-device-evidence local-soak live-smoke live-corpus live-soak kubo-parity kubo-bitswap build-xcframework verify-xcframework build-android-arm64 build-android-x86_64 build-android-all clean
 
 test:
 	cargo test --workspace
@@ -40,6 +40,15 @@ build-xcframework:
 
 verify-xcframework:
 	cargo run -p xtask -- verify-xcframework
+
+build-android-arm64:
+	cargo run -p xtask -- build-android-arm64
+
+build-android-x86_64:
+	cargo run -p xtask -- build-android-x86_64
+
+build-android-all:
+	cargo run -p xtask -- build-android-all
 
 clean:
 	cargo clean
