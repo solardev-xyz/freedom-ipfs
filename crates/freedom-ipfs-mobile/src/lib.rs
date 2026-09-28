@@ -943,6 +943,16 @@ fn progress_recorder() -> Arc<ProgressRecorder> {
 /// from an earlier call is still alive, later calls therefore return a
 /// layer that does nothing. Dropping that earlier layer (or the subscriber
 /// it was added to, e.g. after a failed `try_init`) frees the slot again.
+///
+/// The choice is made when this function is called, not later: a layer
+/// handed out as a no-op stays a no-op for its whole life, even after the
+/// recording layer that blocked it is dropped. So when replacing a
+/// subscriber, drop the old one (and any probe or test subscriber that
+/// carries this layer) *before* calling `progress_layer()` for the new one
+/// — `drop(old); let new = build();`, not `let new = build(); drop(old);`,
+/// which leaves `new` with the no-op layer and the snapshot empty for good.
+/// A subscriber installed with `set_global_default` / `try_init` is never
+/// dropped, so its layer holds the slot for the rest of the process.
 #[must_use]
 pub fn progress_layer<S>() -> impl Layer<S> + Send + Sync + 'static
 where
@@ -4912,6 +4922,39 @@ mod tests {
         let events = value["events"].as_array().unwrap();
         assert_eq!(events.len(), 1, "{value}");
         assert_eq!(events[0]["target_id"], 4545, "{value}");
+    }
+
+    /// Pins the ordering the `progress_layer` doc warns about: a layer built
+    /// while the recording copy is alive stays a no-op after that copy is
+    /// dropped; building after the drop gets the recording copy.
+    #[test]
+    fn progress_layer_built_before_old_is_dropped_stays_a_no_op() {
+        static ISSUED: AtomicBool = AtomicBool::new(false);
+        let recorder = Arc::new(ProgressRecorder::default());
+        let emit = |id: u64| {
+            let span = tracing::info_span!(
+                target: "freedom_ipfs_gateway",
+                "gateway_request",
+                request_id = id,
+                path = "/ipfs/bafyrebuild"
+            );
+            let _entered = span.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
+        };
+        let events = |r: &ProgressRecorder| {
+            serde_json::from_str::<serde_json::Value>(&r.snapshot_json()).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        let old = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        let too_early = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        drop(old);
+        tracing::subscriber::with_default(too_early, || emit(1));
+        assert_eq!(events(&recorder), 0);
+        let rebuilt = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        tracing::subscriber::with_default(rebuilt, || emit(2));
+        assert_eq!(events(&recorder), 1);
     }
 
     /// A host whose filter sits on its own log layer, not on the whole
