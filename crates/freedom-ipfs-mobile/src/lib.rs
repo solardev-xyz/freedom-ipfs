@@ -21,7 +21,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -71,6 +71,7 @@ const FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED: u32 = 1 << 5;
 
 static PROGRESS_RECORDER: OnceLock<Arc<ProgressRecorder>> = OnceLock::new();
 static PROGRESS_TRACING_INIT: Once = Once::new();
+static PROGRESS_LAYER_ISSUED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LifecycleState {
@@ -801,9 +802,33 @@ fn progress_active_targets(inner: &ProgressInner) -> Vec<ProgressTarget> {
     active
 }
 
-#[derive(Clone)]
+// Not `Clone`: a clone dropping would release the claim of the original.
 struct ProgressLayer {
     recorder: Arc<ProgressRecorder>,
+    /// Held by the copy `progress_layer()` hands out; see `LayerClaim`.
+    _claim: Option<LayerClaim>,
+}
+
+/// The "a recording layer is out" flag, released when the layer holding
+/// it is dropped. A layer lives as long as its subscriber, so the claim
+/// sticks once the subscriber is installed (a global subscriber is never
+/// dropped) but comes back when the host discards the subscriber instead —
+/// `try_init` failing, a throwaway or test subscriber — and the host's
+/// next `progress_layer()` call records again.
+struct LayerClaim(&'static AtomicBool);
+
+impl LayerClaim {
+    fn take(flag: &'static AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(Self(flag))
+    }
+}
+
+impl Drop for LayerClaim {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl<S> Layer<S> for ProgressLayer
@@ -889,11 +914,98 @@ fn progress_recorder() -> Arc<ProgressRecorder> {
         .clone()
 }
 
+/// The `tracing` layer that feeds `freedom_ipfs_node_progress_snapshot_json`.
+///
+/// The node installs it as the process's global subscriber on its own
+/// (see `ensure_progress_tracing`), but that slot is process-wide and
+/// the first claim wins: a host that links this crate next to another
+/// library that installs a subscriber first (freedom-mobile-ffi, where
+/// ant-ffi's log subscriber comes up before the IPFS node) must put this
+/// layer on its own subscriber, alongside its other layers, before
+/// either library initialises — otherwise the snapshot stays empty.
+///
+/// Filtered to itself: it only sees freedom-ipfs's spans and the events
+/// that carry a `phase` (the only ones the recorder keeps), so sharing a
+/// subscriber with a chattier library costs one cached callsite check
+/// per foreign callsite, not a field walk per event.
+///
+/// Only per-layer filters leave it alone. The phase events are emitted at
+/// `info`, so a *global* filter on the host subscriber — one added with
+/// `.with(filter)` as a layer of its own, e.g.
+/// `registry().with(EnvFilter::new("warn")).with(log).with(progress_layer())`
+/// — disables them before this layer's filter is consulted, and the
+/// snapshot stays empty. Attach the host's filter to its own layer
+/// instead (`log.with_filter(EnvFilter::new("warn"))`), or make the global
+/// filter admit `freedom_ipfs=info`.
+///
+/// Add it once. Every instance writes to the same process-wide recorder,
+/// so a second copy would record each phase event twice; while the layer
+/// from an earlier call is still alive, later calls therefore return a
+/// layer that does nothing. Dropping that earlier layer (or the subscriber
+/// it was added to, e.g. after a failed `try_init`) frees the slot again.
+///
+/// The choice is made when this function is called, not later: a layer
+/// handed out as a no-op stays a no-op for its whole life, even after the
+/// recording layer that blocked it is dropped. So when replacing a
+/// subscriber, drop the old one (and any probe or test subscriber that
+/// carries this layer) *before* calling `progress_layer()` for the new one
+/// — `drop(old); let new = build();`, not `let new = build(); drop(old);`,
+/// which leaves `new` with the no-op layer and the snapshot empty for good.
+/// A subscriber installed with `set_global_default` / `try_init` is never
+/// dropped, so its layer holds the slot for the rest of the process.
+#[must_use]
+pub fn progress_layer<S>() -> impl Layer<S> + Send + Sync + 'static
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    progress_layer_once(&PROGRESS_LAYER_ISSUED, progress_recorder())
+}
+
+/// The recording layer while `issued` is free, a no-op while an earlier
+/// recording layer is still alive.
+fn progress_layer_once<S>(
+    issued: &'static AtomicBool,
+    recorder: Arc<ProgressRecorder>,
+) -> impl Layer<S> + Send + Sync + 'static
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    LayerClaim::take(issued).map(|claim| progress_layer_with(recorder, Some(claim)))
+}
+
+fn progress_layer_for<S>(recorder: Arc<ProgressRecorder>) -> impl Layer<S> + Send + Sync + 'static
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    progress_layer_with(recorder, None)
+}
+
+fn progress_layer_with<S>(
+    recorder: Arc<ProgressRecorder>,
+    claim: Option<LayerClaim>,
+) -> impl Layer<S> + Send + Sync + 'static
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    ProgressLayer {
+        recorder,
+        _claim: claim,
+    }
+    .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+        meta.target().starts_with("freedom_ipfs")
+            && (meta.is_span() || meta.fields().field("phase").is_some())
+    }))
+}
+
 fn ensure_progress_tracing() {
-    let recorder = progress_recorder();
     PROGRESS_TRACING_INIT.call_once(|| {
-        let layer = ProgressLayer { recorder };
-        let subscriber = Registry::default().with(layer);
+        // Not `progress_layer()`: that hands out the host's one copy, and
+        // claiming it here would leave a host that installs its subscriber
+        // after the node with a no-op layer. The two can't both be live —
+        // only one global subscriber wins.
+        let subscriber = Registry::default().with(progress_layer_for(progress_recorder()));
+        // Fails when the host already installed a subscriber; if that one
+        // carries `progress_layer()` the snapshot still fills (see above).
         let _ = tracing::subscriber::set_global_default(subscriber);
     });
 }
@@ -4716,6 +4828,151 @@ mod tests {
 
             freedom_ipfs_node_free(node);
         }
+    }
+
+    /// A host that owns the global subscriber (freedom-mobile-ffi, next
+    /// to ant-ffi's log layer) must still fill the snapshot through
+    /// `progress_layer`, whatever the other layers filter.
+    #[test]
+    fn progress_layer_records_when_composed_with_other_layers() {
+        let recorder = Arc::new(ProgressRecorder::default());
+        let quiet_logs = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::sink)
+            .with_filter(tracing_subscriber::filter::LevelFilter::ERROR);
+        let subscriber = Registry::default()
+            .with(quiet_logs)
+            .with(progress_layer_for(recorder.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                target: "freedom_ipfs_gateway",
+                "gateway_request",
+                request_id = 9191u64,
+                path = "/ipfs/bafycomposed"
+            );
+            let _entered = span.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
+            // Another library's event, even with a `phase`, isn't ours.
+            tracing::info!(target: "ant_retrieval", phase = "request_start", request_id = 1u64);
+        });
+        let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{value}");
+        assert_eq!(events[0]["target_id"], 9191, "{value}");
+        assert_eq!(events[0]["path"], "/ipfs/bafycomposed", "{value}");
+    }
+
+    /// Adding the layer twice (directly and via a helper) must not record
+    /// every phase event twice in the shared recorder.
+    #[test]
+    fn progress_layer_added_twice_records_each_event_once() {
+        static ISSUED: AtomicBool = AtomicBool::new(false);
+        let recorder = Arc::new(ProgressRecorder::default());
+        let subscriber = Registry::default()
+            .with(progress_layer_once(&ISSUED, recorder.clone()))
+            .with(progress_layer_once(&ISSUED, recorder.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                target: "freedom_ipfs_gateway",
+                "gateway_request",
+                request_id = 4343u64,
+                path = "/ipfs/bafytwice"
+            );
+            let _entered = span.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
+        });
+        let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{value}");
+        assert_eq!(events[0]["target_id"], 4343, "{value}");
+    }
+
+    /// A layer the host builds but throws away (its `try_init` failed, or it
+    /// was a throwaway subscriber) must not use up the one recording copy:
+    /// the next call, for the subscriber that does get installed, records.
+    #[test]
+    fn progress_layer_dropped_unused_frees_the_recording_copy() {
+        static ISSUED: AtomicBool = AtomicBool::new(false);
+        let recorder = Arc::new(ProgressRecorder::default());
+        let throwaway = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        drop(throwaway);
+        let subscriber = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        // While the installed one is alive, another copy is still a no-op.
+        let extra = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        tracing::subscriber::with_default(extra, || {
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
+        });
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recorder.snapshot_json()).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                target: "freedom_ipfs_gateway",
+                "gateway_request",
+                request_id = 4545u64,
+                path = "/ipfs/bafyretry"
+            );
+            let _entered = span.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
+        });
+        let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{value}");
+        assert_eq!(events[0]["target_id"], 4545, "{value}");
+    }
+
+    /// Pins the ordering the `progress_layer` doc warns about: a layer built
+    /// while the recording copy is alive stays a no-op after that copy is
+    /// dropped; building after the drop gets the recording copy.
+    #[test]
+    fn progress_layer_built_before_old_is_dropped_stays_a_no_op() {
+        static ISSUED: AtomicBool = AtomicBool::new(false);
+        let recorder = Arc::new(ProgressRecorder::default());
+        let emit = |id: u64| {
+            let span = tracing::info_span!(
+                target: "freedom_ipfs_gateway",
+                "gateway_request",
+                request_id = id,
+                path = "/ipfs/bafyrebuild"
+            );
+            let _entered = span.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
+        };
+        let events = |r: &ProgressRecorder| {
+            serde_json::from_str::<serde_json::Value>(&r.snapshot_json()).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        let old = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        let too_early = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        drop(old);
+        tracing::subscriber::with_default(too_early, || emit(1));
+        assert_eq!(events(&recorder), 0);
+        let rebuilt = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        tracing::subscriber::with_default(rebuilt, || emit(2));
+        assert_eq!(events(&recorder), 1);
+    }
+
+    /// A host whose filter sits on its own log layer, not on the whole
+    /// subscriber, leaves the info-level phase events to `progress_layer`.
+    #[test]
+    fn progress_layer_records_next_to_a_per_layer_warn_filter() {
+        let recorder = Arc::new(ProgressRecorder::default());
+        let logs = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::sink)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN);
+        let subscriber = Registry::default()
+            .with(logs)
+            .with(progress_layer_for(recorder.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start", request_id = 7u64);
+        });
+        let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
+        assert_eq!(value["events"].as_array().unwrap().len(), 1, "{value}");
     }
 
     #[test]
