@@ -21,7 +21,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -71,6 +71,7 @@ const FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED: u32 = 1 << 5;
 
 static PROGRESS_RECORDER: OnceLock<Arc<ProgressRecorder>> = OnceLock::new();
 static PROGRESS_TRACING_INIT: Once = Once::new();
+static PROGRESS_LAYER_ISSUED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LifecycleState {
@@ -903,12 +904,39 @@ fn progress_recorder() -> Arc<ProgressRecorder> {
 /// that carry a `phase` (the only ones the recorder keeps), so sharing a
 /// subscriber with a chattier library costs one cached callsite check
 /// per foreign callsite, not a field walk per event.
+///
+/// Only per-layer filters leave it alone. The phase events are emitted at
+/// `info`, so a *global* filter on the host subscriber — one added with
+/// `.with(filter)` as a layer of its own, e.g.
+/// `registry().with(EnvFilter::new("warn")).with(log).with(progress_layer())`
+/// — disables them before this layer's filter is consulted, and the
+/// snapshot stays empty. Attach the host's filter to its own layer
+/// instead (`log.with_filter(EnvFilter::new("warn"))`), or make the global
+/// filter admit `freedom_ipfs=info`.
+///
+/// Add it once. Every instance writes to the same process-wide recorder,
+/// so a second copy would record each phase event twice; later calls
+/// therefore return a layer that does nothing.
 #[must_use]
 pub fn progress_layer<S>() -> impl Layer<S> + Send + Sync + 'static
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
-    progress_layer_for(progress_recorder())
+    progress_layer_once(&PROGRESS_LAYER_ISSUED, progress_recorder())
+}
+
+/// The recording layer the first time `issued` is claimed, a no-op after.
+fn progress_layer_once<S>(
+    issued: &AtomicBool,
+    recorder: Arc<ProgressRecorder>,
+) -> impl Layer<S> + Send + Sync + 'static
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    let first = issued
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
+    first.then(|| progress_layer_for(recorder))
 }
 
 fn progress_layer_for<S>(recorder: Arc<ProgressRecorder>) -> impl Layer<S> + Send + Sync + 'static
@@ -923,7 +951,11 @@ where
 
 fn ensure_progress_tracing() {
     PROGRESS_TRACING_INIT.call_once(|| {
-        let subscriber = Registry::default().with(progress_layer());
+        // Not `progress_layer()`: that hands out the host's one copy, and
+        // claiming it here would leave a host that installs its subscriber
+        // after the node with a no-op layer. The two can't both be live —
+        // only one global subscriber wins.
+        let subscriber = Registry::default().with(progress_layer_for(progress_recorder()));
         // Fails when the host already installed a subscriber; if that one
         // carries `progress_layer()` the snapshot still fills (see above).
         let _ = tracing::subscriber::set_global_default(subscriber);
@@ -4779,6 +4811,49 @@ mod tests {
         assert_eq!(events.len(), 1, "{value}");
         assert_eq!(events[0]["target_id"], 9191, "{value}");
         assert_eq!(events[0]["path"], "/ipfs/bafycomposed", "{value}");
+    }
+
+    /// Adding the layer twice (directly and via a helper) must not record
+    /// every phase event twice in the shared recorder.
+    #[test]
+    fn progress_layer_added_twice_records_each_event_once() {
+        let issued = AtomicBool::new(false);
+        let recorder = Arc::new(ProgressRecorder::default());
+        let subscriber = Registry::default()
+            .with(progress_layer_once(&issued, recorder.clone()))
+            .with(progress_layer_once(&issued, recorder.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                target: "freedom_ipfs_gateway",
+                "gateway_request",
+                request_id = 4343u64,
+                path = "/ipfs/bafytwice"
+            );
+            let _entered = span.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
+        });
+        let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{value}");
+        assert_eq!(events[0]["target_id"], 4343, "{value}");
+    }
+
+    /// A host whose filter sits on its own log layer, not on the whole
+    /// subscriber, leaves the info-level phase events to `progress_layer`.
+    #[test]
+    fn progress_layer_records_next_to_a_per_layer_warn_filter() {
+        let recorder = Arc::new(ProgressRecorder::default());
+        let logs = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::sink)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN);
+        let subscriber = Registry::default()
+            .with(logs)
+            .with(progress_layer_for(recorder.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start", request_id = 7u64);
+        });
+        let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
+        assert_eq!(value["events"].as_array().unwrap().len(), 1, "{value}");
     }
 
     #[test]
