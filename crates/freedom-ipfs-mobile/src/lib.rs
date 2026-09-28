@@ -802,9 +802,33 @@ fn progress_active_targets(inner: &ProgressInner) -> Vec<ProgressTarget> {
     active
 }
 
-#[derive(Clone)]
+// Not `Clone`: a clone dropping would release the claim of the original.
 struct ProgressLayer {
     recorder: Arc<ProgressRecorder>,
+    /// Held by the copy `progress_layer()` hands out; see `LayerClaim`.
+    _claim: Option<LayerClaim>,
+}
+
+/// The "a recording layer is out" flag, released when the layer holding
+/// it is dropped. A layer lives as long as its subscriber, so the claim
+/// sticks once the subscriber is installed (a global subscriber is never
+/// dropped) but comes back when the host discards the subscriber instead —
+/// `try_init` failing, a throwaway or test subscriber — and the host's
+/// next `progress_layer()` call records again.
+struct LayerClaim(&'static AtomicBool);
+
+impl LayerClaim {
+    fn take(flag: &'static AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(Self(flag))
+    }
+}
+
+impl Drop for LayerClaim {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl<S> Layer<S> for ProgressLayer
@@ -915,8 +939,10 @@ fn progress_recorder() -> Arc<ProgressRecorder> {
 /// filter admit `freedom_ipfs=info`.
 ///
 /// Add it once. Every instance writes to the same process-wide recorder,
-/// so a second copy would record each phase event twice; later calls
-/// therefore return a layer that does nothing.
+/// so a second copy would record each phase event twice; while the layer
+/// from an earlier call is still alive, later calls therefore return a
+/// layer that does nothing. Dropping that earlier layer (or the subscriber
+/// it was added to, e.g. after a failed `try_init`) frees the slot again.
 #[must_use]
 pub fn progress_layer<S>() -> impl Layer<S> + Send + Sync + 'static
 where
@@ -925,25 +951,37 @@ where
     progress_layer_once(&PROGRESS_LAYER_ISSUED, progress_recorder())
 }
 
-/// The recording layer the first time `issued` is claimed, a no-op after.
+/// The recording layer while `issued` is free, a no-op while an earlier
+/// recording layer is still alive.
 fn progress_layer_once<S>(
-    issued: &AtomicBool,
+    issued: &'static AtomicBool,
     recorder: Arc<ProgressRecorder>,
 ) -> impl Layer<S> + Send + Sync + 'static
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
-    let first = issued
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok();
-    first.then(|| progress_layer_for(recorder))
+    LayerClaim::take(issued).map(|claim| progress_layer_with(recorder, Some(claim)))
 }
 
 fn progress_layer_for<S>(recorder: Arc<ProgressRecorder>) -> impl Layer<S> + Send + Sync + 'static
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
-    ProgressLayer { recorder }.with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+    progress_layer_with(recorder, None)
+}
+
+fn progress_layer_with<S>(
+    recorder: Arc<ProgressRecorder>,
+    claim: Option<LayerClaim>,
+) -> impl Layer<S> + Send + Sync + 'static
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    ProgressLayer {
+        recorder,
+        _claim: claim,
+    }
+    .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
         meta.target().starts_with("freedom_ipfs")
             && (meta.is_span() || meta.fields().field("phase").is_some())
     }))
@@ -4817,11 +4855,11 @@ mod tests {
     /// every phase event twice in the shared recorder.
     #[test]
     fn progress_layer_added_twice_records_each_event_once() {
-        let issued = AtomicBool::new(false);
+        static ISSUED: AtomicBool = AtomicBool::new(false);
         let recorder = Arc::new(ProgressRecorder::default());
         let subscriber = Registry::default()
-            .with(progress_layer_once(&issued, recorder.clone()))
-            .with(progress_layer_once(&issued, recorder.clone()));
+            .with(progress_layer_once(&ISSUED, recorder.clone()))
+            .with(progress_layer_once(&ISSUED, recorder.clone()));
         tracing::subscriber::with_default(subscriber, || {
             let span = tracing::info_span!(
                 target: "freedom_ipfs_gateway",
@@ -4836,6 +4874,44 @@ mod tests {
         let events = value["events"].as_array().unwrap();
         assert_eq!(events.len(), 1, "{value}");
         assert_eq!(events[0]["target_id"], 4343, "{value}");
+    }
+
+    /// A layer the host builds but throws away (its `try_init` failed, or it
+    /// was a throwaway subscriber) must not use up the one recording copy:
+    /// the next call, for the subscriber that does get installed, records.
+    #[test]
+    fn progress_layer_dropped_unused_frees_the_recording_copy() {
+        static ISSUED: AtomicBool = AtomicBool::new(false);
+        let recorder = Arc::new(ProgressRecorder::default());
+        let throwaway = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        drop(throwaway);
+        let subscriber = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        // While the installed one is alive, another copy is still a no-op.
+        let extra = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        tracing::subscriber::with_default(extra, || {
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
+        });
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recorder.snapshot_json()).unwrap()["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                target: "freedom_ipfs_gateway",
+                "gateway_request",
+                request_id = 4545u64,
+                path = "/ipfs/bafyretry"
+            );
+            let _entered = span.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
+        });
+        let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{value}");
+        assert_eq!(events[0]["target_id"], 4545, "{value}");
     }
 
     /// A host whose filter sits on its own log layer, not on the whole
