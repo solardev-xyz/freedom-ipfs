@@ -889,11 +889,43 @@ fn progress_recorder() -> Arc<ProgressRecorder> {
         .clone()
 }
 
+/// The `tracing` layer that feeds `freedom_ipfs_node_progress_snapshot_json`.
+///
+/// The node installs it as the process's global subscriber on its own
+/// (see `ensure_progress_tracing`), but that slot is process-wide and
+/// the first claim wins: a host that links this crate next to another
+/// library that installs a subscriber first (freedom-mobile-ffi, where
+/// ant-ffi's log subscriber comes up before the IPFS node) must put this
+/// layer on its own subscriber, alongside its other layers, before
+/// either library initialises — otherwise the snapshot stays empty.
+///
+/// Filtered to itself: it only sees freedom-ipfs's spans and the events
+/// that carry a `phase` (the only ones the recorder keeps), so sharing a
+/// subscriber with a chattier library costs one cached callsite check
+/// per foreign callsite, not a field walk per event.
+#[must_use]
+pub fn progress_layer<S>() -> impl Layer<S> + Send + Sync + 'static
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    progress_layer_for(progress_recorder())
+}
+
+fn progress_layer_for<S>(recorder: Arc<ProgressRecorder>) -> impl Layer<S> + Send + Sync + 'static
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    ProgressLayer { recorder }.with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+        meta.target().starts_with("freedom_ipfs")
+            && (meta.is_span() || meta.fields().field("phase").is_some())
+    }))
+}
+
 fn ensure_progress_tracing() {
-    let recorder = progress_recorder();
     PROGRESS_TRACING_INIT.call_once(|| {
-        let layer = ProgressLayer { recorder };
-        let subscriber = Registry::default().with(layer);
+        let subscriber = Registry::default().with(progress_layer());
+        // Fails when the host already installed a subscriber; if that one
+        // carries `progress_layer()` the snapshot still fills (see above).
         let _ = tracing::subscriber::set_global_default(subscriber);
     });
 }
@@ -4716,6 +4748,37 @@ mod tests {
 
             freedom_ipfs_node_free(node);
         }
+    }
+
+    /// A host that owns the global subscriber (freedom-mobile-ffi, next
+    /// to ant-ffi's log layer) must still fill the snapshot through
+    /// `progress_layer`, whatever the other layers filter.
+    #[test]
+    fn progress_layer_records_when_composed_with_other_layers() {
+        let recorder = Arc::new(ProgressRecorder::default());
+        let quiet_logs = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::sink)
+            .with_filter(tracing_subscriber::filter::LevelFilter::ERROR);
+        let subscriber = Registry::default()
+            .with(quiet_logs)
+            .with(progress_layer_for(recorder.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                target: "freedom_ipfs_gateway",
+                "gateway_request",
+                request_id = 9191u64,
+                path = "/ipfs/bafycomposed"
+            );
+            let _entered = span.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
+            // Another library's event, even with a `phase`, isn't ours.
+            tracing::info!(target: "ant_retrieval", phase = "request_start", request_id = 1u64);
+        });
+        let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "{value}");
+        assert_eq!(events[0]["target_id"], 9191, "{value}");
+        assert_eq!(events[0]["path"], "/ipfs/bafycomposed", "{value}");
     }
 
     #[test]
