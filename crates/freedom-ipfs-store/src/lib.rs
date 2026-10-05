@@ -123,6 +123,25 @@ impl SqliteBlockStore {
         Ok(())
     }
 
+    /// Closes the database connection now, even while clones of this store
+    /// are still alive (for example held by blocking work that outlived its
+    /// runtime). The connection is swapped for an empty in-memory database, so
+    /// later calls through any clone fail with an SQLite error instead of
+    /// touching the file, and the file can be reopened right away. Waits at
+    /// most `timeout` for a statement already in progress; returns `false`,
+    /// leaving the connection open, if that does not finish in time.
+    pub fn close(&self, timeout: Duration) -> bool {
+        let Some(mut conn) = self.conn.try_lock_for(timeout) else {
+            return false;
+        };
+        let Ok(closed) = Connection::open_in_memory() else {
+            return false;
+        };
+        drop(std::mem::replace(&mut *conn, closed));
+        *self.hot.lock() = VerifiedHotCache::new(0);
+        true
+    }
+
     pub fn put_block(&self, cid: &Cid, data: &[u8]) -> Result<()> {
         verify_block(cid, data)?;
         let cid_bytes = block_key(cid);
@@ -677,6 +696,37 @@ impl VerifiedHotCache {
 mod tests {
     use super::*;
     use freedom_ipfs_core::{cid_from_data, CODEC_DAG_PB, CODEC_RAW};
+
+    #[test]
+    fn close_releases_the_file_while_clones_are_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let store = SqliteBlockStore::open(&path, 0).unwrap();
+        let data = b"closed store fixture".to_vec();
+        let cid = cid_from_data(CODEC_RAW, &data);
+        store.put_block(&cid, &data).unwrap();
+        let leaked = store.clone();
+
+        assert!(store.close(Duration::from_secs(1)));
+        drop(store);
+
+        // A clone that outlived close() gets errors, not the file or the hot cache.
+        assert!(leaked.block_count().is_err());
+        assert!(leaked.get(&cid).is_err());
+        assert!(leaked.put_block(&cid, &data).is_err());
+
+        let reopened = SqliteBlockStore::open(&path, 0).unwrap();
+        assert_eq!(reopened.get(&cid).unwrap().unwrap().data(), data.as_slice());
+    }
+
+    #[test]
+    fn close_gives_up_after_timeout_when_a_statement_holds_the_connection() {
+        let store = SqliteBlockStore::in_memory(0).unwrap();
+        let guard = store.conn.lock();
+        assert!(!store.close(Duration::from_millis(20)));
+        drop(guard);
+        assert!(store.block_count().is_ok());
+    }
 
     #[test]
     fn stores_and_verifies_blocks() {

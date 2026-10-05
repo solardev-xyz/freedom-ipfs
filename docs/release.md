@@ -41,8 +41,14 @@ Electron loads the addon into its main process, so the node lifecycle has
 Promise-returning variants that run on the libuv thread pool instead of the
 JS thread: `nodeNewWithDataDirAsync`, `nodeStartNativeGatewayOnlineAsync`,
 `nodeStopGatewayAsync` and `nodeFreeAsync` (same arguments and results as the
-sync exports, which remain for existing callers). Await a pending start/stop
-before freeing the node, and do not use a handle after `nodeFreeAsync`.
+sync exports, which remain for existing callers). Async start/stop/free calls
+on one handle run one at a time in call order, so an unawaited start cannot
+land after a later stop, and `nodeFreeAsync` runs after the start/stop called
+before it. While one is pending, the sync `nodeStartNativeGatewayOnline`,
+`nodeStopGateway` and `nodeFree` throw for that handle instead of racing it.
+Do not use a handle after `nodeFreeAsync`. Node free closes the cache database
+before it returns (or resolves), even if blocking work outlives the 2 s runtime
+shutdown bound, so the same data dir can be reopened right away.
 `node bench-lifecycle.js` in the addon directory measures how long each
 lifecycle call blocks the JS thread.
 

@@ -57,6 +57,34 @@ async function main() {
     }
     handle = null;
     await addon.nodeFreeAsync(asyncHandle);
+
+    // Async lifecycle calls on one handle settle in call order, even when the
+    // caller does not await them, and free waits for the start/stop before it.
+    const orderHandle = await addon.nodeNewWithDataDirAsync(dataDir, 1024 * 1024);
+    if (!orderHandle || orderHandle === '0') {
+      throw new Error('nodeNewWithDataDirAsync resolved to an empty handle');
+    }
+    const settled = [];
+    const track = (label, promise) => promise.then((value) => settled.push(label) && value);
+    const start = track('start', addon.nodeStartNativeGatewayOnlineAsync(orderHandle));
+    const stop = track('stop', addon.nodeStopGatewayAsync(orderHandle));
+    let syncFreeError = null;
+    try {
+      addon.nodeFree(orderHandle);
+    } catch (err) {
+      syncFreeError = err;
+    }
+    if (!syncFreeError || !/still pending/.test(syncFreeError.message)) {
+      throw new Error('nodeFree did not refuse a handle with a pending async lifecycle call');
+    }
+    const free = track('free', addon.nodeFreeAsync(orderHandle));
+    const results = await Promise.all([start, stop, free]);
+    if (settled.join(',') !== 'start,stop,free') {
+      throw new Error(`async lifecycle calls settled out of order: ${settled.join(',')}`);
+    }
+    if (results[0] !== true || results[1] !== true) {
+      throw new Error(`unawaited start/stop resolved to ${results[0]}/${results[1]}`);
+    }
     console.log(
       JSON.stringify(
         {

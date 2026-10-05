@@ -3,8 +3,10 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 extern "C" {
@@ -70,17 +72,46 @@ std::string TakeCString(char* ptr) {
   return out;
 }
 
+// Async lifecycle calls (start/stop/free) on one node handle run one at a
+// time, in the order JS made them: each waits here until the previous one has
+// settled, so an unawaited start cannot finish after a later stop, and free
+// runs after every start/stop queued before it. Per-env instance data, only
+// touched on that env's JS thread.
+struct LifecycleQueues {
+  std::unordered_map<FreedomIpfsNode*, std::deque<Napi::AsyncWorker*>> pending;
+};
+
+LifecycleQueues& Lifecycle(Napi::Env env) { return *env.GetInstanceData<LifecycleQueues>(); }
+
+bool LifecyclePending(Napi::Env env, FreedomIpfsNode* node) {
+  return Lifecycle(env).pending.count(node) != 0;
+}
+
+// The sync lifecycle exports refuse to run while an async lifecycle call on
+// the same handle is still pending (they would race it, or free the node
+// underneath it).
+bool ThrowIfLifecyclePending(Napi::Env env, FreedomIpfsNode* node, const char* name) {
+  if (!LifecyclePending(env, node)) return false;
+  Napi::Error::New(env, std::string(name) +
+                            ": an async lifecycle call on this node is still pending")
+      .ThrowAsJavaScriptException();
+  return true;
+}
+
 // Runs `Work` on the libuv thread pool and settles a Promise on the JS thread
 // with `Resolve(env, result)`. The lifecycle calls below can open SQLite,
 // build or tear down a Tokio runtime, and wait for in-flight requests to
 // unwind, so the `*Async` exports use this to keep Electron's main process
 // responsive. The sync exports stay for hosts that already rely on them.
+// A non-null `serial` node puts the worker in that node's lifecycle queue.
 template <typename Result, typename Work, typename Resolve>
 class PromiseWorker : public Napi::AsyncWorker {
  public:
-  PromiseWorker(Napi::Env env, const char* resource_name, Work work, Resolve resolve)
+  PromiseWorker(Napi::Env env, const char* resource_name, FreedomIpfsNode* serial, Work work,
+                Resolve resolve)
       : Napi::AsyncWorker(env, resource_name),
         deferred_(Napi::Promise::Deferred::New(env)),
+        serial_(serial),
         work_(std::move(work)),
         resolve_(std::move(resolve)) {}
 
@@ -88,23 +119,51 @@ class PromiseWorker : public Napi::AsyncWorker {
 
   void Execute() override { result_ = work_(); }
 
-  void OnOK() override { deferred_.Resolve(resolve_(Env(), result_)); }
+  void OnOK() override {
+    RunNext();
+    deferred_.Resolve(resolve_(Env(), result_));
+  }
 
-  void OnError(const Napi::Error& error) override { deferred_.Reject(error.Value()); }
+  void OnError(const Napi::Error& error) override {
+    RunNext();
+    deferred_.Reject(error.Value());
+  }
 
  private:
+  // This worker is at the front of its node's queue; hand over to the next.
+  void RunNext() {
+    if (serial_ == nullptr) return;
+    auto& pending = Lifecycle(Env()).pending;
+    auto it = pending.find(serial_);
+    if (it == pending.end()) return;
+    it->second.pop_front();
+    if (it->second.empty()) {
+      pending.erase(it);
+    } else {
+      it->second.front()->Queue();
+    }
+  }
+
   Napi::Promise::Deferred deferred_;
+  FreedomIpfsNode* serial_;
   Work work_;
   Resolve resolve_;
   Result result_{};
 };
 
 template <typename Result, typename Work, typename Resolve>
-Napi::Value QueuePromise(Napi::Env env, const char* resource_name, Work work, Resolve resolve) {
+Napi::Value QueuePromise(Napi::Env env, const char* resource_name, FreedomIpfsNode* serial,
+                         Work work, Resolve resolve) {
   auto* worker = new PromiseWorker<Result, Work, Resolve>(
-      env, resource_name, std::move(work), std::move(resolve));
+      env, resource_name, serial, std::move(work), std::move(resolve));
   Napi::Promise promise = worker->Promise();
-  worker->Queue();
+  if (serial == nullptr) {
+    worker->Queue();
+    return promise;
+  }
+  auto& queue = Lifecycle(env).pending[serial];
+  queue.push_back(worker);
+  if (queue.size() == 1) worker->Queue();
   return promise;
 }
 
@@ -155,7 +214,7 @@ Napi::Value NodeNewWithDataDirAsync(const Napi::CallbackInfo& info) {
   NewArgs args;
   if (!ParseNewArgs(info, "nodeNewWithDataDirAsync", &args)) return env.Null();
   return QueuePromise<FreedomIpfsNode*>(
-      env, "freedomIpfsNodeNew",
+      env, "freedomIpfsNodeNew", nullptr,
       [args]() {
         return freedom_ipfs_node_new_with_data_dir(args.data_dir.c_str(), args.max_cache_bytes);
       },
@@ -168,19 +227,20 @@ Napi::Value NodeFree(const Napi::CallbackInfo& info) {
   bool ok = false;
   FreedomIpfsNode* node = NodeFromValue(info[0], &ok);
   if (ok) {
+    if (ThrowIfLifecyclePending(info.Env(), node, "nodeFree")) return info.Env().Null();
     freedom_ipfs_node_free(node);
   }
   return info.Env().Undefined();
 }
 
 // The handle is invalid as soon as this is called: the caller must not pass
-// it to any other export, and must not call this while an async start/stop
-// on the same handle is still pending.
+// it to any other export. The free itself runs after any async start/stop on
+// the same handle that was called before it.
 Napi::Value NodeFreeAsync(const Napi::CallbackInfo& info) {
   bool ok = false;
   FreedomIpfsNode* node = NodeFromValue(info[0], &ok);
   return QueuePromise<bool>(
-      info.Env(), "freedomIpfsNodeFree",
+      info.Env(), "freedomIpfsNodeFree", ok ? node : nullptr,
       [node, ok]() {
         if (ok) freedom_ipfs_node_free(node);
         return ok;
@@ -249,6 +309,7 @@ Napi::Value NodeStartNativeGatewayOnline(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   StartArgs args;
   if (!ParseStartArgs(info, &args)) return env.Null();
+  if (ThrowIfLifecyclePending(env, args.node, "nodeStartNativeGatewayOnline")) return env.Null();
   return Napi::Boolean::New(env, args.Start());
 }
 
@@ -258,7 +319,7 @@ Napi::Value NodeStartNativeGatewayOnlineAsync(const Napi::CallbackInfo& info) {
   StartArgs args;
   if (!ParseStartArgs(info, &args)) return env.Null();
   return QueuePromise<bool>(
-      env, "freedomIpfsNodeStart", [args]() { return args.Start(); },
+      env, "freedomIpfsNodeStart", args.node, [args]() { return args.Start(); },
       [](Napi::Env env, bool started) -> Napi::Value {
         return Napi::Boolean::New(env, started);
       });
@@ -269,6 +330,7 @@ Napi::Value NodeStopGateway(const Napi::CallbackInfo& info) {
   bool ok = false;
   FreedomIpfsNode* node = NodeFromValue(info[0], &ok);
   if (!ok) return ThrowTypeError(env, "invalid node handle");
+  if (ThrowIfLifecyclePending(env, node, "nodeStopGateway")) return env.Null();
   return Napi::Boolean::New(env, freedom_ipfs_node_stop_gateway(node));
 }
 
@@ -278,7 +340,7 @@ Napi::Value NodeStopGatewayAsync(const Napi::CallbackInfo& info) {
   FreedomIpfsNode* node = NodeFromValue(info[0], &ok);
   if (!ok) return ThrowTypeError(env, "invalid node handle");
   return QueuePromise<bool>(
-      env, "freedomIpfsNodeStopGateway",
+      env, "freedomIpfsNodeStopGateway", node,
       [node]() { return freedom_ipfs_node_stop_gateway(node); },
       [](Napi::Env env, bool stopped) -> Napi::Value {
         return Napi::Boolean::New(env, stopped);
@@ -424,6 +486,7 @@ Napi::Object Constants(Napi::Env env) {
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
+  env.SetInstanceData(new LifecycleQueues());
   exports.Set("version", Napi::Function::New(env, Version));
   exports.Set("buildInfoJson", Napi::Function::New(env, BuildInfoJson));
   exports.Set("nodeNewWithDataDir", Napi::Function::New(env, NodeNewWithDataDir));

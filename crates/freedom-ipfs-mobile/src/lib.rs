@@ -48,6 +48,9 @@ const PRELOAD_TIMEOUT: Duration = Duration::from_secs(60);
 /// work (e.g. a stuck DNS lookup) after async tasks are aborted. Dropping the
 /// runtime instead would wait for that work indefinitely.
 const NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound on how long `freedom_ipfs_node_free` waits for an SQLite
+/// statement in progress before closing the cache database.
+const NODE_FREE_STORE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROGRESS_EVENTS: usize = 512;
 const NATIVE_BODY_CHANNEL_CAPACITY: usize = 2;
 const X_FREEDOM_REQUEST_ID: &str = "X-Freedom-Request-ID";
@@ -1488,6 +1491,11 @@ pub unsafe extern "C" fn freedom_ipfs_node_clear_progress(ptr: *mut FreedomIpfsN
 ///
 /// `ptr` must be a pointer returned by `freedom_ipfs_node_new_in_memory` and
 /// must not be used after this function returns.
+///
+/// Returns once the node's cache database is closed, so the same data dir can
+/// be reopened immediately. Blocking work that is still running after the
+/// runtime shutdown timeout is left to finish on its own, but it can no longer
+/// reach the database: the store is closed underneath it.
 #[no_mangle]
 pub unsafe extern "C" fn freedom_ipfs_node_free(ptr: *mut FreedomIpfsNode) {
     if !ptr.is_null() {
@@ -1496,8 +1504,11 @@ pub unsafe extern "C" fn freedom_ipfs_node_free(ptr: *mut FreedomIpfsNode) {
         stop_gateway(node);
         stop_preloads(node);
         let node = Box::from_raw(ptr);
-        let FreedomIpfsNode { runtime, .. } = *node;
+        let FreedomIpfsNode { runtime, store, .. } = *node;
         runtime.shutdown_timeout(NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT);
+        if !store.close(NODE_FREE_STORE_CLOSE_TIMEOUT) {
+            tracing::warn!(phase = "node_free_store_close_timeout");
+        }
     }
 }
 
@@ -5379,6 +5390,39 @@ mod tests {
                 elapsed < NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT + Duration::from_secs(2),
                 "node free waited {elapsed:?} for a stuck blocking request"
             );
+        }
+    }
+
+    #[test]
+    fn node_free_closes_the_store_even_when_a_clone_outlives_the_runtime() {
+        unsafe {
+            let tempdir = tempfile::tempdir().unwrap();
+            let db_path = tempdir.path().join(CACHE_DB_FILE);
+            let store = SqliteBlockStore::open(&db_path, 0).unwrap();
+            let data = b"store survives free fixture".to_vec();
+            let cid = cid_from_data(CODEC_RAW, &data);
+            store.put_block(&cid, &data).unwrap();
+            // Stands in for blocking-pool work still holding a store clone
+            // after the runtime shutdown timeout.
+            let leaked = store.clone();
+            let node = node_from_store(store);
+            assert!(!node.is_null());
+
+            freedom_ipfs_node_free(node);
+
+            assert!(leaked.block_count().is_err());
+            #[cfg(target_os = "linux")]
+            {
+                let db_path = fs::canonicalize(&db_path).unwrap();
+                let open_fds = fs::read_dir("/proc/self/fd")
+                    .unwrap()
+                    .filter_map(|entry| fs::read_link(entry.ok()?.path()).ok())
+                    .filter(|target| *target == db_path)
+                    .count();
+                assert_eq!(open_fds, 0, "cache db still open after node free");
+            }
+            let reopened = SqliteBlockStore::open(&db_path, 0).unwrap();
+            assert_eq!(reopened.get(&cid).unwrap().unwrap().data(), data.as_slice());
         }
     }
 
