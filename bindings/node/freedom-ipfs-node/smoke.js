@@ -90,9 +90,12 @@ async function main() {
     // Once a free has run, a new node may get the same address before that
     // free's promise settles. The new handle must not inherit the old one's
     // pending lifecycle queue (sync calls on it would throw "still pending").
-    // glibc rarely hands the address back this quickly; to force reuse run
-    //   MALLOC_CONF=narenas:1,tcache:false LD_PRELOAD=<libjemalloc.so.2> node smoke.js
-    // which reuses it on every iteration (reported as reused_addresses).
+    // The default allocators rarely hand the address back this quickly, so
+    // CI also runs this file on Linux under
+    //   MALLOC_CONF=narenas:1,tcache:false LD_PRELOAD=<libjemalloc.so.2>
+    // which reuses it on most iterations (reported as reused_addresses), with
+    // FREEDOM_IPFS_SMOKE_MIN_REUSED_ADDRESSES=1 so that run fails instead of
+    // passing without ever taking the reuse path.
     let reusedAddresses = 0;
     for (let i = 0; i < 20; i += 1) {
       const oldHandle = addon.nodeNewWithDataDir(dataDir, 1024 * 1024);
@@ -115,6 +118,16 @@ async function main() {
       if ((await newStart) !== true || (await newStop) !== true) {
         throw new Error('lifecycle calls on a reused node address did not resolve to true');
       }
+    }
+    const minReused = Number(process.env.FREEDOM_IPFS_SMOKE_MIN_REUSED_ADDRESSES || 0);
+    if (!Number.isInteger(minReused) || minReused < 0) {
+      throw new Error('FREEDOM_IPFS_SMOKE_MIN_REUSED_ADDRESSES must be a non-negative integer');
+    }
+    if (reusedAddresses < minReused) {
+      throw new Error(
+        `node address reused ${reusedAddresses} times, expected at least ${minReused}: ` +
+          'the stale lifecycle queue check did not run'
+      );
     }
     console.log(
       JSON.stringify(

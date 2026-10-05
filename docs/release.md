@@ -52,8 +52,10 @@ database before it returns (or resolves), even if blocking work outlives the
 This is bounded, not guaranteed: free waits up to 2 s more for a SQLite
 statement that leaked blocking work is still running. If that statement holds
 the connection past the bound, free logs `node_free_store_close_timeout` and
-returns with the database still open; it then closes when that work finishes.
-So free blocks for at most about 4 s (runtime shutdown plus store close).
+returns with the database still open. A background thread then closes it as
+soon as that statement releases the connection; until then the leaked work can
+still run statements against the cache file. So free blocks for at most about
+4 s (runtime shutdown plus store close).
 `node bench-lifecycle.js` in the addon directory measures how long each
 lifecycle call blocks the JS thread.
 

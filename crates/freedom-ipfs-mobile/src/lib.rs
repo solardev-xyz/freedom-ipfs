@@ -1498,8 +1498,10 @@ pub unsafe extern "C" fn freedom_ipfs_node_clear_progress(ptr: *mut FreedomIpfsN
 /// longer reach the database: the store is closed underneath it. Closing waits
 /// at most `NODE_FREE_STORE_CLOSE_TIMEOUT` for a statement such work is still
 /// running; if it does not finish in time this logs
-/// `node_free_store_close_timeout` and returns with the database still open
-/// (it closes when that work drops its store). Worst case this blocks for
+/// `node_free_store_close_timeout` and returns with the database still open,
+/// and a background thread closes it as soon as that statement releases the
+/// connection (until then the leaked work can still run statements against
+/// the file). Worst case this blocks for
 /// about `NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT + NODE_FREE_STORE_CLOSE_TIMEOUT`.
 #[no_mangle]
 pub unsafe extern "C" fn freedom_ipfs_node_free(ptr: *mut FreedomIpfsNode) {
@@ -1511,7 +1513,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_free(ptr: *mut FreedomIpfsNode) {
         let node = Box::from_raw(ptr);
         let FreedomIpfsNode { runtime, store, .. } = *node;
         runtime.shutdown_timeout(NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT);
-        if !store.close(NODE_FREE_STORE_CLOSE_TIMEOUT) {
+        if !store.close_or_close_later(NODE_FREE_STORE_CLOSE_TIMEOUT) {
             tracing::warn!(phase = "node_free_store_close_timeout");
         }
     }
