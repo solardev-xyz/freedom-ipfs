@@ -44,6 +44,13 @@ const ROUTING_MODE_DELEGATED: u32 = 1;
 const ROUTING_MODE_LIGHT_DHT: u32 = 2;
 const ROUTING_MODE_OFFLINE: u32 = 3;
 const PRELOAD_TIMEOUT: Duration = Duration::from_secs(60);
+/// Upper bound on how long `freedom_ipfs_node_free` waits for blocking-pool
+/// work (e.g. a stuck DNS lookup) after async tasks are aborted. Dropping the
+/// runtime instead would wait for that work indefinitely.
+const NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound on how long `freedom_ipfs_node_free` waits for an SQLite
+/// statement in progress before closing the cache database.
+const NODE_FREE_STORE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROGRESS_EVENTS: usize = 512;
 const NATIVE_BODY_CHANNEL_CAPACITY: usize = 2;
 const X_FREEDOM_REQUEST_ID: &str = "X-Freedom-Request-ID";
@@ -1484,6 +1491,20 @@ pub unsafe extern "C" fn freedom_ipfs_node_clear_progress(ptr: *mut FreedomIpfsN
 ///
 /// `ptr` must be a pointer returned by `freedom_ipfs_node_new_in_memory` and
 /// must not be used after this function returns.
+///
+/// Normally returns once the node's cache database is closed, so the same data
+/// dir can be reopened immediately. Blocking work that is still running after
+/// the runtime shutdown timeout is left to finish on its own, but it can no
+/// longer reach the database: the store is closed underneath it. Closing waits
+/// at most `NODE_FREE_STORE_CLOSE_TIMEOUT` for a statement such work is still
+/// running; if it does not finish in time this logs
+/// `node_free_store_close_timeout` and returns with the database still open,
+/// and a background thread closes it as soon as that statement releases the
+/// connection (until then the leaked work can still run statements against
+/// the file). That thread waits as long as the statement does: one that
+/// never returns leaves a parked `freedom-ipfs-store-close` thread for the
+/// life of the process, one per such free. Worst case this blocks for
+/// about `NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT + NODE_FREE_STORE_CLOSE_TIMEOUT`.
 #[no_mangle]
 pub unsafe extern "C" fn freedom_ipfs_node_free(ptr: *mut FreedomIpfsNode) {
     if !ptr.is_null() {
@@ -1491,7 +1512,12 @@ pub unsafe extern "C" fn freedom_ipfs_node_free(ptr: *mut FreedomIpfsNode) {
         stop_native_gateway_requests(node);
         stop_gateway(node);
         stop_preloads(node);
-        let _ = Box::from_raw(ptr);
+        let node = Box::from_raw(ptr);
+        let FreedomIpfsNode { runtime, store, .. } = *node;
+        runtime.shutdown_timeout(NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT);
+        if !store.close_or_close_later(NODE_FREE_STORE_CLOSE_TIMEOUT) {
+            tracing::warn!(phase = "node_free_store_close_timeout");
+        }
     }
 }
 
@@ -5334,6 +5360,78 @@ mod tests {
             assert!(freedom_ipfs_gateway_request_free(node, handle));
 
             freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
+    fn node_free_does_not_wait_for_stuck_blocking_request() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let data = b"stuck blocking fixture".to_vec();
+            let cid = cid_from_data(CODEC_RAW, &data);
+            let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let provider: Arc<dyn BlockProvider> = Arc::new(SlowTestProvider {
+                cid,
+                data,
+                entered: entered.clone(),
+                delay: Duration::from_secs(30),
+            });
+            set_native_gateway_core(&*node, GatewayCore::with_provider(provider));
+
+            let _handle = start_native_gateway_request(
+                node,
+                json!({ "method": "GET", "path": format!("/ipfs/{cid}") }),
+            );
+            for _ in 0..500 {
+                if entered.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(entered.load(Ordering::SeqCst));
+
+            let started = Instant::now();
+            freedom_ipfs_node_free(node);
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT + Duration::from_secs(2),
+                "node free waited {elapsed:?} for a stuck blocking request"
+            );
+        }
+    }
+
+    #[test]
+    fn node_free_closes_the_store_even_when_a_clone_outlives_the_runtime() {
+        unsafe {
+            let tempdir = tempfile::tempdir().unwrap();
+            let db_path = tempdir.path().join(CACHE_DB_FILE);
+            let store = SqliteBlockStore::open(&db_path, 0).unwrap();
+            let data = b"store survives free fixture".to_vec();
+            let cid = cid_from_data(CODEC_RAW, &data);
+            store.put_block(&cid, &data).unwrap();
+            // Stands in for blocking-pool work still holding a store clone
+            // after the runtime shutdown timeout.
+            let leaked = store.clone();
+            let node = node_from_store(store);
+            assert!(!node.is_null());
+
+            freedom_ipfs_node_free(node);
+
+            assert!(leaked.block_count().is_err());
+            #[cfg(target_os = "linux")]
+            {
+                let db_path = fs::canonicalize(&db_path).unwrap();
+                let open_fds = fs::read_dir("/proc/self/fd")
+                    .unwrap()
+                    .filter_map(|entry| fs::read_link(entry.ok()?.path()).ok())
+                    .filter(|target| *target == db_path)
+                    .count();
+                assert_eq!(open_fds, 0, "cache db still open after node free");
+            }
+            let reopened = SqliteBlockStore::open(&db_path, 0).unwrap();
+            assert_eq!(reopened.get(&cid).unwrap().unwrap().data(), data.as_slice());
         }
     }
 

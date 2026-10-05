@@ -123,6 +123,56 @@ impl SqliteBlockStore {
         Ok(())
     }
 
+    /// Closes the database connection now, even while clones of this store
+    /// are still alive (for example held by blocking work that outlived its
+    /// runtime). The connection is swapped for an empty in-memory database, so
+    /// later calls through any clone fail with an SQLite error instead of
+    /// touching the file, and the file can be reopened right away. Waits at
+    /// most `timeout` for a statement already in progress; returns `false`,
+    /// leaving the connection open, if that does not finish in time.
+    pub fn close(&self, timeout: Duration) -> bool {
+        match self.conn.try_lock_for(timeout) {
+            Some(conn) => self.close_locked(conn),
+            None => false,
+        }
+    }
+
+    /// Like [`close`](Self::close), but when the statement in progress is
+    /// still running after `timeout`, hands the store to a background thread
+    /// that closes it as soon as that statement releases the connection,
+    /// instead of leaving it open until the last clone is dropped. Returns
+    /// whether the store was closed within `timeout`.
+    ///
+    /// The background thread has no deadline: it blocks on the connection
+    /// lock for exactly as long as the running statement holds it. A statement
+    /// that never returns therefore parks one `freedom-ipfs-store-close`
+    /// thread (and keeps the database open) for the rest of the process, one
+    /// per call that timed out. That is the same lifetime the connection
+    /// would have had without this call, plus one idle thread.
+    pub fn close_or_close_later(self, timeout: Duration) -> bool {
+        if self.close(timeout) {
+            return true;
+        }
+        // If the thread cannot be spawned the store is dropped here and the
+        // connection closes with its last clone, as before.
+        let _ = std::thread::Builder::new()
+            .name("freedom-ipfs-store-close".into())
+            .spawn(move || {
+                let conn = self.conn.lock();
+                self.close_locked(conn);
+            });
+        false
+    }
+
+    fn close_locked(&self, mut conn: parking_lot::MutexGuard<'_, Connection>) -> bool {
+        let Ok(closed) = Connection::open_in_memory() else {
+            return false;
+        };
+        drop(std::mem::replace(&mut *conn, closed));
+        *self.hot.lock() = VerifiedHotCache::new(0);
+        true
+    }
+
     pub fn put_block(&self, cid: &Cid, data: &[u8]) -> Result<()> {
         verify_block(cid, data)?;
         let cid_bytes = block_key(cid);
@@ -677,6 +727,68 @@ impl VerifiedHotCache {
 mod tests {
     use super::*;
     use freedom_ipfs_core::{cid_from_data, CODEC_DAG_PB, CODEC_RAW};
+
+    #[test]
+    fn close_releases_the_file_while_clones_are_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let store = SqliteBlockStore::open(&path, 0).unwrap();
+        let data = b"closed store fixture".to_vec();
+        let cid = cid_from_data(CODEC_RAW, &data);
+        store.put_block(&cid, &data).unwrap();
+        let leaked = store.clone();
+
+        assert!(store.close(Duration::from_secs(1)));
+        drop(store);
+
+        // A clone that outlived close() gets errors, not the file or the hot cache.
+        assert!(leaked.block_count().is_err());
+        assert!(leaked.get(&cid).is_err());
+        assert!(leaked.put_block(&cid, &data).is_err());
+
+        let reopened = SqliteBlockStore::open(&path, 0).unwrap();
+        assert_eq!(reopened.get(&cid).unwrap().unwrap().data(), data.as_slice());
+    }
+
+    #[test]
+    fn close_gives_up_after_timeout_when_a_statement_holds_the_connection() {
+        let store = SqliteBlockStore::in_memory(0).unwrap();
+        let guard = store.conn.lock();
+        assert!(!store.close(Duration::from_millis(20)));
+        drop(guard);
+        assert!(store.block_count().is_ok());
+    }
+
+    #[test]
+    fn close_or_close_later_closes_once_the_statement_releases_the_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let store = SqliteBlockStore::open(&path, 0).unwrap();
+        let data = b"close later fixture".to_vec();
+        let cid = cid_from_data(CODEC_RAW, &data);
+        store.put_block(&cid, &data).unwrap();
+        let leaked = store.clone();
+
+        // Stands in for a statement that leaked blocking work is still running.
+        let guard = leaked.conn.lock();
+        assert!(!store.close_or_close_later(Duration::from_millis(20)));
+        drop(guard);
+
+        // Nothing but the background close touches the store from here on;
+        // it must close the file even though `leaked` is never dropped.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while leaked.block_count().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "store was not closed after the statement released the connection"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(leaked.get(&cid).is_err());
+        assert!(leaked.put_block(&cid, &data).is_err());
+        let reopened = SqliteBlockStore::open(&path, 0).unwrap();
+        assert_eq!(reopened.get(&cid).unwrap().unwrap().data(), data.as_slice());
+    }
 
     #[test]
     fn stores_and_verifies_blocks() {

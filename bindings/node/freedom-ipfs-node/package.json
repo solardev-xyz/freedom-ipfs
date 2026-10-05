@@ -1,6 +1,6 @@
 {
   "name": "@solardev-xyz/freedom-ipfs-node",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "private": true,
   "description": "Native Node/Electron binding for freedom-ipfs",
   "license": "MIT OR Apache-2.0",
@@ -9,7 +9,8 @@
   "scripts": {
     "install": "node -e \"console.log('freedom-ipfs-node: install skips native build; run npm run build or scripts/package-electron-addon.js')\"",
     "build": "node-gyp rebuild",
-    "smoke": "node smoke.js"
+    "smoke": "node smoke.js",
+    "bench:lifecycle": "node bench-lifecycle.js"
   },
   "dependencies": {
     "node-addon-api": "^8.5.0"

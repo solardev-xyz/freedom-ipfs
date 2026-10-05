@@ -64,6 +64,20 @@ jobs:
         working-directory: bindings/node/freedom-ipfs-node
         run: npm run smoke
 
+      # The default allocators rarely give a freed node's address to the next
+      # node, so the smoke's address-reuse check needs jemalloc with a single
+      # arena and no thread cache to actually take that path.
+      - name: Smoke node address reuse (jemalloc)
+        if: runner.os == 'Linux'
+        working-directory: bindings/node/freedom-ipfs-node
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libjemalloc2
+          jemalloc="$(dpkg -L libjemalloc2 | grep '/libjemalloc\.so\.2$' | head -n1)"
+          test -n "$jemalloc"
+          MALLOC_CONF=narenas:1,tcache:false LD_PRELOAD="$jemalloc" \
+            FREEDOM_IPFS_SMOKE_MIN_REUSED_ADDRESSES=1 npm run smoke
+
       - name: Upload addon artifact
         uses: actions/upload-artifact@v7
         with:
