@@ -37,6 +37,15 @@ The desktop addon is a private N-API package under
 static library into `freedom_ipfs_native.node` and exposes the native gateway
 FFI to Electron/Node consumers.
 
+Electron loads the addon into its main process, so the node lifecycle has
+Promise-returning variants that run on the libuv thread pool instead of the
+JS thread: `nodeNewWithDataDirAsync`, `nodeStartNativeGatewayOnlineAsync`,
+`nodeStopGatewayAsync` and `nodeFreeAsync` (same arguments and results as the
+sync exports, which remain for existing callers). Await a pending start/stop
+before freeing the node, and do not use a handle after `nodeFreeAsync`.
+`node bench-lifecycle.js` in the addon directory measures how long each
+lifecycle call blocks the JS thread.
+
 Build a release artifact for the current host platform with:
 
 ```sh

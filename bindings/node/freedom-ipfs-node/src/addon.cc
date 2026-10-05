@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <limits>
 #include <string>
+#include <utility>
 
 extern "C" {
 #include "freedom_ipfs.h"
@@ -69,6 +70,44 @@ std::string TakeCString(char* ptr) {
   return out;
 }
 
+// Runs `Work` on the libuv thread pool and settles a Promise on the JS thread
+// with `Resolve(env, result)`. The lifecycle calls below can open SQLite,
+// build or tear down a Tokio runtime, and wait for in-flight requests to
+// unwind, so the `*Async` exports use this to keep Electron's main process
+// responsive. The sync exports stay for hosts that already rely on them.
+template <typename Result, typename Work, typename Resolve>
+class PromiseWorker : public Napi::AsyncWorker {
+ public:
+  PromiseWorker(Napi::Env env, const char* resource_name, Work work, Resolve resolve)
+      : Napi::AsyncWorker(env, resource_name),
+        deferred_(Napi::Promise::Deferred::New(env)),
+        work_(std::move(work)),
+        resolve_(std::move(resolve)) {}
+
+  Napi::Promise Promise() const { return deferred_.Promise(); }
+
+  void Execute() override { result_ = work_(); }
+
+  void OnOK() override { deferred_.Resolve(resolve_(Env(), result_)); }
+
+  void OnError(const Napi::Error& error) override { deferred_.Reject(error.Value()); }
+
+ private:
+  Napi::Promise::Deferred deferred_;
+  Work work_;
+  Resolve resolve_;
+  Result result_{};
+};
+
+template <typename Result, typename Work, typename Resolve>
+Napi::Value QueuePromise(Napi::Env env, const char* resource_name, Work work, Resolve resolve) {
+  auto* worker = new PromiseWorker<Result, Work, Resolve>(
+      env, resource_name, std::move(work), std::move(resolve));
+  Napi::Promise promise = worker->Promise();
+  worker->Queue();
+  return promise;
+}
+
 Napi::Value Version(const Napi::CallbackInfo& info) {
   return Napi::String::New(info.Env(), TakeCString(freedom_ipfs_version()));
 }
@@ -77,23 +116,52 @@ Napi::Value BuildInfoJson(const Napi::CallbackInfo& info) {
   return Napi::String::New(info.Env(), TakeCString(freedom_ipfs_build_info_json()));
 }
 
-Napi::Value NodeNewWithDataDir(const Napi::CallbackInfo& info) {
+struct NewArgs {
+  std::string data_dir;
+  uint64_t max_cache_bytes = kDefaultMaxCacheBytes;
+};
+
+bool ParseNewArgs(const Napi::CallbackInfo& info, const char* name, NewArgs* out) {
   Napi::Env env = info.Env();
   if (info.Length() < 1 || !info[0].IsString()) {
-    return ThrowTypeError(env, "nodeNewWithDataDir(dataDir, maxCacheBytes) requires a dataDir string");
+    ThrowTypeError(env, (std::string(name) + "(dataDir, maxCacheBytes) requires a dataDir string").c_str());
+    return false;
   }
-  const std::string data_dir = info[0].As<Napi::String>().Utf8Value();
-  uint64_t max_cache_bytes = kDefaultMaxCacheBytes;
+  out->data_dir = info[0].As<Napi::String>().Utf8Value();
   if (info.Length() > 1 && !info[1].IsUndefined() && !info[1].IsNull()) {
     bool ok = false;
-    max_cache_bytes = Uint64FromValue(info[1], &ok);
+    out->max_cache_bytes = Uint64FromValue(info[1], &ok);
     if (!ok) {
-      return ThrowTypeError(env, "maxCacheBytes must be a non-negative integer");
+      ThrowTypeError(env, "maxCacheBytes must be a non-negative integer");
+      return false;
     }
   }
+  return true;
+}
+
+Napi::Value NodeNewWithDataDir(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  NewArgs args;
+  if (!ParseNewArgs(info, "nodeNewWithDataDir", &args)) return env.Null();
   FreedomIpfsNode* node =
-      freedom_ipfs_node_new_with_data_dir(data_dir.c_str(), max_cache_bytes);
+      freedom_ipfs_node_new_with_data_dir(args.data_dir.c_str(), args.max_cache_bytes);
   return StringFromNode(env, node);
+}
+
+// Resolves to the node handle string, or "0" when the node could not be
+// created (same contract as nodeNewWithDataDir).
+Napi::Value NodeNewWithDataDirAsync(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  NewArgs args;
+  if (!ParseNewArgs(info, "nodeNewWithDataDirAsync", &args)) return env.Null();
+  return QueuePromise<FreedomIpfsNode*>(
+      env, "freedomIpfsNodeNew",
+      [args]() {
+        return freedom_ipfs_node_new_with_data_dir(args.data_dir.c_str(), args.max_cache_bytes);
+      },
+      [](Napi::Env env, FreedomIpfsNode* node) -> Napi::Value {
+        return StringFromNode(env, node);
+      });
 }
 
 Napi::Value NodeFree(const Napi::CallbackInfo& info) {
@@ -105,46 +173,95 @@ Napi::Value NodeFree(const Napi::CallbackInfo& info) {
   return info.Env().Undefined();
 }
 
-Napi::Value NodeStartNativeGatewayOnline(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
+// The handle is invalid as soon as this is called: the caller must not pass
+// it to any other export, and must not call this while an async start/stop
+// on the same handle is still pending.
+Napi::Value NodeFreeAsync(const Napi::CallbackInfo& info) {
   bool ok = false;
   FreedomIpfsNode* node = NodeFromValue(info[0], &ok);
-  if (!ok) return ThrowTypeError(env, "invalid node handle");
+  return QueuePromise<bool>(
+      info.Env(), "freedomIpfsNodeFree",
+      [node, ok]() {
+        if (ok) freedom_ipfs_node_free(node);
+        return ok;
+      },
+      [](Napi::Env env, bool) -> Napi::Value { return env.Undefined(); });
+}
 
+struct StartArgs {
+  FreedomIpfsNode* node = nullptr;
+  bool has_delegated_router = false;
   std::string delegated_router;
-  const char* delegated_router_ptr = nullptr;
-  if (info.Length() > 1 && info[1].IsString()) {
-    delegated_router = info[1].As<Napi::String>().Utf8Value();
-    if (!delegated_router.empty()) delegated_router_ptr = delegated_router.c_str();
-  }
   uint32_t routing_mode = FREEDOM_IPFS_ROUTING_MODE_AUTO;
-  if (info.Length() > 2 && info[2].IsNumber()) {
-    routing_mode = info[2].As<Napi::Number>().Uint32Value();
-  }
   size_t max_concurrent_requests = 0;
+  uint64_t dht_query_timeout_secs = 0;
+  size_t dht_max_providers = 0;
+  uint64_t request_queue_timeout_ms = 0;
+
+  bool Start() const {
+    return freedom_ipfs_node_start_native_gateway_online_with_config_v3(
+        node, has_delegated_router ? delegated_router.c_str() : nullptr, routing_mode,
+        max_concurrent_requests, dht_query_timeout_secs, dht_max_providers,
+        request_queue_timeout_ms);
+  }
+};
+
+bool ParseStartArgs(const Napi::CallbackInfo& info, StartArgs* out) {
+  Napi::Env env = info.Env();
+  bool ok = false;
+  out->node = NodeFromValue(info[0], &ok);
+  if (!ok) {
+    ThrowTypeError(env, "invalid node handle");
+    return false;
+  }
+  if (info.Length() > 1 && info[1].IsString()) {
+    out->delegated_router = info[1].As<Napi::String>().Utf8Value();
+    out->has_delegated_router = !out->delegated_router.empty();
+  }
+  if (info.Length() > 2 && info[2].IsNumber()) {
+    out->routing_mode = info[2].As<Napi::Number>().Uint32Value();
+  }
   if (info.Length() > 3 && info[3].IsNumber()) {
-    max_concurrent_requests =
+    out->max_concurrent_requests =
         static_cast<size_t>(info[3].As<Napi::Number>().Uint32Value());
   }
-  uint64_t dht_query_timeout_secs = 0;
   if (info.Length() > 4 && !info[4].IsUndefined() && !info[4].IsNull()) {
-    dht_query_timeout_secs = Uint64FromValue(info[4], &ok);
-    if (!ok) return ThrowTypeError(env, "dhtQueryTimeoutSecs must be an integer");
+    out->dht_query_timeout_secs = Uint64FromValue(info[4], &ok);
+    if (!ok) {
+      ThrowTypeError(env, "dhtQueryTimeoutSecs must be an integer");
+      return false;
+    }
   }
-  size_t dht_max_providers = 0;
   if (info.Length() > 5 && info[5].IsNumber()) {
-    dht_max_providers = static_cast<size_t>(info[5].As<Napi::Number>().Uint32Value());
+    out->dht_max_providers = static_cast<size_t>(info[5].As<Napi::Number>().Uint32Value());
   }
-  uint64_t request_queue_timeout_ms = 0;
   if (info.Length() > 6 && !info[6].IsUndefined() && !info[6].IsNull()) {
-    request_queue_timeout_ms = Uint64FromValue(info[6], &ok);
-    if (!ok) return ThrowTypeError(env, "requestQueueTimeoutMs must be an integer");
+    out->request_queue_timeout_ms = Uint64FromValue(info[6], &ok);
+    if (!ok) {
+      ThrowTypeError(env, "requestQueueTimeoutMs must be an integer");
+      return false;
+    }
   }
+  return true;
+}
 
-  const bool started = freedom_ipfs_node_start_native_gateway_online_with_config_v3(
-      node, delegated_router_ptr, routing_mode, max_concurrent_requests,
-      dht_query_timeout_secs, dht_max_providers, request_queue_timeout_ms);
-  return Napi::Boolean::New(env, started);
+Napi::Value NodeStartNativeGatewayOnline(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  StartArgs args;
+  if (!ParseStartArgs(info, &args)) return env.Null();
+  return Napi::Boolean::New(env, args.Start());
+}
+
+// Same arguments as nodeStartNativeGatewayOnline; resolves to its boolean.
+Napi::Value NodeStartNativeGatewayOnlineAsync(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  StartArgs args;
+  if (!ParseStartArgs(info, &args)) return env.Null();
+  return QueuePromise<bool>(
+      env, "freedomIpfsNodeStart", [args]() { return args.Start(); },
+      [](Napi::Env env, bool started) -> Napi::Value {
+        return Napi::Boolean::New(env, started);
+      });
 }
 
 Napi::Value NodeStopGateway(const Napi::CallbackInfo& info) {
@@ -153,6 +270,19 @@ Napi::Value NodeStopGateway(const Napi::CallbackInfo& info) {
   FreedomIpfsNode* node = NodeFromValue(info[0], &ok);
   if (!ok) return ThrowTypeError(env, "invalid node handle");
   return Napi::Boolean::New(env, freedom_ipfs_node_stop_gateway(node));
+}
+
+Napi::Value NodeStopGatewayAsync(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  bool ok = false;
+  FreedomIpfsNode* node = NodeFromValue(info[0], &ok);
+  if (!ok) return ThrowTypeError(env, "invalid node handle");
+  return QueuePromise<bool>(
+      env, "freedomIpfsNodeStopGateway",
+      [node]() { return freedom_ipfs_node_stop_gateway(node); },
+      [](Napi::Env env, bool stopped) -> Napi::Value {
+        return Napi::Boolean::New(env, stopped);
+      });
 }
 
 Napi::Value StringJsonCall(const Napi::CallbackInfo& info, char* (*fn)(FreedomIpfsNode*)) {
@@ -297,11 +427,17 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("version", Napi::Function::New(env, Version));
   exports.Set("buildInfoJson", Napi::Function::New(env, BuildInfoJson));
   exports.Set("nodeNewWithDataDir", Napi::Function::New(env, NodeNewWithDataDir));
+  exports.Set("nodeNewWithDataDirAsync", Napi::Function::New(env, NodeNewWithDataDirAsync));
   exports.Set("nodeFree", Napi::Function::New(env, NodeFree));
+  exports.Set("nodeFreeAsync", Napi::Function::New(env, NodeFreeAsync));
   exports.Set(
       "nodeStartNativeGatewayOnline",
       Napi::Function::New(env, NodeStartNativeGatewayOnline));
+  exports.Set(
+      "nodeStartNativeGatewayOnlineAsync",
+      Napi::Function::New(env, NodeStartNativeGatewayOnlineAsync));
   exports.Set("nodeStopGateway", Napi::Function::New(env, NodeStopGateway));
+  exports.Set("nodeStopGatewayAsync", Napi::Function::New(env, NodeStopGatewayAsync));
   exports.Set("nodeProgressSnapshotJson", Napi::Function::New(env, NodeProgressSnapshotJson));
   exports.Set("nodeNativeGatewayStatsJson", Napi::Function::New(env, NodeNativeGatewayStatsJson));
   exports.Set("nodeClearProgress", Napi::Function::New(env, NodeClearProgress));

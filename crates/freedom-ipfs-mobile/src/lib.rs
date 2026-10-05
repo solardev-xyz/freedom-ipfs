@@ -44,6 +44,10 @@ const ROUTING_MODE_DELEGATED: u32 = 1;
 const ROUTING_MODE_LIGHT_DHT: u32 = 2;
 const ROUTING_MODE_OFFLINE: u32 = 3;
 const PRELOAD_TIMEOUT: Duration = Duration::from_secs(60);
+/// Upper bound on how long `freedom_ipfs_node_free` waits for blocking-pool
+/// work (e.g. a stuck DNS lookup) after async tasks are aborted. Dropping the
+/// runtime instead would wait for that work indefinitely.
+const NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROGRESS_EVENTS: usize = 512;
 const NATIVE_BODY_CHANNEL_CAPACITY: usize = 2;
 const X_FREEDOM_REQUEST_ID: &str = "X-Freedom-Request-ID";
@@ -1491,7 +1495,9 @@ pub unsafe extern "C" fn freedom_ipfs_node_free(ptr: *mut FreedomIpfsNode) {
         stop_native_gateway_requests(node);
         stop_gateway(node);
         stop_preloads(node);
-        let _ = Box::from_raw(ptr);
+        let node = Box::from_raw(ptr);
+        let FreedomIpfsNode { runtime, .. } = *node;
+        runtime.shutdown_timeout(NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT);
     }
 }
 
@@ -5334,6 +5340,45 @@ mod tests {
             assert!(freedom_ipfs_gateway_request_free(node, handle));
 
             freedom_ipfs_node_free(node);
+        }
+    }
+
+    #[test]
+    fn node_free_does_not_wait_for_stuck_blocking_request() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+
+            let data = b"stuck blocking fixture".to_vec();
+            let cid = cid_from_data(CODEC_RAW, &data);
+            let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let provider: Arc<dyn BlockProvider> = Arc::new(SlowTestProvider {
+                cid,
+                data,
+                entered: entered.clone(),
+                delay: Duration::from_secs(30),
+            });
+            set_native_gateway_core(&*node, GatewayCore::with_provider(provider));
+
+            let _handle = start_native_gateway_request(
+                node,
+                json!({ "method": "GET", "path": format!("/ipfs/{cid}") }),
+            );
+            for _ in 0..500 {
+                if entered.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(entered.load(Ordering::SeqCst));
+
+            let started = Instant::now();
+            freedom_ipfs_node_free(node);
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT + Duration::from_secs(2),
+                "node free waited {elapsed:?} for a stuck blocking request"
+            );
         }
     }
 
