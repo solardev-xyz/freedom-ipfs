@@ -24,6 +24,7 @@ if (buildInfo.mobile_ffi_abi_version !== addon.constants.MOBILE_FFI_ABI_VERSION)
 }
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freedom-ipfs-node-smoke-'));
+const otherDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freedom-ipfs-node-smoke-'));
 let handle = null;
 
 async function main() {
@@ -85,10 +86,41 @@ async function main() {
     if (results[0] !== true || results[1] !== true) {
       throw new Error(`unawaited start/stop resolved to ${results[0]}/${results[1]}`);
     }
+
+    // Once a free has run, a new node may get the same address before that
+    // free's promise settles. The new handle must not inherit the old one's
+    // pending lifecycle queue (sync calls on it would throw "still pending").
+    // glibc rarely hands the address back this quickly; to force reuse run
+    //   MALLOC_CONF=narenas:1,tcache:false LD_PRELOAD=<libjemalloc.so.2> node smoke.js
+    // which reuses it on every iteration (reported as reused_addresses).
+    let reusedAddresses = 0;
+    for (let i = 0; i < 20; i += 1) {
+      const oldHandle = addon.nodeNewWithDataDir(dataDir, 1024 * 1024);
+      addon.nodeStartNativeGatewayOnline(oldHandle);
+      const oldFree = addon.nodeFreeAsync(oldHandle);
+      const newHandle =
+        i % 2 === 0
+          ? addon.nodeNewWithDataDir(otherDataDir, 1024 * 1024)
+          : await addon.nodeNewWithDataDirAsync(otherDataDir, 1024 * 1024);
+      handle = newHandle;
+      if (newHandle === oldHandle) {
+        reusedAddresses += 1;
+        addon.nodeStopGateway(newHandle);
+      }
+      await oldFree;
+      const newStart = addon.nodeStartNativeGatewayOnlineAsync(newHandle);
+      const newStop = addon.nodeStopGatewayAsync(newHandle);
+      handle = null;
+      await addon.nodeFreeAsync(newHandle);
+      if ((await newStart) !== true || (await newStop) !== true) {
+        throw new Error('lifecycle calls on a reused node address did not resolve to true');
+      }
+    }
     console.log(
       JSON.stringify(
         {
           ok: true,
+          reused_addresses: reusedAddresses,
           version,
           release_tag: buildInfo.release_tag,
           target: buildInfo.target,
@@ -103,6 +135,7 @@ async function main() {
       addon.nodeFree(handle);
     }
     fs.rmSync(dataDir, { recursive: true, force: true });
+    fs.rmSync(otherDataDir, { recursive: true, force: true });
   }
 }
 

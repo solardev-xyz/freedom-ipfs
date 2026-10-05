@@ -1492,10 +1492,15 @@ pub unsafe extern "C" fn freedom_ipfs_node_clear_progress(ptr: *mut FreedomIpfsN
 /// `ptr` must be a pointer returned by `freedom_ipfs_node_new_in_memory` and
 /// must not be used after this function returns.
 ///
-/// Returns once the node's cache database is closed, so the same data dir can
-/// be reopened immediately. Blocking work that is still running after the
-/// runtime shutdown timeout is left to finish on its own, but it can no longer
-/// reach the database: the store is closed underneath it.
+/// Normally returns once the node's cache database is closed, so the same data
+/// dir can be reopened immediately. Blocking work that is still running after
+/// the runtime shutdown timeout is left to finish on its own, but it can no
+/// longer reach the database: the store is closed underneath it. Closing waits
+/// at most `NODE_FREE_STORE_CLOSE_TIMEOUT` for a statement such work is still
+/// running; if it does not finish in time this logs
+/// `node_free_store_close_timeout` and returns with the database still open
+/// (it closes when that work drops its store). Worst case this blocks for
+/// about `NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT + NODE_FREE_STORE_CLOSE_TIMEOUT`.
 #[no_mangle]
 pub unsafe extern "C" fn freedom_ipfs_node_free(ptr: *mut FreedomIpfsNode) {
     if !ptr.is_null() {

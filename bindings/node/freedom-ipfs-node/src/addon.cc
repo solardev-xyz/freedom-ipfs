@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <deque>
 #include <limits>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -77,11 +78,27 @@ std::string TakeCString(char* ptr) {
 // settled, so an unawaited start cannot finish after a later stop, and free
 // runs after every start/stop queued before it. Per-env instance data, only
 // touched on that env's JS thread.
+//
+// Each worker holds its own queue, not just the address: once a free has run,
+// the allocator may hand the same address to a new node before the free's
+// OnOK runs here. A new handle detaches any queue still keyed by its address
+// (see ForgetFreedLifecycle), and the old free then settles on its own queue
+// without touching the new handle's entry.
+using LifecycleQueue = std::deque<Napi::AsyncWorker*>;
+
 struct LifecycleQueues {
-  std::unordered_map<FreedomIpfsNode*, std::deque<Napi::AsyncWorker*>> pending;
+  std::unordered_map<FreedomIpfsNode*, std::shared_ptr<LifecycleQueue>> pending;
 };
 
 LifecycleQueues& Lifecycle(Napi::Env env) { return *env.GetInstanceData<LifecycleQueues>(); }
+
+// Called on the JS thread with a node that was just created. Its address
+// cannot belong to a live node, so any queue still keyed by it is left over
+// from a free that has already released it; drop that entry so it does not
+// make lifecycle calls on the new handle look pending.
+void ForgetFreedLifecycle(Napi::Env env, FreedomIpfsNode* node) {
+  if (node != nullptr) Lifecycle(env).pending.erase(node);
+}
 
 bool LifecyclePending(Napi::Env env, FreedomIpfsNode* node) {
   return Lifecycle(env).pending.count(node) != 0;
@@ -112,10 +129,26 @@ class PromiseWorker : public Napi::AsyncWorker {
       : Napi::AsyncWorker(env, resource_name),
         deferred_(Napi::Promise::Deferred::New(env)),
         serial_(serial),
+        queue_(serial == nullptr ? nullptr : [&env, serial] {
+          auto& slot = Lifecycle(env).pending[serial];
+          if (!slot) slot = std::make_shared<LifecycleQueue>();
+          return slot;
+        }()),
         work_(std::move(work)),
         resolve_(std::move(resolve)) {}
 
   Napi::Promise Promise() const { return deferred_.Promise(); }
+
+  // Appends this worker to its node's queue and starts it if nothing on that
+  // node is ahead of it.
+  void Enqueue() {
+    if (!queue_) {
+      Queue();
+      return;
+    }
+    queue_->push_back(this);
+    if (queue_->size() == 1) Queue();
+  }
 
   void Execute() override { result_ = work_(); }
 
@@ -132,20 +165,22 @@ class PromiseWorker : public Napi::AsyncWorker {
  private:
   // This worker is at the front of its node's queue; hand over to the next.
   void RunNext() {
-    if (serial_ == nullptr) return;
+    if (!queue_) return;
+    queue_->pop_front();
+    if (!queue_->empty()) {
+      queue_->front()->Queue();
+      return;
+    }
+    // Only drop the map entry if it is still ours; a new node at the same
+    // address may have replaced it already.
     auto& pending = Lifecycle(Env()).pending;
     auto it = pending.find(serial_);
-    if (it == pending.end()) return;
-    it->second.pop_front();
-    if (it->second.empty()) {
-      pending.erase(it);
-    } else {
-      it->second.front()->Queue();
-    }
+    if (it != pending.end() && it->second == queue_) pending.erase(it);
   }
 
   Napi::Promise::Deferred deferred_;
   FreedomIpfsNode* serial_;
+  std::shared_ptr<LifecycleQueue> queue_;
   Work work_;
   Resolve resolve_;
   Result result_{};
@@ -157,13 +192,7 @@ Napi::Value QueuePromise(Napi::Env env, const char* resource_name, FreedomIpfsNo
   auto* worker = new PromiseWorker<Result, Work, Resolve>(
       env, resource_name, serial, std::move(work), std::move(resolve));
   Napi::Promise promise = worker->Promise();
-  if (serial == nullptr) {
-    worker->Queue();
-    return promise;
-  }
-  auto& queue = Lifecycle(env).pending[serial];
-  queue.push_back(worker);
-  if (queue.size() == 1) worker->Queue();
+  worker->Enqueue();
   return promise;
 }
 
@@ -204,6 +233,7 @@ Napi::Value NodeNewWithDataDir(const Napi::CallbackInfo& info) {
   if (!ParseNewArgs(info, "nodeNewWithDataDir", &args)) return env.Null();
   FreedomIpfsNode* node =
       freedom_ipfs_node_new_with_data_dir(args.data_dir.c_str(), args.max_cache_bytes);
+  ForgetFreedLifecycle(env, node);
   return StringFromNode(env, node);
 }
 
@@ -219,6 +249,7 @@ Napi::Value NodeNewWithDataDirAsync(const Napi::CallbackInfo& info) {
         return freedom_ipfs_node_new_with_data_dir(args.data_dir.c_str(), args.max_cache_bytes);
       },
       [](Napi::Env env, FreedomIpfsNode* node) -> Napi::Value {
+        ForgetFreedLifecycle(env, node);
         return StringFromNode(env, node);
       });
 }

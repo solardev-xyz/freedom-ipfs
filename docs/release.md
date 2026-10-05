@@ -46,9 +46,14 @@ on one handle run one at a time in call order, so an unawaited start cannot
 land after a later stop, and `nodeFreeAsync` runs after the start/stop called
 before it. While one is pending, the sync `nodeStartNativeGatewayOnline`,
 `nodeStopGateway` and `nodeFree` throw for that handle instead of racing it.
-Do not use a handle after `nodeFreeAsync`. Node free closes the cache database
-before it returns (or resolves), even if blocking work outlives the 2 s runtime
-shutdown bound, so the same data dir can be reopened right away.
+Do not use a handle after `nodeFreeAsync`. Node free normally closes the cache
+database before it returns (or resolves), even if blocking work outlives the
+2 s runtime shutdown bound, so the same data dir can be reopened right away.
+This is bounded, not guaranteed: free waits up to 2 s more for a SQLite
+statement that leaked blocking work is still running. If that statement holds
+the connection past the bound, free logs `node_free_store_close_timeout` and
+returns with the database still open; it then closes when that work finishes.
+So free blocks for at most about 4 s (runtime shutdown plus store close).
 `node bench-lifecycle.js` in the addon directory measures how long each
 lifecycle call blocks the JS thread.
 
