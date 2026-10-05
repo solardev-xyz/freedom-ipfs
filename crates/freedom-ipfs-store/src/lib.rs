@@ -142,6 +142,13 @@ impl SqliteBlockStore {
     /// that closes it as soon as that statement releases the connection,
     /// instead of leaving it open until the last clone is dropped. Returns
     /// whether the store was closed within `timeout`.
+    ///
+    /// The background thread has no deadline: it blocks on the connection
+    /// lock for exactly as long as the running statement holds it. A statement
+    /// that never returns therefore parks one `freedom-ipfs-store-close`
+    /// thread (and keeps the database open) for the rest of the process, one
+    /// per call that timed out. That is the same lifetime the connection
+    /// would have had without this call, plus one idle thread.
     pub fn close_or_close_later(self, timeout: Duration) -> bool {
         if self.close(timeout) {
             return true;

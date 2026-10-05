@@ -1501,7 +1501,9 @@ pub unsafe extern "C" fn freedom_ipfs_node_clear_progress(ptr: *mut FreedomIpfsN
 /// `node_free_store_close_timeout` and returns with the database still open,
 /// and a background thread closes it as soon as that statement releases the
 /// connection (until then the leaked work can still run statements against
-/// the file). Worst case this blocks for
+/// the file). That thread waits as long as the statement does: one that
+/// never returns leaves a parked `freedom-ipfs-store-close` thread for the
+/// life of the process, one per such free. Worst case this blocks for
 /// about `NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT + NODE_FREE_STORE_CLOSE_TIMEOUT`.
 #[no_mangle]
 pub unsafe extern "C" fn freedom_ipfs_node_free(ptr: *mut FreedomIpfsNode) {
