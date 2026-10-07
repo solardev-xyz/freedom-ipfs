@@ -20,6 +20,10 @@ struct Args {
 enum XtaskCommand {
     BuildXcframework,
     VerifyXcframework,
+    BuildAndroidArm64,
+    #[command(name = "build-android-x86_64")]
+    BuildAndroidX8664,
+    BuildAndroidAll,
     GenerateMobileWebFixture {
         #[arg(long)]
         car: PathBuf,
@@ -47,6 +51,11 @@ fn main() -> Result<()> {
     match args.command {
         XtaskCommand::BuildXcframework => build_xcframework(),
         XtaskCommand::VerifyXcframework => verify_xcframework_command(),
+        XtaskCommand::BuildAndroidArm64 => build_android(&[ANDROID_ARM64_TARGET]),
+        XtaskCommand::BuildAndroidX8664 => build_android(&[ANDROID_X86_64_TARGET]),
+        XtaskCommand::BuildAndroidAll => {
+            build_android(&[ANDROID_ARM64_TARGET, ANDROID_X86_64_TARGET])
+        }
         XtaskCommand::GenerateMobileWebFixture {
             car,
             corpus,
@@ -706,6 +715,152 @@ fn parse_csv_record(line: &str) -> Result<Vec<String>> {
     Ok(fields)
 }
 
+const ANDROID_ARM64_TARGET: &str = "aarch64-linux-android";
+const ANDROID_X86_64_TARGET: &str = "x86_64-linux-android";
+
+/// Android NDK API level (cargo-ndk `-P`). Matches the `minSdk = 26`
+/// declared by freedom-browser-android — bump both in lock-step.
+const ANDROID_NDK_API_LEVEL: &str = "26";
+
+fn build_android(targets: &[&str]) -> Result<()> {
+    ensure_cargo_ndk()?;
+    for target in targets {
+        run(
+            Command::new("rustup").args(["target", "add", target]),
+            &format!("rustup target add {target}"),
+        )?;
+
+        // `rustc --crate-type cdylib` overrides the `[lib]` crate-type
+        // list for this build only, so Android emits just the `.so`
+        // while Cargo.toml keeps rlib + staticlib for the iOS and
+        // desktop slices (same pattern as ant's xtask). The 16 KB
+        // max-page-size link flag comes from `.cargo/config.toml`, so
+        // it also covers builds that bypass this xtask.
+        run(
+            Command::new("cargo").args([
+                "ndk",
+                "-t",
+                target,
+                "-P",
+                ANDROID_NDK_API_LEVEL,
+                "--",
+                "rustc",
+                "-p",
+                "freedom-ipfs-mobile",
+                "--release",
+                "--crate-type",
+                "cdylib",
+            ]),
+            &format!("cargo ndk -t {target}"),
+        )?;
+
+        let lib = PathBuf::from("target")
+            .join(target)
+            .join("release")
+            .join("libfreedom_ipfs_mobile.so");
+        if !lib.exists() {
+            bail!("expected {} after build, but it is missing", lib.display());
+        }
+        verify_load_alignment(&lib, ANDROID_MIN_LOAD_ALIGN)?;
+        println!("{}", lib.display());
+    }
+    Ok(())
+}
+
+/// Android 15+ can run on 16 KB-page devices; every LOAD segment must
+/// be aligned accordingly or dlopen fails at app runtime on that
+/// hardware only. The flag lives in `.cargo/config.toml`, but cargo
+/// silently ignores config rustflags whenever `RUSTFLAGS` /
+/// `CARGO_ENCODED_RUSTFLAGS` is set in the environment (env replaces,
+/// not merges) — so the alignment is re-checked on the artifact itself
+/// to turn that silent loss into a build failure.
+const ANDROID_MIN_LOAD_ALIGN: u64 = 0x4000;
+
+fn verify_load_alignment(lib: &Path, min_align: u64) -> Result<()> {
+    let data = fs::read(lib).with_context(|| format!("read {}", lib.display()))?;
+    let mut load_segments = 0usize;
+    for (index, align) in elf64_load_alignments(&data)
+        .with_context(|| format!("parse ELF program headers of {}", lib.display()))?
+    {
+        load_segments += 1;
+        if align < min_align {
+            bail!(
+                "{}: LOAD segment {index} alignment {align:#x} is below {min_align:#x}; \
+                 the .so would fail to load on 16 KB-page Android devices. Is a RUSTFLAGS \
+                 environment variable overriding the target rustflags in .cargo/config.toml?",
+                lib.display()
+            );
+        }
+    }
+    if load_segments == 0 {
+        bail!("{}: no LOAD program headers found", lib.display());
+    }
+    Ok(())
+}
+
+/// `(index, p_align)` of every PT_LOAD program header in a
+/// little-endian ELF64 image (the only layout Android targets use).
+fn elf64_load_alignments(data: &[u8]) -> Result<Vec<(usize, u64)>> {
+    fn u16_at(data: &[u8], at: usize) -> Result<u16> {
+        Ok(u16::from_le_bytes(
+            data.get(at..at + 2).context("truncated ELF")?.try_into()?,
+        ))
+    }
+    fn u32_at(data: &[u8], at: usize) -> Result<u32> {
+        Ok(u32::from_le_bytes(
+            data.get(at..at + 4).context("truncated ELF")?.try_into()?,
+        ))
+    }
+    fn u64_at(data: &[u8], at: usize) -> Result<u64> {
+        Ok(u64::from_le_bytes(
+            data.get(at..at + 8).context("truncated ELF")?.try_into()?,
+        ))
+    }
+
+    if data.get(..4) != Some(b"\x7fELF".as_slice()) {
+        bail!("not an ELF file");
+    }
+    if data.get(4) != Some(&2) {
+        bail!("expected ELF64 (EI_CLASS = 2)");
+    }
+    if data.get(5) != Some(&1) {
+        bail!("expected little-endian ELF (EI_DATA = 1)");
+    }
+    let phoff = usize::try_from(u64_at(data, 0x20)?)?;
+    let phentsize = usize::from(u16_at(data, 0x36)?);
+    let phnum = usize::from(u16_at(data, 0x38)?);
+
+    const PT_LOAD: u32 = 1;
+    let mut out = Vec::new();
+    for index in 0..phnum {
+        let entry = phoff + index * phentsize;
+        if u32_at(data, entry)? == PT_LOAD {
+            out.push((index, u64_at(data, entry + 0x30)?));
+        }
+    }
+    Ok(out)
+}
+
+/// cargo-ndk resolves the NDK itself (ANDROID_NDK_HOME / ANDROID_HOME).
+/// Not installed automatically so restricted-network operators aren't
+/// surprised by a hidden `cargo install`.
+fn ensure_cargo_ndk() -> Result<()> {
+    let out = Command::new("cargo")
+        .args(["ndk", "--version"])
+        .output()
+        .context("`cargo` is not on PATH; install Rust via rustup")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    bail!(
+        "`cargo ndk --version` failed. Install cargo-ndk (`cargo install cargo-ndk`), \
+         the Android NDK (release r26 or newer), and export ANDROID_NDK_HOME or \
+         ANDROID_HOME.\nstderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr).trim(),
+        String::from_utf8_lossy(&out.stdout).trim()
+    );
+}
+
 fn build_xcframework() -> Result<()> {
     if env::consts::OS != "macos" {
         bail!(
@@ -721,29 +876,24 @@ fn build_xcframework() -> Result<()> {
     ];
 
     for target in targets {
-        let status = Command::new("rustup")
-            .args(["target", "add", target])
-            .status()
-            .with_context(|| format!("rustup target add {target}"))?;
-        if !status.success() {
-            bail!("rustup target add {target} failed");
-        }
+        run(
+            Command::new("rustup").args(["target", "add", target]),
+            &format!("rustup target add {target}"),
+        )?;
 
-        let status = Command::new("cargo")
-            .args([
-                "build",
-                "-p",
-                "freedom-ipfs-mobile",
-                "--release",
-                "--target",
-                target,
-            ])
-            .env("IPHONEOS_DEPLOYMENT_TARGET", "16.0")
-            .status()
-            .with_context(|| format!("cargo build for {target}"))?;
-        if !status.success() {
-            bail!("cargo build for {target} failed");
-        }
+        run(
+            Command::new("cargo")
+                .args([
+                    "build",
+                    "-p",
+                    "freedom-ipfs-mobile",
+                    "--release",
+                    "--target",
+                    target,
+                ])
+                .env("IPHONEOS_DEPLOYMENT_TARGET", "16.0"),
+            &format!("cargo build for {target}"),
+        )?;
     }
 
     let out_dir = PathBuf::from("target/ios-xcframework");
@@ -1518,6 +1668,50 @@ mod tests {
     use super::*;
     use freedom_ipfs_core::parse_car_v1;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Minimal little-endian ELF64 with the given PT_LOAD alignments.
+    fn synthetic_elf64(load_aligns: &[u64]) -> Vec<u8> {
+        let phoff = 0x40usize;
+        let phentsize = 0x38usize;
+        let mut data = vec![0u8; phoff + load_aligns.len() * phentsize];
+        data[..4].copy_from_slice(b"\x7fELF");
+        data[4] = 2; // ELF64
+        data[5] = 1; // little-endian
+        data[0x20..0x28].copy_from_slice(&(phoff as u64).to_le_bytes());
+        data[0x36..0x38].copy_from_slice(&(phentsize as u16).to_le_bytes());
+        data[0x38..0x3a].copy_from_slice(&(load_aligns.len() as u16).to_le_bytes());
+        for (i, align) in load_aligns.iter().enumerate() {
+            let entry = phoff + i * phentsize;
+            data[entry..entry + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+            data[entry + 0x30..entry + 0x38].copy_from_slice(&align.to_le_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn elf64_load_alignments_reports_each_load_segment() {
+        let parsed = elf64_load_alignments(&synthetic_elf64(&[0x1000, 0x4000])).unwrap();
+        assert_eq!(parsed, vec![(0, 0x1000), (1, 0x4000)]);
+    }
+
+    #[test]
+    fn elf64_load_alignments_rejects_non_elf() {
+        assert!(elf64_load_alignments(b"not an elf").is_err());
+    }
+
+    #[test]
+    fn verify_load_alignment_fails_below_and_passes_at_16k() {
+        let dir = std::env::temp_dir().join(format!("xtask-elf-align-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("bad.so");
+        fs::write(&bad, synthetic_elf64(&[0x4000, 0x1000])).unwrap();
+        let err = verify_load_alignment(&bad, ANDROID_MIN_LOAD_ALIGN).unwrap_err();
+        assert!(err.to_string().contains("alignment 0x1000"), "{err}");
+        let good = dir.join("good.so");
+        fs::write(&good, synthetic_elf64(&[0x4000, 0x10000])).unwrap();
+        verify_load_alignment(&good, ANDROID_MIN_LOAD_ALIGN).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn generates_multiblock_mobile_web_fixture() {

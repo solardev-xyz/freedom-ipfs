@@ -130,6 +130,16 @@ The generated XCFramework is a static library package. iOS apps linking it must 
 
 The `.github/workflows/ios-xcframework.yml` workflow runs the macOS build and simulator command-line/app-rendering smoke in CI and uploads the generated XCFramework artifact.
 
+Build the Android shared library (any host with the Android NDK — release r26 or newer, not to be confused with the Android API level 26 the `.so` targets — plus `cargo-ndk`, and `ANDROID_NDK_HOME` or `ANDROID_HOME` exported):
+
+```bash
+cargo run -p xtask -- build-android-arm64    # aarch64-linux-android (devices)
+cargo run -p xtask -- build-android-x86_64   # x86_64-linux-android (emulator)
+cargo run -p xtask -- build-android-all      # both
+```
+
+Each prints the artifact path, `target/<triple>/release/libfreedom_ipfs_mobile.so`, exporting the same C ABI as the iOS build (`ffi/include/freedom_ipfs.h`). The `.so` is linked with `max-page-size=16384` (via `.cargo/config.toml`) so it loads on 16 KB-page Android 15+ devices; the xtask re-verifies the LOAD alignment on the built artifact and fails the build if the flag was lost — e.g. an exported `RUSTFLAGS` overriding the config-level rustflags. Consumers copy it into their Gradle `jniLibs/<abi>/` tree and vendor the header; the JNI shim lives in the consuming app (see freedom-browser-android), not in this repository.
+
 Live smoke test, intentionally ignored by default because it uses the public IPFS network:
 
 ```bash
