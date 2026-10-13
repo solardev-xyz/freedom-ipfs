@@ -724,6 +724,7 @@ const ANDROID_NDK_API_LEVEL: &str = "26";
 
 fn build_android(targets: &[&str]) -> Result<()> {
     ensure_cargo_ndk()?;
+    let target_dir = cargo_target_dir()?;
     for target in targets {
         run(
             Command::new("rustup").args(["target", "add", target]),
@@ -754,7 +755,7 @@ fn build_android(targets: &[&str]) -> Result<()> {
             &format!("cargo ndk -t {target}"),
         )?;
 
-        let lib = PathBuf::from("target")
+        let lib = target_dir
             .join(target)
             .join("release")
             .join("libfreedom_ipfs_mobile.so");
@@ -1645,6 +1646,22 @@ fn run(command: &mut Command, label: &str) -> Result<()> {
         bail!("{label} failed");
     }
     Ok(())
+}
+
+/// Cargo's resolved target directory (honours `CARGO_TARGET_DIR`,
+/// `[build] target-dir` and the workspace root), as reported by
+/// `cargo metadata` run from the same working directory as the build.
+fn cargo_target_dir() -> Result<PathBuf> {
+    let stdout = command_stdout(
+        Command::new("cargo").args(["metadata", "--format-version", "1", "--no-deps"]),
+        "cargo metadata",
+    )?;
+    let metadata: serde_json::Value =
+        serde_json::from_str(&stdout).context("parse `cargo metadata` output")?;
+    let dir = metadata["target_directory"]
+        .as_str()
+        .context("`cargo metadata` output has no target_directory")?;
+    Ok(PathBuf::from(dir))
 }
 
 fn command_stdout(command: &mut Command, label: &str) -> Result<String> {
