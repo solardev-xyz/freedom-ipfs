@@ -1,17 +1,12 @@
 use axum::http::HeaderMap;
 use freedom_ipfs_core::BlockProvider;
 use freedom_ipfs_gateway::{
-    normalize_content_path, parse_native_request_json, GatewayCore, GatewayCoreRequest,
+    delegated_router_endpoints, normalize_content_path, parse_native_request_json, GatewayCore,
+    GatewayCoreRequest, OnlineNode, RoutingMode,
 };
-use freedom_ipfs_namesys::{
-    CachedNameResolver, CloudflareDohResolver, DefaultNameResolver, DelegatedIpnsResolver,
-    FallbackIpnsResolver, IpnsResolver, NameResolver,
-};
+use freedom_ipfs_namesys::NameResolver;
 use freedom_ipfs_retrieval::FetchingBlockProvider;
-use freedom_ipfs_routing::{
-    AutoRoutingClient, DelegatedRoutingClient, DhtIpnsResolver, LightDhtClient,
-    ProviderRoutingClient, RoutingStatsHandle, DEFAULT_DELEGATED_ROUTER,
-};
+use freedom_ipfs_routing::{RoutingStatsHandle, DEFAULT_DELEGATED_ROUTER};
 use freedom_ipfs_store::SqliteBlockStore;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -2157,83 +2152,39 @@ unsafe fn gateway_router_for_routing_mode(
             start_config.request_queue_timeout_ms,
         ));
     }
-    if start_config.routing_mode == ROUTING_MODE_OFFLINE {
-        let routing_stats = RoutingStatsHandle::default();
-        let provider = FetchingBlockProvider::new(
-            node.store.clone(),
-            ProviderRoutingClient::Offline.with_stats(routing_stats.clone()),
-        );
-        let provider_arc: Arc<dyn BlockProvider> = Arc::new(provider.clone());
-        let name_resolver: Arc<dyn NameResolver> = Arc::new(
-            freedom_ipfs_gateway::PersistentNameResolver::cache_only(node.store.clone()),
-        );
-        let router = freedom_ipfs_gateway::router_with_provider_and_name_resolver_config(
-            provider_arc.clone(),
-            name_resolver.clone(),
-            gateway_config.clone(),
-        );
-        let native_gateway = GatewayCore::with_provider_and_name_resolver_config(
-            provider_arc,
-            name_resolver,
-            gateway_config,
-        );
-        return Some(OnlineGatewayParts {
-            addr,
-            router,
-            native_gateway,
-            retrieval_provider: provider,
-            routing_stats,
-        });
-    }
-
-    let delegated_routers = if delegated_router.is_null() {
-        DEFAULT_DELEGATED_ROUTER.to_string()
-    } else {
-        CStr::from_ptr(delegated_router).to_str().ok()?.to_string()
-    };
-
-    let delegated = delegated_routing_client(&delegated_routers);
-    let delegated_router_endpoints = delegated_router_endpoints(&delegated_routers);
-    let dht = light_dht_client(
-        start_config.dht_query_timeout_secs,
-        start_config.dht_max_providers,
-    );
-    let routing = match start_config.routing_mode {
-        ROUTING_MODE_AUTO => {
-            ProviderRoutingClient::from(AutoRoutingClient::new(delegated, dht.clone()))
-        }
-        ROUTING_MODE_DELEGATED => ProviderRoutingClient::from(delegated),
-        ROUTING_MODE_LIGHT_DHT => ProviderRoutingClient::from(dht.clone()),
+    let routing_mode = match start_config.routing_mode {
+        ROUTING_MODE_AUTO => RoutingMode::Auto,
+        ROUTING_MODE_DELEGATED => RoutingMode::Delegated,
+        ROUTING_MODE_LIGHT_DHT => RoutingMode::LightDht,
+        ROUTING_MODE_OFFLINE => RoutingMode::Offline,
         _ => return None,
     };
-    let routing_stats = RoutingStatsHandle::default();
-    let routing = routing.with_stats(routing_stats.clone());
-    let provider = FetchingBlockProvider::new(node.store.clone(), routing);
-    let provider_arc: Arc<dyn BlockProvider> = Arc::new(provider.clone());
-    let name_resolver = CachedNameResolver::new(freedom_ipfs_gateway::PersistentNameResolver::new(
-        DefaultNameResolver::new(
-            CloudflareDohResolver::default(),
-            ipns_resolver(start_config.routing_mode, delegated_router_endpoints, dht),
-        ),
-        node.store.clone(),
-    ));
-    let name_resolver: Arc<dyn NameResolver> = Arc::new(name_resolver);
-    let router = freedom_ipfs_gateway::router_with_provider_and_name_resolver_config(
-        provider_arc.clone(),
-        name_resolver.clone(),
-        gateway_config.clone(),
-    );
-    let native_gateway = GatewayCore::with_provider_and_name_resolver_config(
-        provider_arc,
-        name_resolver,
-        gateway_config,
-    );
+    let mut builder = OnlineNode::builder(node.store.clone())
+        .routing_mode(routing_mode)
+        .gateway_config(gateway_config);
+    if routing_mode != RoutingMode::Offline {
+        let delegated_routers = if delegated_router.is_null() {
+            DEFAULT_DELEGATED_ROUTER.to_string()
+        } else {
+            CStr::from_ptr(delegated_router).to_str().ok()?.to_string()
+        };
+        builder = builder.delegated_routers(delegated_router_endpoints(&delegated_routers));
+        // Zero keeps the light DHT's own default.
+        if start_config.dht_query_timeout_secs != 0 {
+            builder =
+                builder.dht_query_timeout(Duration::from_secs(start_config.dht_query_timeout_secs));
+        }
+        if start_config.dht_max_providers != 0 {
+            builder = builder.dht_max_providers(start_config.dht_max_providers);
+        }
+    }
+    let online = builder.build();
     Some(OnlineGatewayParts {
         addr,
-        router,
-        native_gateway,
-        retrieval_provider: provider,
-        routing_stats,
+        router: online.router(),
+        native_gateway: online.gateway_core(),
+        retrieval_provider: online.provider().clone(),
+        routing_stats: online.routing_stats().clone(),
     })
 }
 
@@ -2243,48 +2194,6 @@ unsafe fn parse_loopback_gateway_addr(addr: *const c_char) -> Option<SocketAddr>
         .ok()
         .and_then(|s| s.parse::<SocketAddr>().ok())?;
     addr.ip().is_loopback().then_some(addr)
-}
-
-fn light_dht_client(dht_query_timeout_secs: u64, dht_max_providers: usize) -> LightDhtClient {
-    let mut dht = LightDhtClient::default();
-    if dht_query_timeout_secs != 0 {
-        dht = dht.with_query_timeout(Duration::from_secs(dht_query_timeout_secs));
-    }
-    if dht_max_providers != 0 {
-        dht = dht.with_max_providers(dht_max_providers);
-    }
-    dht
-}
-
-fn delegated_routing_client(delegated_routers: &str) -> DelegatedRoutingClient {
-    DelegatedRoutingClient::with_endpoints(delegated_router_endpoints(delegated_routers))
-}
-
-fn delegated_router_endpoints(delegated_routers: &str) -> Vec<String> {
-    delegated_routers
-        .split(',')
-        .map(str::trim)
-        .filter(|endpoint| !endpoint.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn ipns_resolver(
-    routing_mode: u32,
-    delegated_routers: Vec<String>,
-    dht: LightDhtClient,
-) -> Arc<dyn IpnsResolver> {
-    match routing_mode {
-        ROUTING_MODE_AUTO => Arc::new(FallbackIpnsResolver::new(
-            DelegatedIpnsResolver::with_endpoints(delegated_routers),
-            DhtIpnsResolver::new(dht),
-        )),
-        ROUTING_MODE_DELEGATED => {
-            Arc::new(DelegatedIpnsResolver::with_endpoints(delegated_routers))
-        }
-        ROUTING_MODE_LIGHT_DHT => Arc::new(DhtIpnsResolver::new(dht)),
-        _ => Arc::new(DelegatedIpnsResolver::with_endpoints(delegated_routers)),
-    }
 }
 
 fn start_gateway_with_router(

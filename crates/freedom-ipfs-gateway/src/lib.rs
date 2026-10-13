@@ -35,6 +35,9 @@ pub use native_request::{
     normalize_content_path, parse_native_request, parse_native_request_json, NativeRequest,
     NativeRequestError, NativeRequestHeader, ParsedNativeRequest,
 };
+mod node;
+
+pub use node::{delegated_router_endpoints, OnlineNode, OnlineNodeBuilder, RoutingMode};
 
 pub const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 pub const DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT_MS: u64 = 2_000;
