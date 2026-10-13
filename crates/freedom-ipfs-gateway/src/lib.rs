@@ -29,6 +29,13 @@ use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
+mod native_request;
+
+pub use native_request::{
+    normalize_content_path, parse_native_request, parse_native_request_json, NativeRequest,
+    NativeRequestError, NativeRequestHeader, ParsedNativeRequest,
+};
+
 pub const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 pub const DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
