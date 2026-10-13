@@ -37,7 +37,12 @@ pub use native_request::{
 };
 mod node;
 
-pub use node::{delegated_router_endpoints, OnlineNode, OnlineNodeBuilder, RoutingMode};
+pub use freedom_ipfs_retrieval::instance::Fenced;
+pub use freedom_ipfs_retrieval::{with_cancellation, CancellationToken, InstanceContext};
+pub use node::{
+    delegated_router_endpoints, Instance, InstanceConfig, OnlineNode, OnlineNodeBuilder,
+    Quiescence, RoutingMode, Teardown,
+};
 
 pub const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 pub const DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT_MS: u64 = 2_000;
@@ -442,14 +447,14 @@ impl Default for GatewayHtmlRangeWarmConfig {
 #[derive(Clone)]
 struct HtmlPrefetchRuntime {
     config: GatewayHtmlPrefetchConfig,
-    limiter: Arc<Semaphore>,
+    jobs: Arc<BackgroundJobs>,
 }
 
 impl HtmlPrefetchRuntime {
     fn new(config: GatewayHtmlPrefetchConfig) -> Self {
         Self {
             config,
-            limiter: Arc::new(Semaphore::new(config.concurrency())),
+            jobs: BackgroundJobs::new(config.concurrency()),
         }
     }
 
@@ -461,14 +466,14 @@ impl HtmlPrefetchRuntime {
 #[derive(Clone)]
 struct HtmlDirectoryPrefetchRuntime {
     config: GatewayHtmlDirectoryPrefetchConfig,
-    limiter: Arc<Semaphore>,
+    jobs: Arc<BackgroundJobs>,
 }
 
 impl HtmlDirectoryPrefetchRuntime {
     fn new(config: GatewayHtmlDirectoryPrefetchConfig) -> Self {
         Self {
             config,
-            limiter: Arc::new(Semaphore::new(config.concurrency())),
+            jobs: BackgroundJobs::new(config.concurrency()),
         }
     }
 
@@ -480,19 +485,76 @@ impl HtmlDirectoryPrefetchRuntime {
 #[derive(Clone)]
 struct HtmlRangeWarmRuntime {
     config: GatewayHtmlRangeWarmConfig,
-    limiter: Arc<Semaphore>,
+    jobs: Arc<BackgroundJobs>,
 }
 
 impl HtmlRangeWarmRuntime {
     fn new(config: GatewayHtmlRangeWarmConfig) -> Self {
         Self {
             config,
-            limiter: Arc::new(Semaphore::new(config.concurrency())),
+            jobs: BackgroundJobs::new(config.concurrency()),
         }
     }
 
     fn is_enabled(&self) -> bool {
         self.config.is_enabled()
+    }
+}
+
+/// A kind of gateway background job's concurrency limit, and the owned
+/// instance its jobs belong to, if any. Behind one `Arc`, so the gateway's
+/// state stays the size it was.
+struct BackgroundJobs {
+    limiter: Arc<Semaphore>,
+    instance: Option<InstanceContext>,
+}
+
+impl BackgroundJobs {
+    fn new(concurrency: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limiter: Arc::new(Semaphore::new(concurrency)),
+            instance: None,
+        })
+    }
+
+    fn with_instance(&self, instance: &InstanceContext) -> Arc<Self> {
+        Arc::new(Self {
+            limiter: self.limiter.clone(),
+            instance: Some(instance.clone()),
+        })
+    }
+}
+
+/// Spawns a gateway background job: in the owned instance's task set, or on
+/// the ambient runtime without one. A fenced instance runs nothing new.
+fn spawn_background<F>(instance: Option<&InstanceContext>, job: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match instance {
+        Some(instance) => drop(instance.spawn(job)),
+        None => drop(tokio::spawn(job)),
+    }
+}
+
+/// Runs a gateway background job's blocking part and waits for it: counted
+/// as the owned instance's blocking region (skipped once it is cancelled),
+/// or on the ambient runtime's blocking pool without one.
+async fn run_blocking_background<F>(
+    instance: Option<&InstanceContext>,
+    job: F,
+) -> std::result::Result<(), String>
+where
+    F: FnOnce() + Send + 'static,
+{
+    match instance {
+        Some(instance) => match instance.spawn_blocking(job) {
+            Ok(handle) => handle.await.map(drop).map_err(|err| err.to_string()),
+            Err(_) => Ok(()),
+        },
+        None => tokio::task::spawn_blocking(job)
+            .await
+            .map_err(|err| err.to_string()),
     }
 }
 
@@ -527,6 +589,15 @@ impl FileCachePolicy {
 }
 
 impl GatewayState {
+    /// The same state, with its background jobs in `instance`'s group.
+    pub(crate) fn with_instance(mut self, instance: InstanceContext) -> Self {
+        self.html_prefetch.jobs = self.html_prefetch.jobs.with_instance(&instance);
+        self.html_directory_prefetch.jobs =
+            self.html_directory_prefetch.jobs.with_instance(&instance);
+        self.html_range_warm.jobs = self.html_range_warm.jobs.with_instance(&instance);
+        self
+    }
+
     pub fn new(store: SqliteBlockStore) -> Self {
         Self::with_provider(Arc::new(store))
     }
@@ -681,6 +752,14 @@ impl GatewayCore {
         Self { state }
     }
 
+    /// Makes the gateway's background jobs (the HTML prefetches and the
+    /// range warmer, off by default) part of `instance`'s owned group: its
+    /// task set and its blocking regions.
+    pub fn with_instance(mut self, instance: InstanceContext) -> Self {
+        self.state = self.state.with_instance(instance);
+        self
+    }
+
     pub async fn handle(&self, request: GatewayCoreRequest) -> Response {
         handle_gateway_core_request(self.state.clone(), request).await
     }
@@ -725,15 +804,20 @@ pub fn router_with_provider_and_name_resolver_config(
     name_resolver: Arc<dyn NameResolver>,
     config: GatewayConfig,
 ) -> Router {
+    router_with_state(GatewayState::with_provider_and_name_resolver_config(
+        provider,
+        name_resolver,
+        config,
+    ))
+}
+
+/// The gateway's routes over `state`.
+pub(crate) fn router_with_state(state: GatewayState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ipfs/{*path}", get(ipfs_get))
         .route("/ipns/{*path}", get(ipns_get))
-        .with_state(GatewayState::with_provider_and_name_resolver_config(
-            provider,
-            name_resolver,
-            config,
-        ))
+        .with_state(state)
 }
 
 #[derive(Debug, Clone)]
@@ -1493,14 +1577,16 @@ fn maybe_spawn_html_directory_prefetch(
     for path in paths {
         let provider = provider.clone();
         let unixfs = unixfs.clone();
-        let limiter = runtime.limiter.clone();
+        let limiter = runtime.jobs.limiter.clone();
         let root_cid = seed.root_cid;
         let span = tracing::info_span!(
             "gateway_html_directory_prefetch",
             cid = %root_cid,
             unixfs_path = %path
         );
-        tokio::spawn(
+        let instance = runtime.jobs.instance.clone();
+        spawn_background(
+            runtime.jobs.instance.as_ref(),
             async move {
                 let queued = Instant::now();
                 let permit = match tokio::time::timeout(
@@ -1535,7 +1621,7 @@ fn maybe_spawn_html_directory_prefetch(
                 };
                 let _permit = permit;
                 let task_path = path.clone();
-                let joined = tokio::task::spawn_blocking(move || {
+                let joined = run_blocking_background(instance.as_ref(), move || {
                     html_directory_prefetch_one(provider.as_ref(), &unixfs, root_cid, &task_path)
                 })
                 .await;
@@ -1586,14 +1672,16 @@ fn maybe_spawn_html_prefetch(
         let unixfs = unixfs.clone();
         let small_body_cache = small_body_cache.clone();
         let config = runtime.config;
-        let limiter = runtime.limiter.clone();
+        let limiter = runtime.jobs.limiter.clone();
         let root_cid = seed.root_cid;
         let span = tracing::info_span!(
             "gateway_html_prefetch",
             cid = %root_cid,
             unixfs_path = %path
         );
-        tokio::spawn(
+        let instance = runtime.jobs.instance.clone();
+        spawn_background(
+            runtime.jobs.instance.as_ref(),
             async move {
                 let queued = Instant::now();
                 let permit = match tokio::time::timeout(
@@ -1627,7 +1715,7 @@ fn maybe_spawn_html_prefetch(
                 };
                 let _permit = permit;
                 let task_path = path.clone();
-                let joined = tokio::task::spawn_blocking(move || {
+                let joined = run_blocking_background(instance.as_ref(), move || {
                     html_prefetch_one(
                         provider.as_ref(),
                         &unixfs,
@@ -1700,7 +1788,7 @@ fn maybe_spawn_html_range_warm(
         concurrency = runtime.config.concurrency(),
     );
 
-    let limiter = runtime.limiter.clone();
+    let limiter = runtime.jobs.limiter.clone();
     let config = runtime.config;
     let root_cid = seed.root_cid;
     let file_cid = seed.file_cid;
@@ -1711,7 +1799,9 @@ fn maybe_spawn_html_range_warm(
         file_cid = %file_cid,
         unixfs_path = %path
     );
-    tokio::spawn(
+    let instance = runtime.jobs.instance.clone();
+    spawn_background(
+        runtime.jobs.instance.as_ref(),
         async move {
             let queued = Instant::now();
             let permit = match tokio::time::timeout(
@@ -1747,7 +1837,7 @@ fn maybe_spawn_html_range_warm(
             };
             let _permit = permit;
             let task_path = path.clone();
-            let joined = tokio::task::spawn_blocking(move || {
+            let joined = run_blocking_background(instance.as_ref(), move || {
                 html_range_warm_one(
                     provider.as_ref(),
                     &unixfs,
@@ -3473,6 +3563,53 @@ fn is_timeout_error(err: &UnixfsError) -> bool {
     };
     let message = message.to_ascii_lowercase();
     message.contains("timed out") || message.contains("timeout")
+}
+
+#[cfg(test)]
+mod background_job_tests {
+    use super::*;
+
+    #[test]
+    fn an_instance_counts_and_fences_the_gateways_background_jobs() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let instance = InstanceContext::new(runtime.handle().clone());
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let job_instance = instance.clone();
+        runtime.block_on(async {
+            spawn_background(Some(&instance), async move {
+                let _ = run_blocking_background(Some(&job_instance), move || {
+                    let _ = held.recv();
+                })
+                .await;
+            });
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while instance.blocking_regions() == 0 {
+            assert!(Instant::now() < deadline, "the job never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!((instance.tasks(), instance.blocking_regions()), (1, 1));
+        instance.cancel();
+        // After the fence the gateway starts nothing new.
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        runtime.block_on(async {
+            spawn_background(Some(&instance), async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+        });
+        release.send(()).unwrap();
+        assert_eq!(
+            instance.wait_blocking_regions(Instant::now() + Duration::from_secs(5)),
+            0
+        );
+        runtime.block_on(instance.wait_tasks());
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
 }
 
 #[cfg(test)]

@@ -25,8 +25,12 @@
 //! Building opens nothing: no socket, no task. Routing, retrieval and name
 //! resolution start their work on the first request.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::future::Future;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
 
 use axum::Router;
 use freedom_ipfs_core::BlockProvider;
@@ -34,17 +38,15 @@ use freedom_ipfs_namesys::{
     CachedNameResolver, CloudflareDohResolver, DefaultNameResolver, DelegatedIpnsResolver,
     FallbackIpnsResolver, IpnsResolver, NameResolver,
 };
-use freedom_ipfs_retrieval::FetchingBlockProvider;
+use freedom_ipfs_retrieval::instance::Fenced;
+use freedom_ipfs_retrieval::{CancellationToken, FetchingBlockProvider, InstanceContext};
 use freedom_ipfs_routing::{
     AutoRoutingClient, DelegatedRoutingClient, DhtIpnsResolver, LightDhtClient,
     ProviderRoutingClient, RoutingStatsHandle, DEFAULT_DELEGATED_ROUTER,
 };
 use freedom_ipfs_store::SqliteBlockStore;
 
-use crate::{
-    router_with_provider_and_name_resolver_config, GatewayConfig, GatewayCore,
-    PersistentNameResolver,
-};
+use crate::{router_with_state, GatewayConfig, GatewayCore, GatewayState, PersistentNameResolver};
 
 /// How a node finds providers and IPNS records.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -110,6 +112,31 @@ impl OnlineNodeBuilder {
 
     /// Wires the node. This opens no socket and starts no task.
     pub fn build(self) -> OnlineNode {
+        self.build_with(None)
+    }
+
+    /// Wires the node as an owned [`Instance`] on a runtime of its own (see
+    /// [`Instance`]). This starts the runtime's threads, and nothing else.
+    pub fn build_instance(self, config: InstanceConfig) -> std::io::Result<Instance> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(config.worker_threads.max(1))
+            .max_blocking_threads(config.max_blocking_threads.max(1))
+            .thread_name(config.thread_name)
+            .enable_all()
+            .build()?;
+        let context = InstanceContext::new(runtime.handle().clone());
+        let node = self.build_with(Some(context.clone()));
+        Ok(Instance {
+            runtime: OwnedRuntime {
+                runtime: Some(runtime),
+                context: context.clone(),
+            },
+            context,
+            node,
+        })
+    }
+
+    fn build_with(self, instance: Option<InstanceContext>) -> OnlineNode {
         let Self {
             store,
             routing_mode,
@@ -163,8 +190,11 @@ impl OnlineNodeBuilder {
                     (routing, Arc::new(name_resolver))
                 }
             };
-        let provider =
+        let mut provider =
             FetchingBlockProvider::new(store.clone(), routing.with_stats(routing_stats.clone()));
+        if let Some(instance) = &instance {
+            provider = provider.with_instance(instance.clone());
+        }
         let block_provider: Arc<dyn BlockProvider> = Arc::new(provider.clone());
         OnlineNode {
             store,
@@ -174,6 +204,7 @@ impl OnlineNodeBuilder {
             name_resolver,
             routing_stats,
             gateway_config,
+            instance,
         }
     }
 }
@@ -189,6 +220,8 @@ pub struct OnlineNode {
     name_resolver: Arc<dyn NameResolver>,
     routing_stats: RoutingStatsHandle,
     gateway_config: GatewayConfig,
+    /// The owned instance whose gateways' background jobs it runs, if any.
+    instance: Option<InstanceContext>,
 }
 
 impl OnlineNode {
@@ -209,21 +242,29 @@ impl OnlineNode {
     /// The gateway over the node's provider and name resolver, as the native
     /// request API serves it.
     pub fn gateway_core(&self) -> GatewayCore {
-        GatewayCore::with_provider_and_name_resolver_config(
+        let core = GatewayCore::with_provider_and_name_resolver_config(
             self.block_provider.clone(),
             self.name_resolver.clone(),
             self.gateway_config.clone(),
-        )
+        );
+        match &self.instance {
+            Some(instance) => core.with_instance(instance.clone()),
+            None => core,
+        }
     }
 
     /// The same gateway as an HTTP router, for a host that serves it on a
     /// local socket.
     pub fn router(&self) -> Router {
-        router_with_provider_and_name_resolver_config(
+        let state = GatewayState::with_provider_and_name_resolver_config(
             self.block_provider.clone(),
             self.name_resolver.clone(),
             self.gateway_config.clone(),
-        )
+        );
+        router_with_state(match &self.instance {
+            Some(instance) => state.with_instance(instance.clone()),
+            None => state,
+        })
     }
 
     /// The retrieving block provider, for its statistics.
@@ -262,6 +303,327 @@ impl OnlineNode {
     }
 }
 
+/// The runtime of an [`Instance`].
+#[derive(Clone, Debug)]
+pub struct InstanceConfig {
+    /// Its threads' name. The OS shows at most 15 bytes of it.
+    pub thread_name: String,
+    /// Its worker threads: by default the core count, at most 8.
+    pub worker_threads: usize,
+    /// The cap on its blocking pool's threads: 512 by default. Every block
+    /// fetch in flight holds one.
+    pub max_blocking_threads: usize,
+}
+
+impl Default for InstanceConfig {
+    fn default() -> Self {
+        Self {
+            thread_name: "freedom-ipfs".into(),
+            worker_threads: std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
+            max_blocking_threads: 512,
+        }
+    }
+}
+
+/// An owned node: everything it runs, on a runtime of its own, so it can be
+/// torn down and its end proven (design 0007, "Instances and their
+/// teardown", upstream item 7).
+///
+/// - **Requests** run with [`Instance::spawn_request`], each under its own
+///   token, a child of the instance's root ([`Instance::request_token`]).
+///   Cancelling the token drops the request at its next await; a fetch
+///   blocked inside the synchronous block provider ends too, because every
+///   blocking region observes the token.
+/// - **Its task set** holds every request and every task the node spawns
+///   for itself, the shared Bitswap swarm's included. A light-DHT query's
+///   swarm is no task of its own: it is driven inside the lookup, so it ends
+///   with the request. The tasks the libraries spawn (hyper's connections,
+///   libp2p's), and the gateway's HTML prefetch and warm tasks (off by
+///   default), aren't in the set but run on the same runtime.
+/// - **[`Instance::shutdown`]** cancels everything, waits for the task set
+///   and the blocking regions, drops and joins the runtime, which ends
+///   every task and blocking job still on it and closes their sockets, and
+///   closes the store. Its [`Teardown`] reports quiescence only after that
+///   join. Cancelling alone isn't enough: the libraries' tasks keep pooled
+///   and dialled connections open after every request has ended, and their
+///   blocking jobs (a `getaddrinfo` lookup) aren't counted anywhere.
+///
+/// Dropping an instance without shutting it down cancels it and lets its
+/// runtime wind down in the background, proving nothing.
+pub struct Instance {
+    runtime: OwnedRuntime,
+    context: InstanceContext,
+    node: OnlineNode,
+}
+
+/// The instance's runtime. Dropped while it still holds the runtime (an
+/// instance dropped without [`Instance::shutdown`], or a teardown whose
+/// thread couldn't be started), it cancels the instance and lets the
+/// runtime wind down in the background: that never blocks, so it is safe
+/// anywhere, an async context included, and it proves nothing.
+struct OwnedRuntime {
+    runtime: Option<Runtime>,
+    context: InstanceContext,
+}
+
+impl Drop for OwnedRuntime {
+    fn drop(&mut self) {
+        self.context.cancel();
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+/// What a [`Teardown`] proved, once the instance's runtime was joined.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quiescence {
+    /// Quiescence is proven: the runtime was dropped and joined, so no task
+    /// and no blocking thread of it runs (the libraries' untracked blocking
+    /// jobs included), and then the store closed.
+    pub reached: bool,
+    /// The runtime was dropped and joined. False only for a report made
+    /// before the teardown finished ([`Instance::shutdown`]'s timeout), or
+    /// when no teardown thread could be started.
+    pub joined: bool,
+    /// Whether the task set and the blocking regions drained within the
+    /// drain bound, before the runtime was dropped.
+    pub drained: bool,
+    /// Tasks that hadn't ended by themselves when the drain bound passed;
+    /// dropping the runtime dropped them.
+    pub tasks_dropped: usize,
+    /// Whether the store closed (at most 2 s for a statement in progress).
+    pub store_closed: bool,
+}
+
+impl Quiescence {
+    /// Nothing proven: the runtime wasn't joined and the store wasn't
+    /// closed.
+    const UNPROVEN: Quiescence = Quiescence {
+        reached: false,
+        joined: false,
+        drained: false,
+        tasks_dropped: 0,
+        store_closed: false,
+    };
+}
+
+/// An instance's teardown in progress, on a thread of its own. It finishes
+/// only once the runtime has been dropped and joined and the store closed,
+/// however long that takes: its caller bounds it with a watchdog of its own
+/// (0007: 5 s, then `teardown_unproven` and exit 70), and releases nothing
+/// of the instance before it finishes.
+///
+/// If no teardown thread can be started, it finishes at once, unproven
+/// (`reached` and `joined` false): the runtime is then left to wind down in
+/// the background, and its caller must release nothing (0007: exit 70).
+pub struct Teardown {
+    done: Arc<(Mutex<Option<Quiescence>>, Condvar)>,
+}
+
+impl Teardown {
+    /// Waits until quiescence is proven or refused.
+    pub fn wait(&self) -> Quiescence {
+        let (result, finished) = &*self.done;
+        let mut result = lock(result);
+        loop {
+            if let Some(quiescence) = *result {
+                return quiescence;
+            }
+            result = finished
+                .wait(result)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Waits at most `timeout`: `None` means the teardown hasn't finished,
+    /// so quiescence isn't proven.
+    pub fn wait_timeout(&self, timeout: Duration) -> Option<Quiescence> {
+        let deadline = Instant::now() + timeout;
+        let (result, finished) = &*self.done;
+        let mut result = lock(result);
+        loop {
+            if let Some(quiescence) = *result {
+                return Some(quiescence);
+            }
+            let left = deadline.checked_duration_since(Instant::now())?;
+            result = match finished.wait_timeout(result, left) {
+                Ok((result, _)) => result,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+    }
+
+    /// Whether the teardown has finished.
+    pub fn is_finished(&self) -> bool {
+        lock(&self.done.0).is_some()
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// How long the teardown waits for a statement in progress before it gives
+/// up closing the store (as `close_or_close_later` does).
+const STORE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+impl Instance {
+    /// The node.
+    pub fn node(&self) -> &OnlineNode {
+        &self.node
+    }
+
+    /// The gateway over the node.
+    pub fn gateway_core(&self) -> GatewayCore {
+        self.node.gateway_core()
+    }
+
+    /// The instance's group: its runtime, its tokens, its task set and its
+    /// blocking regions.
+    pub fn context(&self) -> &InstanceContext {
+        &self.context
+    }
+
+    /// A new request's token: a child of the instance's root.
+    pub fn request_token(&self) -> CancellationToken {
+        self.context.request_token()
+    }
+
+    /// Runs a request on the instance's runtime, in its task set, under
+    /// `token`: the request ends when `token` or the instance is cancelled,
+    /// with `None`. A host reads a response body inside the same request.
+    pub fn spawn_request<F>(
+        &self,
+        token: CancellationToken,
+        future: F,
+    ) -> Result<JoinHandle<Option<F::Output>>, Fenced>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.context.spawn_request(token, future)
+    }
+
+    /// Runs a task of the instance on its runtime, in its task set, until the
+    /// instance is cancelled. Refused once the teardown has begun.
+    pub fn spawn<F>(&self, future: F) -> Result<JoinHandle<Option<F::Output>>, Fenced>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.context.spawn(future)
+    }
+
+    /// Tears the instance down and waits at most `timeout` for quiescence to
+    /// be proven: [`Instance::begin_shutdown`], draining for up to `timeout`,
+    /// then [`Teardown::wait_timeout`] for what is left of it. If the
+    /// runtime's join and the store's close haven't both finished by then,
+    /// quiescence is unproven: `reached` and `joined` are false, the
+    /// teardown goes on in the background, and nothing of the instance may
+    /// be released (0007: exit 70).
+    pub fn shutdown(self, timeout: Duration) -> Quiescence {
+        let deadline = Instant::now() + timeout;
+        let teardown = self.begin_shutdown(timeout);
+        teardown
+            .wait_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(Quiescence::UNPROVEN)
+    }
+
+    /// Tears the instance down (design 0007's teardown, steps 3 and 4) and
+    /// returns its [`Teardown`]. It cancels and fences the root token, and
+    /// so every request's, at once; then, on a dedicated teardown thread:
+    ///
+    /// 1. waits, at most `drain`, until the task set is empty and no
+    ///    blocking region runs;
+    /// 2. drops the node (its clients and caches), then **drops the runtime
+    ///    and joins it**: this returns only once every worker and every
+    ///    blocking-pool thread has exited, the jobs the libraries spawned
+    ///    included, and every task left on it has been dropped with its
+    ///    sockets. No timed shutdown is used: one may return while such work
+    ///    still runs;
+    /// 3. closes the store, at most 2 s for a statement in progress.
+    ///
+    /// The teardown finishes only after the join, however long it takes, so
+    /// a teardown that hasn't finished proves nothing. Bound it with a
+    /// watchdog of your own.
+    ///
+    /// It never blocks its caller and never joins the runtime on the
+    /// caller's thread, so it may be called from an async context. If the
+    /// OS refuses the teardown thread, the teardown finishes at once,
+    /// unproven, and the runtime winds down in the background.
+    ///
+    /// Revoking the network capability (the design's step 2) comes with the
+    /// network policy (upstream item 3).
+    pub fn begin_shutdown(self, drain: Duration) -> Teardown {
+        let Instance {
+            runtime,
+            context,
+            node,
+        } = self;
+        context.cancel();
+        let done = Arc::new((Mutex::new(None), Condvar::new()));
+        let teardown = Teardown { done: done.clone() };
+        // The runtime stays in its guard until the teardown thread runs. If
+        // the thread can't be started, the closure is dropped right here,
+        // and the guard lets the runtime wind down in the background: a bare
+        // runtime dropped here would be joined on the caller's thread (or
+        // panic, in an async context).
+        let work = move || {
+            let mut guard = runtime;
+            let quiescence = tear_down(guard.runtime.take(), context, node, drain);
+            finish(&done, quiescence);
+        };
+        let builder = std::thread::Builder::new().name("freedom-ipfs-teardown".into());
+        #[cfg(test)]
+        let builder = tests::teardown_thread(builder);
+        if builder.spawn(work).is_err() {
+            finish(&teardown.done, Quiescence::UNPROVEN);
+        }
+        teardown
+    }
+}
+
+fn finish(done: &(Mutex<Option<Quiescence>>, Condvar), quiescence: Quiescence) {
+    let (result, finished) = done;
+    *lock(result) = Some(quiescence);
+    finished.notify_all();
+}
+
+/// The teardown thread's work: drain, join the runtime, close the store.
+fn tear_down(
+    runtime: Option<Runtime>,
+    context: InstanceContext,
+    node: OnlineNode,
+    drain: Duration,
+) -> Quiescence {
+    let deadline = Instant::now() + drain;
+    if let Some(runtime) = &runtime {
+        let waiting = context.clone();
+        runtime.block_on(async move {
+            let _ = tokio::time::timeout_at(deadline.into(), waiting.wait_tasks()).await;
+        });
+    }
+    context.wait_blocking_regions(deadline);
+    let tasks_dropped = context.tasks();
+    let drained = tasks_dropped == 0 && context.blocking_regions() == 0;
+    let store = node.store().clone();
+    drop(node);
+    // The join: dropping a runtime waits for its workers and every
+    // blocking-pool thread.
+    drop(runtime);
+    let store_closed = store.close(STORE_CLOSE_TIMEOUT);
+    Quiescence {
+        reached: store_closed && context.tasks() == 0 && context.blocking_regions() == 0,
+        joined: true,
+        drained,
+        tasks_dropped,
+        store_closed,
+    }
+}
+
 /// Parses a comma-separated list of delegated routers, as the add-on and the
 /// gateway binary take it: each trimmed, empty entries dropped.
 pub fn delegated_router_endpoints(delegated_routers: &str) -> Vec<String> {
@@ -280,6 +642,112 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::{HeaderMap, Method, StatusCode};
     use freedom_ipfs_core::{cid_from_data, CODEC_RAW};
+    use std::cell::Cell;
+
+    thread_local! {
+        static REFUSE_TEARDOWN_THREAD: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The hook [`Instance::begin_shutdown`] calls: for a test thread that
+    /// asked, the teardown thread gets a stack no OS can reserve, so its
+    /// creation really fails.
+    pub(super) fn teardown_thread(builder: std::thread::Builder) -> std::thread::Builder {
+        if REFUSE_TEARDOWN_THREAD.with(Cell::get) {
+            builder.stack_size(usize::MAX / 2)
+        } else {
+            builder
+        }
+    }
+
+    /// An instance holding an untracked job on its blocking pool, as a
+    /// library's would be (reqwest's `getaddrinfo`): only a join of the
+    /// runtime waits for it. The job ends `hold` from now.
+    #[cfg(target_os = "linux")]
+    fn instance_with_held_job(thread_name: &str, hold: Duration) -> (Instance, SqliteBlockStore) {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let instance = OnlineNode::builder(store.clone())
+            .routing_mode(RoutingMode::Offline)
+            .build_instance(InstanceConfig {
+                thread_name: thread_name.into(),
+                worker_threads: 1,
+                max_blocking_threads: 4,
+            })
+            .unwrap();
+        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+        drop(instance.context().handle().spawn_blocking(move || {
+            let _ = entered_tx.send(());
+            std::thread::sleep(hold);
+        }));
+        entered.recv().unwrap();
+        assert_eq!(instance.context().blocking_regions(), 0, "untracked");
+        (instance, store)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn store_is_open(store: &SqliteBlockStore) -> bool {
+        store.get(&cid_from_data(CODEC_RAW, b"probe")).is_ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn without_a_teardown_thread_a_bounded_shutdown_is_unproven_at_once() {
+        let (instance, store) = instance_with_held_job("fipfs-nothread", Duration::from_secs(2));
+        REFUSE_TEARDOWN_THREAD.with(|refuse| refuse.set(true));
+        let started = Instant::now();
+        let quiescence = instance.shutdown(Duration::from_millis(20));
+        let took = started.elapsed();
+        REFUSE_TEARDOWN_THREAD.with(|refuse| refuse.set(false));
+        // Not joined on this thread: the held job would have taken 2 s.
+        assert!(took < Duration::from_millis(500), "shutdown took {took:?}");
+        assert_eq!(quiescence, Quiescence::UNPROVEN);
+        // And nothing of the instance released.
+        assert!(store_is_open(&store));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn without_a_teardown_thread_an_async_caller_neither_blocks_nor_panics() {
+        let (instance, store) = instance_with_held_job("fipfs-nothread-a", Duration::from_secs(2));
+        REFUSE_TEARDOWN_THREAD.with(|refuse| refuse.set(true));
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let teardown =
+            caller.block_on(async move { instance.begin_shutdown(Duration::from_millis(20)) });
+        let took = started.elapsed();
+        REFUSE_TEARDOWN_THREAD.with(|refuse| refuse.set(false));
+        assert!(
+            took < Duration::from_millis(500),
+            "begin_shutdown took {took:?}"
+        );
+        assert!(teardown.is_finished());
+        assert_eq!(teardown.wait(), Quiescence::UNPROVEN);
+        assert!(store_is_open(&store));
+    }
+
+    #[test]
+    fn with_a_teardown_thread_quiescence_is_proven() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let instance = OnlineNode::builder(store)
+            .routing_mode(RoutingMode::Offline)
+            .build_instance(InstanceConfig {
+                thread_name: "fipfs-thread".into(),
+                worker_threads: 1,
+                max_blocking_threads: 4,
+            })
+            .unwrap();
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // From an async caller too: the join happens on the teardown thread.
+        let teardown =
+            caller.block_on(async move { instance.begin_shutdown(Duration::from_secs(1)) });
+        let quiescence = teardown.wait();
+        assert!(quiescence.reached && quiescence.joined, "{quiescence:?}");
+    }
 
     fn store_with(data: &[u8]) -> (SqliteBlockStore, String) {
         let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();

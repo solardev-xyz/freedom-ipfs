@@ -1,3 +1,7 @@
+pub mod instance;
+
+pub use instance::{with_cancellation, CancellationToken, InstanceContext};
+
 use cid::Cid;
 use freedom_ipfs_core::{
     block_data_range, verify_block, Block, BlockProvider, CoreError, Result as CoreResult,
@@ -6,7 +10,7 @@ use freedom_ipfs_core::{
 use freedom_ipfs_namesys::{CloudflareDohResolver, DnsTxtResolver};
 use freedom_ipfs_routing::{Provider, ProviderRoutingClient};
 use freedom_ipfs_store::{CachedProviderRecord, SqliteBlockStore};
-use futures::future::{join_all, BoxFuture, FutureExt, Shared};
+use futures::future::{join_all, BoxFuture, FutureExt, WeakShared};
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use futures::stream::{select_all, FuturesUnordered};
 use futures::StreamExt;
@@ -366,7 +370,11 @@ pub struct HttpRetriever {
     routing: ProviderRoutingClient,
     store: SqliteBlockStore,
     bitswap: Arc<tokio::sync::Mutex<Option<SharedBitswapClient>>>,
-    inflight: Arc<tokio::sync::Mutex<HashMap<Cid, SharedBlockFetch>>>,
+    /// Fetches in flight, by CID. The map holds them weakly: the callers
+    /// awaiting a fetch own it, and the fetch, which holds this retriever,
+    /// doesn't keep itself alive through the map. A fetch whose every caller
+    /// was cancelled is dropped with its last caller.
+    inflight: Arc<tokio::sync::Mutex<HashMap<Cid, WeakBlockFetch>>>,
     successful_bitswap_peers: Arc<tokio::sync::Mutex<HashMap<PeerId, SuccessfulBitswapPeer>>>,
     http_provider_scores: Arc<tokio::sync::Mutex<HashMap<String, HttpProviderScore>>>,
     bitswap_dnsaddr_cache: Arc<tokio::sync::Mutex<SharedDnsaddrCache>>,
@@ -375,9 +383,12 @@ pub struct HttpRetriever {
     single_http_bitswap_hedge_counts: Arc<tokio::sync::Mutex<HashMap<String, usize>>>,
     http_provider_fetch_limiter: Arc<tokio::sync::Semaphore>,
     http_provider_fetch_limit: usize,
+    /// The owned group this retriever's tasks and blocking jobs belong to;
+    /// `None` spawns them on the ambient runtime, as before.
+    instance: Option<InstanceContext>,
 }
 
-type SharedBlockFetch = Shared<BoxFuture<'static, Arc<SharedBlockFetchResult>>>;
+type WeakBlockFetch = WeakShared<BoxFuture<'static, Arc<SharedBlockFetchResult>>>;
 type SharedBlockFetchResult = std::result::Result<(Block, RetrievalSource), String>;
 
 #[derive(Clone, Copy)]
@@ -470,6 +481,48 @@ impl HttpRetriever {
                 http_provider_fetch_limit,
             )),
             http_provider_fetch_limit,
+            instance: None,
+        }
+    }
+
+    /// Makes the retriever's tasks (the shared Bitswap swarm, background
+    /// preconnects) and blocking jobs part of `instance`'s owned group.
+    pub fn with_instance(mut self, instance: InstanceContext) -> Self {
+        self.instance = Some(instance);
+        self
+    }
+
+    /// Spawns a task of the retriever: in its instance's task set, or on
+    /// the ambient runtime without one.
+    fn spawn_task<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        match &self.instance {
+            Some(instance) => drop(instance.spawn(future)),
+            None => drop(tokio::spawn(future)),
+        }
+    }
+
+    /// Runs a blocking job and waits for it: counted as its instance's
+    /// blocking region (and skipped or refused once the instance is
+    /// cancelled), or on the ambient runtime's blocking pool without one.
+    async fn run_blocking_job<F, R>(&self, job: F) -> std::result::Result<R, String>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        match &self.instance {
+            Some(instance) => match instance.spawn_blocking(job) {
+                Ok(handle) => handle
+                    .await
+                    .map_err(|err| err.to_string())?
+                    .ok_or_else(|| "cancelled".to_string()),
+                Err(fenced) => Err(fenced.to_string()),
+            },
+            None => tokio::task::spawn_blocking(job)
+                .await
+                .map_err(|err| err.to_string()),
         }
     }
 
@@ -529,7 +582,9 @@ impl HttpRetriever {
     ) -> Result<(Block, RetrievalSource)> {
         let wait_started = Instant::now();
         let mut inflight = self.inflight.lock().await;
-        if let Some(fetch) = inflight.get(&cid).cloned() {
+        // Fetches whose callers are all gone are dropped already; forget them.
+        inflight.retain(|_, fetch| fetch.upgrade().is_some());
+        if let Some(fetch) = inflight.get(&cid).and_then(WeakShared::upgrade) {
             drop(inflight);
             return tokio::select! {
                 result = fetch => {
@@ -579,13 +634,22 @@ impl HttpRetriever {
         }
         .boxed()
         .shared();
-        inflight.insert(cid, fetch.clone());
+        if let Some(weak) = fetch.downgrade() {
+            inflight.insert(cid, weak);
+        }
         let inflight_count = inflight.len();
         drop(inflight);
 
-        let result = fetch.await;
+        let result = fetch.clone().await;
         let mut inflight = self.inflight.lock().await;
-        inflight.remove(&cid);
+        // Only this fetch's entry: a newer one for the CID stays.
+        if inflight
+            .get(&cid)
+            .and_then(WeakShared::upgrade)
+            .is_none_or(|current| current.ptr_eq(&fetch))
+        {
+            inflight.remove(&cid);
+        }
         drop(inflight);
         tracing::info!(
             phase = "block_fetch_coalesced",
@@ -1747,7 +1811,7 @@ impl HttpRetriever {
 
         let retriever = self.clone();
         let providers = providers.to_vec();
-        tokio::spawn(async move {
+        self.spawn_task(async move {
             with_retrieval_request_context(context, async move {
                 let started = Instant::now();
                 let current_context = current_retrieval_request_context();
@@ -4299,7 +4363,7 @@ impl HttpRetriever {
         if let Some(client) = client.as_ref() {
             return Ok(client.clone());
         }
-        let spawned = SharedBitswapClient::spawn().await?;
+        let spawned = SharedBitswapClient::spawn(self.instance.as_ref()).await?;
         *client = Some(spawned.clone());
         Ok(spawned)
     }
@@ -5056,12 +5120,13 @@ impl HttpRetriever {
         let started = Instant::now();
         let byte_count = bytes.len();
         let store = self.store.clone();
-        let (bytes, result) = tokio::task::spawn_blocking(move || {
-            let result = store.put_block(&cid, &bytes);
-            (bytes, result)
-        })
-        .await
-        .map_err(|err| RetrievalError::Bitswap(format!("block store task failed: {err}")))?;
+        let (bytes, result) = self
+            .run_blocking_job(move || {
+                let result = store.put_block(&cid, &bytes);
+                (bytes, result)
+            })
+            .await
+            .map_err(|err| RetrievalError::Bitswap(format!("block store task failed: {err}")))?;
         match result {
             Ok(()) => {
                 tracing::info!(
@@ -5238,6 +5303,7 @@ pub struct FetchingBlockProvider {
     store: SqliteBlockStore,
     retriever: HttpRetriever,
     stats: Arc<RetrievalStatsInner>,
+    instance: Option<InstanceContext>,
 }
 
 impl FetchingBlockProvider {
@@ -5247,6 +5313,45 @@ impl FetchingBlockProvider {
             store,
             retriever,
             stats: Arc::new(RetrievalStatsInner::default()),
+            instance: None,
+        }
+    }
+
+    /// Makes the provider part of `instance`'s owned group: each of its
+    /// blocking regions is counted and ends when the current request's token
+    /// (or, outside a request, the instance's root) is cancelled, and its
+    /// retriever's tasks and blocking jobs join the instance's task set.
+    /// Without this, nothing changes.
+    pub fn with_instance(mut self, instance: InstanceContext) -> Self {
+        self.retriever = self.retriever.with_instance(instance.clone());
+        self.instance = Some(instance);
+        self
+    }
+
+    /// Runs a retrieval future from the synchronous provider methods.
+    ///
+    /// - **With an instance,** always in one of its counted, cancellable
+    ///   blocking regions, and always on its runtime: in place on its own
+    ///   threads, or from a plain thread with its runtime current, so the
+    ///   future's network work never escapes it. From another runtime the
+    ///   call is refused. A cancelled or refused call fails as `cancelled`.
+    /// - **Without one,** as before: in a blocking region on the current
+    ///   runtime, or on a current-thread runtime of its own outside one.
+    fn block_on_retrieval<F: Future>(&self, future: F) -> CoreResult<F::Output> {
+        if let Some(instance) = &self.instance {
+            return instance
+                .block_on(future)
+                .ok_or_else(|| CoreError::Storage("cancelled".into()));
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
+            Err(_) => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|err| CoreError::Storage(err.to_string()))?;
+                Ok(runtime.block_on(future))
+            }
         }
     }
 
@@ -5444,24 +5549,10 @@ impl BlockProvider for FetchingBlockProvider {
         );
 
         let context = current_retrieval_request_context();
-        let fetched = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(
-                    self.retriever
-                        .fetch_block_with_source_with_context(cid, context),
-                )
-            }),
-            Err(_) => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|err| CoreError::Storage(err.to_string()))?;
-                runtime.block_on(
-                    self.retriever
-                        .fetch_block_with_source_with_context(cid, context),
-                )
-            }
-        };
+        let fetched = self.block_on_retrieval(
+            self.retriever
+                .fetch_block_with_source_with_context(cid, context),
+        )?;
 
         match fetched {
             Ok((block, source)) => {
@@ -5496,24 +5587,10 @@ impl BlockProvider for FetchingBlockProvider {
         );
 
         let context = current_retrieval_request_context();
-        let fetched = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(
-                    self.retriever
-                        .fetch_block_with_source_with_context(cid, context),
-                )
-            }),
-            Err(_) => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|err| CoreError::Storage(err.to_string()))?;
-                runtime.block_on(
-                    self.retriever
-                        .fetch_block_with_source_with_context(cid, context),
-                )
-            }
-        };
+        let fetched = self.block_on_retrieval(
+            self.retriever
+                .fetch_block_with_source_with_context(cid, context),
+        )?;
 
         match fetched {
             Ok((block, source)) => {
@@ -5531,18 +5608,7 @@ impl BlockProvider for FetchingBlockProvider {
                 .map(|(cid, start, end)| self.get_block_range(cid, *start, *end))
                 .collect();
         }
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(self.get_block_ranges_async(ranges.to_vec()))
-            }),
-            Err(_) => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|err| CoreError::Storage(err.to_string()))?;
-                runtime.block_on(self.get_block_ranges_async(ranges.to_vec()))
-            }
-        }
+        self.block_on_retrieval(self.get_block_ranges_async(ranges.to_vec()))?
     }
 
     fn retain_block(&self, cid: &Cid) -> CoreResult<()> {
@@ -7382,12 +7448,19 @@ struct ConnectionErrorBackoff {
 }
 
 impl SharedBitswapClient {
-    async fn spawn() -> Result<Self> {
+    /// Builds the shared swarm and spawns its task: in `instance`'s task
+    /// set, so the instance's cancellation ends it and drops the swarm and
+    /// its connections, or on the ambient runtime without one.
+    async fn spawn(instance: Option<&InstanceContext>) -> Result<Self> {
         let swarm = build_bitswap_swarm().await?;
         let mut control = swarm.behaviour().stream.new_control();
         let incoming = accept_bitswap_streams(&mut control)?;
         let (commands, receiver) = mpsc::channel(64);
-        tokio::spawn(run_shared_bitswap_swarm(swarm, control, incoming, receiver));
+        let task = run_shared_bitswap_swarm(swarm, control, incoming, receiver);
+        match instance {
+            Some(instance) => drop(instance.spawn(task)),
+            None => drop(tokio::spawn(task)),
+        }
         Ok(Self { commands })
     }
 
@@ -11206,6 +11279,80 @@ struct BlockPresence {
 }
 
 #[cfg(test)]
+mod inflight_lifetime_tests {
+    use super::*;
+    use freedom_ipfs_core::{cid_from_data, CODEC_RAW};
+
+    /// A delegated router that accepts and never answers.
+    async fn stalled_router() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        (format!("http://{addr}/routing/v1"), task)
+    }
+
+    async fn entry_alive(retriever: &HttpRetriever, cid: &Cid) -> bool {
+        retriever
+            .inflight
+            .lock()
+            .await
+            .get(cid)
+            .and_then(WeakShared::upgrade)
+            .is_some()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_fetch_releases_the_retriever_and_spares_its_followers() {
+        let (router, router_task) = stalled_router().await;
+        let store = SqliteBlockStore::in_memory(1 << 20).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new(router),
+            store,
+        );
+        let inflight = Arc::downgrade(&retriever.inflight);
+        let cid = cid_from_data(CODEC_RAW, b"never delivered");
+
+        // A leader and a coalesced follower wait on one fetch.
+        let leader = tokio::spawn({
+            let retriever = retriever.clone();
+            async move { retriever.fetch_block_with_source(&cid).await }
+        });
+        while !entry_alive(&retriever, &cid).await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let follower = tokio::spawn({
+            let retriever = retriever.clone();
+            async move { retriever.fetch_block_with_source(&cid).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Cancelling the leader leaves the follower's fetch running.
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+        assert!(
+            entry_alive(&retriever, &cid).await,
+            "the follower still owns it"
+        );
+
+        // Cancelling the follower too drops the fetch and its retriever.
+        follower.abort();
+        assert!(follower.await.unwrap_err().is_cancelled());
+        assert!(!entry_alive(&retriever, &cid).await);
+        drop(retriever);
+        assert!(
+            inflight.upgrade().is_none(),
+            "nothing owns the in-flight map once its owners are gone"
+        );
+        router_task.abort();
+    }
+}
+
+#[cfg(test)]
 mod bitswap_tests {
     use super::*;
     use serde::Deserialize;
@@ -12354,7 +12501,7 @@ mod bitswap_tests {
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
         let (peer_id, addr, swarm_task, stream_task, want_seen) =
             spawn_bitswap_peer_waiting_for_stream_close(cid).await;
-        let client = SharedBitswapClient::spawn().await.unwrap();
+        let client = SharedBitswapClient::spawn(None).await.unwrap();
         let fetch_task = tokio::spawn(async move {
             client
                 .fetch(
@@ -12698,7 +12845,7 @@ mod bitswap_tests {
                 (second, second_data.to_vec()),
             ])
             .await;
-        let client = SharedBitswapClient::spawn().await.unwrap();
+        let client = SharedBitswapClient::spawn(None).await.unwrap();
 
         let result = client
             .fetch_many(
@@ -12739,7 +12886,7 @@ mod bitswap_tests {
                 (second, second_data.to_vec()),
             ])
             .await;
-        let client = SharedBitswapClient::spawn().await.unwrap();
+        let client = SharedBitswapClient::spawn(None).await.unwrap();
 
         let result = client
             .fetch_many(
@@ -12826,6 +12973,7 @@ mod bitswap_tests {
             store: store.clone(),
             retriever,
             stats: Arc::new(RetrievalStatsInner::default()),
+            instance: None,
         };
 
         let ranges = vec![(first, 1, 5), (second, 2, 7)];
@@ -12848,7 +12996,7 @@ mod bitswap_tests {
 
     #[tokio::test]
     async fn shared_bitswap_client_fetch_many_rejects_empty_batch() {
-        let client = SharedBitswapClient::spawn().await.unwrap();
+        let client = SharedBitswapClient::spawn(None).await.unwrap();
         let err = client.fetch_many(Vec::new(), Vec::new()).await.unwrap_err();
 
         assert!(
