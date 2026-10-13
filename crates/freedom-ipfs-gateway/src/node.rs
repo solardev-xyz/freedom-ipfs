@@ -356,9 +356,11 @@ pub struct Instance {
     node: OnlineNode,
 }
 
-/// The instance's runtime. Dropped without [`Instance::shutdown`], it
-/// cancels the instance and lets the runtime wind down in the background:
-/// dropping a runtime that way never blocks, so it is safe anywhere.
+/// The instance's runtime. Dropped while it still holds the runtime (an
+/// instance dropped without [`Instance::shutdown`], or a teardown whose
+/// thread couldn't be started), it cancels the instance and lets the
+/// runtime wind down in the background: that never blocks, so it is safe
+/// anywhere, an async context included, and it proves nothing.
 struct OwnedRuntime {
     runtime: Option<Runtime>,
     context: InstanceContext,
@@ -381,7 +383,8 @@ pub struct Quiescence {
     /// jobs included), and then the store closed.
     pub reached: bool,
     /// The runtime was dropped and joined. False only for a report made
-    /// before the teardown finished ([`Instance::shutdown`]'s timeout).
+    /// before the teardown finished ([`Instance::shutdown`]'s timeout), or
+    /// when no teardown thread could be started.
     pub joined: bool,
     /// Whether the task set and the blocking regions drained within the
     /// drain bound, before the runtime was dropped.
@@ -393,11 +396,27 @@ pub struct Quiescence {
     pub store_closed: bool,
 }
 
+impl Quiescence {
+    /// Nothing proven: the runtime wasn't joined and the store wasn't
+    /// closed.
+    const UNPROVEN: Quiescence = Quiescence {
+        reached: false,
+        joined: false,
+        drained: false,
+        tasks_dropped: 0,
+        store_closed: false,
+    };
+}
+
 /// An instance's teardown in progress, on a thread of its own. It finishes
 /// only once the runtime has been dropped and joined and the store closed,
 /// however long that takes: its caller bounds it with a watchdog of its own
 /// (0007: 5 s, then `teardown_unproven` and exit 70), and releases nothing
 /// of the instance before it finishes.
+///
+/// If no teardown thread can be started, it finishes at once, unproven
+/// (`reached` and `joined` false): the runtime is then left to wind down in
+/// the background, and its caller must release nothing (0007: exit 70).
 pub struct Teardown {
     done: Arc<(Mutex<Option<Quiescence>>, Condvar)>,
 }
@@ -510,13 +529,7 @@ impl Instance {
         let teardown = self.begin_shutdown(timeout);
         teardown
             .wait_timeout(deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or(Quiescence {
-                reached: false,
-                joined: false,
-                drained: false,
-                tasks_dropped: 0,
-                store_closed: false,
-            })
+            .unwrap_or(Quiescence::UNPROVEN)
     }
 
     /// Tears the instance down (design 0007's teardown, steps 3 and 4) and
@@ -537,34 +550,46 @@ impl Instance {
     /// a teardown that hasn't finished proves nothing. Bound it with a
     /// watchdog of your own.
     ///
+    /// It never blocks its caller and never joins the runtime on the
+    /// caller's thread, so it may be called from an async context. If the
+    /// OS refuses the teardown thread, the teardown finishes at once,
+    /// unproven, and the runtime winds down in the background.
+    ///
     /// Revoking the network capability (the design's step 2) comes with the
     /// network policy (upstream item 3).
     pub fn begin_shutdown(self, drain: Duration) -> Teardown {
         let Instance {
-            mut runtime,
+            runtime,
             context,
             node,
         } = self;
         context.cancel();
-        let runtime = runtime.runtime.take();
         let done = Arc::new((Mutex::new(None), Condvar::new()));
         let teardown = Teardown { done: done.clone() };
+        // The runtime stays in its guard until the teardown thread runs. If
+        // the thread can't be started, the closure is dropped right here,
+        // and the guard lets the runtime wind down in the background: a bare
+        // runtime dropped here would be joined on the caller's thread (or
+        // panic, in an async context).
         let work = move || {
-            let quiescence = tear_down(runtime, context, node, drain);
-            let (result, finished) = &*done;
-            *lock(result) = Some(quiescence);
-            finished.notify_all();
+            let mut guard = runtime;
+            let quiescence = tear_down(guard.runtime.take(), context, node, drain);
+            finish(&done, quiescence);
         };
-        let spawned = std::thread::Builder::new()
-            .name("freedom-ipfs-teardown".into())
-            .spawn(work);
-        if let Err(error) = spawned {
-            // No thread to be had: the work is lost with the error, so the
-            // teardown never finishes, and its caller's watchdog acts.
-            drop(error);
+        let builder = std::thread::Builder::new().name("freedom-ipfs-teardown".into());
+        #[cfg(test)]
+        let builder = tests::teardown_thread(builder);
+        if builder.spawn(work).is_err() {
+            finish(&teardown.done, Quiescence::UNPROVEN);
         }
         teardown
     }
+}
+
+fn finish(done: &(Mutex<Option<Quiescence>>, Condvar), quiescence: Quiescence) {
+    let (result, finished) = done;
+    *lock(result) = Some(quiescence);
+    finished.notify_all();
 }
 
 /// The teardown thread's work: drain, join the runtime, close the store.
@@ -617,6 +642,112 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::{HeaderMap, Method, StatusCode};
     use freedom_ipfs_core::{cid_from_data, CODEC_RAW};
+    use std::cell::Cell;
+
+    thread_local! {
+        static REFUSE_TEARDOWN_THREAD: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The hook [`Instance::begin_shutdown`] calls: for a test thread that
+    /// asked, the teardown thread gets a stack no OS can reserve, so its
+    /// creation really fails.
+    pub(super) fn teardown_thread(builder: std::thread::Builder) -> std::thread::Builder {
+        if REFUSE_TEARDOWN_THREAD.with(Cell::get) {
+            builder.stack_size(usize::MAX / 2)
+        } else {
+            builder
+        }
+    }
+
+    /// An instance holding an untracked job on its blocking pool, as a
+    /// library's would be (reqwest's `getaddrinfo`): only a join of the
+    /// runtime waits for it. The job ends `hold` from now.
+    #[cfg(target_os = "linux")]
+    fn instance_with_held_job(thread_name: &str, hold: Duration) -> (Instance, SqliteBlockStore) {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let instance = OnlineNode::builder(store.clone())
+            .routing_mode(RoutingMode::Offline)
+            .build_instance(InstanceConfig {
+                thread_name: thread_name.into(),
+                worker_threads: 1,
+                max_blocking_threads: 4,
+            })
+            .unwrap();
+        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+        drop(instance.context().handle().spawn_blocking(move || {
+            let _ = entered_tx.send(());
+            std::thread::sleep(hold);
+        }));
+        entered.recv().unwrap();
+        assert_eq!(instance.context().blocking_regions(), 0, "untracked");
+        (instance, store)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn store_is_open(store: &SqliteBlockStore) -> bool {
+        store.get(&cid_from_data(CODEC_RAW, b"probe")).is_ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn without_a_teardown_thread_a_bounded_shutdown_is_unproven_at_once() {
+        let (instance, store) = instance_with_held_job("fipfs-nothread", Duration::from_secs(2));
+        REFUSE_TEARDOWN_THREAD.with(|refuse| refuse.set(true));
+        let started = Instant::now();
+        let quiescence = instance.shutdown(Duration::from_millis(20));
+        let took = started.elapsed();
+        REFUSE_TEARDOWN_THREAD.with(|refuse| refuse.set(false));
+        // Not joined on this thread: the held job would have taken 2 s.
+        assert!(took < Duration::from_millis(500), "shutdown took {took:?}");
+        assert_eq!(quiescence, Quiescence::UNPROVEN);
+        // And nothing of the instance released.
+        assert!(store_is_open(&store));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn without_a_teardown_thread_an_async_caller_neither_blocks_nor_panics() {
+        let (instance, store) = instance_with_held_job("fipfs-nothread-a", Duration::from_secs(2));
+        REFUSE_TEARDOWN_THREAD.with(|refuse| refuse.set(true));
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let teardown =
+            caller.block_on(async move { instance.begin_shutdown(Duration::from_millis(20)) });
+        let took = started.elapsed();
+        REFUSE_TEARDOWN_THREAD.with(|refuse| refuse.set(false));
+        assert!(
+            took < Duration::from_millis(500),
+            "begin_shutdown took {took:?}"
+        );
+        assert!(teardown.is_finished());
+        assert_eq!(teardown.wait(), Quiescence::UNPROVEN);
+        assert!(store_is_open(&store));
+    }
+
+    #[test]
+    fn with_a_teardown_thread_quiescence_is_proven() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let instance = OnlineNode::builder(store)
+            .routing_mode(RoutingMode::Offline)
+            .build_instance(InstanceConfig {
+                thread_name: "fipfs-thread".into(),
+                worker_threads: 1,
+                max_blocking_threads: 4,
+            })
+            .unwrap();
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // From an async caller too: the join happens on the teardown thread.
+        let teardown =
+            caller.block_on(async move { instance.begin_shutdown(Duration::from_secs(1)) });
+        let quiescence = teardown.wait();
+        assert!(quiescence.reached && quiescence.joined, "{quiescence:?}");
+    }
 
     fn store_with(data: &[u8]) -> (SqliteBlockStore, String) {
         let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
