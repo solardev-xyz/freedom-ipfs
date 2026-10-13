@@ -17,9 +17,13 @@
 //! - **a blocking-region count**, raised around every `block_in_place` and
 //!   every blocking-pool job the node starts, and readable from outside the
 //!   runtime, so a host can wait for it to reach zero;
-//! - **the runtime handle** the group runs on. Tasks that libraries start
-//!   for the node (hyper's connections, libp2p's) are spawned there too, so
-//!   a host that owns that runtime can end them all by shutting it down.
+//! - **the runtime handle** the group runs on. Tasks and blocking jobs that
+//!   libraries start for the node (hyper's connections, libp2p's, a
+//!   resolver's lookups) run there too, and only dropping and joining that
+//!   runtime proves they have all ended;
+//! - **a fence:** cancelling the group admits no new task or blocking
+//!   region from then on, under the same lock that admits them, and a
+//!   blocking job still queued when it is cancelled never runs.
 //!
 //! A node built without an `InstanceContext` behaves exactly as before.
 
@@ -58,9 +62,30 @@ struct Inner {
     handle: Handle,
     root: CancellationToken,
     tasks: TaskTracker,
-    blocking: Mutex<usize>,
+    /// Admission and the fence, under one lock: work is admitted (a task
+    /// registered, a blocking region counted) only while unfenced, and
+    /// [`InstanceContext::cancel`] fences under the same lock, so nothing is
+    /// admitted after it returns.
+    admission: Mutex<Admission>,
     blocking_done: Condvar,
 }
+
+struct Admission {
+    fenced: bool,
+    blocking: usize,
+}
+
+/// The group was cancelled: it admits no new work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fenced;
+
+impl std::fmt::Display for Fenced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the instance is cancelled")
+    }
+}
+
+impl std::error::Error for Fenced {}
 
 impl std::fmt::Debug for InstanceContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -80,7 +105,10 @@ impl InstanceContext {
                 handle,
                 root: CancellationToken::new(),
                 tasks: TaskTracker::new(),
-                blocking: Mutex::new(0),
+                admission: Mutex::new(Admission {
+                    fenced: false,
+                    blocking: 0,
+                }),
                 blocking_done: Condvar::new(),
             }),
         }
@@ -108,10 +136,10 @@ impl InstanceContext {
 
     /// Spawns a task of the group on its runtime. It ends, dropped at its
     /// next await, when the root token is cancelled, and it counts in the
-    /// task set until it has. After [`InstanceContext::cancel`], the future
-    /// is dropped at once and never runs. The output is `None` whenever the
-    /// token was cancelled before the task ended.
-    pub fn spawn<F>(&self, future: F) -> JoinHandle<Option<F::Output>>
+    /// task set until it has. The output is `None` whenever the token was
+    /// cancelled before the task ended. After [`InstanceContext::cancel`],
+    /// nothing is spawned: [`Fenced`], and the future is dropped unpolled.
+    pub fn spawn<F>(&self, future: F) -> Result<JoinHandle<Option<F::Output>>, Fenced>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
@@ -126,7 +154,7 @@ impl InstanceContext {
         &self,
         token: CancellationToken,
         future: F,
-    ) -> JoinHandle<Option<F::Output>>
+    ) -> Result<JoinHandle<Option<F::Output>>, Fenced>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
@@ -135,13 +163,23 @@ impl InstanceContext {
         self.spawn_with(token, scoped)
     }
 
-    fn spawn_with<F>(&self, token: CancellationToken, future: F) -> JoinHandle<Option<F::Output>>
+    fn spawn_with<F>(
+        &self,
+        token: CancellationToken,
+        future: F,
+    ) -> Result<JoinHandle<Option<F::Output>>, Fenced>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
         let root = self.inner.root.clone();
-        self.inner.tasks.spawn_on(
+        // Registered under the admission lock, so a task is either in the
+        // set before the fence or never spawned.
+        let admission = self.admission();
+        if admission.fenced {
+            return Err(Fenced);
+        }
+        let handle = self.inner.tasks.spawn_on(
             async move {
                 if root.is_cancelled() {
                     return None;
@@ -158,56 +196,98 @@ impl InstanceContext {
                 output.filter(|_| !token.is_cancelled() && !root.is_cancelled())
             },
             &self.inner.handle,
-        )
+        );
+        drop(admission);
+        Ok(handle)
     }
 
     /// Runs `job` on the runtime's blocking pool, counted as a blocking
-    /// region of the group until it returns.
-    pub fn spawn_blocking<F, R>(&self, job: F) -> JoinHandle<R>
+    /// region of the group from now until it returns. A job still queued
+    /// when the group is cancelled never runs (`None`); after the fence,
+    /// nothing is queued ([`Fenced`]).
+    pub fn spawn_blocking<F, R>(&self, job: F) -> Result<JoinHandle<Option<R>>, Fenced>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let region = self.blocking_region();
-        self.inner.handle.spawn_blocking(move || {
+        let region = self.blocking_region()?;
+        let root = self.inner.root.clone();
+        Ok(self.inner.handle.spawn_blocking(move || {
             let _region = region;
-            job()
+            (!root.is_cancelled()).then(job)
+        }))
+    }
+
+    /// Counts a blocking region until the guard is dropped; after the fence,
+    /// none is admitted ([`Fenced`]).
+    pub fn blocking_region(&self) -> Result<BlockingRegion, Fenced> {
+        let mut admission = self.admission();
+        if admission.fenced {
+            return Err(Fenced);
+        }
+        admission.blocking += 1;
+        Ok(BlockingRegion {
+            context: self.clone(),
         })
     }
 
-    /// Counts a blocking region until the guard is dropped.
-    pub fn blocking_region(&self) -> BlockingRegion {
-        *lock(&self.inner.blocking) += 1;
-        BlockingRegion {
-            context: self.clone(),
-        }
+    fn admission(&self) -> MutexGuard<'_, Admission> {
+        self.inner
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Runs `future` to completion from inside a task of the group, in a
-    /// blocking region: `block_in_place`, then `block_on` on the runtime. It
-    /// returns `None`, dropping `future`, as soon as the current request's
-    /// token (or, outside a request, the root token) is cancelled.
-    pub fn block_in_place<F: Future>(&self, handle: &Handle, future: F) -> Option<F::Output> {
+    /// Whether the current thread belongs to the group's runtime: one of its
+    /// workers, or a thread of its blocking pool.
+    pub fn runs_here(&self) -> bool {
+        Handle::try_current().is_ok_and(|current| current.id() == self.inner.handle.id())
+    }
+
+    /// Runs `future` to completion from synchronous code of the group, in a
+    /// counted blocking region, and returns `None`, dropping `future`, as
+    /// soon as the current request's token (or, outside a request, the root)
+    /// is cancelled, or at once after the fence.
+    ///
+    /// - **On the group's runtime** (a task of the group, or its blocking
+    ///   pool): `block_in_place`, then `block_on` on it.
+    /// - **On a thread without a runtime:** `block_on` on the group's
+    ///   runtime from that thread, so everything `future` spawns, the
+    ///   libraries' connection tasks included, runs on the group's runtime.
+    /// - **On another runtime:** refused (`None`): work there would escape
+    ///   the group.
+    pub fn block_on<F: Future>(&self, future: F) -> Option<F::Output> {
+        let region = self.blocking_region().ok()?;
         let token = current_cancellation().unwrap_or_else(|| self.inner.root.clone());
         let root = self.inner.root.clone();
-        let _region = self.blocking_region();
-        tokio::task::block_in_place(|| {
-            handle.block_on(async move {
-                tokio::select! {
-                    biased;
-                    _ = token.cancelled() => None,
-                    _ = root.cancelled() => None,
-                    output = future => Some(output),
-                }
-            })
-        })
+        let guarded = async move {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => None,
+                _ = root.cancelled() => None,
+                output = future => Some(output),
+            }
+        };
+        let output = match Handle::try_current() {
+            Ok(current) if current.id() == self.inner.handle.id() => {
+                tokio::task::block_in_place(|| current.block_on(guarded))
+            }
+            Ok(_) => None,
+            Err(_) => self.inner.handle.block_on(guarded),
+        };
+        drop(region);
+        output
     }
 
-    /// Cancels the group: the root token, and so every request's, and closes
-    /// the task set to new tasks.
+    /// Cancels the group and fences it: the root token, and so every
+    /// request's, is cancelled; the task set is closed; and from the moment
+    /// this returns no task or blocking region is admitted.
     pub fn cancel(&self) {
+        let mut admission = self.admission();
+        admission.fenced = true;
         self.inner.root.cancel();
         self.inner.tasks.close();
+        drop(admission);
     }
 
     /// Tasks of the group still running.
@@ -215,25 +295,25 @@ impl InstanceContext {
         self.inner.tasks.len()
     }
 
-    /// Blocking regions of the group still running.
+    /// Blocking regions of the group still running, or queued.
     pub fn blocking_regions(&self) -> usize {
-        *lock(&self.inner.blocking)
+        self.admission().blocking
     }
 
     /// Waits, from a thread that may block, until no blocking region of the
     /// group runs or `deadline` passes; returns how many still run.
     pub fn wait_blocking_regions(&self, deadline: Instant) -> usize {
-        let mut count = lock(&self.inner.blocking);
-        while *count > 0 {
+        let mut admission = self.admission();
+        while admission.blocking > 0 {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                 break;
             };
-            count = match self.inner.blocking_done.wait_timeout(count, left) {
-                Ok((count, _)) => count,
+            admission = match self.inner.blocking_done.wait_timeout(admission, left) {
+                Ok((admission, _)) => admission,
                 Err(poisoned) => poisoned.into_inner().0,
             };
         }
-        *count
+        admission.blocking
     }
 
     /// Waits until every task of the group has ended. Only meaningful once
@@ -251,29 +331,25 @@ pub struct BlockingRegion {
 
 impl Drop for BlockingRegion {
     fn drop(&mut self) {
-        let mut count = lock(&self.context.inner.blocking);
-        *count = count.saturating_sub(1);
-        if *count == 0 {
+        let mut admission = self.context.admission();
+        admission.blocking = admission.blocking.saturating_sub(1);
+        if admission.blocking == 0 {
             self.context.inner.blocking_done.notify_all();
         }
     }
 }
 
-fn lock(count: &Mutex<usize>) -> MutexGuard<'_, usize> {
-    count
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
-    fn runtime() -> tokio::runtime::Runtime {
+    fn runtime(workers: usize, blocking: usize) -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(workers)
+            .max_blocking_threads(blocking)
             .enable_all()
             .build()
             .unwrap()
@@ -281,11 +357,13 @@ mod tests {
 
     #[test]
     fn cancelling_the_root_ends_tasks_and_requests() {
-        let runtime = runtime();
+        let runtime = runtime(2, 8);
         let context = InstanceContext::new(runtime.handle().clone());
-        let background = context.spawn(std::future::pending::<()>());
-        let request = context.spawn_request(context.request_token(), std::future::pending::<()>());
-        let done = context.spawn(async { 7 });
+        let background = context.spawn(std::future::pending::<()>()).unwrap();
+        let request = context
+            .spawn_request(context.request_token(), std::future::pending::<()>())
+            .unwrap();
+        let done = context.spawn(async { 7 }).unwrap();
         assert_eq!(runtime.block_on(done).unwrap(), Some(7));
         assert_eq!(context.tasks(), 2);
         context.cancel();
@@ -293,22 +371,123 @@ mod tests {
         assert_eq!(runtime.block_on(request).unwrap(), None);
         runtime.block_on(context.wait_tasks());
         assert_eq!(context.tasks(), 0);
-        // A closed set refuses nothing, but nothing runs: the future is
-        // dropped at once.
-        let late = context.spawn(async { panic!("must not run") });
-        assert_eq!(runtime.block_on(late).unwrap(), None);
+    }
+
+    #[test]
+    fn the_fence_admits_nothing_after_cancel() {
+        let runtime = runtime(1, 4);
+        let context = InstanceContext::new(runtime.handle().clone());
+        context.cancel();
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        assert_eq!(
+            context
+                .spawn(async move { flag.store(true, Ordering::SeqCst) })
+                .err(),
+            Some(Fenced)
+        );
+        let flag = ran.clone();
+        assert!(context
+            .spawn_blocking(move || flag.store(true, Ordering::SeqCst))
+            .is_err());
+        assert!(context.blocking_region().is_err());
+        assert_eq!(context.block_on(async { 1 }), None);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!ran.load(Ordering::SeqCst), "nothing ran after the fence");
+        assert_eq!((context.tasks(), context.blocking_regions()), (0, 0));
+    }
+
+    #[test]
+    fn admission_racing_cancellation_is_all_or_nothing() {
+        // Many threads admit tasks and blocking jobs while another fences.
+        // Once `cancel` returns, the counts only fall: nothing registers late.
+        for _ in 0..20 {
+            let runtime = runtime(2, 64);
+            let context = InstanceContext::new(runtime.handle().clone());
+            let admitted_after = Arc::new(AtomicUsize::new(0));
+            let fenced = Arc::new(AtomicBool::new(false));
+            let workers: Vec<_> = (0..4)
+                .map(|n| {
+                    let (context, admitted_after, fenced) =
+                        (context.clone(), admitted_after.clone(), fenced.clone());
+                    std::thread::spawn(move || {
+                        for _ in 0..200 {
+                            let was_fenced = fenced.load(Ordering::SeqCst);
+                            let admitted = if n % 2 == 0 {
+                                context.spawn(std::future::pending::<()>()).is_ok()
+                            } else {
+                                context
+                                    .spawn_blocking(|| std::thread::sleep(Duration::from_millis(1)))
+                                    .is_ok()
+                            };
+                            if admitted && was_fenced {
+                                admitted_after.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            std::thread::sleep(Duration::from_micros(200));
+            context.cancel();
+            fenced.store(true, Ordering::SeqCst);
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert_eq!(admitted_after.load(Ordering::SeqCst), 0);
+            runtime.block_on(context.wait_tasks());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            assert_eq!(context.wait_blocking_regions(deadline), 0);
+            assert_eq!(context.tasks(), 0);
+        }
+    }
+
+    #[test]
+    fn a_queued_blocking_job_never_runs_after_cancel() {
+        // One blocking thread: the second job queues behind the first.
+        let runtime = runtime(1, 1);
+        let context = InstanceContext::new(runtime.handle().clone());
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+        let first = context
+            .spawn_blocking(move || {
+                let _ = entered_tx.send(());
+                held.recv().is_ok()
+            })
+            .unwrap();
+        // Counted from admission; wait until it has really started.
+        entered.recv().unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        let queued = context
+            .spawn_blocking(move || flag.store(true, Ordering::SeqCst))
+            .unwrap();
+        assert_eq!(context.blocking_regions(), 2);
+        context.cancel();
+        release.send(()).unwrap();
+        assert_eq!(
+            runtime.block_on(first).unwrap(),
+            Some(true),
+            "started before the fence"
+        );
+        assert_eq!(runtime.block_on(queued).unwrap(), None, "skipped");
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(context.blocking_regions(), 0);
     }
 
     #[test]
     fn a_request_token_cancels_its_request_only() {
-        let runtime = runtime();
+        let runtime = runtime(2, 8);
         let context = InstanceContext::new(runtime.handle().clone());
         let token = context.request_token();
-        let request = context.spawn_request(token.clone(), std::future::pending::<()>());
-        let other = context.spawn_request(context.request_token(), async {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            "done"
-        });
+        let request = context
+            .spawn_request(token.clone(), std::future::pending::<()>())
+            .unwrap();
+        let other = context
+            .spawn_request(context.request_token(), async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                "done"
+            })
+            .unwrap();
         token.cancel();
         assert_eq!(runtime.block_on(request).unwrap(), None);
         assert_eq!(runtime.block_on(other).unwrap(), Some("done"));
@@ -317,20 +496,19 @@ mod tests {
 
     #[test]
     fn a_blocking_region_ends_when_its_request_is_cancelled() {
-        let runtime = runtime();
+        let runtime = runtime(2, 8);
         let context = InstanceContext::new(runtime.handle().clone());
         let token = context.request_token();
         let entered = Arc::new(AtomicBool::new(false));
         let task = {
-            let context = context.clone();
-            let entered = entered.clone();
-            context.clone().spawn_request(token.clone(), async move {
-                // As the synchronous block provider does: block in place,
-                // then block on a future that never finishes by itself.
-                let handle = Handle::current();
-                entered.store(true, Ordering::SeqCst);
-                context.block_in_place(&handle, std::future::pending::<()>())
-            })
+            let (inner, entered) = (context.clone(), entered.clone());
+            context
+                .spawn_request(token.clone(), async move {
+                    // As the synchronous block provider does.
+                    entered.store(true, Ordering::SeqCst);
+                    inner.block_on(std::future::pending::<()>())
+                })
+                .unwrap()
         };
         while !entered.load(Ordering::SeqCst) || context.blocking_regions() == 0 {
             std::thread::sleep(Duration::from_millis(1));
@@ -338,37 +516,50 @@ mod tests {
         token.cancel();
         let deadline = Instant::now() + Duration::from_secs(5);
         assert_eq!(context.wait_blocking_regions(deadline), 0);
-        // The region returned `None`, and the request ended with it.
         assert_eq!(runtime.block_on(task).unwrap(), None);
     }
 
     #[test]
-    fn blocking_jobs_count_until_they_return() {
-        let runtime = runtime();
+    fn off_the_runtime_work_runs_on_it_and_foreign_runtimes_are_refused() {
+        let runtime = runtime(1, 4);
         let context = InstanceContext::new(runtime.handle().clone());
-        let (release, wait) = std::sync::mpsc::channel::<()>();
-        let job = context.spawn_blocking(move || wait.recv().is_ok());
-        assert_eq!(context.blocking_regions(), 1);
-        let soon = Instant::now() + Duration::from_millis(20);
-        assert_eq!(context.wait_blocking_regions(soon), 1, "still running");
-        release.send(()).unwrap();
-        assert!(runtime.block_on(job).unwrap());
+        // A plain thread: the future runs with the group's runtime current.
+        let id = runtime.handle().id();
         assert_eq!(
-            context.wait_blocking_regions(Instant::now() + Duration::from_secs(5)),
-            0
+            context.block_on(async { tokio::runtime::Handle::current().id() }),
+            Some(id)
         );
+        // A plain thread blocked in the group is counted, and cancelled.
+        let blocked = {
+            let context = context.clone();
+            std::thread::spawn(move || context.block_on(std::future::pending::<()>()))
+        };
+        while context.blocking_regions() == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Another runtime's task is refused at once.
+        let foreign = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let inner = context.clone();
+        let refused = foreign
+            .block_on(foreign.spawn(async move { inner.block_on(async { 1 }) }))
+            .unwrap();
+        assert_eq!(refused, None);
+        context.cancel();
+        assert_eq!(blocked.join().unwrap(), None);
+        assert_eq!(context.blocking_regions(), 0);
     }
 
     #[test]
     fn outside_a_request_a_region_observes_the_root() {
-        let runtime = runtime();
+        let runtime = runtime(2, 8);
         let context = InstanceContext::new(runtime.handle().clone());
         let task = {
             let inner = context.clone();
-            runtime.spawn(async move {
-                let handle = Handle::current();
-                inner.block_in_place(&handle, std::future::pending::<()>())
-            })
+            runtime.spawn(async move { inner.block_on(std::future::pending::<()>()) })
         };
         while context.blocking_regions() == 0 {
             std::thread::sleep(Duration::from_millis(1));

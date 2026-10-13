@@ -10,7 +10,7 @@ use freedom_ipfs_core::{
 use freedom_ipfs_namesys::{CloudflareDohResolver, DnsTxtResolver};
 use freedom_ipfs_routing::{Provider, ProviderRoutingClient};
 use freedom_ipfs_store::{CachedProviderRecord, SqliteBlockStore};
-use futures::future::{join_all, BoxFuture, FutureExt, Shared};
+use futures::future::{join_all, BoxFuture, FutureExt, WeakShared};
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use futures::stream::{select_all, FuturesUnordered};
 use futures::StreamExt;
@@ -370,7 +370,11 @@ pub struct HttpRetriever {
     routing: ProviderRoutingClient,
     store: SqliteBlockStore,
     bitswap: Arc<tokio::sync::Mutex<Option<SharedBitswapClient>>>,
-    inflight: Arc<tokio::sync::Mutex<HashMap<Cid, SharedBlockFetch>>>,
+    /// Fetches in flight, by CID. The map holds them weakly: the callers
+    /// awaiting a fetch own it, and the fetch, which holds this retriever,
+    /// doesn't keep itself alive through the map. A fetch whose every caller
+    /// was cancelled is dropped with its last caller.
+    inflight: Arc<tokio::sync::Mutex<HashMap<Cid, WeakBlockFetch>>>,
     successful_bitswap_peers: Arc<tokio::sync::Mutex<HashMap<PeerId, SuccessfulBitswapPeer>>>,
     http_provider_scores: Arc<tokio::sync::Mutex<HashMap<String, HttpProviderScore>>>,
     bitswap_dnsaddr_cache: Arc<tokio::sync::Mutex<SharedDnsaddrCache>>,
@@ -384,7 +388,7 @@ pub struct HttpRetriever {
     instance: Option<InstanceContext>,
 }
 
-type SharedBlockFetch = Shared<BoxFuture<'static, Arc<SharedBlockFetchResult>>>;
+type WeakBlockFetch = WeakShared<BoxFuture<'static, Arc<SharedBlockFetchResult>>>;
 type SharedBlockFetchResult = std::result::Result<(Block, RetrievalSource), String>;
 
 #[derive(Clone, Copy)]
@@ -500,16 +504,25 @@ impl HttpRetriever {
         }
     }
 
-    /// Runs a blocking job: counted as its instance's blocking region, or
-    /// on the ambient runtime's blocking pool without one.
-    fn spawn_blocking_job<F, R>(&self, job: F) -> tokio::task::JoinHandle<R>
+    /// Runs a blocking job and waits for it: counted as its instance's
+    /// blocking region (and skipped or refused once the instance is
+    /// cancelled), or on the ambient runtime's blocking pool without one.
+    async fn run_blocking_job<F, R>(&self, job: F) -> std::result::Result<R, String>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
         match &self.instance {
-            Some(instance) => instance.spawn_blocking(job),
-            None => tokio::task::spawn_blocking(job),
+            Some(instance) => match instance.spawn_blocking(job) {
+                Ok(handle) => handle
+                    .await
+                    .map_err(|err| err.to_string())?
+                    .ok_or_else(|| "cancelled".to_string()),
+                Err(fenced) => Err(fenced.to_string()),
+            },
+            None => tokio::task::spawn_blocking(job)
+                .await
+                .map_err(|err| err.to_string()),
         }
     }
 
@@ -569,7 +582,9 @@ impl HttpRetriever {
     ) -> Result<(Block, RetrievalSource)> {
         let wait_started = Instant::now();
         let mut inflight = self.inflight.lock().await;
-        if let Some(fetch) = inflight.get(&cid).cloned() {
+        // Fetches whose callers are all gone are dropped already; forget them.
+        inflight.retain(|_, fetch| fetch.upgrade().is_some());
+        if let Some(fetch) = inflight.get(&cid).and_then(WeakShared::upgrade) {
             drop(inflight);
             return tokio::select! {
                 result = fetch => {
@@ -619,13 +634,22 @@ impl HttpRetriever {
         }
         .boxed()
         .shared();
-        inflight.insert(cid, fetch.clone());
+        if let Some(weak) = fetch.downgrade() {
+            inflight.insert(cid, weak);
+        }
         let inflight_count = inflight.len();
         drop(inflight);
 
-        let result = fetch.await;
+        let result = fetch.clone().await;
         let mut inflight = self.inflight.lock().await;
-        inflight.remove(&cid);
+        // Only this fetch's entry: a newer one for the CID stays.
+        if inflight
+            .get(&cid)
+            .and_then(WeakShared::upgrade)
+            .is_none_or(|current| current.ptr_eq(&fetch))
+        {
+            inflight.remove(&cid);
+        }
         drop(inflight);
         tracing::info!(
             phase = "block_fetch_coalesced",
@@ -5097,7 +5121,7 @@ impl HttpRetriever {
         let byte_count = bytes.len();
         let store = self.store.clone();
         let (bytes, result) = self
-            .spawn_blocking_job(move || {
+            .run_blocking_job(move || {
                 let result = store.put_block(&cid, &bytes);
                 (bytes, result)
             })
@@ -5304,18 +5328,23 @@ impl FetchingBlockProvider {
         self
     }
 
-    /// Runs a retrieval future from the synchronous provider methods: in a
-    /// blocking region on the current runtime, or on a current-thread
-    /// runtime of its own outside one. With an instance, the region is
-    /// counted and cancellable, and a cancelled one fails as `cancelled`.
+    /// Runs a retrieval future from the synchronous provider methods.
+    ///
+    /// - **With an instance,** always in one of its counted, cancellable
+    ///   blocking regions, and always on its runtime: in place on its own
+    ///   threads, or from a plain thread with its runtime current, so the
+    ///   future's network work never escapes it. From another runtime the
+    ///   call is refused. A cancelled or refused call fails as `cancelled`.
+    /// - **Without one,** as before: in a blocking region on the current
+    ///   runtime, or on a current-thread runtime of its own outside one.
     fn block_on_retrieval<F: Future>(&self, future: F) -> CoreResult<F::Output> {
+        if let Some(instance) = &self.instance {
+            return instance
+                .block_on(future)
+                .ok_or_else(|| CoreError::Storage("cancelled".into()));
+        }
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => match &self.instance {
-                Some(instance) => instance
-                    .block_in_place(&handle, future)
-                    .ok_or_else(|| CoreError::Storage("cancelled".into())),
-                None => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
-            },
+            Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
             Err(_) => {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -11247,6 +11276,80 @@ struct BlockPresence {
     type_pb: i32,
     #[prost(int32, repeated, tag = "4")]
     tokens: Vec<i32>,
+}
+
+#[cfg(test)]
+mod inflight_lifetime_tests {
+    use super::*;
+    use freedom_ipfs_core::{cid_from_data, CODEC_RAW};
+
+    /// A delegated router that accepts and never answers.
+    async fn stalled_router() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        (format!("http://{addr}/routing/v1"), task)
+    }
+
+    async fn entry_alive(retriever: &HttpRetriever, cid: &Cid) -> bool {
+        retriever
+            .inflight
+            .lock()
+            .await
+            .get(cid)
+            .and_then(WeakShared::upgrade)
+            .is_some()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_fetch_releases_the_retriever_and_spares_its_followers() {
+        let (router, router_task) = stalled_router().await;
+        let store = SqliteBlockStore::in_memory(1 << 20).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new(router),
+            store,
+        );
+        let inflight = Arc::downgrade(&retriever.inflight);
+        let cid = cid_from_data(CODEC_RAW, b"never delivered");
+
+        // A leader and a coalesced follower wait on one fetch.
+        let leader = tokio::spawn({
+            let retriever = retriever.clone();
+            async move { retriever.fetch_block_with_source(&cid).await }
+        });
+        while !entry_alive(&retriever, &cid).await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let follower = tokio::spawn({
+            let retriever = retriever.clone();
+            async move { retriever.fetch_block_with_source(&cid).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Cancelling the leader leaves the follower's fetch running.
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+        assert!(
+            entry_alive(&retriever, &cid).await,
+            "the follower still owns it"
+        );
+
+        // Cancelling the follower too drops the fetch and its retriever.
+        follower.abort();
+        assert!(follower.await.unwrap_err().is_cancelled());
+        assert!(!entry_alive(&retriever, &cid).await);
+        drop(retriever);
+        assert!(
+            inflight.upgrade().is_none(),
+            "nothing owns the in-flight map once its owners are gone"
+        );
+        router_task.abort();
+    }
 }
 
 #[cfg(test)]

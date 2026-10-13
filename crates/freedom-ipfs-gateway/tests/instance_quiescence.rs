@@ -219,7 +219,7 @@ fn teardown_leaves_no_socket_thread_task_or_blocking_job() {
                 .await;
             to_bytes(response.into_body(), usize::MAX).await.ok()
         });
-        requests.push((token, handle));
+        requests.push((token, handle.unwrap()));
     }
 
     // Wait until the requests are blocked inside the block provider, with
@@ -252,8 +252,8 @@ fn teardown_leaves_no_socket_thread_task_or_blocking_job() {
     // Teardown.
     let quiescence = instance.shutdown(Duration::from_secs(5));
     assert!(quiescence.reached, "{quiescence:?}");
-    assert_eq!(quiescence.tasks_left, 0);
-    assert_eq!(quiescence.blocking_left, 0);
+    assert!(quiescence.joined && quiescence.drained, "{quiescence:?}");
+    assert_eq!(quiescence.tasks_dropped, 0);
     assert!(quiescence.store_closed);
 
     // What the kernel sees, right away: no socket of the instance, and no
@@ -303,37 +303,148 @@ fn an_idle_instance_shuts_down_at_once() {
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 
-#[test]
-fn a_stuck_blocking_job_fails_quiescence() {
-    // A blocking job that doesn't return in time, as a statement stuck in
-    // SQLite would: the teardown can't prove quiescence, and says so (the
-    // service then exits 70).
+/// An instance with an idle offline node, for the stuck-work cases.
+fn idle_instance(thread_name: &str) -> (freedom_ipfs_gateway::Instance, SqliteBlockStore) {
     let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
-    let instance = OnlineNode::builder(store)
+    let instance = OnlineNode::builder(store.clone())
         .routing_mode(RoutingMode::Offline)
         .build_instance(InstanceConfig {
-            thread_name: "fipfs-stuck".into(),
+            thread_name: thread_name.into(),
             worker_threads: 1,
             max_blocking_threads: 4,
         })
         .unwrap();
+    (instance, store)
+}
+
+fn store_is_open(store: &SqliteBlockStore) -> bool {
+    store.get(&cid_from_data(CODEC_RAW, b"probe")).is_ok()
+}
+
+#[test]
+fn an_untracked_library_blocking_job_holds_quiescence_until_it_ends() {
+    // As a library's own blocking work would (reqwest's getaddrinfo, for
+    // one): a job on the instance's blocking pool that no counter sees.
+    let (instance, store) = idle_instance("fipfs-untracked");
     let (release, stuck) = std::sync::mpsc::channel::<()>();
-    let _job = instance.context().spawn_blocking(move || stuck.recv());
-    wait_for("the stuck job", Duration::from_secs(5), || {
-        instance.context().blocking_regions() == 1
+    let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+    let job = instance.context().handle().spawn_blocking(move || {
+        let _ = entered_tx.send(());
+        stuck.recv().is_ok()
     });
-    let context = instance.context().clone();
+    entered.recv().unwrap();
+    assert_eq!(instance.context().blocking_regions(), 0, "untracked");
+
+    // Nothing proves quiescence while it runs: not a bounded shutdown...
+    let teardown = instance.begin_shutdown(Duration::from_millis(50));
+    assert_eq!(teardown.wait_timeout(Duration::from_millis(700)), None);
+    assert!(!teardown.is_finished());
+    // ...and nothing of the instance is released: the store stays open.
+    assert!(store_is_open(&store));
+    assert!(instance_thread_named("fipfs-untracked"));
+
+    // Once it ends, the join returns, and then the store closes.
+    release.send(()).unwrap();
+    let quiescence = teardown.wait();
+    assert!(quiescence.reached && quiescence.joined, "{quiescence:?}");
+    assert!(
+        quiescence.drained,
+        "the counters were zero all along: {quiescence:?}"
+    );
+    assert!(!store_is_open(&store));
+    assert!(!instance_thread_named("fipfs-untracked"));
+    drop(job);
+}
+
+#[test]
+fn a_bounded_shutdown_reports_unproven_quiescence_while_work_runs() {
+    let (instance, store) = idle_instance("fipfs-bounded");
+    let (release, stuck) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+    let _job = instance.context().handle().spawn_blocking(move || {
+        let _ = entered_tx.send(());
+        stuck.recv().is_ok()
+    });
+    entered.recv().unwrap();
     let started = Instant::now();
     let quiescence = instance.shutdown(Duration::from_millis(300));
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "bounded by its timeout"
     );
-    assert!(!quiescence.reached, "{quiescence:?}");
-    assert_eq!(quiescence.blocking_left, 1);
-    // Once the job returns, the region ends.
+    assert!(!quiescence.reached && !quiescence.joined, "{quiescence:?}");
+    assert!(store_is_open(&store), "nothing released");
+    // The teardown finishes in the background once the job ends.
     release.send(()).unwrap();
-    wait_for("the job to return", Duration::from_secs(5), || {
-        context.blocking_regions() == 0
+    wait_for("the background teardown", Duration::from_secs(5), || {
+        !store_is_open(&store)
     });
+}
+
+fn instance_thread_named(prefix: &str) -> bool {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path().join("comm")).ok())
+        .any(|name| name.trim_end().starts_with(prefix))
+}
+
+#[test]
+fn a_stuck_blocking_job_holds_quiescence_until_it_ends() {
+    // A counted blocking job that doesn't return in time, as a statement
+    // stuck in SQLite would: quiescence is unproven until it ends (the
+    // service exits 70 past its bound).
+    let (instance, store) = idle_instance("fipfs-stuck");
+    let (release, stuck) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+    let _job = instance
+        .context()
+        .spawn_blocking(move || {
+            let _ = entered_tx.send(());
+            stuck.recv()
+        })
+        .unwrap();
+    // Counted from admission; wait until it has really started (a queued
+    // job would be skipped by the cancel).
+    entered.recv().unwrap();
+    assert_eq!(instance.context().blocking_regions(), 1);
+    let context = instance.context().clone();
+    let teardown = instance.begin_shutdown(Duration::from_millis(100));
+    assert_eq!(teardown.wait_timeout(Duration::from_millis(500)), None);
+    assert!(store_is_open(&store));
+    release.send(()).unwrap();
+    let quiescence = teardown.wait();
+    assert!(quiescence.reached, "{quiescence:?}");
+    assert!(!quiescence.drained, "it outlived the drain: {quiescence:?}");
+    assert_eq!(context.blocking_regions(), 0);
+}
+
+#[test]
+fn a_provider_call_from_a_plain_thread_stays_in_the_instance() {
+    // The instance's block provider, called from a thread with no runtime,
+    // while its delegated router never answers: the fetch runs on the
+    // instance's runtime, in a counted region that the teardown cancels and
+    // waits for, so it has ended before quiescence is reported.
+    let router = Server::start(None);
+    let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+    let instance = OnlineNode::builder(store.clone())
+        .routing_mode(RoutingMode::Delegated)
+        .delegated_routers([format!("http://127.0.0.1:{}/routing/v1", router.port)])
+        .build_instance(InstanceConfig {
+            thread_name: "fipfs-plain".into(),
+            worker_threads: 1,
+            max_blocking_threads: 4,
+        })
+        .unwrap();
+    let provider = instance.node().block_provider();
+    let cid = cid_from_data(CODEC_RAW, b"asked from a plain thread");
+    let caller = std::thread::spawn(move || provider.get_block(&cid).map(|_| ()));
+    wait_for("the router's connection", Duration::from_secs(10), || {
+        router.accepted() > 0
+    });
+    assert_eq!(instance.context().blocking_regions(), 1, "counted");
+    let quiescence = instance.shutdown(Duration::from_secs(5));
+    assert!(quiescence.reached, "{quiescence:?}");
+    assert!(caller.is_finished(), "the call ended before quiescence");
+    assert!(caller.join().unwrap().is_err(), "as cancelled");
+    assert!(!store_is_open(&store));
 }
