@@ -29,6 +29,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
+mod node;
+
+pub use node::{delegated_router_endpoints, OnlineNode, OnlineNodeBuilder, RoutingMode};
+
 pub const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 pub const DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT_MS: u64 = 2_000;
 pub const DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);

@@ -3,20 +3,14 @@ use axum::Router;
 use clap::{Parser, ValueEnum};
 use freedom_ipfs_core::parse_cid;
 use freedom_ipfs_gateway::{
-    router_with_provider_and_name_resolver_config, GatewayConfig,
+    delegated_router_endpoints, router_with_provider_and_name_resolver_config, GatewayConfig,
     GatewayHtmlDirectoryPrefetchConfig, GatewayHtmlPrefetchConfig, GatewayHtmlRangeWarmConfig,
-    PersistentNameResolver, DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
-    DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT_MS, DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
+    OnlineNode, PersistentNameResolver, RoutingMode as NodeRoutingMode,
+    DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS, DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT_MS,
+    DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
 };
-use freedom_ipfs_namesys::{
-    CachedNameResolver, CloudflareDohResolver, DefaultNameResolver, DelegatedIpnsResolver,
-    FallbackIpnsResolver, IpnsRecord, IpnsResolver, NamesysError,
-};
-use freedom_ipfs_retrieval::FetchingBlockProvider;
 use freedom_ipfs_routing::{
-    AutoRoutingClient, DelegatedRoutingClient, DhtIpnsResolver, LightDhtClient,
-    ProviderRoutingClient, DEFAULT_DELEGATED_ROUTER, DEFAULT_DHT_QUERY_TIMEOUT,
-    DEFAULT_MAX_DHT_PROVIDERS,
+    DEFAULT_DELEGATED_ROUTER, DEFAULT_DHT_QUERY_TIMEOUT, DEFAULT_MAX_DHT_PROVIDERS,
 };
 use freedom_ipfs_store::SqliteBlockStore;
 use std::fs;
@@ -128,31 +122,21 @@ async fn main() -> Result<()> {
         .with_raw_link_tsize_fast_headers(raw_link_tsize_fast_headers_enabled())
         .with_stream_small_bodies(stream_small_bodies_enabled());
     let router = if start_online_gateway {
-        let delegated_routers = args.delegated_router.clone();
-        let delegated_router_endpoints = delegated_router_endpoints(&delegated_routers);
-        let delegated = delegated_routing_client(delegated_router_endpoints.clone());
-        let dht = light_dht_client(args.dht_query_timeout_secs, args.dht_max_providers);
-        let routing = match args.routing_mode {
-            RoutingMode::Auto => {
-                ProviderRoutingClient::from(AutoRoutingClient::new(delegated, dht.clone()))
-            }
-            RoutingMode::Delegated => ProviderRoutingClient::from(delegated),
-            RoutingMode::LightDht => ProviderRoutingClient::from(dht.clone()),
-            RoutingMode::Offline => ProviderRoutingClient::Offline,
+        // `should_start_online_gateway` leaves only the online modes here.
+        let routing_mode = match args.routing_mode {
+            RoutingMode::Auto => NodeRoutingMode::Auto,
+            RoutingMode::Delegated => NodeRoutingMode::Delegated,
+            RoutingMode::LightDht => NodeRoutingMode::LightDht,
+            RoutingMode::Offline => NodeRoutingMode::Offline,
         };
-        let provider = FetchingBlockProvider::new(store.clone(), routing);
-        let name_resolver = CachedNameResolver::new(PersistentNameResolver::new(
-            DefaultNameResolver::new(
-                CloudflareDohResolver::default(),
-                ipns_resolver(args.routing_mode, delegated_router_endpoints, dht),
-            ),
-            store,
-        ));
-        router_with_provider_and_name_resolver_config(
-            Arc::new(provider),
-            Arc::new(name_resolver),
-            gateway_config,
-        )
+        OnlineNode::builder(store)
+            .routing_mode(routing_mode)
+            .delegated_routers(delegated_router_endpoints(&args.delegated_router))
+            .dht_query_timeout(Duration::from_secs(args.dht_query_timeout_secs))
+            .dht_max_providers(args.dht_max_providers)
+            .gateway_config(gateway_config)
+            .build()
+            .router()
     } else {
         router_with_provider_and_name_resolver_config(
             Arc::new(store.clone()),
@@ -261,53 +245,6 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
-}
-
-fn light_dht_client(dht_query_timeout_secs: u64, dht_max_providers: usize) -> LightDhtClient {
-    LightDhtClient::default()
-        .with_query_timeout(Duration::from_secs(dht_query_timeout_secs))
-        .with_max_providers(dht_max_providers)
-}
-
-fn delegated_routing_client(delegated_routers: Vec<String>) -> DelegatedRoutingClient {
-    DelegatedRoutingClient::with_endpoints(delegated_routers)
-}
-
-fn delegated_router_endpoints(delegated_routers: &str) -> Vec<String> {
-    delegated_routers
-        .split(',')
-        .map(str::trim)
-        .filter(|endpoint| !endpoint.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn ipns_resolver(
-    routing_mode: RoutingMode,
-    delegated_routers: Vec<String>,
-    dht: LightDhtClient,
-) -> Arc<dyn IpnsResolver> {
-    match routing_mode {
-        RoutingMode::Auto => Arc::new(FallbackIpnsResolver::new(
-            DelegatedIpnsResolver::with_endpoints(delegated_routers),
-            DhtIpnsResolver::new(dht),
-        )),
-        RoutingMode::Delegated => {
-            Arc::new(DelegatedIpnsResolver::with_endpoints(delegated_routers))
-        }
-        RoutingMode::LightDht => Arc::new(DhtIpnsResolver::new(dht)),
-        RoutingMode::Offline => Arc::new(OfflineIpnsResolver),
-    }
-}
-
-#[derive(Debug, Clone)]
-struct OfflineIpnsResolver;
-
-#[async_trait::async_trait]
-impl IpnsResolver for OfflineIpnsResolver {
-    async fn resolve_ipns(&self, name: &str) -> freedom_ipfs_namesys::Result<IpnsRecord> {
-        Err(NamesysError::NotFound(name.to_string()))
-    }
 }
 
 #[cfg(test)]
