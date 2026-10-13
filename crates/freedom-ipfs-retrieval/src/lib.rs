@@ -1,3 +1,7 @@
+pub mod instance;
+
+pub use instance::{with_cancellation, CancellationToken, InstanceContext};
+
 use cid::Cid;
 use freedom_ipfs_core::{
     block_data_range, verify_block, Block, BlockProvider, CoreError, Result as CoreResult,
@@ -375,6 +379,9 @@ pub struct HttpRetriever {
     single_http_bitswap_hedge_counts: Arc<tokio::sync::Mutex<HashMap<String, usize>>>,
     http_provider_fetch_limiter: Arc<tokio::sync::Semaphore>,
     http_provider_fetch_limit: usize,
+    /// The owned group this retriever's tasks and blocking jobs belong to;
+    /// `None` spawns them on the ambient runtime, as before.
+    instance: Option<InstanceContext>,
 }
 
 type SharedBlockFetch = Shared<BoxFuture<'static, Arc<SharedBlockFetchResult>>>;
@@ -470,6 +477,39 @@ impl HttpRetriever {
                 http_provider_fetch_limit,
             )),
             http_provider_fetch_limit,
+            instance: None,
+        }
+    }
+
+    /// Makes the retriever's tasks (the shared Bitswap swarm, background
+    /// preconnects) and blocking jobs part of `instance`'s owned group.
+    pub fn with_instance(mut self, instance: InstanceContext) -> Self {
+        self.instance = Some(instance);
+        self
+    }
+
+    /// Spawns a task of the retriever: in its instance's task set, or on
+    /// the ambient runtime without one.
+    fn spawn_task<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        match &self.instance {
+            Some(instance) => drop(instance.spawn(future)),
+            None => drop(tokio::spawn(future)),
+        }
+    }
+
+    /// Runs a blocking job: counted as its instance's blocking region, or
+    /// on the ambient runtime's blocking pool without one.
+    fn spawn_blocking_job<F, R>(&self, job: F) -> tokio::task::JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        match &self.instance {
+            Some(instance) => instance.spawn_blocking(job),
+            None => tokio::task::spawn_blocking(job),
         }
     }
 
@@ -1747,7 +1787,7 @@ impl HttpRetriever {
 
         let retriever = self.clone();
         let providers = providers.to_vec();
-        tokio::spawn(async move {
+        self.spawn_task(async move {
             with_retrieval_request_context(context, async move {
                 let started = Instant::now();
                 let current_context = current_retrieval_request_context();
@@ -4299,7 +4339,7 @@ impl HttpRetriever {
         if let Some(client) = client.as_ref() {
             return Ok(client.clone());
         }
-        let spawned = SharedBitswapClient::spawn().await?;
+        let spawned = SharedBitswapClient::spawn(self.instance.as_ref()).await?;
         *client = Some(spawned.clone());
         Ok(spawned)
     }
@@ -5056,12 +5096,13 @@ impl HttpRetriever {
         let started = Instant::now();
         let byte_count = bytes.len();
         let store = self.store.clone();
-        let (bytes, result) = tokio::task::spawn_blocking(move || {
-            let result = store.put_block(&cid, &bytes);
-            (bytes, result)
-        })
-        .await
-        .map_err(|err| RetrievalError::Bitswap(format!("block store task failed: {err}")))?;
+        let (bytes, result) = self
+            .spawn_blocking_job(move || {
+                let result = store.put_block(&cid, &bytes);
+                (bytes, result)
+            })
+            .await
+            .map_err(|err| RetrievalError::Bitswap(format!("block store task failed: {err}")))?;
         match result {
             Ok(()) => {
                 tracing::info!(
@@ -5238,6 +5279,7 @@ pub struct FetchingBlockProvider {
     store: SqliteBlockStore,
     retriever: HttpRetriever,
     stats: Arc<RetrievalStatsInner>,
+    instance: Option<InstanceContext>,
 }
 
 impl FetchingBlockProvider {
@@ -5247,6 +5289,40 @@ impl FetchingBlockProvider {
             store,
             retriever,
             stats: Arc::new(RetrievalStatsInner::default()),
+            instance: None,
+        }
+    }
+
+    /// Makes the provider part of `instance`'s owned group: each of its
+    /// blocking regions is counted and ends when the current request's token
+    /// (or, outside a request, the instance's root) is cancelled, and its
+    /// retriever's tasks and blocking jobs join the instance's task set.
+    /// Without this, nothing changes.
+    pub fn with_instance(mut self, instance: InstanceContext) -> Self {
+        self.retriever = self.retriever.with_instance(instance.clone());
+        self.instance = Some(instance);
+        self
+    }
+
+    /// Runs a retrieval future from the synchronous provider methods: in a
+    /// blocking region on the current runtime, or on a current-thread
+    /// runtime of its own outside one. With an instance, the region is
+    /// counted and cancellable, and a cancelled one fails as `cancelled`.
+    fn block_on_retrieval<F: Future>(&self, future: F) -> CoreResult<F::Output> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => match &self.instance {
+                Some(instance) => instance
+                    .block_in_place(&handle, future)
+                    .ok_or_else(|| CoreError::Storage("cancelled".into())),
+                None => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
+            },
+            Err(_) => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|err| CoreError::Storage(err.to_string()))?;
+                Ok(runtime.block_on(future))
+            }
         }
     }
 
@@ -5444,24 +5520,10 @@ impl BlockProvider for FetchingBlockProvider {
         );
 
         let context = current_retrieval_request_context();
-        let fetched = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(
-                    self.retriever
-                        .fetch_block_with_source_with_context(cid, context),
-                )
-            }),
-            Err(_) => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|err| CoreError::Storage(err.to_string()))?;
-                runtime.block_on(
-                    self.retriever
-                        .fetch_block_with_source_with_context(cid, context),
-                )
-            }
-        };
+        let fetched = self.block_on_retrieval(
+            self.retriever
+                .fetch_block_with_source_with_context(cid, context),
+        )?;
 
         match fetched {
             Ok((block, source)) => {
@@ -5496,24 +5558,10 @@ impl BlockProvider for FetchingBlockProvider {
         );
 
         let context = current_retrieval_request_context();
-        let fetched = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(
-                    self.retriever
-                        .fetch_block_with_source_with_context(cid, context),
-                )
-            }),
-            Err(_) => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|err| CoreError::Storage(err.to_string()))?;
-                runtime.block_on(
-                    self.retriever
-                        .fetch_block_with_source_with_context(cid, context),
-                )
-            }
-        };
+        let fetched = self.block_on_retrieval(
+            self.retriever
+                .fetch_block_with_source_with_context(cid, context),
+        )?;
 
         match fetched {
             Ok((block, source)) => {
@@ -5531,18 +5579,7 @@ impl BlockProvider for FetchingBlockProvider {
                 .map(|(cid, start, end)| self.get_block_range(cid, *start, *end))
                 .collect();
         }
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(self.get_block_ranges_async(ranges.to_vec()))
-            }),
-            Err(_) => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|err| CoreError::Storage(err.to_string()))?;
-                runtime.block_on(self.get_block_ranges_async(ranges.to_vec()))
-            }
-        }
+        self.block_on_retrieval(self.get_block_ranges_async(ranges.to_vec()))?
     }
 
     fn retain_block(&self, cid: &Cid) -> CoreResult<()> {
@@ -7382,12 +7419,19 @@ struct ConnectionErrorBackoff {
 }
 
 impl SharedBitswapClient {
-    async fn spawn() -> Result<Self> {
+    /// Builds the shared swarm and spawns its task: in `instance`'s task
+    /// set, so the instance's cancellation ends it and drops the swarm and
+    /// its connections, or on the ambient runtime without one.
+    async fn spawn(instance: Option<&InstanceContext>) -> Result<Self> {
         let swarm = build_bitswap_swarm().await?;
         let mut control = swarm.behaviour().stream.new_control();
         let incoming = accept_bitswap_streams(&mut control)?;
         let (commands, receiver) = mpsc::channel(64);
-        tokio::spawn(run_shared_bitswap_swarm(swarm, control, incoming, receiver));
+        let task = run_shared_bitswap_swarm(swarm, control, incoming, receiver);
+        match instance {
+            Some(instance) => drop(instance.spawn(task)),
+            None => drop(tokio::spawn(task)),
+        }
         Ok(Self { commands })
     }
 
@@ -12354,7 +12398,7 @@ mod bitswap_tests {
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
         let (peer_id, addr, swarm_task, stream_task, want_seen) =
             spawn_bitswap_peer_waiting_for_stream_close(cid).await;
-        let client = SharedBitswapClient::spawn().await.unwrap();
+        let client = SharedBitswapClient::spawn(None).await.unwrap();
         let fetch_task = tokio::spawn(async move {
             client
                 .fetch(
@@ -12698,7 +12742,7 @@ mod bitswap_tests {
                 (second, second_data.to_vec()),
             ])
             .await;
-        let client = SharedBitswapClient::spawn().await.unwrap();
+        let client = SharedBitswapClient::spawn(None).await.unwrap();
 
         let result = client
             .fetch_many(
@@ -12739,7 +12783,7 @@ mod bitswap_tests {
                 (second, second_data.to_vec()),
             ])
             .await;
-        let client = SharedBitswapClient::spawn().await.unwrap();
+        let client = SharedBitswapClient::spawn(None).await.unwrap();
 
         let result = client
             .fetch_many(
@@ -12826,6 +12870,7 @@ mod bitswap_tests {
             store: store.clone(),
             retriever,
             stats: Arc::new(RetrievalStatsInner::default()),
+            instance: None,
         };
 
         let ranges = vec![(first, 1, 5), (second, 2, 7)];
@@ -12848,7 +12893,7 @@ mod bitswap_tests {
 
     #[tokio::test]
     async fn shared_bitswap_client_fetch_many_rejects_empty_batch() {
-        let client = SharedBitswapClient::spawn().await.unwrap();
+        let client = SharedBitswapClient::spawn(None).await.unwrap();
         let err = client.fetch_many(Vec::new(), Vec::new()).await.unwrap_err();
 
         assert!(

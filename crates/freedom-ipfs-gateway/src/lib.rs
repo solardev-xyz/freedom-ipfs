@@ -31,7 +31,11 @@ use tracing::Instrument;
 
 mod node;
 
-pub use node::{delegated_router_endpoints, OnlineNode, OnlineNodeBuilder, RoutingMode};
+pub use freedom_ipfs_retrieval::{with_cancellation, CancellationToken, InstanceContext};
+pub use node::{
+    delegated_router_endpoints, Instance, InstanceConfig, OnlineNode, OnlineNodeBuilder,
+    Quiescence, RoutingMode,
+};
 
 pub const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 pub const DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT_MS: u64 = 2_000;

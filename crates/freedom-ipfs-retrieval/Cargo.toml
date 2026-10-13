@@ -21,6 +21,7 @@ prost.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 unsigned-varint.workspace = true
 url.workspace = true
