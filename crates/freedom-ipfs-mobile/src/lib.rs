@@ -1,7 +1,8 @@
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
-use freedom_ipfs_core::{parse_cid, BlockProvider};
+use axum::http::HeaderMap;
+use freedom_ipfs_core::BlockProvider;
 use freedom_ipfs_gateway::{
-    delegated_router_endpoints, GatewayCore, GatewayCoreRequest, OnlineNode, RoutingMode,
+    delegated_router_endpoints, normalize_content_path, parse_native_request_json, GatewayCore,
+    GatewayCoreRequest, OnlineNode, RoutingMode,
 };
 use freedom_ipfs_namesys::NameResolver;
 use freedom_ipfs_retrieval::FetchingBlockProvider;
@@ -49,9 +50,6 @@ const NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const NODE_FREE_STORE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROGRESS_EVENTS: usize = 512;
 const NATIVE_BODY_CHANNEL_CAPACITY: usize = 2;
-const X_FREEDOM_REQUEST_ID: &str = "X-Freedom-Request-ID";
-const X_FREEDOM_PARENT_REQUEST_ID: &str = "X-Freedom-Parent-Request-ID";
-const X_FREEDOM_TOP_LEVEL_PATH: &str = "X-Freedom-Top-Level-Path";
 
 const FREEDOM_IPFS_GATEWAY_READ_PENDING: u32 = 0;
 const FREEDOM_IPFS_GATEWAY_READ_BYTES: u32 = 1;
@@ -505,16 +503,6 @@ struct NativeGatewayHeader {
 struct NativeGatewayErrorJson {
     code: String,
     message: String,
-}
-
-#[derive(Deserialize)]
-struct NativeGatewayStartRequest {
-    method: Option<String>,
-    path: String,
-    headers: Option<Vec<NativeGatewayHeader>>,
-    request_id: Option<u64>,
-    parent_request_id: Option<u64>,
-    top_level_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2292,9 +2280,9 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_start(
         Ok(request_json) => request_json,
         Err(_) => return 0,
     };
-    let parsed = match parse_native_gateway_start_request(request_json) {
-        Some(parsed) => parsed,
-        None => return 0,
+    let parsed = match parse_native_request_json(request_json) {
+        Ok(parsed) => parsed,
+        Err(_) => return 0,
     };
     let handle = node.next_native_request_id.fetch_add(1, Ordering::Relaxed);
     if handle == 0 {
@@ -2530,89 +2518,6 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_free(
     node.native_gateway_events
         .push(request_handle, FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED);
     true
-}
-
-struct ParsedNativeGatewayRequest {
-    request: GatewayCoreRequest,
-    method_label: String,
-    rendered_path: String,
-    namespace_label: String,
-    request_id: Option<u64>,
-    parent_request_id: Option<u64>,
-    top_level_path: Option<String>,
-}
-
-fn parse_native_gateway_start_request(request_json: &str) -> Option<ParsedNativeGatewayRequest> {
-    let request: NativeGatewayStartRequest = serde_json::from_str(request_json).ok()?;
-    let method_label = request.method.unwrap_or_else(|| "GET".to_string());
-    let method = match method_label.to_ascii_uppercase().as_str() {
-        "GET" => Method::GET,
-        "HEAD" => Method::HEAD,
-        _ => return None,
-    };
-    let path = normalize_gateway_request_path(&request.path)?;
-    let (namespace, path_without_namespace, rendered_path) = split_gateway_namespace_path(&path)?;
-    let mut headers = HeaderMap::new();
-    if let Some(request_headers) = request.headers {
-        for header in request_headers {
-            insert_native_header(&mut headers, &header.name, &header.value)?;
-        }
-    }
-    if let Some(request_id) = request.request_id {
-        insert_native_header(&mut headers, X_FREEDOM_REQUEST_ID, &request_id.to_string())?;
-    }
-    if let Some(parent_request_id) = request.parent_request_id {
-        insert_native_header(
-            &mut headers,
-            X_FREEDOM_PARENT_REQUEST_ID,
-            &parent_request_id.to_string(),
-        )?;
-    }
-    if let Some(top_level_path) = request
-        .top_level_path
-        .as_ref()
-        .filter(|top_level_path| !top_level_path.is_empty())
-    {
-        insert_native_header(&mut headers, X_FREEDOM_TOP_LEVEL_PATH, top_level_path)?;
-    }
-    let gateway_request = match namespace {
-        "ipfs" => GatewayCoreRequest::ipfs(path_without_namespace, method, headers),
-        "ipns" => GatewayCoreRequest::ipns(path_without_namespace, method, headers),
-        _ => return None,
-    };
-    Some(ParsedNativeGatewayRequest {
-        request: gateway_request,
-        method_label: method_label.to_ascii_uppercase(),
-        rendered_path,
-        namespace_label: namespace.to_string(),
-        request_id: request.request_id,
-        parent_request_id: request.parent_request_id,
-        top_level_path: request.top_level_path,
-    })
-}
-
-fn normalize_gateway_request_path(path: &str) -> Option<String> {
-    let path = normalize_preload_path(path)?;
-    let end = path.find(['?', '#']).unwrap_or(path.len());
-    let path = &path[..end];
-    (!path.is_empty()).then(|| path.to_string())
-}
-
-fn split_gateway_namespace_path(path: &str) -> Option<(&'static str, String, String)> {
-    if let Some(path) = path.strip_prefix("/ipfs/") {
-        return (!path.is_empty()).then(|| ("ipfs", path.to_string(), format!("/ipfs/{path}")));
-    }
-    if let Some(path) = path.strip_prefix("/ipns/") {
-        return (!path.is_empty()).then(|| ("ipns", path.to_string(), format!("/ipns/{path}")));
-    }
-    None
-}
-
-fn insert_native_header(headers: &mut HeaderMap, name: &str, value: &str) -> Option<()> {
-    let name = HeaderName::from_bytes(name.as_bytes()).ok()?;
-    let value = HeaderValue::from_str(value).ok()?;
-    headers.insert(name, value);
-    Some(())
 }
 
 async fn run_native_gateway_request(task: NativeGatewayTask) {
@@ -3274,23 +3179,7 @@ fn cache_only_gateway_core(store: SqliteBlockStore) -> GatewayCore {
 }
 
 fn normalize_preload_path(path: &str) -> Option<String> {
-    let path = path.trim();
-    if path.starts_with("/ipfs/") || path.starts_with("/ipns/") {
-        return Some(path.to_string());
-    }
-    if let Some(rest) = path.strip_prefix("ipfs://") {
-        let rest = rest.trim_start_matches('/');
-        if !rest.is_empty() {
-            return Some(format!("/ipfs/{rest}"));
-        }
-    }
-    if let Some(rest) = path.strip_prefix("ipns://") {
-        let rest = rest.trim_start_matches('/');
-        if !rest.is_empty() {
-            return Some(format!("/ipns/{rest}"));
-        }
-    }
-    parse_cid(path).ok().map(|cid| format!("/ipfs/{cid}"))
+    normalize_content_path(path)
 }
 
 #[cfg(test)]

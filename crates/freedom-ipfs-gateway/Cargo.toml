@@ -22,6 +22,8 @@ freedom-ipfs-unixfs.workspace = true
 futures.workspace = true
 http.workspace = true
 mime_guess.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -29,6 +31,4 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 prost.workspace = true
 reqwest.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true
