@@ -7,11 +7,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytes.workspace = true
 cid.workspace = true
 multihash.workspace = true
 multihash-codetable.workspace = true
 thiserror.workspace = true
+# Only the semaphore behind the memory budget, and the timer for a
+# reservation's deadline.
+tokio = { version = "1", default-features = false, features = ["sync", "time"] }
 unsigned-varint.workspace = true
 
 [dev-dependencies]
 data-encoding.workspace = true
+tokio.workspace = true

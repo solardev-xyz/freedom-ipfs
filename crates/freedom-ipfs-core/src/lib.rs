@@ -5,6 +5,11 @@ use std::io::Cursor;
 use thiserror::Error;
 
 pub mod build_info;
+pub mod memory;
+
+pub use memory::{
+    BudgetError, ChargedBytes, FixedPool, HeldBytes, MemoryBudget, Reservation, ReservedVec,
+};
 
 pub const CODEC_DAG_PB: u64 = 0x70;
 pub const CODEC_RAW: u64 = 0x55;
@@ -30,24 +35,40 @@ pub enum CoreError {
     InvalidCar(String),
     #[error("storage error: {0}")]
     Storage(String),
+    /// Memory for the work could not be reserved: a host maps it to busy.
+    #[error("memory budget: {0}")]
+    MemoryBudget(#[from] BudgetError),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
 
+/// A block: its CID and its bytes. The bytes are [`ChargedBytes`], so every
+/// clone shares one allocation and the memory charges that pay for it, which
+/// go when the last clone is dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     cid: Cid,
-    data: Vec<u8>,
+    data: ChargedBytes,
 }
 
 impl Block {
     pub fn new(cid: Cid, data: Vec<u8>) -> Result<Self> {
         verify_block(&cid, &data)?;
-        Ok(Self { cid, data })
+        Ok(Self::unchecked(cid, data))
     }
 
     pub fn unchecked(cid: Cid, data: Vec<u8>) -> Self {
+        Self::unchecked_charged(cid, ChargedBytes::from_vec(data))
+    }
+
+    /// A block over bytes that may carry memory charges, unverified.
+    pub fn unchecked_charged(cid: Cid, data: ChargedBytes) -> Self {
         Self { cid, data }
+    }
+
+    /// The block's bytes, with their allocation and charges.
+    pub fn charged(&self) -> &ChargedBytes {
+        &self.data
     }
 
     pub fn cid(&self) -> &Cid {
@@ -62,8 +83,9 @@ impl Block {
         &self.data
     }
 
+    /// The CID and a copy of the bytes.
     pub fn into_parts(self) -> (Cid, Vec<u8>) {
-        (self.cid, self.data)
+        (self.cid, self.data.to_vec())
     }
 }
 

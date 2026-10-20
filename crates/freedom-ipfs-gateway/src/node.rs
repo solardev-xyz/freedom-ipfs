@@ -46,7 +46,8 @@ use freedom_ipfs_namesys::{
 };
 use freedom_ipfs_retrieval::instance::Fenced;
 use freedom_ipfs_retrieval::{
-    BackgroundQueue, CancellationToken, FetchingBlockProvider, InstanceContext, SharedLimits,
+    BackgroundQueue, CancellationToken, FetchingBlockProvider, InstanceContext, MemoryBudget,
+    SharedLimits,
 };
 use freedom_ipfs_routing::{
     AutoRoutingClient, DelegatedRoutingClient, DhtIpnsResolver, LightDhtClient,
@@ -80,6 +81,7 @@ pub struct OnlineNodeBuilder {
     dht_max_providers: Option<usize>,
     gateway_config: GatewayConfig,
     shared_limits: Option<SharedLimits>,
+    memory_budget: Option<MemoryBudget>,
 }
 
 impl OnlineNodeBuilder {
@@ -129,6 +131,20 @@ impl OnlineNodeBuilder {
         self
     }
 
+    /// A process-wide memory budget the node shares with every other node
+    /// built with clones of `budget` (design 0007, "Budgets"): every receive
+    /// buffer of its fetches reserves from it before it is allocated, and
+    /// the block keeps the charge until its last owner drops it. Request
+    /// work waits for memory; background work fails at once. Unless set,
+    /// the node reserves nothing.
+    ///
+    /// The fixed reservations are the host's to make: the store's hot cache
+    /// reports its fixed capacity ([`SqliteBlockStore::hot_cache_capacity`]).
+    pub fn memory_budget(mut self, budget: MemoryBudget) -> Self {
+        self.memory_budget = Some(budget);
+        self
+    }
+
     /// Wires the node. This opens no socket and starts no task.
     pub fn build(self) -> OnlineNode {
         self.build_with(None)
@@ -164,6 +180,7 @@ impl OnlineNodeBuilder {
             dht_max_providers,
             gateway_config,
             shared_limits,
+            memory_budget,
         } = self;
         let routing_stats = RoutingStatsHandle::default();
         // The node's background queue, shared by its retriever and by every
@@ -225,6 +242,9 @@ impl OnlineNodeBuilder {
         if let Some(limits) = &shared_limits {
             provider = provider.with_shared_limits(limits.clone());
         }
+        if let Some(budget) = &memory_budget {
+            provider = provider.with_memory_budget(budget.clone());
+        }
         let block_provider: Arc<dyn BlockProvider> = Arc::new(provider.clone());
         OnlineNode {
             store,
@@ -237,6 +257,7 @@ impl OnlineNodeBuilder {
             instance,
             background,
             shared_limits,
+            memory_budget,
         }
     }
 }
@@ -257,6 +278,7 @@ pub struct OnlineNode {
     /// Its background queue, shared by its retriever and its gateways.
     background: BackgroundQueue,
     shared_limits: Option<SharedLimits>,
+    memory_budget: Option<MemoryBudget>,
 }
 
 impl OnlineNode {
@@ -272,6 +294,7 @@ impl OnlineNode {
             dht_max_providers: None,
             gateway_config: GatewayConfig::default(),
             shared_limits: None,
+            memory_budget: None,
         }
     }
 
@@ -349,6 +372,11 @@ impl OnlineNode {
     /// The process-wide limits it was built with, if any.
     pub fn shared_limits(&self) -> Option<&SharedLimits> {
         self.shared_limits.as_ref()
+    }
+
+    /// The memory budget it was built with, if any.
+    pub fn memory_budget(&self) -> Option<&MemoryBudget> {
+        self.memory_budget.as_ref()
     }
 }
 
@@ -828,6 +856,7 @@ mod tests {
         assert_eq!(builder.dht_query_timeout, None);
         assert_eq!(builder.dht_max_providers, None);
         assert!(builder.shared_limits.is_none(), "no shared limits");
+        assert!(builder.memory_budget.is_none(), "no memory budget");
         let config = GatewayConfig::default();
         assert_eq!(
             builder.gateway_config.max_concurrent_requests(),
@@ -1068,6 +1097,48 @@ mod tests {
             let quiescence = instance.shutdown(Duration::from_secs(5));
             assert!(quiescence.reached, "{quiescence:?}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_short_of_memory_past_its_deadline_is_busy() {
+        let data = b"a block behind a full memory budget".to_vec();
+        let cid = cid_from_data(CODEC_RAW, &data);
+        let unused = cid_from_data(CODEC_RAW, b"never held");
+        let provider = HeldProvider::spawn(vec![(cid, data.clone())], unused).await;
+        let store = SqliteBlockStore::in_memory(1 << 20).unwrap();
+        store
+            .put_provider_records(&cid, &[provider.record()], Duration::from_secs(60))
+            .unwrap();
+        let budget = MemoryBudget::new(8 << 20);
+        let node = OnlineNode::builder(store)
+            .routing_mode(RoutingMode::Offline)
+            .memory_budget(budget.clone())
+            .build();
+        assert!(node.memory_budget().is_some());
+        let full = budget.try_reserve(budget.limit()).unwrap();
+
+        // Its host's memory deadline passes: busy, as the memory budget's.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        let response = crate::with_memory_wait(
+            crate::MemoryWait::until(deadline),
+            node.gateway_core().handle(GatewayCoreRequest::ipfs(
+                cid.to_string(),
+                Method::GET,
+                HeaderMap::new(),
+            )),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get("x-freedom-ipfs-error-code").unwrap(),
+            "memory_budget"
+        );
+        assert!(!provider.saw(&cid), "nothing was asked for");
+
+        // With memory, the same request is served.
+        drop(full);
+        let (status, body) = get(&node.gateway_core(), &cid.to_string()).await;
+        assert_eq!((status, body), (StatusCode::OK, data));
     }
 
     #[test]

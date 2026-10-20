@@ -1,8 +1,15 @@
 pub mod instance;
 pub mod limits;
+pub mod memory;
 
 pub use instance::{with_cancellation, CancellationToken, InstanceContext};
 pub use limits::{BackgroundQueue, LimitSizes, SharedLimits};
+pub use memory::{
+    current_memory_wait, enter_memory_wait, with_memory_wait, BudgetError, ChargedBytes,
+    MemoryBudget, MemoryWait, MemoryWaitGuard, Reservation,
+};
+
+use memory::FetchMemory;
 
 use limits::{
     ConnectionSlotWaits, HeldPermits, SharedConnectionLimit, SharedConnectionLimitExceeded,
@@ -11,8 +18,8 @@ use limits::{
 
 use cid::Cid;
 use freedom_ipfs_core::{
-    block_data_range, verify_block, Block, BlockProvider, CoreError, Result as CoreResult,
-    CODEC_DAG_PB, DEFAULT_MAX_BLOCK_SIZE, HASH_IDENTITY, HASH_SHA2_256,
+    block_data_range, verify_block, Block, BlockProvider, CoreError, ReservedVec,
+    Result as CoreResult, CODEC_DAG_PB, DEFAULT_MAX_BLOCK_SIZE, HASH_IDENTITY, HASH_SHA2_256,
 };
 use freedom_ipfs_namesys::{CloudflareDohResolver, DnsTxtResolver};
 use freedom_ipfs_routing::{Provider, ProviderRoutingClient};
@@ -287,6 +294,8 @@ const MAX_BITSWAP_FAILURE_DETAILS: usize = 8;
 const MAX_RECORDED_DIAL_ERRORS_PER_PEER: usize = 6;
 const MAX_INFLIGHT_BLOCK_FETCHES: usize = 256;
 const BLOCK_FETCH_COALESCE_HEDGE_AFTER: Duration = Duration::from_secs(8);
+/// The largest Bitswap message read: a maximum-size block and its framing.
+const BITSWAP_MAX_MESSAGE_SIZE: usize = DEFAULT_MAX_BLOCK_SIZE + 4096;
 const CID_VERSION_0: u64 = 0;
 const CID_VERSION_1: u64 = 1;
 const BLOCK_PRESENCE_HAVE: i32 = 0;
@@ -318,6 +327,20 @@ pub enum RetrievalError {
     NoHttpProviders,
     #[error("no Bitswap-capable providers found")]
     NoBitswapProviders,
+    /// Memory for the fetch could not be reserved: a host maps it to busy.
+    #[error("memory budget: {0}")]
+    MemoryBudget(#[from] BudgetError),
+}
+
+impl RetrievalError {
+    /// The error as the block provider reports it: a memory refusal stays
+    /// one, so the host can tell it from a failed retrieval.
+    fn into_core(self) -> CoreError {
+        match self {
+            Self::MemoryBudget(refusal) => CoreError::MemoryBudget(refusal),
+            other => CoreError::Storage(other.to_string()),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, RetrievalError>;
@@ -392,15 +415,48 @@ pub struct HttpRetriever {
     /// The owned group this retriever's tasks and blocking jobs belong to;
     /// `None` spawns them on the ambient runtime, as before.
     instance: Option<InstanceContext>,
-    /// The process-wide limits its fetches, HTTP provider requests and
-    /// Bitswap connections count against; `None` adds no limit.
-    limits: Option<SharedLimits>,
+    /// What it counts against, shared by its clones (one field, so the
+    /// retriever, which the mobile node embeds, keeps its size); `None`
+    /// counts against nothing.
+    accounting: Option<Arc<RetrieverAccounting>>,
     /// Its instance's background queue: work no request awaits.
     background: BackgroundQueue,
 }
 
+/// The process-wide budgets a retriever counts against.
+#[derive(Clone, Default)]
+struct RetrieverAccounting {
+    /// The limits its fetches, HTTP provider requests and Bitswap
+    /// connections count against; `None` adds no limit.
+    limits: Option<SharedLimits>,
+    /// The memory budget its receive buffers reserve from; `None` reserves
+    /// nothing.
+    memory: Option<MemoryBudget>,
+}
+
 type WeakBlockFetch = WeakShared<BoxFuture<'static, Arc<SharedBlockFetchResult>>>;
-type SharedBlockFetchResult = std::result::Result<(Block, RetrievalSource), String>;
+type SharedBlockFetchResult = std::result::Result<(Block, RetrievalSource), SharedFetchError>;
+
+/// A coalesced fetch's failure, as each of its callers gets it: a memory
+/// refusal stays one.
+#[derive(Debug)]
+struct SharedFetchError {
+    message: String,
+    memory: Option<BudgetError>,
+}
+
+impl From<RetrievalError> for SharedFetchError {
+    fn from(err: RetrievalError) -> Self {
+        let memory = match &err {
+            RetrievalError::MemoryBudget(refusal) => Some(*refusal),
+            _ => None,
+        };
+        Self {
+            message: err.to_string(),
+            memory,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct MissingBlockRange {
@@ -488,9 +544,24 @@ impl HttpRetriever {
             )),
             http_provider_fetch_limit,
             instance: None,
-            limits: None,
+            accounting: None,
             background: BackgroundQueue::default(),
         }
+    }
+
+    fn limits(&self) -> Option<&SharedLimits> {
+        self.accounting.as_ref()?.limits.as_ref()
+    }
+
+    fn memory(&self) -> Option<&MemoryBudget> {
+        self.accounting.as_ref()?.memory.as_ref()
+    }
+
+    fn with_accounting(mut self, change: impl FnOnce(&mut RetrieverAccounting)) -> Self {
+        let mut accounting = self.accounting.as_deref().cloned().unwrap_or_default();
+        change(&mut accounting);
+        self.accounting = Some(Arc::new(accounting));
+        self
     }
 
     /// Makes the retriever's tasks (the shared Bitswap swarm, background
@@ -504,9 +575,8 @@ impl HttpRetriever {
     /// Bitswap connections against `limits`, shared with every other node
     /// built with them (see [`limits`]). Without this, it has none of these
     /// limits.
-    pub fn with_shared_limits(mut self, limits: SharedLimits) -> Self {
-        self.limits = Some(limits);
-        self
+    pub fn with_shared_limits(self, limits: SharedLimits) -> Self {
+        self.with_accounting(|accounting| accounting.limits = Some(limits))
     }
 
     /// Puts the retriever's background work in `queue`, its instance's, in
@@ -519,6 +589,28 @@ impl HttpRetriever {
     /// The queue its background work goes through.
     pub fn background_queue(&self) -> &BackgroundQueue {
         &self.background
+    }
+
+    /// Reserves every receive buffer of the retriever's fetches from
+    /// `budget`, shared with every other node built with it (see
+    /// [`memory`]). Without this, it reserves nothing.
+    pub fn with_memory_budget(self, budget: MemoryBudget) -> Self {
+        self.with_accounting(|accounting| accounting.memory = Some(budget))
+    }
+
+    /// Runs `future`, a fetch, with the retriever's memory: its receive
+    /// buffers reserve from the budget, and if a refusal is why it failed,
+    /// it fails as [`RetrievalError::MemoryBudget`].
+    async fn with_fetch_memory<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
+        let Some(budget) = self.memory() else {
+            return future.await;
+        };
+        let memory = FetchMemory::new(budget.clone());
+        let result = FetchMemory::scope(Some(memory.clone()), future).await;
+        match (result, memory.refusal()) {
+            (Err(_), Some(refusal)) => Err(RetrievalError::MemoryBudget(refusal)),
+            (result, _) => result,
+        }
     }
 
     /// Spawns background work of the retriever, work no request awaits:
@@ -539,10 +631,11 @@ impl HttpRetriever {
             );
             return;
         };
-        let future = async move {
+        // Background work never waits for memory.
+        let future = with_memory_wait(MemoryWait::Never, async move {
             let _slot = slot;
             future.await;
-        };
+        });
         match &self.instance {
             Some(instance) => drop(instance.spawn(future)),
             None => drop(tokio::spawn(future)),
@@ -561,7 +654,7 @@ impl HttpRetriever {
         count: usize,
         future: F,
     ) -> Option<F::Output> {
-        let Some(limits) = &self.limits else {
+        let Some(limits) = self.limits() else {
             return Some(future.await);
         };
         let started = Instant::now();
@@ -581,8 +674,7 @@ impl HttpRetriever {
     /// The most blocks one fetch may ask for at once: the block-fetch limit
     /// of the shared limits, if any. A Bitswap batch is split to fit it.
     fn block_fetch_batch_limit(&self) -> usize {
-        self.limits
-            .as_ref()
+        self.limits()
             .map_or(usize::MAX, |limits| limits.sizes().block_fetches)
     }
 
@@ -677,7 +769,15 @@ impl HttpRetriever {
                         hedged = false,
                         elapsed_ms = wait_started.elapsed().as_millis()
                     );
-                    shared_block_fetch_result(result)
+                    match shared_block_fetch_result(result) {
+                        // The fetch reserved as its leader's work does; one
+                        // that couldn't wait for memory leaves the follower
+                        // to fetch as its own work does.
+                        Err(RetrievalError::MemoryBudget(_)) => {
+                            self.fetch_block_uncached_with_source(&cid, context).await
+                        }
+                        result => result,
+                    }
                 }
                 _ = tokio::time::sleep(BLOCK_FETCH_COALESCE_HEDGE_AFTER) => {
                     tracing::info!(
@@ -706,12 +806,17 @@ impl HttpRetriever {
         }
 
         let retriever = self.clone();
+        // The shared fetch reserves memory as its leader's work does,
+        // whichever caller happens to poll it.
+        let memory_wait = current_memory_wait();
         let fetch = async move {
             Arc::new(
-                retriever
-                    .fetch_block_uncached_with_source(&cid, context)
-                    .await
-                    .map_err(|err| err.to_string()),
+                with_memory_wait(
+                    memory_wait,
+                    retriever.fetch_block_uncached_with_source(&cid, context),
+                )
+                .await
+                .map_err(SharedFetchError::from),
             )
         }
         .boxed()
@@ -756,7 +861,8 @@ impl HttpRetriever {
     ) -> Result<(Block, RetrievalSource)> {
         // Boxed, as each fetch below is: the future is large, and moving it
         // into the permit's scope by value would multiply its size.
-        let fetch = Box::pin(self.fetch_block_uncached_admitted(cid, context));
+        let fetch =
+            Box::pin(self.with_fetch_memory(self.fetch_block_uncached_admitted(cid, context)));
         self.with_block_fetch_permits(1, fetch)
             .await
             .unwrap_or_else(unadmitted_single_block_fetch)
@@ -1220,6 +1326,11 @@ impl HttpRetriever {
                 );
                 Err(err)
             }
+            // Memory refused is no fault of the providers': nothing to
+            // refresh or retry, and nothing to cache about them.
+            Err(err) if FetchMemory::current().is_some_and(|memory| memory.refusal().is_some()) => {
+                Err(err)
+            }
             Err(err) if should_refresh_providers_after_failure(&err) => {
                 let timeout_peer_count = bitswap_timeout_peers(&err).len();
                 let connection_timeout_peer_count = bitswap_connection_timeout_peers(&err).len();
@@ -1379,7 +1490,9 @@ impl HttpRetriever {
         providers: &[Provider],
         context: Option<RetrievalRequestContext>,
     ) -> Result<(Block, RetrievalSource)> {
-        let fetch = Box::pin(self.fetch_from_providers_admitted(cid, providers, context));
+        let fetch = Box::pin(
+            self.with_fetch_memory(self.fetch_from_providers_admitted(cid, providers, context)),
+        );
         self.with_block_fetch_permits(1, fetch)
             .await
             .unwrap_or_else(unadmitted_single_block_fetch)
@@ -3518,7 +3631,7 @@ impl HttpRetriever {
         // permit is never held while waiting for an instance's own, and is
         // held as long as that one is, through the body read, the
         // verification and the store put.
-        let held = match &self.limits {
+        let held = match self.limits() {
             Some(limits) => {
                 cancel_trace.set_stage("waiting_shared_limiter");
                 let shared_started = Instant::now();
@@ -3575,11 +3688,14 @@ impl HttpRetriever {
                     error = %err,
                     elapsed_ms = started.elapsed().as_millis()
                 );
-                let _ = self.store.mark_bad_provider(
-                    base.as_str(),
-                    &err.to_string(),
-                    BAD_HTTP_PROVIDER_TTL,
-                );
+                // Memory refused is no fault of the provider's.
+                if !matches!(err, RetrievalError::MemoryBudget(_)) {
+                    let _ = self.store.mark_bad_provider(
+                        base.as_str(),
+                        &err.to_string(),
+                        BAD_HTTP_PROVIDER_TTL,
+                    );
+                }
                 Err(err)
             }
         }
@@ -3791,10 +3907,20 @@ impl HttpRetriever {
         base: &Url,
         cancel_trace: &mut HttpProviderCandidateCancelTrace,
     ) -> Result<(Block, HttpProviderResponseStats)> {
-        let started = Instant::now();
         let url = base
             .join(&format!("/ipfs/{cid}?format=raw"))
             .map_err(RetrievalError::Url)?;
+        // The body's receive buffer is reserved before the request goes out,
+        // so before the client's timeout starts: the maximum block size,
+        // shrunk to the body's declared length once the head says it.
+        let mut reservation = match FetchMemory::current() {
+            Some(memory) => {
+                cancel_trace.set_stage("reserving_memory");
+                Some(memory.reserve(DEFAULT_MAX_BLOCK_SIZE).await?)
+            }
+            None => None,
+        };
+        let started = Instant::now();
         cancel_trace.set_stage("waiting_headers");
         let response = match self
             .client
@@ -3810,11 +3936,16 @@ impl HttpRetriever {
             Err(err) => return Err(err.into()),
         };
         let headers_elapsed = started.elapsed();
+        if let (Some(reservation), Some(declared)) =
+            (reservation.as_mut(), response.content_length())
+        {
+            reservation.shrink_to(usize::try_from(declared).unwrap_or(usize::MAX));
+        }
         cancel_trace.set_stage("reading_body");
         let LimitedResponseBytes {
             bytes,
             stats: body_stats,
-        } = limited_response_bytes(response, DEFAULT_MAX_BLOCK_SIZE).await?;
+        } = limited_response_bytes(response, DEFAULT_MAX_BLOCK_SIZE, reservation).await?;
         let body_elapsed = started.elapsed();
         cancel_trace.set_stage("verifying_block");
         verify_block(cid, &bytes)?;
@@ -3823,7 +3954,7 @@ impl HttpRetriever {
             .store_block_with_trace(*cid, bytes, "http_provider", true)
             .await?;
         Ok((
-            Block::unchecked(*cid, bytes),
+            Block::unchecked_charged(*cid, bytes),
             HttpProviderResponseStats {
                 response_bytes: body_stats.bytes_read,
                 headers_elapsed,
@@ -4504,7 +4635,8 @@ impl HttpRetriever {
             return Ok(client.clone());
         }
         let spawned =
-            SharedBitswapClient::spawn(self.instance.as_ref(), self.limits.as_ref()).await?;
+            SharedBitswapClient::spawn(self.instance.as_ref(), self.limits(), self.memory())
+                .await?;
         *client = Some(spawned.clone());
         Ok(spawned)
     }
@@ -5041,7 +5173,8 @@ impl HttpRetriever {
         // batches to fit, so this is only a backstop) goes block by block
         // instead, each block admitted on its own.
         let count = cids.len();
-        let fetch = Box::pin(self.fetch_many_from_session_peers(cids, peers));
+        let fetch =
+            Box::pin(self.with_fetch_memory(self.fetch_many_from_session_peers(cids, peers)));
         match self.with_block_fetch_permits(count, fetch).await {
             Some(result) => result,
             None => {
@@ -5247,7 +5380,7 @@ impl HttpRetriever {
         let bytes = self
             .store_block_with_trace(*cid, requested_block, "bitswap", true)
             .await?;
-        Ok(Block::unchecked(*cid, bytes))
+        Ok(Block::unchecked_charged(*cid, bytes))
     }
 
     async fn store_bitswap_batch_result(
@@ -5272,18 +5405,21 @@ impl HttpRetriever {
             let bytes = self
                 .store_block_with_trace(cid, data, "bitswap", true)
                 .await?;
-            blocks.insert(cid, Block::unchecked(cid, bytes));
+            blocks.insert(cid, Block::unchecked_charged(cid, bytes));
         }
         Ok(blocks)
     }
 
+    /// Stores a fetched block. The put, a blocking job, owns the bytes (and
+    /// so their charge) until it returns, even if the fetch is cancelled
+    /// first; the store's hot cache shares them rather than copying.
     async fn store_block_with_trace(
         &self,
         cid: Cid,
-        bytes: Vec<u8>,
+        bytes: ChargedBytes,
         source: &'static str,
         required: bool,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<ChargedBytes> {
         let started = Instant::now();
         let byte_count = bytes.len();
         let store = self.store.clone();
@@ -5292,7 +5428,7 @@ impl HttpRetriever {
         let held = HeldPermits::current();
         let (bytes, result) = self
             .run_blocking_job(move || {
-                let result = store.put_block(&cid, &bytes);
+                let result = store.put_charged(&cid, &bytes);
                 drop(held);
                 (bytes, result)
             })
@@ -5471,8 +5607,12 @@ fn shared_block_fetch_result(
 ) -> Result<(Block, RetrievalSource)> {
     match result.as_ref() {
         Ok((block, source)) => Ok((block.clone(), *source)),
-        Err(err) => Err(RetrievalError::Bitswap(format!(
-            "coalesced block fetch failed: {err}"
+        Err(SharedFetchError {
+            memory: Some(refusal),
+            ..
+        }) => Err(RetrievalError::MemoryBudget(*refusal)),
+        Err(SharedFetchError { message, .. }) => Err(RetrievalError::Bitswap(format!(
+            "coalesced block fetch failed: {message}"
         ))),
     }
 }
@@ -5521,6 +5661,13 @@ impl FetchingBlockProvider {
         self
     }
 
+    /// Reserves the provider's receive buffers from `budget` (see
+    /// [`memory`]). Without this, nothing changes.
+    pub fn with_memory_budget(mut self, budget: MemoryBudget) -> Self {
+        self.retriever = self.retriever.with_memory_budget(budget);
+        self
+    }
+
     /// The queue its background work goes through: what is outstanding, and
     /// what was dropped.
     pub fn background_queue(&self) -> &BackgroundQueue {
@@ -5537,6 +5684,9 @@ impl FetchingBlockProvider {
     /// - **Without one,** as before: in a blocking region on the current
     ///   runtime, or on a current-thread runtime of its own outside one.
     fn block_on_retrieval<F: Future>(&self, future: F) -> CoreResult<F::Output> {
+        // The calling work's memory wait, from its task or, on a blocking
+        // job's thread, from the thread, goes with the future.
+        let future = with_memory_wait(current_memory_wait(), future);
         if let Some(instance) = &self.instance {
             return instance
                 .block_on(future)
@@ -5704,7 +5854,7 @@ impl FetchingBlockProvider {
         }
 
         for (index, cid, start, end, elapsed_ms, fetched) in join_all(fetches).await {
-            let (block, source) = fetched.map_err(|err| CoreError::Storage(err.to_string()))?;
+            let (block, source) = fetched.map_err(RetrievalError::into_core)?;
             self.stats.record(source);
             let range_len = if start <= end {
                 end.saturating_sub(start).saturating_add(1)
@@ -5763,7 +5913,7 @@ impl BlockProvider for FetchingBlockProvider {
                 self.stats.record(source);
                 Ok(Some(block))
             }
-            Err(err) => Err(CoreError::Storage(err.to_string())),
+            Err(err) => Err(err.into_core()),
         }
     }
 
@@ -5801,7 +5951,7 @@ impl BlockProvider for FetchingBlockProvider {
                 self.stats.record(source);
                 Ok(Some(block_data_range(block.data(), start, end)))
             }
-            Err(err) => Err(CoreError::Storage(err.to_string())),
+            Err(err) => Err(err.into_core()),
         }
     }
 
@@ -7574,8 +7724,8 @@ struct BitswapPeerFailure {
 
 #[derive(Clone)]
 struct BitswapFetchResult {
-    requested_block: Vec<u8>,
-    extra_blocks: Vec<(Cid, Vec<u8>)>,
+    requested_block: ChargedBytes,
+    extra_blocks: Vec<(Cid, ChargedBytes)>,
     source_peer: Option<PeerId>,
     source_transport: Option<&'static str>,
     source_addr: Option<Multiaddr>,
@@ -7584,8 +7734,8 @@ struct BitswapFetchResult {
 
 #[derive(Clone, Debug)]
 struct BitswapFetchBatchResult {
-    requested_blocks: HashMap<Cid, Vec<u8>>,
-    extra_blocks: Vec<(Cid, Vec<u8>)>,
+    requested_blocks: HashMap<Cid, ChargedBytes>,
+    extra_blocks: Vec<(Cid, ChargedBytes)>,
     source_peer: Option<PeerId>,
     source_transport: Option<&'static str>,
     source_addr: Option<Multiaddr>,
@@ -7593,8 +7743,8 @@ struct BitswapFetchBatchResult {
 }
 
 struct BitswapFetchResults {
-    requested_blocks: HashMap<Cid, Vec<u8>>,
-    extra_blocks: Vec<(Cid, Vec<u8>)>,
+    requested_blocks: HashMap<Cid, ChargedBytes>,
+    extra_blocks: Vec<(Cid, ChargedBytes)>,
 }
 
 #[derive(Clone)]
@@ -7613,6 +7763,11 @@ struct BitswapCommand {
     /// for a connection slot, so a request that gave up never dials,
     /// however the swarm's events are ordered. Dead for a preconnect.
     requester: Weak<()>,
+    /// The requesting fetch's memory, which the reads for it reserve from;
+    /// `None` without a budget, or for a preconnect.
+    memory: Option<FetchMemory>,
+    /// How those reservations wait: as the request's work does.
+    memory_wait: MemoryWait,
     reason: &'static str,
     context: BitswapCommandContext,
 }
@@ -7697,12 +7852,13 @@ impl SharedBitswapClient {
     async fn spawn(
         instance: Option<&InstanceContext>,
         limits: Option<&SharedLimits>,
+        memory: Option<&MemoryBudget>,
     ) -> Result<Self> {
         let swarm = build_bitswap_swarm(limits).await?;
         let mut control = swarm.behaviour().stream.new_control();
         let incoming = accept_bitswap_streams(&mut control)?;
         let (commands, receiver) = mpsc::channel(64);
-        let task = run_shared_bitswap_swarm(swarm, control, incoming, receiver);
+        let task = run_shared_bitswap_swarm(swarm, control, incoming, receiver, memory.cloned());
         match instance {
             Some(instance) => drop(instance.spawn(task)),
             None => drop(tokio::spawn(task)),
@@ -7790,6 +7946,8 @@ impl SharedBitswapClient {
                 sent_at: Instant::now(),
                 respond: Some(respond),
                 requester: Arc::downgrade(&requester),
+                memory: FetchMemory::current(),
+                memory_wait: current_memory_wait(),
                 reason: "fetch",
                 context,
             })
@@ -7838,6 +7996,8 @@ impl SharedBitswapClient {
                 sent_at: Instant::now(),
                 respond: None,
                 requester: Weak::new(),
+                memory: None,
+                memory_wait: MemoryWait::Never,
                 reason,
                 context: BitswapCommandContext {
                     top_level_path,
@@ -7933,7 +8093,14 @@ where
     T: AsyncRead + Unpin,
 {
     let started = Instant::now();
-    match timeout(read_timeout, read_bitswap_blocks(stream)).await {
+    // Answering no one request, its memory wait counts in its timeout.
+    let read = async {
+        let mut memory = BitswapReadMemory::reserve()
+            .await
+            .map_err(io::Error::other)?;
+        read_bitswap_blocks(stream, &mut memory).await
+    };
+    match timeout(read_timeout, read).await {
         Ok(result) => (result, started.elapsed().as_millis(), false),
         Err(_) => (
             Err(io::Error::new(
@@ -7951,8 +8118,12 @@ async fn run_shared_bitswap_swarm(
     control: StreamControl,
     incoming: Vec<IncomingStreams>,
     mut commands: mpsc::Receiver<BitswapCommand>,
+    memory: Option<MemoryBudget>,
 ) {
     let mut incoming = select_all(incoming);
+    // Incoming streams answer no one request: their reads reserve from the
+    // node's budget, waiting within their own read timeout.
+    let incoming_memory = memory.map(FetchMemory::new);
     let mut fetches = FuturesUnordered::<BoxFuture<'static, Vec<Cid>>>::new();
     let mut incoming_reads = FuturesUnordered::<BoxFuture<'static, IncomingBitswapRead>>::new();
     let mut pending_incoming = HashMap::<Cid, Vec<PendingIncomingBitswapResult>>::new();
@@ -8185,6 +8356,7 @@ async fn run_shared_bitswap_swarm(
                 let primary_cid = cids[0];
                 let command_context = command.context;
                 let requester = command.requester;
+                let (fetch_memory, memory_wait) = (command.memory, command.memory_wait);
                 let dial_context =
                     BitswapDialContext::new(command.reason, command_context.clone());
                 let cid_summary =
@@ -8430,15 +8602,23 @@ async fn run_shared_bitswap_swarm(
                 let peer_transports = peer_transports.clone();
                 let fetch_started = Instant::now();
                 fetches.push(Box::pin(async move {
+                    // Its reads reserve, and wait, as its request does.
+                    let fetch = FetchMemory::scope(
+                        fetch_memory,
+                        with_memory_wait(
+                            memory_wait,
+                            fetch_bitswap_batch_with_incoming_streams(
+                                control,
+                                peer_targets,
+                                fetch_cids.clone(),
+                                incoming_results,
+                                dial_errors,
+                                peer_transports,
+                            ),
+                        ),
+                    );
                     let result = tokio::select! {
-                        result = fetch_bitswap_batch_with_incoming_streams(
-                            control,
-                            peer_targets,
-                            fetch_cids.clone(),
-                            incoming_results,
-                            dial_errors,
-                            peer_transports,
-                        ) => Some(result),
+                        result = fetch => Some(result),
                         _ = respond.closed() => None,
                     };
                     if let Some(result) = result {
@@ -8481,7 +8661,16 @@ async fn run_shared_bitswap_swarm(
                     );
                     continue;
                 }
-                incoming_reads.push(read_incoming_bitswap_stream(peer, stream).boxed());
+                incoming_reads.push(
+                    FetchMemory::scope(
+                        incoming_memory.clone(),
+                        with_memory_wait(
+                            MemoryWait::UNTIL_CANCELLED,
+                            read_incoming_bitswap_stream(peer, stream),
+                        ),
+                    )
+                    .boxed(),
+                );
             }
             Some(mut incoming_read) = incoming_reads.next(), if !incoming_reads.is_empty() => {
                 match incoming_read.result {
@@ -9337,7 +9526,8 @@ fn is_connection_limit_error(detail: &str) -> bool {
 #[derive(Clone)]
 struct ReceivedBitswapBlock {
     cid: Option<Cid>,
-    data: Vec<u8>,
+    /// A view into the message's receive buffer, which it keeps charged.
+    data: ChargedBytes,
 }
 
 #[derive(Default)]
@@ -10558,7 +10748,7 @@ fn normalized_provider_set(providers: &[Provider]) -> BTreeSet<(Option<String>, 
 
 #[derive(Debug)]
 struct LimitedResponseBytes {
-    bytes: Vec<u8>,
+    bytes: ChargedBytes,
     stats: LimitedResponseByteStats,
 }
 
@@ -10568,31 +10758,57 @@ struct LimitedResponseByteStats {
     first_chunk_elapsed: Option<Duration>,
 }
 
+/// Reads a response body of at most `max_size` bytes. With a reservation,
+/// into a buffer that never grows past it, trued down to the body's exact
+/// size at the end; without one, into a plain `Vec`, as before.
 async fn limited_response_bytes(
     response: reqwest::Response,
     max_size: usize,
+    reservation: Option<Reservation>,
 ) -> Result<LimitedResponseBytes> {
     let started = Instant::now();
     let mut stream = response.bytes_stream();
-    let mut body = Vec::new();
     let mut first_chunk_elapsed = None;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        first_chunk_elapsed.get_or_insert_with(|| started.elapsed());
-        if body.len().saturating_add(chunk.len()) > max_size {
-            return Err(RetrievalError::Core(CoreError::BlockTooLarge {
-                actual: body.len().saturating_add(chunk.len()),
-                max: max_size,
-            }));
+    let too_large = |actual: usize| {
+        RetrievalError::Core(CoreError::BlockTooLarge {
+            actual,
+            max: max_size,
+        })
+    };
+    let bytes = match reservation {
+        Some(reservation) => {
+            let mut body = ReservedVec::new(reservation);
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                first_chunk_elapsed.get_or_insert_with(|| started.elapsed());
+                let len = body.len().saturating_add(chunk.len());
+                if len > max_size {
+                    return Err(too_large(len));
+                }
+                // A body longer than it declared overruns its reservation.
+                body.extend_from_slice(&chunk)?;
+            }
+            body.into_charged()
         }
-        body.extend_from_slice(&chunk);
-    }
+        None => {
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                first_chunk_elapsed.get_or_insert_with(|| started.elapsed());
+                if body.len().saturating_add(chunk.len()) > max_size {
+                    return Err(too_large(body.len().saturating_add(chunk.len())));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            ChargedBytes::from_vec(body)
+        }
+    };
     Ok(LimitedResponseBytes {
         stats: LimitedResponseByteStats {
-            bytes_read: body.len(),
+            bytes_read: bytes.len(),
             first_chunk_elapsed,
         },
-        bytes: body,
+        bytes,
     })
 }
 
@@ -11006,7 +11222,7 @@ async fn request_bitswap_blocks_after_connection(
             let requested_bytes = result
                 .requested_blocks
                 .values()
-                .map(Vec::len)
+                .map(|block| block.len())
                 .sum::<usize>();
             tracing::info!(
                 phase = "bitswap_peer_attempt",
@@ -11202,6 +11418,16 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let started = Instant::now();
+    // The answer may hold the block: its memory is reserved before the want
+    // goes out, and so before the probe's timer starts.
+    let mut memory = match BitswapReadMemory::reserve().await {
+        Ok(memory) => memory,
+        Err(refusal) => {
+            return Err(WantHaveFailure::TryOtherProtocols(
+                BitswapProtocolFailure::other(format!("{protocol_name}: {refusal}")),
+            ))
+        }
+    };
     if let Err(err) = write_bitswap_want_have(stream, cid).await {
         tracing::info!(
             phase = "bitswap_want_have_probe",
@@ -11228,7 +11454,12 @@ where
             )),
         ));
     }
-    let response = match timeout(request_timeouts.want_have, read_bitswap_response(stream)).await {
+    let response = match timeout(
+        request_timeouts.want_have,
+        read_bitswap_response(stream, &mut memory),
+    )
+    .await
+    {
         Ok(Ok(response)) => response,
         Ok(Err(err)) => {
             tracing::info!(
@@ -11418,12 +11649,27 @@ async fn request_bitswap_blocks_on_stream<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    // Reserved before the wants go out, so before the read's timer starts:
+    // waiting for memory isn't the peer being slow.
+    let mut memory = match BitswapReadMemory::reserve().await {
+        Ok(memory) => memory,
+        Err(refusal) => {
+            return Err(BitswapProtocolFailure::other(format!(
+                "{protocol_name}: {refusal}"
+            )))
+        }
+    };
     if let Err(err) = write_bitswap_wants(stream, cids).await {
         return Err(BitswapProtocolFailure::other(format!(
             "{protocol_name}: write failed: {err}"
         )));
     }
-    let blocks = match timeout(stream_read_timeout, read_bitswap_blocks(stream)).await {
+    let blocks = match timeout(
+        stream_read_timeout,
+        read_bitswap_blocks(stream, &mut memory),
+    )
+    .await
+    {
         Ok(Ok(blocks)) => blocks,
         Ok(Err(err)) => {
             return Err(BitswapProtocolFailure::other(format!(
@@ -11528,12 +11774,66 @@ fn bitswap_want_message_with_type(
     }
 }
 
-async fn read_bitswap_blocks<T>(io: &mut T) -> io::Result<Vec<ReceivedBitswapBlock>>
+/// The memory of one Bitswap read: a whole message's worth (the message
+/// cap), reserved before the read starts. Each message read takes its exact
+/// length from it, for an allocation of exactly that length; one that holds
+/// no block gives it back for the next. What is left goes back to the
+/// budget with the read.
+struct BitswapReadMemory {
+    /// `None` without a memory budget.
+    pool: Option<Reservation>,
+}
+
+impl BitswapReadMemory {
+    /// Reserves the message cap, waiting as the current work does; nothing
+    /// without a memory budget.
+    async fn reserve() -> std::result::Result<Self, BudgetError> {
+        let pool = match FetchMemory::current() {
+            Some(memory) => Some(memory.reserve(BITSWAP_MAX_MESSAGE_SIZE).await?),
+            None => None,
+        };
+        Ok(Self { pool })
+    }
+
+    /// A buffer of exactly `len` bytes, paid from the pool.
+    fn buffer(&mut self, len: usize) -> io::Result<ChargedBuffer> {
+        let Some(pool) = self.pool.as_mut() else {
+            return Ok(ChargedBuffer::Plain(vec![0; len]));
+        };
+        let held = pool.bytes();
+        let part = pool.split(len).ok_or_else(|| {
+            io::Error::other(BudgetError::ExceedsReservation {
+                bytes: len,
+                reserved: held,
+            })
+        })?;
+        ReservedVec::zeroed(len, part)
+            .map(ChargedBuffer::Reserved)
+            .map_err(io::Error::other)
+    }
+
+    /// Takes back the reservation of a message no view outlived.
+    fn reclaim(&mut self, buffer: ChargedBytes) {
+        if let (Some(pool), Ok(part)) = (self.pool.as_mut(), buffer.reclaim()) {
+            pool.merge(part);
+        }
+    }
+}
+
+enum ChargedBuffer {
+    Plain(Vec<u8>),
+    Reserved(ReservedVec),
+}
+
+async fn read_bitswap_blocks<T>(
+    io: &mut T,
+    memory: &mut BitswapReadMemory,
+) -> io::Result<Vec<ReceivedBitswapBlock>>
 where
     T: AsyncRead + Unpin,
 {
     for _ in 0..4 {
-        let response = read_bitswap_response_once(io).await?;
+        let response = read_bitswap_response_once(io, memory).await?;
         if !response.blocks.is_empty() {
             return Ok(response.blocks);
         }
@@ -11541,12 +11841,15 @@ where
     Ok(Vec::new())
 }
 
-async fn read_bitswap_response<T>(io: &mut T) -> io::Result<BitswapResponse>
+async fn read_bitswap_response<T>(
+    io: &mut T,
+    memory: &mut BitswapReadMemory,
+) -> io::Result<BitswapResponse>
 where
     T: AsyncRead + Unpin,
 {
     for _ in 0..4 {
-        let response = read_bitswap_response_once(io).await?;
+        let response = read_bitswap_response_once(io, memory).await?;
         if !response.is_empty() {
             return Ok(response);
         }
@@ -11554,26 +11857,71 @@ where
     Ok(BitswapResponse::default())
 }
 
-async fn read_bitswap_response_once<T>(io: &mut T) -> io::Result<BitswapResponse>
+async fn read_bitswap_response_once<T>(
+    io: &mut T,
+    memory: &mut BitswapReadMemory,
+) -> io::Result<BitswapResponse>
 where
     T: AsyncRead + Unpin,
 {
-    let bytes = read_length_prefixed(io, 2 * 1024 * 1024 + 4096).await?;
-    let message = BitswapMessage::decode(bytes.as_slice()).map_err(invalid_data)?;
-    Ok(decode_bitswap_response(message))
+    let buffer = read_charged_length_prefixed(io, BITSWAP_MAX_MESSAGE_SIZE, memory).await?;
+    // Blocks decode as views of the receive buffer, not copies.
+    let message = BitswapMessage::decode(buffer.to_bytes()).map_err(invalid_data)?;
+    let response = decode_bitswap_response(message, &buffer);
+    if response.blocks.is_empty() {
+        memory.reclaim(buffer);
+    }
+    Ok(response)
 }
 
-fn decode_bitswap_response(message: BitswapMessage) -> BitswapResponse {
+/// A length-prefixed message of at most `max_size` bytes, in an allocation
+/// of exactly its length, paid from `memory`.
+async fn read_charged_length_prefixed<T>(
+    io: &mut T,
+    max_size: usize,
+    memory: &mut BitswapReadMemory,
+) -> io::Result<ChargedBytes>
+where
+    T: AsyncRead + Unpin,
+{
+    let len = read_varint_usize(io).await?;
+    if len > max_size {
+        return Err(invalid_data("bitswap message too large"));
+    }
+    match memory.buffer(len)? {
+        ChargedBuffer::Plain(mut bytes) => {
+            io.read_exact(&mut bytes).await?;
+            Ok(ChargedBytes::from_vec(bytes))
+        }
+        ChargedBuffer::Reserved(mut buffer) => {
+            io.read_exact(buffer.as_mut_slice()).await?;
+            Ok(buffer.into_charged())
+        }
+    }
+}
+
+/// `data`, a field decoded from `buffer`, as a view of it; a copy only if
+/// the decoder had copied it.
+fn bitswap_block_view(buffer: &ChargedBytes, data: &bytes::Bytes) -> ChargedBytes {
+    buffer
+        .slice_ref(data)
+        .unwrap_or_else(|| ChargedBytes::copy_from_slice(data))
+}
+
+fn decode_bitswap_response(message: BitswapMessage, buffer: &ChargedBytes) -> BitswapResponse {
     let mut blocks = message
         .blocks
-        .into_iter()
-        .map(|data| ReceivedBitswapBlock { cid: None, data })
+        .iter()
+        .map(|data| ReceivedBitswapBlock {
+            cid: None,
+            data: bitswap_block_view(buffer, data),
+        })
         .collect::<Vec<_>>();
-    blocks.extend(message.payload.into_iter().map(|payload| {
+    blocks.extend(message.payload.iter().map(|payload| {
         let cid = cid_from_bitswap_payload_prefix(&payload.prefix, &payload.data);
         ReceivedBitswapBlock {
             cid,
-            data: payload.data,
+            data: bitswap_block_view(buffer, &payload.data),
         }
     }));
     let block_presences = message
@@ -11683,6 +12031,7 @@ fn cid_from_bitswap_payload_prefix(prefix: &[u8], data: &[u8]) -> Option<Cid> {
     }
 }
 
+#[cfg(test)]
 async fn read_length_prefixed<T>(io: &mut T, max_size: usize) -> io::Result<Vec<u8>>
 where
     T: AsyncRead + Unpin,
@@ -11740,8 +12089,8 @@ fn timeout_http_client(timeout: Duration) -> reqwest::Client {
 struct BitswapMessage {
     #[prost(message, optional, tag = "1")]
     wantlist: Option<Wantlist>,
-    #[prost(bytes = "vec", repeated, tag = "2")]
-    blocks: Vec<Vec<u8>>,
+    #[prost(bytes = "bytes", repeated, tag = "2")]
+    blocks: Vec<bytes::Bytes>,
     #[prost(message, repeated, tag = "3")]
     payload: Vec<BlockPayload>,
     #[prost(message, repeated, tag = "4")]
@@ -11787,8 +12136,8 @@ enum WantType {
 struct BlockPayload {
     #[prost(bytes = "vec", tag = "1")]
     prefix: Vec<u8>,
-    #[prost(bytes = "vec", tag = "2")]
-    data: Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    data: bytes::Bytes,
     #[prost(int32, repeated, tag = "4")]
     tokens: Vec<i32>,
 }
@@ -12196,6 +12545,322 @@ mod shared_limits_tests {
         established(&mut free).await;
         assert_eq!(limits.bitswap_connections(), 1);
         peer_task.abort();
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use freedom_ipfs_core::{cid_from_data, CODEC_RAW};
+    use std::net::SocketAddr;
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt as TokioAsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt};
+
+    const MIB: usize = 1024 * 1024;
+
+    /// A local HTTP provider serving its blocks in odd-sized writes, with a
+    /// `Content-Length` when `declared`, else ended by closing. For the
+    /// `held` blocks it sends the head and half the body, then holds the
+    /// rest until released.
+    struct BodyProvider {
+        addr: SocketAddr,
+        arrivals: Arc<StdMutex<Vec<String>>>,
+        release: tokio::sync::watch::Sender<bool>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl BodyProvider {
+        async fn spawn(blocks: Vec<(Cid, Vec<u8>)>, held: Vec<Cid>, declared: bool) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let blocks = Arc::new(
+                blocks
+                    .into_iter()
+                    .map(|(cid, data)| (cid.to_string(), data))
+                    .collect::<HashMap<_, _>>(),
+            );
+            let held = Arc::new(
+                held.iter()
+                    .map(ToString::to_string)
+                    .collect::<BTreeSet<_>>(),
+            );
+            let arrivals = Arc::new(StdMutex::new(Vec::new()));
+            let (release, released) = tokio::sync::watch::channel(false);
+            let task = tokio::spawn({
+                let arrivals = arrivals.clone();
+                async move {
+                    while let Ok((mut stream, _)) = listener.accept().await {
+                        let (blocks, held, arrivals) =
+                            (blocks.clone(), held.clone(), arrivals.clone());
+                        let mut released = released.clone();
+                        tokio::spawn(async move {
+                            let mut request = vec![0u8; 4096];
+                            let Ok(len) = TokioAsyncReadExt::read(&mut stream, &mut request).await
+                            else {
+                                return;
+                            };
+                            let request = String::from_utf8_lossy(&request[..len]).to_string();
+                            let Some((cid, data)) = blocks
+                                .iter()
+                                .find(|(cid, _)| request.contains(&format!("/ipfs/{cid}")))
+                            else {
+                                return;
+                            };
+                            arrivals.lock().unwrap().push(cid.clone());
+                            let mut head = "HTTP/1.1 200 OK\r\nconnection: close\r\n".to_string();
+                            if declared {
+                                head.push_str(&format!("content-length: {}\r\n", data.len()));
+                            }
+                            head.push_str("\r\n");
+                            if TokioAsyncWriteExt::write_all(&mut stream, head.as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            let (first, rest) = data.split_at(data.len() / 2);
+                            for part in [first, rest] {
+                                for chunk in part.chunks(10_007) {
+                                    if TokioAsyncWriteExt::write_all(&mut stream, chunk)
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                let _ = TokioAsyncWriteExt::flush(&mut stream).await;
+                                if held.contains(cid) && part.as_ptr() == first.as_ptr() {
+                                    let _ = released.wait_for(|released| *released).await;
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+            Self {
+                addr,
+                arrivals,
+                release,
+                task,
+            }
+        }
+
+        fn saw(&self, cid: &Cid) -> bool {
+            self.arrivals.lock().unwrap().contains(&cid.to_string())
+        }
+
+        fn release(&self) {
+            self.release.send_replace(true);
+        }
+
+        fn retriever(&self, cids: &[Cid], budget: &MemoryBudget) -> HttpRetriever {
+            let store = SqliteBlockStore::in_memory(64 * MIB as u64).unwrap();
+            let record = CachedProviderRecord {
+                id: None,
+                addrs: vec![format!("/ip4/127.0.0.1/tcp/{}/http", self.addr.port())],
+            };
+            for cid in cids {
+                store
+                    .put_provider_records(
+                        cid,
+                        std::slice::from_ref(&record),
+                        Duration::from_secs(60),
+                    )
+                    .unwrap();
+            }
+            HttpRetriever::new(
+                freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+                store,
+            )
+            .with_memory_budget(budget.clone())
+        }
+    }
+
+    impl Drop for BodyProvider {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn block(len: usize, seed: u8) -> (Cid, Vec<u8>) {
+        let data = (0..len)
+            .map(|n| seed.wrapping_add((n % 251) as u8))
+            .collect::<Vec<_>>();
+        (cid_from_data(CODEC_RAW, &data), data)
+    }
+
+    async fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_bodies_reserve_before_they_are_read_and_are_trued_down() {
+        for declared in [true, false] {
+            let budget = MemoryBudget::new(8 * MIB);
+            let (cid, data) = block(MIB + 7, 1);
+            let provider = BodyProvider::spawn(vec![(cid, data.clone())], vec![], declared).await;
+            let retriever = provider.retriever(&[cid], &budget);
+
+            // With the budget full, the fetch waits for memory before its
+            // request goes out.
+            let full = budget.try_reserve(budget.limit()).unwrap();
+            let fetch = tokio::spawn({
+                let retriever = retriever.clone();
+                async move { retriever.fetch_block_with_source(&cid).await }
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!fetch.is_finished(), "it waits for memory");
+            assert!(!provider.saw(&cid), "nothing is sent while it waits");
+            assert_eq!(budget.used(), budget.limit());
+
+            drop(full);
+            let (block, source) = fetch.await.unwrap().unwrap();
+            assert_eq!(
+                (block.data(), source),
+                (&data[..], RetrievalSource::HttpProvider)
+            );
+            // Trued down: the allocation and its charge are the block's size.
+            assert_eq!(block.charged().backing_capacity(), data.len(), "{declared}");
+            assert_eq!(block.charged().charged_bytes(), data.len(), "{declared}");
+            wait_until("a loser's reservation stayed", || {
+                budget.used() == data.len()
+            })
+            .await;
+            drop(block);
+            wait_until("the charge outlived the block", || budget.used() == 0).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_bodies_never_outgrow_their_reservation() {
+        // A budget of one maximum-size block holds a maximum-size body read
+        // in odd-sized pieces without a length...
+        let budget = MemoryBudget::new(DEFAULT_MAX_BLOCK_SIZE);
+        let (cid, data) = block(DEFAULT_MAX_BLOCK_SIZE, 2);
+        let (big, big_data) = block(DEFAULT_MAX_BLOCK_SIZE + 1, 3);
+        let provider =
+            BodyProvider::spawn(vec![(cid, data.clone()), (big, big_data)], vec![], false).await;
+        let retriever = provider.retriever(&[cid, big], &budget);
+        let (block, _) = retriever.fetch_block_with_source(&cid).await.unwrap();
+        assert_eq!(block.data(), &data[..]);
+        assert_eq!(block.charged().charged_bytes(), DEFAULT_MAX_BLOCK_SIZE);
+        drop(block);
+        wait_until("the charge outlived the block", || budget.used() == 0).await;
+
+        // ...and refuses a larger one, as a failed fetch, not a memory one.
+        let err = retriever.fetch_block_with_source(&big).await.unwrap_err();
+        assert!(!matches!(err, RetrievalError::MemoryBudget(_)), "{err}");
+        wait_until("a refused body kept its reservation", || budget.used() == 0).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nodes_sharing_a_budget_wait_for_each_others_memory() {
+        let (first, first_data) = block(3 * MIB / 2, 4);
+        let (second, second_data) = block(1_000, 5);
+        let provider = BodyProvider::spawn(
+            vec![(first, first_data.clone()), (second, second_data.clone())],
+            vec![first],
+            true,
+        )
+        .await;
+        // Room for one body's reservation (the maximum block size), and,
+        // once the first is trued down to its 1.5 MiB, not for another.
+        let budget = MemoryBudget::new(DEFAULT_MAX_BLOCK_SIZE + 500);
+        let (one, two) = (
+            provider.retriever(&[first], &budget),
+            provider.retriever(&[second], &budget),
+        );
+
+        // The first node's body holds its reservation while it is read.
+        let leader = tokio::spawn(async move { one.fetch_block_with_source(&first).await });
+        wait_until("the first body was never reserved", || {
+            budget.used() >= first_data.len()
+        })
+        .await;
+        // The second node's fetch waits for memory the first holds, before
+        // its request goes out.
+        let follower = tokio::spawn(async move { two.fetch_block_with_source(&second).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!follower.is_finished(), "it waits for the first's memory");
+        assert!(!provider.saw(&second));
+
+        // Read and returned, the first block keeps its charge while held.
+        provider.release();
+        let (block, _) = leader.await.unwrap().unwrap();
+        assert_eq!(block.data(), &first_data[..]);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!follower.is_finished(), "the held block keeps its memory");
+        // Let go, it frees the memory the second needs.
+        drop(block);
+        let (block, _) = tokio::time::timeout(Duration::from_secs(10), follower)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.data(), &second_data[..]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_fetches_fail_at_once_and_requests_wait() {
+        let budget = MemoryBudget::new(4 * MIB);
+        let (cid, data) = block(100_000, 6);
+        let provider = BodyProvider::spawn(vec![(cid, data.clone())], vec![], true).await;
+        let retriever = provider.retriever(&[cid], &budget);
+        let full = budget.try_reserve(budget.limit()).unwrap();
+
+        // Background work: refused at once, as the memory budget's.
+        let (sent, background) = oneshot::channel();
+        retriever.spawn_background_task("test", {
+            let retriever = retriever.clone();
+            async move {
+                let _ = sent.send(retriever.fetch_block_with_source(&cid).await);
+            }
+        });
+        let refused = tokio::time::timeout(Duration::from_secs(5), background)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                refused,
+                Err(RetrievalError::MemoryBudget(BudgetError::Exhausted { .. }))
+            ),
+            "{refused:?}"
+        );
+
+        // Request work waits, and is served once memory frees.
+        let request = tokio::spawn({
+            let retriever = retriever.clone();
+            async move { retriever.fetch_block_with_source(&cid).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!request.is_finished(), "a request waits for memory");
+        drop(full);
+        let (block, _) = request.await.unwrap().unwrap();
+        assert_eq!(block.data(), &data[..]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fetch_waiting_for_memory_ends_when_dropped_taking_none() {
+        let budget = MemoryBudget::new(4 * MIB);
+        let (cid, data) = block(100_000, 7);
+        let provider = BodyProvider::spawn(vec![(cid, data)], vec![], true).await;
+        let retriever = provider.retriever(&[cid], &budget);
+        let full = budget.try_reserve(budget.limit()).unwrap();
+        let waiting = tokio::spawn(async move { retriever.fetch_block_with_source(&cid).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!provider.saw(&cid), "it waits before its request");
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        drop(full);
+        // Nothing was waiting any more: no reservation was taken.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(budget.used(), 0);
+        assert!(budget.try_reserve(budget.limit()).is_ok());
     }
 }
 
@@ -13322,7 +13987,9 @@ mod bitswap_tests {
         let mut control = swarm.behaviour().stream.new_control();
         let incoming = accept_bitswap_streams(&mut control).unwrap();
         let (commands, receiver) = mpsc::channel(1);
-        let task = tokio::spawn(run_shared_bitswap_swarm(swarm, control, incoming, receiver));
+        let task = tokio::spawn(run_shared_bitswap_swarm(
+            swarm, control, incoming, receiver, None,
+        ));
 
         drop(commands);
 
@@ -13352,7 +14019,7 @@ mod bitswap_tests {
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
         let (peer_id, addr, swarm_task, stream_task, want_seen) =
             spawn_bitswap_peer_waiting_for_stream_close(cid).await;
-        let client = SharedBitswapClient::spawn(None, None).await.unwrap();
+        let client = SharedBitswapClient::spawn(None, None, None).await.unwrap();
         let fetch_task = tokio::spawn(async move {
             client
                 .fetch(
@@ -13418,18 +14085,21 @@ mod bitswap_tests {
             vec![
                 ReceivedBitswapBlock {
                     cid: Some(extra),
-                    data: extra_data.to_vec(),
+                    data: extra_data.to_vec().into(),
                 },
                 ReceivedBitswapBlock {
                     cid: Some(requested),
-                    data: requested_data.to_vec(),
+                    data: requested_data.to_vec().into(),
                 },
             ],
         )
         .unwrap();
 
         assert_eq!(result.requested_block, requested_data);
-        assert_eq!(result.extra_blocks, vec![(extra, extra_data.to_vec())]);
+        assert_eq!(
+            result.extra_blocks,
+            vec![(extra, extra_data.to_vec().into())]
+        );
     }
 
     #[test]
@@ -13448,19 +14118,19 @@ mod bitswap_tests {
             vec![
                 ReceivedBitswapBlock {
                     cid: Some(second),
-                    data: second_data.to_vec(),
+                    data: second_data.to_vec().into(),
                 },
                 ReceivedBitswapBlock {
                     cid: Some(extra),
-                    data: extra_data.to_vec(),
+                    data: extra_data.to_vec().into(),
                 },
                 ReceivedBitswapBlock {
                     cid: Some(first),
-                    data: first_data.to_vec(),
+                    data: first_data.to_vec().into(),
                 },
                 ReceivedBitswapBlock {
                     cid: Some(invalid),
-                    data: b"wrong bytes".to_vec(),
+                    data: b"wrong bytes".to_vec().into(),
                 },
             ],
         );
@@ -13468,7 +14138,10 @@ mod bitswap_tests {
         assert_eq!(result.requested_blocks.get(&first).unwrap(), first_data);
         assert_eq!(result.requested_blocks.get(&second).unwrap(), second_data);
         assert!(!result.requested_blocks.contains_key(&invalid));
-        assert_eq!(result.extra_blocks, vec![(extra, extra_data.to_vec())]);
+        assert_eq!(
+            result.extra_blocks,
+            vec![(extra, extra_data.to_vec().into())]
+        );
     }
 
     #[test]
@@ -13582,12 +14255,12 @@ mod bitswap_tests {
             payload: vec![
                 BlockPayload {
                     prefix: bitswap_payload_prefix(&second),
-                    data: second_data.to_vec(),
+                    data: second_data.to_vec().into(),
                     tokens: Vec::new(),
                 },
                 BlockPayload {
                     prefix: bitswap_payload_prefix(&first),
-                    data: first_data.to_vec(),
+                    data: first_data.to_vec().into(),
                     tokens: Vec::new(),
                 },
             ],
@@ -13696,7 +14369,7 @@ mod bitswap_tests {
                 (second, second_data.to_vec()),
             ])
             .await;
-        let client = SharedBitswapClient::spawn(None, None).await.unwrap();
+        let client = SharedBitswapClient::spawn(None, None, None).await.unwrap();
 
         let result = client
             .fetch_many(
@@ -13715,7 +14388,7 @@ mod bitswap_tests {
 
         assert_eq!(result.requested_blocks.get(&first).unwrap(), first_data);
         assert_eq!(result.requested_blocks.get(&second).unwrap(), second_data);
-        assert_eq!(result.extra_blocks, Vec::<(Cid, Vec<u8>)>::new());
+        assert_eq!(result.extra_blocks, Vec::<(Cid, ChargedBytes)>::new());
         assert_eq!(result.source_peer, Some(peer_id));
         assert_eq!(result.delivery, "outgoing");
         tokio::time::timeout(Duration::from_secs(5), peer_stream_task)
@@ -13737,7 +14410,7 @@ mod bitswap_tests {
                 (second, second_data.to_vec()),
             ])
             .await;
-        let client = SharedBitswapClient::spawn(None, None).await.unwrap();
+        let client = SharedBitswapClient::spawn(None, None, None).await.unwrap();
 
         let result = client
             .fetch_many(
@@ -13756,7 +14429,7 @@ mod bitswap_tests {
 
         assert_eq!(result.requested_blocks.get(&first).unwrap(), first_data);
         assert_eq!(result.requested_blocks.get(&second).unwrap(), second_data);
-        assert_eq!(result.extra_blocks, Vec::<(Cid, Vec<u8>)>::new());
+        assert_eq!(result.extra_blocks, Vec::<(Cid, ChargedBytes)>::new());
         assert_eq!(result.source_peer, Some(peer_id));
         assert_eq!(result.delivery, "incoming");
         tokio::time::timeout(Duration::from_secs(5), peer_stream_task)
@@ -13775,7 +14448,7 @@ mod bitswap_tests {
         let (sender, receiver) = mpsc::unbounded_channel();
         sender
             .send(BitswapFetchBatchResult {
-                requested_blocks: HashMap::from([(first, first_data.to_vec())]),
+                requested_blocks: HashMap::from([(first, first_data.to_vec().into())]),
                 extra_blocks: Vec::new(),
                 source_peer: None,
                 source_transport: None,
@@ -13795,7 +14468,7 @@ mod bitswap_tests {
         assert_eq!(result.requested_blocks.len(), 1);
         assert_eq!(result.requested_blocks.get(&first).unwrap(), first_data);
         assert!(!result.requested_blocks.contains_key(&second));
-        assert_eq!(result.extra_blocks, Vec::<(Cid, Vec<u8>)>::new());
+        assert_eq!(result.extra_blocks, Vec::<(Cid, ChargedBytes)>::new());
         assert_eq!(result.delivery, "incoming");
         drop(sender);
     }
@@ -13847,7 +14520,7 @@ mod bitswap_tests {
 
     #[tokio::test]
     async fn shared_bitswap_client_fetch_many_rejects_empty_batch() {
-        let client = SharedBitswapClient::spawn(None, None).await.unwrap();
+        let client = SharedBitswapClient::spawn(None, None, None).await.unwrap();
         let err = client.fetch_many(Vec::new(), Vec::new()).await.unwrap_err();
 
         assert!(
@@ -16378,7 +17051,7 @@ mod bitswap_tests {
             .await
             .unwrap();
 
-        let response = limited_response_bytes(response, DEFAULT_MAX_BLOCK_SIZE)
+        let response = limited_response_bytes(response, DEFAULT_MAX_BLOCK_SIZE, None)
             .await
             .unwrap();
 
@@ -18549,7 +19222,7 @@ mod bitswap_tests {
             let response = BitswapMessage {
                 payload: vec![BlockPayload {
                     prefix: bitswap_payload_prefix(&cid),
-                    data,
+                    data: data.into(),
                     tokens: Vec::new(),
                 }],
                 ..BitswapMessage::default()
@@ -18629,13 +19302,13 @@ mod bitswap_tests {
                 .into_iter()
                 .map(|(cid, data)| BlockPayload {
                     prefix: bitswap_payload_prefix(&cid),
-                    data,
+                    data: data.into(),
                     tokens: Vec::new(),
                 })
                 .collect::<Vec<_>>();
             payload.push(BlockPayload {
                 prefix: bitswap_payload_prefix(&cid),
-                data,
+                data: data.into(),
                 tokens: Vec::new(),
             });
             let response = BitswapMessage {
@@ -18767,7 +19440,7 @@ mod bitswap_tests {
                                 .filter_map(|cid| {
                                     blocks.get(cid).map(|data| BlockPayload {
                                         prefix: bitswap_payload_prefix(cid),
-                                        data: data.clone(),
+                                        data: data.clone().into(),
                                         tokens: Vec::new(),
                                     })
                                 })
@@ -18959,7 +19632,9 @@ mod bitswap_tests {
         let mut control = swarm.behaviour().stream.new_control();
         let incoming = accept_bitswap_streams(&mut control).unwrap();
         let (commands, receiver) = mpsc::channel(64);
-        let task = tokio::spawn(run_shared_bitswap_swarm(swarm, control, incoming, receiver));
+        let task = tokio::spawn(run_shared_bitswap_swarm(
+            swarm, control, incoming, receiver, None,
+        ));
         (commands, task)
     }
 
@@ -18991,6 +19666,8 @@ mod bitswap_tests {
                 sent_at: Instant::now(),
                 respond: Some(respond),
                 requester: Arc::downgrade(&requester),
+                memory: None,
+                memory_wait: MemoryWait::UNTIL_CANCELLED,
                 reason: "fetch",
                 context: BitswapCommandContext::default(),
             })
@@ -19202,6 +19879,165 @@ mod bitswap_tests {
         }
     }
 
+    /// A local Bitswap peer that answers the first want it reads with `raw`
+    /// bytes, as they are, then holds its stream open.
+    async fn spawn_bitswap_peer_answering(
+        raw: Vec<u8>,
+    ) -> (
+        PeerId,
+        Multiaddr,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut swarm = SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                (tls::Config::new, noise::Config::new),
+                yamux::Config::default,
+            )
+            .unwrap()
+            .with_behaviour(|_| libp2p_stream::Behaviour::new())
+            .unwrap()
+            .build();
+        let peer_id = *swarm.local_peer_id();
+        let mut control = swarm.behaviour().new_control();
+        let mut incoming = control
+            .accept(StreamProtocol::new("/ipfs/bitswap/1.2.0"))
+            .unwrap();
+        swarm
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let addr = loop {
+            if let libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } =
+                swarm.select_next_some().await
+            {
+                break address;
+            }
+        };
+        let swarm_task = tokio::spawn(async move {
+            loop {
+                let _ = swarm.select_next_some().await;
+            }
+        });
+        let stream_task = tokio::spawn(async move {
+            let (_peer, mut stream) = incoming.next().await.unwrap();
+            let _ = read_length_prefixed(&mut stream, 1024).await;
+            let _ = stream.write_all(&raw).await;
+            let _ = stream.flush().await;
+            std::future::pending::<()>().await;
+        });
+        (peer_id, addr, swarm_task, stream_task)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitswap_reads_reserve_a_message_before_their_wants_go_out() {
+        let data = (0..1024 * 1024 + 9)
+            .map(|n| (n % 253) as u8)
+            .collect::<Vec<_>>();
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, &data);
+        let (peer_id, addr, swarm_task, stream_task) =
+            spawn_local_bitswap_peer(cid, data.clone()).await;
+        let provider =
+            Provider::from_parts(Some(peer_id.to_string()), vec![addr.to_string()]).unwrap();
+        let budget = MemoryBudget::new(8 * 1024 * 1024);
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            SqliteBlockStore::in_memory(64 * 1024 * 1024).unwrap(),
+        )
+        .with_memory_budget(budget.clone());
+
+        // With the budget full, the read's memory is waited for first.
+        let full = budget.try_reserve(budget.limit()).unwrap();
+        let fetch = tokio::spawn({
+            let (retriever, provider) = (retriever.clone(), provider.clone());
+            async move {
+                retriever
+                    .fetch_from_providers_with_source(&cid, &[provider], None)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!fetch.is_finished(), "it waits for memory");
+        assert_eq!(budget.used(), budget.limit());
+        drop(full);
+        let (block, source) = fetch.await.unwrap().unwrap();
+        assert_eq!(
+            (block.data(), source),
+            (&data[..], RetrievalSource::Bitswap)
+        );
+        // The block is a view of its message, which it keeps charged: the
+        // message's exact length, not the cap the read reserved.
+        let charged = block.charged().charged_bytes();
+        assert_eq!(block.charged().backing_capacity(), charged);
+        assert!(
+            charged > data.len() && charged <= data.len() + 4096,
+            "{charged}"
+        );
+        assert_eq!(budget.used(), charged);
+        drop(block);
+        // The store's hot cache holds it now, and takes the charge over.
+        assert_eq!(budget.used(), 0);
+
+        stream_task.abort();
+        swarm_task.abort();
+
+        // A budget that can't hold one message refuses without waiting.
+        let (peer_id, addr, swarm_task, stream_task) =
+            spawn_local_bitswap_peer(cid, data.clone()).await;
+        let provider =
+            Provider::from_parts(Some(peer_id.to_string()), vec![addr.to_string()]).unwrap();
+        let small = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            SqliteBlockStore::in_memory(1024 * 1024).unwrap(),
+        )
+        .with_memory_budget(MemoryBudget::new(1024 * 1024));
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            small.fetch_from_providers_with_source(&cid, &[provider], None),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                RetrievalError::MemoryBudget(BudgetError::TooLarge { .. })
+            ),
+            "{refused}"
+        );
+        stream_task.abort();
+        swarm_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_oversized_bitswap_message_is_refused_unread() {
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, b"never sent");
+        let mut raw = Vec::new();
+        append_uvarint(&mut raw, BITSWAP_MAX_MESSAGE_SIZE as u64 + 1);
+        let (peer_id, addr, swarm_task, stream_task) = spawn_bitswap_peer_answering(raw).await;
+        let provider =
+            Provider::from_parts(Some(peer_id.to_string()), vec![addr.to_string()]).unwrap();
+        let budget = MemoryBudget::new(8 * 1024 * 1024);
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            SqliteBlockStore::in_memory(1024 * 1024).unwrap(),
+        )
+        .with_memory_budget(budget.clone());
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            retriever.fetch_from_providers_with_source(&cid, &[provider], None),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(!matches!(err, RetrievalError::MemoryBudget(_)), "{err}");
+        // Only the read's cap was ever reserved, and it is back.
+        assert_eq!(budget.used(), 0);
+        swarm_task.abort();
+        stream_task.abort();
+    }
+
     async fn spawn_multi_want_bitswap_peer(
         blocks: Vec<(Cid, Vec<u8>)>,
     ) -> (
@@ -19260,7 +20096,7 @@ mod bitswap_tests {
                 requested.push(cid);
                 payload.push(BlockPayload {
                     prefix: bitswap_payload_prefix(&cid),
-                    data,
+                    data: data.into(),
                     tokens: Vec::new(),
                 });
             }
@@ -19368,7 +20204,7 @@ mod bitswap_tests {
                 let response = BitswapMessage {
                     payload: vec![BlockPayload {
                         prefix: bitswap_payload_prefix(&cid),
-                        data,
+                        data: data.into(),
                         tokens: Vec::new(),
                     }],
                     ..BitswapMessage::default()
@@ -19467,7 +20303,7 @@ mod bitswap_tests {
                 let response = BitswapMessage {
                     payload: vec![BlockPayload {
                         prefix: bitswap_payload_prefix(&cid),
-                        data,
+                        data: data.into(),
                         tokens: Vec::new(),
                     }],
                     ..BitswapMessage::default()
@@ -20014,7 +20850,7 @@ mod bitswap_tests {
             let response = BitswapMessage {
                 payload: vec![BlockPayload {
                     prefix: bitswap_payload_prefix(&cid),
-                    data,
+                    data: data.into(),
                     tokens: Vec::new(),
                 }],
                 ..BitswapMessage::default()

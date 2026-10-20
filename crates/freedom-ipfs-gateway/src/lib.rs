@@ -37,10 +37,11 @@ pub use native_request::{
 };
 mod node;
 
+use freedom_ipfs_retrieval::enter_memory_wait;
 pub use freedom_ipfs_retrieval::instance::Fenced;
 pub use freedom_ipfs_retrieval::{
-    with_cancellation, BackgroundQueue, CancellationToken, InstanceContext, LimitSizes,
-    SharedLimits,
+    with_cancellation, with_memory_wait, BackgroundQueue, BudgetError, CancellationToken,
+    InstanceContext, LimitSizes, MemoryBudget, MemoryWait, SharedLimits,
 };
 pub use node::{
     delegated_router_endpoints, Instance, InstanceConfig, OnlineNode, OnlineNodeBuilder,
@@ -558,10 +559,11 @@ where
         );
         return;
     };
-    let job = async move {
+    // Background work never waits for memory: it is dropped instead.
+    let job = with_memory_wait(MemoryWait::Never, async move {
         let _slot = slot;
         job.await;
-    };
+    });
     match &jobs.instance {
         Some(instance) => drop(instance.spawn(job)),
         None => drop(tokio::spawn(job)),
@@ -578,6 +580,12 @@ async fn run_blocking_background<F>(
 where
     F: FnOnce() + Send + 'static,
 {
+    // The job reads through the synchronous block provider on its own
+    // thread: it never waits for memory there either.
+    let job = move || {
+        let _never = enter_memory_wait(MemoryWait::Never);
+        job();
+    };
     match instance {
         Some(instance) => match instance.spawn_blocking(job) {
             Ok(handle) => handle.await.map(drop).map_err(|err| err.to_string()),
@@ -3522,6 +3530,13 @@ fn gateway_error(err: GatewayError) -> Response {
             None,
             None,
         ),
+        GatewayError::Unixfs(UnixfsError::MemoryBudget(refusal)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable",
+            format!("memory budget: {refusal}"),
+            Some("memory_budget"),
+            Some("1"),
+        ),
         GatewayError::Unixfs(err) if is_timeout_error(&err) => (
             StatusCode::GATEWAY_TIMEOUT,
             "Gateway Timeout",
@@ -3622,6 +3637,47 @@ mod background_job_tests {
     use super::*;
     use freedom_ipfs_core::{cid_from_data, CODEC_RAW};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_reads_short_of_memory_fail_at_once() {
+        let data = b"a block behind a full budget";
+        let cid = cid_from_data(CODEC_RAW, data);
+        let store = SqliteBlockStore::in_memory(1 << 20).unwrap();
+        // An HTTP provider it never gets to ask: memory is reserved first.
+        store
+            .put_provider_records(
+                &cid,
+                &[freedom_ipfs_store::CachedProviderRecord {
+                    id: None,
+                    addrs: vec!["/ip4/127.0.0.1/tcp/9/http".into()],
+                }],
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        let budget = MemoryBudget::new(8 << 20);
+        let _full = budget.try_reserve(budget.limit()).unwrap();
+        let provider = freedom_ipfs_retrieval::FetchingBlockProvider::new(
+            store,
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+        )
+        .with_memory_budget(budget.clone());
+        let read = Arc::new(Mutex::new(None));
+        let started = Instant::now();
+        let job = {
+            let read = read.clone();
+            move || *read.lock().unwrap() = Some(provider.get_block(&cid))
+        };
+        tokio::time::timeout(Duration::from_secs(5), run_blocking_background(None, job))
+            .await
+            .expect("a background read waited for memory")
+            .unwrap();
+        let read = read.lock().unwrap().take().unwrap();
+        assert!(
+            matches!(read, Err(freedom_ipfs_core::CoreError::MemoryBudget(_))),
+            "{read:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn background_jobs_past_the_queue_are_dropped_and_requests_are_not() {

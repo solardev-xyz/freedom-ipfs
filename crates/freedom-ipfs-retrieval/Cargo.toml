@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytes.workspace = true
 cid.workspace = true
 freedom-ipfs-core.workspace = true
 freedom-ipfs-namesys.workspace = true

@@ -1,12 +1,12 @@
 use cid::Cid;
 use freedom_ipfs_core::{
     block_data_range, encode_car_v1, parse_car_v1, verify_block, Block, BlockProvider, CarBlock,
-    CoreError, Result as CoreResult,
+    ChargedBytes, CoreError, FixedPool, HeldBytes, Result as CoreResult,
 };
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
@@ -242,7 +242,26 @@ impl SqliteBlockStore {
         true
     }
 
+    /// Stores a block. The hot cache, if it keeps the block, keeps a copy
+    /// of its own.
     pub fn put_block(&self, cid: &Cid, data: &[u8]) -> Result<()> {
+        self.put_verified_block(cid, data, || ChargedBytes::copy_from_slice(data))
+    }
+
+    /// Stores a block from bytes that may carry memory charges. The hot
+    /// cache, if it keeps the block, shares those bytes rather than copying
+    /// them: it counts them in its own capacity, and takes over their charge
+    /// once it holds the last reference (until then they count twice).
+    pub fn put_charged(&self, cid: &Cid, data: &ChargedBytes) -> Result<()> {
+        self.put_verified_block(cid, data, || data.clone())
+    }
+
+    fn put_verified_block(
+        &self,
+        cid: &Cid,
+        data: &[u8],
+        hot_data: impl FnOnce() -> ChargedBytes,
+    ) -> Result<()> {
         verify_block(cid, data)?;
         let cid_bytes = block_key(cid);
         let now = now_secs();
@@ -271,13 +290,28 @@ impl SqliteBlockStore {
         if inserted_block_evicted {
             self.hot.lock().remove(&cid_bytes);
         } else {
-            self.hot.lock().put_verified(cid_bytes, data.to_vec(), now);
+            self.hot.lock().put_verified(cid_bytes, hot_data(), now);
         }
         Ok(())
     }
 
+    /// Stores `block`, sharing its bytes with the hot cache
+    /// ([`SqliteBlockStore::put_charged`]).
     pub fn put(&self, block: &Block) -> Result<()> {
-        self.put_block(block.cid(), block.data())
+        self.put_charged(block.cid(), block.charged())
+    }
+
+    /// The hot cache's fixed capacity in bytes: a host that budgets memory
+    /// reserves it as the cache's fixed reservation. The cache never covers
+    /// more: it counts each block by its allocation's size, for as long as
+    /// the allocation lives, including after the cache has let it go.
+    pub fn hot_cache_capacity(&self) -> u64 {
+        self.hot.lock().max_bytes
+    }
+
+    /// The bytes the hot cache covers now, of its fixed capacity.
+    pub fn hot_cache_used(&self) -> u64 {
+        self.hot.lock().pool.used() as u64
     }
 
     pub fn get(&self, cid: &Cid) -> Result<Option<Block>> {
@@ -287,7 +321,7 @@ impl SqliteBlockStore {
             if hit.touch_persistent {
                 self.touch_at(cid, now)?;
             }
-            return Ok(Some(Block::unchecked(*cid, hit.data)));
+            return Ok(Some(Block::unchecked_charged(*cid, hit.data)));
         }
 
         let row = self
@@ -304,8 +338,9 @@ impl SqliteBlockStore {
             Some(data) => {
                 verify_block(cid, &data)?;
                 self.touch_at(cid, now)?;
+                let data = ChargedBytes::from_vec(data);
                 self.hot.lock().put_verified(cid_bytes, data.clone(), now);
-                Ok(Some(Block::unchecked(*cid, data)))
+                Ok(Some(Block::unchecked_charged(*cid, data)))
             }
             None => Ok(None),
         }
@@ -340,7 +375,9 @@ impl SqliteBlockStore {
                 verify_block(cid, &data)?;
                 self.touch_at(cid, now)?;
                 let range = block_data_range(&data, start, end);
-                self.hot.lock().put_verified(cid_bytes, data, now);
+                self.hot
+                    .lock()
+                    .put_verified(cid_bytes, ChargedBytes::from_vec(data), now);
                 Ok(Some(range))
             }
             None => Ok(None),
@@ -722,21 +759,31 @@ fn cached_unless_full(written: rusqlite::Result<usize>) -> Result<bool> {
 }
 
 // Private cache for block bytes that were already verified on put or cold read.
+//
+// Its capacity is a fixed reservation: a pool that counts each block by its
+// allocation's size (not its length) for as long as the allocation lives,
+// so a block a reader still holds after the cache evicted it stays counted,
+// and the cache never covers more than its capacity. A block shared with
+// the fetch that charged it dynamically counts twice until the cache holds
+// the last reference; then the cache takes the charge over.
 struct VerifiedHotCache {
     max_bytes: u64,
-    bytes: u64,
+    pool: FixedPool,
     clock: u64,
     entries: HashMap<Vec<u8>, VerifiedHotBlock>,
+    /// Entries whose bytes still carry a dynamic charge, to hand over once
+    /// the cache holds them alone.
+    charged: HashSet<Vec<u8>>,
 }
 
 struct VerifiedHotBlock {
-    data: Vec<u8>,
+    data: HeldBytes,
     last_accessed: u64,
     last_persistent_touch: u64,
 }
 
-struct VerifiedHotCacheHit {
-    data: Vec<u8>,
+struct VerifiedHotCacheHit<T> {
+    data: T,
     touch_persistent: bool,
 }
 
@@ -744,13 +791,25 @@ impl VerifiedHotCache {
     fn new(max_bytes: u64) -> Self {
         Self {
             max_bytes,
-            bytes: 0,
+            pool: FixedPool::new(usize::try_from(max_bytes).unwrap_or(usize::MAX)),
             clock: 0,
             entries: HashMap::new(),
+            charged: HashSet::new(),
         }
     }
 
-    fn get_verified(&mut self, cid: &[u8], now: u64) -> Option<VerifiedHotCacheHit> {
+    /// Takes over the dynamic charges of the entries the cache now holds
+    /// alone.
+    fn take_over_charges(&mut self) {
+        let entries = &self.entries;
+        self.charged.retain(|cid| {
+            entries.get(cid).is_some_and(|entry| {
+                !entry.data.take_over_if_only_held() && entry.data.bytes().charged_bytes() > 0
+            })
+        });
+    }
+
+    fn touch(&mut self, cid: &[u8], now: u64) -> Option<(&VerifiedHotBlock, bool)> {
         let entry = self.entries.get_mut(cid)?;
         self.clock = self.clock.saturating_add(1);
         entry.last_accessed = self.clock;
@@ -759,8 +818,14 @@ impl VerifiedHotCache {
         if touch_persistent {
             entry.last_persistent_touch = now;
         }
+        Some((entry, touch_persistent))
+    }
+
+    fn get_verified(&mut self, cid: &[u8], now: u64) -> Option<VerifiedHotCacheHit<ChargedBytes>> {
+        self.take_over_charges();
+        let (entry, touch_persistent) = self.touch(cid, now)?;
         Some(VerifiedHotCacheHit {
-            data: entry.data.clone(),
+            data: entry.data.bytes().clone(),
             touch_persistent,
         })
     }
@@ -771,31 +836,41 @@ impl VerifiedHotCache {
         now: u64,
         start: u64,
         end: u64,
-    ) -> Option<VerifiedHotCacheHit> {
-        let entry = self.entries.get_mut(cid)?;
-        self.clock = self.clock.saturating_add(1);
-        entry.last_accessed = self.clock;
-        let touch_persistent =
-            now.saturating_sub(entry.last_persistent_touch) >= HOT_CACHE_TOUCH_INTERVAL.as_secs();
-        if touch_persistent {
-            entry.last_persistent_touch = now;
-        }
+    ) -> Option<VerifiedHotCacheHit<Vec<u8>>> {
+        self.take_over_charges();
+        let (entry, touch_persistent) = self.touch(cid, now)?;
         Some(VerifiedHotCacheHit {
-            data: block_data_range(&entry.data, start, end),
+            data: block_data_range(entry.data.bytes(), start, end),
             touch_persistent,
         })
     }
 
-    fn put_verified(&mut self, cid: Vec<u8>, data: Vec<u8>, now: u64) {
-        if self.max_bytes == 0 || data.len() as u64 > self.max_bytes {
+    fn put_verified(&mut self, cid: Vec<u8>, data: ChargedBytes, now: u64) {
+        self.take_over_charges();
+        if self.max_bytes == 0 || data.backing_capacity() as u64 > self.max_bytes {
             self.remove(&cid);
             return;
         }
-        if let Some(existing) = self.entries.remove(&cid) {
-            self.bytes = self.bytes.saturating_sub(existing.data.len() as u64);
+        self.remove(&cid);
+        // Bytes another pool covers are copied: one cover per allocation.
+        let mut data = data;
+        if data.is_covered() && !self.pool.covers(&data) {
+            data = ChargedBytes::copy_from_slice(&data);
         }
+        // Make room, oldest first. Evicting a block a reader still holds
+        // frees no room: it stays covered until it is freed.
+        let data = loop {
+            if let Some(held) = self.pool.hold(&data) {
+                break held;
+            }
+            if !self.evict_oldest() {
+                return;
+            }
+        };
         self.clock = self.clock.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(data.len() as u64);
+        if data.bytes().charged_bytes() > 0 {
+            self.charged.insert(cid.clone());
+        }
         self.entries.insert(
             cid,
             VerifiedHotBlock {
@@ -804,33 +879,30 @@ impl VerifiedHotCache {
                 last_persistent_touch: now,
             },
         );
-        self.evict_if_needed();
+        self.take_over_charges();
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        let Some(cid) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, block)| block.last_accessed)
+            .map(|(cid, _)| cid.clone())
+        else {
+            return false;
+        };
+        self.remove(&cid);
+        true
     }
 
     fn remove(&mut self, cid: &[u8]) {
-        if let Some(block) = self.entries.remove(cid) {
-            self.bytes = self.bytes.saturating_sub(block.data.len() as u64);
-        }
+        self.entries.remove(cid);
+        self.charged.remove(cid);
     }
 
     fn clear(&mut self) {
         self.entries.clear();
-        self.bytes = 0;
-    }
-
-    fn evict_if_needed(&mut self) {
-        while self.bytes > self.max_bytes {
-            let Some(cid) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, block)| block.last_accessed)
-                .map(|(cid, _)| cid.clone())
-            else {
-                self.bytes = 0;
-                return;
-            };
-            self.remove(&cid);
-        }
+        self.charged.clear();
     }
 }
 
@@ -939,6 +1011,70 @@ mod tests {
             past.err()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fetched block's bytes as a view into a larger, charged receive
+    /// buffer: `len` of `backing` bytes, `backing` reserved from `budget`.
+    fn charged_view(
+        budget: &freedom_ipfs_core::MemoryBudget,
+        data: &[u8],
+        backing: usize,
+    ) -> ChargedBytes {
+        let mut buffer =
+            freedom_ipfs_core::ReservedVec::zeroed(backing, budget.try_reserve(backing).unwrap())
+                .unwrap();
+        buffer.as_mut_slice()[..data.len()].copy_from_slice(data);
+        buffer.into_charged().slice(0, data.len())
+    }
+
+    #[test]
+    fn the_hot_cache_counts_allocations_and_takes_charges_over_from_the_last_owner() {
+        let budget = freedom_ipfs_core::MemoryBudget::new(1 << 20);
+        let store = SqliteBlockStore::in_memory_with(StoreOptions {
+            max_bytes: 1 << 20,
+            hot_cache_bytes: Some(16 * 1024),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        assert_eq!(store.hot_cache_capacity(), 16 * 1024);
+        let data = vec![7u8; 3_000];
+        let cid = cid_from_data(CODEC_RAW, &data);
+        let fetched = charged_view(&budget, &data, 4_000);
+
+        // Shared with the fetch, the block counts twice: its whole 4,000-byte
+        // allocation in the cache's capacity, and its dynamic charge.
+        store.put_charged(&cid, &fetched).unwrap();
+        assert_eq!(store.hot_cache_used(), 4_000);
+        assert_eq!(budget.used(), 4_000);
+        let hit = store.get(&cid).unwrap().unwrap();
+        assert_eq!(hit.data(), &data[..]);
+        assert_eq!(hit.charged().backing_capacity(), 4_000, "no copy");
+        assert_eq!(budget.used(), 4_000);
+
+        // Once the cache holds the last reference, it takes the charge over,
+        // as the last other handle is dropped.
+        drop(fetched);
+        assert_eq!(budget.used(), 4_000);
+        drop(hit);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(store.hot_cache_used(), 4_000);
+        assert!(store.get(&cid).unwrap().is_some());
+
+        // A reader holds it while the cache evicts it: it stays counted
+        // until the reader lets go, so other blocks can't take its room.
+        let reader = store.get(&cid).unwrap().unwrap();
+        for n in 0..6u8 {
+            let other = vec![n; 3_000];
+            store
+                .put_block(&cid_from_data(CODEC_RAW, &other), &other)
+                .unwrap();
+        }
+        assert!(!store.hot.lock().entries.contains_key(&block_key(&cid)));
+        assert!(store.hot_cache_used() <= 16 * 1024);
+        let held = store.hot_cache_used();
+        drop(reader);
+        assert_eq!(store.hot_cache_used(), held - 4_000);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
