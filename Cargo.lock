@@ -906,11 +906,13 @@ dependencies = [
 name = "freedom-ipfs-core"
 version = "0.4.6"
 dependencies = [
+ "bytes",
  "cid",
  "data-encoding",
  "multihash",
  "multihash-codetable",
  "thiserror 2.0.18",
+ "tokio",
  "unsigned-varint 0.8.0",
 ]
 
@@ -989,6 +991,7 @@ dependencies = [
 name = "freedom-ipfs-retrieval"
 version = "0.4.6"
 dependencies = [
+ "bytes",
  "cid",
  "freedom-ipfs-core",
  "freedom-ipfs-namesys",

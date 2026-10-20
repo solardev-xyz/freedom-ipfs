@@ -35,6 +35,18 @@ pub enum UnixfsError {
     InvalidDagPb(String),
     #[error("block provider: {0}")]
     Provider(String),
+    /// The provider couldn't reserve memory for a block: a host maps it to
+    /// busy.
+    #[error("memory budget: {0}")]
+    MemoryBudget(freedom_ipfs_core::BudgetError),
+}
+
+/// A provider's error as UnixFS reports it: a memory refusal stays one.
+fn provider_error(err: freedom_ipfs_core::CoreError) -> UnixfsError {
+    match err {
+        freedom_ipfs_core::CoreError::MemoryBudget(refusal) => UnixfsError::MemoryBudget(refusal),
+        other => UnixfsError::Provider(other.to_string()),
+    }
 }
 
 pub type Result<T> = std::result::Result<T, UnixfsError>;
@@ -492,21 +504,21 @@ impl<'a> UnixfsContext<'a> {
     fn get_block(&self, cid: &Cid) -> Result<Block> {
         self.provider
             .get_block(cid)
-            .map_err(|err| UnixfsError::Provider(err.to_string()))?
+            .map_err(provider_error)?
             .ok_or(UnixfsError::NotFound(*cid))
     }
 
     fn get_block_range(&self, cid: &Cid, start: u64, end: u64) -> Result<Vec<u8>> {
         self.provider
             .get_block_range(cid, start, end)
-            .map_err(|err| UnixfsError::Provider(err.to_string()))?
+            .map_err(provider_error)?
             .ok_or(UnixfsError::NotFound(*cid))
     }
 
     fn get_block_ranges(&self, ranges: &[(Cid, u64, u64)]) -> Result<Vec<Vec<u8>>> {
         self.provider
             .get_block_ranges(ranges)
-            .map_err(|err| UnixfsError::Provider(err.to_string()))?
+            .map_err(provider_error)?
             .into_iter()
             .zip(ranges.iter())
             .map(|(bytes, (cid, _, _))| bytes.ok_or(UnixfsError::NotFound(*cid)))
