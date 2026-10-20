@@ -4,7 +4,7 @@ use freedom_ipfs_core::{
     CoreError, Result as CoreResult,
 };
 use parking_lot::Mutex;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -26,9 +26,37 @@ pub enum StoreError {
     Core(#[from] CoreError),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// SQLite can't hold the store to the page cap asked for: the database
+    /// already has more pages, or the cap is past SQLite's own limit.
+    #[error("page cap {requested} can't be installed (SQLite keeps {installed})")]
+    PageCap { requested: u32, installed: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// How a store is sized. The default is what [`SqliteBlockStore::open`] and
+/// [`SqliteBlockStore::in_memory`] have always done: 256 MiB of blocks, a hot
+/// cache of `min(max_bytes, 16 MiB)`, and SQLite's own page limits.
+///
+/// A host that must bound the store's memory (an in-memory store holds every
+/// block twice: in SQLite's pages and, while hot, in the hot cache) sets the
+/// hot cache apart from `max_bytes`, and caps SQLite's pages. A write that
+/// meets the page cap leaves its entry uncached and succeeds: the block, name
+/// or provider record still serves the request that fetched it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoreOptions {
+    /// Block bytes kept before the least recently used are evicted; 0 means
+    /// 256 MiB.
+    pub max_bytes: u64,
+    /// The verified hot cache's capacity in bytes; `None` keeps
+    /// `min(max_bytes, 16 MiB)`, and `Some(0)` turns it off.
+    pub hot_cache_bytes: Option<u64>,
+    /// SQLite's page cap (`PRAGMA max_page_count`). A write past it fails
+    /// with `SQLITE_FULL` inside the store, which leaves the entry uncached.
+    pub max_page_count: Option<u32>,
+    /// SQLite's page cache in KiB (`PRAGMA cache_size = -N`).
+    pub cache_kib: Option<u32>,
+}
 
 #[derive(Clone)]
 pub struct SqliteBlockStore {
@@ -46,39 +74,80 @@ pub struct CachedProviderRecord {
 
 impl SqliteBlockStore {
     pub fn open(path: impl AsRef<Path>, max_bytes: u64) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        let max_bytes = if max_bytes == 0 {
+        Self::open_with(
+            path,
+            StoreOptions {
+                max_bytes,
+                ..StoreOptions::default()
+            },
+        )
+    }
+
+    pub fn in_memory(max_bytes: u64) -> Result<Self> {
+        Self::in_memory_with(StoreOptions {
+            max_bytes,
+            ..StoreOptions::default()
+        })
+    }
+
+    /// A store in the file at `path`, sized by `options`.
+    pub fn open_with(path: impl AsRef<Path>, options: StoreOptions) -> Result<Self> {
+        Self::with_connection(Connection::open(path)?, options)
+    }
+
+    /// A store in memory, sized by `options`. Its temporary tables and
+    /// indices are kept in memory too (`PRAGMA temp_store = MEMORY`), so it
+    /// never writes a temporary file.
+    pub fn in_memory_with(options: StoreOptions) -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA temp_store = MEMORY;")?;
+        Self::with_connection(conn, options)
+    }
+
+    fn with_connection(conn: Connection, options: StoreOptions) -> Result<Self> {
+        let max_bytes = if options.max_bytes == 0 {
             DEFAULT_CACHE_BYTES
         } else {
-            max_bytes
+            options.max_bytes
         };
-        let hot_cache = VerifiedHotCache::new(hot_cache_bytes(max_bytes));
+        let hot_bytes = options
+            .hot_cache_bytes
+            .unwrap_or_else(|| hot_cache_bytes(max_bytes));
+        if let Some(pages) = options.max_page_count {
+            // SQLite answers the cap it installed, which isn't the one asked
+            // for when the database already has more pages or the value is
+            // past its limit. A cap the host reserved memory by must hold.
+            let installed =
+                conn.query_row(&format!("PRAGMA max_page_count = {pages}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+            if installed != i64::from(pages) {
+                return Err(StoreError::PageCap {
+                    requested: pages,
+                    installed,
+                });
+            }
+        }
+        if let Some(kib) = options.cache_kib {
+            conn.execute_batch(&format!("PRAGMA cache_size = -{kib};"))?;
+        }
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             max_bytes,
-            hot: Arc::new(Mutex::new(hot_cache)),
+            hot: Arc::new(Mutex::new(VerifiedHotCache::new(hot_bytes))),
             retained: Arc::new(Mutex::new(HashMap::new())),
         };
         store.init()?;
         Ok(store)
     }
 
-    pub fn in_memory(max_bytes: u64) -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        let max_bytes = if max_bytes == 0 {
-            DEFAULT_CACHE_BYTES
-        } else {
-            max_bytes
-        };
-        let hot_cache = VerifiedHotCache::new(hot_cache_bytes(max_bytes));
-        let store = Self {
-            conn: Arc::new(Mutex::new(conn)),
-            max_bytes,
-            hot: Arc::new(Mutex::new(hot_cache)),
-            retained: Arc::new(Mutex::new(HashMap::new())),
-        };
-        store.init()?;
-        Ok(store)
+    /// The bytes SQLite's pages take: `page_count × page_size`. For an
+    /// in-memory store, that is the memory the database holds.
+    pub fn page_bytes(&self) -> Result<u64> {
+        let conn = self.conn.lock();
+        let count = conn.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))?;
+        let size = conn.query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))?;
+        Ok((count.max(0) as u64).saturating_mul(size.max(0) as u64))
     }
 
     fn init(&self) -> Result<()> {
@@ -177,7 +246,7 @@ impl SqliteBlockStore {
         verify_block(cid, data)?;
         let cid_bytes = block_key(cid);
         let now = now_secs();
-        self.conn.lock().execute(
+        let stored = cached_unless_full(self.conn.lock().execute(
             r#"
             INSERT INTO blocks(cid, codec, size, data, inserted_at, last_accessed_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
@@ -194,7 +263,10 @@ impl SqliteBlockStore {
                 data,
                 now as i64
             ],
-        )?;
+        ))?;
+        if !stored {
+            return Ok(());
+        }
         let inserted_block_evicted = self.evict_if_needed_tracking(&cid_bytes)?;
         if inserted_block_evicted {
             self.hot.lock().remove(&cid_bytes);
@@ -312,7 +384,8 @@ impl SqliteBlockStore {
     ) -> Result<()> {
         let expires_at = now_secs().saturating_add(ttl.as_secs());
         let providers_json = serde_json::to_string(providers)?;
-        self.conn.lock().execute(
+        let conn = self.conn.lock();
+        let stored = cached_unless_full(conn.execute(
             r#"
             INSERT INTO provider_cache(cid, providers_json, expires_at)
             VALUES (?1, ?2, ?3)
@@ -321,7 +394,15 @@ impl SqliteBlockStore {
                 expires_at = excluded.expires_at
             "#,
             params![provider_cache_key(cid), providers_json, expires_at as i64],
-        )?;
+        ))?;
+        if !stored {
+            // The refused update left the old row: it must not answer for
+            // the new one.
+            conn.execute(
+                "DELETE FROM provider_cache WHERE cid = ?1",
+                params![provider_cache_key(cid)],
+            )?;
+        }
         Ok(())
     }
 
@@ -356,7 +437,8 @@ impl SqliteBlockStore {
         }
         let now = now_secs();
         let expires_at = now.saturating_add(ttl.as_secs());
-        self.conn.lock().execute(
+        let conn = self.conn.lock();
+        let stored = cached_unless_full(conn.execute(
             r#"
             INSERT INTO name_cache(name, resolved_target, expires_at, updated_at)
             VALUES (?1, ?2, ?3, ?4)
@@ -366,7 +448,13 @@ impl SqliteBlockStore {
                 updated_at = excluded.updated_at
             "#,
             params![name, resolved_target, expires_at as i64, now as i64],
-        )?;
+        ))?;
+        if !stored {
+            // The refused update left the old target: it must not answer.
+            conn.execute("DELETE FROM name_cache WHERE name = ?1", params![name])?;
+            return Ok(());
+        }
+        drop(conn);
         self.prune_name_cache()?;
         Ok(())
     }
@@ -396,7 +484,8 @@ impl SqliteBlockStore {
 
     pub fn mark_bad_provider(&self, peer_or_url: &str, reason: &str, ttl: Duration) -> Result<()> {
         let expires_at = now_secs().saturating_add(ttl.as_secs());
-        self.conn.lock().execute(
+        let conn = self.conn.lock();
+        let stored = cached_unless_full(conn.execute(
             r#"
             INSERT INTO bad_providers(peer_or_url, reason, expires_at)
             VALUES (?1, ?2, ?3)
@@ -405,7 +494,14 @@ impl SqliteBlockStore {
                 expires_at = excluded.expires_at
             "#,
             params![peer_or_url, reason, expires_at as i64],
-        )?;
+        ))?;
+        if !stored {
+            // The refused update left the old mark and its expiry.
+            conn.execute(
+                "DELETE FROM bad_providers WHERE peer_or_url = ?1",
+                params![peer_or_url],
+            )?;
+        }
         Ok(())
     }
 
@@ -610,6 +706,21 @@ fn hot_cache_bytes(max_bytes: u64) -> u64 {
     max_bytes.min(DEFAULT_HOT_CACHE_BYTES)
 }
 
+/// A cache write's outcome: whether the entry was stored. One that met the
+/// page cap (`SQLITE_FULL`) wasn't, and that is not an error: the entry is
+/// left uncached, and the request it served goes on. SQLite rolls back the
+/// failed statement, so nothing of it is left behind; but a refused update
+/// leaves the row it would have replaced, which a metadata caller deletes.
+fn cached_unless_full(written: rusqlite::Result<usize>) -> Result<bool> {
+    match written {
+        Ok(_) => Ok(true),
+        Err(rusqlite::Error::SqliteFailure(failure, _)) if failure.code == ErrorCode::DiskFull => {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 // Private cache for block bytes that were already verified on put or cold read.
 struct VerifiedHotCache {
     max_bytes: u64,
@@ -727,6 +838,232 @@ impl VerifiedHotCache {
 mod tests {
     use super::*;
     use freedom_ipfs_core::{cid_from_data, CODEC_DAG_PB, CODEC_RAW};
+
+    fn pragma(store: &SqliteBlockStore, name: &str) -> i64 {
+        store
+            .conn
+            .lock()
+            .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn default_options_size_the_store_as_before() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        assert_eq!(store.max_bytes, 1024 * 1024);
+        assert_eq!(store.hot.lock().max_bytes, 1024 * 1024);
+        let store = SqliteBlockStore::in_memory(0).unwrap();
+        assert_eq!(store.max_bytes, DEFAULT_CACHE_BYTES);
+        assert_eq!(store.hot.lock().max_bytes, DEFAULT_HOT_CACHE_BYTES);
+    }
+
+    #[test]
+    fn an_in_memory_store_keeps_temporary_tables_in_memory() {
+        // 2 is MEMORY.
+        assert_eq!(
+            pragma(&SqliteBlockStore::in_memory(0).unwrap(), "temp_store"),
+            2
+        );
+        let store = SqliteBlockStore::in_memory_with(StoreOptions::default()).unwrap();
+        assert_eq!(pragma(&store, "temp_store"), 2);
+    }
+
+    #[test]
+    fn options_set_the_page_cap_and_the_page_cache() {
+        let store = SqliteBlockStore::in_memory_with(StoreOptions {
+            max_page_count: Some(500),
+            cache_kib: Some(1024),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        assert_eq!(pragma(&store, "max_page_count"), 500);
+        assert_eq!(pragma(&store, "cache_size"), -1024);
+        let size = pragma(&store, "page_size") as u64;
+        assert_eq!(
+            store.page_bytes().unwrap(),
+            pragma(&store, "page_count") as u64 * size
+        );
+    }
+
+    #[test]
+    fn a_page_cap_that_cant_be_installed_fails_the_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "freedom-ipfs-store-cap-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.sqlite");
+        let store = SqliteBlockStore::open(&path, 0).unwrap();
+        for i in 0..4u8 {
+            let data = vec![i; 64 * 1024];
+            store
+                .put_block(&cid_from_data(CODEC_RAW, &data), &data)
+                .unwrap();
+        }
+        let pages = pragma(&store, "page_count");
+        assert!(store.close(Duration::from_secs(5)));
+        drop(store);
+        // Below the pages the database already has.
+        let refused = SqliteBlockStore::open_with(
+            &path,
+            StoreOptions {
+                max_page_count: Some(1),
+                ..StoreOptions::default()
+            },
+        );
+        assert!(
+            matches!(refused, Err(StoreError::PageCap { requested: 1, installed }) if installed >= pages),
+            "{:?}",
+            refused.err()
+        );
+        // At or above them it holds.
+        let held = SqliteBlockStore::open_with(
+            &path,
+            StoreOptions {
+                max_page_count: Some(pages as u32 + 10),
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(pragma(&held, "max_page_count"), pages + 10);
+        drop(held);
+        // Past SQLite's own limit.
+        let past = SqliteBlockStore::in_memory_with(StoreOptions {
+            max_page_count: Some(u32::MAX),
+            ..StoreOptions::default()
+        });
+        assert!(
+            matches!(past, Err(StoreError::PageCap { .. })),
+            "{:?}",
+            past.err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hot_cache_is_sized_apart_from_max_bytes() {
+        let off = SqliteBlockStore::in_memory_with(StoreOptions {
+            hot_cache_bytes: Some(0),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        let data = b"not kept twice";
+        let cid = cid_from_data(CODEC_RAW, data);
+        off.put_block(&cid, data).unwrap();
+        assert!(off.hot.lock().entries.is_empty());
+        assert_eq!(off.get(&cid).unwrap().unwrap().data(), data);
+
+        let large = SqliteBlockStore::in_memory_with(StoreOptions {
+            max_bytes: 1024,
+            hot_cache_bytes: Some(64 * 1024 * 1024),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        assert_eq!(large.hot.lock().max_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_write_past_the_page_cap_leaves_its_entry_uncached() {
+        let store = SqliteBlockStore::in_memory_with(StoreOptions {
+            max_page_count: Some(64),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        let cap = 64 * pragma(&store, "page_size") as u64;
+        // 64 KiB blocks until one doesn't fit: every put succeeds.
+        let mut stored = Vec::new();
+        let mut refused = None;
+        for i in 0..16u8 {
+            let data = vec![i; 64 * 1024];
+            let cid = cid_from_data(CODEC_RAW, &data);
+            store.put_block(&cid, &data).unwrap();
+            if store.get(&cid).unwrap().is_some() {
+                stored.push((cid, data));
+            } else {
+                refused = Some(cid);
+                break;
+            }
+        }
+        let refused = refused.expect("the page cap was never met");
+        assert!(!stored.is_empty());
+        assert!(!store.hot.lock().entries.contains_key(&block_key(&refused)));
+        for (cid, data) in &stored {
+            assert_eq!(store.get(cid).unwrap().unwrap().data(), &data[..]);
+        }
+        assert!(store.page_bytes().unwrap() <= cap);
+
+        // Names, provider records and bad providers that need new pages
+        // are left uncached too.
+        let long = "x".repeat(16 * 1024);
+        store
+            .put_name_record("example.com", &long, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(store.get_name_record("example.com").unwrap(), None);
+        let providers = vec![CachedProviderRecord {
+            id: Some("peer".to_string()),
+            addrs: vec![long.clone()],
+        }];
+        store
+            .put_provider_records(&refused, &providers, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(store.get_provider_records(&refused).unwrap(), None);
+        store
+            .mark_bad_provider(&long, "slow", Duration::from_secs(60))
+            .unwrap();
+        assert!(!store.is_bad_provider(&long).unwrap());
+
+        // A refreshed entry that no longer fits is gone, not left stale.
+        // (Seeded first, then the store filled again.)
+        store.trim_blocks_to(0).unwrap();
+        store
+            .put_name_record("seeded.example", "old-target", Duration::from_secs(60))
+            .unwrap();
+        let seeded = vec![CachedProviderRecord {
+            id: Some("old".to_string()),
+            addrs: vec![],
+        }];
+        store
+            .put_provider_records(&refused, &seeded, Duration::from_secs(60))
+            .unwrap();
+        store
+            .mark_bad_provider("seeded-peer", "old", Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(
+            store.get_name_record("seeded.example").unwrap().as_deref(),
+            Some("old-target")
+        );
+        assert!(store.get_provider_records(&refused).unwrap().is_some());
+        assert!(store.is_bad_provider("seeded-peer").unwrap());
+        for i in 0..16u8 {
+            let data = vec![i.wrapping_add(100); 64 * 1024];
+            let cid = cid_from_data(CODEC_RAW, &data);
+            store.put_block(&cid, &data).unwrap();
+            if store.get(&cid).unwrap().is_none() {
+                break;
+            }
+        }
+        store
+            .put_name_record("seeded.example", &long, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(store.get_name_record("seeded.example").unwrap(), None);
+        store
+            .put_provider_records(&refused, &providers, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(store.get_provider_records(&refused).unwrap(), None);
+        let long_reason = "r".repeat(16 * 1024);
+        store
+            .mark_bad_provider("seeded-peer", &long_reason, Duration::from_secs(60))
+            .unwrap();
+        assert!(!store.is_bad_provider("seeded-peer").unwrap());
+
+        // Room made, the same block is cached again.
+        store.trim_blocks_to(0).unwrap();
+        let data = vec![0u8; 64 * 1024];
+        let cid = cid_from_data(CODEC_RAW, &data);
+        store.put_block(&cid, &data).unwrap();
+        assert!(store.get(&cid).unwrap().is_some());
+    }
 
     #[test]
     fn close_releases_the_file_while_clones_are_alive() {
