@@ -39,8 +39,8 @@
 use std::cell::Cell;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 pub use freedom_ipfs_core::{BudgetError, ChargedBytes, MemoryBudget, Reservation, ReservedVec};
 
@@ -134,17 +134,20 @@ impl Drop for MemoryWaitGuard {
 }
 
 /// A fetch's memory: the budget its receive buffers reserve from, and what
-/// memory pressure did to it, so the fetch tells local pressure from a
+/// memory pressure did to it, so the fetch can tell local pressure from a
 /// provider's fault:
 ///
-/// - **a refusal:** a reservation that failed (it couldn't wait, or its
+/// - **refusals:** a reservation that failed (it couldn't wait, or its
 ///   deadline passed), or one whose wait was cut short (an enclosing timer
 ///   fired, or its future was dropped) before it was served;
-/// - **a wait:** any reservation that found the budget full and waited;
-/// - **the waits now outstanding**, which a coalesced follower watches.
+/// - **the waits now outstanding**, which a coalesced follower watches;
+/// - **waits begun**, served or not.
 ///
-/// Clones share all of it: the request side and the Bitswap swarm's side
-/// of one fetch see the same.
+/// Pressure is attributed to an operation, not to the fetch for good: a
+/// [`PressureWindow`] opened when the operation starts sees only what
+/// happened since, so a wait served before (or during) it doesn't excuse a
+/// later timeout. Clones share all of it: the request side and the Bitswap
+/// swarm's side of one fetch see the same.
 #[derive(Clone)]
 pub(crate) struct FetchMemory {
     budget: MemoryBudget,
@@ -152,10 +155,26 @@ pub(crate) struct FetchMemory {
 }
 
 struct FetchMemoryState {
+    /// The first refusal, which the fetch fails as if it fails.
     refusal: OnceLock<BudgetError>,
-    waited: AtomicBool,
+    /// The latest refusal, and how many there were.
+    latest_refusal: Mutex<Option<BudgetError>>,
+    refusals: AtomicU64,
+    /// Waits begun, served or not.
+    waits: AtomicU64,
     /// Bytes the fetch's reservations wait for now (0: none waits).
     waiting: tokio::sync::watch::Sender<usize>,
+}
+
+impl FetchMemoryState {
+    fn refuse(&self, refusal: BudgetError) {
+        let _ = self.refusal.set(refusal);
+        *self
+            .latest_refusal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(refusal);
+        self.refusals.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 tokio::task_local! {
@@ -173,10 +192,8 @@ struct WaitGuard<'a> {
 impl Drop for WaitGuard<'_> {
     fn drop(&mut self) {
         if !self.served {
-            let _ = self
-                .state
-                .refusal
-                .set(BudgetError::Exhausted { bytes: self.bytes });
+            self.state
+                .refuse(BudgetError::Exhausted { bytes: self.bytes });
         }
         let bytes = self.bytes;
         self.state
@@ -191,7 +208,9 @@ impl FetchMemory {
             budget,
             state: Arc::new(FetchMemoryState {
                 refusal: OnceLock::new(),
-                waited: AtomicBool::new(false),
+                latest_refusal: Mutex::new(None),
+                refusals: AtomicU64::new(0),
+                waits: AtomicU64::new(0),
                 waiting: tokio::sync::watch::Sender::new(0),
             }),
         }
@@ -200,12 +219,6 @@ impl FetchMemory {
     /// The memory of the fetch running now, if its node has a budget.
     pub(crate) fn current() -> Option<Self> {
         FETCH_MEMORY.try_with(Clone::clone).ok()
-    }
-
-    /// Whether the fetch running now met memory pressure: a refusal, or a
-    /// wait. Its slowness or failure is then not a provider's to answer for.
-    pub(crate) fn current_pressured() -> bool {
-        Self::current().is_some_and(|memory| memory.pressured())
     }
 
     /// Runs `future` as a fetch with `memory` (nothing new without one).
@@ -224,11 +237,11 @@ impl FetchMemory {
             Ok(reservation) => return Ok(reservation),
             Err(BudgetError::Exhausted { .. }) if wait != MemoryWait::Never => {}
             Err(refusal) => {
-                let _ = self.state.refusal.set(refusal);
+                self.state.refuse(refusal);
                 return Err(refusal);
             }
         }
-        self.state.waited.store(true, Ordering::Release);
+        self.state.waits.fetch_add(1, Ordering::AcqRel);
         self.state
             .waiting
             .send_modify(|waiting| *waiting = waiting.saturating_add(bytes));
@@ -243,14 +256,20 @@ impl FetchMemory {
         reserved
     }
 
+    /// `bytes` if they are free now, and `None` (recording nothing) if not:
+    /// for a reservation that would rather give up what it holds than wait.
+    pub(crate) fn reserve_now(&self, bytes: usize) -> Option<Reservation> {
+        self.budget.try_reserve(bytes).ok()
+    }
+
     /// The first refusal the fetch met, if any (a wait cut short counts).
     pub(crate) fn refusal(&self) -> Option<BudgetError> {
         self.state.refusal.get().copied()
     }
 
-    /// Whether the fetch met memory pressure: a refusal, or a wait.
-    pub(crate) fn pressured(&self) -> bool {
-        self.refusal().is_some() || self.state.waited.load(Ordering::Acquire)
+    /// The bytes the fetch's reservations wait for now.
+    pub(crate) fn waiting(&self) -> usize {
+        *self.state.waiting.borrow()
     }
 
     /// The fetch's refusal, counting a wait still outstanding as one: what a
@@ -258,19 +277,8 @@ impl FetchMemory {
     /// short by (the waiting side may not have seen it yet).
     pub(crate) fn refusal_or_outstanding(&self) -> Option<BudgetError> {
         self.refusal().or_else(|| {
-            let waiting = *self.state.waiting.borrow();
+            let waiting = self.waiting();
             (waiting > 0).then_some(BudgetError::Exhausted { bytes: waiting })
-        })
-    }
-
-    /// What the fetch's memory pressure makes of a failure: the refusal, or
-    /// a full budget for a fetch that waited.
-    pub(crate) fn pressure_error(&self) -> Option<BudgetError> {
-        self.refusal().or_else(|| {
-            self.state
-                .waited
-                .load(Ordering::Acquire)
-                .then_some(BudgetError::Exhausted { bytes: 0 })
         })
     }
 
@@ -287,6 +295,64 @@ impl FetchMemory {
             // The sender lives as long as this handle: never reached.
             Err(_) => std::future::pending().await,
         }
+    }
+}
+
+/// Memory pressure on one operation of a fetch (a timed read, a request, a
+/// provider attempt): opened when the operation starts, it sees only what
+/// happened since. Nothing, for a fetch without a budget.
+pub(crate) struct PressureWindow {
+    opened: Option<(FetchMemory, u64, u64)>,
+}
+
+impl PressureWindow {
+    /// A window on the current fetch's memory, from now.
+    pub(crate) fn open() -> Self {
+        Self {
+            opened: FetchMemory::current().map(|memory| {
+                let refusals = memory.state.refusals.load(Ordering::Acquire);
+                let waits = memory.state.waits.load(Ordering::Acquire);
+                (memory, refusals, waits)
+            }),
+        }
+    }
+
+    /// A window that sees nothing.
+    #[cfg(test)]
+    pub(crate) fn none() -> Self {
+        Self { opened: None }
+    }
+
+    /// What makes the operation's failure the memory budget's: a wait still
+    /// outstanding, or a refusal since the window opened. A wait served
+    /// before or during it doesn't: the failure is then the network's.
+    pub(crate) fn pressure(&self) -> Option<BudgetError> {
+        let (memory, refusals, _) = self.opened.as_ref()?;
+        let waiting = memory.waiting();
+        if waiting > 0 {
+            return Some(BudgetError::Exhausted { bytes: waiting });
+        }
+        if memory.state.refusals.load(Ordering::Acquire) > *refusals {
+            return *memory
+                .state
+                .latest_refusal
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        None
+    }
+
+    /// Whether the operation's failure is the memory budget's.
+    pub(crate) fn pressured(&self) -> bool {
+        self.pressure().is_some()
+    }
+
+    /// Whether any reservation waited during the operation, served or not:
+    /// then the time it took is partly memory's, not a peer's slowness.
+    pub(crate) fn waited(&self) -> bool {
+        self.opened.as_ref().is_some_and(|(memory, _, waits)| {
+            memory.state.waits.load(Ordering::Acquire) > *waits || memory.waiting() > 0
+        })
     }
 }
 

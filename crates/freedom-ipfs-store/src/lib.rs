@@ -243,9 +243,9 @@ impl SqliteBlockStore {
     }
 
     /// Stores a block. The hot cache, if it keeps the block, keeps a copy
-    /// of its own.
+    /// of its own, made only once it has room for it.
     pub fn put_block(&self, cid: &Cid, data: &[u8]) -> Result<()> {
-        self.put_verified_block(cid, data, || ChargedBytes::copy_from_slice(data))
+        self.put_verified_block(cid, data, HotInput::Copy(data))
     }
 
     /// Stores a block from bytes that may carry memory charges. The hot
@@ -253,15 +253,10 @@ impl SqliteBlockStore {
     /// them: it counts them in its own capacity, and takes over their charge
     /// once it holds the last reference (until then they count twice).
     pub fn put_charged(&self, cid: &Cid, data: &ChargedBytes) -> Result<()> {
-        self.put_verified_block(cid, data, || data.clone())
+        self.put_verified_block(cid, data, HotInput::Shared(data.clone()))
     }
 
-    fn put_verified_block(
-        &self,
-        cid: &Cid,
-        data: &[u8],
-        hot_data: impl FnOnce() -> ChargedBytes,
-    ) -> Result<()> {
+    fn put_verified_block(&self, cid: &Cid, data: &[u8], hot_data: HotInput<'_>) -> Result<()> {
         verify_block(cid, data)?;
         let cid_bytes = block_key(cid);
         let now = now_secs();
@@ -290,7 +285,7 @@ impl SqliteBlockStore {
         if inserted_block_evicted {
             self.hot.lock().remove(&cid_bytes);
         } else {
-            self.hot.lock().put_verified(cid_bytes, hot_data(), now);
+            self.hot.lock().put_input(cid_bytes, hot_data, now);
         }
         Ok(())
     }
@@ -776,6 +771,13 @@ struct VerifiedHotCache {
     charged: HashSet<Vec<u8>>,
 }
 
+/// What the hot cache is given: bytes to share, or bytes to copy (once
+/// it has room for the copy).
+enum HotInput<'a> {
+    Shared(ChargedBytes),
+    Copy(&'a [u8]),
+}
+
 struct VerifiedHotBlock {
     data: HeldBytes,
     last_accessed: u64,
@@ -846,26 +848,40 @@ impl VerifiedHotCache {
     }
 
     fn put_verified(&mut self, cid: Vec<u8>, data: ChargedBytes, now: u64) {
+        self.put_input(cid, HotInput::Shared(data), now);
+    }
+
+    fn put_input(&mut self, cid: Vec<u8>, input: HotInput<'_>, now: u64) {
         self.take_over_charges();
-        if self.max_bytes == 0 || data.backing_capacity() as u64 > self.max_bytes {
+        let backing = match &input {
+            HotInput::Shared(data) => data.backing_capacity(),
+            HotInput::Copy(data) => data.len(),
+        };
+        if self.max_bytes == 0 || backing as u64 > self.max_bytes {
             self.remove(&cid);
             return;
         }
         self.remove(&cid);
-        // Bytes another pool covers are copied (one cover per allocation),
-        // and only once this pool has room for the copy. Make room oldest
-        // first: evicting a block a reader still holds frees no room, as it
-        // stays covered until it is freed.
-        let foreign = data.is_covered() && !self.pool.covers(&data);
+        // Bytes to copy (plain input, or bytes another pool covers: one
+        // cover per allocation) are copied only once this pool has room for
+        // the copy. Make room oldest first: evicting a block a reader still
+        // holds frees no room, as it stays covered until it is freed.
+        let copy: Option<&[u8]> = match &input {
+            HotInput::Copy(data) => Some(data),
+            HotInput::Shared(data) if data.is_covered() && !self.pool.covers(data) => {
+                Some(data.as_slice())
+            }
+            HotInput::Shared(_) => None,
+        };
         let data = loop {
-            let held = if foreign {
-                self.pool.hold_copy(data.len(), || {
+            let held = match (copy, &input) {
+                (Some(bytes), _) => self.pool.hold_copy(bytes.len(), || {
                     #[cfg(test)]
                     tests::HOT_CACHE_COPIES.with(|copies| copies.set(copies.get() + 1));
-                    data.to_vec()
-                })
-            } else {
-                self.pool.hold(&data)
+                    bytes.to_vec()
+                }),
+                (None, HotInput::Shared(data)) => self.pool.hold(data),
+                (None, HotInput::Copy(_)) => None,
             };
             if let Some(held) = held {
                 break held;
@@ -1082,6 +1098,46 @@ mod tests {
         assert_eq!(HOT_CACHE_COPIES.with(std::cell::Cell::get), 1);
         assert!(b.hot.lock().entries.contains_key(&block_key(&first_cid)));
         assert!(b.hot_cache_used() <= N as u64);
+    }
+
+    #[test]
+    fn a_full_hot_cache_copies_no_plain_put_it_can_not_hold() {
+        const N: usize = 123_457;
+        let store = SqliteBlockStore::in_memory_with(StoreOptions {
+            max_bytes: 4 << 20,
+            hot_cache_bytes: Some(N as u64),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        let (first, second) = (vec![1u8; N], vec![2u8; N]);
+        let (first_cid, second_cid) = (
+            cid_from_data(CODEC_RAW, &first),
+            cid_from_data(CODEC_RAW, &second),
+        );
+        store.put_block(&first_cid, &first).unwrap();
+        // A reader pins the cache's only block: it has no room to make.
+        let pinned = store.get(&first_cid).unwrap().unwrap();
+        HOT_CACHE_COPIES.with(|copies| copies.set(0));
+        store.put_block(&second_cid, &second).unwrap();
+        assert_eq!(
+            HOT_CACHE_COPIES.with(std::cell::Cell::get),
+            0,
+            "no uncovered copy"
+        );
+        assert_eq!(store.hot_cache_used(), N as u64);
+        assert!(
+            store.get(&second_cid).unwrap().is_some(),
+            "stored all the same"
+        );
+        // With room, the copy is made once, into room it holds.
+        drop(pinned);
+        let third = vec![3u8; N];
+        HOT_CACHE_COPIES.with(|copies| copies.set(0));
+        store
+            .put_block(&cid_from_data(CODEC_RAW, &third), &third)
+            .unwrap();
+        assert_eq!(HOT_CACHE_COPIES.with(std::cell::Cell::get), 1);
+        assert!(store.hot_cache_used() <= N as u64);
     }
 
     #[test]
