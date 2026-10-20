@@ -679,6 +679,42 @@ impl FixedPool {
     }
 }
 
+impl FixedPool {
+    /// Holds a copy of `bytes` for the pool's owner: room for it is taken
+    /// in the pool first, and only then is the copy allocated, at exactly
+    /// its size, so no copy is ever made that the pool doesn't cover.
+    /// `None`, allocating nothing, if it doesn't fit; `copy` is what makes
+    /// the copy, called only once the room is taken.
+    pub fn hold_copy(&self, len: usize, copy: impl FnOnce() -> Vec<u8>) -> Option<HeldBytes> {
+        let capacity = self.inner.capacity;
+        self.inner
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(len).filter(|total| *total <= capacity)
+            })
+            .ok()?;
+        let room = Cover {
+            pool: self.inner.clone(),
+            bytes: len,
+        };
+        let mut data = copy();
+        if data.capacity() > len {
+            // Never more than the room taken: shrink to it (or give up).
+            data.shrink_to_fit();
+            if data.capacity() > len {
+                return None;
+            }
+        }
+        let bytes = ChargedBytes::from_vec(data);
+        {
+            let mut charges = bytes.charges();
+            charges.cover = Some(room);
+            charges.holds = 1;
+        }
+        Some(HeldBytes { bytes })
+    }
+}
+
 /// A pool owner's handle on bytes its pool covers: what a cache keeps.
 pub struct HeldBytes {
     bytes: ChargedBytes,
@@ -997,6 +1033,23 @@ mod tests {
         assert!(held.take_over_if_only_held());
         assert_eq!(budget.used(), 0);
         drop(held);
+
+        // A copy is made only once its room is taken.
+        let mut copies = 0;
+        let full = FixedPool::new(100);
+        let _filled = full
+            .hold_copy(100, || {
+                copies += 1;
+                vec![1; 100]
+            })
+            .unwrap();
+        assert!(full
+            .hold_copy(1, || {
+                copies += 1;
+                vec![2]
+            })
+            .is_none());
+        assert_eq!((copies, full.used()), (1, 100));
 
         // What doesn't fit isn't held; another pool's buffer isn't either.
         let big = ChargedBytes::from_vec(vec![0; 10_001]);

@@ -852,15 +852,22 @@ impl VerifiedHotCache {
             return;
         }
         self.remove(&cid);
-        // Bytes another pool covers are copied: one cover per allocation.
-        let mut data = data;
-        if data.is_covered() && !self.pool.covers(&data) {
-            data = ChargedBytes::copy_from_slice(&data);
-        }
-        // Make room, oldest first. Evicting a block a reader still holds
-        // frees no room: it stays covered until it is freed.
+        // Bytes another pool covers are copied (one cover per allocation),
+        // and only once this pool has room for the copy. Make room oldest
+        // first: evicting a block a reader still holds frees no room, as it
+        // stays covered until it is freed.
+        let foreign = data.is_covered() && !self.pool.covers(&data);
         let data = loop {
-            if let Some(held) = self.pool.hold(&data) {
+            let held = if foreign {
+                self.pool.hold_copy(data.len(), || {
+                    #[cfg(test)]
+                    tests::HOT_CACHE_COPIES.with(|copies| copies.set(copies.get() + 1));
+                    data.to_vec()
+                })
+            } else {
+                self.pool.hold(&data)
+            };
+            if let Some(held) = held {
                 break held;
             }
             if !self.evict_oldest() {
@@ -1025,6 +1032,56 @@ mod tests {
                 .unwrap();
         buffer.as_mut_slice()[..data.len()].copy_from_slice(data);
         buffer.into_charged().slice(0, data.len())
+    }
+
+    thread_local! {
+        /// Copies the hot cache made of another pool's bytes, on this thread.
+        pub(super) static HOT_CACHE_COPIES: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn a_full_hot_cache_copies_no_foreign_block_it_can_not_hold() {
+        const N: usize = 123_457;
+        let store = || {
+            SqliteBlockStore::in_memory_with(StoreOptions {
+                max_bytes: 4 << 20,
+                hot_cache_bytes: Some(N as u64),
+                ..StoreOptions::default()
+            })
+            .unwrap()
+        };
+        let (a, b) = (store(), store());
+        let first = vec![1u8; N];
+        let second = vec![2u8; N];
+        let (first_cid, second_cid) = (
+            cid_from_data(CODEC_RAW, &first),
+            cid_from_data(CODEC_RAW, &second),
+        );
+        a.put_block(&first_cid, &first).unwrap();
+        b.put_block(&second_cid, &second).unwrap();
+        let from_a = a.get(&first_cid).unwrap().unwrap();
+        assert!(from_a.charged().is_covered());
+        // A reader pins B's only block: B has no room it can make.
+        let pinned = b.get(&second_cid).unwrap().unwrap();
+        HOT_CACHE_COPIES.with(|copies| copies.set(0));
+        b.put(&from_a).unwrap();
+        assert_eq!(
+            HOT_CACHE_COPIES.with(std::cell::Cell::get),
+            0,
+            "no uncovered copy"
+        );
+        assert_eq!(b.hot_cache_used(), N as u64);
+        // With room, it copies once, into room it holds.
+        drop(pinned);
+        let third = vec![3u8; 1_000];
+        b.put_block(&cid_from_data(CODEC_RAW, &third), &third)
+            .unwrap();
+        HOT_CACHE_COPIES.with(|copies| copies.set(0));
+        b.put(&from_a).unwrap();
+        assert_eq!(HOT_CACHE_COPIES.with(std::cell::Cell::get), 1);
+        assert!(b.hot.lock().entries.contains_key(&block_key(&first_cid)));
+        assert!(b.hot_cache_used() <= N as u64);
     }
 
     #[test]

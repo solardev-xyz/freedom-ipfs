@@ -39,6 +39,7 @@
 use std::cell::Cell;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 pub use freedom_ipfs_core::{BudgetError, ChargedBytes, MemoryBudget, Reservation, ReservedVec};
@@ -132,29 +133,79 @@ impl Drop for MemoryWaitGuard {
     }
 }
 
-/// A fetch's memory: the budget its receive buffers reserve from, and the
-/// first refusal one met, so the fetch fails as the budget's when it does.
+/// A fetch's memory: the budget its receive buffers reserve from, and what
+/// memory pressure did to it, so the fetch tells local pressure from a
+/// provider's fault:
+///
+/// - **a refusal:** a reservation that failed (it couldn't wait, or its
+///   deadline passed), or one whose wait was cut short (an enclosing timer
+///   fired, or its future was dropped) before it was served;
+/// - **a wait:** any reservation that found the budget full and waited;
+/// - **the waits now outstanding**, which a coalesced follower watches.
+///
+/// Clones share all of it: the request side and the Bitswap swarm's side
+/// of one fetch see the same.
 #[derive(Clone)]
 pub(crate) struct FetchMemory {
     budget: MemoryBudget,
-    refusal: Arc<OnceLock<BudgetError>>,
+    state: Arc<FetchMemoryState>,
+}
+
+struct FetchMemoryState {
+    refusal: OnceLock<BudgetError>,
+    waited: AtomicBool,
+    /// Bytes the fetch's reservations wait for now (0: none waits).
+    waiting: tokio::sync::watch::Sender<usize>,
 }
 
 tokio::task_local! {
     static FETCH_MEMORY: FetchMemory;
 }
 
+/// A wait in progress: counted until it ends, and recorded as a refusal if
+/// it ends unserved.
+struct WaitGuard<'a> {
+    state: &'a FetchMemoryState,
+    bytes: usize,
+    served: bool,
+}
+
+impl Drop for WaitGuard<'_> {
+    fn drop(&mut self) {
+        if !self.served {
+            let _ = self
+                .state
+                .refusal
+                .set(BudgetError::Exhausted { bytes: self.bytes });
+        }
+        let bytes = self.bytes;
+        self.state
+            .waiting
+            .send_modify(|waiting| *waiting = waiting.saturating_sub(bytes));
+    }
+}
+
 impl FetchMemory {
     pub(crate) fn new(budget: MemoryBudget) -> Self {
         Self {
             budget,
-            refusal: Arc::new(OnceLock::new()),
+            state: Arc::new(FetchMemoryState {
+                refusal: OnceLock::new(),
+                waited: AtomicBool::new(false),
+                waiting: tokio::sync::watch::Sender::new(0),
+            }),
         }
     }
 
     /// The memory of the fetch running now, if its node has a budget.
     pub(crate) fn current() -> Option<Self> {
         FETCH_MEMORY.try_with(Clone::clone).ok()
+    }
+
+    /// Whether the fetch running now met memory pressure: a refusal, or a
+    /// wait. Its slowness or failure is then not a provider's to answer for.
+    pub(crate) fn current_pressured() -> bool {
+        Self::current().is_some_and(|memory| memory.pressured())
     }
 
     /// Runs `future` as a fetch with `memory` (nothing new without one).
@@ -166,18 +217,76 @@ impl FetchMemory {
     }
 
     /// Reserves `bytes` for a receive buffer, waiting as the current work
-    /// does; a refusal is recorded.
+    /// does. A refusal is recorded, and so is a wait, and a wait cut short.
     pub(crate) async fn reserve(&self, bytes: usize) -> Result<Reservation, BudgetError> {
-        let reserved = current_memory_wait().reserve(&self.budget, bytes).await;
-        if let Err(refusal) = &reserved {
-            let _ = self.refusal.set(*refusal);
+        let wait = current_memory_wait();
+        match self.budget.try_reserve(bytes) {
+            Ok(reservation) => return Ok(reservation),
+            Err(BudgetError::Exhausted { .. }) if wait != MemoryWait::Never => {}
+            Err(refusal) => {
+                let _ = self.state.refusal.set(refusal);
+                return Err(refusal);
+            }
         }
+        self.state.waited.store(true, Ordering::Release);
+        self.state
+            .waiting
+            .send_modify(|waiting| *waiting = waiting.saturating_add(bytes));
+        let mut guard = WaitGuard {
+            state: &self.state,
+            bytes,
+            served: false,
+        };
+        let reserved = wait.reserve(&self.budget, bytes).await;
+        guard.served = reserved.is_ok();
+        drop(guard);
         reserved
     }
 
-    /// The first refusal the fetch met, if any.
+    /// The first refusal the fetch met, if any (a wait cut short counts).
     pub(crate) fn refusal(&self) -> Option<BudgetError> {
-        self.refusal.get().copied()
+        self.state.refusal.get().copied()
+    }
+
+    /// Whether the fetch met memory pressure: a refusal, or a wait.
+    pub(crate) fn pressured(&self) -> bool {
+        self.refusal().is_some() || self.state.waited.load(Ordering::Acquire)
+    }
+
+    /// The fetch's refusal, counting a wait still outstanding as one: what a
+    /// fetch that ends now while a reservation of it still waits was cut
+    /// short by (the waiting side may not have seen it yet).
+    pub(crate) fn refusal_or_outstanding(&self) -> Option<BudgetError> {
+        self.refusal().or_else(|| {
+            let waiting = *self.state.waiting.borrow();
+            (waiting > 0).then_some(BudgetError::Exhausted { bytes: waiting })
+        })
+    }
+
+    /// What the fetch's memory pressure makes of a failure: the refusal, or
+    /// a full budget for a fetch that waited.
+    pub(crate) fn pressure_error(&self) -> Option<BudgetError> {
+        self.refusal().or_else(|| {
+            self.state
+                .waited
+                .load(Ordering::Acquire)
+                .then_some(BudgetError::Exhausted { bytes: 0 })
+        })
+    }
+
+    /// Returns, with the bytes waited for, once one of the fetch's
+    /// reservations waits for memory (at once if one does now).
+    pub(crate) async fn waiting_for_memory(&self) -> usize {
+        let mut waiting = self.state.waiting.subscribe();
+        let bytes = waiting
+            .wait_for(|bytes| *bytes > 0)
+            .await
+            .map(|bytes| *bytes);
+        match bytes {
+            Ok(bytes) => bytes,
+            // The sender lives as long as this handle: never reached.
+            Err(_) => std::future::pending().await,
+        }
     }
 }
 

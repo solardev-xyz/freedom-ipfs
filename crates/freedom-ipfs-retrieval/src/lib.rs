@@ -405,7 +405,7 @@ pub struct HttpRetriever {
     /// awaiting a fetch own it, and the fetch, which holds this retriever,
     /// doesn't keep itself alive through the map. A fetch whose every caller
     /// was cancelled is dropped with its last caller.
-    inflight: Arc<tokio::sync::Mutex<HashMap<Cid, WeakBlockFetch>>>,
+    inflight: Arc<tokio::sync::Mutex<HashMap<Cid, InflightFetch>>>,
     successful_bitswap_peers: Arc<tokio::sync::Mutex<HashMap<PeerId, SuccessfulBitswapPeer>>>,
     http_provider_scores: Arc<tokio::sync::Mutex<HashMap<String, HttpProviderScore>>>,
     /// Its Bitswap bookkeeping, one allocation its clones share.
@@ -435,6 +435,34 @@ struct RetrieverAccounting {
 }
 
 type WeakBlockFetch = WeakShared<BoxFuture<'static, Arc<SharedBlockFetchResult>>>;
+
+/// A fetch in flight, as the coalescing map holds it: the shared fetch,
+/// weakly, and its memory, so a follower can tell when it waits for memory.
+struct InflightFetch {
+    fetch: WeakBlockFetch,
+    memory: Option<FetchMemory>,
+}
+
+/// Resolves when a coalesced follower must stop waiting on shared work that
+/// waits for memory, as its own memory wait says: for work that never
+/// waits, as soon as the shared fetch waits for memory; for work with a
+/// deadline, once that deadline has passed and the shared fetch waits (or
+/// still waits); never, for work that waits until it is cancelled.
+async fn coalesced_memory_gate(wait: MemoryWait, shared: Option<FetchMemory>) -> BudgetError {
+    let Some(shared) = shared else {
+        return std::future::pending().await;
+    };
+    match wait {
+        MemoryWait::Wait { deadline: None } => return std::future::pending().await,
+        MemoryWait::Wait {
+            deadline: Some(deadline),
+        } => tokio::time::sleep_until(deadline).await,
+        MemoryWait::Never => {}
+    }
+    BudgetError::Exhausted {
+        bytes: shared.waiting_for_memory().await,
+    }
+}
 type SharedBlockFetchResult = std::result::Result<(Block, RetrievalSource), SharedFetchError>;
 
 /// A coalesced fetch's failure, as each of its callers gets it: a memory
@@ -605,9 +633,11 @@ impl HttpRetriever {
         let Some(budget) = self.memory() else {
             return future.await;
         };
-        let memory = FetchMemory::new(budget.clone());
+        // A coalesced fetch's memory is its leader's, which its followers
+        // watch: the fetch runs in it rather than in a memory of its own.
+        let memory = FetchMemory::current().unwrap_or_else(|| FetchMemory::new(budget.clone()));
         let result = FetchMemory::scope(Some(memory.clone()), future).await;
-        match (result, memory.refusal()) {
+        match (result, memory.refusal_or_outstanding()) {
             (Err(_), Some(refusal)) => Err(RetrievalError::MemoryBudget(refusal)),
             (result, _) => result,
         }
@@ -757,10 +787,26 @@ impl HttpRetriever {
         let wait_started = Instant::now();
         let mut inflight = self.inflight.lock().await;
         // Fetches whose callers are all gone are dropped already; forget them.
-        inflight.retain(|_, fetch| fetch.upgrade().is_some());
-        if let Some(fetch) = inflight.get(&cid).and_then(WeakShared::upgrade) {
+        inflight.retain(|_, entry| entry.fetch.upgrade().is_some());
+        if let Some((fetch, shared_memory)) = inflight
+            .get(&cid)
+            .and_then(|entry| Some((entry.fetch.upgrade()?, entry.memory.clone())))
+        {
             drop(inflight);
+            // The follower waits on the shared fetch, but never longer for
+            // memory than its own work would.
+            let gate = coalesced_memory_gate(current_memory_wait(), shared_memory);
             return tokio::select! {
+                refusal = gate => {
+                    tracing::info!(
+                        phase = "block_fetch_coalesced",
+                        cid = %cid,
+                        leader = false,
+                        memory_refused = true,
+                        elapsed_ms = wait_started.elapsed().as_millis()
+                    );
+                    Err(RetrievalError::MemoryBudget(refusal))
+                }
                 result = fetch => {
                     tracing::info!(
                         phase = "block_fetch_coalesced",
@@ -807,13 +853,19 @@ impl HttpRetriever {
 
         let retriever = self.clone();
         // The shared fetch reserves memory as its leader's work does,
-        // whichever caller happens to poll it.
+        // whichever caller happens to poll it, from memory its followers
+        // can watch.
         let memory_wait = current_memory_wait();
+        let memory = self.memory().map(|budget| FetchMemory::new(budget.clone()));
+        let fetch_memory = memory.clone();
         let fetch = async move {
             Arc::new(
-                with_memory_wait(
-                    memory_wait,
-                    retriever.fetch_block_uncached_with_source(&cid, context),
+                FetchMemory::scope(
+                    fetch_memory,
+                    with_memory_wait(
+                        memory_wait,
+                        retriever.fetch_block_uncached_with_source(&cid, context),
+                    ),
                 )
                 .await
                 .map_err(SharedFetchError::from),
@@ -822,7 +874,13 @@ impl HttpRetriever {
         .boxed()
         .shared();
         if let Some(weak) = fetch.downgrade() {
-            inflight.insert(cid, weak);
+            inflight.insert(
+                cid,
+                InflightFetch {
+                    fetch: weak,
+                    memory,
+                },
+            );
         }
         let inflight_count = inflight.len();
         drop(inflight);
@@ -832,7 +890,7 @@ impl HttpRetriever {
         // Only this fetch's entry: a newer one for the CID stays.
         if inflight
             .get(&cid)
-            .and_then(WeakShared::upgrade)
+            .and_then(|entry| entry.fetch.upgrade())
             .is_none_or(|current| current.ptr_eq(&fetch))
         {
             inflight.remove(&cid);
@@ -1326,11 +1384,9 @@ impl HttpRetriever {
                 );
                 Err(err)
             }
-            // Memory refused is no fault of the providers': nothing to
-            // refresh or retry, and nothing to cache about them.
-            Err(err) if FetchMemory::current().is_some_and(|memory| memory.refusal().is_some()) => {
-                Err(err)
-            }
+            // Memory pressure (a refusal, or a wait) is no fault of the
+            // providers': nothing to refresh or retry, nothing to cache.
+            Err(err) if FetchMemory::current_pressured() => Err(err),
             Err(err) if should_refresh_providers_after_failure(&err) => {
                 let timeout_peer_count = bitswap_timeout_peers(&err).len();
                 let connection_timeout_peer_count = bitswap_connection_timeout_peers(&err).len();
@@ -4511,6 +4567,18 @@ impl HttpRetriever {
         if timeout_peers.is_empty() {
             return;
         }
+        // A fetch that waited for memory may have timed out for that: its
+        // peers aren't to blame.
+        if FetchMemory::current_pressured() {
+            tracing::info!(
+                phase = "bitswap_peer_timeout_suppressed",
+                cid = %cid,
+                timeout_peer_count = timeout_peers.len(),
+                attempted_peer_count,
+                reason = "memory_pressure"
+            );
+            return;
+        }
         if suppress_bitswap_timeout_suppression(timeout_peers.len(), attempted_peer_count) {
             tracing::info!(
                 phase = "bitswap_peer_timeout_suppressed",
@@ -4599,6 +4667,10 @@ impl HttpRetriever {
         let Some(peer) = candidate.source_peer else {
             return false;
         };
+        // Time spent waiting for memory isn't the source being slow.
+        if FetchMemory::current_pressured() {
+            return false;
+        }
         if !candidate.gateway_request
             || candidate.http_provider_count != 0
             || candidate.elapsed <= candidate.threshold
@@ -5338,6 +5410,17 @@ impl HttpRetriever {
     }
 
     fn mark_single_session_shortcut_timeout_peer(&self, cid: &Cid, peers: &[BitswapPeer]) {
+        // The shortcut may have run out while its read waited for memory.
+        if FetchMemory::current_pressured() {
+            tracing::info!(
+                phase = "bitswap_peer_timeout_suppressed",
+                cid = %cid,
+                timeout_peer_count = peers.len(),
+                attempted_peer_count = peers.len(),
+                reason = "memory_pressure"
+            );
+            return;
+        }
         let [peer] = peers else {
             if !peers.is_empty() {
                 tracing::info!(
@@ -5839,9 +5922,13 @@ impl FetchingBlockProvider {
             let context = context.clone();
             fetches.push(async move {
                 let fetch_started = Instant::now();
+                // The range is copied out as soon as its block comes, and the
+                // block dropped: a finished fetch never holds memory (or the
+                // charge on it) that a sibling still waits for.
                 let fetched = retriever
                     .fetch_block_with_source_with_context(&cid, context)
-                    .await;
+                    .await
+                    .map(|(block, source)| (block_data_range(block.data(), start, end), source));
                 (
                     index,
                     cid,
@@ -5854,7 +5941,7 @@ impl FetchingBlockProvider {
         }
 
         for (index, cid, start, end, elapsed_ms, fetched) in join_all(fetches).await {
-            let (block, source) = fetched.map_err(RetrievalError::into_core)?;
+            let (range, source) = fetched.map_err(RetrievalError::into_core)?;
             self.stats.record(source);
             let range_len = if start <= end {
                 end.saturating_sub(start).saturating_add(1)
@@ -5872,7 +5959,7 @@ impl FetchingBlockProvider {
                 uncached_range_count,
                 elapsed_ms
             );
-            results[index] = Some(block_data_range(block.data(), start, end));
+            results[index] = Some(range);
         }
         Ok(results)
     }
@@ -7826,6 +7913,9 @@ struct IncomingBitswapRead {
     result: io::Result<Vec<ReceivedBitswapBlock>>,
     elapsed_ms: u128,
     timed_out: bool,
+    /// Whether the read waited for memory (or was refused it): its timeout
+    /// is then not the peer's.
+    memory_pressured: bool,
 }
 
 type DialErrorLog = Arc<tokio::sync::Mutex<HashMap<PeerId, Vec<String>>>>;
@@ -7939,6 +8029,7 @@ impl SharedBitswapClient {
         // Alive exactly as long as this request waits for `response`:
         // dropped with it, whether the wait ends or the future is dropped.
         let requester = Arc::new(());
+        let memory = FetchMemory::current();
         self.commands
             .send(BitswapCommand {
                 cids,
@@ -7946,7 +8037,7 @@ impl SharedBitswapClient {
                 sent_at: Instant::now(),
                 respond: Some(respond),
                 requester: Arc::downgrade(&requester),
-                memory: FetchMemory::current(),
+                memory: memory.clone(),
                 memory_wait: current_memory_wait(),
                 reason: "fetch",
                 context,
@@ -7974,7 +8065,13 @@ impl SharedBitswapClient {
                     elapsed_ms = wait_started.elapsed().as_millis(),
                     targets = %target_summary.as_deref().unwrap_or("")
                 );
-                Err(RetrievalError::BitswapTimeout)
+                // Its reads (in the swarm, sharing this fetch's memory) may
+                // have spent the time waiting for memory: then it is busy,
+                // not a peer's timeout.
+                match memory.as_ref().and_then(FetchMemory::pressure_error) {
+                    Some(pressure) => Err(RetrievalError::MemoryBudget(pressure)),
+                    None => Err(RetrievalError::BitswapTimeout),
+                }
             }
         }
     }
@@ -8082,6 +8179,7 @@ async fn read_incoming_bitswap_stream(
         result,
         elapsed_ms,
         timed_out,
+        memory_pressured: FetchMemory::current_pressured(),
     }
 }
 
@@ -8123,7 +8221,7 @@ async fn run_shared_bitswap_swarm(
     let mut incoming = select_all(incoming);
     // Incoming streams answer no one request: their reads reserve from the
     // node's budget, waiting within their own read timeout.
-    let incoming_memory = memory.map(FetchMemory::new);
+    let incoming_budget = memory;
     let mut fetches = FuturesUnordered::<BoxFuture<'static, Vec<Cid>>>::new();
     let mut incoming_reads = FuturesUnordered::<BoxFuture<'static, IncomingBitswapRead>>::new();
     let mut pending_incoming = HashMap::<Cid, Vec<PendingIncomingBitswapResult>>::new();
@@ -8663,7 +8761,9 @@ async fn run_shared_bitswap_swarm(
                 }
                 incoming_reads.push(
                     FetchMemory::scope(
-                        incoming_memory.clone(),
+                        // Each read its own memory, so one read's pressure
+                        // isn't another's.
+                        incoming_budget.clone().map(FetchMemory::new),
                         with_memory_wait(
                             MemoryWait::UNTIL_CANCELLED,
                             read_incoming_bitswap_stream(peer, stream),
@@ -8755,7 +8855,9 @@ async fn run_shared_bitswap_swarm(
                                 timeout_ms = BITSWAP_INCOMING_STREAM_READ_TIMEOUT.as_millis(),
                                 elapsed_ms = incoming_read.elapsed_ms
                             );
-                            if bitswap_incoming_read_timeout_backoff_enabled() {
+                            if bitswap_incoming_read_timeout_backoff_enabled()
+                                && !incoming_read.memory_pressured
+                            {
                                 let backoff = record_incoming_read_timeout_backoff(
                                     &mut connection_error_backoff,
                                     incoming_read.peer,
@@ -11359,6 +11461,7 @@ async fn request_bitswap_blocks(
             &cids,
             &protocol_name,
             request_timeouts.stream_read,
+            None,
         )
         .await
         {
@@ -11507,11 +11610,14 @@ where
                 timeout_ms = request_timeouts.want_have.as_millis(),
                 elapsed_ms = started.elapsed().as_millis()
             );
+            // The block request reuses the probe's memory: one message's
+            // worth, never two.
             return request_bitswap_block_on_stream(
                 stream,
                 cid,
                 protocol_name,
                 request_timeouts.stream_read,
+                Some(memory),
             )
             .await
             .map_err(WantHaveFailure::TryOtherProtocols);
@@ -11598,19 +11704,28 @@ where
         presence_count,
         elapsed_ms = started.elapsed().as_millis()
     );
+    // The block request reuses the probe's memory, which the HAVE (or
+    // presence-only) answer gave back.
     if !has_have {
         return request_bitswap_block_on_stream(
             stream,
             cid,
             protocol_name,
             request_timeouts.stream_read,
+            Some(memory),
         )
         .await
         .map_err(WantHaveFailure::TryOtherProtocols);
     }
-    request_bitswap_block_on_stream(stream, cid, protocol_name, request_timeouts.stream_read)
-        .await
-        .map_err(WantHaveFailure::TryOtherProtocols)
+    request_bitswap_block_on_stream(
+        stream,
+        cid,
+        protocol_name,
+        request_timeouts.stream_read,
+        Some(memory),
+    )
+    .await
+    .map_err(WantHaveFailure::TryOtherProtocols)
 }
 
 async fn request_bitswap_block_on_stream<T>(
@@ -11618,13 +11733,19 @@ async fn request_bitswap_block_on_stream<T>(
     cid: &Cid,
     protocol_name: &str,
     stream_read_timeout: Duration,
+    memory: Option<BitswapReadMemory>,
 ) -> std::result::Result<BitswapFetchResult, BitswapProtocolFailure>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut results =
-        request_bitswap_blocks_on_stream(stream, &[*cid], protocol_name, stream_read_timeout)
-            .await?;
+    let mut results = request_bitswap_blocks_on_stream(
+        stream,
+        &[*cid],
+        protocol_name,
+        stream_read_timeout,
+        memory,
+    )
+    .await?;
     let Some(requested_block) = results.requested_blocks.remove(cid) else {
         return Err(BitswapProtocolFailure::other(format!(
             "{protocol_name}: no valid block returned"
@@ -11640,18 +11761,26 @@ where
     })
 }
 
+/// `memory` is a previous read's on the same stream (a WANT_HAVE probe's),
+/// to reuse rather than hold while reserving another; topped up to a whole
+/// message if that read's cancelled message took some of it.
 async fn request_bitswap_blocks_on_stream<T>(
     stream: &mut T,
     cids: &[Cid],
     protocol_name: &str,
     stream_read_timeout: Duration,
+    memory: Option<BitswapReadMemory>,
 ) -> std::result::Result<BitswapFetchResults, BitswapProtocolFailure>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     // Reserved before the wants go out, so before the read's timer starts:
     // waiting for memory isn't the peer being slow.
-    let mut memory = match BitswapReadMemory::reserve().await {
+    let reserved = match memory {
+        Some(mut memory) => memory.top_up().await.map(|()| memory),
+        None => BitswapReadMemory::reserve().await,
+    };
+    let mut memory = match reserved {
         Ok(memory) => memory,
         Err(refusal) => {
             return Err(BitswapProtocolFailure::other(format!(
@@ -11795,6 +11924,19 @@ impl BitswapReadMemory {
         Ok(Self { pool })
     }
 
+    /// Restores the pool to a whole message, reserving what a cancelled
+    /// message read took with it, waiting as the current work does.
+    async fn top_up(&mut self) -> std::result::Result<(), BudgetError> {
+        let (Some(pool), Some(memory)) = (self.pool.as_mut(), FetchMemory::current()) else {
+            return Ok(());
+        };
+        let missing = BITSWAP_MAX_MESSAGE_SIZE.saturating_sub(pool.bytes());
+        if missing > 0 {
+            pool.merge(memory.reserve(missing).await?);
+        }
+        Ok(())
+    }
+
     /// A buffer of exactly `len` bytes, paid from the pool.
     fn buffer(&mut self, len: usize) -> io::Result<ChargedBuffer> {
         let Some(pool) = self.pool.as_mut() else {
@@ -11865,8 +12007,16 @@ where
     T: AsyncRead + Unpin,
 {
     let buffer = read_charged_length_prefixed(io, BITSWAP_MAX_MESSAGE_SIZE, memory).await?;
-    // Blocks decode as views of the receive buffer, not copies.
-    let message = BitswapMessage::decode(buffer.to_bytes()).map_err(invalid_data)?;
+    // Decoded as views of the receive buffer, not copies, and only after
+    // its entries are counted: nothing the peer sends allocates beside the
+    // charged message more than a bounded table of entries.
+    let entries = count_bitswap_answer_entries(&buffer)?;
+    if entries > MAX_BITSWAP_ANSWER_ENTRIES {
+        return Err(invalid_data(format!(
+            "bitswap answer has {entries} entries, more than {MAX_BITSWAP_ANSWER_ENTRIES}"
+        )));
+    }
+    let message = BitswapAnswer::decode(buffer.to_bytes()).map_err(invalid_data)?;
     let response = decode_bitswap_response(message, &buffer);
     if response.blocks.is_empty() {
         memory.reclaim(buffer);
@@ -11908,7 +12058,46 @@ fn bitswap_block_view(buffer: &ChargedBytes, data: &bytes::Bytes) -> ChargedByte
         .unwrap_or_else(|| ChargedBytes::copy_from_slice(data))
 }
 
-fn decode_bitswap_response(message: BitswapMessage, buffer: &ChargedBytes) -> BitswapResponse {
+/// The most blocks, payloads and presences one Bitswap answer may hold: far
+/// more than the four CIDs a fetch asks for at once, and few enough that
+/// decoding their table allocates little beside the charged message.
+const MAX_BITSWAP_ANSWER_ENTRIES: usize = 4096;
+
+/// The answer's blocks, payloads and presences (top-level fields 2, 3 and
+/// 4), counted without decoding them; an error for a malformed message.
+fn count_bitswap_answer_entries(message: &[u8]) -> io::Result<usize> {
+    fn varint(buf: &mut &[u8]) -> io::Result<u64> {
+        let (value, rest) =
+            unsigned_varint::decode::u64(buf).map_err(|err| invalid_data(err.to_string()))?;
+        *buf = rest;
+        Ok(value)
+    }
+    let mut buf = message;
+    let mut entries = 0usize;
+    while !buf.is_empty() {
+        let key = varint(&mut buf)?;
+        let skip = match key & 0x7 {
+            0 => {
+                varint(&mut buf)?;
+                0
+            }
+            1 => 8,
+            2 => usize::try_from(varint(&mut buf)?).unwrap_or(usize::MAX),
+            5 => 4,
+            _ => return Err(invalid_data("bitswap answer has an unsupported wire type")),
+        };
+        if skip > buf.len() {
+            return Err(invalid_data("bitswap answer field overruns the message"));
+        }
+        buf = &buf[skip..];
+        if matches!(key >> 3, 2..=4) {
+            entries += 1;
+        }
+    }
+    Ok(entries)
+}
+
+fn decode_bitswap_response(message: BitswapAnswer, buffer: &ChargedBytes) -> BitswapResponse {
     let mut blocks = message
         .blocks
         .iter()
@@ -11928,7 +12117,7 @@ fn decode_bitswap_response(message: BitswapMessage, buffer: &ChargedBytes) -> Bi
         .block_presences
         .into_iter()
         .filter_map(|presence| {
-            let cid = Cid::read_bytes(&mut io::Cursor::new(presence.cid)).ok()?;
+            let cid = Cid::read_bytes(&mut io::Cursor::new(&presence.cid[..])).ok()?;
             Some(ReceivedBlockPresence {
                 cid,
                 type_pb: presence.type_pb,
@@ -12085,6 +12274,37 @@ fn timeout_http_client(timeout: Duration) -> reqwest::Client {
         .expect("HTTP provider client config is valid")
 }
 
+/// A Bitswap answer as a fetch decodes it: only the fields it reads, every
+/// byte field a view of the received message, never a copy, so no field a
+/// peer controls allocates beside the charged message. What it doesn't read
+/// (a wantlist, tokens) is skipped without being decoded.
+#[derive(Clone, PartialEq, Message)]
+struct BitswapAnswer {
+    #[prost(bytes = "bytes", repeated, tag = "2")]
+    blocks: Vec<bytes::Bytes>,
+    #[prost(message, repeated, tag = "3")]
+    payload: Vec<BitswapAnswerPayload>,
+    #[prost(message, repeated, tag = "4")]
+    block_presences: Vec<BitswapAnswerPresence>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct BitswapAnswerPayload {
+    #[prost(bytes = "bytes", tag = "1")]
+    prefix: bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    data: bytes::Bytes,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct BitswapAnswerPresence {
+    #[prost(bytes = "bytes", tag = "1")]
+    cid: bytes::Bytes,
+    #[prost(int32, tag = "2")]
+    type_pb: i32,
+}
+
+/// A Bitswap message as the client writes it (and test peers read it).
 #[derive(Clone, PartialEq, Message)]
 struct BitswapMessage {
     #[prost(message, optional, tag = "1")]
@@ -12176,7 +12396,7 @@ mod inflight_lifetime_tests {
             .lock()
             .await
             .get(cid)
-            .and_then(WeakShared::upgrade)
+            .and_then(|entry| entry.fetch.upgrade())
             .is_some()
     }
 
@@ -12842,6 +13062,152 @@ mod memory_tests {
         drop(full);
         let (block, _) = request.await.unwrap().unwrap();
         assert_eq!(block.data(), &data[..]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coalesced_followers_keep_their_own_memory_waits() {
+        for never in [true, false] {
+            let budget = MemoryBudget::new(4 * MIB);
+            let full = budget.try_reserve(budget.limit()).unwrap();
+            let (cid, data) = block(1_000, 42);
+            let provider = BodyProvider::spawn(vec![(cid, data)], vec![], true).await;
+            let retriever = provider.retriever(&[cid], &budget);
+            // A request leads, and waits for memory.
+            let leader = tokio::spawn({
+                let retriever = retriever.clone();
+                async move { retriever.fetch_block_with_source(&cid).await }
+            });
+            wait_until("the leader never waited for memory", || {
+                retriever.inflight.try_lock().is_ok_and(|inflight| {
+                    inflight
+                        .get(&cid)
+                        .and_then(|entry| entry.memory.clone())
+                        .is_some_and(|memory| memory.pressured())
+                })
+            })
+            .await;
+            let (policy, label) = if never {
+                (MemoryWait::Never, "never")
+            } else {
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+                (MemoryWait::until(deadline), "deadline")
+            };
+            let started = Instant::now();
+            let followed = tokio::time::timeout(
+                Duration::from_millis(500),
+                with_memory_wait(policy, retriever.fetch_block_with_source(&cid)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{label}: the follower waited on its leader's memory"));
+            assert!(
+                matches!(followed, Err(RetrievalError::MemoryBudget(_))),
+                "{label}: {:?}",
+                followed.map(|_| ())
+            );
+            if !never {
+                assert!(started.elapsed() >= Duration::from_millis(45), "{label}");
+            }
+            assert!(!leader.is_finished(), "the leader still waits");
+            drop(full);
+            assert!(leader.await.unwrap().is_ok());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_follower_refused_through_its_leader_refetches_as_its_own_work() {
+        let budget = MemoryBudget::new(4 * MIB);
+        let full = budget.try_reserve(budget.limit()).unwrap();
+        let (cid, data) = block(12_345, 31);
+        let provider = BodyProvider::spawn(vec![(cid, data.clone())], vec![], true).await;
+        let retriever = provider.retriever(&[cid], &budget);
+        // Hold the HTTP limiter, so the leader stops there, before memory.
+        let limiter = retriever.http_provider_fetch_limiter.clone();
+        let held = limiter
+            .clone()
+            .acquire_many_owned(limiter.available_permits() as u32)
+            .await
+            .unwrap();
+        // Background work leads: it will be refused memory at once.
+        let leader = tokio::spawn({
+            let retriever = retriever.clone();
+            async move {
+                with_memory_wait(MemoryWait::Never, retriever.fetch_block_with_source(&cid)).await
+            }
+        });
+        wait_until("the leader never started", || {
+            retriever
+                .inflight
+                .try_lock()
+                .is_ok_and(|inflight| inflight.contains_key(&cid))
+        })
+        .await;
+        // A request follows it.
+        let follower = tokio::spawn({
+            let retriever = retriever.clone();
+            async move { retriever.fetch_block_with_source(&cid).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(held);
+        let led = tokio::time::timeout(Duration::from_secs(5), leader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(led, Err(RetrievalError::MemoryBudget(_))));
+        // The follower fetches again, as request work: it waits for memory.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !follower.is_finished(),
+            "the follower waits, as its work does"
+        );
+        assert!(!provider.saw(&cid));
+        drop(full);
+        let (block, _) = tokio::time::timeout(Duration::from_secs(5), follower)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.data(), &data[..]);
+        assert_eq!(provider.arrivals.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn range_results_hold_no_memory_a_later_fetch_needs() {
+        // One block fetch at a time, and memory for one receive buffer.
+        let budget = MemoryBudget::new(BITSWAP_MAX_MESSAGE_SIZE);
+        let (one, one_data) = block(64 * 1024, 11);
+        let (two, two_data) = block(64 * 1024, 12);
+        let provider = BodyProvider::spawn(
+            vec![(one, one_data.clone()), (two, two_data.clone())],
+            vec![],
+            true,
+        )
+        .await;
+        let limits = SharedLimits::new(LimitSizes {
+            block_fetches: 1,
+            ..LimitSizes::default()
+        });
+        let retriever = provider
+            .retriever(&[one, two], &budget)
+            .with_shared_limits(limits.clone());
+        let fetching = FetchingBlockProvider {
+            store: retriever.store.clone(),
+            retriever,
+            stats: Arc::new(RetrievalStatsInner::default()),
+            instance: None,
+        };
+        let ranges = tokio::time::timeout(
+            Duration::from_secs(10),
+            fetching.get_block_ranges_async_inner(vec![(one, 0, 0), (two, 0, 0)], false),
+        )
+        .await
+        .expect("a finished fetch held the memory the next one needs")
+        .unwrap();
+        assert_eq!(
+            ranges,
+            vec![Some(vec![one_data[0]]), Some(vec![two_data[0]])]
+        );
+        assert_eq!(limits.block_fetches_in_flight(), 0);
+        wait_until("a range held its block's charge", || budget.used() == 0).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -14273,6 +14639,7 @@ mod bitswap_tests {
             &[first, second],
             "/ipfs/bitswap/1.2.0",
             BITSWAP_STREAM_READ_TIMEOUT,
+            None,
         )
         .await
         .unwrap();
@@ -14343,6 +14710,7 @@ mod bitswap_tests {
             &[first, second],
             "/ipfs/bitswap/1.2.0",
             BITSWAP_STREAM_READ_TIMEOUT,
+            None,
         )
         .await
         .unwrap();
@@ -20008,6 +20376,306 @@ mod bitswap_tests {
         );
         stream_task.abort();
         swarm_task.abort();
+    }
+
+    /// A stream that answers nothing until its gate opens, then its script.
+    struct GatedBitswapStream {
+        open: Arc<std::sync::atomic::AtomicBool>,
+        waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+        read: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl AsyncRead for GatedBitswapStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            if !self.open.load(Ordering::SeqCst) {
+                *self.waker.lock().unwrap() = Some(cx.waker().clone());
+                if !self.open.load(Ordering::SeqCst) {
+                    return std::task::Poll::Pending;
+                }
+            }
+            std::task::Poll::Ready(std::io::Read::read(&mut self.read, buf))
+        }
+    }
+
+    impl AsyncWrite for GatedBitswapStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn want_have_probe_trace() -> BitswapWantHaveProbeTrace {
+        BitswapWantHaveProbeTrace {
+            peer_candidate_index: 0,
+            target_peer_count: 1,
+            peer_addr_count: 1,
+            peer_first_addr_transport: "tcp",
+            peer_first_addr_family: "ip4",
+            prefer_want_have: true,
+            skip_want_have: false,
+            force_want_block: false,
+            force_want_have: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_want_have_probe_and_its_block_read_share_one_message_of_memory() {
+        let data = b"a block after its WANT_HAVE".to_vec();
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, &data);
+        let other = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, b"other");
+        let presence = |cid: &Cid| BitswapMessage {
+            block_presences: vec![BlockPresence {
+                cid: cid.to_bytes(),
+                type_pb: BLOCK_PRESENCE_HAVE,
+                tokens: Vec::new(),
+            }],
+            ..BitswapMessage::default()
+        };
+        let answer = BitswapMessage {
+            payload: vec![BlockPayload {
+                prefix: bitswap_payload_prefix(&cid),
+                data: data.clone().into(),
+                tokens: Vec::new(),
+            }],
+            ..BitswapMessage::default()
+        };
+        let script = |messages: &[&BitswapMessage]| {
+            messages
+                .iter()
+                .flat_map(|message| length_prefixed_bytes(message))
+                .collect::<Vec<_>>()
+        };
+        // A HAVE, then the block; a presence for another CID (so no HAVE),
+        // then the block; and the probe timing out, then the block.
+        let cases = [
+            ("have", script(&[&presence(&cid), &answer]), true),
+            ("no have", script(&[&presence(&other), &answer]), true),
+            ("timeout", script(&[&answer]), false),
+        ];
+        for (case, script, open) in cases {
+            // Room for one message, and no more.
+            let budget = MemoryBudget::new(BITSWAP_MAX_MESSAGE_SIZE);
+            let gate = Arc::new(std::sync::atomic::AtomicBool::new(open));
+            let waker = Arc::new(std::sync::Mutex::new(None::<std::task::Waker>));
+            let mut stream = GatedBitswapStream {
+                open: gate.clone(),
+                waker: waker.clone(),
+                read: std::io::Cursor::new(script),
+            };
+            if !open {
+                // Opens after the probe's 50 ms has run out.
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    gate.store(true, Ordering::SeqCst);
+                    if let Some(waker) = waker.lock().unwrap().take() {
+                        waker.wake();
+                    }
+                });
+            }
+            let probe = request_bitswap_block_after_want_have(
+                &mut stream,
+                &cid,
+                PeerId::random(),
+                "/ipfs/bitswap/1.2.0",
+                BitswapRequestTimeouts {
+                    want_have: Duration::from_millis(50),
+                    stream_read: Duration::from_secs(2),
+                },
+                want_have_probe_trace(),
+            );
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                FetchMemory::scope(Some(FetchMemory::new(budget.clone())), probe),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{case}: the block read waited for the probe's memory"));
+            let Ok(result) = result else {
+                panic!("{case}: the probe failed");
+            };
+            assert_eq!(result.requested_block.as_slice(), &data[..], "{case}");
+            drop(result);
+            assert_eq!(budget.used(), 0, "{case}");
+        }
+    }
+
+    #[test]
+    fn bitswap_answers_decode_every_field_as_a_view_of_the_message() {
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, b"view");
+        let message = BitswapMessage {
+            payload: vec![BlockPayload {
+                // A peer-sized prefix: decoded, it must not be a copy.
+                prefix: vec![7; 100_000],
+                data: bytes::Bytes::from_static(b"view"),
+                tokens: vec![1, 2, 3],
+            }],
+            block_presences: vec![BlockPresence {
+                cid: cid.to_bytes(),
+                type_pb: BLOCK_PRESENCE_HAVE,
+                tokens: Vec::new(),
+            }],
+            blocks: vec![bytes::Bytes::from_static(b"raw")],
+            ..BitswapMessage::default()
+        };
+        let buffer = ChargedBytes::from_vec(message.encode_to_vec());
+        let answer = BitswapAnswer::decode(buffer.to_bytes()).unwrap();
+        assert!(
+            buffer.slice_ref(&answer.payload[0].prefix).is_some(),
+            "prefix"
+        );
+        assert!(buffer.slice_ref(&answer.payload[0].data).is_some(), "data");
+        assert!(
+            buffer.slice_ref(&answer.block_presences[0].cid).is_some(),
+            "cid"
+        );
+        assert!(buffer.slice_ref(&answer.blocks[0]).is_some(), "block");
+    }
+
+    #[tokio::test]
+    async fn bitswap_answers_with_too_many_entries_are_refused_before_decoding() {
+        let answer = |entries: usize| BitswapMessage {
+            block_presences: (0..entries)
+                .map(|_| BlockPresence {
+                    cid: Vec::new(),
+                    type_pb: 0,
+                    tokens: Vec::new(),
+                })
+                .collect(),
+            ..BitswapMessage::default()
+        };
+        let read = |message: BitswapMessage| async move {
+            let mut wire = futures::io::Cursor::new(length_prefixed_bytes(&message));
+            let mut memory = BitswapReadMemory { pool: None };
+            read_bitswap_response_once(&mut wire, &mut memory)
+                .await
+                .map(|_| ())
+        };
+        assert!(read(answer(MAX_BITSWAP_ANSWER_ENTRIES)).await.is_ok());
+        let err = read(answer(MAX_BITSWAP_ANSWER_ENTRIES + 1))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("entries"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shortcut_waiting_for_memory_blames_no_peer() {
+        let data = b"a healthy peer behind local memory pressure".to_vec();
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, &data);
+        let (peer_id, addr, swarm_task, stream_task) = spawn_local_bitswap_peer(cid, data).await;
+        let budget = MemoryBudget::new(8 << 20);
+        let _full = budget.try_reserve(budget.limit()).unwrap();
+        let store = SqliteBlockStore::in_memory(1 << 20).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        )
+        .with_memory_budget(budget.clone());
+        let memory = FetchMemory::new(budget.clone());
+        // The 2 s shortcut runs out while its read waits for memory.
+        let shortcut = FetchMemory::scope(
+            Some(memory.clone()),
+            retriever.fetch_from_recent_bitswap_peers(
+                &cid,
+                vec![BitswapPeer {
+                    id: peer_id,
+                    addrs: vec![addr],
+                    skip_want_have: true,
+                    force_want_block: false,
+                    force_want_have: false,
+                }],
+            ),
+        )
+        .await;
+        assert!(shortcut.unwrap().is_none());
+        assert!(
+            !store.is_bad_provider(&peer_id.to_string()).unwrap(),
+            "a healthy peer was blamed for a local memory wait"
+        );
+        // The wait cut short is the fetch's refusal: it fails as busy.
+        assert!(memory.pressured());
+        assert!(matches!(
+            memory.refusal_or_outstanding(),
+            Some(BudgetError::Exhausted { .. })
+        ));
+        wait_until("the cut-short wait was never recorded", || {
+            memory.refusal().is_some()
+        })
+        .await;
+        swarm_task.abort();
+        stream_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bitswap_request_timing_out_on_memory_is_busy() {
+        let data = b"behind the request timeout".to_vec();
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, &data);
+        let (trusted, trusted_addr, trusted_swarm, trusted_stream) =
+            spawn_local_bitswap_peer(cid, data.clone()).await;
+        let (untrusted, untrusted_addr, untrusted_swarm, untrusted_stream) =
+            spawn_local_bitswap_peer(cid, data).await;
+        let budget = MemoryBudget::new(8 << 20);
+        let _full = budget.try_reserve(budget.limit()).unwrap();
+        let client = SharedBitswapClient::spawn(None, None, Some(&budget))
+            .await
+            .unwrap();
+        // A trusted and an untrusted peer: the 4 s request timeout.
+        let peers = vec![
+            BitswapPeer {
+                id: trusted,
+                addrs: vec![trusted_addr],
+                skip_want_have: true,
+                force_want_block: true,
+                force_want_have: false,
+            },
+            BitswapPeer {
+                id: untrusted,
+                addrs: vec![untrusted_addr],
+                skip_want_have: false,
+                force_want_block: true,
+                force_want_have: false,
+            },
+        ];
+        let memory = FetchMemory::new(budget.clone());
+        let started = Instant::now();
+        let result = FetchMemory::scope(
+            Some(memory),
+            client.fetch_many_with_context(vec![cid], peers, BitswapCommandContext::default()),
+        )
+        .await;
+        assert!(started.elapsed() >= BITSWAP_TRUSTED_MIXED_REQUEST_TIMEOUT);
+        assert!(
+            matches!(result, Err(RetrievalError::MemoryBudget(_))),
+            "{:?}",
+            result.map(|_| ())
+        );
+        for task in [
+            trusted_swarm,
+            trusted_stream,
+            untrusted_swarm,
+            untrusted_stream,
+        ] {
+            task.abort();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
