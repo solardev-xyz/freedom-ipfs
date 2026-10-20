@@ -1308,18 +1308,18 @@ pub extern "C" fn freedom_ipfs_version() -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn freedom_ipfs_build_info_json() -> *mut c_char {
-    let version = env!("CARGO_PKG_VERSION");
+    let info = freedom_ipfs_core::build_info::build_info();
     let json = serde_json::json!({
-        "name": "freedom-ipfs",
-        "version": version,
-        "release_tag": format!("v{version}"),
+        "name": info.name,
+        "version": info.version,
+        "release_tag": info.release_tag(),
         "mobile_ffi_abi_version": MOBILE_FFI_ABI_VERSION,
-        "git_commit": option_env!("FREEDOM_IPFS_GIT_COMMIT"),
-        "git_describe": option_env!("FREEDOM_IPFS_GIT_DESCRIBE"),
+        "git_commit": info.git_commit,
+        "git_describe": info.git_describe,
         "target": {
-            "os": std::env::consts::OS,
-            "arch": std::env::consts::ARCH,
-            "family": std::env::consts::FAMILY
+            "os": info.os,
+            "arch": info.arch,
+            "family": info.family
         },
         "features": {
             "loopback_gateway": true,
