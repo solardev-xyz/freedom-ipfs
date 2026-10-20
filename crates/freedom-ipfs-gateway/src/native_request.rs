@@ -10,7 +10,8 @@
 //!   `ipfs://…` or `ipns://…`, or as a bare CID (`/ipfs/<cid>`). A query or
 //!   fragment is cut off. The namespace must be followed by something.
 //! - **Headers** are passed through; a name or value `http` refuses fails the
-//!   request. Each is `{ "name", "value" }` or, equally, a `[name, value]`
+//!   request, as do more distinct names than a header map holds (at most
+//!   24,576, the `x-freedom-*` headers below included). Each is `{ "name", "value" }` or, equally, a `[name, value]`
 //!   pair: serde's derived structs take either, so the add-on always has.
 //! - **Request IDs and the top-level path** become the
 //!   `x-freedom-request-id`, `x-freedom-parent-request-id` and
@@ -75,6 +76,8 @@ pub enum NativeRequestError {
     Path,
     /// A header name or value `http` refuses.
     Header,
+    /// More headers than a header map holds.
+    TooManyHeaders,
 }
 
 impl fmt::Display for NativeRequestError {
@@ -84,6 +87,7 @@ impl fmt::Display for NativeRequestError {
             Self::Method(method) => write!(f, "unsupported method {method:?}"),
             Self::Path => f.write_str("not an /ipfs/ or /ipns/ content path"),
             Self::Header => f.write_str("invalid header name or value"),
+            Self::TooManyHeaders => f.write_str("too many headers"),
         }
     }
 }
@@ -209,7 +213,12 @@ fn insert_header(
 ) -> Result<(), NativeRequestError> {
     let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| NativeRequestError::Header)?;
     let value = HeaderValue::from_str(value).map_err(|_| NativeRequestError::Header)?;
-    headers.insert(name, value);
+    // `insert` panics past the map's capacity, and the names are the
+    // caller's: the add-on calls this inside an `extern "C"` function, where
+    // a panic aborts the process.
+    headers
+        .try_insert(name, value)
+        .map_err(|_| NativeRequestError::TooManyHeaders)?;
     Ok(())
 }
 
@@ -363,6 +372,77 @@ mod tests {
         // take a sequence, so the add-on has always accepted this form.
         let pairs = parsed(r#"{"path":"/ipfs/x","headers":[["range","bytes=0-"]]}"#);
         assert_eq!(header(&pairs, "range"), Some("bytes=0-"));
+    }
+
+    fn with_headers(count: usize) -> NativeRequest {
+        NativeRequest {
+            path: "/ipfs/x".into(),
+            headers: Some(
+                (0..count)
+                    .map(|i| NativeRequestHeader {
+                        name: format!("x-h{i}"),
+                        value: String::new(),
+                    })
+                    .collect(),
+            ),
+            ..NativeRequest::default()
+        }
+    }
+
+    /// How many distinct names a header map takes before `try_insert`
+    /// refuses: 24,576 in http 1.x, three quarters of its largest table.
+    fn map_capacity() -> usize {
+        let mut map = HeaderMap::new();
+        (0..)
+            .take_while(|i| {
+                let name = HeaderName::from_bytes(format!("x-h{i}").as_bytes()).unwrap();
+                map.try_insert(name, HeaderValue::from_static("")).is_ok()
+            })
+            .count()
+    }
+
+    #[test]
+    fn more_headers_than_a_map_holds_are_refused_not_a_panic() {
+        let capacity = map_capacity();
+        assert!(capacity < 33_000, "{capacity}");
+        // `insert` panics on the name past capacity: refused instead.
+        let refused = std::panic::catch_unwind(|| parse_native_request(with_headers(33_000)).err());
+        assert_eq!(
+            refused.ok(),
+            Some(Some(NativeRequestError::TooManyHeaders)),
+            "refused, without a panic"
+        );
+        // A request whose own names fill the map parses; one more refuses,
+        // and so does a full map with an `x-freedom-request-id` to add.
+        let full = parse_native_request(with_headers(capacity)).unwrap();
+        assert_eq!(full.request.headers.len(), capacity);
+        assert_eq!(
+            parse_native_request(with_headers(capacity + 1)).unwrap_err(),
+            NativeRequestError::TooManyHeaders
+        );
+        let full = NativeRequest {
+            request_id: Some(1),
+            ..with_headers(capacity)
+        };
+        assert_eq!(
+            parse_native_request(full).unwrap_err(),
+            NativeRequestError::TooManyHeaders
+        );
+        // Repeated names keep one entry, the last value, as `insert` did.
+        let repeated = NativeRequest {
+            headers: Some(
+                (0..40_000)
+                    .map(|i| NativeRequestHeader {
+                        name: "x-h".into(),
+                        value: i.to_string(),
+                    })
+                    .collect(),
+            ),
+            ..with_headers(0)
+        };
+        let repeated = parse_native_request(repeated).unwrap();
+        assert_eq!(repeated.request.headers.len(), 1);
+        assert_eq!(header(&repeated, "x-h"), Some("39999"));
     }
 
     #[test]
