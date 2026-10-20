@@ -1,7 +1,7 @@
 use cid::Cid;
 use freedom_ipfs_core::{
     block_data_range, btree_map_bytes, encode_car_v1, parse_car_v1, verify_block, Block,
-    BlockProvider, CarBlock, ChargedBytes, CoreError, FixedPool, HeldBytes, PoolShare,
+    BlockProvider, CarBlock, ChargedBytes, CoreError, FixedPool, HeldBytes, PoolShare, Reservation,
     Result as CoreResult,
 };
 use parking_lot::Mutex;
@@ -301,9 +301,19 @@ impl SqliteBlockStore {
     /// reserves it as the cache's fixed reservation. The cache never covers
     /// more: it counts each block by its allocation's footprint, for as long
     /// as the allocation lives, including after the cache has let it go, and
-    /// its own structures (its maps' nodes and keys) besides.
+    /// its own structures (itself, its maps' nodes and keys) besides. Even a
+    /// hot cache that caches nothing keeps itself (a few hundred bytes),
+    /// which counts.
     pub fn hot_cache_capacity(&self) -> u64 {
-        self.hot.lock().max_bytes
+        self.hot.lock().pool.capacity() as u64
+    }
+
+    /// Ties `lease`, the fixed reservation the hot cache is reserved by, to
+    /// its memory ([`FixedPool::keep_lease`]): it goes only once the cache
+    /// and every block it covers, one a reader still holds included, are
+    /// gone. Closing the store lets go of the cache, but not of such a block.
+    pub fn keep_hot_cache_lease(&self, lease: Arc<Reservation>) -> bool {
+        self.hot.lock().pool.keep_lease(lease)
     }
 
     /// The bytes the hot cache counts now, of its fixed capacity: the blocks
@@ -772,11 +782,13 @@ fn cached_unless_full(written: rusqlite::Result<usize>) -> Result<bool> {
 // heap, by capacity. Room for them is taken before an entry goes in, oldest
 // blocks making way.
 struct VerifiedHotCache {
-    max_bytes: u64,
     pool: FixedPool,
-    /// The pool's room for the cache's own structures ([`Self::index_bytes`]);
-    /// `None` when it caches nothing.
-    index: Option<PoolShare>,
+    /// Whether it caches anything: not when its capacity is zero, or too
+    /// small for its maps.
+    enabled: bool,
+    /// The pool's room for the cache's own structures ([`Self::index_bytes`]),
+    /// itself alone when it caches nothing.
+    index: PoolShare,
     /// The heap the keys of both maps own.
     key_heap: usize,
     clock: u64,
@@ -788,9 +800,18 @@ struct VerifiedHotCache {
 
 /// What the hot cache's own structures take besides its maps' nodes and
 /// keys: the cache in its store's `Arc<Mutex<_>>`, and its pool's counter in
-/// its own `Arc`.
-const HOT_CACHE_OWN_BYTES: usize =
-    std::mem::size_of::<Mutex<VerifiedHotCache>>() + 6 * std::mem::size_of::<usize>();
+/// its own `Arc`. All a hot cache that caches nothing takes.
+const HOT_CACHE_OWN_BYTES: usize = std::mem::size_of::<Mutex<VerifiedHotCache>>()
+    + 2 * std::mem::size_of::<usize>()
+    + FixedPool::HEAP_BYTES;
+
+/// The fixed capacity of a hot cache of `max_bytes`: at least its own
+/// structures, which even one that caches nothing keeps.
+fn hot_cache_fixed_bytes(max_bytes: u64) -> usize {
+    usize::try_from(max_bytes)
+        .unwrap_or(usize::MAX)
+        .max(HOT_CACHE_OWN_BYTES)
+}
 
 /// What the hot cache is given: bytes to share, or bytes to copy (once
 /// it has room for the copy).
@@ -812,20 +833,23 @@ struct VerifiedHotCacheHit<T> {
 
 impl VerifiedHotCache {
     fn new(max_bytes: u64) -> Self {
-        let pool = FixedPool::new(usize::try_from(max_bytes).unwrap_or(usize::MAX));
+        let pool = FixedPool::new(hot_cache_fixed_bytes(max_bytes));
+        // Its own structures count from the start.
+        let index = pool
+            .share(HOT_CACHE_OWN_BYTES)
+            .expect("a cache's capacity holds its own structures");
         let mut cache = Self {
-            max_bytes,
-            index: (max_bytes > 0).then(|| pool.share(0)).flatten(),
+            enabled: max_bytes > 0,
+            index,
             pool,
             key_heap: 0,
             clock: 0,
             entries: BTreeMap::new(),
             charged: BTreeSet::new(),
         };
-        // Its own structures first; a pool too small for them caches
-        // nothing.
-        if !cache.true_index() {
-            cache.index = None;
+        // Then room for its maps: a pool too small for them caches nothing.
+        if cache.enabled && !cache.true_index() {
+            cache.enabled = false;
         }
         cache
     }
@@ -833,6 +857,10 @@ impl VerifiedHotCache {
     /// What its structures take, at most, with `entries` and `charged` more
     /// entries in its maps, and `key_heap` more bytes of keys.
     fn index_bytes(&self, entries: usize, charged: usize, key_heap: usize) -> usize {
+        if !self.enabled {
+            // It never allocates its maps' nodes.
+            return HOT_CACHE_OWN_BYTES;
+        }
         HOT_CACHE_OWN_BYTES
             .saturating_add(btree_map_bytes::<Vec<u8>, VerifiedHotBlock>(
                 self.entries.len().saturating_add(entries),
@@ -848,9 +876,7 @@ impl VerifiedHotCache {
     /// it can't grow to it.
     fn true_index(&mut self) -> bool {
         let bytes = self.index_bytes(0, 0, 0);
-        self.index
-            .as_mut()
-            .is_some_and(|index| index.try_resize(bytes))
+        self.index.try_resize(bytes)
     }
 
     /// Takes over the dynamic charges of the entries the cache now holds
@@ -920,7 +946,7 @@ impl VerifiedHotCache {
     fn put_input(&mut self, cid: Vec<u8>, input: HotInput<'_>, now: u64) {
         self.take_over_charges();
         self.remove(&cid);
-        if self.index.is_none() {
+        if !self.enabled {
             return;
         }
         // Bytes to copy (plain input, or bytes another pool covers: one
@@ -959,10 +985,7 @@ impl VerifiedHotCache {
             // Room for its entry in the maps first, then for its bytes: each
             // taken before anything is allocated for it.
             let index = self.index_bytes(1, charged, key_heap);
-            let roomy = self
-                .index
-                .as_mut()
-                .is_some_and(|room| room.try_resize(index));
+            let roomy = self.index.try_resize(index);
             if roomy {
                 let held = match (copy, &input) {
                     (Some(bytes), _) => self.pool.hold_copy(bytes.len(), || {
@@ -1071,10 +1094,10 @@ mod tests {
     fn default_options_size_the_store_as_before() {
         let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
         assert_eq!(store.max_bytes, 1024 * 1024);
-        assert_eq!(store.hot.lock().max_bytes, 1024 * 1024);
+        assert_eq!(store.hot_cache_capacity(), 1024 * 1024);
         let store = SqliteBlockStore::in_memory(0).unwrap();
         assert_eq!(store.max_bytes, DEFAULT_CACHE_BYTES);
-        assert_eq!(store.hot.lock().max_bytes, DEFAULT_HOT_CACHE_BYTES);
+        assert_eq!(store.hot_cache_capacity(), DEFAULT_HOT_CACHE_BYTES);
     }
 
     #[test]
@@ -1185,7 +1208,7 @@ mod tests {
     /// but for its own structures.
     fn covered(store: &SqliteBlockStore) -> u64 {
         let hot = store.hot.lock();
-        (hot.pool.used() - hot.index.as_ref().map_or(0, PoolShare::bytes)) as u64
+        (hot.pool.used() - hot.index.bytes()) as u64
     }
 
     /// A hot cache's capacity for exactly one block of `len` bytes, copied
@@ -1356,7 +1379,7 @@ mod tests {
             ..StoreOptions::default()
         })
         .unwrap();
-        assert_eq!(large.hot.lock().max_bytes, 64 * 1024 * 1024);
+        assert_eq!(large.hot_cache_capacity(), 64 * 1024 * 1024);
     }
 
     #[test]
@@ -2087,6 +2110,81 @@ mod tests {
         pub(super) fn peak() -> isize {
             PEAK.with(Cell::get)
         }
+    }
+
+    #[test]
+    fn hot_index_churn_counts_keys_by_capacity_and_takes_room_first() {
+        const CAPACITY: usize = 32 * 1024;
+        let inputs: Vec<_> = (0..2_000u64)
+            .map(|n| {
+                let data = vec![n as u8; 1 + n as usize % 301];
+                let cid = cid_from_data(CODEC_RAW, &data);
+                // Keys with far more capacity than length.
+                let mut key = Vec::with_capacity(700 + n as usize % 23);
+                key.extend(cid.to_bytes());
+                (key, data)
+            })
+            .collect();
+        let origin = heap::live();
+        let mut cache = VerifiedHotCache::new(CAPACITY as u64);
+        for (key, data) in &inputs {
+            // The incoming key is the caller's until the cache takes it.
+            let mut incoming = Vec::with_capacity(key.capacity());
+            incoming.extend(key);
+            let incoming_bytes = incoming.capacity();
+            heap::live();
+            cache.put_input(incoming, HotInput::Copy(data), 0);
+            let peak = heap::peak() - origin;
+            let live = heap::live() - origin;
+            assert!(
+                live as usize <= cache.pool.used(),
+                "live {live}, counted {}",
+                cache.pool.used()
+            );
+            assert!(
+                peak as usize <= CAPACITY + incoming_bytes,
+                "peaked at {peak}"
+            );
+            assert!(cache.pool.used() <= CAPACITY);
+        }
+        drop(cache);
+        assert_eq!(heap::live(), origin);
+    }
+
+    #[test]
+    fn disabled_and_tiny_hot_caches_count_their_own_heap() {
+        for capacity in [0, 1, 64, 256] {
+            let origin = heap::live();
+            let cache = Arc::new(Mutex::new(VerifiedHotCache::new(capacity)));
+            let live = heap::live() - origin;
+            let counted = cache.lock().pool.used();
+            // It caches nothing, but counts, and reports as its fixed
+            // capacity, the heap it keeps.
+            assert!(
+                live as usize <= counted,
+                "capacity {capacity}: heap {live}, counted {counted}"
+            );
+            assert_eq!(
+                cache.lock().pool.capacity(),
+                hot_cache_fixed_bytes(capacity)
+            );
+            assert!(counted <= cache.lock().pool.capacity());
+            let data = b"x";
+            cache.lock().put_input(
+                block_key(&cid_from_data(CODEC_RAW, data)),
+                HotInput::Copy(data),
+                0,
+            );
+            assert!(cache.lock().entries.is_empty(), "caches nothing");
+            drop(cache);
+            assert_eq!(heap::live(), origin);
+        }
+        let off = SqliteBlockStore::in_memory_with(StoreOptions {
+            hot_cache_bytes: Some(0),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        assert_eq!(off.hot_cache_capacity(), HOT_CACHE_OWN_BYTES as u64);
     }
 
     #[test]

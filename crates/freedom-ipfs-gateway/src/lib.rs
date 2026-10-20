@@ -12,6 +12,7 @@ use bytes::Bytes;
 use cid::Cid;
 use freedom_ipfs_core::{
     btree_map_bytes, parse_cid, BlockProvider, ChargedBytes, FixedPool, HeldBytes, PoolShare,
+    Reservation,
 };
 use freedom_ipfs_namesys::{NameResolver, NamesysError, ResolvedName};
 use freedom_ipfs_retrieval::{with_retrieval_request_context, RetrievalRequestContext};
@@ -124,9 +125,12 @@ struct SmallBodyCache {
 #[derive(Debug)]
 struct SmallBodyCacheInner {
     clock: u64,
-    /// The pool's room for the cache's own structures; `None` when it
-    /// caches nothing. The bodies are covered one by one.
-    room: Option<PoolShare>,
+    /// Whether it caches anything: not when its capacity is zero, or too
+    /// small for its maps.
+    enabled: bool,
+    /// The pool's room for the cache's own structures, alone when it caches
+    /// nothing. The bodies are covered one by one.
+    room: PoolShare,
     entries: BTreeMap<SmallBodyCacheKey, SmallBody>,
     /// Entries whose bytes still carry a dynamic charge, to take over once
     /// the cache holds them alone.
@@ -140,14 +144,26 @@ struct SmallBody {
 }
 
 /// What the cache's own structures take besides its maps' nodes: the cache
-/// in its `Arc`, and its pool's counter in its own.
-const SMALL_BODY_CACHE_OWN_BYTES: usize =
-    std::mem::size_of::<SmallBodyCache>() + 6 * std::mem::size_of::<usize>();
+/// in its `Arc`, and its pool's counter in its own. All a cache that caches
+/// nothing takes.
+const SMALL_BODY_CACHE_OWN_BYTES: usize = std::mem::size_of::<SmallBodyCache>()
+    + 2 * std::mem::size_of::<usize>()
+    + FixedPool::HEAP_BYTES;
+
+/// The fixed capacity of a small-body cache of `max_bytes`: at least its own
+/// structures, which even one that caches nothing keeps.
+fn small_body_cache_fixed_bytes(max_bytes: usize) -> usize {
+    max_bytes.max(SMALL_BODY_CACHE_OWN_BYTES)
+}
 
 impl SmallBodyCacheInner {
     /// What its structures take, at most, with `extra` more entries and
     /// `extra_charged` more charged ones.
     fn structure_bytes(&self, extra: usize, extra_charged: usize) -> usize {
+        if !self.enabled {
+            // It never allocates its maps' nodes.
+            return SMALL_BODY_CACHE_OWN_BYTES;
+        }
         SMALL_BODY_CACHE_OWN_BYTES
             .saturating_add(btree_map_bytes::<SmallBodyCacheKey, SmallBody>(
                 self.entries.len().saturating_add(extra),
@@ -160,9 +176,7 @@ impl SmallBodyCacheInner {
     /// Sizes the room to what the structures take now.
     fn true_room(&mut self) -> bool {
         let bytes = self.structure_bytes(0, 0);
-        self.room
-            .as_mut()
-            .is_some_and(|room| room.try_resize(bytes))
+        self.room.try_resize(bytes)
     }
 
     /// Takes over the dynamic charges of the bodies the cache now holds
@@ -200,17 +214,21 @@ impl SmallBodyCacheInner {
 
 impl SmallBodyCache {
     fn new(max_bytes: usize) -> Self {
-        let pool = FixedPool::new(max_bytes);
+        let pool = FixedPool::new(small_body_cache_fixed_bytes(max_bytes));
+        // Its own structures count from the start.
+        let room = pool
+            .share(SMALL_BODY_CACHE_OWN_BYTES)
+            .expect("a cache's capacity holds its own structures");
         let mut inner = SmallBodyCacheInner {
             clock: 0,
-            room: (max_bytes > 0).then(|| pool.share(0)).flatten(),
+            enabled: max_bytes > 0,
+            room,
             entries: BTreeMap::new(),
             charged: BTreeSet::new(),
         };
-        // Its own structures first; a pool too small for them caches
-        // nothing.
-        if !inner.true_room() {
-            inner.room = None;
+        // Then room for its maps: a pool too small for them caches nothing.
+        if inner.enabled && !inner.true_room() {
+            inner.enabled = false;
         }
         Self {
             pool,
@@ -223,7 +241,9 @@ impl SmallBodyCache {
     /// alone.
     fn get(&self, key: &SmallBodyCacheKey) -> Option<Bytes> {
         let mut inner = self.lock_inner();
-        inner.room.as_ref()?;
+        if !inner.enabled {
+            return None;
+        }
         inner.take_over_charges();
         inner.clock = inner.clock.saturating_add(1);
         let tick = inner.clock;
@@ -253,7 +273,9 @@ impl SmallBodyCache {
         key: SmallBodyCacheKey,
         body: &ChargedBytes,
     ) -> Option<usize> {
-        inner.room.as_ref()?;
+        if !inner.enabled {
+            return None;
+        }
         inner.take_over_charges();
         let len = body.len();
         if len > GATEWAY_SMALL_BODY_CACHE_MAX_ENTRY_BYTES {
@@ -295,10 +317,7 @@ impl SmallBodyCache {
             // Room for its entry first, then the body's cover: each taken
             // before anything is allocated for it.
             let structure = inner.structure_bytes(1, charged);
-            let roomy = inner
-                .room
-                .as_mut()
-                .is_some_and(|room| room.try_resize(structure));
+            let roomy = inner.room.try_resize(structure);
             if roomy {
                 let held = match shared {
                     Some(bytes) => self.pool.hold(bytes),
@@ -430,15 +449,16 @@ impl GatewayConfig {
     /// The fixed capacity of a gateway's caches (design 0007, "Budgets"):
     /// its small-body cache's and its UnixFS metadata cache's, which a host
     /// reserves as fixed. Each cache stays within its own, counting what it
-    /// holds conservatively. The gateways of one [`OnlineNode`] share one set
-    /// of caches, so it counts once per node.
+    /// holds conservatively; even one that caches nothing keeps its own
+    /// structures (a few hundred bytes), which count. The gateways of one
+    /// [`OnlineNode`] share one set of caches, so it counts once per node.
     pub fn cache_capacity(&self) -> usize {
-        let unixfs = if self.unixfs_metadata_cache_capacity == 0 {
-            0
-        } else {
-            self.unixfs_metadata_cache_max_bytes
-        };
-        self.small_body_cache_max_bytes.saturating_add(unixfs)
+        small_body_cache_fixed_bytes(self.small_body_cache_max_bytes).saturating_add(
+            UnixfsResolver::metadata_cache_fixed_bytes(
+                self.unixfs_metadata_cache_capacity,
+                self.unixfs_metadata_cache_max_bytes,
+            ),
+        )
     }
 
     pub fn html_prefetch(&self) -> GatewayHtmlPrefetchConfig {
@@ -796,6 +816,14 @@ impl GatewayCaches {
             ),
             small_body: Arc::new(SmallBodyCache::new(config.small_body_cache_max_bytes())),
         }
+    }
+
+    /// Ties `lease`, the fixed reservation the caches are reserved by, to
+    /// their memory ([`FixedPool::keep_lease`]): it goes only once the
+    /// caches, and every body they cover, are gone.
+    pub(crate) fn keep_lease(&self, lease: &Arc<Reservation>) {
+        self.small_body.pool.keep_lease(lease.clone());
+        self.unixfs.keep_metadata_cache_lease(lease.clone());
     }
 }
 
@@ -4807,6 +4835,204 @@ mod tests {
             file_cid: cid_from_data(CODEC_RAW, seed),
             len,
         }
+    }
+
+    /// Counts each thread's live heap bytes, and their peak, so a test can
+    /// see what a cache holds on the heap.
+    mod heap {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static LIVE: Cell<isize> = const { Cell::new(0) };
+            static PEAK: Cell<isize> = const { Cell::new(0) };
+        }
+
+        struct Counting;
+
+        fn add(bytes: isize) {
+            let _ = LIVE.try_with(|live| {
+                let now = live.get() + bytes;
+                live.set(now);
+                let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+            });
+        }
+
+        // SAFETY: every call is passed on to the system allocator as is.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let ptr = unsafe { System.alloc(layout) };
+                if !ptr.is_null() {
+                    add(layout.size() as isize);
+                }
+                ptr
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                let ptr = unsafe { System.alloc_zeroed(layout) };
+                if !ptr.is_null() {
+                    add(layout.size() as isize);
+                }
+                ptr
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) };
+                add(-(layout.size() as isize));
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                let new = unsafe { System.realloc(ptr, layout, new_size) };
+                if !new.is_null() {
+                    add(new_size as isize - layout.size() as isize);
+                }
+                new
+            }
+        }
+
+        #[global_allocator]
+        static COUNTING: Counting = Counting;
+
+        /// This thread's live heap bytes; the peak starts again from them.
+        pub(super) fn live() -> isize {
+            let live = LIVE.with(Cell::get);
+            PEAK.with(|peak| peak.set(live));
+            live
+        }
+
+        /// The most this thread held since [`live`] was last read.
+        pub(super) fn peak() -> isize {
+            PEAK.with(Cell::get)
+        }
+    }
+
+    #[test]
+    fn a_buffers_footprint_is_what_it_allocates() {
+        for len in [0, 1, 2, 100, 65_537] {
+            let origin = heap::live();
+            let bytes = ChargedBytes::from_vec(vec![7u8; len]);
+            let allocated = heap::live() - origin;
+            assert_eq!(allocated as usize, bytes.footprint(), "length {len}");
+            // Clones and views allocate nothing more.
+            let clone = bytes.clone();
+            let view = bytes.slice(0, len.min(1));
+            assert_eq!(heap::live() - origin, allocated);
+            drop((bytes, clone));
+            assert_eq!(heap::live() - origin, allocated);
+            drop(view);
+            assert_eq!(heap::live(), origin);
+        }
+    }
+
+    #[test]
+    fn disabled_and_tiny_small_body_caches_count_their_own_heap() {
+        for max_bytes in [0, 1, 64, 256] {
+            let origin = heap::live();
+            let cache = Arc::new(SmallBodyCache::new(max_bytes));
+            let live = heap::live() - origin;
+            let counted = cache.pool.used();
+            // It caches nothing, but counts, and reports as its fixed
+            // capacity, the heap it keeps.
+            assert!(
+                live as usize <= counted,
+                "{max_bytes}: heap {live}, counted {counted}"
+            );
+            assert_eq!(
+                cache.pool.capacity(),
+                small_body_cache_fixed_bytes(max_bytes)
+            );
+            assert!(counted <= cache.pool.capacity());
+            assert!(
+                !cache
+                    .insert(
+                        small_body_key(b"x", 1),
+                        &ChargedBytes::copy_from_slice(b"x")
+                    )
+                    .inserted
+            );
+            drop(cache);
+            assert_eq!(heap::live(), origin);
+        }
+    }
+
+    #[test]
+    fn the_small_body_cache_covers_its_real_heap_through_copies_and_evictions() {
+        const CAPACITY: usize = 64 * 1024;
+        // Bodies another pool covers, so each one is copied in.
+        let source = FixedPool::new(4 * 1024 * 1024);
+        let inputs: Vec<_> = (0..3_000u64)
+            .map(|n| {
+                let body = ChargedBytes::from_vec(vec![n as u8; 1 + (n as usize * 37) % 900]);
+                let held = source.hold(&body).unwrap();
+                (
+                    small_body_key(&n.to_le_bytes(), body.len() as u64),
+                    body,
+                    held,
+                )
+            })
+            .collect();
+        let origin = heap::live();
+        let cache = Arc::new(SmallBodyCache::new(CAPACITY));
+        for (key, body, _) in &inputs {
+            heap::live();
+            cache.insert(key.clone(), body);
+            let peak = heap::peak() - origin;
+            let live = heap::live() - origin;
+            assert!(
+                live as usize <= cache.pool.used(),
+                "holds {live}, counts {}",
+                cache.pool.used()
+            );
+            assert!(peak as usize <= CAPACITY, "peaked at {peak}");
+            assert!(cache.pool.used() <= CAPACITY);
+        }
+        drop(cache);
+        assert_eq!(heap::live(), origin);
+    }
+
+    #[test]
+    fn concurrent_small_body_readers_and_takeovers_stay_within_the_capacity() {
+        let cache = Arc::new(SmallBodyCache::new(32 * 1024));
+        let budget = MemoryBudget::new(4 * 1024 * 1024);
+        let threads: Vec<_> = (0..4u64)
+            .map(|thread| {
+                let cache = cache.clone();
+                let budget = budget.clone();
+                std::thread::spawn(move || {
+                    let mut pinned = std::collections::VecDeque::new();
+                    for round in 0..1_000u64 {
+                        let len = 1 + (round as usize * 31) % 400;
+                        let fetched = freedom_ipfs_core::ReservedVec::zeroed(
+                            len,
+                            budget.try_reserve(len).unwrap(),
+                        )
+                        .unwrap()
+                        .into_charged();
+                        let mut seed = [0u8; 16];
+                        seed[..8].copy_from_slice(&thread.to_le_bytes());
+                        seed[8..].copy_from_slice(&round.to_le_bytes());
+                        let key = small_body_key(&seed, len as u64);
+                        cache.insert(key.clone(), &fetched);
+                        if let Some(reader) = cache.get(&key) {
+                            pinned.push_back(reader);
+                        }
+                        drop(fetched);
+                        if pinned.len() > 5 {
+                            pinned.pop_front();
+                        }
+                        assert!(cache.pool.used() <= cache.pool.capacity());
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        cache.lock_inner().take_over_charges();
+        assert_eq!(budget.used(), 0, "every charge was taken over or freed");
+        let pool = cache.pool.clone();
+        drop(cache);
+        assert_eq!(pool.used(), 0);
     }
 
     #[test]

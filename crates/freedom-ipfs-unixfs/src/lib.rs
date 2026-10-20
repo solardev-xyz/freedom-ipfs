@@ -1,6 +1,7 @@
 use cid::Cid;
 use freedom_ipfs_core::{
-    btree_map_bytes, Block, BlockProvider, FixedPool, PoolShare, CODEC_DAG_PB, CODEC_RAW,
+    btree_map_bytes, Block, BlockProvider, FixedPool, PoolShare, Reservation, CODEC_DAG_PB,
+    CODEC_RAW,
 };
 use multihash::Multihash;
 use prost::Message;
@@ -160,7 +161,8 @@ impl UnixfsResolver {
     /// At most `capacity` entries of each kind, all of them together in at
     /// most `max_bytes` of heap, counted conservatively: the cache's fixed
     /// capacity ([`UnixfsResolver::metadata_cache_max_bytes`]). Either at
-    /// zero caches nothing.
+    /// zero, or a `max_bytes` too small for the cache's maps, caches
+    /// nothing.
     pub fn with_metadata_cache_limits(capacity: usize, max_bytes: usize) -> Self {
         Self {
             metadata_cache: Arc::new(UnixfsMetadataCache::new(capacity, max_bytes)),
@@ -168,9 +170,24 @@ impl UnixfsResolver {
     }
 
     /// The metadata cache's fixed capacity in bytes, which a host reserves
-    /// for it: zero when it caches nothing.
+    /// for it ([`UnixfsResolver::metadata_cache_fixed_bytes`]).
     pub fn metadata_cache_max_bytes(&self) -> usize {
         self.metadata_cache.max_bytes()
+    }
+
+    /// The fixed capacity of a metadata cache built with these limits
+    /// ([`UnixfsResolver::with_metadata_cache_limits`]): `max_bytes`, but at
+    /// least the cache's own structures, which even one that caches nothing
+    /// keeps (a few hundred bytes).
+    pub fn metadata_cache_fixed_bytes(capacity: usize, max_bytes: usize) -> usize {
+        metadata_cache_fixed_bytes(capacity, max_bytes)
+    }
+
+    /// Ties `lease`, the fixed reservation the metadata cache is reserved
+    /// by, to its memory ([`FixedPool::keep_lease`]): kept for as long as
+    /// the cache lives, and given back with it.
+    pub fn keep_metadata_cache_lease(&self, lease: Arc<Reservation>) -> bool {
+        self.metadata_cache.pool.keep_lease(lease)
     }
 
     /// Whether `other` shares this resolver's metadata cache, as its clones
@@ -307,22 +324,34 @@ struct UnixfsMetadataCache {
 }
 
 /// What the cache's own structures take besides its maps' nodes: the cache
-/// in its `Arc`, and its pool's counter in its own.
-const UNIXFS_METADATA_CACHE_OWN_BYTES: usize =
-    std::mem::size_of::<UnixfsMetadataCache>() + 6 * std::mem::size_of::<usize>();
+/// in its `Arc`, and its pool's counter in its own. All a cache that caches
+/// nothing takes.
+const UNIXFS_METADATA_CACHE_OWN_BYTES: usize = std::mem::size_of::<UnixfsMetadataCache>()
+    + 2 * std::mem::size_of::<usize>()
+    + FixedPool::HEAP_BYTES;
+
+/// The fixed capacity of a metadata cache with these limits: `max_bytes`,
+/// but at least the cache's own structures, which a cache that caches
+/// nothing (`capacity` zero) takes alone.
+fn metadata_cache_fixed_bytes(capacity: usize, max_bytes: usize) -> usize {
+    if capacity == 0 {
+        UNIXFS_METADATA_CACHE_OWN_BYTES
+    } else {
+        max_bytes.max(UNIXFS_METADATA_CACHE_OWN_BYTES)
+    }
+}
 
 impl UnixfsMetadataCache {
     fn new(capacity: usize, max_bytes: usize) -> Self {
-        let (pool, room) = if capacity == 0 || max_bytes == 0 {
-            (FixedPool::new(0), None)
-        } else {
-            let pool = FixedPool::new(max_bytes);
-            let room = pool.share(0);
-            (pool, room)
-        };
+        let pool = FixedPool::new(metadata_cache_fixed_bytes(capacity, max_bytes));
+        // Its own structures count from the start.
+        let room = pool
+            .share(UNIXFS_METADATA_CACHE_OWN_BYTES)
+            .expect("a cache's capacity holds its own structures");
         let mut inner = UnixfsMetadataCacheInner {
             capacity,
             max_bytes: pool.capacity(),
+            enabled: capacity > 0 && max_bytes > 0,
             clock: 0,
             room,
             heap: 0,
@@ -330,10 +359,9 @@ impl UnixfsMetadataCache {
             paths: CachedMap::default(),
             file_sizes: CachedMap::default(),
         };
-        // The cache's own structures first; a pool too small for them
-        // caches nothing.
-        if !inner.true_room() {
-            inner.room = None;
+        // Then room for its maps: a pool too small for them caches nothing.
+        if inner.enabled && !inner.true_room() {
+            inner.enabled = false;
         }
         Self {
             pool,
@@ -341,14 +369,9 @@ impl UnixfsMetadataCache {
         }
     }
 
-    /// The fixed capacity a host reserves for it: zero when it caches
-    /// nothing.
+    /// The fixed capacity a host reserves for it.
     fn max_bytes(&self) -> usize {
-        if self.lock_inner().room.is_some() {
-            self.pool.capacity()
-        } else {
-            0
-        }
+        self.pool.capacity()
     }
 
     fn get(&self, cid: &Cid) -> Option<DecodedDagPb> {
@@ -377,7 +400,7 @@ impl UnixfsMetadataCache {
     /// Caches a copy of `decoded`, made once its room is taken.
     fn insert(&self, cid: &Cid, encoded_len: usize, decoded: &DecodedDagPb) {
         let mut inner = self.lock_inner();
-        if inner.room.is_none() {
+        if !inner.enabled {
             return;
         }
         if encoded_len > UNIXFS_METADATA_CACHE_MAX_BLOCK_BYTES {
@@ -395,7 +418,7 @@ impl UnixfsMetadataCache {
 
     fn insert_path(&self, root: &Cid, path: &str, resolved: ResolvedNode) {
         let mut inner = self.lock_inner();
-        if inner.room.is_none() {
+        if !inner.enabled {
             return;
         }
         if path.len() > UNIXFS_PATH_CACHE_MAX_PATH_BYTES {
@@ -415,7 +438,7 @@ impl UnixfsMetadataCache {
 
     fn insert_file_size(&self, cid: &Cid, size: u64) {
         let mut inner = self.lock_inner();
-        if inner.room.is_none() {
+        if !inner.enabled {
             return;
         }
         inner.insert(
@@ -438,10 +461,7 @@ impl UnixfsMetadataCache {
 
     fn stats(&self) -> UnixfsMetadataCacheStats {
         let inner = self.lock_inner();
-        let (max_bytes, bytes) = match &inner.room {
-            Some(room) => (self.pool.capacity(), room.bytes()),
-            None => (0, 0),
-        };
+        let (max_bytes, bytes) = (self.pool.capacity(), inner.room.bytes());
         UnixfsMetadataCacheStats {
             capacity: inner.capacity,
             max_bytes,
@@ -479,10 +499,13 @@ struct UnixfsMetadataCacheInner {
     capacity: usize,
     /// Its pool's capacity: the most it holds.
     max_bytes: usize,
+    /// Whether it caches anything: not when its limits are zero, or too
+    /// small for its maps.
+    enabled: bool,
     clock: u64,
-    /// The pool's room for all the cache holds ([`Self::footprint`]); `None`
-    /// when it caches nothing.
-    room: Option<PoolShare>,
+    /// The pool's room for all the cache holds ([`Self::footprint`]), its
+    /// own structures alone when it caches nothing.
+    room: PoolShare,
     /// The heap its entries own.
     heap: usize,
     nodes: CachedMap<Cid, DecodedDagPb>,
@@ -497,8 +520,12 @@ impl UnixfsMetadataCacheInner {
     }
 
     /// What the cache holds, at most: its own structures, its maps' nodes
-    /// and its entries' heap.
+    /// and its entries' heap. One that caches nothing never allocates its
+    /// maps' nodes.
     fn footprint(&self) -> usize {
+        if !self.enabled {
+            return UNIXFS_METADATA_CACHE_OWN_BYTES;
+        }
         UNIXFS_METADATA_CACHE_OWN_BYTES
             .saturating_add(self.nodes.node_bytes(0))
             .saturating_add(self.paths.node_bytes(0))
@@ -509,9 +536,7 @@ impl UnixfsMetadataCacheInner {
     /// Sizes the room to the footprint: `false` if it can't grow to it.
     fn true_room(&mut self) -> bool {
         let footprint = self.footprint();
-        self.room
-            .as_mut()
-            .is_some_and(|room| room.try_resize(footprint))
+        self.room.try_resize(footprint)
     }
 
     /// Evicts the least recently used entry of any kind: `false` if there
@@ -581,11 +606,7 @@ impl UnixfsMetadataCacheInner {
         loop {
             let growth = select(self).node_bytes(1) - select(self).node_bytes(0);
             let needed = self.footprint().saturating_add(growth).saturating_add(heap);
-            if self
-                .room
-                .as_mut()
-                .is_some_and(|room| room.try_resize(needed))
-            {
+            if self.room.try_resize(needed) {
                 break;
             }
             if !self.evict_oldest() {
@@ -597,12 +618,7 @@ impl UnixfsMetadataCacheInner {
         let held = heap_of(&key, &value);
         // A copy owns no more than its source; were it ever to, it stays
         // only if the pool has room for the difference.
-        if held > heap
-            && !self
-                .room
-                .as_mut()
-                .is_some_and(|room| room.try_grow(held - heap))
-        {
+        if held > heap && !self.room.try_grow(held - heap) {
             drop((key, value));
             let map = select(self);
             map.oversized_skips = map.oversized_skips.saturating_add(1);
@@ -2379,6 +2395,61 @@ mod tests {
     }
 
     #[test]
+    fn metadata_caches_at_their_capacity_edges_count_and_release_every_heap_byte() {
+        let inputs = cache_inputs(500);
+        for max_bytes in [1, 4096, 8192, 16_000, 65_536] {
+            let origin = heap::live();
+            let cache = Arc::new(UnixfsMetadataCache::new(20, max_bytes));
+            let capacity = cache.max_bytes();
+            assert!(capacity >= max_bytes);
+            for input in &inputs {
+                heap::live();
+                insert_input(&cache, input);
+                let peak = heap::peak() - origin;
+                let live = heap::live() - origin;
+                let counted = cache.stats().bytes;
+                assert!(
+                    live as usize <= counted,
+                    "live {live}, counted {counted} of {max_bytes}"
+                );
+                assert!(counted <= capacity);
+                assert!(peak as usize <= capacity, "peaked at {peak} of {capacity}");
+            }
+            cache.clear();
+            let live = heap::live() - origin;
+            assert!(live as usize <= cache.stats().bytes);
+            drop(cache);
+            assert_eq!(heap::live(), origin);
+        }
+    }
+
+    #[test]
+    fn disabled_and_tiny_metadata_caches_count_their_own_heap() {
+        for (entries, max_bytes) in [(0, 0), (0, 1024 * 1024), (256, 1), (256, 64)] {
+            let origin = heap::live();
+            let cache = Arc::new(UnixfsMetadataCache::new(entries, max_bytes));
+            let live = heap::live() - origin;
+            let stats = cache.stats();
+            // It caches nothing, but counts, and reports as its fixed
+            // capacity, the heap it keeps.
+            assert!(
+                live as usize <= stats.bytes,
+                "{entries} entries in {max_bytes}: heap {live}, counted {}",
+                stats.bytes
+            );
+            assert!(stats.bytes <= cache.max_bytes());
+            assert_eq!(
+                cache.max_bytes(),
+                UnixfsResolver::metadata_cache_fixed_bytes(entries, max_bytes)
+            );
+            insert_input(&cache, &cache_inputs(1).remove(0));
+            assert_eq!(cache.stats().len, 0, "caches nothing");
+            drop(cache);
+            assert_eq!(heap::live(), origin);
+        }
+    }
+
+    #[test]
     fn a_resolver_reports_its_metadata_cache_capacity() {
         assert_eq!(
             UnixfsResolver::new().metadata_cache_max_bytes(),
@@ -2388,20 +2459,27 @@ mod tests {
             UnixfsResolver::with_metadata_cache_limits(8, 64 * 1024).metadata_cache_max_bytes(),
             64 * 1024
         );
+        // A cache that caches nothing still takes its own structures.
+        let own = UNIXFS_METADATA_CACHE_OWN_BYTES;
         assert_eq!(
             UnixfsResolver::without_metadata_cache().metadata_cache_max_bytes(),
-            0
+            own
         );
         assert_eq!(
             UnixfsResolver::with_metadata_cache_capacity(0).metadata_cache_max_bytes(),
-            0
+            own
         );
-        // Too small for even its own structures: it caches nothing, and
-        // needs nothing reserved.
         assert_eq!(
             UnixfsResolver::with_metadata_cache_limits(8, 16).metadata_cache_max_bytes(),
-            0
+            own
         );
+        for (capacity, max_bytes) in [(0, 0), (0, 1 << 20), (8, 16), (8, 64 * 1024)] {
+            assert_eq!(
+                UnixfsResolver::metadata_cache_fixed_bytes(capacity, max_bytes),
+                UnixfsResolver::with_metadata_cache_limits(capacity, max_bytes)
+                    .metadata_cache_max_bytes()
+            );
+        }
     }
 
     #[test]

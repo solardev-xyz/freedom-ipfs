@@ -27,7 +27,10 @@
 //!   owner lets it go too, so the pool never covers more than its capacity.
 //!   Once the owner's handles are the buffer's last, the owner takes over
 //!   its dynamic charge, when the last other handle is dropped; until then
-//!   the bytes count twice, which errs on the safe side. Memory that isn't
+//!   the bytes count twice, which errs on the safe side. The fixed
+//!   reservation a pool's capacity is reserved by can be tied to it
+//!   ([`FixedPool::keep_lease`]): it then goes only with the last of the
+//!   memory it stands for, a buffer a reader holds included. Memory that isn't
 //!   one buffer, such as a cache's decoded entries and its maps, takes a
 //!   [`PoolShare`] of the pool instead, sized by its owner
 //!   ([`btree_map_bytes`] bounds a map's nodes).
@@ -35,7 +38,7 @@
 use std::fmt;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -609,6 +612,9 @@ pub struct FixedPool {
 struct PoolInner {
     capacity: usize,
     used: AtomicUsize,
+    /// The fixed reservation its capacity is reserved by, if its owner gave
+    /// it one ([`FixedPool::keep_lease`]).
+    lease: OnceLock<Arc<Reservation>>,
 }
 
 /// A pool's cover of one allocation, released when the allocation is freed.
@@ -639,8 +645,24 @@ impl FixedPool {
             inner: Arc::new(PoolInner {
                 capacity,
                 used: AtomicUsize::new(0),
+                lease: OnceLock::new(),
             }),
         }
+    }
+
+    /// The heap a pool takes itself: its counter, in its `Arc`. A cache
+    /// counts it with its own structures.
+    pub const HEAP_BYTES: usize =
+        std::mem::size_of::<PoolInner>() + 2 * std::mem::size_of::<usize>();
+
+    /// Ties `lease`, the fixed reservation the pool's capacity is reserved
+    /// by, to the memory it stands for: it is kept for as long as the pool,
+    /// a clone or share of it, or any allocation it covers lives (a block a
+    /// reader still holds after its cache is gone included), and goes with
+    /// the last of them. A pool keeps the first lease it is given: whether
+    /// it kept this one.
+    pub fn keep_lease(&self, lease: Arc<Reservation>) -> bool {
+        self.inner.lease.set(lease).is_ok()
     }
 
     pub fn capacity(&self) -> usize {
@@ -1174,6 +1196,30 @@ mod tests {
         let _other_held = other.hold(&small).unwrap();
         assert!(pool.hold(&small).is_none());
         assert!(small.is_covered() && !pool.covers(&small) && other.covers(&small));
+    }
+
+    #[test]
+    fn a_pools_lease_goes_only_with_the_last_of_its_memory() {
+        let budget = MemoryBudget::new(1 << 20);
+        let lease = Arc::new(budget.try_reserve(10_000).unwrap());
+        let pool = FixedPool::new(10_000);
+        assert!(pool.keep_lease(lease.clone()));
+        assert!(!pool.keep_lease(Arc::new(budget.try_reserve(1).unwrap())));
+        assert_eq!(budget.used(), 10_000, "a second lease isn't kept");
+        let share = pool.share(100).unwrap();
+        let held = pool.hold(&ChargedBytes::from_vec(vec![1; 1_000])).unwrap();
+        let reader = held.bytes().clone();
+        // The owner lets go of the lease, the pool and its cache's handle.
+        drop((lease, pool, held));
+        assert_eq!(budget.used(), 10_000, "a share still stands for it");
+        drop(share);
+        assert_eq!(
+            budget.used(),
+            10_000,
+            "a reader still holds a covered buffer"
+        );
+        drop(reader);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]

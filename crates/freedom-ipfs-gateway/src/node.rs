@@ -180,9 +180,12 @@ impl OnlineNodeBuilder {
     /// reserves the node's fixed reservation
     /// ([`OnlineNodeBuilder::fixed_reservation`]) from the budget, without
     /// waiting: if that doesn't fit, nothing is started and it fails with
-    /// [`InstanceStartError::FixedReservation`]. The instance holds the
-    /// reservation until its teardown proves quiescence
-    /// ([`Instance::begin_shutdown`]). Without a budget it reserves nothing.
+    /// [`InstanceStartError::FixedReservation`]. The reservation is held
+    /// until the instance's teardown proves quiescence
+    /// ([`Instance::begin_shutdown`]) **and** the last of the cache memory
+    /// it stands for is freed: a cache a retained node or gateway still
+    /// holds, a block or body a reader still holds. Without a budget it
+    /// reserves nothing.
     pub fn build_instance(self, config: InstanceConfig) -> Result<Instance, InstanceStartError> {
         let fixed = match &self.memory_budget {
             Some(budget) => {
@@ -190,7 +193,7 @@ impl OnlineNodeBuilder {
                 let reservation = budget
                     .try_reserve(bytes)
                     .map_err(|source| InstanceStartError::FixedReservation { bytes, source })?;
-                Some(reservation)
+                Some(Arc::new(reservation))
             }
             None => None,
         };
@@ -203,6 +206,11 @@ impl OnlineNodeBuilder {
             .map_err(InstanceStartError::Runtime)?;
         let context = InstanceContext::new(runtime.handle().clone());
         let node = self.build_with(Some(context.clone()));
+        if let Some(lease) = &fixed {
+            // The caches keep it too, for as long as their memory lives.
+            node.store.keep_hot_cache_lease(lease.clone());
+            node.caches.keep_lease(lease);
+        }
         Ok(Instance {
             runtime: OwnedRuntime {
                 runtime: Some(runtime),
@@ -530,9 +538,12 @@ impl Default for InstanceConfig {
 /// runtime wind down in the background, proving nothing.
 ///
 /// **Its fixed reservation** (with a memory budget, see
-/// [`OnlineNodeBuilder::build_instance`]) is given back only by a teardown
-/// that proves quiescence, as its last step. An instance dropped without
-/// one, or whose teardown is unproven, keeps it for the rest of the
+/// [`OnlineNodeBuilder::build_instance`]) is let go of only by a teardown
+/// that proves quiescence, as its last step, and is given back once the
+/// caches' memory is freed too: the caches themselves, held by the instance
+/// and by any node or gateway a host retained, and every block or body
+/// they cover that a reader still holds. An instance dropped without a
+/// teardown, or whose teardown is unproven, keeps it for the rest of the
 /// process: the memory it stands for may still be in use (0007: such a
 /// process exits 70).
 pub struct Instance {
@@ -542,16 +553,19 @@ pub struct Instance {
     fixed: FixedReservation,
 }
 
-/// An instance's fixed reservation. Only [`FixedReservation::release`]
-/// gives it back; dropped, it is kept for the rest of the process.
-struct FixedReservation(Option<Reservation>);
+/// An instance's hold on its fixed reservation, which its caches' pools
+/// share ([`freedom_ipfs_core::FixedPool::keep_lease`]): the reservation
+/// goes with the last of them. Only [`FixedReservation::release`] lets go of
+/// the instance's hold; dropped, it keeps the reservation for the rest of
+/// the process.
+struct FixedReservation(Option<Arc<Reservation>>);
 
 impl FixedReservation {
     fn bytes(&self) -> usize {
-        self.0.as_ref().map_or(0, Reservation::bytes)
+        self.0.as_deref().map_or(0, Reservation::bytes)
     }
 
-    /// Gives the reservation back: once quiescence is proven.
+    /// Lets go of the instance's hold: once quiescence is proven.
     fn release(mut self) {
         drop(self.0.take());
     }
@@ -559,8 +573,8 @@ impl FixedReservation {
 
 impl Drop for FixedReservation {
     fn drop(&mut self) {
-        if let Some(reservation) = self.0.take() {
-            std::mem::forget(reservation);
+        if let Some(lease) = self.0.take() {
+            std::mem::forget(lease);
         }
     }
 }
@@ -760,7 +774,8 @@ impl Instance {
     ///    sockets. No timed shutdown is used: one may return while such work
     ///    still runs;
     /// 3. closes the store, at most 2 s for a statement in progress;
-    /// 4. gives back its fixed reservation, if quiescence is proven.
+    /// 4. lets go of its fixed reservation, if quiescence is proven: it is
+    ///    given back once the caches' memory is freed too.
     ///
     /// The teardown finishes only after the join, however long it takes, so
     /// a teardown that hasn't finished proves nothing. Bound it with a
@@ -791,8 +806,10 @@ impl Instance {
         let work = move || {
             let mut guard = runtime;
             let quiescence = tear_down(guard.runtime.take(), context, node, drain);
-            // Last: the reservation goes only once nothing of the instance
-            // can still hold the memory it stands for.
+            // Last: the instance lets go of the reservation only once
+            // nothing of it runs. The caches' pools keep it until the
+            // memory it stands for is freed: a retained node's caches, a
+            // block a reader holds.
             if quiescence.reached {
                 fixed.release();
             } else {
@@ -1047,7 +1064,16 @@ mod tests {
                     .with_unixfs_metadata_cache_capacity(0),
             )
             .build();
-        assert_eq!(node.fixed_reservation(), 16 * 1024 * 1024);
+        // Caches that cache nothing still count what they keep of
+        // themselves: a few hundred bytes.
+        let disabled = node.gateway_config().cache_capacity();
+        assert_eq!(node.fixed_reservation(), 16 * 1024 * 1024 + disabled);
+        assert!(disabled > 0 && disabled < 1024, "{disabled}");
+        let state = node.gateway_state();
+        assert_eq!(
+            state.small_body_cache.pool.capacity() + state.unixfs.metadata_cache_max_bytes(),
+            disabled
+        );
     }
 
     #[tokio::test]
@@ -1164,6 +1190,144 @@ mod tests {
             .unwrap();
         assert_eq!(instance.fixed_reservation(), 0);
         assert!(instance.shutdown(Duration::from_secs(5)).reached);
+    }
+
+    #[test]
+    fn a_retained_node_or_gateway_keeps_the_fixed_reservation_until_its_caches_go() {
+        for retain_the_gateway in [false, true] {
+            let store = SqliteBlockStore::in_memory_with(freedom_ipfs_store::StoreOptions {
+                max_bytes: 1 << 20,
+                hot_cache_bytes: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+            let data = vec![7u8; 32 * 1024];
+            let cid = cid_from_data(CODEC_RAW, &data);
+            store.put_block(&cid, &data).unwrap();
+            let builder = OnlineNode::builder(store)
+                .routing_mode(RoutingMode::Offline)
+                .gateway_config(
+                    GatewayConfig::default()
+                        .with_small_body_cache_max_bytes(64 * 1024)
+                        .with_unixfs_metadata_cache_capacity(0),
+                );
+            let fixed = builder.fixed_reservation();
+            let budget = MemoryBudget::new(fixed);
+            let instance = builder
+                .memory_budget(budget.clone())
+                .build_instance(fixed_instance_config("fipfs-retained"))
+                .unwrap();
+            let node = instance.node().clone();
+            let gateway = instance.gateway_core();
+            // A request fills the shared small-body cache.
+            let core = instance.gateway_core();
+            let path = cid.to_string();
+            let request = instance
+                .spawn_request(
+                    instance.request_token(),
+                    async move { get(&core, &path).await },
+                )
+                .unwrap();
+            let (status, body) = instance
+                .context()
+                .handle()
+                .block_on(request)
+                .unwrap()
+                .unwrap();
+            assert_eq!((status, body), (StatusCode::OK, data.clone()));
+            assert!(node.gateway_state().small_body_cache.pool.used() > 32 * 1024);
+            // The host keeps one of them past the teardown.
+            let retained: Box<dyn std::any::Any> = if retain_the_gateway {
+                drop(node);
+                Box::new(gateway)
+            } else {
+                drop(gateway);
+                Box::new(node)
+            };
+            assert!(instance.shutdown(Duration::from_secs(5)).reached);
+            // Its caches still hold the body: the reservation stays.
+            assert_eq!(
+                budget.used(),
+                fixed,
+                "retaining the gateway: {retain_the_gateway}"
+            );
+            assert!(budget.try_reserve(1).is_err());
+            drop(retained);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn a_retained_block_keeps_the_fixed_reservation_until_it_is_freed() {
+        for fetched in [false, true] {
+            let store = SqliteBlockStore::in_memory_with(freedom_ipfs_store::StoreOptions {
+                max_bytes: 1 << 20,
+                hot_cache_bytes: Some(64 * 1024),
+                ..Default::default()
+            })
+            .unwrap();
+            let data = vec![9u8; 32 * 1024];
+            let cid = cid_from_data(CODEC_RAW, &data);
+            let builder = OnlineNode::builder(store.clone())
+                .routing_mode(RoutingMode::Offline)
+                .gateway_config(
+                    GatewayConfig::default()
+                        .with_small_body_cache_max_bytes(0)
+                        .with_unixfs_metadata_cache_capacity(0),
+                );
+            let fixed = builder.fixed_reservation();
+            let budget = MemoryBudget::new(fixed + 64 * 1024);
+            if fetched {
+                // A fetched block, whose charge the hot cache takes over
+                // once it holds the block alone.
+                let mut buffer = freedom_ipfs_core::ReservedVec::zeroed(
+                    data.len(),
+                    budget.try_reserve(data.len()).unwrap(),
+                )
+                .unwrap();
+                buffer.as_mut_slice().copy_from_slice(&data);
+                let block = buffer.into_charged();
+                store.put_charged(&cid, &block).unwrap();
+                drop(block);
+                assert_eq!(budget.used(), 0, "taken over");
+            } else {
+                store.put_block(&cid, &data).unwrap();
+            }
+            let instance = builder
+                .memory_budget(budget.clone())
+                .build_instance(fixed_instance_config("fipfs-reader"))
+                .unwrap();
+            let reader = instance.node().store().get(&cid).unwrap().unwrap();
+            assert!(reader.charged().is_covered());
+            assert!(instance.shutdown(Duration::from_secs(5)).reached);
+            // The store is closed, but the block a reader holds is still
+            // covered: the reservation stays until it is freed.
+            assert_eq!(budget.used(), fixed, "fetched: {fetched}");
+            assert_eq!(reader.data(), &data[..]);
+            drop(reader);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn a_failed_start_gives_the_reservation_back_and_a_dropped_instance_keeps_it() {
+        let budget = MemoryBudget::new(64 * 1024 * 1024);
+        // A thread name the OS refuses fails the runtime's start by a
+        // panic: the reservation taken for it unwinds with it.
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            offline_builder()
+                .memory_budget(budget.clone())
+                .build_instance(fixed_instance_config("invalid\0thread"))
+        }));
+        assert!(started.is_err());
+        assert_eq!(budget.used(), 0);
+        let instance = offline_builder()
+            .memory_budget(budget.clone())
+            .build_instance(fixed_instance_config("fipfs-dropped"))
+            .unwrap();
+        let held = instance.fixed_reservation();
+        drop(instance);
+        assert_eq!(budget.used(), held, "a drop proves nothing");
     }
 
     #[cfg(target_os = "linux")]
