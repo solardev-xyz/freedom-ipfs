@@ -30,6 +30,13 @@
 //! block fetches, HTTP provider requests, Bitswap connections and DHT queries
 //! count against one set of process-wide limits. Each node also bounds its
 //! own background work ([`OnlineNode::background_queue`]).
+//!
+//! Its caches have fixed capacities, which together are its fixed
+//! reservation ([`OnlineNodeBuilder::fixed_reservation`]): the store's hot
+//! cache, and the small-body and UnixFS metadata caches that all of its
+//! gateways share. An [`Instance`] built with a [`MemoryBudget`] takes that
+//! reservation from it before it starts, and gives it back when its teardown
+//! ends.
 
 use std::future::Future;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -39,7 +46,7 @@ use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
 use axum::Router;
-use freedom_ipfs_core::BlockProvider;
+use freedom_ipfs_core::{BlockProvider, BudgetError, Reservation};
 use freedom_ipfs_namesys::{
     CachedNameResolver, CloudflareDohResolver, DefaultNameResolver, DelegatedIpnsResolver,
     FallbackIpnsResolver, IpnsResolver, NameResolver,
@@ -55,7 +62,10 @@ use freedom_ipfs_routing::{
 };
 use freedom_ipfs_store::SqliteBlockStore;
 
-use crate::{router_with_state, GatewayConfig, GatewayCore, GatewayState, PersistentNameResolver};
+use crate::{
+    router_with_state, GatewayCaches, GatewayConfig, GatewayCore, GatewayState,
+    PersistentNameResolver,
+};
 
 /// How a node finds providers and IPNS records.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -138,11 +148,24 @@ impl OnlineNodeBuilder {
     /// work waits for memory; background work fails at once. Unless set,
     /// the node reserves nothing.
     ///
-    /// The fixed reservations are the host's to make: the store's hot cache
-    /// reports its fixed capacity ([`SqliteBlockStore::hot_cache_capacity`]).
+    /// An [`Instance`] also takes its fixed reservation from it
+    /// ([`OnlineNodeBuilder::fixed_reservation`]) before it starts, and
+    /// fails to start if that doesn't fit. A node built with
+    /// [`OnlineNodeBuilder::build`] takes none: its host reserves it.
     pub fn memory_budget(mut self, budget: MemoryBudget) -> Self {
         self.memory_budget = Some(budget);
         self
+    }
+
+    /// What the node's caches can hold, which is fixed (design 0007,
+    /// "Budgets"): the store's hot cache
+    /// ([`SqliteBlockStore::hot_cache_capacity`]) and its gateways' caches
+    /// ([`GatewayConfig::cache_capacity`]), which all of its gateways share,
+    /// so they count once. Each cache stays within its capacity. An
+    /// [`Instance`] built with a memory budget reserves this much before it
+    /// starts.
+    pub fn fixed_reservation(&self) -> usize {
+        fixed_reservation(&self.store, &self.gateway_config)
     }
 
     /// Wires the node. This opens no socket and starts no task.
@@ -152,15 +175,42 @@ impl OnlineNodeBuilder {
 
     /// Wires the node as an owned [`Instance`] on a runtime of its own (see
     /// [`Instance`]). This starts the runtime's threads, and nothing else.
-    pub fn build_instance(self, config: InstanceConfig) -> std::io::Result<Instance> {
+    ///
+    /// With a memory budget ([`OnlineNodeBuilder::memory_budget`]), it first
+    /// reserves the node's fixed reservation
+    /// ([`OnlineNodeBuilder::fixed_reservation`]) from the budget, without
+    /// waiting: if that doesn't fit, nothing is started and it fails with
+    /// [`InstanceStartError::FixedReservation`]. The reservation is held
+    /// until the instance's teardown proves quiescence
+    /// ([`Instance::begin_shutdown`]) **and** the last of the cache memory
+    /// it stands for is freed: a cache a retained node or gateway still
+    /// holds, a block or body a reader still holds. Without a budget it
+    /// reserves nothing.
+    pub fn build_instance(self, config: InstanceConfig) -> Result<Instance, InstanceStartError> {
+        let fixed = match &self.memory_budget {
+            Some(budget) => {
+                let bytes = self.fixed_reservation();
+                let reservation = budget
+                    .try_reserve(bytes)
+                    .map_err(|source| InstanceStartError::FixedReservation { bytes, source })?;
+                Some(Arc::new(reservation))
+            }
+            None => None,
+        };
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(config.worker_threads.max(1))
             .max_blocking_threads(config.max_blocking_threads.max(1))
             .thread_name(config.thread_name)
             .enable_all()
-            .build()?;
+            .build()
+            .map_err(InstanceStartError::Runtime)?;
         let context = InstanceContext::new(runtime.handle().clone());
         let node = self.build_with(Some(context.clone()));
+        if let Some(lease) = &fixed {
+            // The caches keep it too, for as long as their memory lives.
+            node.store.keep_hot_cache_lease(lease.clone());
+            node.caches.keep_lease(lease);
+        }
         Ok(Instance {
             runtime: OwnedRuntime {
                 runtime: Some(runtime),
@@ -168,6 +218,7 @@ impl OnlineNodeBuilder {
             },
             context,
             node,
+            fixed: FixedReservation(fixed),
         })
     }
 
@@ -246,6 +297,7 @@ impl OnlineNodeBuilder {
             provider = provider.with_memory_budget(budget.clone());
         }
         let block_provider: Arc<dyn BlockProvider> = Arc::new(provider.clone());
+        let caches = GatewayCaches::new(&gateway_config);
         OnlineNode {
             store,
             routing_mode,
@@ -254,10 +306,60 @@ impl OnlineNodeBuilder {
             name_resolver,
             routing_stats,
             gateway_config,
+            caches,
             instance,
             background,
             shared_limits,
             memory_budget,
+        }
+    }
+}
+
+/// A node's fixed reservation: its store's hot cache and its gateways'
+/// caches.
+fn fixed_reservation(store: &SqliteBlockStore, gateway_config: &GatewayConfig) -> usize {
+    usize::try_from(store.hot_cache_capacity())
+        .unwrap_or(usize::MAX)
+        .saturating_add(gateway_config.cache_capacity())
+}
+
+/// Why an [`Instance`] didn't start.
+#[derive(Debug)]
+pub enum InstanceStartError {
+    /// Its fixed reservation ([`OnlineNodeBuilder::fixed_reservation`])
+    /// doesn't fit in the memory budget it was given.
+    FixedReservation { bytes: usize, source: BudgetError },
+    /// Its runtime couldn't be started.
+    Runtime(std::io::Error),
+}
+
+impl std::fmt::Display for InstanceStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FixedReservation { bytes, source } => write!(
+                f,
+                "the instance's fixed reservation of {bytes} bytes (its caches) \
+                 doesn't fit in the memory budget: {source}"
+            ),
+            Self::Runtime(err) => write!(f, "the instance's runtime could not be started: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for InstanceStartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::FixedReservation { source, .. } => Some(source),
+            Self::Runtime(err) => Some(err),
+        }
+    }
+}
+
+impl From<InstanceStartError> for std::io::Error {
+    fn from(err: InstanceStartError) -> Self {
+        match err {
+            InstanceStartError::Runtime(err) => err,
+            other => std::io::Error::new(std::io::ErrorKind::OutOfMemory, other),
         }
     }
 }
@@ -273,6 +375,8 @@ pub struct OnlineNode {
     name_resolver: Arc<dyn NameResolver>,
     routing_stats: RoutingStatsHandle,
     gateway_config: GatewayConfig,
+    /// The caches all of its gateways share.
+    caches: GatewayCaches,
     /// The owned instance whose gateways' background jobs it runs, if any.
     instance: Option<InstanceContext>,
     /// Its background queue, shared by its retriever and its gateways.
@@ -299,33 +403,38 @@ impl OnlineNode {
     }
 
     /// The gateway over the node's provider and name resolver, as the native
-    /// request API serves it.
+    /// request API serves it. Every gateway of the node shares its caches.
     pub fn gateway_core(&self) -> GatewayCore {
-        let core = GatewayCore::with_provider_and_name_resolver_config(
-            self.block_provider.clone(),
-            self.name_resolver.clone(),
-            self.gateway_config.clone(),
-        )
-        .with_background_queue(&self.background);
-        match &self.instance {
-            Some(instance) => core.with_instance(instance.clone()),
-            None => core,
-        }
+        GatewayCore::from_state(self.gateway_state())
     }
 
     /// The same gateway as an HTTP router, for a host that serves it on a
-    /// local socket.
+    /// local socket. It shares the node's caches with
+    /// [`OnlineNode::gateway_core`]'s.
     pub fn router(&self) -> Router {
-        let state = GatewayState::with_provider_and_name_resolver_config(
+        router_with_state(self.gateway_state())
+    }
+
+    /// A gateway's state over the node's caches. Each has its own request
+    /// limiter, as before.
+    fn gateway_state(&self) -> GatewayState {
+        let state = GatewayState::with_caches(
             self.block_provider.clone(),
             self.name_resolver.clone(),
             self.gateway_config.clone(),
+            self.caches.clone(),
         )
         .with_background_queue(&self.background);
-        router_with_state(match &self.instance {
+        match &self.instance {
             Some(instance) => state.with_instance(instance.clone()),
             None => state,
-        })
+        }
+    }
+
+    /// What the node's caches can hold: see
+    /// [`OnlineNodeBuilder::fixed_reservation`].
+    pub fn fixed_reservation(&self) -> usize {
+        fixed_reservation(&self.store, &self.gateway_config)
     }
 
     /// The retrieving block provider, for its statistics.
@@ -427,10 +536,47 @@ impl Default for InstanceConfig {
 ///
 /// Dropping an instance without shutting it down cancels it and lets its
 /// runtime wind down in the background, proving nothing.
+///
+/// **Its fixed reservation** (with a memory budget, see
+/// [`OnlineNodeBuilder::build_instance`]) is let go of only by a teardown
+/// that proves quiescence, as its last step, and is given back once the
+/// caches' memory is freed too: the caches themselves, held by the instance
+/// and by any node or gateway a host retained, and every block or body
+/// they cover that a reader still holds. An instance dropped without a
+/// teardown, or whose teardown is unproven, keeps it for the rest of the
+/// process: the memory it stands for may still be in use (0007: such a
+/// process exits 70).
 pub struct Instance {
     runtime: OwnedRuntime,
     context: InstanceContext,
     node: OnlineNode,
+    fixed: FixedReservation,
+}
+
+/// An instance's hold on its fixed reservation, which its caches' pools
+/// share ([`freedom_ipfs_core::FixedPool::keep_lease`]): the reservation
+/// goes with the last of them. Only [`FixedReservation::release`] lets go of
+/// the instance's hold; dropped, it keeps the reservation for the rest of
+/// the process.
+struct FixedReservation(Option<Arc<Reservation>>);
+
+impl FixedReservation {
+    fn bytes(&self) -> usize {
+        self.0.as_deref().map_or(0, Reservation::bytes)
+    }
+
+    /// Lets go of the instance's hold: once quiescence is proven.
+    fn release(mut self) {
+        drop(self.0.take());
+    }
+}
+
+impl Drop for FixedReservation {
+    fn drop(&mut self) {
+        if let Some(lease) = self.0.take() {
+            std::mem::forget(lease);
+        }
+    }
 }
 
 /// The instance's runtime. Dropped while it still holds the runtime (an
@@ -553,6 +699,12 @@ impl Instance {
         &self.node
     }
 
+    /// The bytes of fixed reservation it holds: none without a memory
+    /// budget.
+    pub fn fixed_reservation(&self) -> usize {
+        self.fixed.bytes()
+    }
+
     /// The gateway over the node.
     pub fn gateway_core(&self) -> GatewayCore {
         self.node.gateway_core()
@@ -621,7 +773,9 @@ impl Instance {
     ///    included, and every task left on it has been dropped with its
     ///    sockets. No timed shutdown is used: one may return while such work
     ///    still runs;
-    /// 3. closes the store, at most 2 s for a statement in progress.
+    /// 3. closes the store, at most 2 s for a statement in progress;
+    /// 4. lets go of its fixed reservation, if quiescence is proven: it is
+    ///    given back once the caches' memory is freed too.
     ///
     /// The teardown finishes only after the join, however long it takes, so
     /// a teardown that hasn't finished proves nothing. Bound it with a
@@ -639,6 +793,7 @@ impl Instance {
             runtime,
             context,
             node,
+            fixed,
         } = self;
         context.cancel();
         let done = Arc::new((Mutex::new(None), Condvar::new()));
@@ -651,6 +806,15 @@ impl Instance {
         let work = move || {
             let mut guard = runtime;
             let quiescence = tear_down(guard.runtime.take(), context, node, drain);
+            // Last: the instance lets go of the reservation only once
+            // nothing of it runs. The caches' pools keep it until the
+            // memory it stands for is freed: a retained node's caches, a
+            // block a reader holds.
+            if quiescence.reached {
+                fixed.release();
+            } else {
+                drop(fixed);
+            }
             finish(&done, quiescence);
         };
         let builder = std::thread::Builder::new().name("freedom-ipfs-teardown".into());
@@ -866,6 +1030,406 @@ mod tests {
             builder.gateway_config.request_queue_timeout(),
             config.request_queue_timeout()
         );
+        assert_eq!(
+            builder.gateway_config.cache_capacity(),
+            config.cache_capacity()
+        );
+    }
+
+    #[test]
+    fn a_nodes_fixed_reservation_is_its_caches_capacities() {
+        let store = SqliteBlockStore::in_memory(64 * 1024 * 1024).unwrap();
+        let builder = OnlineNode::builder(store.clone());
+        assert_eq!(GatewayConfig::default().cache_capacity(), 3 * 1024 * 1024);
+        // The hot cache (16 MiB), the small-body cache (2 MiB) and the UnixFS
+        // metadata cache (1 MiB): the persistent instance's 19 of 0007's 27.
+        assert_eq!(builder.fixed_reservation(), 19 * 1024 * 1024);
+        let node = builder
+            .gateway_config(
+                GatewayConfig::default()
+                    .with_small_body_cache_max_bytes(64 * 1024)
+                    .with_unixfs_metadata_cache_max_bytes(128 * 1024),
+            )
+            .build();
+        assert_eq!(node.fixed_reservation(), (16 * 1024 + 192) * 1024);
+        // The caches are built at those capacities.
+        let state = node.gateway_state();
+        assert_eq!(state.small_body_cache.pool.capacity(), 64 * 1024);
+        assert_eq!(state.unixfs.metadata_cache_max_bytes(), 128 * 1024);
+        assert_eq!(store.hot_cache_capacity(), 16 * 1024 * 1024);
+        let node = OnlineNode::builder(store)
+            .gateway_config(
+                GatewayConfig::default()
+                    .with_small_body_cache_max_bytes(0)
+                    .with_unixfs_metadata_cache_capacity(0),
+            )
+            .build();
+        // Caches that cache nothing still count what they keep of
+        // themselves: a few hundred bytes.
+        let disabled = node.gateway_config().cache_capacity();
+        assert_eq!(node.fixed_reservation(), 16 * 1024 * 1024 + disabled);
+        assert!(disabled > 0 && disabled < 1024, "{disabled}");
+        let state = node.gateway_state();
+        assert_eq!(
+            state.small_body_cache.pool.capacity() + state.unixfs.metadata_cache_max_bytes(),
+            disabled
+        );
+    }
+
+    #[tokio::test]
+    async fn one_nodes_gateway_core_and_router_share_one_set_of_caches() {
+        use crate::tests::{test_link, test_pb_directory};
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let file = b"one set of caches";
+        let file_cid = cid_from_data(CODEC_RAW, file);
+        store.put_block(&file_cid, file).unwrap();
+        let directory = test_pb_directory(vec![test_link("a.txt", &file_cid)]);
+        let directory_cid = cid_from_data(freedom_ipfs_core::CODEC_DAG_PB, &directory);
+        store.put_block(&directory_cid, &directory).unwrap();
+        let node = OnlineNode::builder(store.clone())
+            .routing_mode(RoutingMode::Offline)
+            .build();
+        assert!(node
+            .gateway_core()
+            .state
+            .shares_caches_with(&node.gateway_state()));
+        assert!(node
+            .gateway_core()
+            .state
+            .shares_caches_with(&node.clone().gateway_state()));
+
+        let path = format!("{directory_cid}/a.txt");
+        let (status, body) = get(&node.gateway_core(), &path).await;
+        assert_eq!((status, body.as_slice()), (StatusCode::OK, &file[..]));
+        // With the blocks gone, the router serves the file from what the
+        // native gateway cached: its path, its size and its body.
+        store.clear().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = node.router();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let response = reqwest::get(format!("http://{addr}/ipfs/{path}"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), &file[..]);
+        server.abort();
+    }
+
+    fn fixed_instance_config(thread_name: &str) -> InstanceConfig {
+        InstanceConfig {
+            thread_name: thread_name.into(),
+            worker_threads: 1,
+            max_blocking_threads: 4,
+        }
+    }
+
+    fn offline_builder() -> OnlineNodeBuilder {
+        OnlineNode::builder(SqliteBlockStore::in_memory(1024 * 1024).unwrap())
+            .routing_mode(RoutingMode::Offline)
+    }
+
+    #[test]
+    fn an_instance_starts_only_if_its_fixed_reservation_fits_and_gives_it_back_after_teardown() {
+        let fixed = offline_builder().fixed_reservation();
+        assert_eq!(fixed, 1024 * 1024 + 3 * 1024 * 1024);
+
+        // Past the whole budget: nothing is reserved, and nothing started.
+        let budget = MemoryBudget::new(fixed - 1);
+        match offline_builder()
+            .memory_budget(budget.clone())
+            .build_instance(fixed_instance_config("fipfs-fixed-no"))
+        {
+            Err(InstanceStartError::FixedReservation { bytes, source }) => {
+                assert_eq!(bytes, fixed);
+                assert!(matches!(source, BudgetError::TooLarge { .. }), "{source}");
+            }
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("started without its fixed reservation"),
+        }
+        assert_eq!(budget.used(), 0);
+
+        // It fits: held while the instance lives, so a second one beside it
+        // doesn't fit.
+        let budget = MemoryBudget::new(fixed + fixed / 2);
+        let instance = offline_builder()
+            .memory_budget(budget.clone())
+            .build_instance(fixed_instance_config("fipfs-fixed"))
+            .unwrap();
+        assert_eq!(
+            (budget.used(), instance.fixed_reservation()),
+            (fixed, fixed)
+        );
+        match offline_builder()
+            .memory_budget(budget.clone())
+            .build_instance(fixed_instance_config("fipfs-fixed-2"))
+        {
+            Err(InstanceStartError::FixedReservation { source, .. }) => {
+                assert!(matches!(source, BudgetError::Exhausted { .. }), "{source}");
+            }
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("two fixed reservations passed the budget"),
+        }
+        assert_eq!(budget.used(), fixed);
+
+        // Given back when its teardown ends, once quiescence is proven.
+        let quiescence = instance.shutdown(Duration::from_secs(5));
+        assert!(quiescence.reached, "{quiescence:?}");
+        assert_eq!(budget.used(), 0);
+        let instance = offline_builder()
+            .memory_budget(budget.clone())
+            .build_instance(fixed_instance_config("fipfs-fixed-3"))
+            .unwrap();
+        assert_eq!(budget.used(), fixed);
+        assert!(instance.shutdown(Duration::from_secs(5)).reached);
+        assert_eq!(budget.used(), 0);
+
+        // Without a budget, nothing is reserved.
+        let instance = offline_builder()
+            .build_instance(fixed_instance_config("fipfs-fixed-0"))
+            .unwrap();
+        assert_eq!(instance.fixed_reservation(), 0);
+        assert!(instance.shutdown(Duration::from_secs(5)).reached);
+    }
+
+    #[test]
+    fn a_retained_node_or_gateway_keeps_the_fixed_reservation_until_its_caches_go() {
+        for retain_the_gateway in [false, true] {
+            let store = SqliteBlockStore::in_memory_with(freedom_ipfs_store::StoreOptions {
+                max_bytes: 1 << 20,
+                hot_cache_bytes: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+            let data = vec![7u8; 32 * 1024];
+            let cid = cid_from_data(CODEC_RAW, &data);
+            store.put_block(&cid, &data).unwrap();
+            let builder = OnlineNode::builder(store)
+                .routing_mode(RoutingMode::Offline)
+                .gateway_config(
+                    GatewayConfig::default()
+                        .with_small_body_cache_max_bytes(64 * 1024)
+                        .with_unixfs_metadata_cache_capacity(0),
+                );
+            let fixed = builder.fixed_reservation();
+            let budget = MemoryBudget::new(fixed);
+            let instance = builder
+                .memory_budget(budget.clone())
+                .build_instance(fixed_instance_config("fipfs-retained"))
+                .unwrap();
+            let node = instance.node().clone();
+            let gateway = instance.gateway_core();
+            // A request fills the shared small-body cache.
+            let core = instance.gateway_core();
+            let path = cid.to_string();
+            let request = instance
+                .spawn_request(
+                    instance.request_token(),
+                    async move { get(&core, &path).await },
+                )
+                .unwrap();
+            let (status, body) = instance
+                .context()
+                .handle()
+                .block_on(request)
+                .unwrap()
+                .unwrap();
+            assert_eq!((status, body), (StatusCode::OK, data.clone()));
+            assert!(node.gateway_state().small_body_cache.pool.used() > 32 * 1024);
+            // The host keeps one of them past the teardown.
+            let retained: Box<dyn std::any::Any> = if retain_the_gateway {
+                drop(node);
+                Box::new(gateway)
+            } else {
+                drop(gateway);
+                Box::new(node)
+            };
+            assert!(instance.shutdown(Duration::from_secs(5)).reached);
+            // Its caches still hold the body: the reservation stays.
+            assert_eq!(
+                budget.used(),
+                fixed,
+                "retaining the gateway: {retain_the_gateway}"
+            );
+            assert!(budget.try_reserve(1).is_err());
+            drop(retained);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn a_retained_block_keeps_the_fixed_reservation_until_it_is_freed() {
+        for fetched in [false, true] {
+            let store = SqliteBlockStore::in_memory_with(freedom_ipfs_store::StoreOptions {
+                max_bytes: 1 << 20,
+                hot_cache_bytes: Some(64 * 1024),
+                ..Default::default()
+            })
+            .unwrap();
+            let data = vec![9u8; 32 * 1024];
+            let cid = cid_from_data(CODEC_RAW, &data);
+            let builder = OnlineNode::builder(store.clone())
+                .routing_mode(RoutingMode::Offline)
+                .gateway_config(
+                    GatewayConfig::default()
+                        .with_small_body_cache_max_bytes(0)
+                        .with_unixfs_metadata_cache_capacity(0),
+                );
+            let fixed = builder.fixed_reservation();
+            let budget = MemoryBudget::new(fixed + 64 * 1024);
+            if fetched {
+                // A fetched block, whose charge the hot cache takes over
+                // once it holds the block alone.
+                let mut buffer = freedom_ipfs_core::ReservedVec::zeroed(
+                    data.len(),
+                    budget.try_reserve(data.len()).unwrap(),
+                )
+                .unwrap();
+                buffer.as_mut_slice().copy_from_slice(&data);
+                let block = buffer.into_charged();
+                store.put_charged(&cid, &block).unwrap();
+                drop(block);
+                assert_eq!(budget.used(), 0, "taken over");
+            } else {
+                store.put_block(&cid, &data).unwrap();
+            }
+            let instance = builder
+                .memory_budget(budget.clone())
+                .build_instance(fixed_instance_config("fipfs-reader"))
+                .unwrap();
+            let reader = instance.node().store().get(&cid).unwrap().unwrap();
+            assert!(reader.charged().is_covered());
+            assert!(instance.shutdown(Duration::from_secs(5)).reached);
+            // The store is closed, but the block a reader holds is still
+            // covered: the reservation stays until it is freed.
+            assert_eq!(budget.used(), fixed, "fetched: {fetched}");
+            assert_eq!(reader.data(), &data[..]);
+            // The store handle kept past the close holds no hot cache.
+            assert_eq!((store.hot_cache_capacity(), store.hot_cache_used()), (0, 0));
+            drop(reader);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    fn shared_store() -> SqliteBlockStore {
+        SqliteBlockStore::in_memory_with(freedom_ipfs_store::StoreOptions {
+            max_bytes: 1 << 20,
+            hot_cache_bytes: Some(64 * 1024),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn store_only_config() -> GatewayConfig {
+        GatewayConfig::default()
+            .with_small_body_cache_max_bytes(0)
+            .with_unixfs_metadata_cache_capacity(0)
+    }
+
+    #[test]
+    fn a_closed_shared_store_keeps_no_hot_cache_past_its_instances() {
+        let store = shared_store();
+        let builder = || {
+            OnlineNode::builder(store.clone())
+                .routing_mode(RoutingMode::Offline)
+                .gateway_config(store_only_config())
+        };
+        let fixed = builder().fixed_reservation();
+        let (a_budget, b_budget) = (MemoryBudget::new(fixed), MemoryBudget::new(fixed));
+        let a = builder()
+            .memory_budget(a_budget.clone())
+            .build_instance(fixed_instance_config("fipfs-idle-a"))
+            .unwrap();
+        let b = builder()
+            .memory_budget(b_budget.clone())
+            .build_instance(fixed_instance_config("fipfs-idle-b"))
+            .unwrap();
+        assert!(a.shutdown(Duration::from_secs(5)).reached);
+        assert!(b.shutdown(Duration::from_secs(5)).reached);
+        // The store handle the host kept is closed and holds no hot cache:
+        // nothing is left that a reservation would have to stand for.
+        assert_eq!((store.hot_cache_capacity(), store.hot_cache_used()), (0, 0));
+        assert_eq!((a_budget.used(), b_budget.used()), (0, 0));
+    }
+
+    #[test]
+    fn instances_over_one_store_keep_the_first_lease_in_either_stop_order() {
+        for first_stops_first in [false, true] {
+            let store = shared_store();
+            let data = vec![31u8; 32_000];
+            let cid = cid_from_data(CODEC_RAW, &data);
+            store.put_block(&cid, &data).unwrap();
+            let builder = || {
+                OnlineNode::builder(store.clone())
+                    .routing_mode(RoutingMode::Offline)
+                    .gateway_config(store_only_config())
+            };
+            let fixed = builder().fixed_reservation();
+            let (a_budget, b_budget) = (MemoryBudget::new(fixed), MemoryBudget::new(fixed));
+            let a = builder()
+                .memory_budget(a_budget.clone())
+                .build_instance(fixed_instance_config("fipfs-shared-a"))
+                .unwrap();
+            let b = builder()
+                .memory_budget(b_budget.clone())
+                .build_instance(fixed_instance_config("fipfs-shared-b"))
+                .unwrap();
+            let reader = store.get(&cid).unwrap().unwrap();
+            assert!(reader.charged().is_covered());
+            if first_stops_first {
+                assert!(a.shutdown(Duration::from_secs(5)).reached);
+                assert_eq!(a_budget.used(), fixed);
+                assert!(b.shutdown(Duration::from_secs(5)).reached);
+            } else {
+                assert!(b.shutdown(Duration::from_secs(5)).reached);
+                assert_eq!(b_budget.used(), 0);
+                assert!(a.shutdown(Duration::from_secs(5)).reached);
+            }
+            // The shared pool kept the first instance's lease, and the
+            // second's, refused, wasn't kept.
+            assert_eq!((a_budget.used(), b_budget.used()), (fixed, 0));
+            drop(reader);
+            assert_eq!((a_budget.used(), b_budget.used()), (0, 0));
+        }
+    }
+
+    #[test]
+    fn a_failed_start_gives_the_reservation_back_and_a_dropped_instance_keeps_it() {
+        let budget = MemoryBudget::new(64 * 1024 * 1024);
+        // A thread name the OS refuses fails the runtime's start by a
+        // panic: the reservation taken for it unwinds with it.
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            offline_builder()
+                .memory_budget(budget.clone())
+                .build_instance(fixed_instance_config("invalid\0thread"))
+        }));
+        assert!(started.is_err());
+        assert_eq!(budget.used(), 0);
+        let instance = offline_builder()
+            .memory_budget(budget.clone())
+            .build_instance(fixed_instance_config("fipfs-dropped"))
+            .unwrap();
+        let held = instance.fixed_reservation();
+        drop(instance);
+        assert_eq!(budget.used(), held, "a drop proves nothing");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unproven_teardown_keeps_the_fixed_reservation() {
+        let budget = MemoryBudget::new(64 * 1024 * 1024);
+        let instance = offline_builder()
+            .memory_budget(budget.clone())
+            .build_instance(fixed_instance_config("fipfs-fixed-up"))
+            .unwrap();
+        let fixed = instance.fixed_reservation();
+        assert!(fixed > 0);
+        REFUSE_TEARDOWN_THREAD.with(|refuse| refuse.set(true));
+        let quiescence = instance.shutdown(Duration::from_millis(20));
+        REFUSE_TEARDOWN_THREAD.with(|refuse| refuse.set(false));
+        assert_eq!(quiescence, Quiescence::UNPROVEN);
+        // Nothing of the instance is released: its memory may be in use.
+        assert_eq!(budget.used(), fixed);
     }
 
     #[tokio::test(flavor = "multi_thread")]

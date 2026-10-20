@@ -1,12 +1,13 @@
 use cid::Cid;
 use freedom_ipfs_core::{
-    block_data_range, encode_car_v1, parse_car_v1, verify_block, Block, BlockProvider, CarBlock,
-    ChargedBytes, CoreError, FixedPool, HeldBytes, Result as CoreResult,
+    block_data_range, btree_map_bytes, encode_car_v1, parse_car_v1, verify_block, Block,
+    BlockProvider, CarBlock, ChargedBytes, CoreError, FixedPool, HeldBytes, PoolShare, Reservation,
+    Result as CoreResult,
 };
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
@@ -238,7 +239,10 @@ impl SqliteBlockStore {
             return false;
         };
         drop(std::mem::replace(&mut *conn, closed));
-        *self.hot.lock() = VerifiedHotCache::new(0);
+        // No hot cache at all from now on: one a store handle kept after
+        // the close would hold heap no reservation stands for. Blocks the
+        // old one covers stay covered, by its pool, until they are freed.
+        *self.hot.lock() = VerifiedHotCache::closed();
         true
     }
 
@@ -298,13 +302,26 @@ impl SqliteBlockStore {
 
     /// The hot cache's fixed capacity in bytes: a host that budgets memory
     /// reserves it as the cache's fixed reservation. The cache never covers
-    /// more: it counts each block by its allocation's size, for as long as
-    /// the allocation lives, including after the cache has let it go.
+    /// more: it counts each block by its allocation's footprint, for as long
+    /// as the allocation lives, including after the cache has let it go, and
+    /// its own structures (itself, its maps' nodes and keys) besides. Even a
+    /// hot cache that caches nothing keeps itself (a few hundred bytes),
+    /// which counts.
     pub fn hot_cache_capacity(&self) -> u64 {
-        self.hot.lock().max_bytes
+        self.hot.lock().pool.capacity() as u64
     }
 
-    /// The bytes the hot cache covers now, of its fixed capacity.
+    /// Ties `lease`, the fixed reservation the hot cache is reserved by, to
+    /// its memory ([`FixedPool::keep_lease`]): it goes only once the cache
+    /// and every block it covers, one a reader still holds included, are
+    /// gone. Closing the store lets go of the cache, but not of such a block,
+    /// and leaves no hot cache: a closed store keeps no lease (`false`).
+    pub fn keep_hot_cache_lease(&self, lease: Arc<Reservation>) -> bool {
+        self.hot.lock().pool.keep_lease(lease)
+    }
+
+    /// The bytes the hot cache counts now, of its fixed capacity: the blocks
+    /// it covers and its own structures.
     pub fn hot_cache_used(&self) -> u64 {
         self.hot.lock().pool.used() as u64
     }
@@ -756,19 +773,48 @@ fn cached_unless_full(written: rusqlite::Result<usize>) -> Result<bool> {
 // Private cache for block bytes that were already verified on put or cold read.
 //
 // Its capacity is a fixed reservation: a pool that counts each block by its
-// allocation's size (not its length) for as long as the allocation lives,
-// so a block a reader still holds after the cache evicted it stays counted,
-// and the cache never covers more than its capacity. A block shared with
-// the fetch that charged it dynamically counts twice until the cache holds
-// the last reference; then the cache takes the charge over.
+// allocation's footprint (its backing capacity, not its length, and its
+// header) for as long as the allocation lives, so a block a reader still
+// holds after the cache evicted it stays counted, and the cache never covers
+// more than its capacity. A block shared with the fetch that charged it
+// dynamically counts twice until the cache holds the last reference; then
+// the cache takes the charge over.
+//
+// Its own structures count against the same pool, so many tiny blocks can't
+// grow it past its capacity either: the cache itself, its maps' nodes
+// (`btree_map_bytes`, which bounds them by entry count alone) and their keys'
+// heap, by capacity. Room for them is taken before an entry goes in, oldest
+// blocks making way.
 struct VerifiedHotCache {
-    max_bytes: u64,
     pool: FixedPool,
+    /// Whether it caches anything: not when its capacity is zero, or too
+    /// small for its maps.
+    enabled: bool,
+    /// The pool's room for the cache's own structures ([`Self::index_bytes`]),
+    /// itself alone when it caches nothing.
+    index: PoolShare,
+    /// The heap the keys of both maps own.
+    key_heap: usize,
     clock: u64,
-    entries: HashMap<Vec<u8>, VerifiedHotBlock>,
+    entries: BTreeMap<Vec<u8>, VerifiedHotBlock>,
     /// Entries whose bytes still carry a dynamic charge, to hand over once
     /// the cache holds them alone.
-    charged: HashSet<Vec<u8>>,
+    charged: BTreeSet<Vec<u8>>,
+}
+
+/// What the hot cache's own structures take besides its maps' nodes and
+/// keys: the cache in its store's `Arc<Mutex<_>>`, and its pool's counter in
+/// its own `Arc`. All a hot cache that caches nothing takes.
+const HOT_CACHE_OWN_BYTES: usize = std::mem::size_of::<Mutex<VerifiedHotCache>>()
+    + 2 * std::mem::size_of::<usize>()
+    + FixedPool::HEAP_BYTES;
+
+/// The fixed capacity of a hot cache of `max_bytes`: at least its own
+/// structures, which even one that caches nothing keeps.
+fn hot_cache_fixed_bytes(max_bytes: u64) -> usize {
+    usize::try_from(max_bytes)
+        .unwrap_or(usize::MAX)
+        .max(HOT_CACHE_OWN_BYTES)
 }
 
 /// What the hot cache is given: bytes to share, or bytes to copy (once
@@ -789,26 +835,115 @@ struct VerifiedHotCacheHit<T> {
     touch_persistent: bool,
 }
 
+impl Drop for VerifiedHotCache {
+    /// The cached blocks, the maps and their keys go first: the room, and
+    /// with the last of the pool's handles or covers its lease, go only
+    /// after them, so the reservation is given back only once what it stands
+    /// for is freed. (Fields would drop in their order, the room and the
+    /// pool before the maps, and the last block's cover before the maps'
+    /// last node and the charged set's keys.) The pool's counter is freed in
+    /// the same drop, right after.
+    fn drop(&mut self) {
+        self.entries.clear();
+        self.charged.clear();
+    }
+}
+
 impl VerifiedHotCache {
-    fn new(max_bytes: u64) -> Self {
+    /// A closed store's hot cache: none. It holds, counts and allocates
+    /// nothing (its pool is the pool of nothing), and keeps no lease.
+    fn closed() -> Self {
+        let pool = FixedPool::none();
+        let index = pool.share(0).expect("a share of nothing fits");
         Self {
-            max_bytes,
-            pool: FixedPool::new(usize::try_from(max_bytes).unwrap_or(usize::MAX)),
+            enabled: false,
+            index,
+            pool,
+            key_heap: 0,
             clock: 0,
-            entries: HashMap::new(),
-            charged: HashSet::new(),
+            entries: BTreeMap::new(),
+            charged: BTreeSet::new(),
         }
+    }
+
+    /// What its own structures count: nothing once its store is closed.
+    fn own_bytes(&self) -> usize {
+        if self.pool.capacity() == 0 {
+            0
+        } else {
+            HOT_CACHE_OWN_BYTES
+        }
+    }
+
+    fn new(max_bytes: u64) -> Self {
+        let pool = FixedPool::new(hot_cache_fixed_bytes(max_bytes));
+        // Its own structures count from the start.
+        let index = pool
+            .share(HOT_CACHE_OWN_BYTES)
+            .expect("a cache's capacity holds its own structures");
+        let mut cache = Self {
+            enabled: max_bytes > 0,
+            index,
+            pool,
+            key_heap: 0,
+            clock: 0,
+            entries: BTreeMap::new(),
+            charged: BTreeSet::new(),
+        };
+        // Then room for its maps: a pool too small for them caches nothing.
+        if cache.enabled && !cache.true_index() {
+            cache.enabled = false;
+        }
+        cache
+    }
+
+    /// What its structures take, at most, with `entries` and `charged` more
+    /// entries in its maps, and `key_heap` more bytes of keys.
+    fn index_bytes(&self, entries: usize, charged: usize, key_heap: usize) -> usize {
+        if !self.enabled {
+            // It never allocates its maps' nodes.
+            return self.own_bytes();
+        }
+        HOT_CACHE_OWN_BYTES
+            .saturating_add(btree_map_bytes::<Vec<u8>, VerifiedHotBlock>(
+                self.entries.len().saturating_add(entries),
+            ))
+            .saturating_add(btree_map_bytes::<Vec<u8>, ()>(
+                self.charged.len().saturating_add(charged),
+            ))
+            .saturating_add(self.key_heap)
+            .saturating_add(key_heap)
+    }
+
+    /// Sizes the room for its structures to what they take now: `false` if
+    /// it can't grow to it.
+    fn true_index(&mut self) -> bool {
+        let bytes = self.index_bytes(0, 0, 0);
+        self.index.try_resize(bytes)
     }
 
     /// Takes over the dynamic charges of the entries the cache now holds
     /// alone.
     fn take_over_charges(&mut self) {
-        let entries = &self.entries;
-        self.charged.retain(|cid| {
-            entries.get(cid).is_some_and(|entry| {
+        let Self {
+            entries,
+            charged,
+            key_heap,
+            ..
+        } = self;
+        let before = charged.len();
+        charged.retain(|cid| {
+            let keep = entries.get(cid).is_some_and(|entry| {
                 !entry.data.take_over_if_only_held() && entry.data.bytes().charged_bytes() > 0
-            })
+            });
+            if !keep {
+                *key_heap = key_heap.saturating_sub(cid.capacity());
+            }
+            keep
         });
+        if charged.len() != before {
+            self.true_index();
+        }
     }
 
     fn touch(&mut self, cid: &[u8], now: u64) -> Option<(&VerifiedHotBlock, bool)> {
@@ -853,15 +988,10 @@ impl VerifiedHotCache {
 
     fn put_input(&mut self, cid: Vec<u8>, input: HotInput<'_>, now: u64) {
         self.take_over_charges();
-        let backing = match &input {
-            HotInput::Shared(data) => data.backing_capacity(),
-            HotInput::Copy(data) => data.len(),
-        };
-        if self.max_bytes == 0 || backing as u64 > self.max_bytes {
-            self.remove(&cid);
+        self.remove(&cid);
+        if !self.enabled {
             return;
         }
-        self.remove(&cid);
         // Bytes to copy (plain input, or bytes another pool covers: one
         // cover per allocation) are copied only once this pool has room for
         // the copy. Make room oldest first: evicting a block a reader still
@@ -873,27 +1003,58 @@ impl VerifiedHotCache {
             }
             HotInput::Shared(_) => None,
         };
+        let (footprint, charged) = match (copy, &input) {
+            (Some(bytes), _) => (bytes.len().saturating_add(ChargedBytes::HEADER_BYTES), 0),
+            (None, HotInput::Shared(data)) if self.pool.covers(data) => {
+                (0, usize::from(data.charged_bytes() > 0))
+            }
+            (None, HotInput::Shared(data)) => {
+                (data.footprint(), usize::from(data.charged_bytes() > 0))
+            }
+            (None, HotInput::Copy(_)) => return,
+        };
+        // Its key, and the charged set's copy of it.
+        let key_heap = cid.capacity().saturating_add(charged * cid.len());
+        // Even alone in the cache it wouldn't fit: evict nothing for it.
+        let alone = HOT_CACHE_OWN_BYTES
+            .saturating_add(btree_map_bytes::<Vec<u8>, VerifiedHotBlock>(1))
+            .saturating_add(btree_map_bytes::<Vec<u8>, ()>(charged))
+            .saturating_add(key_heap)
+            .saturating_add(footprint);
+        if alone > self.pool.capacity() {
+            return;
+        }
         let data = loop {
-            let held = match (copy, &input) {
-                (Some(bytes), _) => self.pool.hold_copy(bytes.len(), || {
-                    #[cfg(test)]
-                    tests::HOT_CACHE_COPIES.with(|copies| copies.set(copies.get() + 1));
-                    bytes.to_vec()
-                }),
-                (None, HotInput::Shared(data)) => self.pool.hold(data),
-                (None, HotInput::Copy(_)) => None,
-            };
-            if let Some(held) = held {
-                break held;
+            // Room for its entry in the maps first, then for its bytes: each
+            // taken before anything is allocated for it.
+            let index = self.index_bytes(1, charged, key_heap);
+            let roomy = self.index.try_resize(index);
+            if roomy {
+                let held = match (copy, &input) {
+                    (Some(bytes), _) => self.pool.hold_copy(bytes.len(), || {
+                        #[cfg(test)]
+                        tests::HOT_CACHE_COPIES.with(|copies| copies.set(copies.get() + 1));
+                        bytes.to_vec()
+                    }),
+                    (None, HotInput::Shared(data)) => self.pool.hold(data),
+                    (None, HotInput::Copy(_)) => None,
+                };
+                if let Some(held) = held {
+                    break held;
+                }
             }
             if !self.evict_oldest() {
+                self.true_index();
                 return;
             }
         };
         self.clock = self.clock.saturating_add(1);
         if data.bytes().charged_bytes() > 0 {
-            self.charged.insert(cid.clone());
+            let key = cid.clone();
+            self.key_heap = self.key_heap.saturating_add(key.capacity());
+            self.charged.insert(key);
         }
+        self.key_heap = self.key_heap.saturating_add(cid.capacity());
         self.entries.insert(
             cid,
             VerifiedHotBlock {
@@ -903,29 +1064,59 @@ impl VerifiedHotCache {
             },
         );
         self.take_over_charges();
+        // Its room was taken before it went in, for its key's copy at the
+        // key's length, which is all a copy takes: this only shrinks. Were it
+        // ever to grow past the pool, the block wouldn't stay.
+        if !self.true_index() {
+            self.remove_used_at(self.clock);
+        }
     }
 
     fn evict_oldest(&mut self) -> bool {
-        let Some(cid) = self
-            .entries
-            .iter()
-            .min_by_key(|(_, block)| block.last_accessed)
-            .map(|(cid, _)| cid.clone())
-        else {
+        let Some(oldest) = self.entries.values().map(|block| block.last_accessed).min() else {
             return false;
         };
-        self.remove(&cid);
+        self.remove_used_at(oldest);
         true
     }
 
+    /// Removes the entry last used at `tick` (ticks are unique), its key
+    /// going with it rather than copied to look it up by.
+    fn remove_used_at(&mut self, tick: u64) {
+        let Self {
+            entries,
+            charged,
+            key_heap,
+            ..
+        } = self;
+        entries.retain(|cid, block| {
+            if block.last_accessed != tick {
+                return true;
+            }
+            *key_heap = key_heap.saturating_sub(cid.capacity());
+            if let Some(key) = charged.take(cid) {
+                *key_heap = key_heap.saturating_sub(key.capacity());
+            }
+            false
+        });
+        self.true_index();
+    }
+
     fn remove(&mut self, cid: &[u8]) {
-        self.entries.remove(cid);
-        self.charged.remove(cid);
+        if let Some((key, _)) = self.entries.remove_entry(cid) {
+            self.key_heap = self.key_heap.saturating_sub(key.capacity());
+        }
+        if let Some(key) = self.charged.take(cid) {
+            self.key_heap = self.key_heap.saturating_sub(key.capacity());
+        }
+        self.true_index();
     }
 
     fn clear(&mut self) {
         self.entries.clear();
         self.charged.clear();
+        self.key_heap = 0;
+        self.true_index();
     }
 }
 
@@ -946,10 +1137,10 @@ mod tests {
     fn default_options_size_the_store_as_before() {
         let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
         assert_eq!(store.max_bytes, 1024 * 1024);
-        assert_eq!(store.hot.lock().max_bytes, 1024 * 1024);
+        assert_eq!(store.hot_cache_capacity(), 1024 * 1024);
         let store = SqliteBlockStore::in_memory(0).unwrap();
         assert_eq!(store.max_bytes, DEFAULT_CACHE_BYTES);
-        assert_eq!(store.hot.lock().max_bytes, DEFAULT_HOT_CACHE_BYTES);
+        assert_eq!(store.hot_cache_capacity(), DEFAULT_HOT_CACHE_BYTES);
     }
 
     #[test]
@@ -1056,13 +1247,32 @@ mod tests {
             const { std::cell::Cell::new(0) };
     }
 
+    /// What the hot cache counts for its blocks' bytes alone: its pool's use
+    /// but for its own structures.
+    fn covered(store: &SqliteBlockStore) -> u64 {
+        let hot = store.hot.lock();
+        (hot.pool.used() - hot.index.bytes()) as u64
+    }
+
+    /// A hot cache's capacity for exactly one block of `len` bytes, copied
+    /// in (so uncharged), with its entry.
+    fn room_for_one(cid: &Cid, len: usize) -> u64 {
+        (HOT_CACHE_OWN_BYTES
+            + btree_map_bytes::<Vec<u8>, VerifiedHotBlock>(1)
+            + btree_map_bytes::<Vec<u8>, ()>(0)
+            + block_key(cid).capacity()
+            + len
+            + ChargedBytes::HEADER_BYTES) as u64
+    }
+
     #[test]
     fn a_full_hot_cache_copies_no_foreign_block_it_can_not_hold() {
         const N: usize = 123_457;
+        let capacity = room_for_one(&cid_from_data(CODEC_RAW, b"key"), N);
         let store = || {
             SqliteBlockStore::in_memory_with(StoreOptions {
                 max_bytes: 4 << 20,
-                hot_cache_bytes: Some(N as u64),
+                hot_cache_bytes: Some(capacity),
                 ..StoreOptions::default()
             })
             .unwrap()
@@ -1087,7 +1297,7 @@ mod tests {
             0,
             "no uncovered copy"
         );
-        assert_eq!(b.hot_cache_used(), N as u64);
+        assert_eq!(covered(&b), (N + ChargedBytes::HEADER_BYTES) as u64);
         // With room, it copies once, into room it holds.
         drop(pinned);
         let third = vec![3u8; 1_000];
@@ -1097,15 +1307,16 @@ mod tests {
         b.put(&from_a).unwrap();
         assert_eq!(HOT_CACHE_COPIES.with(std::cell::Cell::get), 1);
         assert!(b.hot.lock().entries.contains_key(&block_key(&first_cid)));
-        assert!(b.hot_cache_used() <= N as u64);
+        assert!(b.hot_cache_used() <= capacity);
     }
 
     #[test]
     fn a_full_hot_cache_copies_no_plain_put_it_can_not_hold() {
         const N: usize = 123_457;
+        let capacity = room_for_one(&cid_from_data(CODEC_RAW, b"key"), N);
         let store = SqliteBlockStore::in_memory_with(StoreOptions {
             max_bytes: 4 << 20,
-            hot_cache_bytes: Some(N as u64),
+            hot_cache_bytes: Some(capacity),
             ..StoreOptions::default()
         })
         .unwrap();
@@ -1124,7 +1335,7 @@ mod tests {
             0,
             "no uncovered copy"
         );
-        assert_eq!(store.hot_cache_used(), N as u64);
+        assert_eq!(covered(&store), (N + ChargedBytes::HEADER_BYTES) as u64);
         assert!(
             store.get(&second_cid).unwrap().is_some(),
             "stored all the same"
@@ -1137,7 +1348,7 @@ mod tests {
             .put_block(&cid_from_data(CODEC_RAW, &third), &third)
             .unwrap();
         assert_eq!(HOT_CACHE_COPIES.with(std::cell::Cell::get), 1);
-        assert!(store.hot_cache_used() <= N as u64);
+        assert!(store.hot_cache_used() <= capacity);
     }
 
     #[test]
@@ -1155,9 +1366,11 @@ mod tests {
         let fetched = charged_view(&budget, &data, 4_000);
 
         // Shared with the fetch, the block counts twice: its whole 4,000-byte
-        // allocation in the cache's capacity, and its dynamic charge.
+        // allocation (and its header) in the cache's capacity, and its
+        // dynamic charge.
+        const FOOTPRINT: u64 = 4_000 + ChargedBytes::HEADER_BYTES as u64;
         store.put_charged(&cid, &fetched).unwrap();
-        assert_eq!(store.hot_cache_used(), 4_000);
+        assert_eq!(covered(&store), FOOTPRINT);
         assert_eq!(budget.used(), 4_000);
         let hit = store.get(&cid).unwrap().unwrap();
         assert_eq!(hit.data(), &data[..]);
@@ -1170,7 +1383,7 @@ mod tests {
         assert_eq!(budget.used(), 4_000);
         drop(hit);
         assert_eq!(budget.used(), 0);
-        assert_eq!(store.hot_cache_used(), 4_000);
+        assert_eq!(covered(&store), FOOTPRINT);
         assert!(store.get(&cid).unwrap().is_some());
 
         // A reader holds it while the cache evicts it: it stays counted
@@ -1184,9 +1397,9 @@ mod tests {
         }
         assert!(!store.hot.lock().entries.contains_key(&block_key(&cid)));
         assert!(store.hot_cache_used() <= 16 * 1024);
-        let held = store.hot_cache_used();
+        let held = covered(&store);
         drop(reader);
-        assert_eq!(store.hot_cache_used(), held - 4_000);
+        assert_eq!(covered(&store), held - FOOTPRINT);
         assert_eq!(budget.used(), 0);
     }
 
@@ -1209,7 +1422,7 @@ mod tests {
             ..StoreOptions::default()
         })
         .unwrap();
-        assert_eq!(large.hot.lock().max_bytes, 64 * 1024 * 1024);
+        assert_eq!(large.hot_cache_capacity(), 64 * 1024 * 1024);
     }
 
     #[test]
@@ -1871,5 +2084,327 @@ mod tests {
         assert!(store.get(&cid).unwrap().is_some());
         assert_eq!(store.get_provider_records(&cid).unwrap(), None);
         assert!(!store.is_bad_provider("peer").unwrap());
+    }
+
+    /// Counts each thread's live heap bytes, and their peak, so a test can
+    /// see what a cache holds on the heap; and can watch one allocation
+    /// being freed, to see what was still allocated, and reserved, then.
+    mod heap {
+        use freedom_ipfs_core::MemoryBudget;
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static LIVE: Cell<isize> = const { Cell::new(0) };
+            static PEAK: Cell<isize> = const { Cell::new(0) };
+            /// An address inside the allocation watched on this thread.
+            static WATCHED: Cell<usize> = const { Cell::new(0) };
+            /// The budget to read when it is freed.
+            static WATCHED_BUDGET: Cell<*const MemoryBudget> =
+                const { Cell::new(std::ptr::null()) };
+            /// The live bytes, and the budget's use, just before it was freed.
+            static AT_FREE: Cell<Option<(isize, usize)>> = const { Cell::new(None) };
+        }
+
+        struct Counting;
+
+        fn add(bytes: isize) {
+            let _ = LIVE.try_with(|live| {
+                let now = live.get() + bytes;
+                live.set(now);
+                let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+            });
+        }
+
+        /// Before `ptr`'s allocation of `size` bytes is freed: whether it is
+        /// the one watched.
+        fn freeing(ptr: *mut u8, size: usize) {
+            let _ = WATCHED.try_with(|watched| {
+                let address = watched.get();
+                let start = ptr as usize;
+                if address == 0 || address < start || address >= start + size.max(1) {
+                    return;
+                }
+                watched.set(0);
+                let budget = WATCHED_BUDGET.with(Cell::get);
+                // SAFETY: `watch_free`'s caller keeps the budget alive until
+                // it reads the result, which ends the watch.
+                let used = (!budget.is_null()).then(|| unsafe { &*budget }.used());
+                AT_FREE.with(|at| at.set(Some((LIVE.with(Cell::get), used.unwrap_or(0)))));
+            });
+        }
+
+        // SAFETY: every call is passed on to the system allocator as is.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let ptr = unsafe { System.alloc(layout) };
+                if !ptr.is_null() {
+                    add(layout.size() as isize);
+                }
+                ptr
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                let ptr = unsafe { System.alloc_zeroed(layout) };
+                if !ptr.is_null() {
+                    add(layout.size() as isize);
+                }
+                ptr
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                freeing(ptr, layout.size());
+                unsafe { System.dealloc(ptr, layout) };
+                add(-(layout.size() as isize));
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                let new = unsafe { System.realloc(ptr, layout, new_size) };
+                if !new.is_null() {
+                    add(new_size as isize - layout.size() as isize);
+                }
+                new
+            }
+        }
+
+        #[global_allocator]
+        static COUNTING: Counting = Counting;
+
+        /// This thread's live heap bytes; the peak starts again from them.
+        pub(super) fn live() -> isize {
+            let live = LIVE.with(Cell::get);
+            PEAK.with(|peak| peak.set(live));
+            live
+        }
+
+        /// The most this thread held since [`live`] was last read.
+        #[allow(dead_code)]
+        pub(super) fn peak() -> isize {
+            PEAK.with(Cell::get)
+        }
+
+        /// Watches, on this thread, the allocation that holds `address`:
+        /// when it is freed, what was live and what `budget` had reserved.
+        #[allow(dead_code)]
+        pub(super) fn watch_free(address: *const u8, budget: &MemoryBudget) {
+            AT_FREE.with(|at| at.set(None));
+            WATCHED_BUDGET.with(|watched| watched.set(budget));
+            WATCHED.with(|watched| watched.set(address as usize));
+        }
+
+        /// The live bytes, and the budget's use, just before the watched
+        /// allocation was freed: `None` if it wasn't. Ends the watch.
+        #[allow(dead_code)]
+        pub(super) fn watched_free() -> Option<(isize, usize)> {
+            WATCHED.with(|watched| watched.set(0));
+            WATCHED_BUDGET.with(|watched| watched.set(std::ptr::null()));
+            AT_FREE.with(Cell::take)
+        }
+    }
+
+    #[test]
+    fn hot_index_churn_counts_keys_by_capacity_and_takes_room_first() {
+        const CAPACITY: usize = 32 * 1024;
+        let inputs: Vec<_> = (0..2_000u64)
+            .map(|n| {
+                let data = vec![n as u8; 1 + n as usize % 301];
+                let cid = cid_from_data(CODEC_RAW, &data);
+                // Keys with far more capacity than length.
+                let mut key = Vec::with_capacity(700 + n as usize % 23);
+                key.extend(cid.to_bytes());
+                (key, data)
+            })
+            .collect();
+        let origin = heap::live();
+        let mut cache = VerifiedHotCache::new(CAPACITY as u64);
+        for (key, data) in &inputs {
+            // The incoming key is the caller's until the cache takes it.
+            let mut incoming = Vec::with_capacity(key.capacity());
+            incoming.extend(key);
+            let incoming_bytes = incoming.capacity();
+            heap::live();
+            cache.put_input(incoming, HotInput::Copy(data), 0);
+            let peak = heap::peak() - origin;
+            let live = heap::live() - origin;
+            assert!(
+                live as usize <= cache.pool.used(),
+                "live {live}, counted {}",
+                cache.pool.used()
+            );
+            assert!(
+                peak as usize <= CAPACITY + incoming_bytes,
+                "peaked at {peak}"
+            );
+            assert!(cache.pool.used() <= CAPACITY);
+        }
+        drop(cache);
+        assert_eq!(heap::live(), origin);
+    }
+
+    #[test]
+    fn a_closed_store_keeps_no_hot_cache_and_no_lease() {
+        let budget = freedom_ipfs_core::MemoryBudget::new(1 << 20);
+        let store = SqliteBlockStore::in_memory_with(StoreOptions {
+            max_bytes: 1 << 20,
+            hot_cache_bytes: Some(64 * 1024),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        let data = vec![5u8; 10_000];
+        let cid = cid_from_data(CODEC_RAW, &data);
+        store.put_block(&cid, &data).unwrap();
+        let lease = Arc::new(
+            budget
+                .try_reserve(store.hot_cache_capacity() as usize)
+                .unwrap(),
+        );
+        assert!(store.keep_hot_cache_lease(lease.clone()));
+        drop(lease);
+        let reader = store.get(&cid).unwrap().unwrap();
+        assert!(store.close(Duration::from_secs(1)));
+        // Nothing of a hot cache is left, and none is counted.
+        assert_eq!((store.hot_cache_capacity(), store.hot_cache_used()), (0, 0));
+        assert!(store.hot.lock().pool.capacity() == 0 && store.hot.lock().entries.is_empty());
+        let late = Arc::new(budget.try_reserve(100).unwrap());
+        assert!(
+            !store.keep_hot_cache_lease(late),
+            "a closed store keeps no lease"
+        );
+        // The old cache's block a reader holds keeps the old lease.
+        assert_eq!(budget.used(), 64 * 1024);
+        assert_eq!(reader.data(), &data[..]);
+        drop(reader);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn a_hot_cache_lease_stays_until_its_heap_is_freed() {
+        let budget = freedom_ipfs_core::MemoryBudget::new(64 * 1024);
+        let fetches = freedom_ipfs_core::MemoryBudget::new(1 << 20);
+        let origin = heap::live();
+        let mut cache = VerifiedHotCache::new(64 * 1024);
+        let lease = Arc::new(budget.try_reserve(64 * 1024).unwrap());
+        assert!(cache.pool.keep_lease(lease.clone()));
+        let lease_address = Arc::as_ptr(&lease) as *const u8;
+        drop(lease);
+        for n in 0..40u32 {
+            let data = n.to_le_bytes().repeat(100);
+            let key = block_key(&cid_from_data(CODEC_RAW, &data));
+            if n % 2 == 0 {
+                cache.put_input(key, HotInput::Copy(&data), 0);
+            } else {
+                // Still charged, so the charged set keeps a copy of its key.
+                let fetched = charged_view(&fetches, &data, data.len());
+                cache.put_input(key, HotInput::Shared(fetched), 0);
+            }
+        }
+        assert!(!cache.charged.is_empty());
+        heap::watch_free(lease_address, &budget);
+        drop(cache);
+        let (live, _) = heap::watched_free().expect("the lease was freed");
+        // When its reservation goes, all that is left of the cache is its
+        // pool's counter, freed in the same drop, and the lease itself.
+        let left = (live - origin) as usize;
+        let lease_bytes = std::mem::size_of::<Reservation>() + 2 * std::mem::size_of::<usize>();
+        assert!(
+            left <= FixedPool::HEAP_BYTES + lease_bytes,
+            "{left} bytes still allocated when the reservation went"
+        );
+        assert_eq!((budget.used(), fetches.used()), (0, 0));
+        assert_eq!(heap::live(), origin);
+    }
+
+    #[test]
+    fn disabled_and_tiny_hot_caches_count_their_own_heap() {
+        for capacity in [0, 1, 64, 256] {
+            let origin = heap::live();
+            let cache = Arc::new(Mutex::new(VerifiedHotCache::new(capacity)));
+            let live = heap::live() - origin;
+            let counted = cache.lock().pool.used();
+            // It caches nothing, but counts, and reports as its fixed
+            // capacity, the heap it keeps.
+            assert!(
+                live as usize <= counted,
+                "capacity {capacity}: heap {live}, counted {counted}"
+            );
+            assert_eq!(
+                cache.lock().pool.capacity(),
+                hot_cache_fixed_bytes(capacity)
+            );
+            assert!(counted <= cache.lock().pool.capacity());
+            let data = b"x";
+            cache.lock().put_input(
+                block_key(&cid_from_data(CODEC_RAW, data)),
+                HotInput::Copy(data),
+                0,
+            );
+            assert!(cache.lock().entries.is_empty(), "caches nothing");
+            drop(cache);
+            assert_eq!(heap::live(), origin);
+        }
+        let off = SqliteBlockStore::in_memory_with(StoreOptions {
+            hot_cache_bytes: Some(0),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        assert_eq!(off.hot_cache_capacity(), HOT_CACHE_OWN_BYTES as u64);
+    }
+
+    #[test]
+    fn thousands_of_tiny_blocks_keep_the_hot_cache_within_its_capacity() {
+        const CAPACITY: usize = 512 * 1024;
+        let budget = freedom_ipfs_core::MemoryBudget::new(1 << 20);
+        let blocks: Vec<Vec<u8>> = (0..6_000u32)
+            .map(|index| index.to_le_bytes().repeat(1 + index as usize % 16))
+            .collect();
+        let cids: Vec<Cid> = blocks
+            .iter()
+            .map(|data| cid_from_data(CODEC_RAW, data))
+            .collect();
+        // Fetches still holding the last of their blocks, so some entries
+        // stay charged a while.
+        let mut fetching = std::collections::VecDeque::with_capacity(64);
+        let origin = heap::live();
+        let mut cache = VerifiedHotCache::new(CAPACITY as u64);
+        let mut most = 0;
+        for (index, (data, cid)) in blocks.iter().zip(&cids).enumerate() {
+            let key = block_key(cid);
+            match index % 3 {
+                // Copied in, as a plain put is.
+                0 => cache.put_input(key, HotInput::Copy(data), 0),
+                // Shared, as a cold read is.
+                1 => cache.put_verified(key, ChargedBytes::from_vec(data.clone()), 0),
+                // Shared with the fetch that charged it.
+                _ => {
+                    let fetched = charged_view(&budget, data, data.len());
+                    cache.put_input(key, HotInput::Shared(fetched.clone()), 0);
+                    if fetching.len() == 50 {
+                        fetching.pop_front();
+                    }
+                    fetching.push_back(fetched);
+                }
+            }
+            let held = heap::live() - origin;
+            let peak = heap::peak() - origin;
+            let counted = cache.pool.used();
+            most = most.max(cache.entries.len());
+            // The block just put went in, older ones making way for it.
+            assert!(cache.entries.contains_key(&block_key(cid)));
+            // What it counts stays within its capacity, and what it really
+            // holds on the heap (with the fetches' blocks it still covers)
+            // within what it counts, at every step.
+            assert!(counted <= CAPACITY, "counts {counted}");
+            assert!(held as usize <= counted, "holds {held}, counts {counted}");
+            assert!(peak as usize <= CAPACITY, "peaked at {peak}");
+        }
+        assert!(most > 1_000, "thousands of entries: {most}");
+        assert!(cache.entries.len() < blocks.len(), "and evictions");
+        assert!(!cache.charged.is_empty(), "some still charged");
+        fetching.clear();
+        cache.clear();
+        assert_eq!(cache.entries.len(), 0);
+        drop(cache);
+        assert_eq!(heap::live(), origin, "all of it was the cache's");
+        assert_eq!(budget.used(), 0);
     }
 }

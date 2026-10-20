@@ -22,16 +22,23 @@
 //!   allocation charged.
 //! - **[`FixedPool`]** is a fixed reservation's account, such as a cache's
 //!   capacity. A buffer its owner holds ([`FixedPool::hold`]) counts against
-//!   it by backing capacity for the rest of the buffer's life, after the
+//!   it by its footprint ([`ChargedBytes::footprint`]: its backing capacity
+//!   and its shared header) for the rest of the buffer's life, after the
 //!   owner lets it go too, so the pool never covers more than its capacity.
 //!   Once the owner's handles are the buffer's last, the owner takes over
 //!   its dynamic charge, when the last other handle is dropped; until then
-//!   the bytes count twice, which errs on the safe side.
+//!   the bytes count twice, which errs on the safe side. The fixed
+//!   reservation a pool's capacity is reserved by can be tied to it
+//!   ([`FixedPool::keep_lease`]): it then goes only with the last of the
+//!   memory it stands for, a buffer a reader holds included. Memory that isn't
+//!   one buffer, such as a cache's decoded entries and its maps, takes a
+//!   [`PoolShare`] of the pool instead, sized by its owner
+//!   ([`btree_map_bytes`] bounds a map's nodes).
 
 use std::fmt;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -440,6 +447,17 @@ impl ChargedBytes {
         self.buffer.data.capacity()
     }
 
+    /// The heap an allocation takes besides its bytes' backing: the header
+    /// its clones and views share, with its charges.
+    pub const HEADER_BYTES: usize =
+        std::mem::size_of::<Buffer>() + 2 * std::mem::size_of::<usize>();
+
+    /// All the heap the allocation takes: its backing capacity and its
+    /// header. What a [`FixedPool`] covers it by.
+    pub fn footprint(&self) -> usize {
+        self.backing_capacity().saturating_add(Self::HEADER_BYTES)
+    }
+
     /// The bytes of dynamic reservation the allocation still holds.
     pub fn charged_bytes(&self) -> usize {
         self.charges()
@@ -584,8 +602,8 @@ impl From<Vec<u8>> for ChargedBytes {
 }
 
 /// A fixed reservation's account: the buffers it covers count against its
-/// capacity by backing capacity, for the rest of their lives. Clones share
-/// it.
+/// capacity by their footprint ([`ChargedBytes::footprint`]), for the rest
+/// of their lives. Clones share it.
 #[derive(Clone)]
 pub struct FixedPool {
     inner: Arc<PoolInner>,
@@ -594,6 +612,9 @@ pub struct FixedPool {
 struct PoolInner {
     capacity: usize,
     used: AtomicUsize,
+    /// The fixed reservation its capacity is reserved by, if its owner gave
+    /// it one ([`FixedPool::keep_lease`]).
+    lease: OnceLock<Arc<Reservation>>,
 }
 
 /// A pool's cover of one allocation, released when the allocation is freed.
@@ -624,15 +645,45 @@ impl FixedPool {
             inner: Arc::new(PoolInner {
                 capacity,
                 used: AtomicUsize::new(0),
+                lease: OnceLock::new(),
             }),
         }
+    }
+
+    /// A pool of no capacity, for a cache that is gone (a closed store's):
+    /// it covers nothing, takes no lease, and allocates nothing, as every
+    /// one of them is the same pool.
+    pub fn none() -> Self {
+        static NONE: OnceLock<FixedPool> = OnceLock::new();
+        NONE.get_or_init(|| {
+            let pool = FixedPool::new(0);
+            // Taken already, by a lease of nothing: no other is ever kept.
+            pool.keep_lease(Arc::new(Reservation::empty()));
+            pool
+        })
+        .clone()
+    }
+
+    /// The heap a pool takes itself: its counter, in its `Arc`. A cache
+    /// counts it with its own structures.
+    pub const HEAP_BYTES: usize =
+        std::mem::size_of::<PoolInner>() + 2 * std::mem::size_of::<usize>();
+
+    /// Ties `lease`, the fixed reservation the pool's capacity is reserved
+    /// by, to the memory it stands for: it is kept for as long as the pool,
+    /// a clone or share of it, or any allocation it covers lives (a block a
+    /// reader still holds after its cache is gone included), and goes with
+    /// the last of them. A pool keeps the first lease it is given: whether
+    /// it kept this one.
+    pub fn keep_lease(&self, lease: Arc<Reservation>) -> bool {
+        self.inner.lease.set(lease).is_ok()
     }
 
     pub fn capacity(&self) -> usize {
         self.inner.capacity
     }
 
-    /// The backing capacity of every live allocation it covers, those its
+    /// The footprint of every live allocation it covers, those its
     /// owner has let go of but others still hold included.
     pub fn used(&self) -> usize {
         self.inner.used.load(Ordering::Acquire)
@@ -648,7 +699,7 @@ impl FixedPool {
     }
 
     /// Holds `bytes` for the pool's owner, a cache: covers the allocation
-    /// for the rest of its life if its backing capacity fits in what is left
+    /// for the rest of its life if its footprint fits in what is left
     /// of the pool (or this pool covers it already). `None` if it doesn't
     /// fit, or another pool covers it.
     pub fn hold(&self, bytes: &ChargedBytes) -> Option<HeldBytes> {
@@ -657,7 +708,7 @@ impl FixedPool {
             Some(cover) if !Arc::ptr_eq(&cover.pool, &self.inner) => return None,
             Some(_) => {}
             None => {
-                let needed = bytes.backing_capacity();
+                let needed = bytes.footprint();
                 let capacity = self.inner.capacity;
                 self.inner
                     .used
@@ -680,22 +731,25 @@ impl FixedPool {
 }
 
 impl FixedPool {
-    /// Holds a copy of `bytes` for the pool's owner: room for it is taken
-    /// in the pool first, and only then is the copy allocated, at exactly
-    /// its size, so no copy is ever made that the pool doesn't cover.
+    /// Holds a copy of `len` bytes for the pool's owner: room for its
+    /// footprint (`len` and a header) is taken in the pool first, and only
+    /// then is the copy allocated, at exactly its size, so no copy is ever
+    /// made that the pool doesn't cover.
     /// `None`, allocating nothing, if it doesn't fit; `copy` is what makes
     /// the copy, called only once the room is taken.
     pub fn hold_copy(&self, len: usize, copy: impl FnOnce() -> Vec<u8>) -> Option<HeldBytes> {
         let capacity = self.inner.capacity;
+        let footprint = len.saturating_add(ChargedBytes::HEADER_BYTES);
         self.inner
             .used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(len).filter(|total| *total <= capacity)
+                used.checked_add(footprint)
+                    .filter(|total| *total <= capacity)
             })
             .ok()?;
         let room = Cover {
             pool: self.inner.clone(),
-            bytes: len,
+            bytes: footprint,
         };
         let mut data = copy();
         if data.capacity() > len {
@@ -750,6 +804,100 @@ impl fmt::Debug for HeldBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("HeldBytes").field(&self.bytes).finish()
     }
+}
+
+impl FixedPool {
+    /// A share of `bytes` of the pool, for memory its owner sizes itself:
+    /// a cache's decoded entries and its maps, which are no one buffer.
+    /// `None` if it doesn't fit in what is left of the pool. The share's
+    /// bytes come back when it is dropped or shrunk.
+    pub fn share(&self, bytes: usize) -> Option<PoolShare> {
+        let mut share = PoolShare {
+            cover: Cover {
+                pool: self.inner.clone(),
+                bytes: 0,
+            },
+        };
+        share.try_grow(bytes).then_some(share)
+    }
+}
+
+/// A share of a [`FixedPool`] whose owner sizes it: room is taken
+/// ([`PoolShare::try_grow`]) before what it pays for is allocated, and
+/// given back ([`PoolShare::shrink`]) once that is freed.
+pub struct PoolShare {
+    cover: Cover,
+}
+
+impl PoolShare {
+    pub fn bytes(&self) -> usize {
+        self.cover.bytes
+    }
+
+    /// Grows the share by `bytes` if the pool has room for them; otherwise
+    /// takes nothing.
+    pub fn try_grow(&mut self, bytes: usize) -> bool {
+        let capacity = self.cover.pool.capacity;
+        let taken = self
+            .cover
+            .pool
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= capacity)
+            })
+            .is_ok();
+        if taken {
+            self.cover.bytes += bytes;
+        }
+        taken
+    }
+
+    /// Gives `bytes` of the share back to the pool (at most all of it).
+    pub fn shrink(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.cover.bytes);
+        self.cover.bytes -= bytes;
+        self.cover.pool.used.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    /// Sizes the share to `bytes`: grows it if the pool has room (`false`,
+    /// taking nothing, if it hasn't), or shrinks it.
+    pub fn try_resize(&mut self, bytes: usize) -> bool {
+        match bytes.checked_sub(self.cover.bytes) {
+            Some(more) => self.try_grow(more),
+            None => {
+                self.shrink(self.cover.bytes - bytes);
+                true
+            }
+        }
+    }
+}
+
+impl fmt::Debug for PoolShare {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("PoolShare").field(&self.bytes()).finish()
+    }
+}
+
+/// The most heap a `std` `BTreeMap<K, V>` of `len` entries holds: its
+/// nodes, by `std`'s layout. A node holds at most 11 entries and, the root
+/// excepted, at least 5 (insertion splits a full node in two of at least 5;
+/// removal merges or refills a node that falls below 5), so `len` entries
+/// take at most `1 + (len - 1) / 5` nodes; an emptied map may keep its
+/// root, so even none take one. Each is at most an internal node: 11
+/// `(K, V)` slots, 12 child pointers, its parent pointer, two `u16`s and
+/// padding. What the keys and values own on the heap isn't in it. The bound
+/// grows with `len` and never depends on the map's history, so room taken
+/// for `len + 1` entries before an insertion covers it.
+pub fn btree_map_bytes<K, V>(len: usize) -> usize {
+    let nodes = 1 + len.saturating_sub(1) / 5;
+    let word = std::mem::size_of::<usize>();
+    let node = 11 * (std::mem::size_of::<K>() + std::mem::size_of::<V>())
+        + 13 * word
+        + 4
+        + std::mem::align_of::<K>()
+        + std::mem::align_of::<V>()
+        + word;
+    nodes.saturating_mul(node)
 }
 
 #[cfg(test)]
@@ -990,6 +1138,7 @@ mod tests {
     #[test]
     fn a_fixed_pool_covers_for_life_and_takes_over_only_from_the_last_owner() {
         let budget = MemoryBudget::new(1 << 20);
+        const H: usize = ChargedBytes::HEADER_BYTES;
         let pool = FixedPool::new(10_000);
         let fetched = ReservedVec::zeroed(4_000, budget.try_reserve(4_000).unwrap())
             .unwrap()
@@ -997,7 +1146,9 @@ mod tests {
         let reader = fetched.clone();
         let held = pool.hold(&fetched).unwrap();
         let again = pool.hold(&fetched).unwrap();
-        assert_eq!(pool.used(), 4_000, "held twice, covered once");
+        // A buffer counts by its footprint: its backing and its header.
+        assert_eq!(fetched.footprint(), 4_000 + H);
+        assert_eq!(pool.used(), 4_000 + H, "held twice, covered once");
         drop(again);
         // While others hold it, it counts twice.
         assert!(!held.take_over_if_only_held());
@@ -1006,12 +1157,12 @@ mod tests {
         // The last other handle goes: the owner takes the charge over.
         drop(reader);
         assert_eq!(budget.used(), 0);
-        assert_eq!(pool.used(), 4_000);
+        assert_eq!(pool.used(), 4_000 + H);
         // Handed out again and let go by the owner, it stays covered until
         // it is freed.
         let reader = held.bytes().clone();
         drop(held);
-        assert_eq!(pool.used(), 4_000);
+        assert_eq!(pool.used(), 4_000 + H);
         drop(reader);
         assert_eq!(pool.used(), 0);
 
@@ -1036,7 +1187,7 @@ mod tests {
 
         // A copy is made only once its room is taken.
         let mut copies = 0;
-        let full = FixedPool::new(100);
+        let full = FixedPool::new(100 + H);
         let _filled = full
             .hold_copy(100, || {
                 copies += 1;
@@ -1049,16 +1200,121 @@ mod tests {
                 vec![2]
             })
             .is_none());
-        assert_eq!((copies, full.used()), (1, 100));
+        assert_eq!((copies, full.used()), (1, 100 + H));
 
         // What doesn't fit isn't held; another pool's buffer isn't either.
-        let big = ChargedBytes::from_vec(vec![0; 10_001]);
+        let big = ChargedBytes::from_vec(vec![0; 10_001 - H]);
         assert!(pool.hold(&big).is_none());
         let other = FixedPool::new(10_000);
         let small = ChargedBytes::from_vec(vec![0; 100]);
         let _other_held = other.hold(&small).unwrap();
         assert!(pool.hold(&small).is_none());
         assert!(small.is_covered() && !pool.covers(&small) && other.covers(&small));
+    }
+
+    #[test]
+    fn a_pools_lease_goes_only_with_the_last_of_its_memory() {
+        let budget = MemoryBudget::new(1 << 20);
+        let lease = Arc::new(budget.try_reserve(10_000).unwrap());
+        let pool = FixedPool::new(10_000);
+        assert!(pool.keep_lease(lease.clone()));
+        assert!(!pool.keep_lease(Arc::new(budget.try_reserve(1).unwrap())));
+        assert_eq!(budget.used(), 10_000, "a second lease isn't kept");
+        let share = pool.share(100).unwrap();
+        let held = pool.hold(&ChargedBytes::from_vec(vec![1; 1_000])).unwrap();
+        let reader = held.bytes().clone();
+        // The owner lets go of the lease, the pool and its cache's handle.
+        drop((lease, pool, held));
+        assert_eq!(budget.used(), 10_000, "a share still stands for it");
+        drop(share);
+        assert_eq!(
+            budget.used(),
+            10_000,
+            "a reader still holds a covered buffer"
+        );
+        drop(reader);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn one_lease_wins_a_race_and_its_shares_and_views_release_it_once() {
+        use std::sync::Barrier;
+        let budget = MemoryBudget::new(8 * 4096);
+        let pool = FixedPool::new(4096);
+        let share = pool.share(0).unwrap();
+        let data = ChargedBytes::from_vec(vec![7; 100]);
+        let held = pool.hold(&data).unwrap();
+        let view = held.bytes().to_bytes();
+        drop(data);
+        let barrier = Arc::new(Barrier::new(4));
+        let racers: Vec<_> = (0..4)
+            .map(|_| {
+                let (budget, pool, barrier) = (budget.clone(), pool.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let lease = Arc::new(budget.try_reserve(4096).unwrap());
+                    barrier.wait();
+                    pool.keep_lease(lease)
+                })
+            })
+            .collect();
+        let winners = racers
+            .into_iter()
+            .map(|racer| usize::from(racer.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(winners, 1);
+        assert_eq!(budget.used(), 4096, "the losing leases go at once");
+        drop((held, pool));
+        assert_eq!(budget.used(), 4096);
+        drop(view);
+        assert_eq!(budget.used(), 4096, "an empty share still owns the pool");
+        drop(share);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn the_pool_of_nothing_holds_nothing_and_keeps_no_lease() {
+        let budget = MemoryBudget::new(1 << 20);
+        let none = FixedPool::none();
+        assert!(
+            Arc::ptr_eq(&none.inner, &FixedPool::none().inner),
+            "one for all"
+        );
+        assert!(!none.keep_lease(Arc::new(budget.try_reserve(100).unwrap())));
+        assert_eq!(budget.used(), 0);
+        assert!(none.hold(&ChargedBytes::from_vec(vec![1])).is_none());
+        assert!(none.share(1).is_none());
+        let empty = none.share(0).unwrap();
+        assert_eq!((none.capacity(), none.used(), empty.bytes()), (0, 0, 0));
+    }
+
+    #[test]
+    fn a_pool_share_takes_room_first_and_gives_it_back() {
+        let pool = FixedPool::new(1_000);
+        let mut share = pool.share(600).unwrap();
+        assert!(pool.share(401).is_none(), "nothing past the capacity");
+        let held = pool
+            .hold(&ChargedBytes::from_vec(
+                vec![0; 300 - ChargedBytes::HEADER_BYTES],
+            ))
+            .unwrap();
+        assert_eq!(pool.used(), 900);
+        assert!(!share.try_grow(101));
+        assert_eq!(
+            (share.bytes(), pool.used()),
+            (600, 900),
+            "a refusal takes nothing"
+        );
+        assert!(share.try_resize(700));
+        assert!(!share.try_resize(701));
+        share.shrink(200);
+        assert_eq!((share.bytes(), pool.used()), (500, 800));
+        share.shrink(10_000);
+        assert_eq!((share.bytes(), pool.used()), (0, 300));
+        assert!(share.try_resize(400));
+        drop(share);
+        assert_eq!(pool.used(), 300);
+        drop(held);
+        assert_eq!(pool.used(), 0);
     }
 
     #[test]

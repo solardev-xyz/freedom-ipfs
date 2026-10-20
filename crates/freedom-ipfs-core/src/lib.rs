@@ -8,7 +8,8 @@ pub mod build_info;
 pub mod memory;
 
 pub use memory::{
-    BudgetError, ChargedBytes, FixedPool, HeldBytes, MemoryBudget, Reservation, ReservedVec,
+    btree_map_bytes, BudgetError, ChargedBytes, FixedPool, HeldBytes, MemoryBudget, PoolShare,
+    Reservation, ReservedVec,
 };
 
 pub const CODEC_DAG_PB: u64 = 0x70;
