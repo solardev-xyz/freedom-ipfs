@@ -5,21 +5,26 @@
 //! own limits are per instance. [`SharedLimits`] is that set of limits.
 //! Every node built with clones of one value shares its counts:
 //!
-//! - **block fetches** in flight: a permit from before an uncached fetch
-//!   starts (its provider lookup included) until it has ended, its store put
-//!   included. Coalesced callers that only wait on another caller's fetch
-//!   take none;
+//! - **block fetches** in flight: a permit per block, from before an
+//!   uncached fetch starts (its provider lookup included) until it has
+//!   ended, its store put included. Coalesced callers that only wait on
+//!   another caller's fetch take none. A Bitswap batch takes one per CID,
+//!   and is split so that it never asks for more than the limit holds;
 //! - **HTTP provider requests**: a permit taken inside the retriever's own
 //!   limit, held through the body read, the verification and the store put;
 //! - **DHT queries**: a permit per light-DHT query, held for the query;
 //! - **Bitswap connections**: established and pending, across every node's
-//!   swarm. A connection past the cap is denied, not queued.
+//!   swarm. At the swarm, a connection past the cap is denied. Above it, a
+//!   request's dial that was denied for the cap waits, holding no slot, and
+//!   is retried when any swarm releases one; background dials (preconnects)
+//!   are dropped instead.
 //!
 //! Work beyond a limit waits; it never fails for waiting. A wait ends when
 //! its request is cancelled: every wait is an `await` inside the request's
 //! future, so dropping the future ends it, and the synchronous block
 //! provider runs that future in a blocking region that drops it as soon as
 //! the request's token is cancelled ([`crate::InstanceContext::block_on`]).
+//! A dial waiting for a slot is dropped once no request waits on it.
 //!
 //! A permit is released only once the operation and every blocking job it
 //! started (the store put) have ended, so a cancelled fetch keeps its permit
@@ -46,7 +51,7 @@ use libp2p::swarm::{
     THandlerOutEvent, ToSwarm,
 };
 use libp2p::{Multiaddr, PeerId};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 
 /// Block fetches in flight across a process, by default.
 pub const DEFAULT_SHARED_BLOCK_FETCHES: usize = 256;
@@ -180,17 +185,27 @@ impl SharedLimits {
         self.inner.bitswap_connections.denied()
     }
 
+    /// Bitswap dials waiting for a free connection slot, across every node:
+    /// each was denied for the cap, and is retried when a slot is released.
+    pub fn bitswap_connections_waiting(&self) -> usize {
+        self.inner.bitswap_connections.waiting()
+    }
+
     /// The DHT query limiter, for [`freedom_ipfs_routing::LightDhtClient`]'s
     /// `with_query_limiter`.
     pub fn dht_query_limiter(&self) -> Arc<Semaphore> {
         self.inner.dht_queries.clone()
     }
 
-    /// Waits for `count` block-fetch permits (at most the limit's size).
-    /// `None` only if the limiter were closed, which it never is.
+    /// Waits for `count` block-fetch permits, one per block. `None`, at once,
+    /// when `count` is 0 or more than the limit's size: such a fetch could
+    /// never be admitted whole, so its caller must split it. (`None` too if
+    /// the limiter were closed, which it never is.)
     pub(crate) async fn acquire_block_fetches(&self, count: usize) -> Option<OwnedSemaphorePermit> {
-        let count = count.clamp(1, self.inner.sizes.block_fetches);
-        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        if count == 0 || count > self.inner.sizes.block_fetches {
+            return None;
+        }
+        let count = u32::try_from(count).ok()?;
         self.inner
             .block_fetches
             .clone()
@@ -257,6 +272,12 @@ struct ConnectionCountInner {
     max: usize,
     current: AtomicUsize,
     denied: AtomicU64,
+    /// Dials waiting for a slot, in every swarm.
+    waiting: AtomicUsize,
+    /// Bumped on every release, so a swarm with dials waiting for a slot
+    /// learns of one without missing it (a receiver sees any change since it
+    /// last looked).
+    released: watch::Sender<u64>,
 }
 
 impl ConnectionCount {
@@ -266,6 +287,8 @@ impl ConnectionCount {
                 max,
                 current: AtomicUsize::new(0),
                 denied: AtomicU64::new(0),
+                waiting: AtomicUsize::new(0),
+                released: watch::Sender::new(0),
             }),
         }
     }
@@ -287,12 +310,18 @@ impl ConnectionCount {
     }
 
     fn release(&self) {
-        let _ = self
+        let released = self
             .inner
             .current
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_sub(1)
-            });
+            })
+            .is_ok();
+        if released {
+            self.inner
+                .released
+                .send_modify(|count| *count = count.wrapping_add(1));
+        }
     }
 
     fn current(&self) -> usize {
@@ -301,6 +330,54 @@ impl ConnectionCount {
 
     fn denied(&self) -> u64 {
         self.inner.denied.load(Ordering::Relaxed)
+    }
+
+    fn waiting(&self) -> usize {
+        self.inner.waiting.load(Ordering::Acquire)
+    }
+}
+
+/// A swarm's view of the cap for its dials that wait for a slot: it tells
+/// when a slot is released, in any swarm, and counts the waiting dials.
+pub(crate) struct ConnectionSlotWaits {
+    count: ConnectionCount,
+    released: watch::Receiver<u64>,
+}
+
+impl ConnectionSlotWaits {
+    /// Counts a waiting dial until the guard is dropped.
+    pub(crate) fn waiting(&self) -> WaitingConnection {
+        self.count.inner.waiting.fetch_add(1, Ordering::AcqRel);
+        WaitingConnection {
+            count: self.count.clone(),
+        }
+    }
+
+    /// Returns once a slot has been released since this was last called
+    /// (or since the waits were made), at once if one has. A dial denied
+    /// for the cap is retried then.
+    pub(crate) async fn released(&mut self) {
+        if self.released.changed().await.is_err() {
+            // The count outlives every swarm sharing it; never reached.
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Marks every release so far as seen, before the waiting dials are
+    /// retried: a release after this wakes [`ConnectionSlotWaits::released`].
+    pub(crate) fn mark_released_seen(&mut self) {
+        self.released.borrow_and_update();
+    }
+}
+
+/// A dial counted as waiting for a slot, until dropped.
+pub(crate) struct WaitingConnection {
+    count: ConnectionCount,
+}
+
+impl Drop for WaitingConnection {
+    fn drop(&mut self) {
+        self.count.inner.waiting.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -339,6 +416,14 @@ impl SharedConnectionLimit {
         Self {
             count,
             held: HashSet::new(),
+        }
+    }
+
+    /// The waits of dials this swarm defers because the cap is reached.
+    pub(crate) fn slot_waits(&self) -> ConnectionSlotWaits {
+        ConnectionSlotWaits {
+            released: self.count.inner.released.subscribe(),
+            count: self.count.clone(),
         }
     }
 
@@ -616,8 +701,12 @@ mod tests {
         assert!(waiting.is_err(), "a third fetch waits");
         drop((first, second, held));
         assert_eq!(limits.block_fetches_in_flight(), 0);
-        // A batch asking for more than the limit takes all of it, no more.
-        let all = other.acquire_block_fetches(10).await.unwrap();
+        // A fetch of more blocks than the limit admits is refused at once,
+        // never charged less than its blocks, and never left waiting.
+        assert!(other.acquire_block_fetches(3).await.is_none());
+        assert!(other.acquire_block_fetches(0).await.is_none());
+        assert_eq!(limits.block_fetches_in_flight(), 0);
+        let all = other.acquire_block_fetches(2).await.unwrap();
         assert_eq!(all.num_permits(), 2);
         assert_eq!(limits.block_fetches_in_flight(), 2);
         drop(all);
