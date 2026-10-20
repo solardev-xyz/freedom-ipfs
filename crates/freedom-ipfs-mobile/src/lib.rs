@@ -94,8 +94,10 @@ pub struct FreedomIpfsNode {
     native_gateway_stats: Arc<NativeGatewayStats>,
     next_native_request_id: AtomicU64,
     /// The node's progress, which its snapshot reads: everything its
-    /// runtime's threads emit, its gateways' requests, and its preloads'
-    /// events from the host's thread.
+    /// runtime's threads emit, its gateways' requests, and the events the
+    /// node's calls emit on the host's thread (its preloads' start, cancel
+    /// and stop), as root events in this recorder's scope, so no span the
+    /// host is in can take them.
     progress: ProgressRecorder,
 }
 
@@ -748,10 +750,17 @@ pub unsafe extern "C" fn freedom_ipfs_node_free(ptr: *mut FreedomIpfsNode) {
         stop_gateway(node);
         stop_preloads(node);
         let node = Box::from_raw(ptr);
-        let FreedomIpfsNode { runtime, store, .. } = *node;
+        let FreedomIpfsNode {
+            runtime,
+            store,
+            progress,
+            ..
+        } = *node;
         runtime.shutdown_timeout(NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT);
         if !store.close_or_close_later(NODE_FREE_STORE_CLOSE_TIMEOUT) {
-            tracing::warn!(phase = "node_free_store_close_timeout");
+            // The node's, as the preload events below are.
+            let _scope = progress.enter();
+            tracing::warn!(parent: None, phase = "node_free_store_close_timeout");
         }
     }
 }
@@ -2230,10 +2239,12 @@ pub unsafe extern "C" fn freedom_ipfs_node_preload_path(
     let id = node.next_preload_id.fetch_add(1, Ordering::Relaxed);
     let url = format!("http://{addr}{path}");
     {
-        // On the host's thread: in the node's scope. The preload's own task
-        // runs on the node's runtime.
+        // On the host's thread, so the node's by its scope, as a root
+        // event: a span the host has entered, another node's say, would
+        // otherwise take it. The preload's own task runs on the node's
+        // runtime.
         let _scope = node.progress.enter();
-        tracing::info!(phase = "preload_start", preload_id = id, path = %path);
+        tracing::info!(parent: None, phase = "preload_start", preload_id = id, path = %path);
     }
     let preload_path = path.clone();
     let task = node.runtime.spawn(async move {
@@ -2305,8 +2316,9 @@ pub unsafe extern "C" fn freedom_ipfs_node_cancel_preload(
         return false;
     };
     task.abort();
+    // The node's, whatever span the host is in (see the preload's start).
     let _scope = node.progress.enter();
-    tracing::info!(phase = "preload_cancelled", preload_id = task_id);
+    tracing::info!(parent: None, phase = "preload_cancelled", preload_id = task_id);
     true
 }
 
@@ -2355,13 +2367,14 @@ fn stop_native_gateway_requests(node: &FreedomIpfsNode) {
 }
 
 fn stop_preloads(node: &FreedomIpfsNode) {
-    // Called on the host's thread.
+    // Called on the host's thread: the node's events, whatever span the
+    // host is in (see `freedom_ipfs_node_preload_path`).
     let _scope = node.progress.enter();
     if let Ok(mut tasks) = node.preload_tasks.lock() {
         for (task_id, task) in tasks.drain() {
             if !task.is_finished() {
                 task.abort();
-                tracing::info!(phase = "preload_cancelled", preload_id = task_id);
+                tracing::info!(parent: None, phase = "preload_cancelled", preload_id = task_id);
             }
         }
     }
@@ -4762,6 +4775,134 @@ mod tests {
 
             assert!(freedom_ipfs_gateway_request_free(node, handle));
             freedom_ipfs_node_free(node);
+        }
+    }
+
+    /// A span of another node's, current on the host's thread.
+    fn foreign_host_span(recorder: &ProgressRecorder) -> tracing::Span {
+        let _scope = recorder.enter();
+        tracing::info_span!(target: "freedom_ipfs_test", parent: None, "node_a_host_call")
+    }
+
+    fn snapshot_of(recorder: &ProgressRecorder) -> serde_json::Value {
+        serde_json::from_str(&recorder.snapshot_json()).unwrap()
+    }
+
+    fn has_raw_phase(snapshot: &serde_json::Value, raw_phase: &str) -> bool {
+        snapshot["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["raw_phase"] == raw_phase)
+    }
+
+    /// B's preload, started while A's span is current on the host's thread,
+    /// is B's: A gets neither its start nor an orphaned active entry.
+    #[test]
+    fn preload_host_events_must_not_follow_another_nodes_current_span() {
+        unsafe {
+            init_progress_tracing();
+            let a = ProgressRecorder::new();
+            let foreign = foreign_host_span(&a);
+            let b = freedom_ipfs_node_new_in_memory();
+            assert!(!b.is_null());
+            let addr = CString::new("127.0.0.1:0").unwrap();
+            assert!(freedom_ipfs_node_start_gateway(b, addr.as_ptr()));
+            // Not stored: the cache-only gateway answers 404 at once.
+            let cid = cid_from_data(CODEC_RAW, b"not stored; local cache-only 404");
+            let path = CString::new(format!("/ipfs/{cid}")).unwrap();
+            let id = foreign.in_scope(|| freedom_ipfs_node_preload_path(b, path.as_ptr()));
+            assert_ne!(id, 0);
+
+            let started: serde_json::Value =
+                serde_json::from_str(&progress_snapshot_json(b)).unwrap();
+            assert!(has_raw_phase(&started, "preload_start"), "{started}");
+            assert!(!has_raw_phase(&snapshot_of(&a), "preload_start"));
+            let done =
+                progress_snapshot_until(b, |snapshot| has_raw_phase(snapshot, "preload_done"));
+            assert!(has_raw_phase(&done, "preload_done"), "{done}");
+            freedom_ipfs_node_free(b);
+            drop(foreign);
+            let a_after = snapshot_of(&a);
+            assert_eq!(a_after["event_count"], 0, "{a_after}");
+            assert_eq!(a_after["active_count"], 0, "{a_after}");
+        }
+    }
+
+    /// Cancelling B's preload under A's span cancels B's, not A's preload
+    /// with the same number.
+    #[test]
+    fn cancelling_b_must_not_cancel_as_same_numbered_preload() {
+        unsafe {
+            init_progress_tracing();
+            let a = ProgressRecorder::new();
+            let foreign = foreign_host_span(&a);
+            let b = freedom_ipfs_node_new_in_memory();
+            assert!(!b.is_null());
+            let addr = CString::new("127.0.0.1:0").unwrap();
+            assert!(freedom_ipfs_node_start_gateway(b, addr.as_ptr()));
+            let cid = cid_from_data(CODEC_RAW, b"not stored; local cache-only 404");
+            let path = CString::new(format!("/ipfs/{cid}")).unwrap();
+            let id = freedom_ipfs_node_preload_path(b, path.as_ptr());
+            assert_ne!(id, 0);
+            {
+                let _a = a.enter();
+                tracing::info!(
+                    target: "freedom_ipfs_test",
+                    parent: None,
+                    phase = "preload_start",
+                    preload_id = id,
+                    path = "/ipfs/A-private"
+                );
+            }
+            assert_eq!(snapshot_of(&a)["active_count"], 1);
+
+            assert!(foreign.in_scope(|| freedom_ipfs_node_cancel_preload(b, id)));
+            let a_after = snapshot_of(&a);
+            assert_eq!(a_after["active_count"], 1, "{a_after}");
+            assert!(!has_raw_phase(&a_after, "preload_cancelled"), "{a_after}");
+            let b_after: serde_json::Value =
+                serde_json::from_str(&progress_snapshot_json(b)).unwrap();
+            assert!(has_raw_phase(&b_after, "preload_cancelled"), "{b_after}");
+            freedom_ipfs_node_free(b);
+            drop(foreign);
+        }
+    }
+
+    /// Stopping B's preloads (a lifecycle hook) under A's span stops B's,
+    /// and leaves A's preload with the same number alone.
+    #[test]
+    fn stopping_b_must_not_cancel_as_same_numbered_preload() {
+        unsafe {
+            init_progress_tracing();
+            let a = ProgressRecorder::new();
+            let foreign = foreign_host_span(&a);
+            let b = freedom_ipfs_node_new_in_memory();
+            assert!(!b.is_null());
+            let id = 77;
+            let task = (*b).runtime.spawn(std::future::pending::<()>());
+            (*b).preload_tasks.lock().unwrap().insert(id, task);
+            {
+                let _a = a.enter();
+                tracing::info!(
+                    target: "freedom_ipfs_test",
+                    parent: None,
+                    phase = "preload_start",
+                    preload_id = id,
+                    path = "/ipfs/A-private"
+                );
+            }
+            assert_eq!(snapshot_of(&a)["active_count"], 1);
+
+            assert!(foreign.in_scope(|| freedom_ipfs_node_enter_background(b)));
+            let a_after = snapshot_of(&a);
+            assert_eq!(a_after["active_count"], 1, "{a_after}");
+            assert!(!has_raw_phase(&a_after, "preload_cancelled"), "{a_after}");
+            let b_after: serde_json::Value =
+                serde_json::from_str(&progress_snapshot_json(b)).unwrap();
+            assert!(has_raw_phase(&b_after, "preload_cancelled"), "{b_after}");
+            freedom_ipfs_node_free(b);
+            drop(foreign);
         }
     }
 

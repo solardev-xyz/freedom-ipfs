@@ -48,7 +48,12 @@
 //!   the Bitswap swarm's task. A host that wants it marks that runtime;
 //! - the work of a host that calls a node's block provider or name
 //!   resolver itself, outside a request. It enters the node's scope around
-//!   the call.
+//!   the call, outside other nodes' spans: a current span's recorder
+//!   outranks the thread's.
+//!
+//! A host that emits events of its own on a node's behalf, as the add-on
+//! does for its preloads, emits them as root events (`parent: None`) in the
+//! node's scope, so no span it happens to be in can take them.
 //!
 //! A host that gives no node a recorder of its own finds everything in the
 //! default recorder.
