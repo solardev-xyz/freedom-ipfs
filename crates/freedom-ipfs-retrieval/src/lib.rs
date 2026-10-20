@@ -45,7 +45,7 @@ use std::net::IpAddr;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -7420,6 +7420,9 @@ struct DeferredBitswapDial {
     context: BitswapDialContext,
     /// The waiting requests' `admitted` senders, dropped when it starts.
     admitted: Vec<oneshot::Sender<()>>,
+    /// The liveness of the requests waiting on it. It is dialed only while
+    /// one is alive, and dropped, undialed, once none is.
+    requesters: Vec<Weak<()>>,
     /// Counts it in [`SharedLimits::bitswap_connections_waiting`].
     _waiting: WaitingConnection,
 }
@@ -7610,6 +7613,12 @@ struct BitswapCommand {
     peers: Vec<BitswapPeer>,
     sent_at: Instant,
     respond: Option<oneshot::Sender<Result<BitswapFetchBatchResult>>>,
+    /// The requester's liveness: upgradable while it still waits for the
+    /// response (it holds the `Arc` for as long as it awaits). The swarm
+    /// checks it synchronously before it dials for a request that waited
+    /// for a connection slot, so a request that gave up never dials,
+    /// however the swarm's events are ordered. Dead for a preconnect.
+    requester: Weak<()>,
     reason: &'static str,
     context: BitswapCommandContext,
 }
@@ -7777,12 +7786,16 @@ impl SharedBitswapClient {
         let cid_count = cids.len();
         let cid_summary = tracing::enabled!(tracing::Level::INFO).then(|| format_cids(&cids));
         let (respond, response) = oneshot::channel();
+        // Alive exactly as long as this request waits for `response`:
+        // dropped with it, whether the wait ends or the future is dropped.
+        let requester = Arc::new(());
         self.commands
             .send(BitswapCommand {
                 cids,
                 peers,
                 sent_at: Instant::now(),
                 respond: Some(respond),
+                requester: Arc::downgrade(&requester),
                 reason: "fetch",
                 context,
             })
@@ -7830,6 +7843,7 @@ impl SharedBitswapClient {
                 peers,
                 sent_at: Instant::now(),
                 respond: None,
+                requester: Weak::new(),
                 reason,
                 context: BitswapCommandContext {
                     top_level_path,
@@ -8176,6 +8190,7 @@ async fn run_shared_bitswap_swarm(
                 let cid_count = cids.len();
                 let primary_cid = cids[0];
                 let command_context = command.context;
+                let requester = command.requester;
                 let dial_context =
                     BitswapDialContext::new(command.reason, command_context.clone());
                 let cid_summary =
@@ -8373,6 +8388,7 @@ async fn run_shared_bitswap_swarm(
                             addrs,
                             context: dial_context.clone(),
                             admitted: Vec::new(),
+                            requesters: Vec::new(),
                             _waiting: waits.waiting(),
                         });
                         handled_dial_peers.insert(peer);
@@ -8387,7 +8403,7 @@ async fn run_shared_bitswap_swarm(
                 // Requests on a dial that waits for a slot hold their
                 // connection timers until it starts; the others' start now.
                 for (peer, senders) in admitted_senders {
-                    join_deferred_bitswap_dial(&mut deferred_dials, peer, senders);
+                    join_deferred_bitswap_dial(&mut deferred_dials, peer, senders, &requester);
                 }
                 if failed_dial_waiter_count > 0 {
                     tracing::info!(
@@ -8769,24 +8785,39 @@ async fn connection_slot_released(waits: Option<&mut ConnectionSlotWaits>) {
     }
 }
 
-/// Adds requests' `admitted` senders to the dial to `peer` waiting for a
-/// slot, dropping those of requests already gone first, so a dial that
-/// callers keep joining and leaving holds one per live request.
+/// Adds a request, its `admitted` senders and its liveness, to the dial to
+/// `peer` waiting for a slot, dropping those of requests already gone
+/// first, so a dial that callers keep joining and leaving holds one entry
+/// per live request.
 fn join_deferred_bitswap_dial(
     deferred: &mut VecDeque<DeferredBitswapDial>,
     peer: PeerId,
     senders: Vec<oneshot::Sender<()>>,
+    requester: &Weak<()>,
 ) {
     if let Some(dial) = deferred.iter_mut().find(|dial| dial.peer == peer) {
         dial.admitted.retain(|admitted| !admitted.is_closed());
         dial.admitted.extend(senders);
+        dial.requesters
+            .retain(|requester| requester.strong_count() > 0);
+        if !dial
+            .requesters
+            .iter()
+            .any(|joined| Weak::ptr_eq(joined, requester))
+        {
+            dial.requesters.push(requester.clone());
+        }
     }
 }
 
-/// Drops the dials waiting for a slot that no request waits on any longer
-/// (their responders gone, so their waiters closed), with their waiters'
-/// entries, so a later request dials afresh; and those of peers since
-/// connected. Returns how many were dropped.
+/// Drops the dials waiting for a slot that no request waits on any longer,
+/// and those of peers since connected; returns how many were dropped.
+///
+/// A request's liveness is checked directly (its requester token), not
+/// through its connection waiter: that waiter closes only once the swarm
+/// next polls the request's fetch, which may come after a slot release in
+/// the same turn. A dial dropped for want of live requests takes its
+/// waiters' entry with it, so a later request for the peer dials afresh.
 fn prune_deferred_bitswap_dials(
     deferred: &mut VecDeque<DeferredBitswapDial>,
     connection_waiters: &mut HashMap<PeerId, Vec<oneshot::Sender<()>>>,
@@ -8795,11 +8826,25 @@ fn prune_deferred_bitswap_dials(
 ) -> usize {
     prune_connection_waiters(connection_waiters, connection_wait_started);
     let before = deferred.len();
+    let mut abandoned = Vec::new();
     deferred.retain_mut(|dial| {
         // A request that went away while others still wait leaves nothing.
         dial.admitted.retain(|admitted| !admitted.is_closed());
-        !connected_peers.contains_key(&dial.peer) && connection_waiters.contains_key(&dial.peer)
+        dial.requesters
+            .retain(|requester| requester.strong_count() > 0);
+        if connected_peers.contains_key(&dial.peer) {
+            return false;
+        }
+        if dial.requesters.is_empty() {
+            abandoned.push(dial.peer);
+            return false;
+        }
+        connection_waiters.contains_key(&dial.peer)
     });
+    for peer in abandoned {
+        connection_waiters.remove(&peer);
+        connection_wait_started.remove(&peer);
+    }
     before - deferred.len()
 }
 
@@ -18836,18 +18881,26 @@ mod bitswap_tests {
         let (live_connected, _live_connected) = oneshot::channel();
         let mut connection_waiters = HashMap::from([(peer, vec![live_connected])]);
         let mut started = HashMap::new();
+        let live = Arc::new(());
         let mut deferred = VecDeque::from([DeferredBitswapDial {
             peer,
             addrs: Vec::new(),
             context: BitswapDialContext::new("test", BitswapCommandContext::default()),
             admitted: vec![live_admitted],
+            requesters: vec![Arc::downgrade(&live)],
             _waiting: waits.waiting(),
         }]);
         // Callers join and give up while one live caller keeps it waiting.
         for _ in 0..1_000 {
             let (admitted, gone) = oneshot::channel::<()>();
-            join_deferred_bitswap_dial(&mut deferred, peer, vec![admitted]);
-            drop(gone);
+            let requester = Arc::new(());
+            join_deferred_bitswap_dial(
+                &mut deferred,
+                peer,
+                vec![admitted],
+                &Arc::downgrade(&requester),
+            );
+            drop((gone, requester));
             prune_deferred_bitswap_dials(
                 &mut deferred,
                 &mut connection_waiters,
@@ -18857,7 +18910,177 @@ mod bitswap_tests {
         }
         assert_eq!(deferred.len(), 1);
         assert_eq!(deferred[0].admitted.len(), 1);
+        assert_eq!(deferred[0].requesters.len(), 1);
         assert_eq!(limits.bitswap_connections_waiting(), 1);
+
+        // Once the last requester is gone, the dial goes too, though its
+        // connection waiter is still open (the swarm hasn't yet polled the
+        // fetch that holds it), and takes the waiters' entry with it.
+        drop(live);
+        prune_deferred_bitswap_dials(
+            &mut deferred,
+            &mut connection_waiters,
+            &mut started,
+            &HashMap::new(),
+        );
+        assert!(deferred.is_empty());
+        assert!(!connection_waiters.contains_key(&peer));
+        assert_eq!(limits.bitswap_connections_waiting(), 0);
+    }
+
+    /// Holds one slot of `limits`' connection cap until dropped, as a
+    /// connection of another swarm would.
+    fn hold_connection_slot(limits: &SharedLimits) -> SharedConnectionLimit {
+        let mut holder = limits.bitswap_connection_limit();
+        holder
+            .handle_pending_outbound_connection(
+                libp2p::swarm::ConnectionId::new_unchecked(usize::MAX),
+                None,
+                &[],
+                libp2p::core::Endpoint::Dialer,
+            )
+            .unwrap();
+        holder
+    }
+
+    /// A shared Bitswap swarm's task over `limits`, and its command sender.
+    async fn spawn_bitswap_actor(
+        limits: &SharedLimits,
+    ) -> (mpsc::Sender<BitswapCommand>, tokio::task::JoinHandle<()>) {
+        let swarm = build_bitswap_swarm(Some(limits)).await.unwrap();
+        let mut control = swarm.behaviour().stream.new_control();
+        let incoming = accept_bitswap_streams(&mut control).unwrap();
+        let (commands, receiver) = mpsc::channel(64);
+        let task = tokio::spawn(run_shared_bitswap_swarm(swarm, control, incoming, receiver));
+        (commands, task)
+    }
+
+    /// A fetch command's requester, as `fetch_many_with_context` holds it:
+    /// dropping it drops the response receiver and the liveness together.
+    struct WaitingFetch {
+        response: oneshot::Receiver<Result<BitswapFetchBatchResult>>,
+        _requester: Arc<()>,
+    }
+
+    async fn send_fetch(
+        commands: &mpsc::Sender<BitswapCommand>,
+        cid: Cid,
+        peer: PeerId,
+        addr: Multiaddr,
+    ) -> WaitingFetch {
+        let (respond, response) = oneshot::channel();
+        let requester = Arc::new(());
+        commands
+            .send(BitswapCommand {
+                cids: vec![cid],
+                peers: vec![BitswapPeer {
+                    id: peer,
+                    addrs: vec![addr],
+                    skip_want_have: true,
+                    force_want_block: true,
+                    force_want_have: false,
+                }],
+                sent_at: Instant::now(),
+                respond: Some(respond),
+                requester: Arc::downgrade(&requester),
+                reason: "fetch",
+                context: BitswapCommandContext::default(),
+            })
+            .await
+            .unwrap();
+        WaitingFetch {
+            response,
+            _requester: requester,
+        }
+    }
+
+    // A current-thread runtime: the test gives up on a request and frees a
+    // slot in one turn, so both are ready before the swarm next runs, in
+    // whichever order its select takes them.
+    #[tokio::test]
+    async fn a_request_that_gives_up_as_a_slot_frees_never_dials() {
+        let mut dialed = 0;
+        for round in 0..32 {
+            let limits = SharedLimits::new(LimitSizes {
+                bitswap_connections: 1,
+                ..LimitSizes::default()
+            });
+            let held = hold_connection_slot(&limits);
+            let (commands, actor) = spawn_bitswap_actor(&limits).await;
+            let data = format!("given up as a slot frees, round {round}").into_bytes();
+            let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, &data);
+            let (peer, addr, peer_swarm, peer_stream) = spawn_local_bitswap_peer(cid, data).await;
+            let fetch = send_fetch(&commands, cid, peer, addr).await;
+            wait_until("the dial never waited", || {
+                limits.bitswap_connections_waiting() == 1
+            })
+            .await;
+            drop((fetch, held));
+            wait_until("the abandoned dial never left", || {
+                limits.bitswap_connections_waiting() == 0
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if limits.bitswap_connections() > 0 {
+                dialed += 1;
+            }
+            actor.abort();
+            let _ = actor.await;
+            peer_swarm.abort();
+            peer_stream.abort();
+        }
+        assert_eq!(
+            dialed, 0,
+            "requests that gave up dialed in {dialed} of 32 rounds"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_gives_up_leaves_the_slot_to_the_next() {
+        let mut blocked = 0;
+        for round in 0..24 {
+            let limits = SharedLimits::new(LimitSizes {
+                bitswap_connections: 1,
+                ..LimitSizes::default()
+            });
+            let held = hold_connection_slot(&limits);
+            let (commands, actor) = spawn_bitswap_actor(&limits).await;
+            let mut fetches = Vec::new();
+            let mut peers = Vec::new();
+            for n in 0..2 {
+                let data = format!("request {n} of round {round}").into_bytes();
+                let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, &data);
+                let (peer, addr, peer_swarm, peer_stream) =
+                    spawn_local_bitswap_peer(cid, data).await;
+                fetches.push(send_fetch(&commands, cid, peer, addr).await);
+                peers.push((peer_swarm, peer_stream));
+                wait_until("a dial never waited", || {
+                    limits.bitswap_connections_waiting() == n + 1
+                })
+                .await;
+            }
+            // The first in line gives up as the slot frees: the second
+            // takes the slot, without the first's peer having to close.
+            let second = fetches.pop().unwrap();
+            drop((fetches, held));
+            match tokio::time::timeout(Duration::from_secs(3), second.response).await {
+                Ok(result) => {
+                    assert_eq!(result.unwrap().unwrap().requested_blocks.len(), 1);
+                    assert_eq!(limits.bitswap_connections_waiting(), 0);
+                }
+                Err(_) => blocked += 1,
+            }
+            actor.abort();
+            let _ = actor.await;
+            for (peer_swarm, peer_stream) in peers {
+                peer_swarm.abort();
+                peer_stream.abort();
+            }
+        }
+        assert_eq!(
+            blocked, 0,
+            "the live request was blocked in {blocked} of 24 rounds"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
