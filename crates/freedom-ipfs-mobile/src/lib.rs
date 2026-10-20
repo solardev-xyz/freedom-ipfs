@@ -1,6 +1,6 @@
 use axum::http::HeaderMap;
 use freedom_ipfs_core::BlockProvider;
-use freedom_ipfs_gateway::progress::{self, default_recorder, init_progress_tracing};
+use freedom_ipfs_gateway::progress::{self, init_progress_tracing, ProgressRecorder};
 use freedom_ipfs_gateway::{
     delegated_router_endpoints, normalize_content_path, parse_native_request_json, GatewayCore,
     GatewayCoreRequest, OnlineNode, RoutingMode,
@@ -87,11 +87,16 @@ pub struct FreedomIpfsNode {
     routing_stats: Mutex<Option<RoutingStatsHandle>>,
     lifecycle_state: Mutex<LifecycleState>,
     next_preload_id: AtomicU64,
-    preload_tasks: Mutex<HashMap<u64, JoinHandle<()>>>,
+    /// Boxed, to make room for `progress` within the size class.
+    preload_tasks: Box<Mutex<HashMap<u64, JoinHandle<()>>>>,
     native_gateway_state: Mutex<NativeGatewayState>,
     native_gateway_events: Arc<NativeGatewayEventMux>,
     native_gateway_stats: Arc<NativeGatewayStats>,
     next_native_request_id: AtomicU64,
+    /// The node's progress, which its snapshot reads: everything its
+    /// runtime's threads emit, its gateways' requests, and its preloads'
+    /// events from the host's thread.
+    progress: ProgressRecorder,
 }
 
 #[repr(C)]
@@ -628,11 +633,16 @@ pub unsafe extern "C" fn freedom_ipfs_node_new_with_data_dir(
 
 fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
     init_progress_tracing();
-    let runtime = match Runtime::new() {
+    // `Runtime::new()`'s runtime, its threads marked with the node's
+    // recorder.
+    let progress = ProgressRecorder::new();
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.enable_all();
+    let runtime = match progress.mark_runtime_threads(&mut runtime).build() {
         Ok(runtime) => runtime,
         Err(_) => return ptr::null_mut(),
     };
-    let native_gateway = cache_only_gateway_core(store.clone());
+    let native_gateway = cache_only_gateway_core(store.clone()).with_progress(progress.clone());
     let native_gateway_events = Arc::new(NativeGatewayEventMux::default());
     let native_gateway_stats = Arc::new(NativeGatewayStats::default());
     Box::into_raw(Box::new(FreedomIpfsNode {
@@ -644,7 +654,7 @@ fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
         routing_stats: Mutex::new(None),
         lifecycle_state: Mutex::new(LifecycleState::Foreground),
         next_preload_id: AtomicU64::new(1),
-        preload_tasks: Mutex::new(HashMap::new()),
+        preload_tasks: Box::new(Mutex::new(HashMap::new())),
         native_gateway_state: Mutex::new(NativeGatewayState {
             core: native_gateway,
             requests: HashMap::new(),
@@ -652,6 +662,7 @@ fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
         native_gateway_events,
         native_gateway_stats,
         next_native_request_id: AtomicU64::new(1),
+        progress,
     }))
 }
 
@@ -669,7 +680,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_progress_snapshot_json(
             .into_raw();
     }
     init_progress_tracing();
-    CString::new(default_recorder().snapshot_json())
+    CString::new((*ptr).progress.snapshot_json())
         .unwrap_or_else(|_| CString::new("{\"active\":[],\"events\":[]}").unwrap())
         .into_raw()
 }
@@ -707,7 +718,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_clear_progress(ptr: *mut FreedomIpfsN
     if ptr.is_null() {
         return false;
     }
-    default_recorder().clear();
+    (*ptr).progress.clear();
     true
 }
 
@@ -1401,7 +1412,8 @@ unsafe fn gateway_router_for_routing_mode(
     };
     let mut builder = OnlineNode::builder(node.store.clone())
         .routing_mode(routing_mode)
-        .gateway_config(gateway_config);
+        .gateway_config(gateway_config)
+        .progress(node.progress.clone());
     if routing_mode != RoutingMode::Offline {
         let delegated_routers = if delegated_router.is_null() {
             DEFAULT_DELEGATED_ROUTER.to_string()
@@ -2217,7 +2229,12 @@ pub unsafe extern "C" fn freedom_ipfs_node_preload_path(
 
     let id = node.next_preload_id.fetch_add(1, Ordering::Relaxed);
     let url = format!("http://{addr}{path}");
-    tracing::info!(phase = "preload_start", preload_id = id, path = %path);
+    {
+        // On the host's thread: in the node's scope. The preload's own task
+        // runs on the node's runtime.
+        let _scope = node.progress.enter();
+        tracing::info!(phase = "preload_start", preload_id = id, path = %path);
+    }
     let preload_path = path.clone();
     let task = node.runtime.spawn(async move {
         let Ok(client) = reqwest::Client::builder().timeout(PRELOAD_TIMEOUT).build() else {
@@ -2288,6 +2305,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_cancel_preload(
         return false;
     };
     task.abort();
+    let _scope = node.progress.enter();
     tracing::info!(phase = "preload_cancelled", preload_id = task_id);
     true
 }
@@ -2337,6 +2355,8 @@ fn stop_native_gateway_requests(node: &FreedomIpfsNode) {
 }
 
 fn stop_preloads(node: &FreedomIpfsNode) {
+    // Called on the host's thread.
+    let _scope = node.progress.enter();
     if let Ok(mut tasks) = node.preload_tasks.lock() {
         for (task_id, task) in tasks.drain() {
             if !task.is_finished() {
@@ -2385,6 +2405,7 @@ fn clear_online_stats(node: &FreedomIpfsNode) {
 }
 
 fn set_native_gateway_core(node: &FreedomIpfsNode, core: GatewayCore) {
+    let core = core.with_progress(node.progress.clone());
     let requests = if let Ok(mut native_state) = node.native_gateway_state.lock() {
         let requests = native_state
             .requests
@@ -3115,6 +3136,28 @@ mod tests {
             assert!(freedom_ipfs_node_cancel_preload(node, task_id));
             assert!(!freedom_ipfs_node_cancel_preload(node, task_id));
 
+            // Both are emitted on this thread, into the node's recorder.
+            let snapshot: serde_json::Value =
+                serde_json::from_str(&progress_snapshot_json(node)).unwrap();
+            for raw_phase in ["preload_start", "preload_cancelled"] {
+                assert!(
+                    snapshot["events"].as_array().unwrap().iter().any(|event| {
+                        event["kind"] == "preload"
+                            && event["target_id"] == task_id
+                            && event["raw_phase"] == raw_phase
+                    }),
+                    "{raw_phase}: {snapshot}"
+                );
+            }
+            assert!(
+                !snapshot["active"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|target| target["kind"] == "preload"),
+                "{snapshot}"
+            );
+
             freedom_ipfs_node_free(node);
         }
     }
@@ -3257,11 +3300,15 @@ mod tests {
             assert!(freedom_ipfs_node_clear_progress(node));
 
             let preload_id = 77;
-            tracing::info!(
-                phase = "preload_start",
-                preload_id,
-                path = "/ipfs/bafyprogress"
-            );
+            {
+                // As `freedom_ipfs_node_preload_path` emits it.
+                let _scope = (*node).progress.enter();
+                tracing::info!(
+                    phase = "preload_start",
+                    preload_id,
+                    path = "/ipfs/bafyprogress"
+                );
+            }
             let task = (*node).runtime.spawn(async {
                 std::future::pending::<()>().await;
             });
@@ -4350,6 +4397,206 @@ mod tests {
         let url = CStr::from_ptr(url_ptr).to_str().unwrap().to_string();
         freedom_ipfs_string_free(url_ptr);
         url
+    }
+
+    /// A fixed sequence of phase events touching every snapshot field.
+    fn emit_golden_progress_sequence() {
+        let root = tracing::info_span!(
+            target: "freedom_ipfs_gateway",
+            "gateway_request",
+            process_id = 1u32,
+            request_id = 11u64,
+            progress_request_id = 500u64,
+            parent_request_id = 0u64,
+            top_level_path = "",
+            namespace = "ipfs",
+            path = "/ipfs/bafygolden",
+            range = ""
+        );
+        {
+            let _entered = root.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start", request_id = 11u64, path = "/ipfs/bafygolden");
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "gateway_limiter", acquired = true, request_id = 11u64);
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "block_store_get", cache_hit = false, cid = "bafyblock");
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "provider_lookup", provider_count = 3u64, cid = "bafyblock");
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "bitswap_fetch", bitswap_delivery = "incoming", source_transport = "tcp", peer_count = 4u64);
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "block_fetch_total", source = "bitswap", bytes = 1000u64, elapsed_ms = 12u64);
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "bitswap_request_timeout", error = "timeout", retry_provider_count = 2u64);
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "block_fetch_total", source = "http_provider", transport = "https", bytes = 2000u64, file_len = 3000u64);
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_done", request_id = 11u64, status = 200u16, body_mode = "stream", elapsed_ms = 40u64);
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "gateway_stream_done", cid = "bafygolden", body_len = 3000u64, chunks = 1u64, elapsed_ms = 41u64);
+        }
+        let page = tracing::info_span!(
+            target: "freedom_ipfs_gateway",
+            "gateway_request",
+            request_id = 15u64,
+            progress_request_id = 600u64,
+            parent_request_id = 0u64,
+            top_level_path = "",
+            namespace = "ipfs",
+            path = "/ipfs/bafypage"
+        );
+        {
+            let _entered = page.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start", request_id = 15u64, path = "/ipfs/bafypage");
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "unixfs_resource", resource = "file", file_len = 9000u64);
+        }
+        let child = tracing::info_span!(
+            target: "freedom_ipfs_gateway",
+            "gateway_request",
+            request_id = 12u64,
+            progress_request_id = 501u64,
+            parent_request_id = 600u64,
+            top_level_path = "/ipfs/bafypage",
+            namespace = "ipfs",
+            path = "/ipfs/bafygolden/style.css"
+        );
+        {
+            let _entered = child.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start", request_id = 12u64, path = "/ipfs/bafygolden/style.css");
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "delegated_provider_lookup", candidate_peer_count = 5u64);
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "bitswap_incoming_stream_read", ok = false, error = "reset");
+        }
+        let busy = tracing::info_span!(
+            target: "freedom_ipfs_gateway",
+            "gateway_request",
+            request_id = 13u64,
+            progress_request_id = 502u64,
+            parent_request_id = 500u64,
+            top_level_path = "/ipfs/bafygolden",
+            namespace = "ipfs",
+            path = "/ipfs/bafygolden/app.js"
+        );
+        {
+            let _entered = busy.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start", request_id = 13u64, path = "/ipfs/bafygolden/app.js");
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "gateway_limiter", acquired = false, request_id = 13u64);
+        }
+        let missing = tracing::info_span!(
+            target: "freedom_ipfs_gateway",
+            "gateway_request",
+            request_id = 14u64,
+            progress_request_id = 0u64,
+            parent_request_id = 0u64,
+            top_level_path = "",
+            namespace = "ipns",
+            path = "/ipns/example.org"
+        );
+        {
+            let _entered = missing.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start", request_id = 14u64, path = "/ipns/example.org");
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "name_cache", cache_hit = false, name = "example.org");
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "name_resolve", ok = true, offset = -3i64);
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_done", request_id = 14u64, status = 404u16, body_mode = "direct", elapsed_ms = 7u64);
+        }
+        tracing::info!(target: "freedom_ipfs_mobile", phase = "preload_start", preload_id = 9u64, path = "/ipfs/bafypreload");
+        tracing::info!(target: "freedom_ipfs_mobile", phase = "preload_start", preload_id = 10u64, path = "/ipfs/bafystill");
+        tracing::info!(target: "freedom_ipfs_mobile", phase = "preload_done", preload_id = 9u64, path = "/ipfs/bafypreload", ok = false, error = "request_failed");
+        tracing::info!(target: "freedom_ipfs_routing", phase = "light_dht_provider_lookup", task_id = 77u64, cid = "bafyblock");
+        tracing::info!(target: "freedom_ipfs_retrieval", phase = "unknown_phase_kept_raw", cid = "bafyblock", debug_field = ?Some(3u8));
+        tracing::info!(target: "freedom_ipfs_retrieval", no_phase = true);
+        tracing::info!(target: "ant_retrieval", phase = "request_start", request_id = 1u64);
+    }
+
+    /// The snapshot with its clock readings zeroed, for a golden comparison.
+    fn zero_progress_timestamps(snapshot: &str) -> String {
+        let mut out = String::with_capacity(snapshot.len());
+        let mut rest = snapshot;
+        loop {
+            let next = [
+                "\"generated_at_unix_ms\":",
+                "\"timestamp_ms\":",
+                "\"updated_ms\":",
+            ]
+            .iter()
+            .filter_map(|key| rest.find(key).map(|at| (at, key.len())))
+            .min();
+            let Some((at, len)) = next else {
+                out.push_str(rest);
+                return out;
+            };
+            out.push_str(&rest[..at + len]);
+            out.push('0');
+            rest = rest[at + len..].trim_start_matches(|c: char| c.is_ascii_digit());
+        }
+    }
+
+    /// The snapshot from before nodes had recorders of their own, for the
+    /// events `emit_golden_progress_sequence` emits, clocks zeroed: recorded
+    /// on 90c3c6c.
+    const GOLDEN_PROGRESS_SNAPSHOT: &str =
+        include_str!("../../../tests/fixtures/progress-snapshot-golden.json");
+
+    /// A node's recorder keeps the snapshot's shape and semantics: the same
+    /// events give the JSON the process-wide recorder gave, byte for byte
+    /// but for the clocks.
+    #[test]
+    fn progress_snapshot_matches_the_golden_from_before_per_node_recorders() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+            {
+                let _scope = (*node).progress.enter();
+                emit_golden_progress_sequence();
+            }
+            let snapshot = zero_progress_timestamps(&progress_snapshot_json(node));
+            assert_eq!(snapshot, GOLDEN_PROGRESS_SNAPSHOT.trim_end());
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    /// Two nodes in one process, serving at once, each see only their own
+    /// requests.
+    #[test]
+    fn two_nodes_progress_snapshots_never_mix() {
+        unsafe {
+            let nodes = [
+                (freedom_ipfs_node_new_in_memory(), 81_000u64),
+                (freedom_ipfs_node_new_in_memory(), 82_000u64),
+            ];
+            let mut requests = Vec::new();
+            for &(node, base) in &nodes {
+                assert!(!node.is_null());
+                let data = format!("the block of node {base}").into_bytes();
+                let cid = cid_from_data(CODEC_RAW, &data);
+                (*node).store.put_block(&cid, &data).unwrap();
+                for id in base..base + 10 {
+                    let handle = start_native_gateway_request(
+                        node,
+                        json!({
+                            "method": "GET",
+                            "path": format!("/ipfs/{cid}"),
+                            "headers": [
+                                { "name": "X-Freedom-Request-ID", "value": id.to_string() }
+                            ]
+                        }),
+                    );
+                    requests.push((node, handle, data.len()));
+                }
+            }
+            for (node, handle, len) in requests {
+                assert_eq!(wait_native_gateway_response(node, handle)["status"], 200);
+                assert_eq!(read_native_gateway_body_wait(node, handle, 64).len(), len);
+                assert!(freedom_ipfs_gateway_request_free(node, handle));
+            }
+            for &(node, base) in &nodes {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&progress_snapshot_json(node)).unwrap();
+                let events = snapshot["events"].as_array().unwrap();
+                let completed: std::collections::BTreeSet<u64> = events
+                    .iter()
+                    .filter(|event| event["raw_phase"] == "request_done")
+                    .map(|event| event["target_id"].as_u64().unwrap())
+                    .collect();
+                assert_eq!(completed, (base..base + 10).collect(), "{snapshot}");
+                assert!(
+                    events.iter().all(|event| event["kind"] != "gateway_request"
+                        || (base..base + 10).contains(&event["target_id"].as_u64().unwrap())),
+                    "{snapshot}"
+                );
+                freedom_ipfs_node_free(node);
+            }
+        }
     }
 
     unsafe fn progress_snapshot_json(node: *mut FreedomIpfsNode) -> String {

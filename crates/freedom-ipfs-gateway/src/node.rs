@@ -62,6 +62,7 @@ use freedom_ipfs_routing::{
 };
 use freedom_ipfs_store::SqliteBlockStore;
 
+use crate::progress::ProgressRecorder;
 use crate::{
     router_with_state, GatewayCaches, GatewayConfig, GatewayCore, GatewayState,
     PersistentNameResolver,
@@ -92,6 +93,7 @@ pub struct OnlineNodeBuilder {
     gateway_config: GatewayConfig,
     shared_limits: Option<SharedLimits>,
     memory_budget: Option<MemoryBudget>,
+    progress: Option<ProgressRecorder>,
 }
 
 impl OnlineNodeBuilder {
@@ -157,6 +159,18 @@ impl OnlineNodeBuilder {
         self
     }
 
+    /// The recorder the node's progress goes to (see [`crate::progress`]):
+    /// its gateways' requests record into it wherever they are polled.
+    ///
+    /// An [`Instance`] has one of its own unless given one, and marks its
+    /// runtime with it, so all of its work records there. A node built with
+    /// [`OnlineNodeBuilder::build`] has none unless given one; it runs on
+    /// its host's threads, which route what it starts for itself.
+    pub fn progress(mut self, recorder: ProgressRecorder) -> Self {
+        self.progress = Some(recorder);
+        self
+    }
+
     /// What the node's caches can hold, which is fixed (design 0007,
     /// "Budgets"): the store's hot cache
     /// ([`SqliteBlockStore::hot_cache_capacity`]) and its gateways' caches
@@ -175,6 +189,8 @@ impl OnlineNodeBuilder {
 
     /// Wires the node as an owned [`Instance`] on a runtime of its own (see
     /// [`Instance`]). This starts the runtime's threads, and nothing else.
+    /// Its progress recorder ([`OnlineNodeBuilder::progress`], or a new
+    /// one) marks the runtime's threads.
     ///
     /// With a memory budget ([`OnlineNodeBuilder::memory_budget`]), it first
     /// reserves the node's fixed reservation
@@ -186,7 +202,10 @@ impl OnlineNodeBuilder {
     /// it stands for is freed: a cache a retained node or gateway still
     /// holds, a block or body a reader still holds. Without a budget it
     /// reserves nothing.
-    pub fn build_instance(self, config: InstanceConfig) -> Result<Instance, InstanceStartError> {
+    pub fn build_instance(
+        mut self,
+        config: InstanceConfig,
+    ) -> Result<Instance, InstanceStartError> {
         let fixed = match &self.memory_budget {
             Some(budget) => {
                 let bytes = self.fixed_reservation();
@@ -197,11 +216,18 @@ impl OnlineNodeBuilder {
             }
             None => None,
         };
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let progress = self
+            .progress
+            .get_or_insert_with(ProgressRecorder::new)
+            .clone();
+        let mut runtime = tokio::runtime::Builder::new_multi_thread();
+        runtime
             .worker_threads(config.worker_threads.max(1))
             .max_blocking_threads(config.max_blocking_threads.max(1))
             .thread_name(config.thread_name)
-            .enable_all()
+            .enable_all();
+        let runtime = progress
+            .mark_runtime_threads(&mut runtime)
             .build()
             .map_err(InstanceStartError::Runtime)?;
         let context = InstanceContext::new(runtime.handle().clone());
@@ -219,6 +245,7 @@ impl OnlineNodeBuilder {
             context,
             node,
             fixed: FixedReservation(fixed),
+            progress,
         })
     }
 
@@ -232,6 +259,7 @@ impl OnlineNodeBuilder {
             gateway_config,
             shared_limits,
             memory_budget,
+            progress,
         } = self;
         let routing_stats = RoutingStatsHandle::default();
         // The node's background queue, shared by its retriever and by every
@@ -311,6 +339,7 @@ impl OnlineNodeBuilder {
             background,
             shared_limits,
             memory_budget,
+            progress,
         }
     }
 }
@@ -383,6 +412,8 @@ pub struct OnlineNode {
     background: BackgroundQueue,
     shared_limits: Option<SharedLimits>,
     memory_budget: Option<MemoryBudget>,
+    /// The recorder its gateways' requests record into, if any.
+    progress: Option<ProgressRecorder>,
 }
 
 impl OnlineNode {
@@ -399,6 +430,7 @@ impl OnlineNode {
             gateway_config: GatewayConfig::default(),
             shared_limits: None,
             memory_budget: None,
+            progress: None,
         }
     }
 
@@ -425,6 +457,10 @@ impl OnlineNode {
             self.caches.clone(),
         )
         .with_background_queue(&self.background);
+        let state = match &self.progress {
+            Some(progress) => state.with_progress(progress.clone()),
+            None => state,
+        };
         match &self.instance {
             Some(instance) => state.with_instance(instance.clone()),
             None => state,
@@ -487,6 +523,12 @@ impl OnlineNode {
     pub fn memory_budget(&self) -> Option<&MemoryBudget> {
         self.memory_budget.as_ref()
     }
+
+    /// The recorder its gateways' requests record into, if it has one: see
+    /// [`OnlineNodeBuilder::progress`].
+    pub fn progress(&self) -> Option<&ProgressRecorder> {
+        self.progress.as_ref()
+    }
 }
 
 /// The runtime of an [`Instance`].
@@ -526,6 +568,9 @@ impl Default for InstanceConfig {
 ///   with the request. The tasks the libraries spawn (hyper's connections,
 ///   libp2p's), and the gateway's HTML prefetch and warm tasks (off by
 ///   default), aren't in the set but run on the same runtime.
+/// - **Its progress** ([`Instance::progress`]) records what its runtime's
+///   threads emit, and its requests wherever they are polled
+///   ([`crate::progress`]), so two instances' progress never mixes.
 /// - **[`Instance::shutdown`]** cancels everything, waits for the task set
 ///   and the blocking regions, drops and joins the runtime, which ends
 ///   every task and blocking job still on it and closes their sockets, and
@@ -551,6 +596,7 @@ pub struct Instance {
     context: InstanceContext,
     node: OnlineNode,
     fixed: FixedReservation,
+    progress: ProgressRecorder,
 }
 
 /// An instance's hold on its fixed reservation, which its caches' pools
@@ -710,6 +756,12 @@ impl Instance {
         self.node.gateway_core()
     }
 
+    /// The instance's progress: everything its runtime's threads emit, and
+    /// its requests wherever they are polled (see [`crate::progress`]).
+    pub fn progress(&self) -> &ProgressRecorder {
+        &self.progress
+    }
+
     /// The instance's group: its runtime, its tokens, its task set and its
     /// blocking regions.
     pub fn context(&self) -> &InstanceContext {
@@ -794,6 +846,7 @@ impl Instance {
             context,
             node,
             fixed,
+            progress: _,
         } = self;
         context.cancel();
         let done = Arc::new((Mutex::new(None), Condvar::new()));
@@ -1021,6 +1074,7 @@ mod tests {
         assert_eq!(builder.dht_max_providers, None);
         assert!(builder.shared_limits.is_none(), "no shared limits");
         assert!(builder.memory_budget.is_none(), "no memory budget");
+        assert!(builder.progress.is_none(), "no recorder of its own");
         let config = GatewayConfig::default();
         assert_eq!(
             builder.gateway_config.max_concurrent_requests(),

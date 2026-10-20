@@ -1,15 +1,61 @@
-//! Loading progress from the phase events: what the add-on's progress
+//! Loading progress, recorded per node: what the add-on's progress
 //! snapshot shows (docs/mobile-progress-api.md).
 //!
 //! freedom-ipfs's crates emit a `tracing` event with a `phase` field at
 //! each step of a request, a preload or a lookup. [`progress_layer`] turns
 //! those into a [`ProgressRecorder`]'s bounded snapshot: the targets still
-//! active, what each is doing, and the latest events.
+//! active, what each is doing, and the latest 512 events.
+//!
+//! # One recorder per node
+//!
+//! The subscriber is process-wide, so one layer serves every node and
+//! routes each event to the recorder of the node whose work emitted it:
+//!
+//! - **A thread** records into a recorder while it is in that recorder's
+//!   scope ([`ProgressRecorder::enter`], [`ProgressRecorder::scope`]), and
+//!   for its whole life if it is a thread of a runtime marked with
+//!   [`ProgressRecorder::mark_runtime_threads`]: the runtime's workers, and
+//!   its blocking pool's threads, which run its `spawn_blocking` jobs and
+//!   take over from a worker that enters `block_in_place`.
+//! - **A span** of freedom-ipfs's takes its recorder when it is created:
+//!   its parent span's, or else the creating thread's. It keeps it on
+//!   whatever thread it is entered later, so a request's response body
+//!   records into the request's node wherever its reader polls it.
+//! - **An event** goes to its span's recorder, or else its thread's, or
+//!   else the process's [`default_recorder`].
+//!
+//! An [`Instance`](crate::Instance) marks its runtime with a recorder of its
+//! own ([`Instance::progress`](crate::Instance::progress)), so everything
+//! that runs there records there: its requests, the tasks it starts for
+//! itself (the Bitswap swarm's, preconnects) and its blocking jobs. A
+//! node's gateways enter its recorder around each request
+//! ([`GatewayCore::handle`](crate::GatewayCore::handle)), so a request a
+//! host polls on a thread of its own records there too, and the request's
+//! spans carry the recorder to its body. Two instances' progress never
+//! mixes.
+//!
+//! What still reaches the default recorder is work on a thread no node
+//! marked, outside any node's scope and spans:
+//!
+//! - for a node built with [`OnlineNodeBuilder::build`](crate::OnlineNodeBuilder::build)
+//!   on a runtime its host shares, the work it starts for itself, such as
+//!   the Bitswap swarm's task. A host that wants it marks that runtime;
+//! - the work of a host that calls a node's block provider or name
+//!   resolver itself, outside a request. It enters the node's scope around
+//!   the call.
+//!
+//! A host that gives no node a recorder of its own finds everything in the
+//! default recorder.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::task::Poll;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -21,9 +67,31 @@ use tracing_subscriber::{Layer, Registry};
 
 const MAX_PROGRESS_EVENTS: usize = 512;
 
-static PROGRESS_RECORDER: OnceLock<Arc<ProgressRecorder>> = OnceLock::new();
+static DEFAULT_RECORDER: OnceLock<ProgressRecorder> = OnceLock::new();
 static PROGRESS_TRACING_INIT: Once = Once::new();
 static PROGRESS_LAYER_ISSUED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// The recorder this thread's events go to when their span names none.
+    static THREAD_RECORDER: RefCell<Option<ProgressRecorder>> = const { RefCell::new(None) };
+}
+
+/// The current thread's recorder, if any. None while the thread's locals
+/// are being torn down.
+fn thread_recorder() -> Option<ProgressRecorder> {
+    THREAD_RECORDER
+        .try_with(|current| current.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+/// Sets the current thread's recorder, returning the one it had.
+fn set_thread_recorder(recorder: Option<ProgressRecorder>) -> Option<ProgressRecorder> {
+    THREAD_RECORDER
+        .try_with(|current| current.replace(recorder))
+        .ok()
+        .flatten()
+}
 
 #[derive(Clone, Default)]
 struct ProgressSpanFields {
@@ -35,11 +103,20 @@ struct ProgressSpanFields {
     path: Option<String>,
 }
 
-/// The progress snapshot's state: the targets still active and the latest
-/// events, at most 512.
-#[derive(Default)]
+/// A node's progress: the targets still active and the latest events, at
+/// most 512. Clones share them.
+///
+/// Which events reach it is the [module's](self) routing: a recorder records
+/// only what its scopes, its marked runtimes and their spans emit.
+#[derive(Clone, Default)]
 pub struct ProgressRecorder {
-    inner: Mutex<ProgressInner>,
+    inner: Arc<Mutex<ProgressInner>>,
+}
+
+impl fmt::Debug for ProgressRecorder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProgressRecorder").finish_non_exhaustive()
+    }
 }
 
 #[derive(Default)]
@@ -49,7 +126,7 @@ struct ProgressInner {
     active_targets: HashMap<String, ProgressTarget>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct ProgressEvent {
     event_id: u64,
     target_id: u64,
@@ -77,7 +154,7 @@ struct ProgressEvent {
     timestamp_ms: u64,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct ProgressTarget {
     id: u64,
     request_id: Option<u64>,
@@ -103,8 +180,10 @@ struct ProgressTarget {
     updated_ms: u64,
 }
 
-#[derive(Serialize)]
-struct ProgressSnapshot {
+/// A recorder's snapshot, which serializes to the JSON
+/// docs/mobile-progress-api.md describes.
+#[derive(Clone, Debug, Serialize)]
+pub struct ProgressSnapshot {
     generated_at_unix_ms: u64,
     active_count: usize,
     event_count: usize,
@@ -113,6 +192,44 @@ struct ProgressSnapshot {
 }
 
 impl ProgressRecorder {
+    /// A recorder of its own, empty.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records the current thread's events into this recorder until the
+    /// scope is dropped, then into whichever it recorded into before. Spans
+    /// created meanwhile keep this recorder; an event in a span that already
+    /// has one still goes to the span's.
+    pub fn enter(&self) -> ProgressScope {
+        ProgressScope {
+            previous: set_thread_recorder(Some(self.clone())),
+            _thread: PhantomData,
+        }
+    }
+
+    /// `future`, recording into this recorder whenever it is polled or
+    /// dropped, on whichever thread does that.
+    pub fn scope<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
+        Scoped {
+            recorder: self.clone(),
+            future: Some(Box::pin(future)),
+        }
+    }
+
+    /// Makes every thread of the runtime `builder` builds record into this
+    /// recorder: its workers, and its blocking pool's threads. This takes
+    /// the builder's `on_thread_start` and `on_thread_stop`.
+    pub fn mark_runtime_threads<'b>(
+        &self,
+        builder: &'b mut tokio::runtime::Builder,
+    ) -> &'b mut tokio::runtime::Builder {
+        let recorder = self.clone();
+        builder
+            .on_thread_start(move || drop(set_thread_recorder(Some(recorder.clone()))))
+            .on_thread_stop(|| drop(set_thread_recorder(None)))
+    }
+
     fn record_event(&self, span: ProgressSpanFields, fields: ProgressFields, _metadata_name: &str) {
         let Some(raw_phase) = fields.get("phase").cloned() else {
             return;
@@ -247,9 +364,9 @@ impl ProgressRecorder {
         }
     }
 
-    /// The snapshot, as the JSON docs/mobile-progress-api.md describes.
-    pub fn snapshot_json(&self) -> String {
-        let snapshot = match self.inner.lock() {
+    /// The targets still active and the latest events.
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        match self.inner.lock() {
             Ok(inner) => ProgressSnapshot {
                 generated_at_unix_ms: now_ms(),
                 active_count: inner.active_targets.len(),
@@ -264,8 +381,13 @@ impl ProgressRecorder {
                 active: Vec::new(),
                 events: Vec::new(),
             },
-        };
-        serde_json::to_string(&snapshot).unwrap_or_else(|_| "{\"active\":[],\"events\":[]}".into())
+        }
+    }
+
+    /// The snapshot, as the JSON docs/mobile-progress-api.md describes.
+    pub fn snapshot_json(&self) -> String {
+        serde_json::to_string(&self.snapshot())
+            .unwrap_or_else(|_| "{\"active\":[],\"events\":[]}".into())
     }
 
     /// Forgets every target and event.
@@ -300,12 +422,70 @@ fn progress_active_targets(inner: &ProgressInner) -> Vec<ProgressTarget> {
     active
 }
 
+/// The current thread's time in a recorder's scope: see
+/// [`ProgressRecorder::enter`].
+#[must_use = "the thread records into the recorder only while the scope lives"]
+pub struct ProgressScope {
+    previous: Option<ProgressRecorder>,
+    /// Not `Send`: it restores the recorder of the thread that entered it.
+    _thread: PhantomData<*const ()>,
+}
+
+impl Drop for ProgressScope {
+    fn drop(&mut self) {
+        drop(set_thread_recorder(self.previous.take()));
+    }
+}
+
+impl fmt::Debug for ProgressScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProgressScope").finish_non_exhaustive()
+    }
+}
+
+/// A future in a recorder's scope: see [`ProgressRecorder::scope`].
+struct Scoped<F> {
+    recorder: ProgressRecorder,
+    /// Taken once it is ready, and on drop, so it is dropped in scope too.
+    future: Option<Pin<Box<F>>>,
+}
+
+impl<F: Future> Future for Scoped<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<F::Output> {
+        let this = self.get_mut();
+        let _scope = this.recorder.enter();
+        let Some(future) = this.future.as_mut() else {
+            return Poll::Pending;
+        };
+        let output = future.as_mut().poll(cx);
+        if output.is_ready() {
+            this.future = None;
+        }
+        output
+    }
+}
+
+impl<F> Drop for Scoped<F> {
+    fn drop(&mut self) {
+        if self.future.is_some() {
+            let _scope = self.recorder.enter();
+            self.future = None;
+        }
+    }
+}
+
 // Not `Clone`: a clone dropping would release the claim of the original.
 struct ProgressLayer {
-    recorder: Arc<ProgressRecorder>,
     /// Held by the copy `progress_layer()` hands out; see `LayerClaim`.
     _claim: Option<LayerClaim>,
 }
+
+/// The recorder a span's events go to, fixed when it is created: its parent
+/// span's, or else the creating thread's. `None` leaves them to the thread
+/// they are emitted on.
+struct SpanRecorder(Option<ProgressRecorder>);
 
 /// The "a recording layer is out" flag, released when the layer holding
 /// it is dropped. A layer lives as long as its subscriber, so the claim
@@ -348,19 +528,39 @@ where
             path: fields.get("path").cloned(),
         };
         if let Some(span) = ctx.span(id) {
-            span.extensions_mut().insert(span_fields);
+            // A span belongs to its parent's node, or else to the thread's.
+            let recorder = span
+                .parent()
+                .and_then(|parent| {
+                    parent
+                        .extensions()
+                        .get::<SpanRecorder>()
+                        .and_then(|recorder| recorder.0.clone())
+                })
+                .or_else(thread_recorder);
+            let mut extensions = span.extensions_mut();
+            extensions.insert(span_fields);
+            extensions.insert(SpanRecorder(recorder));
         }
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let mut fields = ProgressFields::default();
         event.record(&mut fields);
-        let span = ctx
-            .lookup_current()
-            .and_then(|span| span.extensions().get::<ProgressSpanFields>().cloned())
+        let current = ctx.lookup_current();
+        let extensions = current.as_ref().map(|span| span.extensions());
+        let span = extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get::<ProgressSpanFields>().cloned())
             .unwrap_or_default();
-        self.recorder
-            .record_event(span, fields, event.metadata().name());
+        let recorder = extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get::<SpanRecorder>())
+            .and_then(|recorder| recorder.0.clone())
+            .or_else(thread_recorder)
+            .unwrap_or_else(default_recorder);
+        drop(extensions);
+        recorder.record_event(span, fields, event.metadata().name());
     }
 }
 
@@ -406,14 +606,14 @@ impl Visit for ProgressFields {
     }
 }
 
-/// The process's recorder, which [`progress_layer`] feeds.
-pub fn default_recorder() -> Arc<ProgressRecorder> {
-    PROGRESS_RECORDER
-        .get_or_init(|| Arc::new(ProgressRecorder::default()))
-        .clone()
+/// The process's recorder for the events no node's recorder takes (see the
+/// [module docs](self)).
+pub fn default_recorder() -> ProgressRecorder {
+    DEFAULT_RECORDER.get_or_init(ProgressRecorder::new).clone()
 }
 
-/// The `tracing` layer that feeds [`default_recorder`].
+/// The `tracing` layer that feeds every [`ProgressRecorder`], each event
+/// its own node's (see the [module docs](self)).
 ///
 /// [`init_progress_tracing`] installs it as the process's global
 /// subscriber, but that slot is process-wide and the first claim wins: a
@@ -437,8 +637,8 @@ pub fn default_recorder() -> Arc<ProgressRecorder> {
 /// instead (`log.with_filter(EnvFilter::new("warn"))`), or make the global
 /// filter admit `freedom_ipfs=info`.
 ///
-/// Add it once. Every instance writes to the same process-wide recorder,
-/// so a second copy would record each phase event twice; while the layer
+/// Add it once. Every copy sends an event to the same recorder, so a
+/// second copy would record each phase event twice; while the layer
 /// from an earlier call is still alive, later calls therefore return a
 /// layer that does nothing. Dropping that earlier layer (or the subscriber
 /// it was added to, e.g. after a failed `try_init`) frees the slot again.
@@ -457,55 +657,46 @@ pub fn progress_layer<S>() -> impl Layer<S> + Send + Sync + 'static
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
-    progress_layer_once(&PROGRESS_LAYER_ISSUED, default_recorder())
+    progress_layer_once(&PROGRESS_LAYER_ISSUED)
 }
 
 /// The recording layer while `issued` is free, a no-op while an earlier
 /// recording layer is still alive.
-fn progress_layer_once<S>(
-    issued: &'static AtomicBool,
-    recorder: Arc<ProgressRecorder>,
-) -> impl Layer<S> + Send + Sync + 'static
+fn progress_layer_once<S>(issued: &'static AtomicBool) -> impl Layer<S> + Send + Sync + 'static
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
-    LayerClaim::take(issued).map(|claim| progress_layer_with(recorder, Some(claim)))
+    LayerClaim::take(issued).map(|claim| progress_layer_with(Some(claim)))
 }
 
-fn progress_layer_for<S>(recorder: Arc<ProgressRecorder>) -> impl Layer<S> + Send + Sync + 'static
+/// A recording layer that holds no claim.
+fn progress_layer_unclaimed<S>() -> impl Layer<S> + Send + Sync + 'static
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
-    progress_layer_with(recorder, None)
+    progress_layer_with(None)
 }
 
-fn progress_layer_with<S>(
-    recorder: Arc<ProgressRecorder>,
-    claim: Option<LayerClaim>,
-) -> impl Layer<S> + Send + Sync + 'static
+fn progress_layer_with<S>(claim: Option<LayerClaim>) -> impl Layer<S> + Send + Sync + 'static
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
-    ProgressLayer {
-        recorder,
-        _claim: claim,
-    }
-    .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+    ProgressLayer { _claim: claim }.with_filter(tracing_subscriber::filter::filter_fn(|meta| {
         meta.target().starts_with("freedom_ipfs")
             && (meta.is_span() || meta.fields().field("phase").is_some())
     }))
 }
 
-/// Installs a global subscriber that feeds only the progress recorder,
+/// Installs a global subscriber that feeds only the progress recorders,
 /// unless one is installed already: then, if that one carries
-/// [`progress_layer`], the snapshot still fills. Once per process.
+/// [`progress_layer`], the snapshots still fill. Once per process.
 pub fn init_progress_tracing() {
     PROGRESS_TRACING_INIT.call_once(|| {
         // Not `progress_layer()`: that hands out the host's one copy, and
         // claiming it here would leave a host that installs its subscriber
         // after the node with a no-op layer. The two can't both be live —
         // only one global subscriber wins.
-        let subscriber = Registry::default().with(progress_layer_for(default_recorder()));
+        let subscriber = Registry::default().with(progress_layer_unclaimed());
         // Fails when the host already installed a subscriber; if that one
         // carries `progress_layer()` the snapshot still fills (see above).
         let _ = tracing::subscriber::set_global_default(subscriber);
@@ -1479,14 +1670,15 @@ mod tests {
     /// `progress_layer`, whatever the other layers filter.
     #[test]
     fn progress_layer_records_when_composed_with_other_layers() {
-        let recorder = Arc::new(ProgressRecorder::default());
+        let recorder = ProgressRecorder::new();
         let quiet_logs = tracing_subscriber::fmt::layer()
             .with_writer(std::io::sink)
             .with_filter(tracing_subscriber::filter::LevelFilter::ERROR);
         let subscriber = Registry::default()
             .with(quiet_logs)
-            .with(progress_layer_for(recorder.clone()));
+            .with(progress_layer_unclaimed());
         tracing::subscriber::with_default(subscriber, || {
+            let _scope = recorder.enter();
             let span = tracing::info_span!(
                 target: "freedom_ipfs_gateway",
                 "gateway_request",
@@ -1506,15 +1698,16 @@ mod tests {
     }
 
     /// Adding the layer twice (directly and via a helper) must not record
-    /// every phase event twice in the shared recorder.
+    /// every phase event twice in the recorder it routes them to.
     #[test]
     fn progress_layer_added_twice_records_each_event_once() {
         static ISSUED: AtomicBool = AtomicBool::new(false);
-        let recorder = Arc::new(ProgressRecorder::default());
+        let recorder = ProgressRecorder::new();
         let subscriber = Registry::default()
-            .with(progress_layer_once(&ISSUED, recorder.clone()))
-            .with(progress_layer_once(&ISSUED, recorder.clone()));
+            .with(progress_layer_once(&ISSUED))
+            .with(progress_layer_once(&ISSUED));
         tracing::subscriber::with_default(subscriber, || {
+            let _scope = recorder.enter();
             let span = tracing::info_span!(
                 target: "freedom_ipfs_gateway",
                 "gateway_request",
@@ -1536,13 +1729,14 @@ mod tests {
     #[test]
     fn progress_layer_dropped_unused_frees_the_recording_copy() {
         static ISSUED: AtomicBool = AtomicBool::new(false);
-        let recorder = Arc::new(ProgressRecorder::default());
-        let throwaway = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        let recorder = ProgressRecorder::new();
+        let throwaway = Registry::default().with(progress_layer_once(&ISSUED));
         drop(throwaway);
-        let subscriber = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        let subscriber = Registry::default().with(progress_layer_once(&ISSUED));
         // While the installed one is alive, another copy is still a no-op.
-        let extra = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        let extra = Registry::default().with(progress_layer_once(&ISSUED));
         tracing::subscriber::with_default(extra, || {
+            let _scope = recorder.enter();
             tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
         });
         assert_eq!(
@@ -1553,6 +1747,7 @@ mod tests {
             0
         );
         tracing::subscriber::with_default(subscriber, || {
+            let _scope = recorder.enter();
             let span = tracing::info_span!(
                 target: "freedom_ipfs_gateway",
                 "gateway_request",
@@ -1574,8 +1769,9 @@ mod tests {
     #[test]
     fn progress_layer_built_before_old_is_dropped_stays_a_no_op() {
         static ISSUED: AtomicBool = AtomicBool::new(false);
-        let recorder = Arc::new(ProgressRecorder::default());
+        let recorder = ProgressRecorder::new();
         let emit = |id: u64| {
+            let _scope = recorder.enter();
             let span = tracing::info_span!(
                 target: "freedom_ipfs_gateway",
                 "gateway_request",
@@ -1591,12 +1787,12 @@ mod tests {
                 .unwrap()
                 .len()
         };
-        let old = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
-        let too_early = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        let old = Registry::default().with(progress_layer_once(&ISSUED));
+        let too_early = Registry::default().with(progress_layer_once(&ISSUED));
         drop(old);
         tracing::subscriber::with_default(too_early, || emit(1));
         assert_eq!(events(&recorder), 0);
-        let rebuilt = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
+        let rebuilt = Registry::default().with(progress_layer_once(&ISSUED));
         tracing::subscriber::with_default(rebuilt, || emit(2));
         assert_eq!(events(&recorder), 1);
     }
@@ -1605,14 +1801,15 @@ mod tests {
     /// subscriber, leaves the info-level phase events to `progress_layer`.
     #[test]
     fn progress_layer_records_next_to_a_per_layer_warn_filter() {
-        let recorder = Arc::new(ProgressRecorder::default());
+        let recorder = ProgressRecorder::new();
         let logs = tracing_subscriber::fmt::layer()
             .with_writer(std::io::sink)
             .with_filter(tracing_subscriber::filter::LevelFilter::WARN);
         let subscriber = Registry::default()
             .with(logs)
-            .with(progress_layer_for(recorder.clone()));
+            .with(progress_layer_unclaimed());
         tracing::subscriber::with_default(subscriber, || {
+            let _scope = recorder.enter();
             tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start", request_id = 7u64);
         });
         let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();

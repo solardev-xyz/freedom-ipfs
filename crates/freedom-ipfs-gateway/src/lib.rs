@@ -51,6 +51,7 @@ pub use node::{
     delegated_router_endpoints, Instance, InstanceConfig, InstanceStartError, OnlineNode,
     OnlineNodeBuilder, Quiescence, RoutingMode, Teardown,
 };
+use progress::ProgressRecorder;
 
 pub const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
 pub const DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT_MS: u64 = 2_000;
@@ -855,6 +856,9 @@ pub struct GatewayState {
     html_range_warm: HtmlRangeWarmRuntime,
     raw_link_tsize_fast_headers: bool,
     stream_small_bodies: bool,
+    /// The node's recorder, which its requests record into: see
+    /// [`GatewayCore::with_progress`].
+    progress: Option<ProgressRecorder>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -886,6 +890,12 @@ impl GatewayState {
         self.html_directory_prefetch.jobs =
             self.html_directory_prefetch.jobs.with_instance(&instance);
         self.html_range_warm.jobs = self.html_range_warm.jobs.with_instance(&instance);
+        self
+    }
+
+    /// The same state, its requests recording into `recorder`.
+    pub(crate) fn with_progress(mut self, recorder: ProgressRecorder) -> Self {
+        self.progress = Some(recorder);
         self
     }
 
@@ -959,6 +969,7 @@ impl GatewayState {
             html_range_warm: HtmlRangeWarmRuntime::new(config.html_range_warm(), &background),
             raw_link_tsize_fast_headers: config.raw_link_tsize_fast_headers(),
             stream_small_bodies: config.stream_small_bodies(),
+            progress: None,
         }
     }
 }
@@ -1080,8 +1091,26 @@ impl GatewayCore {
         self
     }
 
+    /// Makes the gateway's requests record their progress into `recorder`,
+    /// wherever they are polled: a request runs in the recorder's scope,
+    /// and its spans carry the recorder to its response body (see
+    /// [`progress`]). Without one, a request records into whatever its
+    /// threads are routed to.
+    pub fn with_progress(mut self, recorder: ProgressRecorder) -> Self {
+        self.state = self.state.with_progress(recorder);
+        self
+    }
+
     pub async fn handle(&self, request: GatewayCoreRequest) -> Response {
-        handle_gateway_core_request(self.state.clone(), request).await
+        let state = self.state.clone();
+        match state.progress.clone() {
+            Some(progress) => {
+                progress
+                    .scope(handle_gateway_core_request(state, request))
+                    .await
+            }
+            None => handle_gateway_core_request(state, request).await,
+        }
     }
 }
 
