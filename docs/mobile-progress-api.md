@@ -10,6 +10,21 @@ The mobile library exposes a bounded JSON progress snapshot for Swift polling:
 The returned string is owned by Rust and must be released with
 `freedom_ipfs_string_free` when called through the C ABI.
 
+Each node has a recorder of its own, and its snapshot shows only that node's
+work: its requests and preloads, and what its runtime runs for them. Clearing
+one node's progress leaves another's alone, and a new node starts with an
+empty snapshot. A host with one node at a time sees what it saw when the
+recorder was process-wide, except that a node replaced by a new one takes its
+history with it.
+
+The recorder lives in `freedom_ipfs_gateway::progress`, so a Rust host can read
+the same snapshot without the C ABI: an `Instance` has one
+(`Instance::progress()`), and `OnlineNodeBuilder::progress` gives one to a node.
+A host that installs its own global `tracing` subscriber adds
+`freedom_ipfs_mobile::progress_layer()` (or the library's `progress_layer()`)
+to it; the module documentation describes how events are routed to each
+node's recorder.
+
 ## Shape
 
 ```json
@@ -120,6 +135,12 @@ The first implementation records existing structured Rust phases from the local
 gateway, UnixFS path handling, IPNS/name resolution, routing/provider lookup,
 and retrieval/Bitswap paths. It also records explicit mobile preload
 `started`, `completed`, `failed`, and `cancelled` events.
+
+A gateway request that is cancelled before it ends, or whose streamed body is
+dropped before its last chunk, leaves `active` too: its last event has
+`phase: "cancelled"` and `status: "cancelled"`, with `raw_phase:
+"request_cancelled"`. The recorder adds that event when the request's work is
+dropped; it is not a Rust log line.
 
 Lifecycle hooks that stop active preloads also emit `cancelled` preload events
 before pruning the preload task. This includes `enterBackground`, low-memory

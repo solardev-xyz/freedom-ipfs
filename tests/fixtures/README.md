@@ -7,6 +7,10 @@ Offline tests currently generate minimal fixtures in Rust so they remain reprodu
 - dag-pb UnixFS file,
 - dag-pb UnixFS directory pointing at a file,
 - missing and malformed block cases through unit tests.
+- `progress-snapshot-golden.json`: the progress snapshot, clocks zeroed, that
+  the process-wide recorder of 90c3c6c gave for the events the mobile crate's
+  `emit_golden_progress_sequence` emits. A node's recorder must give the same
+  JSON, byte for byte.
 - Kubo-generated UnixFS directory and HAMT directory CAR parity smokes via
   `make kubo-parity` when `KUBO_BIN` points at an `ipfs` binary, including
   empty files, percent-encoded browser paths, and fixed/open-ended/suffix byte

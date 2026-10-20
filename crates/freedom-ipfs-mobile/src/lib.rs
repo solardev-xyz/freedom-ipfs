@@ -1,5 +1,6 @@
 use axum::http::HeaderMap;
 use freedom_ipfs_core::BlockProvider;
+use freedom_ipfs_gateway::progress::{self, init_progress_tracing, ProgressRecorder};
 use freedom_ipfs_gateway::{
     delegated_router_endpoints, normalize_content_path, parse_native_request_json, GatewayCore,
     GatewayCoreRequest, OnlineNode, RoutingMode,
@@ -13,24 +14,21 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ffi::{c_char, CStr, CString};
-use std::fmt;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::field::{Field, Visit};
-use tracing::{Event, Id, Subscriber};
-use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing::Subscriber;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::{Layer, Registry};
+use tracing_subscriber::Layer;
 
 const MOBILE_FFI_ABI_VERSION: u32 = 1;
 const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -48,7 +46,6 @@ const NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Upper bound on how long `freedom_ipfs_node_free` waits for an SQLite
 /// statement in progress before closing the cache database.
 const NODE_FREE_STORE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_PROGRESS_EVENTS: usize = 512;
 const NATIVE_BODY_CHANNEL_CAPACITY: usize = 2;
 
 const FREEDOM_IPFS_GATEWAY_READ_PENDING: u32 = 0;
@@ -70,10 +67,6 @@ const FREEDOM_IPFS_GATEWAY_EVENT_FAILED: u32 = 1 << 3;
 const FREEDOM_IPFS_GATEWAY_EVENT_CANCELLED: u32 = 1 << 4;
 const FREEDOM_IPFS_GATEWAY_EVENT_HANDLE_FREED: u32 = 1 << 5;
 
-static PROGRESS_RECORDER: OnceLock<Arc<ProgressRecorder>> = OnceLock::new();
-static PROGRESS_TRACING_INIT: Once = Once::new();
-static PROGRESS_LAYER_ISSUED: AtomicBool = AtomicBool::new(false);
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LifecycleState {
     Foreground,
@@ -94,11 +87,18 @@ pub struct FreedomIpfsNode {
     routing_stats: Mutex<Option<RoutingStatsHandle>>,
     lifecycle_state: Mutex<LifecycleState>,
     next_preload_id: AtomicU64,
-    preload_tasks: Mutex<HashMap<u64, JoinHandle<()>>>,
+    /// Boxed, to make room for `progress` within the size class.
+    preload_tasks: Box<Mutex<HashMap<u64, JoinHandle<()>>>>,
     native_gateway_state: Mutex<NativeGatewayState>,
     native_gateway_events: Arc<NativeGatewayEventMux>,
     native_gateway_stats: Arc<NativeGatewayStats>,
     next_native_request_id: AtomicU64,
+    /// The node's progress, which its snapshot reads: everything its
+    /// runtime's threads emit, its gateways' requests, and the events the
+    /// node's calls emit on the host's thread (its preloads' start, cancel
+    /// and stop), as root events in this recorder's scope, so no span the
+    /// host is in can take them.
+    progress: ProgressRecorder,
 }
 
 #[repr(C)]
@@ -527,781 +527,23 @@ struct NativeGatewayResponseJson {
     error: Option<NativeGatewayErrorJson>,
 }
 
-#[derive(Clone, Default)]
-struct ProgressSpanFields {
-    request_id: Option<u64>,
-    progress_request_id: Option<u64>,
-    parent_request_id: Option<u64>,
-    top_level_path: Option<String>,
-    namespace: Option<String>,
-    path: Option<String>,
-}
-
-#[derive(Default)]
-struct ProgressRecorder {
-    inner: Mutex<ProgressInner>,
-}
-
-#[derive(Default)]
-struct ProgressInner {
-    next_event_id: u64,
-    events: VecDeque<ProgressEvent>,
-    active_targets: HashMap<String, ProgressTarget>,
-}
-
-#[derive(Clone, Serialize)]
-struct ProgressEvent {
-    event_id: u64,
-    target_id: u64,
-    request_id: Option<u64>,
-    parent_id: Option<u64>,
-    kind: String,
-    path: Option<String>,
-    top_level_path: Option<String>,
-    namespace: Option<String>,
-    phase: String,
-    raw_phase: String,
-    status: String,
-    source: Option<String>,
-    transport: Option<String>,
-    delivery: Option<String>,
-    bytes_loaded: Option<u64>,
-    bytes_total: Option<u64>,
-    providers_found: Option<u64>,
-    candidate_peers: Option<u64>,
-    blocks_loaded: u64,
-    retry_count: u64,
-    elapsed_ms: Option<u64>,
-    last_error_code: Option<String>,
-    last_error_message: Option<String>,
-    timestamp_ms: u64,
-}
-
-#[derive(Clone, Serialize)]
-struct ProgressTarget {
-    id: u64,
-    request_id: Option<u64>,
-    parent_id: Option<u64>,
-    kind: String,
-    path: Option<String>,
-    top_level_path: Option<String>,
-    namespace: Option<String>,
-    phase: String,
-    status: String,
-    source: Option<String>,
-    transport: Option<String>,
-    delivery: Option<String>,
-    bytes_loaded: Option<u64>,
-    bytes_total: Option<u64>,
-    active_subrequests: usize,
-    elapsed_ms: Option<u64>,
-    blocks_loaded: u64,
-    retry_count: u64,
-    last_error_code: Option<String>,
-    last_error_message: Option<String>,
-    last_event_id: u64,
-    updated_ms: u64,
-}
-
-#[derive(Serialize)]
-struct ProgressSnapshot {
-    generated_at_unix_ms: u64,
-    active_count: usize,
-    event_count: usize,
-    active: Vec<ProgressTarget>,
-    events: Vec<ProgressEvent>,
-}
-
-impl ProgressRecorder {
-    fn record_event(&self, span: ProgressSpanFields, fields: ProgressFields, _metadata_name: &str) {
-        let Some(raw_phase) = fields.get("phase").cloned() else {
-            return;
-        };
-        let kind = progress_kind(&fields, &raw_phase, &span);
-        let target_id = progress_target_id(&fields, &span);
-        let path = fields.get("path").cloned().or(span.path);
-        let top_level_path = fields
-            .get("top_level_path")
-            .filter(|path| !path.is_empty())
-            .cloned()
-            .or(span.top_level_path);
-        let namespace = fields.get("namespace").cloned().or(span.namespace);
-        let request_id = fields.get_u64("request_id").or(span.request_id);
-        let parent_id = fields
-            .get_u64("parent_request_id")
-            .filter(|id| *id != 0)
-            .or(span.parent_request_id);
-        let status = progress_status(&raw_phase, &fields);
-        let phase = progress_phase(&raw_phase, &fields, &status);
-        let elapsed_ms = fields.get_u64("elapsed_ms");
-        let timestamp_ms = now_ms();
-        let source = progress_source(&raw_phase, &fields);
-        let transport = fields
-            .get("source_transport")
-            .cloned()
-            .or_else(|| fields.get("transport").cloned());
-        let delivery = fields.get("bitswap_delivery").cloned();
-        let last_error_message = fields.get("error").cloned();
-        let last_error_code = progress_error_code(&raw_phase, &fields, &status);
-        let mut inner = match self.inner.lock() {
-            Ok(inner) => inner,
-            Err(_) => return,
-        };
-        inner.next_event_id = inner.next_event_id.saturating_add(1);
-        let target_key = format!("{kind}:{target_id}");
-        let previous_target = inner.active_targets.get(&target_key);
-        let (
-            previous_bytes_loaded,
-            previous_bytes_total,
-            previous_blocks_loaded,
-            previous_retry_count,
-        ) = previous_target
-            .map(|target| {
-                (
-                    target.bytes_loaded,
-                    target.bytes_total,
-                    target.blocks_loaded,
-                    target.retry_count,
-                )
-            })
-            .unwrap_or_default();
-        let target_source = source
-            .clone()
-            .or_else(|| previous_target.and_then(|target| target.source.clone()));
-        let target_transport = transport
-            .clone()
-            .or_else(|| previous_target.and_then(|target| target.transport.clone()));
-        let target_delivery = delivery
-            .clone()
-            .or_else(|| previous_target.and_then(|target| target.delivery.clone()));
-        let blocks_loaded =
-            previous_blocks_loaded.saturating_add(u64::from(raw_phase == "block_fetch_total"));
-        let retry_count = previous_retry_count.saturating_add(u64::from(phase == "retrying"));
-        let bytes_loaded = progress_bytes_loaded(&fields).or(previous_bytes_loaded);
-        let bytes_total = progress_bytes_total(&fields).or(previous_bytes_total);
-        let event = ProgressEvent {
-            event_id: inner.next_event_id,
-            target_id,
-            request_id,
-            parent_id,
-            kind: kind.clone(),
-            path: path.clone(),
-            top_level_path: top_level_path.clone(),
-            namespace: namespace.clone(),
-            phase: phase.clone(),
-            raw_phase: raw_phase.clone(),
-            status: status.clone(),
-            source: target_source.clone(),
-            transport: target_transport.clone(),
-            delivery: target_delivery.clone(),
-            bytes_loaded,
-            bytes_total,
-            providers_found: fields
-                .get_u64("provider_count")
-                .or_else(|| fields.get_u64("retry_provider_count")),
-            candidate_peers: fields
-                .get_u64("peer_count")
-                .or_else(|| fields.get_u64("candidate_peer_count")),
-            blocks_loaded,
-            retry_count,
-            elapsed_ms,
-            last_error_code: last_error_code.clone(),
-            last_error_message: last_error_message.clone(),
-            timestamp_ms,
-        };
-        inner.events.push_back(event.clone());
-        while inner.events.len() > MAX_PROGRESS_EVENTS {
-            inner.events.pop_front();
-        }
-
-        if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
-            inner.active_targets.remove(&target_key);
-        } else if target_id != 0 {
-            inner.active_targets.insert(
-                target_key,
-                ProgressTarget {
-                    id: target_id,
-                    request_id,
-                    parent_id,
-                    kind,
-                    path,
-                    top_level_path,
-                    namespace,
-                    phase,
-                    status,
-                    source: target_source,
-                    transport: target_transport,
-                    delivery: target_delivery,
-                    bytes_loaded,
-                    bytes_total,
-                    active_subrequests: 0,
-                    elapsed_ms,
-                    blocks_loaded,
-                    retry_count,
-                    last_error_code,
-                    last_error_message,
-                    last_event_id: event.event_id,
-                    updated_ms: timestamp_ms,
-                },
-            );
-        }
-    }
-
-    fn snapshot_json(&self) -> String {
-        let snapshot = match self.inner.lock() {
-            Ok(inner) => ProgressSnapshot {
-                generated_at_unix_ms: now_ms(),
-                active_count: inner.active_targets.len(),
-                event_count: inner.events.len(),
-                active: progress_active_targets(&inner),
-                events: inner.events.iter().cloned().collect(),
-            },
-            Err(_) => ProgressSnapshot {
-                generated_at_unix_ms: now_ms(),
-                active_count: 0,
-                event_count: 0,
-                active: Vec::new(),
-                events: Vec::new(),
-            },
-        };
-        serde_json::to_string(&snapshot).unwrap_or_else(|_| "{\"active\":[],\"events\":[]}".into())
-    }
-
-    fn clear(&self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.events.clear();
-            inner.active_targets.clear();
-        }
-    }
-}
-
-fn progress_active_targets(inner: &ProgressInner) -> Vec<ProgressTarget> {
-    let mut active = inner.active_targets.values().cloned().collect::<Vec<_>>();
-    let mut active_subrequest_counts = HashMap::<u64, usize>::new();
-    for target in &active {
-        if let Some(parent_id) = target.parent_id {
-            *active_subrequest_counts.entry(parent_id).or_default() += 1;
-        }
-    }
-    for target in &mut active {
-        target.active_subrequests = active_subrequest_counts
-            .get(&target.id)
-            .copied()
-            .unwrap_or_default();
-    }
-    active.sort_by(|left, right| {
-        left.id
-            .cmp(&right.id)
-            .then_with(|| left.kind.cmp(&right.kind))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    active
-}
-
-// Not `Clone`: a clone dropping would release the claim of the original.
-struct ProgressLayer {
-    recorder: Arc<ProgressRecorder>,
-    /// Held by the copy `progress_layer()` hands out; see `LayerClaim`.
-    _claim: Option<LayerClaim>,
-}
-
-/// The "a recording layer is out" flag, released when the layer holding
-/// it is dropped. A layer lives as long as its subscriber, so the claim
-/// sticks once the subscriber is installed (a global subscriber is never
-/// dropped) but comes back when the host discards the subscriber instead —
-/// `try_init` failing, a throwaway or test subscriber — and the host's
-/// next `progress_layer()` call records again.
-struct LayerClaim(&'static AtomicBool);
-
-impl LayerClaim {
-    fn take(flag: &'static AtomicBool) -> Option<Self> {
-        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-            .then_some(Self(flag))
-    }
-}
-
-impl Drop for LayerClaim {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
-impl<S> Layer<S> for ProgressLayer
-where
-    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-{
-    fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
-        let mut fields = ProgressFields::default();
-        attrs.record(&mut fields);
-        let span_fields = ProgressSpanFields {
-            request_id: fields.get_u64("request_id"),
-            progress_request_id: fields.get_u64("progress_request_id").filter(|id| *id != 0),
-            parent_request_id: fields.get_u64("parent_request_id").filter(|id| *id != 0),
-            top_level_path: fields
-                .get("top_level_path")
-                .filter(|path| !path.is_empty())
-                .cloned(),
-            namespace: fields.get("namespace").cloned(),
-            path: fields.get("path").cloned(),
-        };
-        if let Some(span) = ctx.span(id) {
-            span.extensions_mut().insert(span_fields);
-        }
-    }
-
-    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        let mut fields = ProgressFields::default();
-        event.record(&mut fields);
-        let span = ctx
-            .lookup_current()
-            .and_then(|span| span.extensions().get::<ProgressSpanFields>().cloned())
-            .unwrap_or_default();
-        self.recorder
-            .record_event(span, fields, event.metadata().name());
-    }
-}
-
-#[derive(Default)]
-struct ProgressFields {
-    values: HashMap<String, String>,
-}
-
-impl ProgressFields {
-    fn get(&self, key: &str) -> Option<&String> {
-        self.values.get(key)
-    }
-
-    fn get_u64(&self, key: &str) -> Option<u64> {
-        self.get(key).and_then(|value| value.parse::<u64>().ok())
-    }
-}
-
-impl Visit for ProgressFields {
-    fn record_i64(&mut self, field: &Field, value: i64) {
-        self.values
-            .insert(field.name().to_string(), value.to_string());
-    }
-
-    fn record_u64(&mut self, field: &Field, value: u64) {
-        self.values
-            .insert(field.name().to_string(), value.to_string());
-    }
-
-    fn record_bool(&mut self, field: &Field, value: bool) {
-        self.values
-            .insert(field.name().to_string(), value.to_string());
-    }
-
-    fn record_str(&mut self, field: &Field, value: &str) {
-        self.values
-            .insert(field.name().to_string(), value.to_string());
-    }
-
-    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.values
-            .insert(field.name().to_string(), format!("{value:?}"));
-    }
-}
-
-fn progress_recorder() -> Arc<ProgressRecorder> {
-    PROGRESS_RECORDER
-        .get_or_init(|| Arc::new(ProgressRecorder::default()))
-        .clone()
-}
-
-/// The `tracing` layer that feeds `freedom_ipfs_node_progress_snapshot_json`.
+/// The `tracing` layer that feeds `freedom_ipfs_node_progress_snapshot_json`:
+/// [`progress::progress_layer`], whose rules apply (add it once, and only
+/// per-layer filters leave it alone).
 ///
 /// The node installs it as the process's global subscriber on its own
-/// (see `ensure_progress_tracing`), but that slot is process-wide and
-/// the first claim wins: a host that links this crate next to another
+/// (see [`progress::init_progress_tracing`]), but that slot is process-wide
+/// and the first claim wins: a host that links this crate next to another
 /// library that installs a subscriber first (freedom-mobile-ffi, where
 /// ant-ffi's log subscriber comes up before the IPFS node) must put this
 /// layer on its own subscriber, alongside its other layers, before
 /// either library initialises — otherwise the snapshot stays empty.
-///
-/// Filtered to itself: it only sees freedom-ipfs's spans and the events
-/// that carry a `phase` (the only ones the recorder keeps), so sharing a
-/// subscriber with a chattier library costs one cached callsite check
-/// per foreign callsite, not a field walk per event.
-///
-/// Only per-layer filters leave it alone. The phase events are emitted at
-/// `info`, so a *global* filter on the host subscriber — one added with
-/// `.with(filter)` as a layer of its own, e.g.
-/// `registry().with(EnvFilter::new("warn")).with(log).with(progress_layer())`
-/// — disables them before this layer's filter is consulted, and the
-/// snapshot stays empty. Attach the host's filter to its own layer
-/// instead (`log.with_filter(EnvFilter::new("warn"))`), or make the global
-/// filter admit `freedom_ipfs=info`.
-///
-/// Add it once. Every instance writes to the same process-wide recorder,
-/// so a second copy would record each phase event twice; while the layer
-/// from an earlier call is still alive, later calls therefore return a
-/// layer that does nothing. Dropping that earlier layer (or the subscriber
-/// it was added to, e.g. after a failed `try_init`) frees the slot again.
-///
-/// The choice is made when this function is called, not later: a layer
-/// handed out as a no-op stays a no-op for its whole life, even after the
-/// recording layer that blocked it is dropped. So when replacing a
-/// subscriber, drop the old one (and any probe or test subscriber that
-/// carries this layer) *before* calling `progress_layer()` for the new one
-/// — `drop(old); let new = build();`, not `let new = build(); drop(old);`,
-/// which leaves `new` with the no-op layer and the snapshot empty for good.
-/// A subscriber installed with `set_global_default` / `try_init` is never
-/// dropped, so its layer holds the slot for the rest of the process.
 #[must_use]
 pub fn progress_layer<S>() -> impl Layer<S> + Send + Sync + 'static
 where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
-    progress_layer_once(&PROGRESS_LAYER_ISSUED, progress_recorder())
-}
-
-/// The recording layer while `issued` is free, a no-op while an earlier
-/// recording layer is still alive.
-fn progress_layer_once<S>(
-    issued: &'static AtomicBool,
-    recorder: Arc<ProgressRecorder>,
-) -> impl Layer<S> + Send + Sync + 'static
-where
-    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-{
-    LayerClaim::take(issued).map(|claim| progress_layer_with(recorder, Some(claim)))
-}
-
-fn progress_layer_for<S>(recorder: Arc<ProgressRecorder>) -> impl Layer<S> + Send + Sync + 'static
-where
-    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-{
-    progress_layer_with(recorder, None)
-}
-
-fn progress_layer_with<S>(
-    recorder: Arc<ProgressRecorder>,
-    claim: Option<LayerClaim>,
-) -> impl Layer<S> + Send + Sync + 'static
-where
-    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-{
-    ProgressLayer {
-        recorder,
-        _claim: claim,
-    }
-    .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
-        meta.target().starts_with("freedom_ipfs")
-            && (meta.is_span() || meta.fields().field("phase").is_some())
-    }))
-}
-
-fn ensure_progress_tracing() {
-    PROGRESS_TRACING_INIT.call_once(|| {
-        // Not `progress_layer()`: that hands out the host's one copy, and
-        // claiming it here would leave a host that installs its subscriber
-        // after the node with a no-op layer. The two can't both be live —
-        // only one global subscriber wins.
-        let subscriber = Registry::default().with(progress_layer_for(progress_recorder()));
-        // Fails when the host already installed a subscriber; if that one
-        // carries `progress_layer()` the snapshot still fills (see above).
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
-}
-
-fn progress_bytes_loaded(fields: &ProgressFields) -> Option<u64> {
-    fields
-        .get_u64("bytes")
-        .or_else(|| fields.get_u64("body_len"))
-}
-
-fn progress_bytes_total(fields: &ProgressFields) -> Option<u64> {
-    fields
-        .get_u64("bytes_total")
-        .or_else(|| fields.get_u64("file_len"))
-        .or_else(|| fields.get_u64("body_len"))
-}
-
-fn progress_kind(fields: &ProgressFields, raw_phase: &str, span: &ProgressSpanFields) -> String {
-    if fields.get("preload_id").is_some() || raw_phase.starts_with("preload_") {
-        "preload".into()
-    } else if span.request_id.is_some() || fields.get("request_id").is_some() {
-        "gateway_request".into()
-    } else if raw_phase.contains("provider") || raw_phase.contains("routing") {
-        "provider_lookup".into()
-    } else if raw_phase.contains("name") || raw_phase.contains("ipns") {
-        "name_resolution".into()
-    } else if fields.get("cid").is_some() {
-        "block_fetch".into()
-    } else {
-        "event".into()
-    }
-}
-
-fn progress_target_id(fields: &ProgressFields, span: &ProgressSpanFields) -> u64 {
-    fields
-        .get_u64("preload_id")
-        .or_else(|| fields.get_u64("progress_request_id"))
-        .or(span.progress_request_id)
-        .or_else(|| fields.get_u64("request_id"))
-        .or(span.request_id)
-        .or_else(|| fields.get_u64("task_id"))
-        .unwrap_or(0)
-}
-
-fn progress_status(raw_phase: &str, fields: &ProgressFields) -> String {
-    match raw_phase {
-        "gateway_stream_done" => "completed",
-        "gateway_stream_failed" => "failed",
-        "request_done" => match fields.get_u64("status") {
-            Some(status)
-                if status < 400
-                    && fields.get("body_mode").map(String::as_str) == Some("stream") =>
-            {
-                "active"
-            }
-            Some(status) if status < 400 => "completed",
-            Some(_) => "failed",
-            None => "completed",
-        },
-        "preload_done" => match fields.get("ok").map(String::as_str) {
-            Some("true") => "completed",
-            Some("false") => "failed",
-            _ => "completed",
-        },
-        "preload_cancelled" => "cancelled",
-        "gateway_limiter" if fields.get("acquired").map(String::as_str) == Some("false") => {
-            "failed"
-        }
-        _ if fields.get("ok").map(String::as_str) == Some("false") => "active",
-        _ => "active",
-    }
-    .into()
-}
-
-fn progress_source(raw_phase: &str, fields: &ProgressFields) -> Option<String> {
-    if let Some(source) = fields.get("source") {
-        return Some(source.clone());
-    }
-    match raw_phase {
-        "block_store_get" | "gateway_conditional"
-            if fields.get("cache_hit").map(String::as_str) == Some("true") =>
-        {
-            Some("cache".into())
-        }
-        "gateway_small_body_cache"
-            if fields.get("cache_hit").map(String::as_str) == Some("true") =>
-        {
-            Some("cache".into())
-        }
-        "http_provider_fetch"
-        | "http_provider_candidate_cancelled"
-        | "http_provider_hedge"
-        | "http_provider_race"
-        | "http_provider_self_hedge_skip"
-        | "http_provider_bitswap_hedge_skip"
-        | "http_provider_race_result" => Some("http_provider".into()),
-        "http_provider_bitswap_hedge" => Some("bitswap".into()),
-        "http_provider_bitswap_hedge_result" => fields
-            .get("source")
-            .cloned()
-            .or_else(|| Some("unknown".into())),
-        "delegated_provider_lookup" | "delegated_provider_empty_retry" => {
-            Some("delegated_routing".into())
-        }
-        "provider_diversity_low" | "light_dht_provider_lookup" | "dht_provider_lookup" => {
-            Some("dht".into())
-        }
-        phase if phase.starts_with("bitswap_") => Some("bitswap".into()),
-        _ => None,
-    }
-}
-
-fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> String {
-    match raw_phase {
-        "request_start" | "preload_start" => "started",
-        "request_done"
-            if status == "active"
-                && fields.get("body_mode").map(String::as_str) == Some("stream") =>
-        {
-            "streaming"
-        }
-        "request_done" if status == "completed" => "completed",
-        "request_done" => "failed",
-        "gateway_stream_done" => "completed",
-        "gateway_stream_failed" => "failed",
-        "preload_done" if status == "completed" => "completed",
-        "preload_done" => "failed",
-        "preload_cancelled" => "cancelled",
-        "block_store_get" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
-            "cache_hit"
-        }
-        "block_store_get" => "checking_cache",
-        "gateway_small_body_cache"
-            if fields.get("cache_hit").map(String::as_str) == Some("true") =>
-        {
-            "cache_hit"
-        }
-        "gateway_small_body_cache"
-            if fields.get("cache_inserted").map(String::as_str) == Some("true") =>
-        {
-            "streaming"
-        }
-        "gateway_small_body_cache" => "checking_cache",
-        "block_fetch_total" if fields.get("source").map(String::as_str) == Some("cache") => {
-            "cache_hit"
-        }
-        "block_fetch_total" if fields.get("source").map(String::as_str) == Some("bitswap") => {
-            "fetching_bitswap"
-        }
-        "block_fetch_total"
-            if fields.get("source").map(String::as_str) == Some("http_provider") =>
-        {
-            "fetching_http_provider"
-        }
-        "block_range_batch_fetch" if fields.get("source").map(String::as_str) == Some("cache") => {
-            "cache_hit"
-        }
-        "block_range_batch_fetch"
-            if fields.get("source").map(String::as_str) == Some("bitswap") =>
-        {
-            "fetching_bitswap"
-        }
-        "block_range_batch_fetch"
-            if fields.get("source").map(String::as_str) == Some("http_provider") =>
-        {
-            "fetching_http_provider"
-        }
-        "block_fetch_total" | "block_fetch_coalesced" | "block_range_batch_fetch" => "streaming",
-        "name_cache" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
-            "name_resolved"
-        }
-        "name_cache" => "resolving_name",
-        "name_persistent_cache" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
-            "name_resolved"
-        }
-        "name_persistent_cache" => "resolving_name",
-        "name_resolve" if fields.get("ok").map(String::as_str) == Some("false") => "failed",
-        "name_resolve" => "name_resolved",
-        "provider_cache"
-            if fields.get("cache_hit").map(String::as_str) == Some("true")
-                && fields.get("provider_count").map(String::as_str) == Some("0") =>
-        {
-            "failed"
-        }
-        "provider_cache" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
-            "providers_found"
-        }
-        "provider_cache" => "provider_lookup",
-        "provider_lookup" | "provider_refresh_skipped_empty_provider_set"
-            if fields.get("error").is_some() =>
-        {
-            "failed"
-        }
-        "provider_lookup" => "providers_found",
-        "provider_diversity_low" => "provider_diversity_low",
-        "light_dht_provider_lookup" | "dht_provider_lookup" => "dht_fallback_started",
-        "provider_fetch_start" => "providers_found",
-        "delegated_provider_lookup"
-        | "delegated_provider_empty_retry"
-        | "bitswap_dns_prefetch"
-        | "bitswap_dnsaddr_expand"
-        | "bitswap_dns_multiaddr_expand" => "provider_lookup",
-        "http_provider_fetch"
-        | "http_provider_candidate_cancelled"
-        | "http_provider_hedge"
-        | "http_provider_race"
-        | "http_provider_self_hedge_skip"
-        | "http_provider_bitswap_hedge_skip"
-        | "http_provider_race_result" => "fetching_http_provider",
-        "http_provider_bitswap_hedge" => "fetching_bitswap",
-        "http_provider_bitswap_hedge_result"
-            if fields.get("source").map(String::as_str) == Some("bitswap") =>
-        {
-            "fetching_bitswap"
-        }
-        "http_provider_bitswap_hedge_result" => "fetching_http_provider",
-        "bitswap_fetch"
-        | "bitswap_connection_established"
-        | "bitswap_incoming_block"
-        | "bitswap_incoming_batch"
-        | "bitswap_peer_attempt"
-        | "bitswap_peer_attempt_cancelled"
-        | "bitswap_peer_attempt_start"
-        | "bitswap_peer_expand"
-        | "bitswap_dial_plan"
-        | "bitswap_session_shortcut"
-        | "bitswap_session_shortcut_start"
-        | "bitswap_session_shortcut_pre_lookup"
-        | "bitswap_session_late_peer_wait"
-        | "bitswap_session_shortcut_empty_providers_wait"
-        | "bitswap_session_shortcut_post_lookup_wait"
-        | "bitswap_session_shortcut_post_lookup_race" => "fetching_bitswap",
-        "bitswap_fetch_cancelled" => "cancelled",
-        "bitswap_request_timeout_detail"
-        | "retry_provider_count"
-        | "provider_retry_after_connection_timeout"
-        | "bitswap_connection_error_backoff"
-        | "bitswap_connection_error_peer_skipped" => "retrying",
-        "bad_peer_skipped"
-        | "bitswap_client_reset"
-        | "bitswap_connection_error"
-        | "bitswap_dial_rejected"
-        | "bitswap_dial_waiters_dropped"
-        | "bitswap_incoming_stream_read"
-        | "bitswap_peer_timeout"
-        | "bitswap_peer_timeout_suppressed"
-        | "bitswap_provider_candidates_empty" => "retrying",
-        "bitswap_request_timeout"
-        | "provider_retry_after_timeout"
-        | "provider_retry_after_request_timeout"
-        | "provider_refresh_after_timeout"
-        | "provider_refresh_after_failure" => "retrying",
-        "ipfs_path_parse"
-        | "gateway_direct_body"
-        | "mime_total"
-        | "mime_detect"
-        | "mime_sniff_read"
-        | "unixfs_resource"
-        | "unixfs_metadata_cache"
-        | "unixfs_file_size"
-        | "unixfs_index_lookup"
-        | "unixfs_list_directory" => "streaming",
-        "gateway_conditional" => "cache_hit",
-        "gateway_limiter" if fields.get("acquired").map(String::as_str) == Some("false") => {
-            "failed"
-        }
-        "gateway_limiter" => "queued",
-        _ => raw_phase,
-    }
-    .into()
-}
-
-fn progress_error_code(raw_phase: &str, fields: &ProgressFields, status: &str) -> Option<String> {
-    if raw_phase == "request_done" && status == "failed" {
-        return fields.get("status").map(|status| format!("http_{status}"));
-    }
-    if raw_phase == "gateway_stream_failed" {
-        return Some("gateway_stream_failed".into());
-    }
-    if raw_phase == "gateway_limiter" && fields.get("acquired").map(String::as_str) == Some("false")
-    {
-        return Some("gateway_busy".into());
-    }
-    if raw_phase == "bitswap_incoming_stream_read"
-        && fields.get("ok").map(String::as_str) == Some("false")
-    {
-        return Some("bitswap_incoming_stream_read".into());
-    }
-    if fields.get("error").is_some() {
-        Some(raw_phase.to_string())
-    } else {
-        None
-    }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or_default()
+    progress::progress_layer()
 }
 
 #[no_mangle]
@@ -1392,12 +634,17 @@ pub unsafe extern "C" fn freedom_ipfs_node_new_with_data_dir(
 }
 
 fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
-    ensure_progress_tracing();
-    let runtime = match Runtime::new() {
+    init_progress_tracing();
+    // `Runtime::new()`'s runtime, its threads marked with the node's
+    // recorder.
+    let progress = ProgressRecorder::new();
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.enable_all();
+    let runtime = match progress.mark_runtime_threads(&mut runtime).build() {
         Ok(runtime) => runtime,
         Err(_) => return ptr::null_mut(),
     };
-    let native_gateway = cache_only_gateway_core(store.clone());
+    let native_gateway = cache_only_gateway_core(store.clone()).with_progress(progress.clone());
     let native_gateway_events = Arc::new(NativeGatewayEventMux::default());
     let native_gateway_stats = Arc::new(NativeGatewayStats::default());
     Box::into_raw(Box::new(FreedomIpfsNode {
@@ -1409,7 +656,7 @@ fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
         routing_stats: Mutex::new(None),
         lifecycle_state: Mutex::new(LifecycleState::Foreground),
         next_preload_id: AtomicU64::new(1),
-        preload_tasks: Mutex::new(HashMap::new()),
+        preload_tasks: Box::new(Mutex::new(HashMap::new())),
         native_gateway_state: Mutex::new(NativeGatewayState {
             core: native_gateway,
             requests: HashMap::new(),
@@ -1417,6 +664,7 @@ fn node_from_store(store: SqliteBlockStore) -> *mut FreedomIpfsNode {
         native_gateway_events,
         native_gateway_stats,
         next_native_request_id: AtomicU64::new(1),
+        progress,
     }))
 }
 
@@ -1433,8 +681,8 @@ pub unsafe extern "C" fn freedom_ipfs_node_progress_snapshot_json(
             .expect("static JSON has no nul")
             .into_raw();
     }
-    ensure_progress_tracing();
-    CString::new(progress_recorder().snapshot_json())
+    init_progress_tracing();
+    CString::new((*ptr).progress.snapshot_json())
         .unwrap_or_else(|_| CString::new("{\"active\":[],\"events\":[]}").unwrap())
         .into_raw()
 }
@@ -1472,7 +720,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_clear_progress(ptr: *mut FreedomIpfsN
     if ptr.is_null() {
         return false;
     }
-    progress_recorder().clear();
+    (*ptr).progress.clear();
     true
 }
 
@@ -1502,10 +750,17 @@ pub unsafe extern "C" fn freedom_ipfs_node_free(ptr: *mut FreedomIpfsNode) {
         stop_gateway(node);
         stop_preloads(node);
         let node = Box::from_raw(ptr);
-        let FreedomIpfsNode { runtime, store, .. } = *node;
+        let FreedomIpfsNode {
+            runtime,
+            store,
+            progress,
+            ..
+        } = *node;
         runtime.shutdown_timeout(NODE_FREE_RUNTIME_SHUTDOWN_TIMEOUT);
         if !store.close_or_close_later(NODE_FREE_STORE_CLOSE_TIMEOUT) {
-            tracing::warn!(phase = "node_free_store_close_timeout");
+            // The node's, as the preload events below are.
+            let _scope = progress.enter();
+            tracing::warn!(parent: None, phase = "node_free_store_close_timeout");
         }
     }
 }
@@ -2166,7 +1421,8 @@ unsafe fn gateway_router_for_routing_mode(
     };
     let mut builder = OnlineNode::builder(node.store.clone())
         .routing_mode(routing_mode)
-        .gateway_config(gateway_config);
+        .gateway_config(gateway_config)
+        .progress(node.progress.clone());
     if routing_mode != RoutingMode::Offline {
         let delegated_routers = if delegated_router.is_null() {
             DEFAULT_DELEGATED_ROUTER.to_string()
@@ -2982,7 +2238,14 @@ pub unsafe extern "C" fn freedom_ipfs_node_preload_path(
 
     let id = node.next_preload_id.fetch_add(1, Ordering::Relaxed);
     let url = format!("http://{addr}{path}");
-    tracing::info!(phase = "preload_start", preload_id = id, path = %path);
+    {
+        // On the host's thread, so the node's by its scope, as a root
+        // event: a span the host has entered, another node's say, would
+        // otherwise take it. The preload's own task runs on the node's
+        // runtime.
+        let _scope = node.progress.enter();
+        tracing::info!(parent: None, phase = "preload_start", preload_id = id, path = %path);
+    }
     let preload_path = path.clone();
     let task = node.runtime.spawn(async move {
         let Ok(client) = reqwest::Client::builder().timeout(PRELOAD_TIMEOUT).build() else {
@@ -3053,7 +2316,9 @@ pub unsafe extern "C" fn freedom_ipfs_node_cancel_preload(
         return false;
     };
     task.abort();
-    tracing::info!(phase = "preload_cancelled", preload_id = task_id);
+    // The node's, whatever span the host is in (see the preload's start).
+    let _scope = node.progress.enter();
+    tracing::info!(parent: None, phase = "preload_cancelled", preload_id = task_id);
     true
 }
 
@@ -3102,11 +2367,14 @@ fn stop_native_gateway_requests(node: &FreedomIpfsNode) {
 }
 
 fn stop_preloads(node: &FreedomIpfsNode) {
+    // Called on the host's thread: the node's events, whatever span the
+    // host is in (see `freedom_ipfs_node_preload_path`).
+    let _scope = node.progress.enter();
     if let Ok(mut tasks) = node.preload_tasks.lock() {
         for (task_id, task) in tasks.drain() {
             if !task.is_finished() {
                 task.abort();
-                tracing::info!(phase = "preload_cancelled", preload_id = task_id);
+                tracing::info!(parent: None, phase = "preload_cancelled", preload_id = task_id);
             }
         }
     }
@@ -3150,6 +2418,7 @@ fn clear_online_stats(node: &FreedomIpfsNode) {
 }
 
 fn set_native_gateway_core(node: &FreedomIpfsNode, core: GatewayCore) {
+    let core = core.with_progress(node.progress.clone());
     let requests = if let Ok(mut native_state) = node.native_gateway_state.lock() {
         let requests = native_state
             .requests
@@ -3769,666 +3038,6 @@ mod tests {
     }
 
     #[test]
-    fn progress_snapshot_accumulates_target_counters() {
-        let recorder = ProgressRecorder::default();
-        let span = ProgressSpanFields {
-            request_id: Some(1),
-            ..ProgressSpanFields::default()
-        };
-
-        recorder.record_event(
-            span.clone(),
-            progress_fields([("phase", "request_start"), ("request_id", "1")]),
-            "test",
-        );
-        recorder.record_event(
-            span.clone(),
-            progress_fields([
-                ("phase", "bitswap_connection_error"),
-                ("request_id", "1"),
-                ("error", "timeout"),
-            ]),
-            "test",
-        );
-        recorder.record_event(
-            span.clone(),
-            progress_fields([
-                ("phase", "block_fetch_total"),
-                ("request_id", "1"),
-                ("source", "bitswap"),
-            ]),
-            "test",
-        );
-        recorder.record_event(
-            span,
-            progress_fields([
-                ("phase", "request_done"),
-                ("request_id", "1"),
-                ("status", "200"),
-            ]),
-            "test",
-        );
-
-        let snapshot = recorder.snapshot_json();
-        let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
-        assert_eq!(value["active_count"].as_u64().unwrap(), 0);
-        let events = value["events"].as_array().unwrap();
-        let retrying = events
-            .iter()
-            .find(|event| event["phase"] == "retrying")
-            .unwrap();
-        assert_eq!(retrying["source"], "bitswap");
-        let completed = events
-            .iter()
-            .find(|event| event["phase"] == "completed")
-            .unwrap();
-        assert_eq!(completed["source"], "bitswap");
-        assert_eq!(completed["blocks_loaded"].as_u64().unwrap(), 1);
-        assert_eq!(completed["retry_count"].as_u64().unwrap(), 1);
-    }
-
-    #[test]
-    fn progress_snapshot_records_stream_body_bytes() {
-        let recorder = ProgressRecorder::default();
-        let span = ProgressSpanFields {
-            request_id: Some(1),
-            progress_request_id: Some(4242),
-            path: Some("/ipfs/root".into()),
-            ..ProgressSpanFields::default()
-        };
-
-        recorder.record_event(
-            span.clone(),
-            progress_fields([("phase", "request_start")]),
-            "test",
-        );
-        recorder.record_event(
-            span.clone(),
-            progress_fields([
-                ("phase", "unixfs_resource"),
-                ("resource", "file"),
-                ("file_len", "600000"),
-            ]),
-            "test",
-        );
-        recorder.record_event(
-            span.clone(),
-            progress_fields([
-                ("phase", "request_done"),
-                ("status", "200"),
-                ("body_mode", "stream"),
-            ]),
-            "test",
-        );
-        recorder.record_event(
-            span,
-            progress_fields([
-                ("phase", "gateway_stream_done"),
-                ("body_len", "600000"),
-                ("chunks", "10"),
-            ]),
-            "test",
-        );
-
-        let snapshot = recorder.snapshot_json();
-        let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
-        assert_eq!(value["active_count"].as_u64().unwrap(), 0);
-        let events = value["events"].as_array().unwrap();
-        let response_ready = events
-            .iter()
-            .find(|event| event["raw_phase"] == "request_done")
-            .unwrap();
-        assert_eq!(response_ready["phase"], "streaming");
-        assert_eq!(response_ready["status"], "active");
-        assert_eq!(response_ready["bytes_total"].as_u64().unwrap(), 600000);
-        let completed = events
-            .iter()
-            .find(|event| event["raw_phase"] == "gateway_stream_done")
-            .unwrap();
-        assert_eq!(completed["target_id"].as_u64().unwrap(), 4242);
-        assert_eq!(completed["path"], "/ipfs/root");
-        assert_eq!(completed["phase"], "completed");
-        assert_eq!(completed["status"], "completed");
-        assert_eq!(completed["bytes_loaded"].as_u64().unwrap(), 600000);
-        assert_eq!(completed["bytes_total"].as_u64().unwrap(), 600000);
-    }
-
-    #[test]
-    fn progress_snapshot_counts_active_subrequests() {
-        let recorder = ProgressRecorder::default();
-        let root_span = ProgressSpanFields {
-            request_id: Some(1),
-            progress_request_id: Some(100),
-            path: Some("/ipns/site/".into()),
-            ..ProgressSpanFields::default()
-        };
-        let child_span = ProgressSpanFields {
-            request_id: Some(2),
-            progress_request_id: Some(101),
-            parent_request_id: Some(100),
-            path: Some("/ipns/site/app.js".into()),
-            ..ProgressSpanFields::default()
-        };
-        let second_child_span = ProgressSpanFields {
-            request_id: Some(3),
-            progress_request_id: Some(102),
-            parent_request_id: Some(100),
-            path: Some("/ipns/site/app.css".into()),
-            ..ProgressSpanFields::default()
-        };
-
-        recorder.record_event(
-            root_span,
-            progress_fields([("phase", "request_start")]),
-            "test",
-        );
-        recorder.record_event(
-            child_span,
-            progress_fields([("phase", "request_start")]),
-            "test",
-        );
-        recorder.record_event(
-            second_child_span,
-            progress_fields([("phase", "request_start")]),
-            "test",
-        );
-
-        let snapshot = recorder.snapshot_json();
-        let value: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
-        assert_eq!(value["active_count"].as_u64().unwrap(), 3);
-        let active = value["active"].as_array().unwrap();
-        let root = active.iter().find(|target| target["id"] == 100).unwrap();
-        assert_eq!(root["active_subrequests"].as_u64().unwrap(), 2);
-        let child = active.iter().find(|target| target["id"] == 101).unwrap();
-        assert_eq!(child["parent_id"].as_u64().unwrap(), 100);
-        assert_eq!(child["active_subrequests"].as_u64().unwrap(), 0);
-    }
-
-    #[test]
-    fn progress_phase_maps_trace_events_to_ui_states() {
-        assert_eq!(
-            progress_source(
-                "bitswap_fetch",
-                &progress_fields([("phase", "bitswap_fetch"), ("bitswap_delivery", "incoming")]),
-            )
-            .as_deref(),
-            Some("bitswap")
-        );
-        assert_eq!(
-            progress_source(
-                "delegated_provider_lookup",
-                &progress_fields([("phase", "delegated_provider_lookup")]),
-            )
-            .as_deref(),
-            Some("delegated_routing")
-        );
-        assert_eq!(
-            progress_source(
-                "delegated_provider_empty_retry",
-                &progress_fields([("phase", "delegated_provider_empty_retry")]),
-            )
-            .as_deref(),
-            Some("delegated_routing")
-        );
-        assert_eq!(
-            progress_source(
-                "http_provider_race",
-                &progress_fields([("phase", "http_provider_race")]),
-            )
-            .as_deref(),
-            Some("http_provider")
-        );
-        assert_eq!(
-            progress_source(
-                "http_provider_hedge",
-                &progress_fields([("phase", "http_provider_hedge")]),
-            )
-            .as_deref(),
-            Some("http_provider")
-        );
-        assert_eq!(
-            progress_source(
-                "http_provider_bitswap_hedge",
-                &progress_fields([("phase", "http_provider_bitswap_hedge")]),
-            )
-            .as_deref(),
-            Some("bitswap")
-        );
-        assert_eq!(
-            progress_source(
-                "http_provider_self_hedge_skip",
-                &progress_fields([("phase", "http_provider_self_hedge_skip")]),
-            )
-            .as_deref(),
-            Some("http_provider")
-        );
-        assert_eq!(
-            progress_source(
-                "http_provider_bitswap_hedge_skip",
-                &progress_fields([("phase", "http_provider_bitswap_hedge_skip")]),
-            )
-            .as_deref(),
-            Some("http_provider")
-        );
-        assert_eq!(
-            progress_source(
-                "http_provider_bitswap_hedge_result",
-                &progress_fields([
-                    ("phase", "http_provider_bitswap_hedge_result"),
-                    ("source", "bitswap")
-                ]),
-            )
-            .as_deref(),
-            Some("bitswap")
-        );
-        assert_eq!(
-            progress_source(
-                "gateway_small_body_cache",
-                &progress_fields([("phase", "gateway_small_body_cache"), ("cache_hit", "true")]),
-            )
-            .as_deref(),
-            Some("cache")
-        );
-        assert_eq!(
-            progress_phase(
-                "name_cache",
-                &progress_fields([("phase", "name_cache"), ("cache_hit", "false")]),
-                "active",
-            ),
-            "resolving_name"
-        );
-        assert_eq!(
-            progress_phase(
-                "name_resolve",
-                &progress_fields([("phase", "name_resolve"), ("ok", "true")]),
-                "active",
-            ),
-            "name_resolved"
-        );
-        assert_eq!(
-            progress_phase(
-                "name_persistent_cache",
-                &progress_fields([("phase", "name_persistent_cache"), ("cache_hit", "true")]),
-                "active",
-            ),
-            "name_resolved"
-        );
-        assert_eq!(
-            progress_phase(
-                "provider_cache",
-                &progress_fields([("phase", "provider_cache"), ("cache_hit", "false")]),
-                "active",
-            ),
-            "provider_lookup"
-        );
-        assert_eq!(
-            progress_phase(
-                "provider_cache",
-                &progress_fields([
-                    ("phase", "provider_cache"),
-                    ("cache_hit", "true"),
-                    ("provider_count", "0")
-                ]),
-                "active",
-            ),
-            "failed"
-        );
-        assert_eq!(
-            progress_phase(
-                "delegated_provider_lookup",
-                &progress_fields([
-                    ("phase", "delegated_provider_lookup"),
-                    ("provider_count", "8")
-                ]),
-                "active",
-            ),
-            "provider_lookup"
-        );
-        assert_eq!(
-            progress_phase(
-                "delegated_provider_empty_retry",
-                &progress_fields([
-                    ("phase", "delegated_provider_empty_retry"),
-                    ("provider_count", "1")
-                ]),
-                "active",
-            ),
-            "provider_lookup"
-        );
-        assert_eq!(
-            progress_phase(
-                "bitswap_dnsaddr_expand",
-                &progress_fields([("phase", "bitswap_dnsaddr_expand"), ("record_count", "2")]),
-                "active",
-            ),
-            "provider_lookup"
-        );
-        assert_eq!(
-            progress_phase(
-                "bitswap_dns_prefetch",
-                &progress_fields([
-                    ("phase", "bitswap_dns_prefetch"),
-                    ("dns_ip_host_count", "4")
-                ]),
-                "active",
-            ),
-            "provider_lookup"
-        );
-        assert_eq!(
-            progress_phase(
-                "bitswap_peer_expand",
-                &progress_fields([("phase", "bitswap_peer_expand"), ("peer_count", "3")]),
-                "active",
-            ),
-            "fetching_bitswap"
-        );
-        assert_eq!(
-            progress_phase(
-                "bitswap_connection_established",
-                &progress_fields([("phase", "bitswap_connection_established")]),
-                "active",
-            ),
-            "fetching_bitswap"
-        );
-        assert_eq!(
-            progress_phase(
-                "bitswap_incoming_batch",
-                &progress_fields([("phase", "bitswap_incoming_batch")]),
-                "active",
-            ),
-            "fetching_bitswap"
-        );
-        assert_eq!(
-            progress_phase(
-                "bitswap_session_shortcut_pre_lookup",
-                &progress_fields([("phase", "bitswap_session_shortcut_pre_lookup")]),
-                "active",
-            ),
-            "fetching_bitswap"
-        );
-        assert_eq!(
-            progress_phase(
-                "bitswap_session_shortcut_post_lookup_race",
-                &progress_fields([("phase", "bitswap_session_shortcut_post_lookup_race")]),
-                "active",
-            ),
-            "fetching_bitswap"
-        );
-        assert_eq!(
-            progress_phase(
-                "bitswap_session_shortcut_empty_providers_wait",
-                &progress_fields([("phase", "bitswap_session_shortcut_empty_providers_wait")]),
-                "active",
-            ),
-            "fetching_bitswap"
-        );
-        assert_eq!(
-            progress_phase(
-                "unixfs_resource",
-                &progress_fields([("phase", "unixfs_resource")]),
-                "active",
-            ),
-            "streaming"
-        );
-        assert_eq!(
-            progress_phase(
-                "gateway_direct_body",
-                &progress_fields([("phase", "gateway_direct_body"), ("body_len", "4096")]),
-                "active",
-            ),
-            "streaming"
-        );
-        assert_eq!(
-            progress_phase(
-                "gateway_small_body_cache",
-                &progress_fields([
-                    ("phase", "gateway_small_body_cache"),
-                    ("cache_hit", "true"),
-                    ("body_len", "4096")
-                ]),
-                "active",
-            ),
-            "cache_hit"
-        );
-        assert_eq!(
-            progress_phase(
-                "gateway_small_body_cache",
-                &progress_fields([
-                    ("phase", "gateway_small_body_cache"),
-                    ("cache_hit", "false")
-                ]),
-                "active",
-            ),
-            "checking_cache"
-        );
-        assert_eq!(
-            progress_phase(
-                "gateway_small_body_cache",
-                &progress_fields([
-                    ("phase", "gateway_small_body_cache"),
-                    ("cache_inserted", "true")
-                ]),
-                "active",
-            ),
-            "streaming"
-        );
-        assert_eq!(
-            progress_phase(
-                "request_done",
-                &progress_fields([
-                    ("phase", "request_done"),
-                    ("status", "200"),
-                    ("body_mode", "stream")
-                ]),
-                "active",
-            ),
-            "streaming"
-        );
-        assert_eq!(
-            progress_phase(
-                "gateway_stream_done",
-                &progress_fields([
-                    ("phase", "gateway_stream_done"),
-                    ("body_len", "600000"),
-                    ("chunks", "3")
-                ]),
-                "completed",
-            ),
-            "completed"
-        );
-        assert_eq!(
-            progress_phase(
-                "gateway_stream_failed",
-                &progress_fields([
-                    ("phase", "gateway_stream_failed"),
-                    ("error", "missing block")
-                ]),
-                "failed",
-            ),
-            "failed"
-        );
-        assert_eq!(
-            progress_phase(
-                "gateway_conditional",
-                &progress_fields([
-                    ("phase", "gateway_conditional"),
-                    ("outcome", "not_modified")
-                ]),
-                "active",
-            ),
-            "cache_hit"
-        );
-        assert_eq!(
-            progress_phase(
-                "block_fetch_total",
-                &progress_fields([("phase", "block_fetch_total"), ("source", "http_provider")]),
-                "active",
-            ),
-            "fetching_http_provider"
-        );
-        assert_eq!(
-            progress_phase(
-                "block_range_batch_fetch",
-                &progress_fields([
-                    ("phase", "block_range_batch_fetch"),
-                    ("source", "bitswap"),
-                    ("range_len", "32768")
-                ]),
-                "active",
-            ),
-            "fetching_bitswap"
-        );
-        assert_eq!(
-            progress_phase(
-                "block_range_batch_fetch",
-                &progress_fields([
-                    ("phase", "block_range_batch_fetch"),
-                    ("source", "http_provider"),
-                    ("range_len", "32768")
-                ]),
-                "active",
-            ),
-            "fetching_http_provider"
-        );
-        assert_eq!(
-            progress_phase(
-                "http_provider_race",
-                &progress_fields([("phase", "http_provider_race")]),
-                "active",
-            ),
-            "fetching_http_provider"
-        );
-        assert_eq!(
-            progress_phase(
-                "http_provider_candidate_cancelled",
-                &progress_fields([("phase", "http_provider_candidate_cancelled")]),
-                "active",
-            ),
-            "fetching_http_provider"
-        );
-        assert_eq!(
-            progress_phase(
-                "http_provider_hedge",
-                &progress_fields([("phase", "http_provider_hedge")]),
-                "active",
-            ),
-            "fetching_http_provider"
-        );
-        assert_eq!(
-            progress_phase(
-                "http_provider_bitswap_hedge",
-                &progress_fields([("phase", "http_provider_bitswap_hedge")]),
-                "active",
-            ),
-            "fetching_bitswap"
-        );
-        assert_eq!(
-            progress_phase(
-                "http_provider_self_hedge_skip",
-                &progress_fields([("phase", "http_provider_self_hedge_skip")]),
-                "active",
-            ),
-            "fetching_http_provider"
-        );
-        assert_eq!(
-            progress_phase(
-                "http_provider_bitswap_hedge_skip",
-                &progress_fields([("phase", "http_provider_bitswap_hedge_skip")]),
-                "active",
-            ),
-            "fetching_http_provider"
-        );
-        assert_eq!(
-            progress_phase(
-                "http_provider_bitswap_hedge_result",
-                &progress_fields([
-                    ("phase", "http_provider_bitswap_hedge_result"),
-                    ("source", "bitswap")
-                ]),
-                "active",
-            ),
-            "fetching_bitswap"
-        );
-        assert_eq!(
-            progress_phase(
-                "http_provider_bitswap_hedge_result",
-                &progress_fields([
-                    ("phase", "http_provider_bitswap_hedge_result"),
-                    ("source", "http_provider")
-                ]),
-                "active",
-            ),
-            "fetching_http_provider"
-        );
-        assert_eq!(
-            progress_phase(
-                "bitswap_connection_error",
-                &progress_fields([("phase", "bitswap_connection_error"), ("error", "timeout")]),
-                "active",
-            ),
-            "retrying"
-        );
-        assert_eq!(
-            progress_phase(
-                "bitswap_dial_waiters_dropped",
-                &progress_fields([
-                    ("phase", "bitswap_dial_waiters_dropped"),
-                    ("waiter_count", "2")
-                ]),
-                "active",
-            ),
-            "retrying"
-        );
-        assert_eq!(
-            progress_phase(
-                "bitswap_incoming_stream_read",
-                &progress_fields([
-                    ("phase", "bitswap_incoming_stream_read"),
-                    ("ok", "false"),
-                    ("timed_out", "true")
-                ]),
-                "active",
-            ),
-            "retrying"
-        );
-        assert_eq!(
-            progress_phase(
-                "provider_retry_after_connection_timeout",
-                &progress_fields([("phase", "provider_retry_after_connection_timeout")]),
-                "active",
-            ),
-            "retrying"
-        );
-        assert_eq!(
-            progress_phase(
-                "provider_refresh_skipped_empty_provider_set",
-                &progress_fields([
-                    ("phase", "provider_refresh_skipped_empty_provider_set"),
-                    ("error", "no bitswap providers")
-                ]),
-                "active",
-            ),
-            "failed"
-        );
-    }
-
-    #[test]
-    fn progress_error_code_marks_incoming_stream_read_failures() {
-        assert_eq!(
-            progress_error_code(
-                "bitswap_incoming_stream_read",
-                &progress_fields([
-                    ("phase", "bitswap_incoming_stream_read"),
-                    ("ok", "false"),
-                    ("timed_out", "true")
-                ]),
-                "active",
-            ),
-            Some("bitswap_incoming_stream_read".into())
-        );
-    }
-
-    #[test]
     fn restarts_online_gateway_for_routing_mode_changes() {
         unsafe {
             let node = freedom_ipfs_node_new_in_memory();
@@ -4539,6 +3148,28 @@ mod tests {
             assert!(task_id > 0);
             assert!(freedom_ipfs_node_cancel_preload(node, task_id));
             assert!(!freedom_ipfs_node_cancel_preload(node, task_id));
+
+            // Both are emitted on this thread, into the node's recorder.
+            let snapshot: serde_json::Value =
+                serde_json::from_str(&progress_snapshot_json(node)).unwrap();
+            for raw_phase in ["preload_start", "preload_cancelled"] {
+                assert!(
+                    snapshot["events"].as_array().unwrap().iter().any(|event| {
+                        event["kind"] == "preload"
+                            && event["target_id"] == task_id
+                            && event["raw_phase"] == raw_phase
+                    }),
+                    "{raw_phase}: {snapshot}"
+                );
+            }
+            assert!(
+                !snapshot["active"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|target| target["kind"] == "preload"),
+                "{snapshot}"
+            );
 
             freedom_ipfs_node_free(node);
         }
@@ -4674,151 +3305,6 @@ mod tests {
         }
     }
 
-    /// A host that owns the global subscriber (freedom-mobile-ffi, next
-    /// to ant-ffi's log layer) must still fill the snapshot through
-    /// `progress_layer`, whatever the other layers filter.
-    #[test]
-    fn progress_layer_records_when_composed_with_other_layers() {
-        let recorder = Arc::new(ProgressRecorder::default());
-        let quiet_logs = tracing_subscriber::fmt::layer()
-            .with_writer(std::io::sink)
-            .with_filter(tracing_subscriber::filter::LevelFilter::ERROR);
-        let subscriber = Registry::default()
-            .with(quiet_logs)
-            .with(progress_layer_for(recorder.clone()));
-        tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::info_span!(
-                target: "freedom_ipfs_gateway",
-                "gateway_request",
-                request_id = 9191u64,
-                path = "/ipfs/bafycomposed"
-            );
-            let _entered = span.enter();
-            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
-            // Another library's event, even with a `phase`, isn't ours.
-            tracing::info!(target: "ant_retrieval", phase = "request_start", request_id = 1u64);
-        });
-        let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
-        let events = value["events"].as_array().unwrap();
-        assert_eq!(events.len(), 1, "{value}");
-        assert_eq!(events[0]["target_id"], 9191, "{value}");
-        assert_eq!(events[0]["path"], "/ipfs/bafycomposed", "{value}");
-    }
-
-    /// Adding the layer twice (directly and via a helper) must not record
-    /// every phase event twice in the shared recorder.
-    #[test]
-    fn progress_layer_added_twice_records_each_event_once() {
-        static ISSUED: AtomicBool = AtomicBool::new(false);
-        let recorder = Arc::new(ProgressRecorder::default());
-        let subscriber = Registry::default()
-            .with(progress_layer_once(&ISSUED, recorder.clone()))
-            .with(progress_layer_once(&ISSUED, recorder.clone()));
-        tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::info_span!(
-                target: "freedom_ipfs_gateway",
-                "gateway_request",
-                request_id = 4343u64,
-                path = "/ipfs/bafytwice"
-            );
-            let _entered = span.enter();
-            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
-        });
-        let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
-        let events = value["events"].as_array().unwrap();
-        assert_eq!(events.len(), 1, "{value}");
-        assert_eq!(events[0]["target_id"], 4343, "{value}");
-    }
-
-    /// A layer the host builds but throws away (its `try_init` failed, or it
-    /// was a throwaway subscriber) must not use up the one recording copy:
-    /// the next call, for the subscriber that does get installed, records.
-    #[test]
-    fn progress_layer_dropped_unused_frees_the_recording_copy() {
-        static ISSUED: AtomicBool = AtomicBool::new(false);
-        let recorder = Arc::new(ProgressRecorder::default());
-        let throwaway = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
-        drop(throwaway);
-        let subscriber = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
-        // While the installed one is alive, another copy is still a no-op.
-        let extra = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
-        tracing::subscriber::with_default(extra, || {
-            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
-        });
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&recorder.snapshot_json()).unwrap()["events"]
-                .as_array()
-                .unwrap()
-                .len(),
-            0
-        );
-        tracing::subscriber::with_default(subscriber, || {
-            let span = tracing::info_span!(
-                target: "freedom_ipfs_gateway",
-                "gateway_request",
-                request_id = 4545u64,
-                path = "/ipfs/bafyretry"
-            );
-            let _entered = span.enter();
-            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
-        });
-        let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
-        let events = value["events"].as_array().unwrap();
-        assert_eq!(events.len(), 1, "{value}");
-        assert_eq!(events[0]["target_id"], 4545, "{value}");
-    }
-
-    /// Pins the ordering the `progress_layer` doc warns about: a layer built
-    /// while the recording copy is alive stays a no-op after that copy is
-    /// dropped; building after the drop gets the recording copy.
-    #[test]
-    fn progress_layer_built_before_old_is_dropped_stays_a_no_op() {
-        static ISSUED: AtomicBool = AtomicBool::new(false);
-        let recorder = Arc::new(ProgressRecorder::default());
-        let emit = |id: u64| {
-            let span = tracing::info_span!(
-                target: "freedom_ipfs_gateway",
-                "gateway_request",
-                request_id = id,
-                path = "/ipfs/bafyrebuild"
-            );
-            let _entered = span.enter();
-            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
-        };
-        let events = |r: &ProgressRecorder| {
-            serde_json::from_str::<serde_json::Value>(&r.snapshot_json()).unwrap()["events"]
-                .as_array()
-                .unwrap()
-                .len()
-        };
-        let old = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
-        let too_early = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
-        drop(old);
-        tracing::subscriber::with_default(too_early, || emit(1));
-        assert_eq!(events(&recorder), 0);
-        let rebuilt = Registry::default().with(progress_layer_once(&ISSUED, recorder.clone()));
-        tracing::subscriber::with_default(rebuilt, || emit(2));
-        assert_eq!(events(&recorder), 1);
-    }
-
-    /// A host whose filter sits on its own log layer, not on the whole
-    /// subscriber, leaves the info-level phase events to `progress_layer`.
-    #[test]
-    fn progress_layer_records_next_to_a_per_layer_warn_filter() {
-        let recorder = Arc::new(ProgressRecorder::default());
-        let logs = tracing_subscriber::fmt::layer()
-            .with_writer(std::io::sink)
-            .with_filter(tracing_subscriber::filter::LevelFilter::WARN);
-        let subscriber = Registry::default()
-            .with(logs)
-            .with(progress_layer_for(recorder.clone()));
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start", request_id = 7u64);
-        });
-        let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
-        assert_eq!(value["events"].as_array().unwrap().len(), 1, "{value}");
-    }
-
     #[test]
     fn lifecycle_preload_cancellation_clears_progress_target() {
         unsafe {
@@ -4827,11 +3313,15 @@ mod tests {
             assert!(freedom_ipfs_node_clear_progress(node));
 
             let preload_id = 77;
-            tracing::info!(
-                phase = "preload_start",
-                preload_id,
-                path = "/ipfs/bafyprogress"
-            );
+            {
+                // As `freedom_ipfs_node_preload_path` emits it.
+                let _scope = (*node).progress.enter();
+                tracing::info!(
+                    phase = "preload_start",
+                    preload_id,
+                    path = "/ipfs/bafyprogress"
+                );
+            }
             let task = (*node).runtime.spawn(async {
                 std::future::pending::<()>().await;
             });
@@ -5922,6 +4412,500 @@ mod tests {
         url
     }
 
+    /// A fixed sequence of phase events touching every snapshot field. It
+    /// returns the spans of the two requests still in flight, which their
+    /// work would hold.
+    fn emit_golden_progress_sequence() -> [tracing::Span; 2] {
+        let root = tracing::info_span!(
+            target: "freedom_ipfs_gateway",
+            "gateway_request",
+            process_id = 1u32,
+            request_id = 11u64,
+            progress_request_id = 500u64,
+            parent_request_id = 0u64,
+            top_level_path = "",
+            namespace = "ipfs",
+            path = "/ipfs/bafygolden",
+            range = ""
+        );
+        {
+            let _entered = root.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start", request_id = 11u64, path = "/ipfs/bafygolden");
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "gateway_limiter", acquired = true, request_id = 11u64);
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "block_store_get", cache_hit = false, cid = "bafyblock");
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "provider_lookup", provider_count = 3u64, cid = "bafyblock");
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "bitswap_fetch", bitswap_delivery = "incoming", source_transport = "tcp", peer_count = 4u64);
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "block_fetch_total", source = "bitswap", bytes = 1000u64, elapsed_ms = 12u64);
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "bitswap_request_timeout", error = "timeout", retry_provider_count = 2u64);
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "block_fetch_total", source = "http_provider", transport = "https", bytes = 2000u64, file_len = 3000u64);
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_done", request_id = 11u64, status = 200u16, body_mode = "stream", elapsed_ms = 40u64);
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "gateway_stream_done", cid = "bafygolden", body_len = 3000u64, chunks = 1u64, elapsed_ms = 41u64);
+        }
+        let page = tracing::info_span!(
+            target: "freedom_ipfs_gateway",
+            "gateway_request",
+            request_id = 15u64,
+            progress_request_id = 600u64,
+            parent_request_id = 0u64,
+            top_level_path = "",
+            namespace = "ipfs",
+            path = "/ipfs/bafypage"
+        );
+        {
+            let _entered = page.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start", request_id = 15u64, path = "/ipfs/bafypage");
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "unixfs_resource", resource = "file", file_len = 9000u64);
+        }
+        let child = tracing::info_span!(
+            target: "freedom_ipfs_gateway",
+            "gateway_request",
+            request_id = 12u64,
+            progress_request_id = 501u64,
+            parent_request_id = 600u64,
+            top_level_path = "/ipfs/bafypage",
+            namespace = "ipfs",
+            path = "/ipfs/bafygolden/style.css"
+        );
+        {
+            let _entered = child.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start", request_id = 12u64, path = "/ipfs/bafygolden/style.css");
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "delegated_provider_lookup", candidate_peer_count = 5u64);
+            tracing::info!(target: "freedom_ipfs_retrieval", phase = "bitswap_incoming_stream_read", ok = false, error = "reset");
+        }
+        let busy = tracing::info_span!(
+            target: "freedom_ipfs_gateway",
+            "gateway_request",
+            request_id = 13u64,
+            progress_request_id = 502u64,
+            parent_request_id = 500u64,
+            top_level_path = "/ipfs/bafygolden",
+            namespace = "ipfs",
+            path = "/ipfs/bafygolden/app.js"
+        );
+        {
+            let _entered = busy.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start", request_id = 13u64, path = "/ipfs/bafygolden/app.js");
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "gateway_limiter", acquired = false, request_id = 13u64);
+        }
+        let missing = tracing::info_span!(
+            target: "freedom_ipfs_gateway",
+            "gateway_request",
+            request_id = 14u64,
+            progress_request_id = 0u64,
+            parent_request_id = 0u64,
+            top_level_path = "",
+            namespace = "ipns",
+            path = "/ipns/example.org"
+        );
+        {
+            let _entered = missing.enter();
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start", request_id = 14u64, path = "/ipns/example.org");
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "name_cache", cache_hit = false, name = "example.org");
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "name_resolve", ok = true, offset = -3i64);
+            tracing::info!(target: "freedom_ipfs_gateway", phase = "request_done", request_id = 14u64, status = 404u16, body_mode = "direct", elapsed_ms = 7u64);
+        }
+        tracing::info!(target: "freedom_ipfs_mobile", phase = "preload_start", preload_id = 9u64, path = "/ipfs/bafypreload");
+        tracing::info!(target: "freedom_ipfs_mobile", phase = "preload_start", preload_id = 10u64, path = "/ipfs/bafystill");
+        tracing::info!(target: "freedom_ipfs_mobile", phase = "preload_done", preload_id = 9u64, path = "/ipfs/bafypreload", ok = false, error = "request_failed");
+        tracing::info!(target: "freedom_ipfs_routing", phase = "light_dht_provider_lookup", task_id = 77u64, cid = "bafyblock");
+        tracing::info!(target: "freedom_ipfs_retrieval", phase = "unknown_phase_kept_raw", cid = "bafyblock", debug_field = ?Some(3u8));
+        tracing::info!(target: "freedom_ipfs_retrieval", no_phase = true);
+        tracing::info!(target: "ant_retrieval", phase = "request_start", request_id = 1u64);
+        [page, child]
+    }
+
+    /// The snapshot with its clock readings zeroed, for a golden comparison.
+    fn zero_progress_timestamps(snapshot: &str) -> String {
+        let mut out = String::with_capacity(snapshot.len());
+        let mut rest = snapshot;
+        loop {
+            let next = [
+                "\"generated_at_unix_ms\":",
+                "\"timestamp_ms\":",
+                "\"updated_ms\":",
+            ]
+            .iter()
+            .filter_map(|key| rest.find(key).map(|at| (at, key.len())))
+            .min();
+            let Some((at, len)) = next else {
+                out.push_str(rest);
+                return out;
+            };
+            out.push_str(&rest[..at + len]);
+            out.push('0');
+            rest = rest[at + len..].trim_start_matches(|c: char| c.is_ascii_digit());
+        }
+    }
+
+    /// The snapshot from before nodes had recorders of their own, for the
+    /// events `emit_golden_progress_sequence` emits, clocks zeroed: recorded
+    /// on 90c3c6c.
+    const GOLDEN_PROGRESS_SNAPSHOT: &str =
+        include_str!("../../../tests/fixtures/progress-snapshot-golden.json");
+
+    /// A node's recorder keeps the snapshot's shape and semantics: the same
+    /// events give the JSON the process-wide recorder gave, byte for byte
+    /// but for the clocks.
+    #[test]
+    fn progress_snapshot_matches_the_golden_from_before_per_node_recorders() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+            let in_flight = {
+                let _scope = (*node).progress.enter();
+                emit_golden_progress_sequence()
+            };
+            let snapshot = zero_progress_timestamps(&progress_snapshot_json(node));
+            assert_eq!(snapshot, GOLDEN_PROGRESS_SNAPSHOT.trim_end());
+
+            // Their work dropped, the two requests in flight are cancelled.
+            drop(in_flight);
+            let snapshot: serde_json::Value =
+                serde_json::from_str(&progress_snapshot_json(node)).unwrap();
+            let active: Vec<_> = snapshot["active"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|target| target["id"].as_u64().unwrap())
+                .collect();
+            assert_eq!(active, [10, 77], "{snapshot}");
+            let events = snapshot["events"].as_array().unwrap();
+            let last: Vec<_> = events[events.len() - 2..]
+                .iter()
+                .map(|event| {
+                    (
+                        event["target_id"].as_u64().unwrap(),
+                        event["raw_phase"].as_str().unwrap(),
+                        event["status"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                last,
+                [
+                    (600, "request_cancelled", "cancelled"),
+                    (501, "request_cancelled", "cancelled")
+                ],
+                "{snapshot}"
+            );
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    /// Two nodes in one process, serving at once, each see only their own
+    /// requests.
+    #[test]
+    fn two_nodes_progress_snapshots_never_mix() {
+        unsafe {
+            let nodes = [
+                (freedom_ipfs_node_new_in_memory(), 81_000u64),
+                (freedom_ipfs_node_new_in_memory(), 82_000u64),
+            ];
+            let mut requests = Vec::new();
+            for &(node, base) in &nodes {
+                assert!(!node.is_null());
+                let data = format!("the block of node {base}").into_bytes();
+                let cid = cid_from_data(CODEC_RAW, &data);
+                (*node).store.put_block(&cid, &data).unwrap();
+                for id in base..base + 10 {
+                    let handle = start_native_gateway_request(
+                        node,
+                        json!({
+                            "method": "GET",
+                            "path": format!("/ipfs/{cid}"),
+                            "headers": [
+                                { "name": "X-Freedom-Request-ID", "value": id.to_string() }
+                            ]
+                        }),
+                    );
+                    requests.push((node, handle, data.len()));
+                }
+            }
+            for (node, handle, len) in requests {
+                assert_eq!(wait_native_gateway_response(node, handle)["status"], 200);
+                assert_eq!(read_native_gateway_body_wait(node, handle, 64).len(), len);
+                assert!(freedom_ipfs_gateway_request_free(node, handle));
+            }
+            for &(node, base) in &nodes {
+                let snapshot: serde_json::Value =
+                    serde_json::from_str(&progress_snapshot_json(node)).unwrap();
+                let events = snapshot["events"].as_array().unwrap();
+                let completed: std::collections::BTreeSet<u64> = events
+                    .iter()
+                    .filter(|event| event["raw_phase"] == "request_done")
+                    .map(|event| event["target_id"].as_u64().unwrap())
+                    .collect();
+                assert_eq!(completed, (base..base + 10).collect(), "{snapshot}");
+                assert!(
+                    events.iter().all(|event| event["kind"] != "gateway_request"
+                        || (base..base + 10).contains(&event["target_id"].as_u64().unwrap())),
+                    "{snapshot}"
+                );
+                freedom_ipfs_node_free(node);
+            }
+        }
+    }
+
+    /// Polls the node's snapshot until `done` holds for it, for at most 5 s,
+    /// and returns the last one.
+    unsafe fn progress_snapshot_until(
+        node: *mut FreedomIpfsNode,
+        done: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot: serde_json::Value =
+                serde_json::from_str(&progress_snapshot_json(node)).unwrap();
+            if done(&snapshot) || Instant::now() >= deadline {
+                return snapshot;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn progress_target_is_active(snapshot: &serde_json::Value, id: u64) -> bool {
+        snapshot["active"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|target| target["kind"] == "gateway_request" && target["id"] == id)
+    }
+
+    fn progress_target_was_cancelled(snapshot: &serde_json::Value, id: u64) -> bool {
+        snapshot["events"].as_array().unwrap().iter().any(|event| {
+            event["kind"] == "gateway_request"
+                && event["target_id"] == id
+                && event["phase"] == "cancelled"
+                && event["status"] == "cancelled"
+        })
+    }
+
+    /// A request cancelled while it waits for the gateway's one permit never
+    /// reaches `request_done`: its entry must still leave `active`.
+    #[test]
+    fn cancelling_a_queued_native_request_closes_its_progress_target() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+            let data = b"queued cancel fixture".to_vec();
+            let cid = cid_from_data(CODEC_RAW, &data);
+            let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let provider: Arc<dyn BlockProvider> = Arc::new(SlowTestProvider {
+                cid,
+                data,
+                entered: entered.clone(),
+                delay: Duration::from_millis(300),
+            });
+            let core = GatewayCore::with_provider_config(
+                provider,
+                freedom_ipfs_gateway::GatewayConfig::new(1)
+                    .with_request_queue_timeout(Duration::from_secs(30)),
+            );
+            set_native_gateway_core(&*node, core);
+            let path = format!("/ipfs/{cid}");
+            let holder =
+                start_native_gateway_request(node, json!({ "method": "GET", "path": path }));
+            for _ in 0..500 {
+                if entered.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(entered.load(Ordering::SeqCst));
+
+            let queued = start_native_gateway_request(
+                node,
+                json!({
+                    "method": "GET",
+                    "path": path,
+                    "headers": [{ "name": "X-Freedom-Request-ID", "value": "9001" }]
+                }),
+            );
+            let snapshot = progress_snapshot_until(node, |s| progress_target_is_active(s, 9001));
+            assert!(progress_target_is_active(&snapshot, 9001), "{snapshot}");
+
+            assert!(freedom_ipfs_gateway_request_cancel(node, queued));
+            let snapshot = progress_snapshot_until(node, |s| !progress_target_is_active(s, 9001));
+            assert!(!progress_target_is_active(&snapshot, 9001), "{snapshot}");
+            assert!(progress_target_was_cancelled(&snapshot, 9001), "{snapshot}");
+
+            assert!(freedom_ipfs_gateway_request_free(node, queued));
+            let _ = wait_native_gateway_response(node, holder);
+            assert!(freedom_ipfs_gateway_request_free(node, holder));
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    /// A request whose body is cancelled mid-stream never reaches
+    /// `gateway_stream_done`: its entry must still leave `active`.
+    #[test]
+    fn cancelling_a_streaming_native_request_closes_its_progress_target() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+            // Four 64 KiB chunks: more than the body channel holds.
+            let data = vec![7u8; 256 * 1024];
+            let cid = cid_from_data(CODEC_RAW, &data);
+            (*node).store.put_block(&cid, &data).unwrap();
+            let handle = start_native_gateway_request(
+                node,
+                json!({
+                    "method": "GET",
+                    "path": format!("/ipfs/{cid}"),
+                    "headers": [{ "name": "X-Freedom-Request-ID", "value": "9002" }]
+                }),
+            );
+            let metadata = wait_native_gateway_response(node, handle);
+            assert_eq!(metadata["status"], 200);
+            let snapshot = progress_snapshot_until(node, |s| progress_target_is_active(s, 9002));
+            assert!(progress_target_is_active(&snapshot, 9002), "{snapshot}");
+            assert!(
+                snapshot["active"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|target| target["id"] == 9002 && target["phase"] == "streaming"),
+                "{snapshot}"
+            );
+
+            assert!(freedom_ipfs_gateway_request_cancel(node, handle));
+            let snapshot = progress_snapshot_until(node, |s| !progress_target_is_active(s, 9002));
+            assert!(!progress_target_is_active(&snapshot, 9002), "{snapshot}");
+            assert!(progress_target_was_cancelled(&snapshot, 9002), "{snapshot}");
+
+            assert!(freedom_ipfs_gateway_request_free(node, handle));
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    /// A span of another node's, current on the host's thread.
+    fn foreign_host_span(recorder: &ProgressRecorder) -> tracing::Span {
+        let _scope = recorder.enter();
+        tracing::info_span!(target: "freedom_ipfs_test", parent: None, "node_a_host_call")
+    }
+
+    fn snapshot_of(recorder: &ProgressRecorder) -> serde_json::Value {
+        serde_json::from_str(&recorder.snapshot_json()).unwrap()
+    }
+
+    fn has_raw_phase(snapshot: &serde_json::Value, raw_phase: &str) -> bool {
+        snapshot["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["raw_phase"] == raw_phase)
+    }
+
+    /// B's preload, started while A's span is current on the host's thread,
+    /// is B's: A gets neither its start nor an orphaned active entry.
+    #[test]
+    fn preload_host_events_must_not_follow_another_nodes_current_span() {
+        unsafe {
+            init_progress_tracing();
+            let a = ProgressRecorder::new();
+            let foreign = foreign_host_span(&a);
+            let b = freedom_ipfs_node_new_in_memory();
+            assert!(!b.is_null());
+            let addr = CString::new("127.0.0.1:0").unwrap();
+            assert!(freedom_ipfs_node_start_gateway(b, addr.as_ptr()));
+            // Not stored: the cache-only gateway answers 404 at once.
+            let cid = cid_from_data(CODEC_RAW, b"not stored; local cache-only 404");
+            let path = CString::new(format!("/ipfs/{cid}")).unwrap();
+            let id = foreign.in_scope(|| freedom_ipfs_node_preload_path(b, path.as_ptr()));
+            assert_ne!(id, 0);
+
+            let started: serde_json::Value =
+                serde_json::from_str(&progress_snapshot_json(b)).unwrap();
+            assert!(has_raw_phase(&started, "preload_start"), "{started}");
+            assert!(!has_raw_phase(&snapshot_of(&a), "preload_start"));
+            let done =
+                progress_snapshot_until(b, |snapshot| has_raw_phase(snapshot, "preload_done"));
+            assert!(has_raw_phase(&done, "preload_done"), "{done}");
+            freedom_ipfs_node_free(b);
+            drop(foreign);
+            let a_after = snapshot_of(&a);
+            assert_eq!(a_after["event_count"], 0, "{a_after}");
+            assert_eq!(a_after["active_count"], 0, "{a_after}");
+        }
+    }
+
+    /// Cancelling B's preload under A's span cancels B's, not A's preload
+    /// with the same number.
+    #[test]
+    fn cancelling_b_must_not_cancel_as_same_numbered_preload() {
+        unsafe {
+            init_progress_tracing();
+            let a = ProgressRecorder::new();
+            let foreign = foreign_host_span(&a);
+            let b = freedom_ipfs_node_new_in_memory();
+            assert!(!b.is_null());
+            let addr = CString::new("127.0.0.1:0").unwrap();
+            assert!(freedom_ipfs_node_start_gateway(b, addr.as_ptr()));
+            let cid = cid_from_data(CODEC_RAW, b"not stored; local cache-only 404");
+            let path = CString::new(format!("/ipfs/{cid}")).unwrap();
+            let id = freedom_ipfs_node_preload_path(b, path.as_ptr());
+            assert_ne!(id, 0);
+            {
+                let _a = a.enter();
+                tracing::info!(
+                    target: "freedom_ipfs_test",
+                    parent: None,
+                    phase = "preload_start",
+                    preload_id = id,
+                    path = "/ipfs/A-private"
+                );
+            }
+            assert_eq!(snapshot_of(&a)["active_count"], 1);
+
+            assert!(foreign.in_scope(|| freedom_ipfs_node_cancel_preload(b, id)));
+            let a_after = snapshot_of(&a);
+            assert_eq!(a_after["active_count"], 1, "{a_after}");
+            assert!(!has_raw_phase(&a_after, "preload_cancelled"), "{a_after}");
+            let b_after: serde_json::Value =
+                serde_json::from_str(&progress_snapshot_json(b)).unwrap();
+            assert!(has_raw_phase(&b_after, "preload_cancelled"), "{b_after}");
+            freedom_ipfs_node_free(b);
+            drop(foreign);
+        }
+    }
+
+    /// Stopping B's preloads (a lifecycle hook) under A's span stops B's,
+    /// and leaves A's preload with the same number alone.
+    #[test]
+    fn stopping_b_must_not_cancel_as_same_numbered_preload() {
+        unsafe {
+            init_progress_tracing();
+            let a = ProgressRecorder::new();
+            let foreign = foreign_host_span(&a);
+            let b = freedom_ipfs_node_new_in_memory();
+            assert!(!b.is_null());
+            let id = 77;
+            let task = (*b).runtime.spawn(std::future::pending::<()>());
+            (*b).preload_tasks.lock().unwrap().insert(id, task);
+            {
+                let _a = a.enter();
+                tracing::info!(
+                    target: "freedom_ipfs_test",
+                    parent: None,
+                    phase = "preload_start",
+                    preload_id = id,
+                    path = "/ipfs/A-private"
+                );
+            }
+            assert_eq!(snapshot_of(&a)["active_count"], 1);
+
+            assert!(foreign.in_scope(|| freedom_ipfs_node_enter_background(b)));
+            let a_after = snapshot_of(&a);
+            assert_eq!(a_after["active_count"], 1, "{a_after}");
+            assert!(!has_raw_phase(&a_after, "preload_cancelled"), "{a_after}");
+            let b_after: serde_json::Value =
+                serde_json::from_str(&progress_snapshot_json(b)).unwrap();
+            assert!(has_raw_phase(&b_after, "preload_cancelled"), "{b_after}");
+            freedom_ipfs_node_free(b);
+            drop(foreign);
+        }
+    }
+
     unsafe fn progress_snapshot_json(node: *mut FreedomIpfsNode) -> String {
         let snapshot_ptr = freedom_ipfs_node_progress_snapshot_json(node);
         assert!(!snapshot_ptr.is_null());
@@ -6310,16 +5294,5 @@ mod tests {
             );
         }
         results
-    }
-
-    fn progress_fields(
-        values: impl IntoIterator<Item = (&'static str, &'static str)>,
-    ) -> ProgressFields {
-        ProgressFields {
-            values: values
-                .into_iter()
-                .map(|(key, value)| (key.to_string(), value.to_string()))
-                .collect(),
-        }
     }
 }
