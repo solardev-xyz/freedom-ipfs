@@ -868,6 +868,9 @@ pub struct LightDhtClient {
     bootstrap_peers: Vec<String>,
     query_timeout: Duration,
     max_providers: usize,
+    /// A limit on queries in flight, shared with other clients (a host's
+    /// process-wide limit); `None` adds no limit.
+    query_limiter: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl Default for LightDhtClient {
@@ -879,6 +882,7 @@ impl Default for LightDhtClient {
                 .collect(),
             query_timeout: DEFAULT_DHT_QUERY_TIMEOUT,
             max_providers: DEFAULT_MAX_DHT_PROVIDERS,
+            query_limiter: None,
         }
     }
 }
@@ -905,7 +909,32 @@ impl LightDhtClient {
         self
     }
 
+    /// Counts every query (a provider lookup or a record lookup) against
+    /// `limiter`, shared with other clients: a query takes a permit before
+    /// it starts, waiting for one if none is free, and holds it until it
+    /// ends. The query's own timeout starts once it has its permit. A wait
+    /// ends when the query's future is dropped.
+    pub fn with_query_limiter(mut self, limiter: Arc<tokio::sync::Semaphore>) -> Self {
+        self.query_limiter = Some(limiter);
+        self
+    }
+
+    /// The query's permit, once one is free; `None` without a limiter.
+    async fn query_permit(&self, query: &'static str) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let limiter = self.query_limiter.as_ref()?;
+        let started = Instant::now();
+        let permit = limiter.clone().acquire_owned().await.ok();
+        tracing::info!(
+            phase = "dht_query_limiter",
+            query,
+            acquired = permit.is_some(),
+            elapsed_ms = started.elapsed().as_millis()
+        );
+        permit
+    }
+
     pub async fn providers(&self, cid: &Cid) -> Result<Vec<Provider>> {
+        let _permit = self.query_permit("providers").await;
         let started = Instant::now();
         let result = self.providers_inner(cid).await;
         match &result {
@@ -979,6 +1008,7 @@ impl LightDhtClient {
     }
 
     pub async fn records(&self, key: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let _permit = self.query_permit("records").await;
         let mut swarm = self.bootstrapped_swarm().await?;
         let key = kad::RecordKey::new(&key.to_vec());
         let query_id = swarm.behaviour_mut().kad.get_record(key);
@@ -3165,5 +3195,57 @@ mod tests {
     #[repr(i32)]
     enum TestValidityType {
         Eol = 0,
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dht_queries_wait_for_a_shared_permit_and_hold_it_while_they_run() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let cid = Cid::new_v1(0x55, Multihash::<64>::wrap(0x12, &[3; 32]).unwrap());
+        // Without bootstrap peers, a query that starts fails at once.
+        let dht = LightDhtClient::new(Vec::new()).with_query_limiter(limiter.clone());
+        let held = limiter.clone().acquire_owned().await.unwrap();
+        let waiting = tokio::time::timeout(Duration::from_millis(200), dht.providers(&cid)).await;
+        assert!(waiting.is_err(), "a provider lookup waits for the permit");
+        let waiting = tokio::time::timeout(Duration::from_millis(200), dht.records(b"key")).await;
+        assert!(waiting.is_err(), "so does a record lookup");
+        // The dropped waits took nothing.
+        drop(held);
+        assert_eq!(limiter.available_permits(), 1);
+        let err = dht.records(b"key").await.unwrap_err();
+        assert!(
+            err.to_string().contains("no valid DHT bootstrap peers"),
+            "{err}"
+        );
+        assert!(dht.providers(&cid).await.is_err());
+        assert_eq!(limiter.available_permits(), 1);
+
+        // A query holds its permit while it runs: one whose bootstrap peer
+        // accepts and never answers runs to its timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let stalled = LightDhtClient::new(vec![format!("/ip4/127.0.0.1/tcp/{port}/p2p/{peer}")])
+            .with_query_timeout(Duration::from_millis(600))
+            .with_query_limiter(limiter.clone());
+        let query = tokio::spawn(async move { stalled.providers(&cid).await });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while limiter.available_permits() != 0 {
+            assert!(Instant::now() < deadline, "the query never took its permit");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(limiter.available_permits(), 0, "held while it runs");
+        // It ends at its timeout, empty or timed out, and gives it back.
+        if let Ok(providers) = query.await.unwrap() {
+            assert!(providers.is_empty());
+        }
+        assert_eq!(limiter.available_permits(), 1);
+        silent.abort();
     }
 }
