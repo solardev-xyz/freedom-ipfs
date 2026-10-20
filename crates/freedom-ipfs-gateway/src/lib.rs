@@ -39,6 +39,7 @@ pub use native_request::{
     NativeRequestError, NativeRequestHeader, ParsedNativeRequest,
 };
 mod node;
+pub mod progress;
 
 use freedom_ipfs_retrieval::enter_memory_wait;
 pub use freedom_ipfs_retrieval::instance::Fenced;
