@@ -385,10 +385,8 @@ pub struct HttpRetriever {
     inflight: Arc<tokio::sync::Mutex<HashMap<Cid, WeakBlockFetch>>>,
     successful_bitswap_peers: Arc<tokio::sync::Mutex<HashMap<PeerId, SuccessfulBitswapPeer>>>,
     http_provider_scores: Arc<tokio::sync::Mutex<HashMap<String, HttpProviderScore>>>,
-    bitswap_dnsaddr_cache: Arc<tokio::sync::Mutex<SharedDnsaddrCache>>,
-    bitswap_dns_ip_cache: Arc<tokio::sync::Mutex<SharedDnsIpCache>>,
-    top_level_bitswap_provider_preconnect_counts: Arc<tokio::sync::Mutex<HashMap<String, usize>>>,
-    single_http_bitswap_hedge_counts: Arc<tokio::sync::Mutex<HashMap<String, usize>>>,
+    /// Its Bitswap bookkeeping, one allocation its clones share.
+    bitswap_state: Arc<BitswapBookkeeping>,
     http_provider_fetch_limiter: Arc<tokio::sync::Semaphore>,
     http_provider_fetch_limit: usize,
     /// The owned group this retriever's tasks and blocking jobs belong to;
@@ -484,12 +482,7 @@ impl HttpRetriever {
             inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             successful_bitswap_peers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             http_provider_scores: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            bitswap_dnsaddr_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            bitswap_dns_ip_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            top_level_bitswap_provider_preconnect_counts: Arc::new(tokio::sync::Mutex::new(
-                HashMap::new(),
-            )),
-            single_http_bitswap_hedge_counts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            bitswap_state: Arc::new(BitswapBookkeeping::default()),
             http_provider_fetch_limiter: Arc::new(tokio::sync::Semaphore::new(
                 http_provider_fetch_limit,
             )),
@@ -2038,7 +2031,8 @@ impl HttpRetriever {
     ) -> Option<usize> {
         let max_request_count = top_level_bitswap_provider_preconnect_max_requests();
         let mut counts = self
-            .top_level_bitswap_provider_preconnect_counts
+            .bitswap_state
+            .top_level_provider_preconnect_counts
             .lock()
             .await;
         if !counts.contains_key(top_level_path)
@@ -2129,7 +2123,7 @@ impl HttpRetriever {
         if max_per_top_level == 0 {
             return None;
         }
-        let mut counts = self.single_http_bitswap_hedge_counts.lock().await;
+        let mut counts = self.bitswap_state.single_http_hedge_counts.lock().await;
         if !counts.contains_key(top_level_path)
             && counts.len() >= MAX_SINGLE_HTTP_BITSWAP_HEDGE_TRACKED_PATHS
         {
@@ -3976,7 +3970,7 @@ impl HttpRetriever {
             ..BitswapDnsExpansionCacheStats::default()
         };
         {
-            let mut shared = self.bitswap_dnsaddr_cache.lock().await;
+            let mut shared = self.bitswap_state.dnsaddr_cache.lock().await;
             prune_shared_dnsaddr_cache(&mut shared, now);
             for host in &dnsaddr_hosts {
                 if let Some(entry) = shared.get_mut(host) {
@@ -3999,7 +3993,7 @@ impl HttpRetriever {
         let dns_names = provider_dns_ip_names(providers, dnsaddr_cache);
         stats.dns_ip_requested = dns_names.len();
         {
-            let mut shared = self.bitswap_dns_ip_cache.lock().await;
+            let mut shared = self.bitswap_state.dns_ip_cache.lock().await;
             prune_shared_dns_ip_cache(&mut shared, now);
             for host in &dns_names {
                 if let Some(entry) = shared.get_mut(host) {
@@ -4028,7 +4022,7 @@ impl HttpRetriever {
     ) {
         let now = Instant::now();
         {
-            let mut shared = self.bitswap_dnsaddr_cache.lock().await;
+            let mut shared = self.bitswap_state.dnsaddr_cache.lock().await;
             prune_shared_dnsaddr_cache(&mut shared, now);
             for (host, entry) in dnsaddr_cache {
                 shared.insert(
@@ -4042,7 +4036,7 @@ impl HttpRetriever {
             prune_shared_dnsaddr_cache_len(&mut shared);
         }
         {
-            let mut shared = self.bitswap_dns_ip_cache.lock().await;
+            let mut shared = self.bitswap_state.dns_ip_cache.lock().await;
             prune_shared_dns_ip_cache(&mut shared, now);
             for (host, entry) in dns_ip_cache {
                 shared.insert(
@@ -9508,6 +9502,16 @@ struct SharedCachedDnsIpRecords {
     seen_at: Instant,
 }
 
+/// A retriever's Bitswap bookkeeping, kept behind one `Arc` so the retriever,
+/// which every node and fetch clones, stays small.
+#[derive(Default)]
+struct BitswapBookkeeping {
+    dnsaddr_cache: tokio::sync::Mutex<SharedDnsaddrCache>,
+    dns_ip_cache: tokio::sync::Mutex<SharedDnsIpCache>,
+    top_level_provider_preconnect_counts: tokio::sync::Mutex<HashMap<String, usize>>,
+    single_http_hedge_counts: tokio::sync::Mutex<HashMap<String, usize>>,
+}
+
 type SharedDnsaddrCache = HashMap<String, SharedCachedDnsaddrRecords>;
 type SharedDnsIpCache = HashMap<String, SharedCachedDnsIpRecords>;
 
@@ -12315,7 +12319,7 @@ mod bitswap_tests {
             .checked_sub(BITSWAP_DNS_EXPANSION_CACHE_TTL + Duration::from_secs(1))
             .unwrap();
         {
-            let mut shared = retriever.bitswap_dnsaddr_cache.lock().await;
+            let mut shared = retriever.bitswap_state.dnsaddr_cache.lock().await;
             shared.insert(
                 "bootstrap.example".to_string(),
                 SharedCachedDnsaddrRecords {
@@ -12335,7 +12339,7 @@ mod bitswap_tests {
             );
         }
         {
-            let mut shared = retriever.bitswap_dns_ip_cache.lock().await;
+            let mut shared = retriever.bitswap_state.dns_ip_cache.lock().await;
             shared.insert(
                 "inner.example".to_string(),
                 SharedCachedDnsIpRecords {
@@ -12389,12 +12393,14 @@ mod bitswap_tests {
         assert!(dns_ip_cache.get("direct.example").unwrap().log_as_cached);
         assert!(!dns_ip_cache.contains_key("ws.example"));
         assert!(!retriever
-            .bitswap_dnsaddr_cache
+            .bitswap_state
+            .dnsaddr_cache
             .lock()
             .await
             .contains_key("stale-bootstrap.example"));
         assert!(!retriever
-            .bitswap_dns_ip_cache
+            .bitswap_state
+            .dns_ip_cache
             .lock()
             .await
             .contains_key("stale.example"));
@@ -12418,12 +12424,14 @@ mod bitswap_tests {
             .await;
 
         assert!(retriever
-            .bitswap_dnsaddr_cache
+            .bitswap_state
+            .dnsaddr_cache
             .lock()
             .await
             .contains_key("new-bootstrap.example"));
         assert!(retriever
-            .bitswap_dns_ip_cache
+            .bitswap_state
+            .dns_ip_cache
             .lock()
             .await
             .contains_key("new.example"));

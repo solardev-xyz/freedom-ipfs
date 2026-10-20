@@ -80,6 +80,11 @@ enum LifecycleState {
     Background,
 }
 
+/// Its size matters to CI: the add-on's jemalloc smoke (`smoke.js`, run
+/// with a single arena and no thread cache in `electron-addon.yml`) needs a
+/// freed node's address to be handed to the next node, which happens in
+/// jemalloc's 768-byte class and not in the next one up. See
+/// `the_node_stays_in_the_reuse_smokes_size_class`.
 pub struct FreedomIpfsNode {
     runtime: Runtime,
     store: SqliteBlockStore,
@@ -3184,6 +3189,20 @@ fn normalize_preload_path(path: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A node of more than 768 bytes moves to jemalloc's 896-byte class,
+    /// where the next node doesn't get a freed node's address, so the
+    /// add-on's address-reuse smoke never takes its path and fails; one of
+    /// 640 or less moves down a class, with the same risk. Keep it in.
+    #[test]
+    fn the_node_stays_in_the_reuse_smokes_size_class() {
+        let size = std::mem::size_of::<super::FreedomIpfsNode>();
+        assert!(
+            (641..=768).contains(&size),
+            "FreedomIpfsNode is {size} bytes, outside jemalloc's 768-byte class: \
+             move a field behind an Arc or Box (or re-check the jemalloc smoke)"
+        );
+    }
+
     use super::*;
     use cid::Cid;
     use freedom_ipfs_core::{cid_from_data, parse_car_v1, Block, CODEC_RAW};
