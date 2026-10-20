@@ -156,6 +156,20 @@ fn small_body_cache_fixed_bytes(max_bytes: usize) -> usize {
     max_bytes.max(SMALL_BODY_CACHE_OWN_BYTES)
 }
 
+impl Drop for SmallBodyCacheInner {
+    /// The cached bodies and the maps go first: the room, and with the last
+    /// of the pool's handles or covers its lease, go only after them, so
+    /// the reservation is given back only once what it stands for is freed.
+    /// (Fields would drop in their order, the room before the maps, and the
+    /// last body's cover before the maps' last node.) The cache's own
+    /// structure and its pool's counter are freed in the same drop, right
+    /// after.
+    fn drop(&mut self) {
+        self.entries.clear();
+        self.charged.clear();
+    }
+}
+
 impl SmallBodyCacheInner {
     /// What its structures take, at most, with `extra` more entries and
     /// `extra_charged` more charged ones.
@@ -4838,14 +4852,23 @@ mod tests {
     }
 
     /// Counts each thread's live heap bytes, and their peak, so a test can
-    /// see what a cache holds on the heap.
+    /// see what a cache holds on the heap; and can watch one allocation
+    /// being freed, to see what was still allocated, and reserved, then.
     mod heap {
+        use freedom_ipfs_core::MemoryBudget;
         use std::alloc::{GlobalAlloc, Layout, System};
         use std::cell::Cell;
 
         thread_local! {
             static LIVE: Cell<isize> = const { Cell::new(0) };
             static PEAK: Cell<isize> = const { Cell::new(0) };
+            /// An address inside the allocation watched on this thread.
+            static WATCHED: Cell<usize> = const { Cell::new(0) };
+            /// The budget to read when it is freed.
+            static WATCHED_BUDGET: Cell<*const MemoryBudget> =
+                const { Cell::new(std::ptr::null()) };
+            /// The live bytes, and the budget's use, just before it was freed.
+            static AT_FREE: Cell<Option<(isize, usize)>> = const { Cell::new(None) };
         }
 
         struct Counting;
@@ -4855,6 +4878,24 @@ mod tests {
                 let now = live.get() + bytes;
                 live.set(now);
                 let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+            });
+        }
+
+        /// Before `ptr`'s allocation of `size` bytes is freed: whether it is
+        /// the one watched.
+        fn freeing(ptr: *mut u8, size: usize) {
+            let _ = WATCHED.try_with(|watched| {
+                let address = watched.get();
+                let start = ptr as usize;
+                if address == 0 || address < start || address >= start + size.max(1) {
+                    return;
+                }
+                watched.set(0);
+                let budget = WATCHED_BUDGET.with(Cell::get);
+                // SAFETY: `watch_free`'s caller keeps the budget alive until
+                // it reads the result, which ends the watch.
+                let used = (!budget.is_null()).then(|| unsafe { &*budget }.used());
+                AT_FREE.with(|at| at.set(Some((LIVE.with(Cell::get), used.unwrap_or(0)))));
             });
         }
 
@@ -4877,6 +4918,7 @@ mod tests {
             }
 
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                freeing(ptr, layout.size());
                 unsafe { System.dealloc(ptr, layout) };
                 add(-(layout.size() as isize));
             }
@@ -4901,8 +4943,27 @@ mod tests {
         }
 
         /// The most this thread held since [`live`] was last read.
+        #[allow(dead_code)]
         pub(super) fn peak() -> isize {
             PEAK.with(Cell::get)
+        }
+
+        /// Watches, on this thread, the allocation that holds `address`:
+        /// when it is freed, what was live and what `budget` had reserved.
+        #[allow(dead_code)]
+        pub(super) fn watch_free(address: *const u8, budget: &MemoryBudget) {
+            AT_FREE.with(|at| at.set(None));
+            WATCHED_BUDGET.with(|watched| watched.set(budget));
+            WATCHED.with(|watched| watched.set(address as usize));
+        }
+
+        /// The live bytes, and the budget's use, just before the watched
+        /// allocation was freed: `None` if it wasn't. Ends the watch.
+        #[allow(dead_code)]
+        pub(super) fn watched_free() -> Option<(isize, usize)> {
+            WATCHED.with(|watched| watched.set(0));
+            WATCHED_BUDGET.with(|watched| watched.set(std::ptr::null()));
+            AT_FREE.with(Cell::take)
         }
     }
 
@@ -4922,6 +4983,36 @@ mod tests {
             drop(view);
             assert_eq!(heap::live(), origin);
         }
+    }
+
+    #[test]
+    fn a_small_body_cache_lease_stays_until_its_heap_is_freed() {
+        let budget = MemoryBudget::new(64 * 1024);
+        let origin = heap::live();
+        let cache = Arc::new(SmallBodyCache::new(64 * 1024));
+        let lease = Arc::new(budget.try_reserve(64 * 1024).unwrap());
+        assert!(cache.pool.keep_lease(lease.clone()));
+        let lease_address = Arc::as_ptr(&lease) as *const u8;
+        // The cache is the lease's last owner, and its bodies' last.
+        drop(lease);
+        for n in 0..40u8 {
+            let body = ChargedBytes::from_vec(vec![n; 1_000]);
+            assert!(cache.insert(small_body_key(&[n], 1_000), &body).inserted);
+        }
+        heap::watch_free(lease_address, &budget);
+        drop(cache);
+        let (live, _) = heap::watched_free().expect("the lease was freed");
+        // When its reservation goes, all that is left of the cache is its own
+        // structure and pool counter, freed in the same drop, and the lease
+        // itself.
+        let left = (live - origin) as usize;
+        let lease_bytes = std::mem::size_of::<Reservation>() + 2 * std::mem::size_of::<usize>();
+        assert!(
+            left <= SMALL_BODY_CACHE_OWN_BYTES + lease_bytes,
+            "{left} bytes still allocated when the reservation went"
+        );
+        assert_eq!(budget.used(), 0);
+        assert_eq!(heap::live(), origin);
     }
 
     #[test]

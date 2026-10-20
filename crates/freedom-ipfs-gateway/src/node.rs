@@ -1304,8 +1304,92 @@ mod tests {
             // covered: the reservation stays until it is freed.
             assert_eq!(budget.used(), fixed, "fetched: {fetched}");
             assert_eq!(reader.data(), &data[..]);
+            // The store handle kept past the close holds no hot cache.
+            assert_eq!((store.hot_cache_capacity(), store.hot_cache_used()), (0, 0));
             drop(reader);
             assert_eq!(budget.used(), 0);
+        }
+    }
+
+    fn shared_store() -> SqliteBlockStore {
+        SqliteBlockStore::in_memory_with(freedom_ipfs_store::StoreOptions {
+            max_bytes: 1 << 20,
+            hot_cache_bytes: Some(64 * 1024),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn store_only_config() -> GatewayConfig {
+        GatewayConfig::default()
+            .with_small_body_cache_max_bytes(0)
+            .with_unixfs_metadata_cache_capacity(0)
+    }
+
+    #[test]
+    fn a_closed_shared_store_keeps_no_hot_cache_past_its_instances() {
+        let store = shared_store();
+        let builder = || {
+            OnlineNode::builder(store.clone())
+                .routing_mode(RoutingMode::Offline)
+                .gateway_config(store_only_config())
+        };
+        let fixed = builder().fixed_reservation();
+        let (a_budget, b_budget) = (MemoryBudget::new(fixed), MemoryBudget::new(fixed));
+        let a = builder()
+            .memory_budget(a_budget.clone())
+            .build_instance(fixed_instance_config("fipfs-idle-a"))
+            .unwrap();
+        let b = builder()
+            .memory_budget(b_budget.clone())
+            .build_instance(fixed_instance_config("fipfs-idle-b"))
+            .unwrap();
+        assert!(a.shutdown(Duration::from_secs(5)).reached);
+        assert!(b.shutdown(Duration::from_secs(5)).reached);
+        // The store handle the host kept is closed and holds no hot cache:
+        // nothing is left that a reservation would have to stand for.
+        assert_eq!((store.hot_cache_capacity(), store.hot_cache_used()), (0, 0));
+        assert_eq!((a_budget.used(), b_budget.used()), (0, 0));
+    }
+
+    #[test]
+    fn instances_over_one_store_keep_the_first_lease_in_either_stop_order() {
+        for first_stops_first in [false, true] {
+            let store = shared_store();
+            let data = vec![31u8; 32_000];
+            let cid = cid_from_data(CODEC_RAW, &data);
+            store.put_block(&cid, &data).unwrap();
+            let builder = || {
+                OnlineNode::builder(store.clone())
+                    .routing_mode(RoutingMode::Offline)
+                    .gateway_config(store_only_config())
+            };
+            let fixed = builder().fixed_reservation();
+            let (a_budget, b_budget) = (MemoryBudget::new(fixed), MemoryBudget::new(fixed));
+            let a = builder()
+                .memory_budget(a_budget.clone())
+                .build_instance(fixed_instance_config("fipfs-shared-a"))
+                .unwrap();
+            let b = builder()
+                .memory_budget(b_budget.clone())
+                .build_instance(fixed_instance_config("fipfs-shared-b"))
+                .unwrap();
+            let reader = store.get(&cid).unwrap().unwrap();
+            assert!(reader.charged().is_covered());
+            if first_stops_first {
+                assert!(a.shutdown(Duration::from_secs(5)).reached);
+                assert_eq!(a_budget.used(), fixed);
+                assert!(b.shutdown(Duration::from_secs(5)).reached);
+            } else {
+                assert!(b.shutdown(Duration::from_secs(5)).reached);
+                assert_eq!(b_budget.used(), 0);
+                assert!(a.shutdown(Duration::from_secs(5)).reached);
+            }
+            // The shared pool kept the first instance's lease, and the
+            // second's, refused, wasn't kept.
+            assert_eq!((a_budget.used(), b_budget.used()), (fixed, 0));
+            drop(reader);
+            assert_eq!((a_budget.used(), b_budget.used()), (0, 0));
         }
     }
 

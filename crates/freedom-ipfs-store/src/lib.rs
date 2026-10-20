@@ -239,7 +239,10 @@ impl SqliteBlockStore {
             return false;
         };
         drop(std::mem::replace(&mut *conn, closed));
-        *self.hot.lock() = VerifiedHotCache::new(0);
+        // No hot cache at all from now on: one a store handle kept after
+        // the close would hold heap no reservation stands for. Blocks the
+        // old one covers stay covered, by its pool, until they are freed.
+        *self.hot.lock() = VerifiedHotCache::closed();
         true
     }
 
@@ -311,7 +314,8 @@ impl SqliteBlockStore {
     /// Ties `lease`, the fixed reservation the hot cache is reserved by, to
     /// its memory ([`FixedPool::keep_lease`]): it goes only once the cache
     /// and every block it covers, one a reader still holds included, are
-    /// gone. Closing the store lets go of the cache, but not of such a block.
+    /// gone. Closing the store lets go of the cache, but not of such a block,
+    /// and leaves no hot cache: a closed store keeps no lease (`false`).
     pub fn keep_hot_cache_lease(&self, lease: Arc<Reservation>) -> bool {
         self.hot.lock().pool.keep_lease(lease)
     }
@@ -831,7 +835,46 @@ struct VerifiedHotCacheHit<T> {
     touch_persistent: bool,
 }
 
+impl Drop for VerifiedHotCache {
+    /// The cached blocks, the maps and their keys go first: the room, and
+    /// with the last of the pool's handles or covers its lease, go only
+    /// after them, so the reservation is given back only once what it stands
+    /// for is freed. (Fields would drop in their order, the room and the
+    /// pool before the maps, and the last block's cover before the maps'
+    /// last node and the charged set's keys.) The pool's counter is freed in
+    /// the same drop, right after.
+    fn drop(&mut self) {
+        self.entries.clear();
+        self.charged.clear();
+    }
+}
+
 impl VerifiedHotCache {
+    /// A closed store's hot cache: none. It holds, counts and allocates
+    /// nothing (its pool is the pool of nothing), and keeps no lease.
+    fn closed() -> Self {
+        let pool = FixedPool::none();
+        let index = pool.share(0).expect("a share of nothing fits");
+        Self {
+            enabled: false,
+            index,
+            pool,
+            key_heap: 0,
+            clock: 0,
+            entries: BTreeMap::new(),
+            charged: BTreeSet::new(),
+        }
+    }
+
+    /// What its own structures count: nothing once its store is closed.
+    fn own_bytes(&self) -> usize {
+        if self.pool.capacity() == 0 {
+            0
+        } else {
+            HOT_CACHE_OWN_BYTES
+        }
+    }
+
     fn new(max_bytes: u64) -> Self {
         let pool = FixedPool::new(hot_cache_fixed_bytes(max_bytes));
         // Its own structures count from the start.
@@ -859,7 +902,7 @@ impl VerifiedHotCache {
     fn index_bytes(&self, entries: usize, charged: usize, key_heap: usize) -> usize {
         if !self.enabled {
             // It never allocates its maps' nodes.
-            return HOT_CACHE_OWN_BYTES;
+            return self.own_bytes();
         }
         HOT_CACHE_OWN_BYTES
             .saturating_add(btree_map_bytes::<Vec<u8>, VerifiedHotBlock>(
@@ -2044,14 +2087,23 @@ mod tests {
     }
 
     /// Counts each thread's live heap bytes, and their peak, so a test can
-    /// see what the hot cache holds on the heap.
+    /// see what a cache holds on the heap; and can watch one allocation
+    /// being freed, to see what was still allocated, and reserved, then.
     mod heap {
+        use freedom_ipfs_core::MemoryBudget;
         use std::alloc::{GlobalAlloc, Layout, System};
         use std::cell::Cell;
 
         thread_local! {
             static LIVE: Cell<isize> = const { Cell::new(0) };
             static PEAK: Cell<isize> = const { Cell::new(0) };
+            /// An address inside the allocation watched on this thread.
+            static WATCHED: Cell<usize> = const { Cell::new(0) };
+            /// The budget to read when it is freed.
+            static WATCHED_BUDGET: Cell<*const MemoryBudget> =
+                const { Cell::new(std::ptr::null()) };
+            /// The live bytes, and the budget's use, just before it was freed.
+            static AT_FREE: Cell<Option<(isize, usize)>> = const { Cell::new(None) };
         }
 
         struct Counting;
@@ -2061,6 +2113,24 @@ mod tests {
                 let now = live.get() + bytes;
                 live.set(now);
                 let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+            });
+        }
+
+        /// Before `ptr`'s allocation of `size` bytes is freed: whether it is
+        /// the one watched.
+        fn freeing(ptr: *mut u8, size: usize) {
+            let _ = WATCHED.try_with(|watched| {
+                let address = watched.get();
+                let start = ptr as usize;
+                if address == 0 || address < start || address >= start + size.max(1) {
+                    return;
+                }
+                watched.set(0);
+                let budget = WATCHED_BUDGET.with(Cell::get);
+                // SAFETY: `watch_free`'s caller keeps the budget alive until
+                // it reads the result, which ends the watch.
+                let used = (!budget.is_null()).then(|| unsafe { &*budget }.used());
+                AT_FREE.with(|at| at.set(Some((LIVE.with(Cell::get), used.unwrap_or(0)))));
             });
         }
 
@@ -2083,6 +2153,7 @@ mod tests {
             }
 
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                freeing(ptr, layout.size());
                 unsafe { System.dealloc(ptr, layout) };
                 add(-(layout.size() as isize));
             }
@@ -2107,8 +2178,27 @@ mod tests {
         }
 
         /// The most this thread held since [`live`] was last read.
+        #[allow(dead_code)]
         pub(super) fn peak() -> isize {
             PEAK.with(Cell::get)
+        }
+
+        /// Watches, on this thread, the allocation that holds `address`:
+        /// when it is freed, what was live and what `budget` had reserved.
+        #[allow(dead_code)]
+        pub(super) fn watch_free(address: *const u8, budget: &MemoryBudget) {
+            AT_FREE.with(|at| at.set(None));
+            WATCHED_BUDGET.with(|watched| watched.set(budget));
+            WATCHED.with(|watched| watched.set(address as usize));
+        }
+
+        /// The live bytes, and the budget's use, just before the watched
+        /// allocation was freed: `None` if it wasn't. Ends the watch.
+        #[allow(dead_code)]
+        pub(super) fn watched_free() -> Option<(isize, usize)> {
+            WATCHED.with(|watched| watched.set(0));
+            WATCHED_BUDGET.with(|watched| watched.set(std::ptr::null()));
+            AT_FREE.with(Cell::take)
         }
     }
 
@@ -2148,6 +2238,79 @@ mod tests {
             assert!(cache.pool.used() <= CAPACITY);
         }
         drop(cache);
+        assert_eq!(heap::live(), origin);
+    }
+
+    #[test]
+    fn a_closed_store_keeps_no_hot_cache_and_no_lease() {
+        let budget = freedom_ipfs_core::MemoryBudget::new(1 << 20);
+        let store = SqliteBlockStore::in_memory_with(StoreOptions {
+            max_bytes: 1 << 20,
+            hot_cache_bytes: Some(64 * 1024),
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        let data = vec![5u8; 10_000];
+        let cid = cid_from_data(CODEC_RAW, &data);
+        store.put_block(&cid, &data).unwrap();
+        let lease = Arc::new(
+            budget
+                .try_reserve(store.hot_cache_capacity() as usize)
+                .unwrap(),
+        );
+        assert!(store.keep_hot_cache_lease(lease.clone()));
+        drop(lease);
+        let reader = store.get(&cid).unwrap().unwrap();
+        assert!(store.close(Duration::from_secs(1)));
+        // Nothing of a hot cache is left, and none is counted.
+        assert_eq!((store.hot_cache_capacity(), store.hot_cache_used()), (0, 0));
+        assert!(store.hot.lock().pool.capacity() == 0 && store.hot.lock().entries.is_empty());
+        let late = Arc::new(budget.try_reserve(100).unwrap());
+        assert!(
+            !store.keep_hot_cache_lease(late),
+            "a closed store keeps no lease"
+        );
+        // The old cache's block a reader holds keeps the old lease.
+        assert_eq!(budget.used(), 64 * 1024);
+        assert_eq!(reader.data(), &data[..]);
+        drop(reader);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn a_hot_cache_lease_stays_until_its_heap_is_freed() {
+        let budget = freedom_ipfs_core::MemoryBudget::new(64 * 1024);
+        let fetches = freedom_ipfs_core::MemoryBudget::new(1 << 20);
+        let origin = heap::live();
+        let mut cache = VerifiedHotCache::new(64 * 1024);
+        let lease = Arc::new(budget.try_reserve(64 * 1024).unwrap());
+        assert!(cache.pool.keep_lease(lease.clone()));
+        let lease_address = Arc::as_ptr(&lease) as *const u8;
+        drop(lease);
+        for n in 0..40u32 {
+            let data = n.to_le_bytes().repeat(100);
+            let key = block_key(&cid_from_data(CODEC_RAW, &data));
+            if n % 2 == 0 {
+                cache.put_input(key, HotInput::Copy(&data), 0);
+            } else {
+                // Still charged, so the charged set keeps a copy of its key.
+                let fetched = charged_view(&fetches, &data, data.len());
+                cache.put_input(key, HotInput::Shared(fetched), 0);
+            }
+        }
+        assert!(!cache.charged.is_empty());
+        heap::watch_free(lease_address, &budget);
+        drop(cache);
+        let (live, _) = heap::watched_free().expect("the lease was freed");
+        // When its reservation goes, all that is left of the cache is its
+        // pool's counter, freed in the same drop, and the lease itself.
+        let left = (live - origin) as usize;
+        let lease_bytes = std::mem::size_of::<Reservation>() + 2 * std::mem::size_of::<usize>();
+        assert!(
+            left <= FixedPool::HEAP_BYTES + lease_bytes,
+            "{left} bytes still allocated when the reservation went"
+        );
+        assert_eq!((budget.used(), fetches.used()), (0, 0));
         assert_eq!(heap::live(), origin);
     }
 

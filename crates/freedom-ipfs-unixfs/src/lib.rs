@@ -513,6 +513,19 @@ struct UnixfsMetadataCacheInner {
     file_sizes: CachedMap<Cid, u64>,
 }
 
+impl Drop for UnixfsMetadataCacheInner {
+    /// The cached entries go first: the room, and with the last of the
+    /// pool's handles its lease, go only after them, so the reservation is
+    /// given back only once what it stands for is freed. (Fields would drop
+    /// in their order, the room before the maps.) The cache's own structure
+    /// and its pool's counter are freed in the same drop, right after.
+    fn drop(&mut self) {
+        self.nodes.entries.clear();
+        self.paths.entries.clear();
+        self.file_sizes.entries.clear();
+    }
+}
+
 impl UnixfsMetadataCacheInner {
     fn tick(&mut self) -> u64 {
         self.clock = self.clock.saturating_add(1);
@@ -2141,14 +2154,23 @@ mod tests {
     }
 
     /// Counts each thread's live heap bytes, and their peak, so a test can
-    /// see what the cache holds on the heap, and at most held at once.
+    /// see what a cache holds on the heap; and can watch one allocation
+    /// being freed, to see what was still allocated, and reserved, then.
     mod heap {
+        use freedom_ipfs_core::MemoryBudget;
         use std::alloc::{GlobalAlloc, Layout, System};
         use std::cell::Cell;
 
         thread_local! {
             static LIVE: Cell<isize> = const { Cell::new(0) };
             static PEAK: Cell<isize> = const { Cell::new(0) };
+            /// An address inside the allocation watched on this thread.
+            static WATCHED: Cell<usize> = const { Cell::new(0) };
+            /// The budget to read when it is freed.
+            static WATCHED_BUDGET: Cell<*const MemoryBudget> =
+                const { Cell::new(std::ptr::null()) };
+            /// The live bytes, and the budget's use, just before it was freed.
+            static AT_FREE: Cell<Option<(isize, usize)>> = const { Cell::new(None) };
         }
 
         struct Counting;
@@ -2158,6 +2180,24 @@ mod tests {
                 let now = live.get() + bytes;
                 live.set(now);
                 let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+            });
+        }
+
+        /// Before `ptr`'s allocation of `size` bytes is freed: whether it is
+        /// the one watched.
+        fn freeing(ptr: *mut u8, size: usize) {
+            let _ = WATCHED.try_with(|watched| {
+                let address = watched.get();
+                let start = ptr as usize;
+                if address == 0 || address < start || address >= start + size.max(1) {
+                    return;
+                }
+                watched.set(0);
+                let budget = WATCHED_BUDGET.with(Cell::get);
+                // SAFETY: `watch_free`'s caller keeps the budget alive until
+                // it reads the result, which ends the watch.
+                let used = (!budget.is_null()).then(|| unsafe { &*budget }.used());
+                AT_FREE.with(|at| at.set(Some((LIVE.with(Cell::get), used.unwrap_or(0)))));
             });
         }
 
@@ -2180,6 +2220,7 @@ mod tests {
             }
 
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                freeing(ptr, layout.size());
                 unsafe { System.dealloc(ptr, layout) };
                 add(-(layout.size() as isize));
             }
@@ -2204,8 +2245,27 @@ mod tests {
         }
 
         /// The most this thread held since [`live`] was last read.
+        #[allow(dead_code)]
         pub(super) fn peak() -> isize {
             PEAK.with(Cell::get)
+        }
+
+        /// Watches, on this thread, the allocation that holds `address`:
+        /// when it is freed, what was live and what `budget` had reserved.
+        #[allow(dead_code)]
+        pub(super) fn watch_free(address: *const u8, budget: &MemoryBudget) {
+            AT_FREE.with(|at| at.set(None));
+            WATCHED_BUDGET.with(|watched| watched.set(budget));
+            WATCHED.with(|watched| watched.set(address as usize));
+        }
+
+        /// The live bytes, and the budget's use, just before the watched
+        /// allocation was freed: `None` if it wasn't. Ends the watch.
+        #[allow(dead_code)]
+        pub(super) fn watched_free() -> Option<(isize, usize)> {
+            WATCHED.with(|watched| watched.set(0));
+            WATCHED_BUDGET.with(|watched| watched.set(std::ptr::null()));
+            AT_FREE.with(Cell::take)
         }
     }
 
@@ -2419,6 +2479,63 @@ mod tests {
             let live = heap::live() - origin;
             assert!(live as usize <= cache.stats().bytes);
             drop(cache);
+            assert_eq!(heap::live(), origin);
+        }
+    }
+
+    #[test]
+    fn a_metadata_cache_lease_stays_until_its_cached_heap_is_freed() {
+        let encoded = pb_file(&vec![73u8; 32 * 1024], Vec::new());
+        let cid = cid_from_data(CODEC_DAG_PB, &encoded);
+        let provider = CountingProvider::new(HashMap::from([(cid, encoded)]));
+        // The provider's own bookkeeping, before anything is counted.
+        UnixfsResolver::without_metadata_cache()
+            .file_size(&provider, &cid, "")
+            .unwrap();
+        let fixed = UnixfsResolver::metadata_cache_fixed_bytes(256, 128 * 1024);
+        let budget = freedom_ipfs_core::MemoryBudget::new(fixed);
+        for watch_the_lease in [false, true] {
+            let origin = heap::live();
+            let resolver = UnixfsResolver::with_metadata_cache_limits(256, 128 * 1024);
+            let lease = Arc::new(budget.try_reserve(fixed).unwrap());
+            assert!(resolver.keep_metadata_cache_lease(lease.clone()));
+            let lease_address = Arc::as_ptr(&lease) as *const u8;
+            // The cache is the lease's last owner.
+            drop(lease);
+            assert_eq!(resolver.file_size(&provider, &cid, "").unwrap(), 32 * 1024);
+            let payload = {
+                let inner = resolver.metadata_cache.lock_inner();
+                let cached = &inner.nodes.entries.get(&cid).unwrap().value;
+                cached.data.data.as_ref().unwrap().as_ptr()
+            };
+            heap::watch_free(
+                if watch_the_lease {
+                    lease_address
+                } else {
+                    payload
+                },
+                &budget,
+            );
+            drop(resolver);
+            let (live, reserved) = heap::watched_free().expect("it was freed");
+            if watch_the_lease {
+                // When the reservation goes, all that is left of the cache
+                // is its own structure and pool counter, freed in the same
+                // drop, and the lease itself.
+                let left = (live - origin) as usize;
+                let lease_bytes =
+                    std::mem::size_of::<Reservation>() + 2 * std::mem::size_of::<usize>();
+                assert!(
+                    left <= UNIXFS_METADATA_CACHE_OWN_BYTES + lease_bytes,
+                    "{left} bytes still allocated when the reservation went"
+                );
+            } else {
+                assert_eq!(
+                    reserved, fixed,
+                    "the 32 KiB payload is freed while still reserved"
+                );
+            }
+            assert_eq!(budget.used(), 0);
             assert_eq!(heap::live(), origin);
         }
     }

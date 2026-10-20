@@ -650,6 +650,20 @@ impl FixedPool {
         }
     }
 
+    /// A pool of no capacity, for a cache that is gone (a closed store's):
+    /// it covers nothing, takes no lease, and allocates nothing, as every
+    /// one of them is the same pool.
+    pub fn none() -> Self {
+        static NONE: OnceLock<FixedPool> = OnceLock::new();
+        NONE.get_or_init(|| {
+            let pool = FixedPool::new(0);
+            // Taken already, by a lease of nothing: no other is ever kept.
+            pool.keep_lease(Arc::new(Reservation::empty()));
+            pool
+        })
+        .clone()
+    }
+
     /// The heap a pool takes itself: its counter, in its `Arc`. A cache
     /// counts it with its own structures.
     pub const HEAP_BYTES: usize =
@@ -1220,6 +1234,57 @@ mod tests {
         );
         drop(reader);
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn one_lease_wins_a_race_and_its_shares_and_views_release_it_once() {
+        use std::sync::Barrier;
+        let budget = MemoryBudget::new(8 * 4096);
+        let pool = FixedPool::new(4096);
+        let share = pool.share(0).unwrap();
+        let data = ChargedBytes::from_vec(vec![7; 100]);
+        let held = pool.hold(&data).unwrap();
+        let view = held.bytes().to_bytes();
+        drop(data);
+        let barrier = Arc::new(Barrier::new(4));
+        let racers: Vec<_> = (0..4)
+            .map(|_| {
+                let (budget, pool, barrier) = (budget.clone(), pool.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let lease = Arc::new(budget.try_reserve(4096).unwrap());
+                    barrier.wait();
+                    pool.keep_lease(lease)
+                })
+            })
+            .collect();
+        let winners = racers
+            .into_iter()
+            .map(|racer| usize::from(racer.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(winners, 1);
+        assert_eq!(budget.used(), 4096, "the losing leases go at once");
+        drop((held, pool));
+        assert_eq!(budget.used(), 4096);
+        drop(view);
+        assert_eq!(budget.used(), 4096, "an empty share still owns the pool");
+        drop(share);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn the_pool_of_nothing_holds_nothing_and_keeps_no_lease() {
+        let budget = MemoryBudget::new(1 << 20);
+        let none = FixedPool::none();
+        assert!(
+            Arc::ptr_eq(&none.inner, &FixedPool::none().inner),
+            "one for all"
+        );
+        assert!(!none.keep_lease(Arc::new(budget.try_reserve(100).unwrap())));
+        assert_eq!(budget.used(), 0);
+        assert!(none.hold(&ChargedBytes::from_vec(vec![1])).is_none());
+        assert!(none.share(1).is_none());
+        let empty = none.share(0).unwrap();
+        assert_eq!((none.capacity(), none.used(), empty.bytes()), (0, 0, 0));
     }
 
     #[test]
