@@ -22,7 +22,8 @@
 //!   allocation charged.
 //! - **[`FixedPool`]** is a fixed reservation's account, such as a cache's
 //!   capacity. A buffer its owner holds ([`FixedPool::hold`]) counts against
-//!   it by backing capacity for the rest of the buffer's life, after the
+//!   it by its footprint ([`ChargedBytes::footprint`]: its backing capacity
+//!   and its shared header) for the rest of the buffer's life, after the
 //!   owner lets it go too, so the pool never covers more than its capacity.
 //!   Once the owner's handles are the buffer's last, the owner takes over
 //!   its dynamic charge, when the last other handle is dropped; until then
@@ -443,6 +444,17 @@ impl ChargedBytes {
         self.buffer.data.capacity()
     }
 
+    /// The heap an allocation takes besides its bytes' backing: the header
+    /// its clones and views share, with its charges.
+    pub const HEADER_BYTES: usize =
+        std::mem::size_of::<Buffer>() + 2 * std::mem::size_of::<usize>();
+
+    /// All the heap the allocation takes: its backing capacity and its
+    /// header. What a [`FixedPool`] covers it by.
+    pub fn footprint(&self) -> usize {
+        self.backing_capacity().saturating_add(Self::HEADER_BYTES)
+    }
+
     /// The bytes of dynamic reservation the allocation still holds.
     pub fn charged_bytes(&self) -> usize {
         self.charges()
@@ -587,8 +599,8 @@ impl From<Vec<u8>> for ChargedBytes {
 }
 
 /// A fixed reservation's account: the buffers it covers count against its
-/// capacity by backing capacity, for the rest of their lives. Clones share
-/// it.
+/// capacity by their footprint ([`ChargedBytes::footprint`]), for the rest
+/// of their lives. Clones share it.
 #[derive(Clone)]
 pub struct FixedPool {
     inner: Arc<PoolInner>,
@@ -635,7 +647,7 @@ impl FixedPool {
         self.inner.capacity
     }
 
-    /// The backing capacity of every live allocation it covers, those its
+    /// The footprint of every live allocation it covers, those its
     /// owner has let go of but others still hold included.
     pub fn used(&self) -> usize {
         self.inner.used.load(Ordering::Acquire)
@@ -651,7 +663,7 @@ impl FixedPool {
     }
 
     /// Holds `bytes` for the pool's owner, a cache: covers the allocation
-    /// for the rest of its life if its backing capacity fits in what is left
+    /// for the rest of its life if its footprint fits in what is left
     /// of the pool (or this pool covers it already). `None` if it doesn't
     /// fit, or another pool covers it.
     pub fn hold(&self, bytes: &ChargedBytes) -> Option<HeldBytes> {
@@ -660,7 +672,7 @@ impl FixedPool {
             Some(cover) if !Arc::ptr_eq(&cover.pool, &self.inner) => return None,
             Some(_) => {}
             None => {
-                let needed = bytes.backing_capacity();
+                let needed = bytes.footprint();
                 let capacity = self.inner.capacity;
                 self.inner
                     .used
@@ -683,22 +695,25 @@ impl FixedPool {
 }
 
 impl FixedPool {
-    /// Holds a copy of `bytes` for the pool's owner: room for it is taken
-    /// in the pool first, and only then is the copy allocated, at exactly
-    /// its size, so no copy is ever made that the pool doesn't cover.
+    /// Holds a copy of `len` bytes for the pool's owner: room for its
+    /// footprint (`len` and a header) is taken in the pool first, and only
+    /// then is the copy allocated, at exactly its size, so no copy is ever
+    /// made that the pool doesn't cover.
     /// `None`, allocating nothing, if it doesn't fit; `copy` is what makes
     /// the copy, called only once the room is taken.
     pub fn hold_copy(&self, len: usize, copy: impl FnOnce() -> Vec<u8>) -> Option<HeldBytes> {
         let capacity = self.inner.capacity;
+        let footprint = len.saturating_add(ChargedBytes::HEADER_BYTES);
         self.inner
             .used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(len).filter(|total| *total <= capacity)
+                used.checked_add(footprint)
+                    .filter(|total| *total <= capacity)
             })
             .ok()?;
         let room = Cover {
             pool: self.inner.clone(),
-            bytes: len,
+            bytes: footprint,
         };
         let mut data = copy();
         if data.capacity() > len {
@@ -1087,6 +1102,7 @@ mod tests {
     #[test]
     fn a_fixed_pool_covers_for_life_and_takes_over_only_from_the_last_owner() {
         let budget = MemoryBudget::new(1 << 20);
+        const H: usize = ChargedBytes::HEADER_BYTES;
         let pool = FixedPool::new(10_000);
         let fetched = ReservedVec::zeroed(4_000, budget.try_reserve(4_000).unwrap())
             .unwrap()
@@ -1094,7 +1110,9 @@ mod tests {
         let reader = fetched.clone();
         let held = pool.hold(&fetched).unwrap();
         let again = pool.hold(&fetched).unwrap();
-        assert_eq!(pool.used(), 4_000, "held twice, covered once");
+        // A buffer counts by its footprint: its backing and its header.
+        assert_eq!(fetched.footprint(), 4_000 + H);
+        assert_eq!(pool.used(), 4_000 + H, "held twice, covered once");
         drop(again);
         // While others hold it, it counts twice.
         assert!(!held.take_over_if_only_held());
@@ -1103,12 +1121,12 @@ mod tests {
         // The last other handle goes: the owner takes the charge over.
         drop(reader);
         assert_eq!(budget.used(), 0);
-        assert_eq!(pool.used(), 4_000);
+        assert_eq!(pool.used(), 4_000 + H);
         // Handed out again and let go by the owner, it stays covered until
         // it is freed.
         let reader = held.bytes().clone();
         drop(held);
-        assert_eq!(pool.used(), 4_000);
+        assert_eq!(pool.used(), 4_000 + H);
         drop(reader);
         assert_eq!(pool.used(), 0);
 
@@ -1133,7 +1151,7 @@ mod tests {
 
         // A copy is made only once its room is taken.
         let mut copies = 0;
-        let full = FixedPool::new(100);
+        let full = FixedPool::new(100 + H);
         let _filled = full
             .hold_copy(100, || {
                 copies += 1;
@@ -1146,10 +1164,10 @@ mod tests {
                 vec![2]
             })
             .is_none());
-        assert_eq!((copies, full.used()), (1, 100));
+        assert_eq!((copies, full.used()), (1, 100 + H));
 
         // What doesn't fit isn't held; another pool's buffer isn't either.
-        let big = ChargedBytes::from_vec(vec![0; 10_001]);
+        let big = ChargedBytes::from_vec(vec![0; 10_001 - H]);
         assert!(pool.hold(&big).is_none());
         let other = FixedPool::new(10_000);
         let small = ChargedBytes::from_vec(vec![0; 100]);
@@ -1163,7 +1181,11 @@ mod tests {
         let pool = FixedPool::new(1_000);
         let mut share = pool.share(600).unwrap();
         assert!(pool.share(401).is_none(), "nothing past the capacity");
-        let held = pool.hold(&ChargedBytes::from_vec(vec![0; 300])).unwrap();
+        let held = pool
+            .hold(&ChargedBytes::from_vec(
+                vec![0; 300 - ChargedBytes::HEADER_BYTES],
+            ))
+            .unwrap();
         assert_eq!(pool.used(), 900);
         assert!(!share.try_grow(101));
         assert_eq!(

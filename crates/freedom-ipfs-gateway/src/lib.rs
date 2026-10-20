@@ -102,9 +102,9 @@ struct SmallBodyCacheKey {
 /// host reserves as fixed: a [`FixedPool`].
 ///
 /// - **A body counts by its backing capacity,** the allocation it keeps
-///   alive, not its length: a small view of a large buffer counts the whole
-///   buffer, for the rest of the buffer's life (the store's hot cache counts
-///   alike). So a view of a buffer larger than an entry may be is copied
+///   alive, not its length, and its header ([`ChargedBytes::footprint`]): a
+///   small view of a large buffer counts the whole buffer, for the rest of
+///   the buffer's life (the store's hot cache counts alike). So a view of a buffer larger than an entry may be is copied
 ///   instead, at its exact size, as is a buffer another pool covers (one
 ///   cover per buffer).
 /// - **A copy is made only once its room is taken** ([`FixedPool::hold_copy`]),
@@ -274,11 +274,11 @@ impl SmallBodyCache {
             bytes.backing_capacity() <= GATEWAY_SMALL_BODY_CACHE_MAX_ENTRY_BYTES
                 && (!bytes.is_covered() || self.pool.covers(bytes))
         });
-        let counted = shared.map_or(len, |bytes| {
+        let counted = shared.map_or(len.saturating_add(ChargedBytes::HEADER_BYTES), |bytes| {
             if self.pool.covers(bytes) {
                 0
             } else {
-                bytes.backing_capacity()
+                bytes.footprint()
             }
         });
         let charged = usize::from(shared.is_some_and(|bytes| bytes.charged_bytes() > 0));
@@ -4811,7 +4811,8 @@ mod tests {
 
     #[test]
     fn small_body_cache_evicts_to_byte_budget() {
-        let cache = SmallBodyCache::new(small_body_structure(1, 0) + 5);
+        const H: usize = ChargedBytes::HEADER_BYTES;
+        let cache = SmallBodyCache::new(small_body_structure(1, 0) + H + 5);
         let first_key = small_body_key(b"one", 3);
         let second_key = small_body_key(b"two", 3);
 
@@ -4823,7 +4824,10 @@ mod tests {
 
         assert!(second_insert.inserted);
         assert_eq!(second_insert.evicted, 1);
-        assert_eq!(second_insert.cache_bytes, small_body_structure(1, 0) + 3);
+        assert_eq!(
+            second_insert.cache_bytes,
+            small_body_structure(1, 0) + H + 3
+        );
         assert!(cache.get(&first_key).is_none());
         assert_eq!(cache.get(&second_key).unwrap(), Bytes::from_static(b"two"));
     }
@@ -4831,17 +4835,25 @@ mod tests {
     #[test]
     fn a_small_body_counts_by_its_backing_capacity() {
         SMALL_BODY_COPIES.with(|copies| copies.set(0));
+        // Each buffer also counts its header.
+        const H: usize = ChargedBytes::HEADER_BYTES;
         let cache = SmallBodyCache::new(DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES);
         // Ten bytes that keep a 32 KiB buffer alive count the buffer.
         let view = ChargedBytes::from_vec(vec![7; 32 * 1024]).slice(100, 110);
         let key = small_body_key(b"view", 10);
         let insert = cache.insert(key.clone(), &view);
         assert!(insert.inserted);
-        assert_eq!(insert.cache_bytes, small_body_structure(1, 0) + 32 * 1024);
+        assert_eq!(
+            insert.cache_bytes,
+            small_body_structure(1, 0) + 32 * 1024 + H
+        );
         assert_eq!(cache.get(&key).unwrap(), Bytes::from(vec![7; 10]));
         assert_eq!(SMALL_BODY_COPIES.with(Cell::get), 0, "shared, not copied");
         drop(view);
-        assert_eq!(cache.pool.used(), small_body_structure(1, 0) + 32 * 1024);
+        assert_eq!(
+            cache.pool.used(),
+            small_body_structure(1, 0) + 32 * 1024 + H
+        );
 
         // A view of a buffer larger than an entry may be is copied, and
         // counts its copy's exact size.
@@ -4850,7 +4862,7 @@ mod tests {
         assert!(insert.inserted);
         assert_eq!(
             insert.cache_bytes,
-            small_body_structure(2, 0) + 32 * 1024 + 10
+            small_body_structure(2, 0) + 32 * 1024 + 10 + 2 * H
         );
         assert_eq!(SMALL_BODY_COPIES.with(Cell::get), 1);
 
@@ -4862,7 +4874,7 @@ mod tests {
         assert!(insert.inserted);
         assert_eq!(
             insert.cache_bytes,
-            small_body_structure(3, 0) + 32 * 1024 + 10 + 100
+            small_body_structure(3, 0) + 32 * 1024 + 10 + 100 + 3 * H
         );
         assert_eq!(SMALL_BODY_COPIES.with(Cell::get), 2);
         assert!(cache.pool.used() <= cache.pool.capacity());
@@ -4881,7 +4893,10 @@ mod tests {
         assert!(insert.inserted);
         // Shared, not copied: the cache covers the same buffer, so until
         // the fetcher lets go it counts twice.
-        assert_eq!(insert.cache_bytes, small_body_structure(1, 1) + 1_000);
+        assert_eq!(
+            insert.cache_bytes,
+            small_body_structure(1, 1) + 1_000 + ChargedBytes::HEADER_BYTES
+        );
         assert_eq!(budget.used(), 1_000);
         let served = cache.get(&key).unwrap();
         drop(fetched);
@@ -4892,13 +4907,18 @@ mod tests {
         // The cache holds it alone: its charge is the cache's now.
         assert_eq!(budget.used(), 0);
         assert!(cache.get(&key).is_some());
-        assert_eq!(cache.pool.used(), small_body_structure(1, 0) + 1_000);
+        assert_eq!(
+            cache.pool.used(),
+            small_body_structure(1, 0) + 1_000 + ChargedBytes::HEADER_BYTES
+        );
     }
 
     #[test]
     fn a_small_body_is_copied_only_into_room() {
         SMALL_BODY_COPIES.with(|copies| copies.set(0));
-        let cache = SmallBodyCache::new(small_body_structure(4, 0) + 4 * 1_000);
+        let cache = SmallBodyCache::new(
+            small_body_structure(4, 0) + 4 * (1_000 + ChargedBytes::HEADER_BYTES),
+        );
         // Four bodies that readers hold: evicting them frees no room.
         let readers: Vec<Bytes> = (0..4u8)
             .map(|index| {
