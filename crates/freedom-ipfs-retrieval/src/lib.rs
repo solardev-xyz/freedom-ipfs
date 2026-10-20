@@ -4540,8 +4540,10 @@ impl HttpRetriever {
             elapsed_ms = elapsed.as_millis()
         );
         if let Some(peer) = source_peer {
-            // Time spent waiting for memory isn't the source being slow.
-            if !window.waited() {
+            // Time spent waiting for memory, by this fetch's reads or by the
+            // incoming read that delivered the block, isn't the source being
+            // slow.
+            if !window.waited() && !result.memory_delayed {
                 self.maybe_mark_slow_zero_http_source_peer(
                     cid,
                     providers,
@@ -7017,7 +7019,17 @@ fn zero_http_subresource_slow_source_suppression_threshold_from_values(
     )
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// A test's gateway slow-source threshold, in place of the environment.
+    static TEST_GATEWAY_SLOW_SOURCE_THRESHOLD: Duration;
+}
+
 fn zero_http_gateway_slow_source_suppression_threshold() -> Option<Duration> {
+    #[cfg(test)]
+    if let Ok(threshold) = TEST_GATEWAY_SLOW_SOURCE_THRESHOLD.try_with(|threshold| *threshold) {
+        return Some(threshold);
+    }
     zero_http_gateway_slow_source_suppression_threshold_from_values(
         std::env::var_os(ENABLE_ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION_ENV).is_some(),
         std::env::var_os(ZERO_HTTP_GATEWAY_SLOW_SOURCE_SUPPRESSION_MS_ENV)
@@ -7823,6 +7835,11 @@ struct BitswapFetchResult {
     source_transport: Option<&'static str>,
     source_addr: Option<Multiaddr>,
     delivery: &'static str,
+    /// Whether its delivery waited for memory where the requesting fetch
+    /// doesn't see it (an incoming stream's read, which reserves from its
+    /// own memory): then the time it took is partly local, not the
+    /// source's.
+    memory_delayed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -7833,6 +7850,11 @@ struct BitswapFetchBatchResult {
     source_transport: Option<&'static str>,
     source_addr: Option<Multiaddr>,
     delivery: &'static str,
+    /// Whether its delivery waited for memory where the requesting fetch
+    /// doesn't see it (an incoming stream's read, which reserves from its
+    /// own memory): then the time it took is partly local, not the
+    /// source's.
+    memory_delayed: bool,
 }
 
 struct BitswapFetchResults {
@@ -7919,9 +7941,12 @@ struct IncomingBitswapRead {
     result: io::Result<Vec<ReceivedBitswapBlock>>,
     elapsed_ms: u128,
     timed_out: bool,
-    /// Whether the read waited for memory (or was refused it): its timeout
-    /// is then not the peer's.
+    /// Whether its timer ran out for memory (a wait inside it, outstanding,
+    /// refused or served late): its timeout is then not the peer's.
     memory_pressured: bool,
+    /// Whether it waited for memory at all: its delivery was then delayed
+    /// locally, which the requesting fetch learns with the block.
+    memory_delayed: bool,
 }
 
 type DialErrorLog = Arc<tokio::sync::Mutex<HashMap<PeerId, Vec<String>>>>;
@@ -7975,6 +8000,7 @@ impl SharedBitswapClient {
             source_transport: result.source_transport,
             source_addr: result.source_addr,
             delivery: result.delivery,
+            memory_delayed: result.memory_delayed,
         }))
     }
 
@@ -7997,6 +8023,7 @@ impl SharedBitswapClient {
             source_transport: result.source_transport,
             source_addr: result.source_addr,
             delivery: result.delivery,
+            memory_delayed: result.memory_delayed,
         }))
     }
 
@@ -8179,6 +8206,9 @@ async fn read_incoming_bitswap_stream(
     peer: PeerId,
     mut stream: Libp2pStream,
 ) -> IncomingBitswapRead {
+    // Its timer runs while its reservation waits: what happens to memory
+    // inside this window is what excuses it.
+    let window = PressureWindow::open();
     let (result, elapsed_ms, timed_out) =
         read_incoming_bitswap_blocks(&mut stream, BITSWAP_INCOMING_STREAM_READ_TIMEOUT).await;
     IncomingBitswapRead {
@@ -8187,8 +8217,8 @@ async fn read_incoming_bitswap_stream(
         result,
         elapsed_ms,
         timed_out,
-        memory_pressured: FetchMemory::current()
-            .is_some_and(|memory| memory.refusal_or_outstanding().is_some()),
+        memory_pressured: window.excuses_timer(),
+        memory_delayed: window.waited(),
     }
 }
 
@@ -8801,6 +8831,7 @@ async fn run_shared_bitswap_swarm(
                                     source_transport: result.source_transport,
                                     source_addr: result.source_addr,
                                     delivery: result.delivery,
+                                    memory_delayed: incoming_read.memory_delayed,
                                 };
                                 matched = true;
                                 let mut pending_waiter_count = 0usize;
@@ -10964,6 +10995,7 @@ async fn collect_incoming_bitswap_batch(
     let mut source_peer = None;
     let mut source_transport = None;
     let mut source_addr = None;
+    let mut memory_delayed = false;
 
     while requested_blocks.len() < wanted.len() {
         let next_result = if requested_blocks.is_empty() {
@@ -11001,6 +11033,7 @@ async fn collect_incoming_bitswap_batch(
                 extra_blocks.push((cid, data));
             }
         }
+        memory_delayed |= result.memory_delayed;
         extra_blocks.extend(result.extra_blocks);
     }
 
@@ -11031,6 +11064,7 @@ async fn collect_incoming_bitswap_batch(
         source_transport,
         source_addr,
         delivery: "incoming",
+        memory_delayed,
     })
 }
 
@@ -11448,6 +11482,7 @@ async fn request_bitswap_blocks(
                         source_transport,
                         source_addr,
                         delivery: result.delivery,
+                        memory_delayed: result.memory_delayed,
                     });
                 }
                 Err(WantHaveFailure::TryOtherProtocols(err)) => {
@@ -11484,6 +11519,9 @@ async fn request_bitswap_blocks(
                     source_transport,
                     source_addr,
                     delivery: "outgoing",
+                    // Outgoing reads share the fetch's memory: its own
+                    // window sees their waits.
+                    memory_delayed: false,
                 });
             }
             Err(err) => {
@@ -11767,6 +11805,7 @@ where
         source_transport: None,
         source_addr: None,
         delivery: "outgoing",
+        memory_delayed: false,
     })
 }
 
@@ -12161,6 +12200,7 @@ fn collect_bitswap_result(
         source_transport: None,
         source_addr: None,
         delivery: "outgoing",
+        memory_delayed: false,
     })
 }
 
@@ -14840,6 +14880,7 @@ mod bitswap_tests {
                 source_transport: None,
                 source_addr: None,
                 delivery: "incoming",
+                memory_delayed: false,
             })
             .unwrap();
 
@@ -20767,6 +20808,168 @@ mod bitswap_tests {
             after_wait,
             "a served wait turned a network timeout into busy"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incoming_read_timer_is_excused_only_by_waits_inside_it() {
+        // An answer read as an incoming stream is (its timer: 6 s), from a
+        // peer that answers once released.
+        let case = |case: &'static str| async move {
+            let data = format!("an incoming answer, {case}").into_bytes();
+            let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, &data);
+            let (release, released) = tokio::sync::watch::channel(false);
+            let (peer, addr, _wants, peer_task, accept_task) =
+                spawn_held_bitswap_peer(vec![(cid, data)], released).await;
+            let mut swarm = build_bitswap_swarm(None).await.unwrap();
+            let mut control = swarm.behaviour().stream.new_control();
+            swarm
+                .dial(
+                    libp2p::swarm::dial_opts::DialOpts::peer_id(peer)
+                        .addresses(vec![addr])
+                        .build(),
+                )
+                .unwrap();
+            let swarm_task = tokio::spawn(async move {
+                loop {
+                    let _ = swarm.select_next_some().await;
+                }
+            });
+            let mut stream = tokio::time::timeout(
+                Duration::from_secs(3),
+                control.open_stream(peer, StreamProtocol::new("/ipfs/bitswap/1.2.0")),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            write_bitswap_wants(&mut stream, &[cid]).await.unwrap();
+            let budget = MemoryBudget::new(BITSWAP_MAX_MESSAGE_SIZE);
+            let memory = FetchMemory::new(budget.clone());
+            if case == "served before" {
+                // A wait served and over before the read starts; the peer
+                // never answers.
+                let full = budget.try_reserve(budget.limit()).unwrap();
+                let mut wait = Box::pin(memory.reserve(1));
+                assert!(futures::poll!(&mut wait).is_pending());
+                drop(full);
+                drop(wait.await.unwrap());
+            }
+            let full =
+                (case == "served inside").then(|| budget.try_reserve(budget.limit()).unwrap());
+            // The sender lives to the end: dropped, it would let the peer
+            // answer at once.
+            let answer = release.clone();
+            let releasing = (case != "served before").then(|| {
+                let memory = memory.clone();
+                tokio::spawn(async move {
+                    // Inside: memory comes 5 s into the read's 6 s, and the
+                    // answer 1.5 s after that.
+                    if let Some(full) = full {
+                        let deadline = Instant::now() + Duration::from_secs(3);
+                        while memory.waiting() == 0 {
+                            assert!(Instant::now() < deadline, "the read never waited");
+                            tokio::task::yield_now().await;
+                        }
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        drop(full);
+                    }
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    answer.send_replace(true);
+                })
+            });
+            let read = FetchMemory::scope(
+                Some(memory.clone()),
+                read_incoming_bitswap_stream(peer, stream),
+            )
+            .await;
+            let outcome = (read.result.is_ok(), read.timed_out, read.memory_pressured);
+            if let Some(releasing) = releasing {
+                releasing.abort();
+            }
+            drop((read, release));
+            for task in [swarm_task, peer_task, accept_task] {
+                task.abort();
+            }
+            assert_eq!(memory.refusal(), None, "{case}: every wait was served");
+            outcome
+        };
+        let (plain, inside, before) =
+            tokio::join!(case("plain"), case("served inside"), case("served before"));
+        assert_eq!(
+            plain,
+            (true, false, false),
+            "without pressure, it is served"
+        );
+        assert_eq!(
+            inside,
+            (false, true, true),
+            "a wait served late inside the timer excuses its timeout"
+        );
+        assert_eq!(
+            before,
+            (false, true, false),
+            "a wait before the read excuses nothing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_source_delivering_through_a_memory_delayed_incoming_read_is_not_slow() {
+        for pressure in [false, true] {
+            let data = format!("an instant incoming source, pressure={pressure}").into_bytes();
+            let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, &data);
+            let (peer, addr, peer_task, stream_task) =
+                spawn_incoming_multi_want_bitswap_peer(vec![(cid, data.clone())]).await;
+            // Two messages of memory: the outgoing read holds one; under
+            // pressure the other is held until 900 ms after that, so the
+            // incoming read that delivers the block waits for it.
+            let budget = MemoryBudget::new(2 * BITSWAP_MAX_MESSAGE_SIZE);
+            let release = pressure.then(|| {
+                let held = budget.try_reserve(BITSWAP_MAX_MESSAGE_SIZE).unwrap();
+                let budget = budget.clone();
+                tokio::spawn(async move {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while budget.used() < budget.limit() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "the outgoing read never reserved"
+                        );
+                        tokio::task::yield_now().await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(900)).await;
+                    drop(held);
+                })
+            });
+            let store = SqliteBlockStore::in_memory(1 << 20).unwrap();
+            let retriever = HttpRetriever::new(
+                freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+                store.clone(),
+            )
+            .with_memory_budget(budget.clone());
+            let provider =
+                Provider::from_parts(Some(peer.to_string()), vec![addr.to_string()]).unwrap();
+            // Slow-source suppression on: a gateway source slower than 500 ms
+            // is marked bad.
+            let block = TEST_GATEWAY_SLOW_SOURCE_THRESHOLD
+                .scope(
+                    Duration::from_millis(500),
+                    retriever.with_fetch_memory(retriever.fetch_from_bitswap_providers(
+                        &cid,
+                        &[provider],
+                        Some(RetrievalRequestContext::gateway_request(None)),
+                    )),
+                )
+                .await
+                .unwrap();
+            if let Some(release) = release {
+                release.await.unwrap();
+            }
+            assert_eq!(block.data(), &data[..]);
+            assert!(
+                !store.is_bad_provider(&peer.to_string()).unwrap(),
+                "pressure={pressure}: an instant source was blamed for a local memory delay"
+            );
+            peer_task.abort();
+            stream_task.abort();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
