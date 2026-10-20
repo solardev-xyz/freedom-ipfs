@@ -1,6 +1,10 @@
 pub mod instance;
+pub mod limits;
 
 pub use instance::{with_cancellation, CancellationToken, InstanceContext};
+pub use limits::{BackgroundQueue, LimitSizes, SharedLimits};
+
+use limits::{HeldPermits, SharedConnectionLimit};
 
 use cid::Cid;
 use freedom_ipfs_core::{
@@ -18,6 +22,7 @@ use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::Boxed;
 use libp2p::core::upgrade;
 use libp2p::multiaddr::Protocol;
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, Stream as Libp2pStream, SwarmEvent};
 use libp2p::StreamProtocol;
 use libp2p::{
@@ -386,6 +391,11 @@ pub struct HttpRetriever {
     /// The owned group this retriever's tasks and blocking jobs belong to;
     /// `None` spawns them on the ambient runtime, as before.
     instance: Option<InstanceContext>,
+    /// The process-wide limits its fetches, HTTP provider requests and
+    /// Bitswap connections count against; `None` adds no limit.
+    limits: Option<SharedLimits>,
+    /// Its instance's background queue: work no request awaits.
+    background: BackgroundQueue,
 }
 
 type WeakBlockFetch = WeakShared<BoxFuture<'static, Arc<SharedBlockFetchResult>>>;
@@ -482,6 +492,8 @@ impl HttpRetriever {
             )),
             http_provider_fetch_limit,
             instance: None,
+            limits: None,
+            background: BackgroundQueue::default(),
         }
     }
 
@@ -492,15 +504,76 @@ impl HttpRetriever {
         self
     }
 
-    /// Spawns a task of the retriever: in its instance's task set, or on
-    /// the ambient runtime without one.
-    fn spawn_task<F>(&self, future: F)
+    /// Counts the retriever's block fetches, HTTP provider requests and
+    /// Bitswap connections against `limits`, shared with every other node
+    /// built with them (see [`limits`]). Without this, it has none of these
+    /// limits.
+    pub fn with_shared_limits(mut self, limits: SharedLimits) -> Self {
+        self.limits = Some(limits);
+        self
+    }
+
+    /// Puts the retriever's background work in `queue`, its instance's, in
+    /// place of a queue of its own.
+    pub fn with_background_queue(mut self, queue: BackgroundQueue) -> Self {
+        self.background = queue;
+        self
+    }
+
+    /// The queue its background work goes through.
+    pub fn background_queue(&self) -> &BackgroundQueue {
+        &self.background
+    }
+
+    /// Spawns background work of the retriever, work no request awaits:
+    /// admitted to its background queue, then in its instance's task set or
+    /// on the ambient runtime without one. When the queue is full, the work
+    /// is dropped, and counted.
+    fn spawn_background_task<F>(&self, kind: &'static str, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let Some(slot) = self.background.try_admit() else {
+            tracing::info!(
+                phase = "background_task_dropped",
+                kind,
+                outstanding = self.background.outstanding(),
+                capacity = self.background.capacity(),
+                dropped = self.background.dropped()
+            );
+            return;
+        };
+        let future = async move {
+            let _slot = slot;
+            future.await;
+        };
         match &self.instance {
             Some(instance) => drop(instance.spawn(future)),
             None => drop(tokio::spawn(future)),
+        }
+    }
+
+    /// Runs `future`, a fetch of `count` blocks, holding as many block-fetch
+    /// permits of the shared limits (none without them). The permits are
+    /// waited for first, and held until the fetch and its store puts have
+    /// ended.
+    async fn with_block_fetch_permits<F: Future>(&self, count: usize, future: F) -> F::Output {
+        let Some(limits) = &self.limits else {
+            return future.await;
+        };
+        let started = Instant::now();
+        let permit = limits.acquire_block_fetches(count).await;
+        tracing::info!(
+            phase = "block_fetch_limiter",
+            count,
+            acquired = permit.is_some(),
+            in_flight = limits.block_fetches_in_flight(),
+            max_concurrent = limits.sizes().block_fetches,
+            elapsed_ms = started.elapsed().as_millis()
+        );
+        match permit {
+            Some(permit) => HeldPermits::current().with(permit).scope(future).await,
+            None => future.await,
         }
     }
 
@@ -662,7 +735,23 @@ impl HttpRetriever {
         shared_block_fetch_result(result)
     }
 
+    /// Fetches a block the store doesn't hold, over HTTP or Bitswap, its
+    /// provider lookup included: the single point every uncached fetch goes
+    /// through, so it holds a block-fetch permit of the shared limits for
+    /// the whole operation. A coalesced caller that only awaits another
+    /// caller's fetch doesn't come here, and takes none.
     async fn fetch_block_uncached_with_source(
+        &self,
+        cid: &Cid,
+        context: Option<RetrievalRequestContext>,
+    ) -> Result<(Block, RetrievalSource)> {
+        // Boxed, as each fetch below is: the future is large, and moving it
+        // into the permit's scope by value would multiply its size.
+        let fetch = Box::pin(self.fetch_block_uncached_admitted(cid, context));
+        self.with_block_fetch_permits(1, fetch).await
+    }
+
+    async fn fetch_block_uncached_admitted(
         &self,
         cid: &Cid,
         context: Option<RetrievalRequestContext>,
@@ -1107,7 +1196,7 @@ impl HttpRetriever {
             return Ok((block, RetrievalSource::Cache));
         }
         match self
-            .fetch_from_providers_with_source(cid, &providers, context.clone())
+            .fetch_from_providers_admitted(cid, &providers, context.clone())
             .await
         {
             Ok((block, source)) => Ok((block, source)),
@@ -1196,7 +1285,7 @@ impl HttpRetriever {
                             initial_error = %err
                         );
                         return match self
-                            .fetch_from_providers_with_source(cid, &providers, context.clone())
+                            .fetch_from_providers_admitted(cid, &providers, context.clone())
                             .await
                         {
                             Ok((block, source)) => Ok((block, source)),
@@ -1213,7 +1302,7 @@ impl HttpRetriever {
                             initial_error = %err
                         );
                         return match self
-                            .fetch_from_providers_with_source(cid, &providers, context.clone())
+                            .fetch_from_providers_admitted(cid, &providers, context.clone())
                             .await
                         {
                             Ok((block, source)) => Ok((block, source)),
@@ -1226,7 +1315,7 @@ impl HttpRetriever {
                 }
                 self.cache_providers(cid, &refreshed)?;
                 match self
-                    .fetch_from_providers_with_source(cid, &refreshed, context.clone())
+                    .fetch_from_providers_admitted(cid, &refreshed, context.clone())
                     .await
                 {
                     Ok((block, source)) => Ok((block, source)),
@@ -1271,7 +1360,20 @@ impl HttpRetriever {
             .map(|(block, _source)| block)
     }
 
+    /// Fetches `cid` from `providers`, holding a block-fetch permit of the
+    /// shared limits, if any, for the whole fetch.
     pub async fn fetch_from_providers_with_source(
+        &self,
+        cid: &Cid,
+        providers: &[Provider],
+        context: Option<RetrievalRequestContext>,
+    ) -> Result<(Block, RetrievalSource)> {
+        let fetch = Box::pin(self.fetch_from_providers_admitted(cid, providers, context));
+        self.with_block_fetch_permits(1, fetch).await
+    }
+
+    /// The same, for a fetch that holds its permit already.
+    async fn fetch_from_providers_admitted(
         &self,
         cid: &Cid,
         providers: &[Provider],
@@ -1811,7 +1913,7 @@ impl HttpRetriever {
 
         let retriever = self.clone();
         let providers = providers.to_vec();
-        self.spawn_task(async move {
+        self.spawn_background_task("bitswap_provider_preconnect", async move {
             with_retrieval_request_context(context, async move {
                 let started = Instant::now();
                 let current_context = current_retrieval_request_context();
@@ -2033,7 +2135,7 @@ impl HttpRetriever {
     {
         let post_lookup_grace = bitswap_session_post_lookup_grace(providers, context.as_ref());
         let http_provider_count = provider_http_url_count(providers);
-        let provider_fetch = self.fetch_from_providers_with_source(cid, providers, context.clone());
+        let provider_fetch = self.fetch_from_providers_admitted(cid, providers, context.clone());
         tokio::pin!(provider_fetch);
         let race_started = Instant::now();
         let provider_count = providers.len();
@@ -3398,11 +3500,35 @@ impl HttpRetriever {
                 )));
             }
         };
+        // The process-wide limit, taken inside the retriever's own: a shared
+        // permit is never held while waiting for an instance's own, and is
+        // held as long as that one is, through the body read, the
+        // verification and the store put.
+        let held = match &self.limits {
+            Some(limits) => {
+                cancel_trace.set_stage("waiting_shared_limiter");
+                let shared_started = Instant::now();
+                let permit = limits.acquire_http_provider_request().await;
+                tracing::info!(
+                    phase = "http_provider_shared_limiter",
+                    cid = %cid,
+                    provider = %base,
+                    acquired = permit.is_some(),
+                    in_flight = limits.http_provider_requests_in_flight(),
+                    max_concurrent = limits.sizes().http_provider_requests,
+                    elapsed_ms = shared_started.elapsed().as_millis()
+                );
+                permit.map(|permit| HeldPermits::current().with(permit))
+            }
+            None => None,
+        };
         let started = Instant::now();
-        match self
-            .fetch_from_http_provider(&cid, &base, &mut cancel_trace)
-            .await
-        {
+        let fetch = self.fetch_from_http_provider(&cid, &base, &mut cancel_trace);
+        let fetched = match held.clone() {
+            Some(held) => held.scope(fetch).await,
+            None => fetch.await,
+        };
+        match fetched {
             Ok((block, stats)) => {
                 cancel_trace.complete();
                 self.record_http_provider_success(&base, stats.body_elapsed)
@@ -4363,7 +4489,8 @@ impl HttpRetriever {
         if let Some(client) = client.as_ref() {
             return Ok(client.clone());
         }
-        let spawned = SharedBitswapClient::spawn(self.instance.as_ref()).await?;
+        let spawned =
+            SharedBitswapClient::spawn(self.instance.as_ref(), self.limits.as_ref()).await?;
         *client = Some(spawned.clone());
         Ok(spawned)
     }
@@ -4882,7 +5009,7 @@ impl HttpRetriever {
             return Ok(None);
         }
 
-        let mut peers = self.recent_bitswap_peers_for_fetch().await;
+        let peers = self.recent_bitswap_peers_for_fetch().await;
         if peers.is_empty() {
             tracing::info!(
                 phase = "bitswap_session_range_batch",
@@ -4894,7 +5021,19 @@ impl HttpRetriever {
             );
             return Ok(None);
         }
+        // A batch is a fetch of each of its blocks: it holds a block-fetch
+        // permit per CID (at most the limit's size), from before its timer
+        // starts until its blocks are stored.
+        let count = cids.len();
+        let fetch = Box::pin(self.fetch_many_from_session_peers(cids, peers));
+        self.with_block_fetch_permits(count, fetch).await
+    }
 
+    async fn fetch_many_from_session_peers(
+        &self,
+        cids: Vec<Cid>,
+        mut peers: Vec<BitswapPeer>,
+    ) -> Result<Option<HashMap<Cid, Block>>> {
         let trusted_want_have_probe_count =
             maybe_force_trusted_bitswap_want_have_probes(&mut peers);
         let peer_count = peers.len();
@@ -5120,9 +5259,13 @@ impl HttpRetriever {
         let started = Instant::now();
         let byte_count = bytes.len();
         let store = self.store.clone();
+        // The put holds the operation's shared permits until it returns,
+        // even if the operation is cancelled first.
+        let held = HeldPermits::current();
         let (bytes, result) = self
             .run_blocking_job(move || {
                 let result = store.put_block(&cid, &bytes);
+                drop(held);
                 (bytes, result)
             })
             .await
@@ -5326,6 +5469,26 @@ impl FetchingBlockProvider {
         self.retriever = self.retriever.with_instance(instance.clone());
         self.instance = Some(instance);
         self
+    }
+
+    /// Counts the provider's fetches against `limits`, process-wide limits
+    /// shared with every other node built with them (see [`limits`]).
+    /// Without this, nothing changes.
+    pub fn with_shared_limits(mut self, limits: SharedLimits) -> Self {
+        self.retriever = self.retriever.with_shared_limits(limits);
+        self
+    }
+
+    /// Puts the provider's background work in `queue`, its instance's.
+    pub fn with_background_queue(mut self, queue: BackgroundQueue) -> Self {
+        self.retriever = self.retriever.with_background_queue(queue);
+        self
+    }
+
+    /// The queue its background work goes through: what is outstanding, and
+    /// what was dropped.
+    pub fn background_queue(&self) -> &BackgroundQueue {
+        self.retriever.background_queue()
     }
 
     /// Runs a retrieval future from the synchronous provider methods.
@@ -7451,8 +7614,11 @@ impl SharedBitswapClient {
     /// Builds the shared swarm and spawns its task: in `instance`'s task
     /// set, so the instance's cancellation ends it and drops the swarm and
     /// its connections, or on the ambient runtime without one.
-    async fn spawn(instance: Option<&InstanceContext>) -> Result<Self> {
-        let swarm = build_bitswap_swarm().await?;
+    async fn spawn(
+        instance: Option<&InstanceContext>,
+        limits: Option<&SharedLimits>,
+    ) -> Result<Self> {
+        let swarm = build_bitswap_swarm(limits).await?;
         let mut control = swarm.behaviour().stream.new_control();
         let incoming = accept_bitswap_streams(&mut control)?;
         let (commands, receiver) = mpsc::channel(64);
@@ -8877,6 +9043,10 @@ struct BitswapBehaviour {
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     limits: connection_limits::Behaviour,
+    /// The process-wide cap, across every node's swarm, when the node has
+    /// shared limits; after the per-swarm limits, so a connection they deny
+    /// never takes a shared slot.
+    shared_limit: Toggle<SharedConnectionLimit>,
 }
 
 fn bitswap_connection_limits() -> connection_limits::ConnectionLimits {
@@ -8886,7 +9056,10 @@ fn bitswap_connection_limits() -> connection_limits::ConnectionLimits {
         .with_max_established(Some(BITSWAP_MAX_ESTABLISHED_CONNECTIONS))
 }
 
-async fn build_bitswap_swarm() -> Result<libp2p::Swarm<BitswapBehaviour>> {
+async fn build_bitswap_swarm(
+    limits: Option<&SharedLimits>,
+) -> Result<libp2p::Swarm<BitswapBehaviour>> {
+    let shared_limit = Toggle::from(limits.map(SharedLimits::bitswap_connection_limit));
     let swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -8909,6 +9082,7 @@ async fn build_bitswap_swarm() -> Result<libp2p::Swarm<BitswapBehaviour>> {
             )),
             ping: ping::Behaviour::new(ping::Config::new()),
             limits: connection_limits::Behaviour::new(bitswap_connection_limits()),
+            shared_limit,
         })
         .map_err(|err| RetrievalError::Bitswap(err.to_string()))?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(BITSWAP_IDLE_CONNECTION_TIMEOUT))
@@ -11353,6 +11527,328 @@ mod inflight_lifetime_tests {
 }
 
 #[cfg(test)]
+mod shared_limits_tests {
+    use super::*;
+    use freedom_ipfs_core::{cid_from_data, CODEC_RAW};
+    use std::net::SocketAddr;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt as TokioAsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt};
+
+    /// A local HTTP provider. It answers each block's request at once, but
+    /// holds the answers for the `held` blocks until [`HeldProvider::release`];
+    /// it records each request's CID as it arrives.
+    struct HeldProvider {
+        addr: SocketAddr,
+        arrivals: Arc<StdMutex<Vec<String>>>,
+        release: tokio::sync::watch::Sender<bool>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl HeldProvider {
+        async fn spawn(blocks: &[(Cid, Vec<u8>)], held: &[Cid]) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let blocks: Arc<HashMap<String, Vec<u8>>> = Arc::new(
+                blocks
+                    .iter()
+                    .map(|(cid, data)| (cid.to_string(), data.clone()))
+                    .collect(),
+            );
+            let held: Arc<BTreeSet<String>> =
+                Arc::new(held.iter().map(ToString::to_string).collect());
+            let arrivals = Arc::new(StdMutex::new(Vec::new()));
+            let (release, released) = tokio::sync::watch::channel(false);
+            let task = tokio::spawn({
+                let arrivals = arrivals.clone();
+                async move {
+                    while let Ok((mut stream, _)) = listener.accept().await {
+                        let (blocks, held, arrivals) =
+                            (blocks.clone(), held.clone(), arrivals.clone());
+                        let mut released = released.clone();
+                        tokio::spawn(async move {
+                            let mut request = vec![0u8; 4096];
+                            let Ok(len) = TokioAsyncReadExt::read(&mut stream, &mut request).await
+                            else {
+                                return;
+                            };
+                            let request = String::from_utf8_lossy(&request[..len]);
+                            let Some(cid) = request
+                                .split("/ipfs/")
+                                .nth(1)
+                                .and_then(|rest| rest.split(['?', ' ']).next())
+                                .map(str::to_string)
+                            else {
+                                return;
+                            };
+                            arrivals.lock().unwrap().push(cid.clone());
+                            if held.contains(&cid) {
+                                let _ = released.wait_for(|released| *released).await;
+                            }
+                            let Some(data) = blocks.get(&cid) else {
+                                return;
+                            };
+                            let mut response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                data.len()
+                            )
+                            .into_bytes();
+                            response.extend_from_slice(data);
+                            let _ = TokioAsyncWriteExt::write_all(&mut stream, &response).await;
+                        });
+                    }
+                }
+            });
+            Self {
+                addr,
+                arrivals,
+                release,
+                task,
+            }
+        }
+
+        fn record(&self) -> CachedProviderRecord {
+            CachedProviderRecord {
+                id: None,
+                addrs: vec![format!(
+                    "/ip4/{}/tcp/{}/http",
+                    self.addr.ip(),
+                    self.addr.port()
+                )],
+            }
+        }
+
+        fn saw(&self, cid: &Cid) -> bool {
+            self.arrivals.lock().unwrap().contains(&cid.to_string())
+        }
+
+        async fn wait_for(&self, cid: &Cid) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !self.saw(cid) {
+                assert!(
+                    Instant::now() < deadline,
+                    "{cid} never reached the provider"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        fn release(&self) {
+            self.release.send_replace(true);
+        }
+    }
+
+    impl Drop for HeldProvider {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// A retriever whose store knows `provider` for each of `cids`, so it
+    /// fetches them without a routing lookup.
+    fn retriever_for(provider: &HeldProvider, cids: &[Cid]) -> HttpRetriever {
+        let store = SqliteBlockStore::in_memory(1 << 20).unwrap();
+        for cid in cids {
+            store
+                .put_provider_records(cid, &[provider.record()], Duration::from_secs(60))
+                .unwrap();
+        }
+        HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store,
+        )
+    }
+
+    fn block(data: &[u8]) -> (Cid, Vec<u8>) {
+        (cid_from_data(CODEC_RAW, data), data.to_vec())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retrievers_sharing_limits_take_turns_at_block_fetches() {
+        let limits = SharedLimits::new(LimitSizes {
+            block_fetches: 1,
+            ..LimitSizes::default()
+        });
+        let (first, first_data) = block(b"the first instance's block");
+        let (second, second_data) = block(b"the second instance's block");
+        let provider = HeldProvider::spawn(
+            &[(first, first_data.clone()), (second, second_data.clone())],
+            &[first],
+        )
+        .await;
+        let one = retriever_for(&provider, &[first]).with_shared_limits(limits.clone());
+        let two = retriever_for(&provider, &[second]).with_shared_limits(limits.clone());
+
+        let leader = tokio::spawn(async move { one.fetch_block_with_source(&first).await });
+        provider.wait_for(&first).await;
+        assert_eq!(limits.block_fetches_in_flight(), 1);
+
+        // The other retriever's fetch waits, before its provider lookup.
+        let follower = tokio::spawn(async move { two.fetch_block_with_source(&second).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!follower.is_finished(), "it waits for the first fetch");
+        assert!(!provider.saw(&second), "and hasn't reached the network");
+
+        // Once the first ends, its permit passes on.
+        provider.release();
+        let (block, source) = leader.await.unwrap().unwrap();
+        assert_eq!(
+            (block.data(), source),
+            (&first_data[..], RetrievalSource::HttpProvider)
+        );
+        let (block, _) = follower.await.unwrap().unwrap();
+        assert_eq!(block.data(), &second_data[..]);
+        assert_eq!(limits.block_fetches_in_flight(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_provider_requests_share_a_process_wide_limit() {
+        let limits = SharedLimits::new(LimitSizes {
+            http_provider_requests: 1,
+            ..LimitSizes::default()
+        });
+        let (first, first_data) = block(b"a held HTTP request");
+        let (second, second_data) = block(b"a waiting HTTP request");
+        let provider = HeldProvider::spawn(
+            &[(first, first_data.clone()), (second, second_data.clone())],
+            &[first],
+        )
+        .await;
+        let one = retriever_for(&provider, &[first]).with_shared_limits(limits.clone());
+        let two = retriever_for(&provider, &[second]).with_shared_limits(limits.clone());
+
+        let leader = tokio::spawn(async move { one.fetch_block_with_source(&first).await });
+        provider.wait_for(&first).await;
+        let follower = tokio::spawn(async move { two.fetch_block_with_source(&second).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Both fetches are admitted; only one request is in flight.
+        assert_eq!(limits.block_fetches_in_flight(), 2);
+        assert_eq!(limits.http_provider_requests_in_flight(), 1);
+        assert!(!follower.is_finished());
+        assert!(!provider.saw(&second), "the second request waits");
+
+        provider.release();
+        assert_eq!(leader.await.unwrap().unwrap().0.data(), &first_data[..]);
+        assert_eq!(follower.await.unwrap().unwrap().0.data(), &second_data[..]);
+        assert_eq!(limits.http_provider_requests_in_flight(), 0);
+        assert_eq!(limits.block_fetches_in_flight(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn background_work_past_the_queue_is_dropped_and_fetches_are_not() {
+        let (cid, data) = block(b"request work goes on");
+        let provider = HeldProvider::spawn(&[(cid, data.clone())], &[]).await;
+        let retriever = retriever_for(&provider, &[cid]);
+        let queue = retriever.background_queue().clone();
+        assert_eq!(queue.capacity(), 64);
+
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        for _ in 0..64 {
+            let gate = gate.clone();
+            retriever.spawn_background_task("test", async move {
+                let _ = gate.acquire().await;
+            });
+        }
+        assert_eq!(queue.outstanding(), 64);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        retriever.spawn_background_task("test", async move {
+            flag.store(true, Ordering::SeqCst);
+        });
+        assert_eq!((queue.outstanding(), queue.dropped()), (64, 1));
+
+        // A request's fetch doesn't go through the queue.
+        let (block, _) = retriever.fetch_block_with_source(&cid).await.unwrap();
+        assert_eq!(block.data(), &data[..]);
+
+        gate.add_permits(64);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while queue.outstanding() > 0 {
+            assert!(Instant::now() < deadline, "the background work never ended");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!ran.load(Ordering::SeqCst), "the dropped work never ran");
+    }
+
+    async fn established(swarm: &mut libp2p::Swarm<BitswapBehaviour>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let SwarmEvent::ConnectionEstablished { .. } = swarm.select_next_some().await {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bitswap_swarms_sharing_limits_are_capped_together() {
+        let limits = SharedLimits::new(LimitSizes {
+            bitswap_connections: 1,
+            ..LimitSizes::default()
+        });
+        // A local peer that accepts connections.
+        let mut peer = SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                (tls::Config::new, noise::Config::new),
+                yamux::Config::default,
+            )
+            .unwrap()
+            .with_behaviour(|_| libp2p_stream::Behaviour::new())
+            .unwrap()
+            .with_swarm_config(|config| {
+                config.with_idle_connection_timeout(Duration::from_secs(30))
+            })
+            .build();
+        let peer_id = *peer.local_peer_id();
+        peer.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = peer.select_next_some().await {
+                break address.with_p2p(peer_id).unwrap();
+            }
+        };
+        let peer_task = tokio::spawn(async move {
+            loop {
+                let _ = peer.select_next_some().await;
+            }
+        });
+
+        // Two nodes' swarms: the first's connection fills the shared cap.
+        let mut first = build_bitswap_swarm(Some(&limits)).await.unwrap();
+        let mut second = build_bitswap_swarm(Some(&limits)).await.unwrap();
+        first.dial(addr.clone()).unwrap();
+        established(&mut first).await;
+        assert_eq!(limits.bitswap_connections(), 1);
+
+        // The second's dial is denied, not queued, as a connection limit.
+        let err = second.dial(addr.clone()).unwrap_err();
+        assert!(
+            is_connection_limit_error(&format_error_detail(&err)),
+            "{err:?}"
+        );
+        assert_eq!(limits.bitswap_connections_denied(), 1);
+
+        // A swarm that ends gives its connections' slots back.
+        drop(first);
+        assert_eq!(limits.bitswap_connections(), 0);
+        second.dial(addr.clone()).unwrap();
+        established(&mut second).await;
+        assert_eq!(limits.bitswap_connections(), 1);
+
+        // A swarm built without shared limits isn't counted.
+        let mut free = build_bitswap_swarm(None).await.unwrap();
+        free.dial(addr).unwrap();
+        established(&mut free).await;
+        assert_eq!(limits.bitswap_connections(), 1);
+        peer_task.abort();
+    }
+}
+
+#[cfg(test)]
 mod bitswap_tests {
     use super::*;
     use serde::Deserialize;
@@ -12460,14 +12956,14 @@ mod bitswap_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn bitswap_client_swarm_does_not_listen_for_inbound_peers() {
-        let swarm = build_bitswap_swarm().await.unwrap();
+        let swarm = build_bitswap_swarm(None).await.unwrap();
 
         assert_eq!(swarm.listeners().count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn shared_bitswap_swarm_exits_when_commands_close() {
-        let swarm = build_bitswap_swarm().await.unwrap();
+        let swarm = build_bitswap_swarm(None).await.unwrap();
         let mut control = swarm.behaviour().stream.new_control();
         let incoming = accept_bitswap_streams(&mut control).unwrap();
         let (commands, receiver) = mpsc::channel(1);
@@ -12501,7 +12997,7 @@ mod bitswap_tests {
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
         let (peer_id, addr, swarm_task, stream_task, want_seen) =
             spawn_bitswap_peer_waiting_for_stream_close(cid).await;
-        let client = SharedBitswapClient::spawn(None).await.unwrap();
+        let client = SharedBitswapClient::spawn(None, None).await.unwrap();
         let fetch_task = tokio::spawn(async move {
             client
                 .fetch(
@@ -12796,7 +13292,7 @@ mod bitswap_tests {
             ])
             .await;
 
-        let mut swarm = build_bitswap_swarm().await.unwrap();
+        let mut swarm = build_bitswap_swarm(None).await.unwrap();
         let mut control = swarm.behaviour().stream.new_control();
         swarm
             .dial(addr.with_p2p(peer_id).unwrap_or_else(|addr| addr))
@@ -12845,7 +13341,7 @@ mod bitswap_tests {
                 (second, second_data.to_vec()),
             ])
             .await;
-        let client = SharedBitswapClient::spawn(None).await.unwrap();
+        let client = SharedBitswapClient::spawn(None, None).await.unwrap();
 
         let result = client
             .fetch_many(
@@ -12886,7 +13382,7 @@ mod bitswap_tests {
                 (second, second_data.to_vec()),
             ])
             .await;
-        let client = SharedBitswapClient::spawn(None).await.unwrap();
+        let client = SharedBitswapClient::spawn(None, None).await.unwrap();
 
         let result = client
             .fetch_many(
@@ -12996,7 +13492,7 @@ mod bitswap_tests {
 
     #[tokio::test]
     async fn shared_bitswap_client_fetch_many_rejects_empty_batch() {
-        let client = SharedBitswapClient::spawn(None).await.unwrap();
+        let client = SharedBitswapClient::spawn(None, None).await.unwrap();
         let err = client.fetch_many(Vec::new(), Vec::new()).await.unwrap_err();
 
         assert!(

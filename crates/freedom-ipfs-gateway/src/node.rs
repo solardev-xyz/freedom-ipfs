@@ -24,6 +24,12 @@
 //!
 //! Building opens nothing: no socket, no task. Routing, retrieval and name
 //! resolution start their work on the first request.
+//!
+//! A host that runs several nodes in one process gives each builder a clone
+//! of one [`SharedLimits`] ([`OnlineNodeBuilder::shared_limits`]), so their
+//! block fetches, HTTP provider requests, Bitswap connections and DHT queries
+//! count against one set of process-wide limits. Each node also bounds its
+//! own background work ([`OnlineNode::background_queue`]).
 
 use std::future::Future;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -39,7 +45,9 @@ use freedom_ipfs_namesys::{
     FallbackIpnsResolver, IpnsResolver, NameResolver,
 };
 use freedom_ipfs_retrieval::instance::Fenced;
-use freedom_ipfs_retrieval::{CancellationToken, FetchingBlockProvider, InstanceContext};
+use freedom_ipfs_retrieval::{
+    BackgroundQueue, CancellationToken, FetchingBlockProvider, InstanceContext, SharedLimits,
+};
 use freedom_ipfs_routing::{
     AutoRoutingClient, DelegatedRoutingClient, DhtIpnsResolver, LightDhtClient,
     ProviderRoutingClient, RoutingStatsHandle, DEFAULT_DELEGATED_ROUTER,
@@ -71,6 +79,7 @@ pub struct OnlineNodeBuilder {
     dht_query_timeout: Option<Duration>,
     dht_max_providers: Option<usize>,
     gateway_config: GatewayConfig,
+    shared_limits: Option<SharedLimits>,
 }
 
 impl OnlineNodeBuilder {
@@ -110,6 +119,16 @@ impl OnlineNodeBuilder {
         self
     }
 
+    /// Process-wide limits the node shares with every other node built with
+    /// clones of `limits` (design 0007, "Budgets"): block fetches, HTTP
+    /// provider requests, Bitswap connections and DHT queries. The node's
+    /// own limits still apply inside them. Unless set, the node has none of
+    /// these limits.
+    pub fn shared_limits(mut self, limits: SharedLimits) -> Self {
+        self.shared_limits = Some(limits);
+        self
+    }
+
     /// Wires the node. This opens no socket and starts no task.
     pub fn build(self) -> OnlineNode {
         self.build_with(None)
@@ -144,8 +163,12 @@ impl OnlineNodeBuilder {
             dht_query_timeout,
             dht_max_providers,
             gateway_config,
+            shared_limits,
         } = self;
         let routing_stats = RoutingStatsHandle::default();
+        // The node's background queue, shared by its retriever and by every
+        // gateway built from it.
+        let background = BackgroundQueue::default();
         let (routing, name_resolver): (ProviderRoutingClient, Arc<dyn NameResolver>) =
             match routing_mode {
                 RoutingMode::Offline => (
@@ -159,6 +182,9 @@ impl OnlineNodeBuilder {
                     }
                     if let Some(max_providers) = dht_max_providers {
                         dht = dht.with_max_providers(max_providers);
+                    }
+                    if let Some(limits) = &shared_limits {
+                        dht = dht.with_query_limiter(limits.dht_query_limiter());
                     }
                     let delegated =
                         DelegatedRoutingClient::with_endpoints(delegated_routers.clone());
@@ -191,9 +217,13 @@ impl OnlineNodeBuilder {
                 }
             };
         let mut provider =
-            FetchingBlockProvider::new(store.clone(), routing.with_stats(routing_stats.clone()));
+            FetchingBlockProvider::new(store.clone(), routing.with_stats(routing_stats.clone()))
+                .with_background_queue(background.clone());
         if let Some(instance) = &instance {
             provider = provider.with_instance(instance.clone());
+        }
+        if let Some(limits) = &shared_limits {
+            provider = provider.with_shared_limits(limits.clone());
         }
         let block_provider: Arc<dyn BlockProvider> = Arc::new(provider.clone());
         OnlineNode {
@@ -205,6 +235,8 @@ impl OnlineNodeBuilder {
             routing_stats,
             gateway_config,
             instance,
+            background,
+            shared_limits,
         }
     }
 }
@@ -222,6 +254,9 @@ pub struct OnlineNode {
     gateway_config: GatewayConfig,
     /// The owned instance whose gateways' background jobs it runs, if any.
     instance: Option<InstanceContext>,
+    /// Its background queue, shared by its retriever and its gateways.
+    background: BackgroundQueue,
+    shared_limits: Option<SharedLimits>,
 }
 
 impl OnlineNode {
@@ -236,6 +271,7 @@ impl OnlineNode {
             dht_query_timeout: None,
             dht_max_providers: None,
             gateway_config: GatewayConfig::default(),
+            shared_limits: None,
         }
     }
 
@@ -246,7 +282,8 @@ impl OnlineNode {
             self.block_provider.clone(),
             self.name_resolver.clone(),
             self.gateway_config.clone(),
-        );
+        )
+        .with_background_queue(&self.background);
         match &self.instance {
             Some(instance) => core.with_instance(instance.clone()),
             None => core,
@@ -260,7 +297,8 @@ impl OnlineNode {
             self.block_provider.clone(),
             self.name_resolver.clone(),
             self.gateway_config.clone(),
-        );
+        )
+        .with_background_queue(&self.background);
         router_with_state(match &self.instance {
             Some(instance) => state.with_instance(instance.clone()),
             None => state,
@@ -300,6 +338,17 @@ impl OnlineNode {
     /// The gateway configuration it was built with.
     pub fn gateway_config(&self) -> &GatewayConfig {
         &self.gateway_config
+    }
+
+    /// Its background queue: the work it started that no request awaits,
+    /// at most [`BackgroundQueue::capacity`] items, and what was dropped.
+    pub fn background_queue(&self) -> &BackgroundQueue {
+        &self.background
+    }
+
+    /// The process-wide limits it was built with, if any.
+    pub fn shared_limits(&self) -> Option<&SharedLimits> {
+        self.shared_limits.as_ref()
     }
 }
 
@@ -641,6 +690,7 @@ mod tests {
     use crate::GatewayCoreRequest;
     use axum::body::to_bytes;
     use axum::http::{HeaderMap, Method, StatusCode};
+    use cid::Cid;
     use freedom_ipfs_core::{cid_from_data, CODEC_RAW};
     use std::cell::Cell;
 
@@ -777,6 +827,7 @@ mod tests {
         assert_eq!(builder.delegated_routers, [DEFAULT_DELEGATED_ROUTER]);
         assert_eq!(builder.dht_query_timeout, None);
         assert_eq!(builder.dht_max_providers, None);
+        assert!(builder.shared_limits.is_none(), "no shared limits");
         let config = GatewayConfig::default();
         assert_eq!(
             builder.gateway_config.max_concurrent_requests(),
@@ -838,6 +889,207 @@ mod tests {
             ))
             .await;
         assert!(!response.status().is_success());
+    }
+
+    /// A local HTTP provider whose answer for `held` waits until released;
+    /// it records each request's CID as it arrives.
+    struct HeldProvider {
+        addr: std::net::SocketAddr,
+        arrivals: Arc<Mutex<Vec<String>>>,
+        release: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl HeldProvider {
+        async fn spawn(blocks: Vec<(Cid, Vec<u8>)>, held: Cid) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let blocks: Arc<Vec<(String, Vec<u8>)>> = Arc::new(
+                blocks
+                    .into_iter()
+                    .map(|(cid, data)| (cid.to_string(), data))
+                    .collect(),
+            );
+            let arrivals = Arc::new(Mutex::new(Vec::new()));
+            let (release, released) = tokio::sync::watch::channel(false);
+            let recorded = arrivals.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let (blocks, recorded) = (blocks.clone(), recorded.clone());
+                    let mut released = released.clone();
+                    tokio::spawn(async move {
+                        let mut request = vec![0u8; 4096];
+                        let Ok(len) = stream.read(&mut request).await else {
+                            return;
+                        };
+                        let request = String::from_utf8_lossy(&request[..len]).to_string();
+                        let Some((cid, data)) = blocks
+                            .iter()
+                            .find(|(cid, _)| request.contains(&format!("/ipfs/{cid}")))
+                        else {
+                            return;
+                        };
+                        lock(&recorded).push(cid.clone());
+                        if *cid == held.to_string() {
+                            let _ = released.wait_for(|released| *released).await;
+                        }
+                        let mut response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            data.len()
+                        )
+                        .into_bytes();
+                        response.extend_from_slice(data);
+                        let _ = stream.write_all(&response).await;
+                    });
+                }
+            });
+            Self {
+                addr,
+                arrivals,
+                release,
+            }
+        }
+
+        fn record(&self) -> freedom_ipfs_store::CachedProviderRecord {
+            freedom_ipfs_store::CachedProviderRecord {
+                id: None,
+                addrs: vec![format!("/ip4/127.0.0.1/tcp/{}/http", self.addr.port())],
+            }
+        }
+
+        fn saw(&self, cid: &Cid) -> bool {
+            lock(&self.arrivals).contains(&cid.to_string())
+        }
+    }
+
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn instances_sharing_limits_take_turns_and_a_cancelled_wait_ends_at_once() {
+        let fixtures = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let block = |data: &[u8]| (cid_from_data(CODEC_RAW, data), data.to_vec());
+        let (held, held_data) = block(b"the first instance's block");
+        let (cancelled, cancelled_data) = block(b"a block whose request is cancelled");
+        let (waiting, waiting_data) = block(b"a block whose request waits its turn");
+        let provider = fixtures.block_on(HeldProvider::spawn(
+            vec![
+                (held, held_data.clone()),
+                (cancelled, cancelled_data),
+                (waiting, waiting_data.clone()),
+            ],
+            held,
+        ));
+        // One block fetch at a time, across both instances.
+        let limits = SharedLimits::new(freedom_ipfs_retrieval::LimitSizes {
+            block_fetches: 1,
+            ..Default::default()
+        });
+        let instance = |name: &str, cids: &[Cid]| {
+            let store = SqliteBlockStore::in_memory(1 << 20).unwrap();
+            for cid in cids {
+                store
+                    .put_provider_records(cid, &[provider.record()], Duration::from_secs(60))
+                    .unwrap();
+            }
+            OnlineNode::builder(store)
+                .routing_mode(RoutingMode::Offline)
+                .shared_limits(limits.clone())
+                .build_instance(InstanceConfig {
+                    thread_name: name.into(),
+                    worker_threads: 2,
+                    max_blocking_threads: 8,
+                })
+                .unwrap()
+        };
+        let first = instance("fipfs-limits-1", &[held]);
+        let second = instance("fipfs-limits-2", &[cancelled, waiting]);
+        let request = |instance: &Instance, token: CancellationToken, cid: Cid| {
+            let core = instance.gateway_core();
+            instance
+                .spawn_request(token, async move { get(&core, &cid.to_string()).await })
+                .unwrap()
+        };
+
+        // The first instance's fetch holds the only permit.
+        let leader = request(&first, first.request_token(), held);
+        wait_until("the first fetch never started", || provider.saw(&held));
+        assert_eq!(limits.block_fetches_in_flight(), 1);
+
+        // The second instance's requests wait for it, inside their blocking
+        // regions, before their fetches start.
+        let token = second.request_token();
+        let doomed = request(&second, token.clone(), cancelled);
+        let patient = request(&second, second.request_token(), waiting);
+        wait_until("the second instance's requests never blocked", || {
+            second.context().blocking_regions() == 2
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!doomed.is_finished() && !patient.is_finished());
+        assert!(!provider.saw(&cancelled) && !provider.saw(&waiting));
+
+        // Cancelling one request ends its wait at once.
+        let started = Instant::now();
+        token.cancel();
+        assert_eq!(fixtures.block_on(doomed).unwrap(), None);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        wait_until("the cancelled region never ended", || {
+            second.context().blocking_regions() == 1
+        });
+        assert!(!patient.is_finished(), "the other request still waits");
+        assert_eq!(limits.block_fetches_in_flight(), 1);
+
+        // Once the first fetch ends, the waiting one has its turn.
+        provider.release.send_replace(true);
+        let (status, body) = fixtures.block_on(leader).unwrap().unwrap();
+        assert_eq!((status, body), (StatusCode::OK, held_data));
+        let (status, body) = fixtures.block_on(patient).unwrap().unwrap();
+        assert_eq!((status, body), (StatusCode::OK, waiting_data));
+        assert!(
+            !provider.saw(&cancelled),
+            "the cancelled fetch never started"
+        );
+        assert_eq!(limits.block_fetches_in_flight(), 0);
+
+        for instance in [first, second] {
+            let quiescence = instance.shutdown(Duration::from_secs(5));
+            assert!(quiescence.reached, "{quiescence:?}");
+        }
+    }
+
+    #[test]
+    fn a_node_shares_one_background_queue_with_its_gateways() {
+        let store = SqliteBlockStore::in_memory(1 << 20).unwrap();
+        let node = OnlineNode::builder(store)
+            .routing_mode(RoutingMode::Offline)
+            .build();
+        assert!(node.shared_limits().is_none());
+        let queue = node.background_queue();
+        let slots: Vec<_> = (0..queue.capacity())
+            .map(|_| queue.try_admit().unwrap())
+            .collect();
+        assert_eq!(queue.capacity(), 64);
+        // The retriever's and every gateway's background work count in it.
+        assert!(node.provider().background_queue().try_admit().is_none());
+        let core = node.gateway_core();
+        assert!(core.state.html_prefetch.jobs.queue.try_admit().is_none());
+        assert!(core.state.html_range_warm.jobs.queue.try_admit().is_none());
+        assert_eq!(queue.dropped(), 3);
+        drop(slots);
+        assert_eq!(queue.outstanding(), 0);
     }
 
     #[test]
