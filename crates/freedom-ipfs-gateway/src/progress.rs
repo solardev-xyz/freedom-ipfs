@@ -17,22 +17,28 @@
 //!   [`ProgressRecorder::mark_runtime_threads`]: the runtime's workers, and
 //!   its blocking pool's threads, which run its `spawn_blocking` jobs and
 //!   take over from a worker that enters `block_in_place`.
-//! - **A span** of freedom-ipfs's takes its recorder when it is created:
-//!   its parent span's, or else the creating thread's. It keeps it on
-//!   whatever thread it is entered later, so a request's response body
-//!   records into the request's node wherever its reader polls it.
-//! - **An event** goes to its span's recorder, or else its thread's, or
-//!   else the process's [`default_recorder`].
+//! - **A span** of freedom-ipfs's takes its recorder when it is created,
+//!   and keeps it for its life, on whatever thread it is entered: a gateway
+//!   request's root span takes its gateway's
+//!   ([`GatewayCore::with_progress`](crate::GatewayCore::with_progress)),
+//!   whatever span is current; any other span its parent span's, or else
+//!   the creating thread's, or else the default. So a request's descendants
+//!   and its response body record into the request's node, wherever its
+//!   reader polls it.
+//! - **An event** goes to the recorder of its span: its explicit parent, or
+//!   else the current span, unless it is a root event (`parent: None`).
+//!   Without a span, it goes to its thread's recorder, or else the
+//!   process's [`default_recorder`].
 //!
 //! An [`Instance`](crate::Instance) marks its runtime with a recorder of its
 //! own ([`Instance::progress`](crate::Instance::progress)), so everything
 //! that runs there records there: its requests, the tasks it starts for
 //! itself (the Bitswap swarm's, preconnects) and its blocking jobs. A
-//! node's gateways enter its recorder around each request
-//! ([`GatewayCore::handle`](crate::GatewayCore::handle)), so a request a
-//! host polls on a thread of its own records there too, and the request's
-//! spans carry the recorder to its body. Two instances' progress never
-//! mixes.
+//! node's gateways bind each request's span to its recorder, and run the
+//! request in its scope ([`GatewayCore::handle`](crate::GatewayCore::handle)),
+//! so a request a host polls on a thread of its own, or under another
+//! node's span, records there too, and the request's spans carry the
+//! recorder to its body. Two instances' progress never mixes.
 //!
 //! What still reaches the default recorder is work on a thread no node
 //! marked, outside any node's scope and spans:
@@ -55,9 +61,17 @@
 //! cancelled it, or its reader dropped the body) emits neither. Its span
 //! closes once nothing holds it: its future, its body, and the spans
 //! opened inside it, such as a background prefetch's. If its target is
-//! still open then, the recorder closes it with an event of its own: raw
-//! phase `request_cancelled`, phase and status `cancelled`. No other layer
-//! sees that event.
+//! still open then, and still its own, the recorder closes it with an event
+//! of its own: raw phase `request_cancelled`, phase and status
+//! `cancelled`. No other layer sees that event.
+//!
+//! "Its own": the recorder keeps, for each active target, the span that
+//! owns it, which is the last span whose event for the target it stands
+//! for left it active. That changes under the recorder's lock with the
+//! event itself, so it follows the order the recorder takes events in,
+//! whichever threads emit them. A closing span cancels only a target it
+//! still owns: not one a newer request reusing its id took over, nor one
+//! the host cleared.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -65,8 +79,8 @@ use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::task::Poll;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -86,10 +100,16 @@ const REQUEST_CANCELLED: &str = "request_cancelled";
 static DEFAULT_RECORDER: OnceLock<ProgressRecorder> = OnceLock::new();
 static PROGRESS_TRACING_INIT: Once = Once::new();
 static PROGRESS_LAYER_ISSUED: AtomicBool = AtomicBool::new(false);
+/// The next span's owner token: unique for the process's life, unlike span
+/// ids, which the registry reuses.
+static NEXT_SPAN_OWNER: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     /// The recorder this thread's events go to when their span names none.
     static THREAD_RECORDER: RefCell<Option<ProgressRecorder>> = const { RefCell::new(None) };
+    /// The recorder that owns the spans this thread creates now, whatever
+    /// their parent: a gateway's, around its request's root span.
+    static SPAN_OWNER: RefCell<Option<ProgressRecorder>> = const { RefCell::new(None) };
 }
 
 /// The current thread's recorder, if any. None while the thread's locals
@@ -97,6 +117,14 @@ thread_local! {
 fn thread_recorder() -> Option<ProgressRecorder> {
     THREAD_RECORDER
         .try_with(|current| current.borrow().clone())
+        .ok()
+        .flatten()
+}
+
+/// The recorder that owns the spans the current thread creates now, if any.
+fn span_owner() -> Option<ProgressRecorder> {
+    SPAN_OWNER
+        .try_with(|owner| owner.borrow().clone())
         .ok()
         .flatten()
 }
@@ -140,6 +168,19 @@ struct ProgressInner {
     next_event_id: u64,
     events: VecDeque<ProgressEvent>,
     active_targets: HashMap<String, ProgressTarget>,
+    /// The owner token of the span that owns each active target: the last
+    /// one whose event for the target it stands for left it active. Only an
+    /// active target has an owner, and only its owner's close cancels it.
+    owners: HashMap<String, u64>,
+}
+
+/// Which events `ProgressRecorder::record` takes.
+enum Admit {
+    /// An event, emitted in the span with this owner token, if any.
+    Event { owner: Option<u64> },
+    /// The cancel of a closed span: only if the span with this owner token
+    /// still owns its target.
+    IfOwnedBy(u64),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -196,12 +237,6 @@ struct ProgressTarget {
     updated_ms: u64,
 }
 
-/// The target an event was recorded for, and whether it ended it.
-struct RecordedTarget {
-    key: String,
-    ended: bool,
-}
-
 /// A recorder's snapshot, which serializes to the JSON
 /// docs/mobile-progress-api.md describes.
 #[derive(Clone, Debug, Serialize)]
@@ -239,6 +274,21 @@ impl ProgressRecorder {
         }
     }
 
+    /// Makes the spans the current thread creates until the guard is
+    /// dropped belong to this recorder, whatever their parent. A gateway
+    /// creates its request's root span under it, so a request it serves
+    /// records into its node even while another node's span is current;
+    /// the root's descendants and its body inherit it as usual.
+    pub(crate) fn own_new_spans(&self) -> SpanOwnerScope {
+        SpanOwnerScope {
+            previous: SPAN_OWNER
+                .try_with(|owner| owner.replace(Some(self.clone())))
+                .ok()
+                .flatten(),
+            _thread: PhantomData,
+        }
+    }
+
     /// Makes every thread of the runtime `builder` builds record into this
     /// recorder: its workers, and its blocking pool's threads. This takes
     /// the builder's `on_thread_start` and `on_thread_stop`.
@@ -252,34 +302,31 @@ impl ProgressRecorder {
             .on_thread_stop(|| drop(set_thread_recorder(None)))
     }
 
-    fn record_event(
-        &self,
-        span: ProgressSpanFields,
-        fields: ProgressFields,
-        _metadata_name: &str,
-    ) -> Option<RecordedTarget> {
-        self.record(span, fields, false)
+    /// Records an event emitted in `span`, whose owner token is `owner`
+    /// (`None` outside a span).
+    fn record_event(&self, span: ProgressSpanFields, fields: ProgressFields, owner: Option<u64>) {
+        self.record(span, fields, Admit::Event { owner });
     }
 
-    /// Closes the target `span` stands for, as cancelled, if it is still
-    /// active.
-    fn record_cancelled(&self, span: ProgressSpanFields) {
+    /// The span with owner token `owner` closed: if it still owns the
+    /// target it stands for, nothing ended that target, so it is closed as
+    /// cancelled.
+    fn close_span(&self, owner: u64, span: ProgressSpanFields) {
         let mut fields = ProgressFields::default();
         fields
             .values
             .insert("phase".into(), REQUEST_CANCELLED.into());
-        drop(self.record(span, fields, true));
+        self.record(span, fields, Admit::IfOwnedBy(owner));
     }
 
-    /// Records an event, unless it has no phase, or `only_if_active` and
-    /// its target isn't active.
-    fn record(
-        &self,
-        span: ProgressSpanFields,
-        fields: ProgressFields,
-        only_if_active: bool,
-    ) -> Option<RecordedTarget> {
-        let raw_phase = fields.get("phase").cloned()?;
+    /// Records an event that has a phase, as `admit` says. The event, its
+    /// target and the target's owner change under one lock, so they agree
+    /// in the order events are recorded, whichever threads emit them.
+    fn record(&self, span: ProgressSpanFields, fields: ProgressFields, admit: Admit) {
+        let Some(raw_phase) = fields.get("phase").cloned() else {
+            return;
+        };
+        let own_target = span_target_key(&span);
         let kind = progress_kind(&fields, &raw_phase, &span);
         let target_id = progress_target_id(&fields, &span);
         let path = fields.get("path").cloned().or(span.path);
@@ -308,12 +355,21 @@ impl ProgressRecorder {
         let last_error_code = progress_error_code(&raw_phase, &fields, &status);
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,
-            Err(_) => return None,
+            Err(_) => return,
         };
         let target_key = format!("{kind}:{target_id}");
-        if only_if_active && !inner.active_targets.contains_key(&target_key) {
-            return None;
-        }
+        // A span owns only the target it stands for.
+        let owner = match admit {
+            Admit::Event { owner } => {
+                owner.filter(|_| own_target.as_deref() == Some(target_key.as_str()))
+            }
+            Admit::IfOwnedBy(owner) => {
+                if inner.owners.get(&target_key) != Some(&owner) {
+                    return;
+                }
+                Some(owner)
+            }
+        };
         inner.next_event_id = inner.next_event_id.saturating_add(1);
         let previous_target = inner.active_targets.get(&target_key);
         let (
@@ -380,12 +436,17 @@ impl ProgressRecorder {
             inner.events.pop_front();
         }
 
-        let ended = matches!(status.as_str(), "completed" | "failed" | "cancelled");
-        if ended {
+        if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
             inner.active_targets.remove(&target_key);
+            inner.owners.remove(&target_key);
         } else if target_id != 0 {
+            // The span this event is in takes the target over; an event from
+            // elsewhere leaves its owner as it is.
+            if let Some(owner) = owner {
+                inner.owners.insert(target_key.clone(), owner);
+            }
             inner.active_targets.insert(
-                target_key.clone(),
+                target_key,
                 ProgressTarget {
                     id: target_id,
                     request_id,
@@ -412,10 +473,6 @@ impl ProgressRecorder {
                 },
             );
         }
-        Some(RecordedTarget {
-            key: target_key,
-            ended,
-        })
     }
 
     /// The targets still active and the latest events.
@@ -449,6 +506,7 @@ impl ProgressRecorder {
         if let Ok(mut inner) = self.inner.lock() {
             inner.events.clear();
             inner.active_targets.clear();
+            inner.owners.clear();
         }
     }
 }
@@ -538,21 +596,27 @@ struct ProgressLayer {
 
 /// What the layer keeps on a span besides its fields.
 struct SpanRoute {
-    /// The recorder its events go to, fixed when it is created: its parent
-    /// span's, or else the creating thread's. `None` leaves them to the
-    /// thread they are emitted on.
-    recorder: Option<ProgressRecorder>,
-    /// The recorder the target the span stands for (`span_target_key`) is
-    /// open in: set by the span's events that leave it active, cleared by
-    /// the one that ends it.
-    open_in: Mutex<Option<ProgressRecorder>>,
+    /// The recorder its events go to, fixed when it is created: its
+    /// gateway's, for a gateway request's root span; else its parent span's;
+    /// else the creating thread's; else the default.
+    recorder: ProgressRecorder,
+    /// The span's owner token, which the recorder keeps for the target the
+    /// span stands for (`span_target_key`) while the span owns it.
+    owner: u64,
 }
 
-impl SpanRoute {
-    fn open_in(&self) -> MutexGuard<'_, Option<ProgressRecorder>> {
-        self.open_in
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// The time a gateway binds the spans the current thread creates to its
+/// recorder: see [`ProgressRecorder::own_new_spans`].
+pub(crate) struct SpanOwnerScope {
+    previous: Option<ProgressRecorder>,
+    /// Not `Send`: it restores the owner of the thread that set it.
+    _thread: PhantomData<*const ()>,
+}
+
+impl Drop for SpanOwnerScope {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        drop(SPAN_OWNER.try_with(|owner| owner.replace(previous)));
     }
 }
 
@@ -606,21 +670,24 @@ where
             path: fields.get("path").cloned(),
         };
         if let Some(span) = ctx.span(id) {
-            // A span belongs to its parent's node, or else to the thread's.
-            let recorder = span
-                .parent()
-                .and_then(|parent| {
-                    parent
-                        .extensions()
-                        .get::<SpanRoute>()
-                        .and_then(|route| route.recorder.clone())
+            // A gateway's request belongs to the gateway's node; any other
+            // span to its parent's, or else to the thread's.
+            let recorder = span_owner()
+                .or_else(|| {
+                    span.parent().and_then(|parent| {
+                        parent
+                            .extensions()
+                            .get::<SpanRoute>()
+                            .map(|route| route.recorder.clone())
+                    })
                 })
-                .or_else(thread_recorder);
+                .or_else(thread_recorder)
+                .unwrap_or_else(default_recorder);
             let mut extensions = span.extensions_mut();
             extensions.insert(span_fields);
             extensions.insert(SpanRoute {
                 recorder,
-                open_in: Mutex::new(None),
+                owner: NEXT_SPAN_OWNER.fetch_add(1, Ordering::Relaxed),
             });
         }
     }
@@ -628,40 +695,37 @@ where
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let mut fields = ProgressFields::default();
         event.record(&mut fields);
-        let current = ctx.lookup_current();
-        let extensions = current.as_ref().map(|span| span.extensions());
-        let span = extensions
+        // The event's own span: its explicit parent, or else the current
+        // span, unless it is a root event.
+        let span = ctx.event_span(event);
+        let extensions = span.as_ref().map(|span| span.extensions());
+        let span_fields = extensions
             .as_ref()
             .and_then(|extensions| extensions.get::<ProgressSpanFields>().cloned())
             .unwrap_or_default();
-        let recorder = extensions
+        let route = extensions
             .as_ref()
             .and_then(|extensions| extensions.get::<SpanRoute>())
-            .and_then(|route| route.recorder.clone())
-            .or_else(thread_recorder)
-            .unwrap_or_else(default_recorder);
+            .map(|route| (route.recorder.clone(), route.owner));
         drop(extensions);
-        let own_target = span_target_key(&span);
-        let Some(recorded) = recorder.record_event(span, fields, event.metadata().name()) else {
-            return;
+        // Outside a span, by the thread.
+        let (recorder, owner) = match route {
+            Some((recorder, owner)) => (recorder, Some(owner)),
+            None => (thread_recorder().unwrap_or_else(default_recorder), None),
         };
-        // An event of the target the span stands for opens or ends it.
-        if own_target.as_ref() == Some(&recorded.key) {
-            if let Some(span) = &current {
-                if let Some(route) = span.extensions().get::<SpanRoute>() {
-                    *route.open_in() = (!recorded.ended).then_some(recorder);
-                }
-            }
-        }
+        recorder.record_event(span_fields, fields, owner);
+        #[cfg(test)]
+        tests::after_record();
     }
 
     /// A span closes once nothing holds it: its request's future, a
-    /// streamed response's body, and the spans opened inside it. If the
-    /// target it stands for is still open then, no event ended it: the
+    /// streamed response's body, and the spans opened inside it. If it
+    /// still owns the target it stands for then, no event ended it: the
     /// request was dropped first, that is cancelled. Its entry would
-    /// otherwise stay active until the next `clear`, so it is closed here,
-    /// as cancelled, in the recorder it is open in (whichever thread closes
-    /// the span).
+    /// otherwise stay active until the next `clear`, so its recorder closes
+    /// it here, as cancelled, whichever thread closes the span. A target a
+    /// newer span took over, or that was cleared, is not the closing span's
+    /// to cancel.
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
         let Some(span) = ctx.span(&id) else {
             return;
@@ -673,11 +737,9 @@ where
         ) else {
             return;
         };
-        let (fields, open_in) = (fields.clone(), route.open_in().take());
+        let (fields, recorder, owner) = (fields.clone(), route.recorder.clone(), route.owner);
         drop(extensions);
-        if let Some(recorder) = open_in {
-            recorder.record_cancelled(fields);
-        }
+        recorder.close_span(owner, fields);
     }
 }
 
@@ -1122,6 +1184,19 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Runs on this thread after its next event is recorded, before the
+        /// layer returns: where per-span bookkeeping outside the recorder's
+        /// lock would race with another thread's event.
+        static AFTER_RECORD: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn after_record() {
+        if let Some(hook) = AFTER_RECORD.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
     #[test]
     fn progress_snapshot_accumulates_target_counters() {
         let recorder = ProgressRecorder::default();
@@ -1133,7 +1208,7 @@ mod tests {
         recorder.record_event(
             span.clone(),
             progress_fields([("phase", "request_start"), ("request_id", "1")]),
-            "test",
+            None,
         );
         recorder.record_event(
             span.clone(),
@@ -1142,7 +1217,7 @@ mod tests {
                 ("request_id", "1"),
                 ("error", "timeout"),
             ]),
-            "test",
+            None,
         );
         recorder.record_event(
             span.clone(),
@@ -1151,7 +1226,7 @@ mod tests {
                 ("request_id", "1"),
                 ("source", "bitswap"),
             ]),
-            "test",
+            None,
         );
         recorder.record_event(
             span,
@@ -1160,7 +1235,7 @@ mod tests {
                 ("request_id", "1"),
                 ("status", "200"),
             ]),
-            "test",
+            None,
         );
 
         let snapshot = recorder.snapshot_json();
@@ -1194,7 +1269,7 @@ mod tests {
         recorder.record_event(
             span.clone(),
             progress_fields([("phase", "request_start")]),
-            "test",
+            None,
         );
         recorder.record_event(
             span.clone(),
@@ -1203,7 +1278,7 @@ mod tests {
                 ("resource", "file"),
                 ("file_len", "600000"),
             ]),
-            "test",
+            None,
         );
         recorder.record_event(
             span.clone(),
@@ -1212,7 +1287,7 @@ mod tests {
                 ("status", "200"),
                 ("body_mode", "stream"),
             ]),
-            "test",
+            None,
         );
         recorder.record_event(
             span,
@@ -1221,7 +1296,7 @@ mod tests {
                 ("body_len", "600000"),
                 ("chunks", "10"),
             ]),
-            "test",
+            None,
         );
 
         let snapshot = recorder.snapshot_json();
@@ -1274,17 +1349,17 @@ mod tests {
         recorder.record_event(
             root_span,
             progress_fields([("phase", "request_start")]),
-            "test",
+            None,
         );
         recorder.record_event(
             child_span,
             progress_fields([("phase", "request_start")]),
-            "test",
+            None,
         );
         recorder.record_event(
             second_child_span,
             progress_fields([("phase", "request_start")]),
-            "test",
+            None,
         );
 
         let snapshot = recorder.snapshot_json();
@@ -2174,6 +2249,70 @@ mod tests {
                 event(940, "request_cancelled", "cancelled", "cancelled"),
             ]
         );
+    }
+
+    /// The schedule that orphaned targets while per-span bookkeeping ran
+    /// outside the recorder's lock: a terminal event is recorded and its
+    /// thread pauses before the layer returns; meanwhile another event of
+    /// the same span re-opens the target. Once the span closes, nothing may
+    /// stay active, for any number of spans (the 512-event cap doesn't
+    /// bound active targets).
+    #[test]
+    fn codex_concurrent_terminal_and_progress_cannot_leave_an_orphan() {
+        let recorder = ProgressRecorder::new();
+        let dispatch = tracing::Dispatch::new(Registry::default().with(progress_layer_unclaimed()));
+        let wait = std::time::Duration::from_secs(5);
+        for request_id in 1u64..=600 {
+            let span = tracing::dispatcher::with_default(&dispatch, || {
+                let _scope = recorder.enter();
+                let span = tracing::info_span!(
+                    target: "freedom_ipfs_gateway",
+                    parent: None,
+                    "gateway_request",
+                    request_id
+                );
+                span.in_scope(
+                    || tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start"),
+                );
+                span
+            });
+            let (paused_tx, paused) = std::sync::mpsc::channel();
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let terminal = {
+                let (span, dispatch) = (span.clone(), dispatch.clone());
+                std::thread::spawn(move || {
+                    AFTER_RECORD.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            paused_tx.send(()).unwrap();
+                            held.recv_timeout(wait).unwrap();
+                        }))
+                    });
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        span.in_scope(|| {
+                            tracing::info!(
+                                target: "freedom_ipfs_gateway",
+                                phase = "request_done",
+                                status = 200u16,
+                                body_mode = "direct"
+                            )
+                        })
+                    });
+                })
+            };
+            paused.recv_timeout(wait).unwrap();
+            tracing::dispatcher::with_default(&dispatch, || {
+                span.in_scope(|| {
+                    tracing::info!(target: "freedom_ipfs_gateway", phase = "block_fetch_total", source = "cache")
+                })
+            });
+            release.send(()).unwrap();
+            terminal.join().unwrap();
+            drop(span);
+        }
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot.active_count, 0, "{}", recorder.snapshot_json());
+        assert_eq!(snapshot.event_count, MAX_PROGRESS_EVENTS);
+        assert!(recorder.inner.lock().unwrap().owners.is_empty());
     }
 
     fn progress_fields(

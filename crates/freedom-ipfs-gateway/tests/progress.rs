@@ -477,3 +477,254 @@ fn a_streamed_body_dropped_midway_leaves_active_as_cancelled() {
         assert!(!phases.contains(&cancelled()), "{id}: {phases:?}");
     }
 }
+
+/// The ids of the gateway requests `recorder` has any event of.
+fn request_ids(recorder: &ProgressRecorder) -> BTreeSet<u64> {
+    events(recorder, "gateway_request")
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// A gateway with a recorder records its requests there even while another
+/// node's span is current where they are polled: the request's root span
+/// belongs to its gateway, not to its parent.
+#[test]
+fn a_gateway_request_records_into_its_node_under_another_nodes_span() {
+    use tracing::Instrument;
+
+    init_progress_tracing();
+    // Two instances: B's request, polled on a host runtime inside A's span.
+    let (store, _) = store_with(b"the first instance's block");
+    let first = OnlineNode::builder(store)
+        .routing_mode(RoutingMode::Offline)
+        .build_instance(instance_config("fipfs-owner-a"))
+        .unwrap();
+    let (store, cid) = store_with(b"the second instance's block");
+    let second = OnlineNode::builder(store)
+        .routing_mode(RoutingMode::Offline)
+        .build_instance(instance_config("fipfs-owner-b"))
+        .unwrap();
+    let foreign = {
+        let _scope = first.progress().enter();
+        tracing::info_span!(target: TARGET, "host_operation")
+    };
+    let host = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let core = second.gateway_core();
+    host.block_on(
+        async {
+            let response = core.handle(request(&cid, 920_000)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(body.as_ref(), b"the second instance's block");
+        }
+        .instrument(foreign),
+    );
+    let recorded = events(second.progress(), "gateway_request");
+    for raw_phase in ["request_start", "request_done"] {
+        assert!(
+            recorded.contains(&(920_000, raw_phase.to_string())),
+            "{raw_phase}: {recorded:?}"
+        );
+    }
+    assert!(request_ids(first.progress()).is_empty());
+    assert!(first.shutdown(std::time::Duration::from_secs(5)).reached);
+    assert!(second.shutdown(std::time::Duration::from_secs(5)).reached);
+
+    // A gateway given a recorder, polled while a span of another's is
+    // entered on the polling thread.
+    let (foreign_recorder, own) = (ProgressRecorder::new(), ProgressRecorder::new());
+    let foreign = {
+        let _scope = foreign_recorder.enter();
+        tracing::info_span!(target: TARGET, parent: None, "gateway_request", request_id = 10u64)
+    };
+    let (store, cid) = store_with(b"only this gateway has this");
+    let core = GatewayCore::new(store).with_progress(own.clone());
+    let response = foreign.in_scope(|| host.block_on(core.handle(request(&cid, 9_902))));
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    assert!(request_ids(&own).contains(&9_902));
+    assert!(request_ids(&foreign_recorder).is_empty());
+}
+
+/// A request's body keeps its node's recorder when another node's runtime
+/// reads it.
+#[test]
+fn a_carried_body_read_on_another_nodes_runtime_records_into_its_own_node() {
+    init_progress_tracing();
+    let (own, other) = (ProgressRecorder::new(), ProgressRecorder::new());
+    // Four 64 KiB chunks, so the body streams.
+    let (store, cid) = store_with(&vec![9u8; 256 * 1024]);
+    let core = GatewayCore::new(store).with_progress(own.clone());
+    let host = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let response = host.block_on(core.handle(request(&cid, 920_001)));
+    assert_eq!(response.status(), StatusCode::OK);
+    let reader = marked_runtime(&other);
+    let len = reader
+        .block_on(reader.spawn(async move {
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .len()
+        }))
+        .unwrap();
+    assert_eq!(len, 256 * 1024);
+    assert!(events(&own, "gateway_request").contains(&(920_001, "gateway_stream_done".into())));
+    assert!(active(&own, "gateway_request").is_empty());
+    assert!(request_ids(&other).is_empty());
+}
+
+/// A gateway with no recorder of its own keeps the plain inheritance: its
+/// request records into the recorder of the span it is polled in.
+#[test]
+fn a_gateway_without_a_recorder_records_into_its_parent_spans() {
+    init_progress_tracing();
+    let parent_recorder = ProgressRecorder::new();
+    let parent = {
+        let _scope = parent_recorder.enter();
+        tracing::info_span!(target: TARGET, "host_operation")
+    };
+    let (store, cid) = store_with(b"a gateway without a recorder");
+    let core = GatewayCore::new(store);
+    let host = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let response = parent.in_scope(|| host.block_on(core.handle(request(&cid, 920_002))));
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    assert!(events(&parent_recorder, "gateway_request").contains(&(920_002, "request_done".into())));
+}
+
+fn root_span(recorder: &ProgressRecorder, request_id: u64, progress_id: u64) -> tracing::Span {
+    let _scope = recorder.enter();
+    tracing::info_span!(
+        target: TARGET,
+        parent: None,
+        "gateway_request",
+        request_id,
+        progress_request_id = progress_id,
+        path = "/ipfs/owned"
+    )
+}
+
+fn start(span: &tracing::Span) {
+    span.in_scope(|| tracing::info!(target: TARGET, phase = "request_start"));
+}
+
+/// An event with an explicit parent records into that span's recorder,
+/// whatever scope its thread is in, and the parent's close still settles
+/// the target it opened.
+#[test]
+fn an_event_records_into_its_explicit_parents_recorder() {
+    init_progress_tracing();
+    let (parents, threads) = (ProgressRecorder::new(), ProgressRecorder::new());
+    let parent = root_span(&parents, 11, 11);
+    {
+        let _scope = threads.enter();
+        tracing::info!(
+            target: TARGET,
+            parent: &parent,
+            phase = "request_start",
+            request_id = 11u64,
+            progress_request_id = 11u64
+        );
+    }
+    assert_eq!(snapshot(&parents)["event_count"], 1);
+    assert_eq!(active(&parents, "gateway_request"), BTreeSet::from([11]));
+    assert_eq!(snapshot(&threads)["event_count"], 0);
+    drop(parent);
+    assert!(active(&parents, "gateway_request").is_empty());
+    assert!(events(&parents, "gateway_request").contains(&(11, "request_cancelled".into())));
+    assert_eq!(snapshot(&threads)["event_count"], 0);
+}
+
+/// A root event (`parent: None`) has no span, whatever span is current: it
+/// records into its thread's recorder.
+#[test]
+fn a_root_event_records_into_its_threads_recorder() {
+    init_progress_tracing();
+    let (spans, threads) = (ProgressRecorder::new(), ProgressRecorder::new());
+    let current = root_span(&spans, 12, 12);
+    {
+        let _scope = threads.enter();
+        let _entered = current.enter();
+        tracing::info!(target: TARGET, parent: None, phase = "preload_start", preload_id = 930_000u64);
+        tracing::info!(target: TARGET, phase = "preload_start", preload_id = 930_001u64);
+    }
+    assert_eq!(active(&threads, "preload"), BTreeSet::from([930_000]));
+    assert_eq!(active(&spans, "preload"), BTreeSet::from([930_001]));
+}
+
+/// An old span still open when a newer request reuses its progress id
+/// mustn't cancel the newer one when it closes: the newer span owns the
+/// target now. With `clear()` between the two, likewise.
+#[test]
+fn codex_old_span_must_not_cancel_reused_id() {
+    init_progress_tracing();
+    for clear in [false, true] {
+        let recorder = ProgressRecorder::new();
+        let old = root_span(&recorder, 1, 700);
+        start(&old);
+        if clear {
+            recorder.clear();
+        }
+        let new = root_span(&recorder, 2, 700);
+        start(&new);
+        drop(old);
+        let after = snapshot(&recorder);
+        assert_eq!(after["active_count"], 1, "clear={clear}: {after}");
+        assert_eq!(
+            after["active"][0]["request_id"], 2,
+            "clear={clear}: {after}"
+        );
+        assert!(
+            !after["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["raw_phase"] == "request_cancelled"),
+            "clear={clear}: {after}"
+        );
+        // The newer span still owns it: its own close cancels it.
+        drop(new);
+        let after = snapshot(&recorder);
+        assert_eq!(after["active_count"], 0, "clear={clear}: {after}");
+        let last = after["events"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(
+            last["raw_phase"], "request_cancelled",
+            "clear={clear}: {after}"
+        );
+        assert_eq!(last["request_id"], 2, "clear={clear}: {after}");
+    }
+}
+
+/// `clear()` lets go of every owner: an old span closing after a clear and a
+/// reuse cancels nothing.
+#[test]
+fn codex_clear_then_reuse_must_invalidate_old_close() {
+    init_progress_tracing();
+    let recorder = ProgressRecorder::new();
+    let old = root_span(&recorder, 1, 701);
+    start(&old);
+    recorder.clear();
+    let new = root_span(&recorder, 2, 701);
+    start(&new);
+    drop(old);
+    let after = snapshot(&recorder);
+    assert_eq!(after["active_count"], 1, "{after}");
+    assert_eq!(after["event_count"], 1, "{after}");
+    new.in_scope(|| {
+        tracing::info!(target: TARGET, phase = "request_done", status = 200u16, body_mode = "direct")
+    });
+    drop(new);
+    let after = snapshot(&recorder);
+    assert_eq!(after["active_count"], 0, "{after}");
+    assert_eq!(after["event_count"], 2, "{after}");
+}

@@ -1092,10 +1092,11 @@ impl GatewayCore {
     }
 
     /// Makes the gateway's requests record their progress into `recorder`,
-    /// wherever they are polled: a request runs in the recorder's scope,
-    /// and its spans carry the recorder to its response body (see
-    /// [`progress`]). Without one, a request records into whatever its
-    /// threads are routed to.
+    /// wherever they are polled and whatever span is current then: a
+    /// request's root span belongs to the recorder, the request runs in its
+    /// scope, and its spans carry the recorder to its response body (see
+    /// [`progress`]). Without one, a request records into its parent span's
+    /// recorder, or whatever its threads are routed to.
     pub fn with_progress(mut self, recorder: ProgressRecorder) -> Self {
         self.state = self.state.with_progress(recorder);
         self
@@ -1340,6 +1341,9 @@ async fn handle_gateway_core_request(state: GatewayState, request: GatewayCoreRe
     let progress_request_id = header_u64_for_trace(&request.headers, X_FREEDOM_REQUEST_ID);
     let parent_request_id = header_u64_for_trace(&request.headers, X_FREEDOM_PARENT_REQUEST_ID);
     let top_level_path = header_value_for_trace(request.headers.get(X_FREEDOM_TOP_LEVEL_PATH));
+    // The request belongs to the gateway's node, even under another node's
+    // span; its descendants and its body inherit that.
+    let owner = state.progress.as_ref().map(ProgressRecorder::own_new_spans);
     let span = tracing::info_span!(
         "gateway_request",
         process_id,
@@ -1351,6 +1355,7 @@ async fn handle_gateway_core_request(state: GatewayState, request: GatewayCoreRe
         path = %request_path,
         range = %range
     );
+    drop(owner);
 
     async move {
         let request_started = Instant::now();
