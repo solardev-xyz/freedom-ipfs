@@ -1,13 +1,24 @@
 use cid::Cid;
-use freedom_ipfs_core::{Block, BlockProvider, CODEC_DAG_PB, CODEC_RAW};
+use freedom_ipfs_core::{
+    btree_map_bytes, Block, BlockProvider, FixedPool, PoolShare, CODEC_DAG_PB, CODEC_RAW,
+};
 use multihash::Multihash;
 use prost::Message;
-use std::collections::{HashMap, VecDeque};
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 
+/// The most entries of each kind (decoded nodes, resolved paths, file
+/// sizes) a resolver's metadata cache keeps by default.
 pub const DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY: usize = 256;
+/// A resolver's metadata cache's byte capacity by default, for all its
+/// entries together (design 0007, "Budgets"): its fixed reservation. As the
+/// cache counts conservatively, it holds the default 256 resolved paths and
+/// 256 file sizes in about 145 KiB and 75 KiB of it, and in the remaining
+/// 800 KiB or so, 256 directory or file nodes of up to about 20 links each
+/// (some 3 KiB with their share of the maps), or fewer larger ones.
+pub const DEFAULT_UNIXFS_METADATA_CACHE_MAX_BYTES: usize = 1024 * 1024;
 
 const HAMT_MURMUR3_X64_64: u64 = 0x22;
 const HAMT_FANOUT_256: u64 = 256;
@@ -129,18 +140,43 @@ pub struct UnixfsResolver {
 }
 
 impl UnixfsResolver {
+    /// A resolver whose metadata cache has the default limits:
+    /// [`DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY`] entries of each kind in
+    /// [`DEFAULT_UNIXFS_METADATA_CACHE_MAX_BYTES`].
     pub fn new() -> Self {
         Self::with_metadata_cache_capacity(DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY)
     }
 
     pub fn without_metadata_cache() -> Self {
-        Self::with_metadata_cache_capacity(0)
+        Self::with_metadata_cache_limits(0, 0)
     }
 
+    /// At most `capacity` entries of each kind, in the default byte
+    /// capacity.
     pub fn with_metadata_cache_capacity(capacity: usize) -> Self {
+        Self::with_metadata_cache_limits(capacity, DEFAULT_UNIXFS_METADATA_CACHE_MAX_BYTES)
+    }
+
+    /// At most `capacity` entries of each kind, all of them together in at
+    /// most `max_bytes` of heap, counted conservatively: the cache's fixed
+    /// capacity ([`UnixfsResolver::metadata_cache_max_bytes`]). Either at
+    /// zero caches nothing.
+    pub fn with_metadata_cache_limits(capacity: usize, max_bytes: usize) -> Self {
         Self {
-            metadata_cache: Arc::new(UnixfsMetadataCache::new(capacity)),
+            metadata_cache: Arc::new(UnixfsMetadataCache::new(capacity, max_bytes)),
         }
+    }
+
+    /// The metadata cache's fixed capacity in bytes, which a host reserves
+    /// for it: zero when it caches nothing.
+    pub fn metadata_cache_max_bytes(&self) -> usize {
+        self.metadata_cache.max_bytes()
+    }
+
+    /// Whether `other` shares this resolver's metadata cache, as its clones
+    /// do.
+    pub fn shares_metadata_cache_with(&self, other: &UnixfsResolver) -> bool {
+        Arc::ptr_eq(&self.metadata_cache, &other.metadata_cache)
     }
 
     pub fn metadata_cache_stats(&self) -> UnixfsMetadataCacheStats {
@@ -227,7 +263,13 @@ impl Default for UnixfsResolver {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UnixfsMetadataCacheStats {
+    /// The most entries of each kind.
     pub capacity: usize,
+    /// The byte capacity, for all entries together (zero when it caches
+    /// nothing).
+    pub max_bytes: usize,
+    /// The bytes it holds, conservatively counted, of `max_bytes`.
+    pub bytes: usize,
     pub len: usize,
     pub hits: u64,
     pub misses: u64,
@@ -247,32 +289,72 @@ pub struct UnixfsMetadataCacheStats {
     pub file_size_evictions: u64,
 }
 
+/// The metadata cache: decoded dag-pb nodes, resolved paths and file sizes,
+/// each kind at most `capacity` entries, all of them together within a
+/// fixed byte capacity (design 0007, "Budgets").
+///
+/// The byte capacity is a [`FixedPool`], which a host reserves as fixed.
+/// What the cache holds counts against it by heap footprint, conservatively:
+/// the cache itself, its maps' nodes ([`btree_map_bytes`], which bounds
+/// them by entry count alone), and every entry's own heap, by capacity (a
+/// decoded node's data and its links, their hashes and names; a path key's
+/// path). Room is taken before an entry is copied in, oldest entries of any
+/// kind making way for it, and given back when one goes.
 #[derive(Debug)]
 struct UnixfsMetadataCache {
+    pool: FixedPool,
     inner: Mutex<UnixfsMetadataCacheInner>,
 }
 
+/// What the cache's own structures take besides its maps' nodes: the cache
+/// in its `Arc`, and its pool's counter in its own.
+const UNIXFS_METADATA_CACHE_OWN_BYTES: usize =
+    std::mem::size_of::<UnixfsMetadataCache>() + 6 * std::mem::size_of::<usize>();
+
 impl UnixfsMetadataCache {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, max_bytes: usize) -> Self {
+        let (pool, room) = if capacity == 0 || max_bytes == 0 {
+            (FixedPool::new(0), None)
+        } else {
+            let pool = FixedPool::new(max_bytes);
+            let room = pool.share(0);
+            (pool, room)
+        };
+        let mut inner = UnixfsMetadataCacheInner {
+            capacity,
+            max_bytes: pool.capacity(),
+            clock: 0,
+            room,
+            heap: 0,
+            nodes: CachedMap::default(),
+            paths: CachedMap::default(),
+            file_sizes: CachedMap::default(),
+        };
+        // The cache's own structures first; a pool too small for them
+        // caches nothing.
+        if !inner.true_room() {
+            inner.room = None;
+        }
         Self {
-            inner: Mutex::new(UnixfsMetadataCacheInner {
-                capacity,
-                ..UnixfsMetadataCacheInner::default()
-            }),
+            pool,
+            inner: Mutex::new(inner),
+        }
+    }
+
+    /// The fixed capacity a host reserves for it: zero when it caches
+    /// nothing.
+    fn max_bytes(&self) -> usize {
+        if self.lock_inner().room.is_some() {
+            self.pool.capacity()
+        } else {
+            0
         }
     }
 
     fn get(&self, cid: &Cid) -> Option<DecodedDagPb> {
         let mut inner = self.lock_inner();
-        let decoded = inner.entries.get(cid).cloned();
-        if let Some(decoded) = decoded {
-            inner.hits = inner.hits.saturating_add(1);
-            touch_metadata_cache_order(&mut inner, cid);
-            Some(decoded)
-        } else {
-            inner.misses = inner.misses.saturating_add(1);
-            None
-        }
+        let tick = inner.tick();
+        inner.nodes.get(cid, tick).cloned()
     }
 
     fn get_path(&self, root: &Cid, path: &str) -> Option<ResolvedNode> {
@@ -282,133 +364,105 @@ impl UnixfsMetadataCache {
 
         let key = UnixfsPathCacheKey::new(root, path);
         let mut inner = self.lock_inner();
-        let resolved = inner.path_entries.get(&key).cloned();
-        if let Some(resolved) = resolved {
-            inner.path_hits = inner.path_hits.saturating_add(1);
-            touch_path_cache_order(&mut inner, &key);
-            Some(resolved)
-        } else {
-            inner.path_misses = inner.path_misses.saturating_add(1);
-            None
-        }
+        let tick = inner.tick();
+        inner.paths.get(&key, tick).cloned()
     }
 
     fn get_file_size(&self, cid: &Cid) -> Option<u64> {
         let mut inner = self.lock_inner();
-        let size = inner.file_size_entries.get(cid).copied();
-        if let Some(size) = size {
-            inner.file_size_hits = inner.file_size_hits.saturating_add(1);
-            touch_file_size_cache_order(&mut inner, cid);
-            Some(size)
-        } else {
-            inner.file_size_misses = inner.file_size_misses.saturating_add(1);
-            None
-        }
+        let tick = inner.tick();
+        inner.file_sizes.get(cid, tick).copied()
     }
 
-    fn insert(&self, cid: &Cid, encoded_len: usize, decoded: DecodedDagPb) {
+    /// Caches a copy of `decoded`, made once its room is taken.
+    fn insert(&self, cid: &Cid, encoded_len: usize, decoded: &DecodedDagPb) {
         let mut inner = self.lock_inner();
-        if inner.capacity == 0 {
+        if inner.room.is_none() {
             return;
         }
         if encoded_len > UNIXFS_METADATA_CACHE_MAX_BLOCK_BYTES {
-            inner.oversized_skips = inner.oversized_skips.saturating_add(1);
+            inner.nodes.oversized_skips = inner.nodes.oversized_skips.saturating_add(1);
             return;
         }
-
-        if inner.entries.insert(*cid, decoded).is_none() {
-            inner.inserts = inner.inserts.saturating_add(1);
-        }
-        touch_metadata_cache_order(&mut inner, cid);
-
-        while inner.entries.len() > inner.capacity {
-            let Some(evicted) = inner.order.pop_front() else {
-                break;
-            };
-            if inner.entries.remove(&evicted).is_some() {
-                inner.evictions = inner.evictions.saturating_add(1);
-            }
-        }
+        inner.insert(
+            |inner| &mut inner.nodes,
+            |nodes, tick| nodes.touch(cid, tick),
+            decoded.heap_bytes(),
+            || (*cid, decoded.clone()),
+            |_, decoded| decoded.heap_bytes(),
+        );
     }
 
     fn insert_path(&self, root: &Cid, path: &str, resolved: ResolvedNode) {
         let mut inner = self.lock_inner();
-        if inner.capacity == 0 {
+        if inner.room.is_none() {
             return;
         }
         if path.len() > UNIXFS_PATH_CACHE_MAX_PATH_BYTES {
-            inner.path_oversized_skips = inner.path_oversized_skips.saturating_add(1);
+            inner.paths.oversized_skips = inner.paths.oversized_skips.saturating_add(1);
             return;
         }
 
-        let key = UnixfsPathCacheKey::new(root, path);
-        if inner.path_entries.insert(key.clone(), resolved).is_none() {
-            inner.path_inserts = inner.path_inserts.saturating_add(1);
-        }
-        touch_path_cache_order(&mut inner, &key);
-
-        while inner.path_entries.len() > inner.capacity {
-            let Some(evicted) = inner.path_order.pop_front() else {
-                break;
-            };
-            if inner.path_entries.remove(&evicted).is_some() {
-                inner.path_evictions = inner.path_evictions.saturating_add(1);
-            }
-        }
+        // The key is made only once its room is taken.
+        inner.insert(
+            |inner| &mut inner.paths,
+            |paths, tick| paths.touch_where(|key| key.root == *root && key.path == path, tick),
+            path.len(),
+            || (UnixfsPathCacheKey::new(root, path), resolved),
+            |key, _| key.heap_bytes(),
+        );
     }
 
     fn insert_file_size(&self, cid: &Cid, size: u64) {
         let mut inner = self.lock_inner();
-        if inner.capacity == 0 {
+        if inner.room.is_none() {
             return;
         }
-
-        if inner.file_size_entries.insert(*cid, size).is_none() {
-            inner.file_size_inserts = inner.file_size_inserts.saturating_add(1);
-        }
-        touch_file_size_cache_order(&mut inner, cid);
-
-        while inner.file_size_entries.len() > inner.capacity {
-            let Some(evicted) = inner.file_size_order.pop_front() else {
-                break;
-            };
-            if inner.file_size_entries.remove(&evicted).is_some() {
-                inner.file_size_evictions = inner.file_size_evictions.saturating_add(1);
-            }
-        }
+        inner.insert(
+            |inner| &mut inner.file_sizes,
+            |sizes, tick| sizes.touch(cid, tick),
+            0,
+            || (*cid, size),
+            |_, _| 0,
+        );
     }
 
     fn clear(&self) {
         let mut inner = self.lock_inner();
-        inner.entries.clear();
-        inner.order.clear();
-        inner.path_entries.clear();
-        inner.path_order.clear();
-        inner.file_size_entries.clear();
-        inner.file_size_order.clear();
+        inner.nodes.entries.clear();
+        inner.paths.entries.clear();
+        inner.file_sizes.entries.clear();
+        inner.heap = 0;
+        inner.true_room();
     }
 
     fn stats(&self) -> UnixfsMetadataCacheStats {
         let inner = self.lock_inner();
+        let (max_bytes, bytes) = match &inner.room {
+            Some(room) => (self.pool.capacity(), room.bytes()),
+            None => (0, 0),
+        };
         UnixfsMetadataCacheStats {
             capacity: inner.capacity,
-            len: inner.entries.len(),
-            hits: inner.hits,
-            misses: inner.misses,
-            inserts: inner.inserts,
-            evictions: inner.evictions,
-            oversized_skips: inner.oversized_skips,
-            path_len: inner.path_entries.len(),
-            path_hits: inner.path_hits,
-            path_misses: inner.path_misses,
-            path_inserts: inner.path_inserts,
-            path_evictions: inner.path_evictions,
-            path_oversized_skips: inner.path_oversized_skips,
-            file_size_len: inner.file_size_entries.len(),
-            file_size_hits: inner.file_size_hits,
-            file_size_misses: inner.file_size_misses,
-            file_size_inserts: inner.file_size_inserts,
-            file_size_evictions: inner.file_size_evictions,
+            max_bytes,
+            bytes,
+            len: inner.nodes.entries.len(),
+            hits: inner.nodes.hits,
+            misses: inner.nodes.misses,
+            inserts: inner.nodes.inserts,
+            evictions: inner.nodes.evictions,
+            oversized_skips: inner.nodes.oversized_skips,
+            path_len: inner.paths.entries.len(),
+            path_hits: inner.paths.hits,
+            path_misses: inner.paths.misses,
+            path_inserts: inner.paths.inserts,
+            path_evictions: inner.paths.evictions,
+            path_oversized_skips: inner.paths.oversized_skips,
+            file_size_len: inner.file_sizes.entries.len(),
+            file_size_hits: inner.file_sizes.hits,
+            file_size_misses: inner.file_sizes.misses,
+            file_size_inserts: inner.file_sizes.inserts,
+            file_size_evictions: inner.file_sizes.evictions,
         }
     }
 
@@ -419,32 +473,247 @@ impl UnixfsMetadataCache {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct UnixfsMetadataCacheInner {
+    /// The most entries of each kind.
     capacity: usize,
-    entries: HashMap<Cid, DecodedDagPb>,
-    order: VecDeque<Cid>,
-    path_entries: HashMap<UnixfsPathCacheKey, ResolvedNode>,
-    path_order: VecDeque<UnixfsPathCacheKey>,
-    file_size_entries: HashMap<Cid, u64>,
-    file_size_order: VecDeque<Cid>,
+    /// Its pool's capacity: the most it holds.
+    max_bytes: usize,
+    clock: u64,
+    /// The pool's room for all the cache holds ([`Self::footprint`]); `None`
+    /// when it caches nothing.
+    room: Option<PoolShare>,
+    /// The heap its entries own.
+    heap: usize,
+    nodes: CachedMap<Cid, DecodedDagPb>,
+    paths: CachedMap<UnixfsPathCacheKey, ResolvedNode>,
+    file_sizes: CachedMap<Cid, u64>,
+}
+
+impl UnixfsMetadataCacheInner {
+    fn tick(&mut self) -> u64 {
+        self.clock = self.clock.saturating_add(1);
+        self.clock
+    }
+
+    /// What the cache holds, at most: its own structures, its maps' nodes
+    /// and its entries' heap.
+    fn footprint(&self) -> usize {
+        UNIXFS_METADATA_CACHE_OWN_BYTES
+            .saturating_add(self.nodes.node_bytes(0))
+            .saturating_add(self.paths.node_bytes(0))
+            .saturating_add(self.file_sizes.node_bytes(0))
+            .saturating_add(self.heap)
+    }
+
+    /// Sizes the room to the footprint: `false` if it can't grow to it.
+    fn true_room(&mut self) -> bool {
+        let footprint = self.footprint();
+        self.room
+            .as_mut()
+            .is_some_and(|room| room.try_resize(footprint))
+    }
+
+    /// Evicts the least recently used entry of any kind: `false` if there
+    /// is none.
+    fn evict_oldest(&mut self) -> bool {
+        let oldest = [
+            self.nodes.oldest(),
+            self.paths.oldest(),
+            self.file_sizes.oldest(),
+        ];
+        let Some(kind) = (0..oldest.len())
+            .filter(|kind| oldest[*kind].is_some())
+            .min_by_key(|kind| oldest[*kind])
+        else {
+            return false;
+        };
+        let freed = match kind {
+            0 => self.nodes.evict_oldest(),
+            1 => self.paths.evict_oldest(),
+            _ => self.file_sizes.evict_oldest(),
+        };
+        self.heap = self.heap.saturating_sub(freed.unwrap_or(0));
+        true
+    }
+
+    /// Caches the entry `make` makes in the map `select` picks, unless
+    /// `cached` finds it there already (and touches it, at the tick it is
+    /// given): a key names its content, so that is the same entry. Room for
+    /// it (its heap, at most `heap`, and its map's nodes with it) is taken
+    /// first, evicting the oldest entries of any kind, and only then is
+    /// `make` called to copy it in; the room is then trued to what the
+    /// cache holds.
+    fn insert<K: Ord, V>(
+        &mut self,
+        select: fn(&mut Self) -> &mut CachedMap<K, V>,
+        cached: impl FnOnce(&mut CachedMap<K, V>, u64) -> bool,
+        heap: usize,
+        make: impl FnOnce() -> (K, V),
+        heap_of: fn(&K, &V) -> usize,
+    ) {
+        let tick = self.tick();
+        if cached(select(self), tick) {
+            return;
+        }
+        // The cache emptied but for this entry: if even that is past the
+        // capacity, nothing is evicted for it.
+        let alone = UNIXFS_METADATA_CACHE_OWN_BYTES
+            .saturating_add(btree_map_bytes::<Cid, Cached<DecodedDagPb>>(0))
+            .saturating_add(btree_map_bytes::<UnixfsPathCacheKey, Cached<ResolvedNode>>(
+                0,
+            ))
+            .saturating_add(btree_map_bytes::<Cid, Cached<u64>>(0))
+            .saturating_add(btree_map_bytes::<K, Cached<V>>(1) - btree_map_bytes::<K, Cached<V>>(0))
+            .saturating_add(heap);
+        if alone > self.max_bytes {
+            let map = select(self);
+            map.oversized_skips = map.oversized_skips.saturating_add(1);
+            return;
+        }
+        // Each kind's entry cap, as before the byte capacity.
+        while select(self).entries.len() >= self.capacity {
+            let Some(freed) = select(self).evict_oldest() else {
+                break;
+            };
+            self.heap = self.heap.saturating_sub(freed);
+        }
+        loop {
+            let growth = select(self).node_bytes(1) - select(self).node_bytes(0);
+            let needed = self.footprint().saturating_add(growth).saturating_add(heap);
+            if self
+                .room
+                .as_mut()
+                .is_some_and(|room| room.try_resize(needed))
+            {
+                break;
+            }
+            if !self.evict_oldest() {
+                self.true_room();
+                return;
+            }
+        }
+        let (key, value) = make();
+        let held = heap_of(&key, &value);
+        // A copy owns no more than its source; were it ever to, it stays
+        // only if the pool has room for the difference.
+        if held > heap
+            && !self
+                .room
+                .as_mut()
+                .is_some_and(|room| room.try_grow(held - heap))
+        {
+            drop((key, value));
+            let map = select(self);
+            map.oversized_skips = map.oversized_skips.saturating_add(1);
+            self.true_room();
+            return;
+        }
+        let map = select(self);
+        map.entries.insert(
+            key,
+            Cached {
+                value,
+                last_used: tick,
+                heap: held,
+            },
+        );
+        map.inserts = map.inserts.saturating_add(1);
+        self.heap = self.heap.saturating_add(held);
+        self.true_room();
+    }
+}
+
+/// One kind of entry, with its counters.
+#[derive(Debug)]
+struct CachedMap<K, V> {
+    entries: BTreeMap<K, Cached<V>>,
     hits: u64,
     misses: u64,
     inserts: u64,
     evictions: u64,
     oversized_skips: u64,
-    path_hits: u64,
-    path_misses: u64,
-    path_inserts: u64,
-    path_evictions: u64,
-    path_oversized_skips: u64,
-    file_size_hits: u64,
-    file_size_misses: u64,
-    file_size_inserts: u64,
-    file_size_evictions: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+impl<K, V> Default for CachedMap<K, V> {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            hits: 0,
+            misses: 0,
+            inserts: 0,
+            evictions: 0,
+            oversized_skips: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Cached<V> {
+    value: V,
+    last_used: u64,
+    /// The heap the entry owns, its key's included.
+    heap: usize,
+}
+
+impl<K: Ord, V> CachedMap<K, V> {
+    /// What the map's nodes take, at most, with `extra` more entries.
+    fn node_bytes(&self, extra: usize) -> usize {
+        btree_map_bytes::<K, Cached<V>>(self.entries.len().saturating_add(extra))
+    }
+
+    fn get(&mut self, key: &K, tick: u64) -> Option<&V> {
+        match self.entries.get_mut(key) {
+            Some(entry) => {
+                self.hits = self.hits.saturating_add(1);
+                entry.last_used = tick;
+                Some(&entry.value)
+            }
+            None => {
+                self.misses = self.misses.saturating_add(1);
+                None
+            }
+        }
+    }
+
+    /// Marks `key`'s entry used at `tick`: whether there is one.
+    fn touch(&mut self, key: &K, tick: u64) -> bool {
+        self.entries
+            .get_mut(key)
+            .map(|entry| entry.last_used = tick)
+            .is_some()
+    }
+
+    /// Marks the entry whose key `matches` used at `tick`, without making a
+    /// key to look it up by: whether there is one.
+    fn touch_where(&mut self, matches: impl Fn(&K) -> bool, tick: u64) -> bool {
+        self.entries
+            .iter_mut()
+            .find(|(key, _)| matches(key))
+            .map(|(_, entry)| entry.last_used = tick)
+            .is_some()
+    }
+
+    /// When the least recently used entry was last used.
+    fn oldest(&self) -> Option<u64> {
+        self.entries.values().map(|entry| entry.last_used).min()
+    }
+
+    /// Evicts the least recently used entry, returning the heap it owned.
+    fn evict_oldest(&mut self) -> Option<usize> {
+        let (last_used, heap) = self
+            .entries
+            .values()
+            .map(|entry| (entry.last_used, entry.heap))
+            .min()?;
+        // Ticks are unique: this removes that one entry.
+        self.entries.retain(|_, entry| entry.last_used != last_used);
+        self.evictions = self.evictions.saturating_add(1);
+        Some(heap)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct UnixfsPathCacheKey {
     root: Cid,
     path: String,
@@ -457,28 +726,48 @@ impl UnixfsPathCacheKey {
             path: path.to_string(),
         }
     }
-}
 
-fn touch_metadata_cache_order(inner: &mut UnixfsMetadataCacheInner, cid: &Cid) {
-    inner.order.retain(|candidate| candidate != cid);
-    inner.order.push_back(*cid);
-}
-
-fn touch_path_cache_order(inner: &mut UnixfsMetadataCacheInner, key: &UnixfsPathCacheKey) {
-    inner.path_order.retain(|candidate| candidate != key);
-    inner.path_order.push_back(key.clone());
-}
-
-fn touch_file_size_cache_order(inner: &mut UnixfsMetadataCacheInner, cid: &Cid) {
-    inner.file_size_order.retain(|candidate| candidate != cid);
-    inner.file_size_order.push_back(*cid);
+    fn heap_bytes(&self) -> usize {
+        self.path.capacity()
+    }
 }
 
 #[derive(Clone, Debug)]
 struct DecodedDagPb {
+    /// The node's links. Its data is decoded into `data` and not kept.
     node: PbNode,
     data: UnixfsData,
     kind: DataType,
+}
+
+impl DecodedDagPb {
+    /// The heap it owns, by capacity: what a clone of it owns at most.
+    fn heap_bytes(&self) -> usize {
+        let vec = |bytes: &Option<Vec<u8>>| bytes.as_ref().map_or(0, Vec::capacity);
+        let links = self
+            .node
+            .links
+            .iter()
+            .map(|link| {
+                vec(&link.hash).saturating_add(link.name.as_ref().map_or(0, String::capacity))
+            })
+            .fold(
+                self.node
+                    .links
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<PbLink>()),
+                usize::saturating_add,
+            );
+        vec(&self.node.data)
+            .saturating_add(links)
+            .saturating_add(vec(&self.data.data))
+            .saturating_add(
+                self.data
+                    .blocksizes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
+    }
 }
 
 struct UnixfsContext<'a> {
@@ -537,12 +826,14 @@ impl<'a> UnixfsContext<'a> {
             return Err(UnixfsError::UnsupportedCodec(block.codec()));
         }
 
-        let node = decode_pb_node(block.data())?;
+        let mut node = decode_pb_node(block.data())?;
         let data = decode_unixfs_data(&node)?;
+        // Decoded into `data`: a second copy of it would only take room.
+        node.data = None;
         let kind = data_type(&data)?;
         let decoded = DecodedDagPb { node, data, kind };
         if let Some(cache) = self.metadata_cache {
-            cache.insert(cid, block.data().len(), decoded.clone());
+            cache.insert(cid, block.data().len(), &decoded);
         }
         Ok(decoded)
     }
@@ -1518,10 +1809,17 @@ mod tests {
         );
 
         assert_eq!(provider.call_count(&dir_cid), 1);
+        let stats = resolver.metadata_cache_stats();
+        assert!(
+            stats.bytes > 0 && stats.bytes <= stats.max_bytes,
+            "{stats:?}"
+        );
         assert_eq!(
-            resolver.metadata_cache_stats(),
+            stats,
             UnixfsMetadataCacheStats {
                 capacity: 8,
+                max_bytes: DEFAULT_UNIXFS_METADATA_CACHE_MAX_BYTES,
+                bytes: stats.bytes,
                 len: 1,
                 hits: 1,
                 misses: 1,
@@ -1824,5 +2122,320 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("alpha.txt", alpha_cid), ("nested.txt", nested_cid)]
         );
+    }
+
+    /// Counts each thread's live heap bytes, and their peak, so a test can
+    /// see what the cache holds on the heap, and at most held at once.
+    mod heap {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static LIVE: Cell<isize> = const { Cell::new(0) };
+            static PEAK: Cell<isize> = const { Cell::new(0) };
+        }
+
+        struct Counting;
+
+        fn add(bytes: isize) {
+            let _ = LIVE.try_with(|live| {
+                let now = live.get() + bytes;
+                live.set(now);
+                let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+            });
+        }
+
+        // SAFETY: every call is passed on to the system allocator as is.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let ptr = unsafe { System.alloc(layout) };
+                if !ptr.is_null() {
+                    add(layout.size() as isize);
+                }
+                ptr
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                let ptr = unsafe { System.alloc_zeroed(layout) };
+                if !ptr.is_null() {
+                    add(layout.size() as isize);
+                }
+                ptr
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) };
+                add(-(layout.size() as isize));
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                let new = unsafe { System.realloc(ptr, layout, new_size) };
+                if !new.is_null() {
+                    add(new_size as isize - layout.size() as isize);
+                }
+                new
+            }
+        }
+
+        #[global_allocator]
+        static COUNTING: Counting = Counting;
+
+        /// This thread's live heap bytes; the peak starts again from them.
+        pub(super) fn live() -> isize {
+            let live = LIVE.with(Cell::get);
+            PEAK.with(|peak| peak.set(live));
+            live
+        }
+
+        /// The most this thread held since [`live`] was last read.
+        pub(super) fn peak() -> isize {
+            PEAK.with(Cell::get)
+        }
+    }
+
+    /// A decoded directory node of `links` links, as a block decodes to.
+    fn decoded_directory(links: usize, seed: usize) -> (Cid, usize, DecodedDagPb) {
+        let encoded = pb_directory(
+            (0..links)
+                .map(|index| {
+                    let target = cid_from_data(CODEC_RAW, format!("{seed}/{index}").as_bytes());
+                    link(&format!("entry-{seed}-{index}.html"), &target)
+                })
+                .collect(),
+        );
+        let cid = cid_from_data(CODEC_DAG_PB, &encoded);
+        let mut node = decode_pb_node(&encoded).unwrap();
+        let data = decode_unixfs_data(&node).unwrap();
+        node.data = None;
+        let kind = data_type(&data).unwrap();
+        (cid, encoded.len(), DecodedDagPb { node, data, kind })
+    }
+
+    /// One insertion's worth of input, made before the measured region.
+    enum CacheInput {
+        Node(Cid, usize, DecodedDagPb),
+        Path(Cid, String, ResolvedNode),
+        FileSize(Cid, u64),
+    }
+
+    fn cache_inputs(count: usize) -> Vec<CacheInput> {
+        let root = cid_from_data(CODEC_DAG_PB, b"root");
+        (0..count)
+            .map(|index| match index % 3 {
+                0 => {
+                    let (cid, len, decoded) = decoded_directory(1 + index % 23, index);
+                    CacheInput::Node(cid, len, decoded)
+                }
+                1 => CacheInput::Path(
+                    root,
+                    // Short paths and long ones, near the longest cached.
+                    format!("assets/{index}/{}.js", "x".repeat(index % 7 * 140)),
+                    ResolvedNode {
+                        cid: cid_from_data(CODEC_RAW, &index.to_le_bytes()),
+                        kind: NodeKind::Raw,
+                    },
+                ),
+                _ => CacheInput::FileSize(
+                    cid_from_data(CODEC_RAW, &index.to_le_bytes()),
+                    index as u64,
+                ),
+            })
+            .collect()
+    }
+
+    fn insert_input(cache: &UnixfsMetadataCache, input: &CacheInput) {
+        match input {
+            CacheInput::Node(cid, len, decoded) => cache.insert(cid, *len, decoded),
+            CacheInput::Path(root, path, resolved) => {
+                cache.insert_path(root, path, resolved.clone())
+            }
+            CacheInput::FileSize(cid, size) => cache.insert_file_size(cid, *size),
+        }
+    }
+
+    #[test]
+    fn the_metadata_cache_counts_at_least_the_heap_it_holds_and_copies_only_into_room() {
+        const MAX_BYTES: usize = 48 * 1024;
+        let inputs = cache_inputs(600);
+        let origin = heap::live();
+        let cache = Arc::new(UnixfsMetadataCache::new(10_000, MAX_BYTES));
+        let mut evicted = false;
+        for input in &inputs {
+            let before = heap::live();
+            insert_input(&cache, input);
+            let peak = heap::peak() - origin;
+            let held = heap::live() - origin;
+            let stats = cache.stats();
+            evicted |= stats.evictions + stats.path_evictions + stats.file_size_evictions > 0;
+            // What the cache holds on the heap is never more than it counts,
+            // which is never more than its capacity...
+            assert!(
+                held as usize <= stats.bytes,
+                "holds {held}, counts {stats:?}"
+            );
+            assert!(stats.bytes <= MAX_BYTES, "{stats:?}");
+            // ...and a copy is made only into room: at no point did the
+            // cache hold more than its capacity.
+            assert!(
+                peak as usize <= MAX_BYTES,
+                "peaked at {peak} (from {}), {stats:?}",
+                before - origin
+            );
+        }
+        assert!(evicted, "the capacity was reached");
+        drop(cache);
+        assert_eq!(heap::live(), origin, "all of it was the cache's");
+    }
+
+    /// A decoded file node holding `len` bytes inline, as a block decodes to.
+    fn decoded_file(len: usize, seed: usize) -> (Cid, usize, DecodedDagPb) {
+        let inline: Vec<u8> = (0..len).map(|index| (index + seed) as u8).collect();
+        let encoded = pb_file(&inline, Vec::new());
+        let cid = cid_from_data(CODEC_DAG_PB, &encoded);
+        let mut node = decode_pb_node(&encoded).unwrap();
+        let data = decode_unixfs_data(&node).unwrap();
+        node.data = None;
+        let kind = data_type(&data).unwrap();
+        (cid, encoded.len(), DecodedDagPb { node, data, kind })
+    }
+
+    #[test]
+    fn a_metadata_copy_is_made_only_into_room() {
+        const MAX_BYTES: usize = 64 * 1024;
+        // Entries whose copies are larger than what the cache's counting
+        // leaves spare: a copy made before its room would show.
+        let inputs: Vec<_> = (0..12).map(|seed| decoded_file(16 * 1024, seed)).collect();
+        let origin = heap::live();
+        let cache = UnixfsMetadataCache::new(10_000, MAX_BYTES);
+        for (cid, len, decoded) in &inputs {
+            heap::live();
+            cache.insert(cid, *len, decoded);
+            let peak = heap::peak() - origin;
+            let stats = cache.stats();
+            assert!(peak as usize <= MAX_BYTES, "peaked at {peak}: {stats:?}");
+            assert!(cache.get(cid).is_some(), "the newest is cached");
+        }
+        assert!(cache.stats().evictions > 0);
+    }
+
+    #[test]
+    fn the_metadata_cache_stays_within_its_byte_capacity_across_its_maps() {
+        const MAX_BYTES: usize = 64 * 1024;
+        let cache = UnixfsMetadataCache::new(10_000, MAX_BYTES);
+        let root = cid_from_data(CODEC_DAG_PB, b"root");
+        // Paths and sizes first: far below their entry cap.
+        for index in 0..40u64 {
+            let cid = cid_from_data(CODEC_RAW, &index.to_le_bytes());
+            cache.insert_path(
+                &root,
+                &format!("dir/{index}.txt"),
+                ResolvedNode {
+                    cid,
+                    kind: NodeKind::Raw,
+                },
+            );
+            cache.insert_file_size(&cid, index);
+        }
+        let start = cache.stats();
+        assert_eq!((start.path_len, start.file_size_len), (40, 40));
+        assert!(start.bytes <= MAX_BYTES);
+        // Then nodes, until all of it together passes the capacity: the
+        // oldest entries go, whatever their kind.
+        let mut newest = Vec::new();
+        for seed in 0..60 {
+            let (cid, len, decoded) = decoded_directory(12, seed);
+            cache.insert(&cid, len, &decoded);
+            newest.push(cid);
+            let stats = cache.stats();
+            assert!(stats.bytes <= MAX_BYTES, "{stats:?}");
+            assert_eq!(stats.bytes, cache.pool.used());
+        }
+        let stats = cache.stats();
+        assert!(stats.len < 60, "nodes were evicted too: {stats:?}");
+        assert_eq!(
+            (stats.path_len, stats.file_size_len),
+            (0, 0),
+            "the older paths and sizes made way: {stats:?}"
+        );
+        assert_eq!(stats.path_evictions + stats.file_size_evictions, 80);
+        assert!(cache.get(newest.last().unwrap()).is_some());
+        assert!(cache.get(&newest[0]).is_none());
+
+        // An entry past the whole capacity evicts nothing for itself.
+        let (cid, len, big) = decoded_directory(600, 1_000);
+        assert!(big.heap_bytes() > MAX_BYTES);
+        let before = cache.stats();
+        cache.insert(&cid, len.min(UNIXFS_METADATA_CACHE_MAX_BLOCK_BYTES), &big);
+        let after = cache.stats();
+        assert_eq!(after.oversized_skips, before.oversized_skips + 1);
+        assert_eq!((after.len, after.evictions), (before.len, before.evictions));
+        assert!(cache.get(&cid).is_none());
+
+        // Cleared, it holds only its own structures.
+        cache.clear();
+        let cleared = cache.stats();
+        assert_eq!(cleared.bytes, cache.pool.used());
+        assert!(cleared.bytes < 16 * 1024, "{cleared:?}");
+    }
+
+    #[test]
+    fn a_resolver_reports_its_metadata_cache_capacity() {
+        assert_eq!(
+            UnixfsResolver::new().metadata_cache_max_bytes(),
+            DEFAULT_UNIXFS_METADATA_CACHE_MAX_BYTES
+        );
+        assert_eq!(
+            UnixfsResolver::with_metadata_cache_limits(8, 64 * 1024).metadata_cache_max_bytes(),
+            64 * 1024
+        );
+        assert_eq!(
+            UnixfsResolver::without_metadata_cache().metadata_cache_max_bytes(),
+            0
+        );
+        assert_eq!(
+            UnixfsResolver::with_metadata_cache_capacity(0).metadata_cache_max_bytes(),
+            0
+        );
+        // Too small for even its own structures: it caches nothing, and
+        // needs nothing reserved.
+        assert_eq!(
+            UnixfsResolver::with_metadata_cache_limits(8, 16).metadata_cache_max_bytes(),
+            0
+        );
+    }
+
+    #[test]
+    #[ignore = "prints the footprints the default capacity is chosen by"]
+    fn print_metadata_cache_footprints() {
+        let cache = UnixfsMetadataCache::new(10_000, 64 * 1024 * 1024);
+        let root = cid_from_data(CODEC_DAG_PB, b"root");
+        let empty = cache.stats().bytes;
+        for index in 0..256u64 {
+            let cid = cid_from_data(CODEC_RAW, &index.to_le_bytes());
+            cache.insert_path(
+                &root,
+                &format!("assets/img/photo-{index}.jpg"),
+                ResolvedNode {
+                    cid,
+                    kind: NodeKind::Raw,
+                },
+            );
+        }
+        let paths = cache.stats().bytes - empty;
+        for index in 0..256u64 {
+            cache.insert_file_size(&cid_from_data(CODEC_RAW, &index.to_le_bytes()), index);
+        }
+        let sizes = cache.stats().bytes - empty - paths;
+        let mut nodes = Vec::new();
+        for links in [1, 5, 10, 20, 50, 100] {
+            let before = cache.stats().bytes;
+            let (cid, len, decoded) = decoded_directory(links, 10_000 + links);
+            cache.insert(&cid, len, &decoded);
+            nodes.push((links, len, cache.stats().bytes - before));
+        }
+        println!("empty {empty}, 256 paths {paths}, 256 sizes {sizes}");
+        for (links, encoded, bytes) in nodes {
+            println!("directory of {links} links: {encoded} bytes encoded, {bytes} cached");
+        }
     }
 }

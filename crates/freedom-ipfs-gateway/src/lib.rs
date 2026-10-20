@@ -10,16 +10,18 @@ use axum::routing::get;
 use axum::Router;
 use bytes::Bytes;
 use cid::Cid;
-use freedom_ipfs_core::{parse_cid, BlockProvider};
+use freedom_ipfs_core::{
+    btree_map_bytes, parse_cid, BlockProvider, ChargedBytes, FixedPool, HeldBytes, PoolShare,
+};
 use freedom_ipfs_namesys::{NameResolver, NamesysError, ResolvedName};
 use freedom_ipfs_retrieval::{with_retrieval_request_context, RetrievalRequestContext};
 use freedom_ipfs_store::SqliteBlockStore;
 use freedom_ipfs_unixfs::{
     DirectoryEntry, NodeKind, UnixfsError, UnixfsMetadataCacheStats, UnixfsResolver,
-    DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY,
+    DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY, DEFAULT_UNIXFS_METADATA_CACHE_MAX_BYTES,
 };
 use futures::stream;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,8 +46,8 @@ pub use freedom_ipfs_retrieval::{
     InstanceContext, LimitSizes, MemoryBudget, MemoryWait, SharedLimits,
 };
 pub use node::{
-    delegated_router_endpoints, Instance, InstanceConfig, OnlineNode, OnlineNodeBuilder,
-    Quiescence, RoutingMode, Teardown,
+    delegated_router_endpoints, Instance, InstanceConfig, InstanceStartError, OnlineNode,
+    OnlineNodeBuilder, Quiescence, RoutingMode, Teardown,
 };
 
 pub const DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS: usize = 8;
@@ -89,95 +91,242 @@ impl GatewayBodyMode {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 struct SmallBodyCacheKey {
     file_cid: Cid,
     len: u64,
 }
 
+/// The gateway's cache of small bodies (at most 64 KiB each), within a
+/// fixed byte capacity (design 0007, "Budgets"; 2 MiB by default), which a
+/// host reserves as fixed: a [`FixedPool`].
+///
+/// - **A body counts by its backing capacity,** the allocation it keeps
+///   alive, not its length: a small view of a large buffer counts the whole
+///   buffer, for the rest of the buffer's life (the store's hot cache counts
+///   alike). So a view of a buffer larger than an entry may be is copied
+///   instead, at its exact size, as is a buffer another pool covers (one
+///   cover per buffer).
+/// - **A copy is made only once its room is taken** ([`FixedPool::hold_copy`]),
+///   oldest bodies making way for it. Evicting a body a reader still holds
+///   frees no room: it stays covered until it is freed.
+/// - **A shared body's dynamic charge** (its fetch's reservation) moves to
+///   the cache only once the cache holds the last reference to it.
+/// - **Its own structures** (itself, its map's nodes, by
+///   [`btree_map_bytes`]) count against the same capacity, so many tiny
+///   bodies can't grow it past it either.
 #[derive(Debug)]
 struct SmallBodyCache {
-    max_bytes: usize,
+    pool: FixedPool,
     inner: Mutex<SmallBodyCacheInner>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SmallBodyCacheInner {
-    entries: HashMap<SmallBodyCacheKey, Bytes>,
-    order: VecDeque<SmallBodyCacheKey>,
-    bytes: usize,
+    clock: u64,
+    /// The pool's room for the cache's own structures; `None` when it
+    /// caches nothing. The bodies are covered one by one.
+    room: Option<PoolShare>,
+    entries: BTreeMap<SmallBodyCacheKey, SmallBody>,
+    /// Entries whose bytes still carry a dynamic charge, to take over once
+    /// the cache holds them alone.
+    charged: BTreeSet<SmallBodyCacheKey>,
+}
+
+#[derive(Debug)]
+struct SmallBody {
+    bytes: HeldBytes,
+    last_used: u64,
+}
+
+/// What the cache's own structures take besides its maps' nodes: the cache
+/// in its `Arc`, and its pool's counter in its own.
+const SMALL_BODY_CACHE_OWN_BYTES: usize =
+    std::mem::size_of::<SmallBodyCache>() + 6 * std::mem::size_of::<usize>();
+
+impl SmallBodyCacheInner {
+    /// What its structures take, at most, with `extra` more entries and
+    /// `extra_charged` more charged ones.
+    fn structure_bytes(&self, extra: usize, extra_charged: usize) -> usize {
+        SMALL_BODY_CACHE_OWN_BYTES
+            .saturating_add(btree_map_bytes::<SmallBodyCacheKey, SmallBody>(
+                self.entries.len().saturating_add(extra),
+            ))
+            .saturating_add(btree_map_bytes::<SmallBodyCacheKey, ()>(
+                self.charged.len().saturating_add(extra_charged),
+            ))
+    }
+
+    /// Sizes the room to what the structures take now.
+    fn true_room(&mut self) -> bool {
+        let bytes = self.structure_bytes(0, 0);
+        self.room
+            .as_mut()
+            .is_some_and(|room| room.try_resize(bytes))
+    }
+
+    /// Takes over the dynamic charges of the bodies the cache now holds
+    /// alone: the sweep behind the takeover on a reader's drop.
+    fn take_over_charges(&mut self) {
+        let entries = &self.entries;
+        let before = self.charged.len();
+        self.charged.retain(|key| {
+            entries.get(key).is_some_and(|entry| {
+                !entry.bytes.take_over_if_only_held() && entry.bytes.bytes().charged_bytes() > 0
+            })
+        });
+        if self.charged.len() != before {
+            self.true_room();
+        }
+    }
+
+    fn remove(&mut self, key: &SmallBodyCacheKey) -> bool {
+        self.charged.remove(key);
+        self.entries.remove(key).is_some()
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        let Some(key) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone())
+        else {
+            return false;
+        };
+        self.remove(&key)
+    }
 }
 
 impl SmallBodyCache {
     fn new(max_bytes: usize) -> Self {
+        let pool = FixedPool::new(max_bytes);
+        let mut inner = SmallBodyCacheInner {
+            clock: 0,
+            room: (max_bytes > 0).then(|| pool.share(0)).flatten(),
+            entries: BTreeMap::new(),
+            charged: BTreeSet::new(),
+        };
+        // Its own structures first; a pool too small for them caches
+        // nothing.
+        if !inner.true_room() {
+            inner.room = None;
+        }
         Self {
-            max_bytes,
-            inner: Mutex::new(SmallBodyCacheInner::default()),
+            pool,
+            inner: Mutex::new(inner),
         }
     }
 
+    /// A cached body, as bytes that keep its buffer: when the last of them
+    /// is dropped, the cache takes over its charge if it then holds it
+    /// alone.
     fn get(&self, key: &SmallBodyCacheKey) -> Option<Bytes> {
-        if self.max_bytes == 0 {
+        let mut inner = self.lock_inner();
+        inner.room.as_ref()?;
+        inner.take_over_charges();
+        inner.clock = inner.clock.saturating_add(1);
+        let tick = inner.clock;
+        let entry = inner.entries.get_mut(key)?;
+        entry.last_used = tick;
+        Some(entry.bytes.bytes().to_bytes())
+    }
+
+    /// Caches `body`: shared if it can be, copied otherwise.
+    fn insert(&self, key: SmallBodyCacheKey, body: &ChargedBytes) -> SmallBodyCacheInsert {
+        let mut inner = self.lock_inner();
+        let inserted = self.insert_locked(&mut inner, key, body);
+        // The bytes it counts: its structures, and every body it covers,
+        // those it evicted but readers still hold included.
+        SmallBodyCacheInsert {
+            inserted: inserted.is_some(),
+            evicted: inserted.unwrap_or(0),
+            cache_len: inner.entries.len(),
+            cache_bytes: self.pool.used(),
+        }
+    }
+
+    /// The insertion: `Some(evicted)` if the body was cached.
+    fn insert_locked(
+        &self,
+        inner: &mut SmallBodyCacheInner,
+        key: SmallBodyCacheKey,
+        body: &ChargedBytes,
+    ) -> Option<usize> {
+        inner.room.as_ref()?;
+        inner.take_over_charges();
+        let len = body.len();
+        if len > GATEWAY_SMALL_BODY_CACHE_MAX_ENTRY_BYTES {
             return None;
         }
-        let mut inner = self.lock_inner();
-        let body = inner.entries.get(key).cloned();
-        if body.is_some() {
-            touch_small_body_cache_order(&mut inner, key);
+        // A key names its content (a file's CID and length): one cached
+        // already is the same body.
+        inner.clock = inner.clock.saturating_add(1);
+        let tick = inner.clock;
+        if let Some(entry) = inner.entries.get_mut(&key) {
+            entry.last_used = tick;
+            return Some(0);
         }
-        body
-    }
-
-    fn insert(&self, key: SmallBodyCacheKey, body: Bytes) -> SmallBodyCacheInsert {
-        let body_len = body.len();
-        if self.max_bytes == 0
-            || body_len > self.max_bytes
-            || body_len > GATEWAY_SMALL_BODY_CACHE_MAX_ENTRY_BYTES
-        {
-            return SmallBodyCacheInsert {
-                inserted: false,
-                evicted: 0,
-                cache_len: self.len(),
-                cache_bytes: self.bytes(),
-            };
+        // Shared if it can be: not a view that keeps more than an entry may
+        // count, nor a buffer another pool covers. Otherwise copied, at its
+        // exact size.
+        let shared = Some(body).filter(|bytes| {
+            bytes.backing_capacity() <= GATEWAY_SMALL_BODY_CACHE_MAX_ENTRY_BYTES
+                && (!bytes.is_covered() || self.pool.covers(bytes))
+        });
+        let counted = shared.map_or(len, |bytes| {
+            if self.pool.covers(bytes) {
+                0
+            } else {
+                bytes.backing_capacity()
+            }
+        });
+        let charged = usize::from(shared.is_some_and(|bytes| bytes.charged_bytes() > 0));
+        // Even alone in the cache it wouldn't fit: evict nothing for it.
+        let alone = SMALL_BODY_CACHE_OWN_BYTES
+            .saturating_add(btree_map_bytes::<SmallBodyCacheKey, SmallBody>(1))
+            .saturating_add(btree_map_bytes::<SmallBodyCacheKey, ()>(charged))
+            .saturating_add(counted);
+        if alone > self.pool.capacity() {
+            return None;
         }
-
-        let mut inner = self.lock_inner();
-        if let Some(previous) = inner.entries.insert(key.clone(), body) {
-            inner.bytes = inner.bytes.saturating_sub(previous.len());
-        }
-        inner.bytes = inner.bytes.saturating_add(body_len);
-        touch_small_body_cache_order(&mut inner, &key);
-
         let mut evicted = 0usize;
-        while inner.bytes > self.max_bytes {
-            let Some(evicted_key) = inner.order.pop_front() else {
-                break;
-            };
-            if evicted_key == key {
-                inner.order.push_back(evicted_key);
-                break;
+        let held = loop {
+            // Room for its entry first, then the body's cover: each taken
+            // before anything is allocated for it.
+            let structure = inner.structure_bytes(1, charged);
+            let roomy = inner
+                .room
+                .as_mut()
+                .is_some_and(|room| room.try_resize(structure));
+            if roomy {
+                let held = match shared {
+                    Some(bytes) => self.pool.hold(bytes),
+                    None => self.pool.hold_copy(len, || copy_small_body(body)),
+                };
+                if let Some(held) = held {
+                    break held;
+                }
             }
-            if let Some(evicted_body) = inner.entries.remove(&evicted_key) {
-                inner.bytes = inner.bytes.saturating_sub(evicted_body.len());
-                evicted = evicted.saturating_add(1);
+            if !inner.evict_oldest() {
+                inner.true_room();
+                return None;
             }
+            evicted = evicted.saturating_add(1);
+        };
+        if held.bytes().charged_bytes() > 0 {
+            inner.charged.insert(key.clone());
         }
-
-        SmallBodyCacheInsert {
-            inserted: true,
-            evicted,
-            cache_len: inner.entries.len(),
-            cache_bytes: inner.bytes,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.lock_inner().entries.len()
-    }
-
-    fn bytes(&self) -> usize {
-        self.lock_inner().bytes
+        inner.entries.insert(
+            key,
+            SmallBody {
+                bytes: held,
+                last_used: tick,
+            },
+        );
+        inner.take_over_charges();
+        inner.true_room();
+        Some(evicted)
     }
 
     fn lock_inner(&self) -> std::sync::MutexGuard<'_, SmallBodyCacheInner> {
@@ -185,6 +334,13 @@ impl SmallBodyCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// The copy of a body the cache keeps, at its exact size.
+fn copy_small_body(bytes: &[u8]) -> Vec<u8> {
+    #[cfg(test)]
+    tests::SMALL_BODY_COPIES.with(|copies| copies.set(copies.get() + 1));
+    bytes.to_vec()
 }
 
 #[derive(Debug)]
@@ -195,16 +351,12 @@ struct SmallBodyCacheInsert {
     cache_bytes: usize,
 }
 
-fn touch_small_body_cache_order(inner: &mut SmallBodyCacheInner, key: &SmallBodyCacheKey) {
-    inner.order.retain(|candidate| candidate != key);
-    inner.order.push_back(key.clone());
-}
-
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     max_concurrent_requests: usize,
     request_queue_timeout: Duration,
     unixfs_metadata_cache_capacity: usize,
+    unixfs_metadata_cache_max_bytes: usize,
     small_body_cache_max_bytes: usize,
     html_prefetch: GatewayHtmlPrefetchConfig,
     html_directory_prefetch: GatewayHtmlDirectoryPrefetchConfig,
@@ -219,6 +371,7 @@ impl GatewayConfig {
             max_concurrent_requests: max_concurrent_requests.max(1),
             request_queue_timeout: DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT,
             unixfs_metadata_cache_capacity: DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY,
+            unixfs_metadata_cache_max_bytes: DEFAULT_UNIXFS_METADATA_CACHE_MAX_BYTES,
             small_body_cache_max_bytes: DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
             html_prefetch: GatewayHtmlPrefetchConfig::default(),
             html_directory_prefetch: GatewayHtmlDirectoryPrefetchConfig::default(),
@@ -241,6 +394,8 @@ impl GatewayConfig {
         self
     }
 
+    /// The most entries of each kind (decoded nodes, resolved paths, file
+    /// sizes) the UnixFS metadata cache keeps.
     pub fn unixfs_metadata_cache_capacity(&self) -> usize {
         self.unixfs_metadata_cache_capacity
     }
@@ -250,6 +405,19 @@ impl GatewayConfig {
         self
     }
 
+    /// The UnixFS metadata cache's fixed byte capacity, for all its entries
+    /// together: [`DEFAULT_UNIXFS_METADATA_CACHE_MAX_BYTES`] by default.
+    pub fn unixfs_metadata_cache_max_bytes(&self) -> usize {
+        self.unixfs_metadata_cache_max_bytes
+    }
+
+    pub fn with_unixfs_metadata_cache_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.unixfs_metadata_cache_max_bytes = max_bytes;
+        self
+    }
+
+    /// The small-body cache's fixed byte capacity:
+    /// [`DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES`] by default.
     pub fn small_body_cache_max_bytes(&self) -> usize {
         self.small_body_cache_max_bytes
     }
@@ -257,6 +425,20 @@ impl GatewayConfig {
     pub fn with_small_body_cache_max_bytes(mut self, max_bytes: usize) -> Self {
         self.small_body_cache_max_bytes = max_bytes;
         self
+    }
+
+    /// The fixed capacity of a gateway's caches (design 0007, "Budgets"):
+    /// its small-body cache's and its UnixFS metadata cache's, which a host
+    /// reserves as fixed. Each cache stays within its own, counting what it
+    /// holds conservatively. The gateways of one [`OnlineNode`] share one set
+    /// of caches, so it counts once per node.
+    pub fn cache_capacity(&self) -> usize {
+        let unixfs = if self.unixfs_metadata_cache_capacity == 0 {
+            0
+        } else {
+            self.unixfs_metadata_cache_max_bytes
+        };
+        self.small_body_cache_max_bytes.saturating_add(unixfs)
     }
 
     pub fn html_prefetch(&self) -> GatewayHtmlPrefetchConfig {
@@ -597,6 +779,26 @@ where
     }
 }
 
+/// A gateway's caches: its UnixFS metadata cache and its small-body cache.
+/// Clones share them, so every gateway of one node holds one set.
+#[derive(Clone, Debug)]
+pub(crate) struct GatewayCaches {
+    unixfs: UnixfsResolver,
+    small_body: Arc<SmallBodyCache>,
+}
+
+impl GatewayCaches {
+    pub(crate) fn new(config: &GatewayConfig) -> Self {
+        Self {
+            unixfs: UnixfsResolver::with_metadata_cache_limits(
+                config.unixfs_metadata_cache_capacity(),
+                config.unixfs_metadata_cache_max_bytes(),
+            ),
+            small_body: Arc::new(SmallBodyCache::new(config.small_body_cache_max_bytes())),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct GatewayState {
     provider: Arc<dyn BlockProvider>,
@@ -628,6 +830,13 @@ impl FileCachePolicy {
 }
 
 impl GatewayState {
+    /// Whether `other` holds the same caches.
+    #[cfg(test)]
+    pub(crate) fn shares_caches_with(&self, other: &GatewayState) -> bool {
+        Arc::ptr_eq(&self.small_body_cache, &other.small_body_cache)
+            && self.unixfs.shares_metadata_cache_with(&other.unixfs)
+    }
+
     /// The same state, with its background jobs in `instance`'s group.
     pub(crate) fn with_instance(mut self, instance: InstanceContext) -> Self {
         self.html_prefetch.jobs = self.html_prefetch.jobs.with_instance(&instance);
@@ -678,8 +887,19 @@ impl GatewayState {
         name_resolver: Arc<dyn NameResolver>,
         config: GatewayConfig,
     ) -> Self {
-        let unixfs =
-            UnixfsResolver::with_metadata_cache_capacity(config.unixfs_metadata_cache_capacity());
+        let caches = GatewayCaches::new(&config);
+        Self::with_caches(provider, name_resolver, config, caches)
+    }
+
+    /// A state over `caches`, which it shares with every other state built
+    /// over clones of them.
+    pub(crate) fn with_caches(
+        provider: Arc<dyn BlockProvider>,
+        name_resolver: Arc<dyn NameResolver>,
+        config: GatewayConfig,
+        caches: GatewayCaches,
+    ) -> Self {
+        let GatewayCaches { unixfs, small_body } = caches;
         let background = BackgroundQueue::default();
         Self {
             provider,
@@ -687,7 +907,7 @@ impl GatewayState {
             unixfs,
             request_limiter: Arc::new(Semaphore::new(config.max_concurrent_requests())),
             request_queue_timeout: config.request_queue_timeout(),
-            small_body_cache: Arc::new(SmallBodyCache::new(config.small_body_cache_max_bytes())),
+            small_body_cache: small_body,
             html_prefetch: HtmlPrefetchRuntime::new(config.html_prefetch(), &background),
             html_directory_prefetch: HtmlDirectoryPrefetchRuntime::new(
                 config.html_directory_prefetch(),
@@ -1470,6 +1690,8 @@ fn trace_unixfs_metadata_cache_delta(
         phase = "unixfs_metadata_cache",
         elapsed_ms = 0u64,
         cache_capacity = after.capacity,
+        cache_max_bytes = after.max_bytes,
+        cache_bytes = after.bytes,
         cache_len = after.len,
         hits = after.hits.saturating_sub(before.hits),
         misses = after.misses.saturating_sub(before.misses),
@@ -1977,7 +2199,7 @@ fn html_range_warm_one(
 
     let end = len - 1;
     let bytes = match unixfs.read_file_cid_range(provider, &file_cid, 0, end) {
-        Ok(bytes) => Bytes::from(bytes),
+        Ok(bytes) => ChargedBytes::from_vec(bytes),
         Err(err) => {
             tracing::info!(
                 phase = "gateway_html_range_warm_failed",
@@ -1992,7 +2214,7 @@ fn html_range_warm_one(
         }
     };
     let body_len = bytes.len();
-    let insert = small_body_cache.insert(cache_key, bytes);
+    let insert = small_body_cache.insert(cache_key, &bytes);
     tracing::info!(
         phase = "gateway_html_range_warm_done",
         cid = %root_cid,
@@ -2128,7 +2350,7 @@ fn html_prefetch_one(
     }
     let end = len - 1;
     let bytes = match unixfs.read_file_cid_range(provider, &resolved.cid, 0, end) {
-        Ok(bytes) => Bytes::from(bytes),
+        Ok(bytes) => ChargedBytes::from_vec(bytes),
         Err(err) => {
             tracing::info!(
                 phase = "gateway_html_prefetch_failed",
@@ -2142,7 +2364,7 @@ fn html_prefetch_one(
             return;
         }
     };
-    let insert = small_body_cache.insert(cache_key, bytes);
+    let insert = small_body_cache.insert(cache_key, &bytes);
     tracing::info!(
         phase = "gateway_html_prefetch_done",
         cid = %root_cid,
@@ -2942,7 +3164,7 @@ fn streaming_response(
                 let started = Instant::now();
                 let bytes = unixfs
                     .read_file_cid_range(provider.as_ref(), &file_cid, 0, end)
-                    .map(Bytes::from)
+                    .map(ChargedBytes::from_vec)
                     .map_err(GatewayError::Unixfs)?;
                 tracing::info!(
                     phase = "gateway_direct_body",
@@ -2955,7 +3177,7 @@ fn streaming_response(
                     source = "unixfs",
                     elapsed_ms = started.elapsed().as_millis()
                 );
-                let insert = small_body_cache.insert(cache_key, bytes.clone());
+                let insert = small_body_cache.insert(cache_key, &bytes);
                 tracing::info!(
                     phase = "gateway_small_body_cache",
                     cid = %root_cid,
@@ -2966,7 +3188,7 @@ fn streaming_response(
                     cache_len = insert.cache_len,
                     cache_bytes = insert.cache_bytes
                 );
-                bytes
+                bytes.to_bytes()
             }
         };
         maybe_spawn_html_directory_prefetch(
@@ -3805,10 +4027,16 @@ mod tests {
     use freedom_ipfs_namesys::{NamesysError, Result as NamesysResult};
     use futures::StreamExt;
     use prost::Message;
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::net::TcpListener;
+
+    thread_local! {
+        /// The copies the small-body cache made on this thread.
+        pub(super) static SMALL_BODY_COPIES: Cell<usize> = const { Cell::new(0) };
+    }
 
     #[tokio::test]
     async fn gateway_core_serves_cached_raw_block_without_tcp() {
@@ -4566,29 +4794,133 @@ mod tests {
         );
     }
 
+    /// What the small-body cache's own structures take with `entries`
+    /// entries, `charged` of them charged.
+    fn small_body_structure(entries: usize, charged: usize) -> usize {
+        SMALL_BODY_CACHE_OWN_BYTES
+            + btree_map_bytes::<SmallBodyCacheKey, SmallBody>(entries)
+            + btree_map_bytes::<SmallBodyCacheKey, ()>(charged)
+    }
+
+    fn small_body_key(seed: &[u8], len: u64) -> SmallBodyCacheKey {
+        SmallBodyCacheKey {
+            file_cid: cid_from_data(CODEC_RAW, seed),
+            len,
+        }
+    }
+
     #[test]
     fn small_body_cache_evicts_to_byte_budget() {
-        let first = cid_from_data(CODEC_RAW, b"one");
-        let second = cid_from_data(CODEC_RAW, b"two");
-        let cache = SmallBodyCache::new(5);
-        let first_key = SmallBodyCacheKey {
-            file_cid: first,
-            len: 3,
-        };
-        let second_key = SmallBodyCacheKey {
-            file_cid: second,
-            len: 3,
-        };
+        let cache = SmallBodyCache::new(small_body_structure(1, 0) + 5);
+        let first_key = small_body_key(b"one", 3);
+        let second_key = small_body_key(b"two", 3);
 
-        let first_insert = cache.insert(first_key.clone(), Bytes::from_static(b"one"));
+        let first_insert = cache.insert(first_key.clone(), &ChargedBytes::copy_from_slice(b"one"));
         assert!(first_insert.inserted);
         assert_eq!(first_insert.evicted, 0);
-        let second_insert = cache.insert(second_key.clone(), Bytes::from_static(b"two"));
+        let second_insert =
+            cache.insert(second_key.clone(), &ChargedBytes::copy_from_slice(b"two"));
 
         assert!(second_insert.inserted);
         assert_eq!(second_insert.evicted, 1);
+        assert_eq!(second_insert.cache_bytes, small_body_structure(1, 0) + 3);
         assert!(cache.get(&first_key).is_none());
         assert_eq!(cache.get(&second_key).unwrap(), Bytes::from_static(b"two"));
+    }
+
+    #[test]
+    fn a_small_body_counts_by_its_backing_capacity() {
+        SMALL_BODY_COPIES.with(|copies| copies.set(0));
+        let cache = SmallBodyCache::new(DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES);
+        // Ten bytes that keep a 32 KiB buffer alive count the buffer.
+        let view = ChargedBytes::from_vec(vec![7; 32 * 1024]).slice(100, 110);
+        let key = small_body_key(b"view", 10);
+        let insert = cache.insert(key.clone(), &view);
+        assert!(insert.inserted);
+        assert_eq!(insert.cache_bytes, small_body_structure(1, 0) + 32 * 1024);
+        assert_eq!(cache.get(&key).unwrap(), Bytes::from(vec![7; 10]));
+        assert_eq!(SMALL_BODY_COPIES.with(Cell::get), 0, "shared, not copied");
+        drop(view);
+        assert_eq!(cache.pool.used(), small_body_structure(1, 0) + 32 * 1024);
+
+        // A view of a buffer larger than an entry may be is copied, and
+        // counts its copy's exact size.
+        let large = ChargedBytes::from_vec(vec![9; 3 * GATEWAY_SMALL_BODY_CACHE_MAX_ENTRY_BYTES]);
+        let insert = cache.insert(small_body_key(b"large", 10), &large.slice(0, 10));
+        assert!(insert.inserted);
+        assert_eq!(
+            insert.cache_bytes,
+            small_body_structure(2, 0) + 32 * 1024 + 10
+        );
+        assert_eq!(SMALL_BODY_COPIES.with(Cell::get), 1);
+
+        // So is a buffer another pool covers: one cover per buffer.
+        let other = FixedPool::new(1024 * 1024);
+        let covered = ChargedBytes::from_vec(vec![3; 100]);
+        let _held = other.hold(&covered).unwrap();
+        let insert = cache.insert(small_body_key(b"covered", 100), &covered);
+        assert!(insert.inserted);
+        assert_eq!(
+            insert.cache_bytes,
+            small_body_structure(3, 0) + 32 * 1024 + 10 + 100
+        );
+        assert_eq!(SMALL_BODY_COPIES.with(Cell::get), 2);
+        assert!(cache.pool.used() <= cache.pool.capacity());
+    }
+
+    #[test]
+    fn a_small_body_takes_over_its_charge_only_from_the_last_reference() {
+        use freedom_ipfs_core::ReservedVec;
+        let budget = MemoryBudget::new(1024 * 1024);
+        let fetched = ReservedVec::zeroed(1_000, budget.try_reserve(1_000).unwrap())
+            .unwrap()
+            .into_charged();
+        let cache = SmallBodyCache::new(DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES);
+        let key = small_body_key(b"fetched", 1_000);
+        let insert = cache.insert(key.clone(), &fetched);
+        assert!(insert.inserted);
+        // Shared, not copied: the cache covers the same buffer, so until
+        // the fetcher lets go it counts twice.
+        assert_eq!(insert.cache_bytes, small_body_structure(1, 1) + 1_000);
+        assert_eq!(budget.used(), 1_000);
+        let served = cache.get(&key).unwrap();
+        drop(fetched);
+        assert_eq!(budget.used(), 1_000, "a body being served still holds it");
+        assert!(cache.get(&key).is_some());
+        assert_eq!(budget.used(), 1_000, "nor does a lookup take it over");
+        drop(served);
+        // The cache holds it alone: its charge is the cache's now.
+        assert_eq!(budget.used(), 0);
+        assert!(cache.get(&key).is_some());
+        assert_eq!(cache.pool.used(), small_body_structure(1, 0) + 1_000);
+    }
+
+    #[test]
+    fn a_small_body_is_copied_only_into_room() {
+        SMALL_BODY_COPIES.with(|copies| copies.set(0));
+        let cache = SmallBodyCache::new(small_body_structure(4, 0) + 4 * 1_000);
+        // Four bodies that readers hold: evicting them frees no room.
+        let readers: Vec<Bytes> = (0..4u8)
+            .map(|index| {
+                let key = small_body_key(&[index], 1_000);
+                let body = ChargedBytes::from_vec(vec![index; 1_000]);
+                assert!(cache.insert(key.clone(), &body).inserted);
+                cache.get(&key).unwrap()
+            })
+            .collect();
+        // A body that must be copied (its buffer is larger than an entry)
+        // finds no room, and is never copied.
+        let large = ChargedBytes::from_vec(vec![5; 2 * GATEWAY_SMALL_BODY_CACHE_MAX_ENTRY_BYTES]);
+        let body = large.slice(0, 500);
+        let key = small_body_key(b"copy", 500);
+        assert!(!cache.insert(key.clone(), &body).inserted);
+        assert_eq!(SMALL_BODY_COPIES.with(Cell::get), 0);
+        assert!(cache.pool.used() <= cache.pool.capacity());
+        // Once the readers let go, there is room, and then it is copied.
+        drop(readers);
+        assert!(cache.insert(key.clone(), &body).inserted);
+        assert_eq!(SMALL_BODY_COPIES.with(Cell::get), 1);
+        assert_eq!(cache.get(&key).unwrap(), Bytes::from(vec![5; 500]));
     }
 
     #[tokio::test]
@@ -5765,7 +6097,7 @@ mod tests {
     }
 
     #[derive(Clone, PartialEq, Message)]
-    struct TestPbLink {
+    pub(crate) struct TestPbLink {
         #[prost(bytes = "vec", optional, tag = "1")]
         hash: Option<Vec<u8>>,
         #[prost(string, optional, tag = "2")]
@@ -5829,7 +6161,7 @@ mod tests {
         .encode_to_vec()
     }
 
-    fn test_pb_directory(links: Vec<TestPbLink>) -> Vec<u8> {
+    pub(crate) fn test_pb_directory(links: Vec<TestPbLink>) -> Vec<u8> {
         TestPbNode {
             data: Some(
                 TestUnixfsData {
@@ -5845,7 +6177,7 @@ mod tests {
         .encode_to_vec()
     }
 
-    fn test_link(name: &str, cid: &Cid) -> TestPbLink {
+    pub(crate) fn test_link(name: &str, cid: &Cid) -> TestPbLink {
         TestPbLink {
             hash: Some(cid.to_bytes()),
             name: Some(name.to_string()),

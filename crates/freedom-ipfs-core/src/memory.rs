@@ -26,7 +26,10 @@
 //!   owner lets it go too, so the pool never covers more than its capacity.
 //!   Once the owner's handles are the buffer's last, the owner takes over
 //!   its dynamic charge, when the last other handle is dropped; until then
-//!   the bytes count twice, which errs on the safe side.
+//!   the bytes count twice, which errs on the safe side. Memory that isn't
+//!   one buffer, such as a cache's decoded entries and its maps, takes a
+//!   [`PoolShare`] of the pool instead, sized by its owner
+//!   ([`btree_map_bytes`] bounds a map's nodes).
 
 use std::fmt;
 use std::ops::Deref;
@@ -752,6 +755,100 @@ impl fmt::Debug for HeldBytes {
     }
 }
 
+impl FixedPool {
+    /// A share of `bytes` of the pool, for memory its owner sizes itself:
+    /// a cache's decoded entries and its maps, which are no one buffer.
+    /// `None` if it doesn't fit in what is left of the pool. The share's
+    /// bytes come back when it is dropped or shrunk.
+    pub fn share(&self, bytes: usize) -> Option<PoolShare> {
+        let mut share = PoolShare {
+            cover: Cover {
+                pool: self.inner.clone(),
+                bytes: 0,
+            },
+        };
+        share.try_grow(bytes).then_some(share)
+    }
+}
+
+/// A share of a [`FixedPool`] whose owner sizes it: room is taken
+/// ([`PoolShare::try_grow`]) before what it pays for is allocated, and
+/// given back ([`PoolShare::shrink`]) once that is freed.
+pub struct PoolShare {
+    cover: Cover,
+}
+
+impl PoolShare {
+    pub fn bytes(&self) -> usize {
+        self.cover.bytes
+    }
+
+    /// Grows the share by `bytes` if the pool has room for them; otherwise
+    /// takes nothing.
+    pub fn try_grow(&mut self, bytes: usize) -> bool {
+        let capacity = self.cover.pool.capacity;
+        let taken = self
+            .cover
+            .pool
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|total| *total <= capacity)
+            })
+            .is_ok();
+        if taken {
+            self.cover.bytes += bytes;
+        }
+        taken
+    }
+
+    /// Gives `bytes` of the share back to the pool (at most all of it).
+    pub fn shrink(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.cover.bytes);
+        self.cover.bytes -= bytes;
+        self.cover.pool.used.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    /// Sizes the share to `bytes`: grows it if the pool has room (`false`,
+    /// taking nothing, if it hasn't), or shrinks it.
+    pub fn try_resize(&mut self, bytes: usize) -> bool {
+        match bytes.checked_sub(self.cover.bytes) {
+            Some(more) => self.try_grow(more),
+            None => {
+                self.shrink(self.cover.bytes - bytes);
+                true
+            }
+        }
+    }
+}
+
+impl fmt::Debug for PoolShare {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("PoolShare").field(&self.bytes()).finish()
+    }
+}
+
+/// The most heap a `std` `BTreeMap<K, V>` of `len` entries holds: its
+/// nodes, by `std`'s layout. A node holds at most 11 entries and, the root
+/// excepted, at least 5 (insertion splits a full node in two of at least 5;
+/// removal merges or refills a node that falls below 5), so `len` entries
+/// take at most `1 + (len - 1) / 5` nodes; an emptied map may keep its
+/// root, so even none take one. Each is at most an internal node: 11
+/// `(K, V)` slots, 12 child pointers, its parent pointer, two `u16`s and
+/// padding. What the keys and values own on the heap isn't in it. The bound
+/// grows with `len` and never depends on the map's history, so room taken
+/// for `len + 1` entries before an insertion covers it.
+pub fn btree_map_bytes<K, V>(len: usize) -> usize {
+    let nodes = 1 + len.saturating_sub(1) / 5;
+    let word = std::mem::size_of::<usize>();
+    let node = 11 * (std::mem::size_of::<K>() + std::mem::size_of::<V>())
+        + 13 * word
+        + 4
+        + std::mem::align_of::<K>()
+        + std::mem::align_of::<V>()
+        + word;
+    nodes.saturating_mul(node)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1059,6 +1156,32 @@ mod tests {
         let _other_held = other.hold(&small).unwrap();
         assert!(pool.hold(&small).is_none());
         assert!(small.is_covered() && !pool.covers(&small) && other.covers(&small));
+    }
+
+    #[test]
+    fn a_pool_share_takes_room_first_and_gives_it_back() {
+        let pool = FixedPool::new(1_000);
+        let mut share = pool.share(600).unwrap();
+        assert!(pool.share(401).is_none(), "nothing past the capacity");
+        let held = pool.hold(&ChargedBytes::from_vec(vec![0; 300])).unwrap();
+        assert_eq!(pool.used(), 900);
+        assert!(!share.try_grow(101));
+        assert_eq!(
+            (share.bytes(), pool.used()),
+            (600, 900),
+            "a refusal takes nothing"
+        );
+        assert!(share.try_resize(700));
+        assert!(!share.try_resize(701));
+        share.shrink(200);
+        assert_eq!((share.bytes(), pool.used()), (500, 800));
+        share.shrink(10_000);
+        assert_eq!((share.bytes(), pool.used()), (0, 300));
+        assert!(share.try_resize(400));
+        drop(share);
+        assert_eq!(pool.used(), 300);
+        drop(held);
+        assert_eq!(pool.used(), 0);
     }
 
     #[test]
