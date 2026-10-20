@@ -59,6 +59,33 @@ pub struct StoreOptions {
     pub cache_kib: Option<u32>,
 }
 
+impl StoreOptions {
+    /// The block bytes kept: `max_bytes`, or 256 MiB for 0.
+    fn effective_max_bytes(&self) -> u64 {
+        if self.max_bytes == 0 {
+            DEFAULT_CACHE_BYTES
+        } else {
+            self.max_bytes
+        }
+    }
+
+    /// The hot cache's capacity asked for: `hot_cache_bytes`, or
+    /// `min(max_bytes, 16 MiB)`.
+    fn hot_bytes(&self) -> u64 {
+        self.hot_cache_bytes
+            .unwrap_or_else(|| hot_cache_bytes(self.effective_max_bytes()))
+    }
+
+    /// The hot cache's fixed capacity a store opened with these options has:
+    /// what [`SqliteBlockStore::hot_cache_capacity`] reports once it is open,
+    /// so a host can reserve it before opening the store. It is at least the
+    /// cache's own structures, which even a cache that caches nothing (or is
+    /// turned off) keeps.
+    pub fn hot_cache_fixed_bytes(&self) -> u64 {
+        hot_cache_fixed_bytes(self.hot_bytes()) as u64
+    }
+}
+
 #[derive(Clone)]
 pub struct SqliteBlockStore {
     conn: Arc<Mutex<Connection>>,
@@ -106,14 +133,8 @@ impl SqliteBlockStore {
     }
 
     fn with_connection(conn: Connection, options: StoreOptions) -> Result<Self> {
-        let max_bytes = if options.max_bytes == 0 {
-            DEFAULT_CACHE_BYTES
-        } else {
-            options.max_bytes
-        };
-        let hot_bytes = options
-            .hot_cache_bytes
-            .unwrap_or_else(|| hot_cache_bytes(max_bytes));
+        let max_bytes = options.effective_max_bytes();
+        let hot_bytes = options.hot_bytes();
         if let Some(pages) = options.max_page_count {
             // SQLite answers the cap it installed, which isn't the one asked
             // for when the database already has more pages or the value is
@@ -2348,6 +2369,52 @@ mod tests {
         })
         .unwrap();
         assert_eq!(off.hot_cache_capacity(), HOT_CACHE_OWN_BYTES as u64);
+    }
+
+    #[test]
+    fn options_tell_the_hot_caches_fixed_capacity_before_the_store_opens() {
+        for options in [
+            StoreOptions::default(),
+            StoreOptions {
+                max_bytes: 1,
+                ..StoreOptions::default()
+            },
+            StoreOptions {
+                max_bytes: 3 << 20,
+                ..StoreOptions::default()
+            },
+            StoreOptions {
+                max_bytes: 1 << 30,
+                ..StoreOptions::default()
+            },
+            StoreOptions {
+                max_bytes: 1,
+                hot_cache_bytes: Some(4 << 20),
+                ..StoreOptions::default()
+            },
+            StoreOptions {
+                hot_cache_bytes: Some(0),
+                ..StoreOptions::default()
+            },
+            StoreOptions {
+                hot_cache_bytes: Some(1),
+                ..StoreOptions::default()
+            },
+        ] {
+            let store = SqliteBlockStore::in_memory_with(options).unwrap();
+            assert_eq!(
+                options.hot_cache_fixed_bytes(),
+                store.hot_cache_capacity(),
+                "{options:?}"
+            );
+        }
+        // A tiny target still keeps the cache's own structures.
+        let tiny = StoreOptions {
+            max_bytes: 1,
+            ..StoreOptions::default()
+        };
+        assert_eq!(tiny.hot_cache_fixed_bytes(), HOT_CACHE_OWN_BYTES as u64);
+        assert!(tiny.hot_cache_fixed_bytes() > tiny.max_bytes);
     }
 
     #[test]
