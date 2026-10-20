@@ -22,6 +22,11 @@ if (buildInfo.name !== 'freedom-ipfs') {
 if (buildInfo.mobile_ffi_abi_version !== addon.constants.MOBILE_FFI_ABI_VERSION) {
   throw new Error('mobile FFI ABI version mismatch');
 }
+// scripts/package-electron-addon.js sets FREEDOM_IPFS_BUILD_GIT_* for every
+// packaged build, so in CI the build must carry its git state.
+if (process.env.CI && !(buildInfo.git_commit && buildInfo.git_describe)) {
+  throw new Error(`build info without git state: ${JSON.stringify(buildInfo)}`);
+}
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freedom-ipfs-node-smoke-'));
 const otherDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freedom-ipfs-node-smoke-'));

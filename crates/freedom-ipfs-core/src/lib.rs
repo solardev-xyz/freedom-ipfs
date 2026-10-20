@@ -4,6 +4,8 @@ use multihash_codetable::{Code, MultihashDigest};
 use std::io::Cursor;
 use thiserror::Error;
 
+pub mod build_info;
+
 pub const CODEC_DAG_PB: u64 = 0x70;
 pub const CODEC_RAW: u64 = 0x55;
 pub const HASH_IDENTITY: u64 = 0x00;
