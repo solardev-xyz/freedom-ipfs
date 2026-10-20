@@ -5143,8 +5143,10 @@ impl HttpRetriever {
                     timeout = true,
                     elapsed_ms = started.elapsed().as_millis()
                 );
-                // It may have run out while its read waited for memory.
-                if window.pressured() {
+                // Its timer runs while its reads wait for memory: one that
+                // ran out with a wait inside it (outstanding, cut short, or
+                // served late) blames no peer.
+                if window.excuses_timer() {
                     tracing::info!(
                         phase = "bitswap_peer_timeout_suppressed",
                         cid = %cid,
@@ -8071,8 +8073,9 @@ impl SharedBitswapClient {
                     targets = %target_summary.as_deref().unwrap_or("")
                 );
                 // Its reads (in the swarm, sharing this fetch's memory) may
-                // have spent the time waiting for memory: then it is busy,
-                // not a peer's timeout.
+                // have spent the time waiting for memory: busy, if a wait is
+                // outstanding or was refused. (A request timeout names no
+                // peer, so none is blamed for it whatever the cause.)
                 match window.pressure() {
                     Some(pressure) => Err(RetrievalError::MemoryBudget(pressure)),
                     None => Err(RetrievalError::BitswapTimeout),
@@ -20764,6 +20767,111 @@ mod bitswap_tests {
             after_wait,
             "a served wait turned a network timeout into busy"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shortcut_served_late_for_memory_blames_no_healthy_peer() {
+        for pressure in [false, true] {
+            let data = b"a healthy peer answering in 700 ms".to_vec();
+            let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, &data);
+            let (peer_id, addr, swarm_task, stream_task) = spawn_delayed_multi_block_bitswap_peer(
+                vec![(cid, data)],
+                Duration::from_millis(700),
+            )
+            .await;
+            let budget = MemoryBudget::new(BITSWAP_MAX_MESSAGE_SIZE);
+            let memory = FetchMemory::new(budget.clone());
+            let store = SqliteBlockStore::in_memory(1 << 20).unwrap();
+            let retriever = HttpRetriever::new(
+                freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+                store.clone(),
+            )
+            .with_memory_budget(budget.clone());
+            // Under pressure, the read's memory comes 1.7 s into the 2 s
+            // shortcut: served, but too late for the 700 ms answer.
+            let release = pressure.then(|| {
+                let full = budget.try_reserve(budget.limit()).unwrap();
+                let memory = memory.clone();
+                tokio::spawn(async move {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while memory.waiting() == 0 {
+                        assert!(Instant::now() < deadline, "the read never waited");
+                        tokio::task::yield_now().await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1700)).await;
+                    drop(full);
+                })
+            });
+            let result = FetchMemory::scope(
+                Some(memory.clone()),
+                retriever.fetch_from_recent_bitswap_peers(
+                    &cid,
+                    vec![BitswapPeer {
+                        id: peer_id,
+                        addrs: vec![addr],
+                        skip_want_have: true,
+                        force_want_block: true,
+                        force_want_have: false,
+                    }],
+                ),
+            )
+            .await
+            .unwrap();
+            if let Some(release) = release {
+                release.await.unwrap();
+            }
+            if !pressure {
+                assert!(result.is_some(), "the peer serves the shortcut in time");
+            }
+            assert!(
+                !store.is_bad_provider(&peer_id.to_string()).unwrap(),
+                "pressure={pressure}: a healthy peer was blamed for a memory wait"
+            );
+            swarm_task.abort();
+            stream_task.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wait_served_before_the_shortcut_excuses_no_silent_peer() {
+        let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, b"silent");
+        let (peer_id, addr, swarm_task, stream_task) = spawn_silent_bitswap_peer(cid).await;
+        let budget = MemoryBudget::new(BITSWAP_MAX_MESSAGE_SIZE);
+        let memory = FetchMemory::new(budget.clone());
+        // A wait, served and over before the shortcut starts.
+        let full = budget.try_reserve(budget.limit()).unwrap();
+        let mut wait = Box::pin(memory.reserve(1));
+        assert!(futures::poll!(&mut wait).is_pending());
+        drop(full);
+        drop(wait.await.unwrap());
+        let store = SqliteBlockStore::in_memory(1 << 20).unwrap();
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            store.clone(),
+        )
+        .with_memory_budget(budget.clone());
+        let result = FetchMemory::scope(
+            Some(memory),
+            retriever.fetch_from_recent_bitswap_peers(
+                &cid,
+                vec![BitswapPeer {
+                    id: peer_id,
+                    addrs: vec![addr],
+                    skip_want_have: true,
+                    force_want_block: true,
+                    force_want_have: false,
+                }],
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+        assert!(
+            store.is_bad_provider(&peer_id.to_string()).unwrap(),
+            "a silent peer had its whole shortcut, and an earlier wait excuses nothing"
+        );
+        swarm_task.abort();
+        stream_task.abort();
     }
 
     #[tokio::test(flavor = "multi_thread")]

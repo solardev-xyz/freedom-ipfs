@@ -347,6 +347,15 @@ impl PressureWindow {
         self.pressure().is_some()
     }
 
+    /// Whether a timer around the operation that also runs while its
+    /// reservations wait (rather than one started after them) ran out for
+    /// memory, so no peer is to blame for it: pressure now, or any wait
+    /// during the operation, even one since served, as the wait spent the
+    /// timer's time. Waits before the window don't count.
+    pub(crate) fn excuses_timer(&self) -> bool {
+        self.pressured() || self.waited()
+    }
+
     /// Whether any reservation waited during the operation, served or not:
     /// then the time it took is partly memory's, not a peer's slowness.
     pub(crate) fn waited(&self) -> bool {
