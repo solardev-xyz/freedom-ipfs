@@ -26,6 +26,10 @@ pub enum StoreError {
     Core(#[from] CoreError),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// SQLite can't hold the store to the page cap asked for: the database
+    /// already has more pages, or the cap is past SQLite's own limit.
+    #[error("page cap {requested} can't be installed (SQLite keeps {installed})")]
+    PageCap { requested: u32, installed: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -110,10 +114,19 @@ impl SqliteBlockStore {
             .hot_cache_bytes
             .unwrap_or_else(|| hot_cache_bytes(max_bytes));
         if let Some(pages) = options.max_page_count {
-            // Answers the cap it set: a value that can't be read back fails.
-            conn.query_row(&format!("PRAGMA max_page_count = {pages}"), [], |row| {
-                row.get::<_, i64>(0)
-            })?;
+            // SQLite answers the cap it installed, which isn't the one asked
+            // for when the database already has more pages or the value is
+            // past its limit. A cap the host reserved memory by must hold.
+            let installed =
+                conn.query_row(&format!("PRAGMA max_page_count = {pages}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })?;
+            if installed != i64::from(pages) {
+                return Err(StoreError::PageCap {
+                    requested: pages,
+                    installed,
+                });
+            }
         }
         if let Some(kib) = options.cache_kib {
             conn.execute_batch(&format!("PRAGMA cache_size = -{kib};"))?;
@@ -371,7 +384,8 @@ impl SqliteBlockStore {
     ) -> Result<()> {
         let expires_at = now_secs().saturating_add(ttl.as_secs());
         let providers_json = serde_json::to_string(providers)?;
-        cached_unless_full(self.conn.lock().execute(
+        let conn = self.conn.lock();
+        let stored = cached_unless_full(conn.execute(
             r#"
             INSERT INTO provider_cache(cid, providers_json, expires_at)
             VALUES (?1, ?2, ?3)
@@ -381,6 +395,14 @@ impl SqliteBlockStore {
             "#,
             params![provider_cache_key(cid), providers_json, expires_at as i64],
         ))?;
+        if !stored {
+            // The refused update left the old row: it must not answer for
+            // the new one.
+            conn.execute(
+                "DELETE FROM provider_cache WHERE cid = ?1",
+                params![provider_cache_key(cid)],
+            )?;
+        }
         Ok(())
     }
 
@@ -415,7 +437,8 @@ impl SqliteBlockStore {
         }
         let now = now_secs();
         let expires_at = now.saturating_add(ttl.as_secs());
-        let stored = cached_unless_full(self.conn.lock().execute(
+        let conn = self.conn.lock();
+        let stored = cached_unless_full(conn.execute(
             r#"
             INSERT INTO name_cache(name, resolved_target, expires_at, updated_at)
             VALUES (?1, ?2, ?3, ?4)
@@ -426,9 +449,13 @@ impl SqliteBlockStore {
             "#,
             params![name, resolved_target, expires_at as i64, now as i64],
         ))?;
-        if stored {
-            self.prune_name_cache()?;
+        if !stored {
+            // The refused update left the old target: it must not answer.
+            conn.execute("DELETE FROM name_cache WHERE name = ?1", params![name])?;
+            return Ok(());
         }
+        drop(conn);
+        self.prune_name_cache()?;
         Ok(())
     }
 
@@ -457,7 +484,8 @@ impl SqliteBlockStore {
 
     pub fn mark_bad_provider(&self, peer_or_url: &str, reason: &str, ttl: Duration) -> Result<()> {
         let expires_at = now_secs().saturating_add(ttl.as_secs());
-        cached_unless_full(self.conn.lock().execute(
+        let conn = self.conn.lock();
+        let stored = cached_unless_full(conn.execute(
             r#"
             INSERT INTO bad_providers(peer_or_url, reason, expires_at)
             VALUES (?1, ?2, ?3)
@@ -467,6 +495,13 @@ impl SqliteBlockStore {
             "#,
             params![peer_or_url, reason, expires_at as i64],
         ))?;
+        if !stored {
+            // The refused update left the old mark and its expiry.
+            conn.execute(
+                "DELETE FROM bad_providers WHERE peer_or_url = ?1",
+                params![peer_or_url],
+            )?;
+        }
         Ok(())
     }
 
@@ -674,7 +709,8 @@ fn hot_cache_bytes(max_bytes: u64) -> u64 {
 /// A cache write's outcome: whether the entry was stored. One that met the
 /// page cap (`SQLITE_FULL`) wasn't, and that is not an error: the entry is
 /// left uncached, and the request it served goes on. SQLite rolls back the
-/// failed statement, so nothing of it is left behind.
+/// failed statement, so nothing of it is left behind; but a refused update
+/// leaves the row it would have replaced, which a metadata caller deletes.
 fn cached_unless_full(written: rusqlite::Result<usize>) -> Result<bool> {
     match written {
         Ok(_) => Ok(true),
@@ -850,6 +886,62 @@ mod tests {
     }
 
     #[test]
+    fn a_page_cap_that_cant_be_installed_fails_the_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "freedom-ipfs-store-cap-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.sqlite");
+        let store = SqliteBlockStore::open(&path, 0).unwrap();
+        for i in 0..4u8 {
+            let data = vec![i; 64 * 1024];
+            store
+                .put_block(&cid_from_data(CODEC_RAW, &data), &data)
+                .unwrap();
+        }
+        let pages = pragma(&store, "page_count");
+        assert!(store.close(Duration::from_secs(5)));
+        drop(store);
+        // Below the pages the database already has.
+        let refused = SqliteBlockStore::open_with(
+            &path,
+            StoreOptions {
+                max_page_count: Some(1),
+                ..StoreOptions::default()
+            },
+        );
+        assert!(
+            matches!(refused, Err(StoreError::PageCap { requested: 1, installed }) if installed >= pages),
+            "{:?}",
+            refused.err()
+        );
+        // At or above them it holds.
+        let held = SqliteBlockStore::open_with(
+            &path,
+            StoreOptions {
+                max_page_count: Some(pages as u32 + 10),
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(pragma(&held, "max_page_count"), pages + 10);
+        drop(held);
+        // Past SQLite's own limit.
+        let past = SqliteBlockStore::in_memory_with(StoreOptions {
+            max_page_count: Some(u32::MAX),
+            ..StoreOptions::default()
+        });
+        assert!(
+            matches!(past, Err(StoreError::PageCap { .. })),
+            "{:?}",
+            past.err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_hot_cache_is_sized_apart_from_max_bytes() {
         let off = SqliteBlockStore::in_memory_with(StoreOptions {
             hot_cache_bytes: Some(0),
@@ -920,6 +1012,50 @@ mod tests {
             .mark_bad_provider(&long, "slow", Duration::from_secs(60))
             .unwrap();
         assert!(!store.is_bad_provider(&long).unwrap());
+
+        // A refreshed entry that no longer fits is gone, not left stale.
+        // (Seeded first, then the store filled again.)
+        store.trim_blocks_to(0).unwrap();
+        store
+            .put_name_record("seeded.example", "old-target", Duration::from_secs(60))
+            .unwrap();
+        let seeded = vec![CachedProviderRecord {
+            id: Some("old".to_string()),
+            addrs: vec![],
+        }];
+        store
+            .put_provider_records(&refused, &seeded, Duration::from_secs(60))
+            .unwrap();
+        store
+            .mark_bad_provider("seeded-peer", "old", Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(
+            store.get_name_record("seeded.example").unwrap().as_deref(),
+            Some("old-target")
+        );
+        assert!(store.get_provider_records(&refused).unwrap().is_some());
+        assert!(store.is_bad_provider("seeded-peer").unwrap());
+        for i in 0..16u8 {
+            let data = vec![i.wrapping_add(100); 64 * 1024];
+            let cid = cid_from_data(CODEC_RAW, &data);
+            store.put_block(&cid, &data).unwrap();
+            if store.get(&cid).unwrap().is_none() {
+                break;
+            }
+        }
+        store
+            .put_name_record("seeded.example", &long, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(store.get_name_record("seeded.example").unwrap(), None);
+        store
+            .put_provider_records(&refused, &providers, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(store.get_provider_records(&refused).unwrap(), None);
+        let long_reason = "r".repeat(16 * 1024);
+        store
+            .mark_bad_provider("seeded-peer", &long_reason, Duration::from_secs(60))
+            .unwrap();
+        assert!(!store.is_bad_provider("seeded-peer").unwrap());
 
         // Room made, the same block is cached again.
         store.trim_blocks_to(0).unwrap();
