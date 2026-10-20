@@ -8387,9 +8387,7 @@ async fn run_shared_bitswap_swarm(
                 // Requests on a dial that waits for a slot hold their
                 // connection timers until it starts; the others' start now.
                 for (peer, senders) in admitted_senders {
-                    if let Some(dial) = deferred_dials.iter_mut().find(|dial| dial.peer == peer) {
-                        dial.admitted.extend(senders);
-                    }
+                    join_deferred_bitswap_dial(&mut deferred_dials, peer, senders);
                 }
                 if failed_dial_waiter_count > 0 {
                     tracing::info!(
@@ -8771,6 +8769,20 @@ async fn connection_slot_released(waits: Option<&mut ConnectionSlotWaits>) {
     }
 }
 
+/// Adds requests' `admitted` senders to the dial to `peer` waiting for a
+/// slot, dropping those of requests already gone first, so a dial that
+/// callers keep joining and leaving holds one per live request.
+fn join_deferred_bitswap_dial(
+    deferred: &mut VecDeque<DeferredBitswapDial>,
+    peer: PeerId,
+    senders: Vec<oneshot::Sender<()>>,
+) {
+    if let Some(dial) = deferred.iter_mut().find(|dial| dial.peer == peer) {
+        dial.admitted.retain(|admitted| !admitted.is_closed());
+        dial.admitted.extend(senders);
+    }
+}
+
 /// Drops the dials waiting for a slot that no request waits on any longer
 /// (their responders gone, so their waiters closed), with their waiters'
 /// entries, so a later request dials afresh; and those of peers since
@@ -8783,7 +8795,9 @@ fn prune_deferred_bitswap_dials(
 ) -> usize {
     prune_connection_waiters(connection_waiters, connection_wait_started);
     let before = deferred.len();
-    deferred.retain(|dial| {
+    deferred.retain_mut(|dial| {
+        // A request that went away while others still wait leaves nothing.
+        dial.admitted.retain(|admitted| !admitted.is_closed());
         !connected_peers.contains_key(&dial.peer) && connection_waiters.contains_key(&dial.peer)
     });
     before - deferred.len()
@@ -18808,6 +18822,42 @@ mod bitswap_tests {
             swarm_task.abort();
             accept_task.abort();
         }
+    }
+
+    #[test]
+    fn a_deferred_dial_keeps_only_its_live_requests() {
+        let limits = SharedLimits::new(LimitSizes {
+            bitswap_connections: 1,
+            ..LimitSizes::default()
+        });
+        let waits = limits.bitswap_connection_limit().slot_waits();
+        let peer = PeerId::random();
+        let (live_admitted, _live_admitted) = oneshot::channel();
+        let (live_connected, _live_connected) = oneshot::channel();
+        let mut connection_waiters = HashMap::from([(peer, vec![live_connected])]);
+        let mut started = HashMap::new();
+        let mut deferred = VecDeque::from([DeferredBitswapDial {
+            peer,
+            addrs: Vec::new(),
+            context: BitswapDialContext::new("test", BitswapCommandContext::default()),
+            admitted: vec![live_admitted],
+            _waiting: waits.waiting(),
+        }]);
+        // Callers join and give up while one live caller keeps it waiting.
+        for _ in 0..1_000 {
+            let (admitted, gone) = oneshot::channel::<()>();
+            join_deferred_bitswap_dial(&mut deferred, peer, vec![admitted]);
+            drop(gone);
+            prune_deferred_bitswap_dials(
+                &mut deferred,
+                &mut connection_waiters,
+                &mut started,
+                &HashMap::new(),
+            );
+        }
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].admitted.len(), 1);
+        assert_eq!(limits.bitswap_connections_waiting(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
