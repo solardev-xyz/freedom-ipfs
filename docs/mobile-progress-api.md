@@ -136,6 +136,12 @@ gateway, UnixFS path handling, IPNS/name resolution, routing/provider lookup,
 and retrieval/Bitswap paths. It also records explicit mobile preload
 `started`, `completed`, `failed`, and `cancelled` events.
 
+A gateway request that is cancelled before it ends, or whose streamed body is
+dropped before its last chunk, leaves `active` too: its last event has
+`phase: "cancelled"` and `status: "cancelled"`, with `raw_phase:
+"request_cancelled"`. The recorder adds that event when the request's work is
+dropped; it is not a Rust log line.
+
 Lifecycle hooks that stop active preloads also emit `cancelled` preload events
 before pruning the preload task. This includes `enterBackground`, low-memory
 handling, network changes, and node teardown. Swift can treat those events as a

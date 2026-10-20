@@ -46,6 +46,18 @@
 //!
 //! A host that gives no node a recorder of its own finds everything in the
 //! default recorder.
+//!
+//! # Cancelled requests
+//!
+//! A gateway request's target is active from its `request_start` until its
+//! `request_done`, or, when its body streams, until `gateway_stream_done`
+//! or `gateway_stream_failed`. A request dropped before then (its host
+//! cancelled it, or its reader dropped the body) emits neither. Its span
+//! closes once nothing holds it: its future, its body, and the spans
+//! opened inside it, such as a background prefetch's. If its target is
+//! still open then, the recorder closes it with an event of its own: raw
+//! phase `request_cancelled`, phase and status `cancelled`. No other layer
+//! sees that event.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -54,7 +66,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock};
 use std::task::Poll;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -66,6 +78,10 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Layer, Registry};
 
 const MAX_PROGRESS_EVENTS: usize = 512;
+
+/// The raw phase of the event that closes a request whose span ended while
+/// its target was open: see `ProgressLayer::on_close`.
+const REQUEST_CANCELLED: &str = "request_cancelled";
 
 static DEFAULT_RECORDER: OnceLock<ProgressRecorder> = OnceLock::new();
 static PROGRESS_TRACING_INIT: Once = Once::new();
@@ -180,6 +196,12 @@ struct ProgressTarget {
     updated_ms: u64,
 }
 
+/// The target an event was recorded for, and whether it ended it.
+struct RecordedTarget {
+    key: String,
+    ended: bool,
+}
+
 /// A recorder's snapshot, which serializes to the JSON
 /// docs/mobile-progress-api.md describes.
 #[derive(Clone, Debug, Serialize)]
@@ -230,10 +252,34 @@ impl ProgressRecorder {
             .on_thread_stop(|| drop(set_thread_recorder(None)))
     }
 
-    fn record_event(&self, span: ProgressSpanFields, fields: ProgressFields, _metadata_name: &str) {
-        let Some(raw_phase) = fields.get("phase").cloned() else {
-            return;
-        };
+    fn record_event(
+        &self,
+        span: ProgressSpanFields,
+        fields: ProgressFields,
+        _metadata_name: &str,
+    ) -> Option<RecordedTarget> {
+        self.record(span, fields, false)
+    }
+
+    /// Closes the target `span` stands for, as cancelled, if it is still
+    /// active.
+    fn record_cancelled(&self, span: ProgressSpanFields) {
+        let mut fields = ProgressFields::default();
+        fields
+            .values
+            .insert("phase".into(), REQUEST_CANCELLED.into());
+        drop(self.record(span, fields, true));
+    }
+
+    /// Records an event, unless it has no phase, or `only_if_active` and
+    /// its target isn't active.
+    fn record(
+        &self,
+        span: ProgressSpanFields,
+        fields: ProgressFields,
+        only_if_active: bool,
+    ) -> Option<RecordedTarget> {
+        let raw_phase = fields.get("phase").cloned()?;
         let kind = progress_kind(&fields, &raw_phase, &span);
         let target_id = progress_target_id(&fields, &span);
         let path = fields.get("path").cloned().or(span.path);
@@ -262,10 +308,13 @@ impl ProgressRecorder {
         let last_error_code = progress_error_code(&raw_phase, &fields, &status);
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,
-            Err(_) => return,
+            Err(_) => return None,
         };
-        inner.next_event_id = inner.next_event_id.saturating_add(1);
         let target_key = format!("{kind}:{target_id}");
+        if only_if_active && !inner.active_targets.contains_key(&target_key) {
+            return None;
+        }
+        inner.next_event_id = inner.next_event_id.saturating_add(1);
         let previous_target = inner.active_targets.get(&target_key);
         let (
             previous_bytes_loaded,
@@ -331,11 +380,12 @@ impl ProgressRecorder {
             inner.events.pop_front();
         }
 
-        if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+        let ended = matches!(status.as_str(), "completed" | "failed" | "cancelled");
+        if ended {
             inner.active_targets.remove(&target_key);
         } else if target_id != 0 {
             inner.active_targets.insert(
-                target_key,
+                target_key.clone(),
                 ProgressTarget {
                     id: target_id,
                     request_id,
@@ -362,6 +412,10 @@ impl ProgressRecorder {
                 },
             );
         }
+        Some(RecordedTarget {
+            key: target_key,
+            ended,
+        })
     }
 
     /// The targets still active and the latest events.
@@ -482,10 +536,34 @@ struct ProgressLayer {
     _claim: Option<LayerClaim>,
 }
 
-/// The recorder a span's events go to, fixed when it is created: its parent
-/// span's, or else the creating thread's. `None` leaves them to the thread
-/// they are emitted on.
-struct SpanRecorder(Option<ProgressRecorder>);
+/// What the layer keeps on a span besides its fields.
+struct SpanRoute {
+    /// The recorder its events go to, fixed when it is created: its parent
+    /// span's, or else the creating thread's. `None` leaves them to the
+    /// thread they are emitted on.
+    recorder: Option<ProgressRecorder>,
+    /// The recorder the target the span stands for (`span_target_key`) is
+    /// open in: set by the span's events that leave it active, cleared by
+    /// the one that ends it.
+    open_in: Mutex<Option<ProgressRecorder>>,
+}
+
+impl SpanRoute {
+    fn open_in(&self) -> MutexGuard<'_, Option<ProgressRecorder>> {
+        self.open_in
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// The target a span stands for by its own fields, keyed as `record_event`
+/// keys an event in it that names no target of its own: a gateway
+/// request's.
+fn span_target_key(span: &ProgressSpanFields) -> Option<String> {
+    let none = ProgressFields::default();
+    let id = progress_target_id(&none, span);
+    (id != 0).then(|| format!("{}:{id}", progress_kind(&none, "", span)))
+}
 
 /// The "a recording layer is out" flag, released when the layer holding
 /// it is dropped. A layer lives as long as its subscriber, so the claim
@@ -534,13 +612,16 @@ where
                 .and_then(|parent| {
                     parent
                         .extensions()
-                        .get::<SpanRecorder>()
-                        .and_then(|recorder| recorder.0.clone())
+                        .get::<SpanRoute>()
+                        .and_then(|route| route.recorder.clone())
                 })
                 .or_else(thread_recorder);
             let mut extensions = span.extensions_mut();
             extensions.insert(span_fields);
-            extensions.insert(SpanRecorder(recorder));
+            extensions.insert(SpanRoute {
+                recorder,
+                open_in: Mutex::new(None),
+            });
         }
     }
 
@@ -555,12 +636,48 @@ where
             .unwrap_or_default();
         let recorder = extensions
             .as_ref()
-            .and_then(|extensions| extensions.get::<SpanRecorder>())
-            .and_then(|recorder| recorder.0.clone())
+            .and_then(|extensions| extensions.get::<SpanRoute>())
+            .and_then(|route| route.recorder.clone())
             .or_else(thread_recorder)
             .unwrap_or_else(default_recorder);
         drop(extensions);
-        recorder.record_event(span, fields, event.metadata().name());
+        let own_target = span_target_key(&span);
+        let Some(recorded) = recorder.record_event(span, fields, event.metadata().name()) else {
+            return;
+        };
+        // An event of the target the span stands for opens or ends it.
+        if own_target.as_ref() == Some(&recorded.key) {
+            if let Some(span) = &current {
+                if let Some(route) = span.extensions().get::<SpanRoute>() {
+                    *route.open_in() = (!recorded.ended).then_some(recorder);
+                }
+            }
+        }
+    }
+
+    /// A span closes once nothing holds it: its request's future, a
+    /// streamed response's body, and the spans opened inside it. If the
+    /// target it stands for is still open then, no event ended it: the
+    /// request was dropped first, that is cancelled. Its entry would
+    /// otherwise stay active until the next `clear`, so it is closed here,
+    /// as cancelled, in the recorder it is open in (whichever thread closes
+    /// the span).
+    fn on_close(&self, id: Id, ctx: Context<'_, S>) {
+        let Some(span) = ctx.span(&id) else {
+            return;
+        };
+        let extensions = span.extensions();
+        let (Some(fields), Some(route)) = (
+            extensions.get::<ProgressSpanFields>(),
+            extensions.get::<SpanRoute>(),
+        ) else {
+            return;
+        };
+        let (fields, open_in) = (fields.clone(), route.open_in().take());
+        drop(extensions);
+        if let Some(recorder) = open_in {
+            recorder.record_cancelled(fields);
+        }
     }
 }
 
@@ -763,7 +880,7 @@ fn progress_status(raw_phase: &str, fields: &ProgressFields) -> String {
             Some("false") => "failed",
             _ => "completed",
         },
-        "preload_cancelled" => "cancelled",
+        "preload_cancelled" | REQUEST_CANCELLED => "cancelled",
         "gateway_limiter" if fields.get("acquired").map(String::as_str) == Some("false") => {
             "failed"
         }
@@ -826,7 +943,7 @@ fn progress_phase(raw_phase: &str, fields: &ProgressFields, status: &str) -> Str
         "gateway_stream_failed" => "failed",
         "preload_done" if status == "completed" => "completed",
         "preload_done" => "failed",
-        "preload_cancelled" => "cancelled",
+        "preload_cancelled" | REQUEST_CANCELLED => "cancelled",
         "block_store_get" if fields.get("cache_hit").map(String::as_str) == Some("true") => {
             "cache_hit"
         }
@@ -1692,7 +1809,12 @@ mod tests {
         });
         let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
         let events = value["events"].as_array().unwrap();
-        assert_eq!(events.len(), 1, "{value}");
+        // The request never ended, so closing its span cancelled it.
+        assert_eq!(
+            raw_phases(&recorder),
+            ["request_start", "request_cancelled"],
+            "{value}"
+        );
         assert_eq!(events[0]["target_id"], 9191, "{value}");
         assert_eq!(events[0]["path"], "/ipfs/bafycomposed", "{value}");
     }
@@ -1719,7 +1841,11 @@ mod tests {
         });
         let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
         let events = value["events"].as_array().unwrap();
-        assert_eq!(events.len(), 1, "{value}");
+        assert_eq!(
+            raw_phases(&recorder),
+            ["request_start", "request_cancelled"],
+            "{value}"
+        );
         assert_eq!(events[0]["target_id"], 4343, "{value}");
     }
 
@@ -1759,7 +1885,11 @@ mod tests {
         });
         let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
         let events = value["events"].as_array().unwrap();
-        assert_eq!(events.len(), 1, "{value}");
+        assert_eq!(
+            raw_phases(&recorder),
+            ["request_start", "request_cancelled"],
+            "{value}"
+        );
         assert_eq!(events[0]["target_id"], 4545, "{value}");
     }
 
@@ -1782,10 +1912,10 @@ mod tests {
             tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
         };
         let events = |r: &ProgressRecorder| {
-            serde_json::from_str::<serde_json::Value>(&r.snapshot_json()).unwrap()["events"]
-                .as_array()
-                .unwrap()
-                .len()
+            raw_phases(r)
+                .iter()
+                .filter(|raw_phase| *raw_phase == "request_start")
+                .count()
         };
         let old = Registry::default().with(progress_layer_once(&ISSUED));
         let too_early = Registry::default().with(progress_layer_once(&ISSUED));
@@ -1814,6 +1944,236 @@ mod tests {
         });
         let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
         assert_eq!(value["events"].as_array().unwrap().len(), 1, "{value}");
+    }
+
+    fn request_span(request_id: u64, progress_request_id: u64) -> tracing::Span {
+        tracing::info_span!(
+            target: "freedom_ipfs_gateway",
+            "gateway_request",
+            request_id,
+            progress_request_id,
+            path = "/ipfs/bafycancel"
+        )
+    }
+
+    /// The events `recorder` holds, as (target, raw phase, phase, status).
+    fn recorded(recorder: &ProgressRecorder) -> Vec<(u64, String, String, String)> {
+        let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
+        value["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| {
+                (
+                    event["target_id"].as_u64().unwrap(),
+                    event["raw_phase"].as_str().unwrap().into(),
+                    event["phase"].as_str().unwrap().into(),
+                    event["status"].as_str().unwrap().into(),
+                )
+            })
+            .collect()
+    }
+
+    fn raw_phases(recorder: &ProgressRecorder) -> Vec<String> {
+        recorded(recorder)
+            .into_iter()
+            .map(|(_, raw_phase, _, _)| raw_phase)
+            .collect()
+    }
+
+    fn event(
+        target: u64,
+        raw_phase: &str,
+        phase: &str,
+        status: &str,
+    ) -> (u64, String, String, String) {
+        (target, raw_phase.into(), phase.into(), status.into())
+    }
+
+    /// A request whose span closes before any event ended its target was
+    /// dropped: its entry leaves `active` as cancelled, keeping what the
+    /// target had.
+    #[test]
+    fn a_span_closed_with_its_target_open_closes_it_as_cancelled() {
+        let recorder = ProgressRecorder::new();
+        let subscriber = Registry::default().with(progress_layer_unclaimed());
+        tracing::subscriber::with_default(subscriber, || {
+            let _scope = recorder.enter();
+            let span = request_span(1, 900);
+            span.in_scope(|| {
+                tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
+                tracing::info!(
+                    target: "freedom_ipfs_retrieval",
+                    phase = "block_fetch_total",
+                    source = "bitswap",
+                    bytes = 4096u64
+                );
+            });
+            assert_eq!(recorder.snapshot().active_count, 1);
+            drop(span);
+        });
+        let value: serde_json::Value = serde_json::from_str(&recorder.snapshot_json()).unwrap();
+        assert_eq!(value["active_count"], 0, "{value}");
+        let last = value["events"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["raw_phase"], "request_cancelled", "{value}");
+        assert_eq!(last["phase"], "cancelled", "{value}");
+        assert_eq!(last["status"], "cancelled", "{value}");
+        assert_eq!(last["kind"], "gateway_request", "{value}");
+        assert_eq!(last["target_id"], 900, "{value}");
+        assert_eq!(last["request_id"], 1, "{value}");
+        assert_eq!(last["path"], "/ipfs/bafycancel", "{value}");
+        assert_eq!(last["source"], "bitswap", "{value}");
+        assert_eq!(last["bytes_loaded"], 4096, "{value}");
+        assert_eq!(last["blocks_loaded"], 1, "{value}");
+    }
+
+    /// A span whose events ended its target closes without a word: a
+    /// completed request, a failed one, a streamed one whose stream ended,
+    /// and one whose target a newer request with its id holds now.
+    #[test]
+    fn a_span_whose_target_ended_closes_quietly() {
+        let recorder = ProgressRecorder::new();
+        let subscriber = Registry::default().with(progress_layer_unclaimed());
+        tracing::subscriber::with_default(subscriber, || {
+            let _scope = recorder.enter();
+            let emit = |span: &tracing::Span, phases: &[(&str, u16, &str)]| {
+                span.in_scope(|| {
+                    for &(phase, status, body_mode) in phases {
+                        tracing::info!(
+                            target: "freedom_ipfs_gateway",
+                            phase,
+                            status,
+                            body_mode
+                        );
+                    }
+                })
+            };
+            let completed = request_span(1, 910);
+            emit(
+                &completed,
+                &[("request_start", 0, ""), ("request_done", 200, "direct")],
+            );
+            drop(completed);
+            let failed = request_span(2, 911);
+            emit(
+                &failed,
+                &[("request_start", 0, ""), ("request_done", 404, "direct")],
+            );
+            drop(failed);
+            let streamed = request_span(3, 912);
+            emit(
+                &streamed,
+                &[
+                    ("request_start", 0, ""),
+                    ("request_done", 200, "stream"),
+                    ("gateway_stream_done", 0, ""),
+                ],
+            );
+            drop(streamed);
+            // The first ends, a second takes the id, then the first closes.
+            let first = request_span(4, 913);
+            emit(
+                &first,
+                &[("request_start", 0, ""), ("request_done", 200, "direct")],
+            );
+            let second = request_span(5, 913);
+            emit(&second, &[("request_start", 0, "")]);
+            drop(first);
+            assert_eq!(recorder.snapshot().active_count, 1);
+            emit(&second, &[("request_done", 200, "direct")]);
+            drop(second);
+        });
+        assert_eq!(recorder.snapshot().active_count, 0);
+        assert!(
+            recorded(&recorder)
+                .iter()
+                .all(|(_, raw_phase, _, _)| raw_phase != "request_cancelled"),
+            "{:?}",
+            recorded(&recorder)
+        );
+    }
+
+    /// A streamed response's target stays open while its body lives, and is
+    /// cancelled when the body is dropped before its stream ends.
+    #[test]
+    fn a_streamed_body_dropped_before_its_end_cancels_its_target() {
+        let recorder = ProgressRecorder::new();
+        let subscriber = Registry::default().with(progress_layer_unclaimed());
+        tracing::subscriber::with_default(subscriber, || {
+            let _scope = recorder.enter();
+            let span = request_span(1, 920);
+            span.in_scope(|| {
+                tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
+                tracing::info!(
+                    target: "freedom_ipfs_gateway",
+                    phase = "request_done",
+                    status = 200u16,
+                    body_mode = "stream"
+                );
+            });
+            // The body holds the span, as the gateway's stream does.
+            let body = span.clone();
+            drop(span);
+            assert_eq!(recorder.snapshot().active_count, 1);
+            body.in_scope(|| {
+                tracing::info!(target: "freedom_ipfs_gateway", phase = "block_fetch_total", source = "cache");
+            });
+            drop(body);
+        });
+        assert_eq!(
+            recorded(&recorder),
+            [
+                event(920, "request_start", "started", "active"),
+                event(920, "request_done", "streaming", "active"),
+                event(920, "block_fetch_total", "cache_hit", "active"),
+                event(920, "request_cancelled", "cancelled", "cancelled"),
+            ]
+        );
+    }
+
+    /// A target the host cleared stays cleared: closing its span adds no
+    /// event for it.
+    #[test]
+    fn a_cleared_target_is_not_cancelled_when_its_span_closes() {
+        let recorder = ProgressRecorder::new();
+        let subscriber = Registry::default().with(progress_layer_unclaimed());
+        tracing::subscriber::with_default(subscriber, || {
+            let _scope = recorder.enter();
+            let span = request_span(1, 930);
+            span.in_scope(|| {
+                tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
+            });
+            recorder.clear();
+            drop(span);
+        });
+        assert_eq!(recorded(&recorder), []);
+    }
+
+    /// The cancel goes to the recorder the target is open in, whatever
+    /// thread closes the span.
+    #[test]
+    fn a_span_closed_on_another_thread_cancels_in_its_recorder() {
+        let recorder = ProgressRecorder::new();
+        let subscriber = Registry::default().with(progress_layer_unclaimed());
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let span = tracing::dispatcher::with_default(&dispatch, || {
+            let _scope = recorder.enter();
+            let span = request_span(1, 940);
+            span.in_scope(|| {
+                tracing::info!(target: "freedom_ipfs_gateway", phase = "request_start");
+            });
+            span
+        });
+        std::thread::scope(|threads| {
+            threads.spawn(|| tracing::dispatcher::with_default(&dispatch, || drop(span)));
+        });
+        assert_eq!(
+            recorded(&recorder),
+            [
+                event(940, "request_start", "started", "active"),
+                event(940, "request_cancelled", "cancelled", "cancelled"),
+            ]
+        );
     }
 
     fn progress_fields(

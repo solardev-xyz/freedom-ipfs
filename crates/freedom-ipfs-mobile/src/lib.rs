@@ -4399,8 +4399,10 @@ mod tests {
         url
     }
 
-    /// A fixed sequence of phase events touching every snapshot field.
-    fn emit_golden_progress_sequence() {
+    /// A fixed sequence of phase events touching every snapshot field. It
+    /// returns the spans of the two requests still in flight, which their
+    /// work would hold.
+    fn emit_golden_progress_sequence() -> [tracing::Span; 2] {
         let root = tracing::info_span!(
             target: "freedom_ipfs_gateway",
             "gateway_request",
@@ -4496,6 +4498,7 @@ mod tests {
         tracing::info!(target: "freedom_ipfs_retrieval", phase = "unknown_phase_kept_raw", cid = "bafyblock", debug_field = ?Some(3u8));
         tracing::info!(target: "freedom_ipfs_retrieval", no_phase = true);
         tracing::info!(target: "ant_retrieval", phase = "request_start", request_id = 1u64);
+        [page, child]
     }
 
     /// The snapshot with its clock readings zeroed, for a golden comparison.
@@ -4535,12 +4538,43 @@ mod tests {
         unsafe {
             let node = freedom_ipfs_node_new_in_memory();
             assert!(!node.is_null());
-            {
+            let in_flight = {
                 let _scope = (*node).progress.enter();
-                emit_golden_progress_sequence();
-            }
+                emit_golden_progress_sequence()
+            };
             let snapshot = zero_progress_timestamps(&progress_snapshot_json(node));
             assert_eq!(snapshot, GOLDEN_PROGRESS_SNAPSHOT.trim_end());
+
+            // Their work dropped, the two requests in flight are cancelled.
+            drop(in_flight);
+            let snapshot: serde_json::Value =
+                serde_json::from_str(&progress_snapshot_json(node)).unwrap();
+            let active: Vec<_> = snapshot["active"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|target| target["id"].as_u64().unwrap())
+                .collect();
+            assert_eq!(active, [10, 77], "{snapshot}");
+            let events = snapshot["events"].as_array().unwrap();
+            let last: Vec<_> = events[events.len() - 2..]
+                .iter()
+                .map(|event| {
+                    (
+                        event["target_id"].as_u64().unwrap(),
+                        event["raw_phase"].as_str().unwrap(),
+                        event["status"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                last,
+                [
+                    (600, "request_cancelled", "cancelled"),
+                    (501, "request_cancelled", "cancelled")
+                ],
+                "{snapshot}"
+            );
             freedom_ipfs_node_free(node);
         }
     }
@@ -4596,6 +4630,138 @@ mod tests {
                 );
                 freedom_ipfs_node_free(node);
             }
+        }
+    }
+
+    /// Polls the node's snapshot until `done` holds for it, for at most 5 s,
+    /// and returns the last one.
+    unsafe fn progress_snapshot_until(
+        node: *mut FreedomIpfsNode,
+        done: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot: serde_json::Value =
+                serde_json::from_str(&progress_snapshot_json(node)).unwrap();
+            if done(&snapshot) || Instant::now() >= deadline {
+                return snapshot;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn progress_target_is_active(snapshot: &serde_json::Value, id: u64) -> bool {
+        snapshot["active"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|target| target["kind"] == "gateway_request" && target["id"] == id)
+    }
+
+    fn progress_target_was_cancelled(snapshot: &serde_json::Value, id: u64) -> bool {
+        snapshot["events"].as_array().unwrap().iter().any(|event| {
+            event["kind"] == "gateway_request"
+                && event["target_id"] == id
+                && event["phase"] == "cancelled"
+                && event["status"] == "cancelled"
+        })
+    }
+
+    /// A request cancelled while it waits for the gateway's one permit never
+    /// reaches `request_done`: its entry must still leave `active`.
+    #[test]
+    fn cancelling_a_queued_native_request_closes_its_progress_target() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+            let data = b"queued cancel fixture".to_vec();
+            let cid = cid_from_data(CODEC_RAW, &data);
+            let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let provider: Arc<dyn BlockProvider> = Arc::new(SlowTestProvider {
+                cid,
+                data,
+                entered: entered.clone(),
+                delay: Duration::from_millis(300),
+            });
+            let core = GatewayCore::with_provider_config(
+                provider,
+                freedom_ipfs_gateway::GatewayConfig::new(1)
+                    .with_request_queue_timeout(Duration::from_secs(30)),
+            );
+            set_native_gateway_core(&*node, core);
+            let path = format!("/ipfs/{cid}");
+            let holder =
+                start_native_gateway_request(node, json!({ "method": "GET", "path": path }));
+            for _ in 0..500 {
+                if entered.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(entered.load(Ordering::SeqCst));
+
+            let queued = start_native_gateway_request(
+                node,
+                json!({
+                    "method": "GET",
+                    "path": path,
+                    "headers": [{ "name": "X-Freedom-Request-ID", "value": "9001" }]
+                }),
+            );
+            let snapshot = progress_snapshot_until(node, |s| progress_target_is_active(s, 9001));
+            assert!(progress_target_is_active(&snapshot, 9001), "{snapshot}");
+
+            assert!(freedom_ipfs_gateway_request_cancel(node, queued));
+            let snapshot = progress_snapshot_until(node, |s| !progress_target_is_active(s, 9001));
+            assert!(!progress_target_is_active(&snapshot, 9001), "{snapshot}");
+            assert!(progress_target_was_cancelled(&snapshot, 9001), "{snapshot}");
+
+            assert!(freedom_ipfs_gateway_request_free(node, queued));
+            let _ = wait_native_gateway_response(node, holder);
+            assert!(freedom_ipfs_gateway_request_free(node, holder));
+            freedom_ipfs_node_free(node);
+        }
+    }
+
+    /// A request whose body is cancelled mid-stream never reaches
+    /// `gateway_stream_done`: its entry must still leave `active`.
+    #[test]
+    fn cancelling_a_streaming_native_request_closes_its_progress_target() {
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!node.is_null());
+            // Four 64 KiB chunks: more than the body channel holds.
+            let data = vec![7u8; 256 * 1024];
+            let cid = cid_from_data(CODEC_RAW, &data);
+            (*node).store.put_block(&cid, &data).unwrap();
+            let handle = start_native_gateway_request(
+                node,
+                json!({
+                    "method": "GET",
+                    "path": format!("/ipfs/{cid}"),
+                    "headers": [{ "name": "X-Freedom-Request-ID", "value": "9002" }]
+                }),
+            );
+            let metadata = wait_native_gateway_response(node, handle);
+            assert_eq!(metadata["status"], 200);
+            let snapshot = progress_snapshot_until(node, |s| progress_target_is_active(s, 9002));
+            assert!(progress_target_is_active(&snapshot, 9002), "{snapshot}");
+            assert!(
+                snapshot["active"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|target| target["id"] == 9002 && target["phase"] == "streaming"),
+                "{snapshot}"
+            );
+
+            assert!(freedom_ipfs_gateway_request_cancel(node, handle));
+            let snapshot = progress_snapshot_until(node, |s| !progress_target_is_active(s, 9002));
+            assert!(!progress_target_is_active(&snapshot, 9002), "{snapshot}");
+            assert!(progress_target_was_cancelled(&snapshot, 9002), "{snapshot}");
+
+            assert!(freedom_ipfs_gateway_request_free(node, handle));
+            freedom_ipfs_node_free(node);
         }
     }
 

@@ -341,3 +341,139 @@ fn a_request_polled_on_host_threads_records_into_its_node() {
     check(instance.gateway_core(), instance.progress(), &cid, 70_001);
     assert!(instance.shutdown(std::time::Duration::from_secs(5)).reached);
 }
+
+/// A name that never resolves, so an `/ipns` request waits for good.
+struct NeverResolves;
+
+#[async_trait::async_trait]
+impl freedom_ipfs_namesys::NameResolver for NeverResolves {
+    async fn resolve_name(&self, _name: &str) -> freedom_ipfs_namesys::Result<String> {
+        std::future::pending().await
+    }
+}
+
+/// Waits, at most 5 s, until `done` holds for `recorder`.
+fn wait_until(recorder: &ProgressRecorder, done: impl Fn(&ProgressRecorder) -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !done(recorder) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// What the recorder holds of `id`'s events: (raw phase, phase, status).
+fn phases_of(recorder: &ProgressRecorder, id: u64) -> Vec<(String, String, String)> {
+    snapshot(recorder)["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "gateway_request" && event["target_id"] == id)
+        .map(|event| {
+            let field = |name: &str| event[name].as_str().unwrap().to_string();
+            (field("raw_phase"), field("phase"), field("status"))
+        })
+        .collect()
+}
+
+fn cancelled() -> (String, String, String) {
+    (
+        "request_cancelled".into(),
+        "cancelled".into(),
+        "cancelled".into(),
+    )
+}
+
+/// A request cancelled before it answers never reaches `request_done`: its
+/// entry still leaves `active`, as cancelled.
+#[test]
+fn a_request_cancelled_before_it_answers_leaves_active_as_cancelled() {
+    init_progress_tracing();
+    let recorder = ProgressRecorder::new();
+    let (store, _) = store_with(b"unused");
+    let core =
+        GatewayCore::with_provider_and_name_resolver(Arc::new(store), Arc::new(NeverResolves))
+            .with_progress(recorder.clone());
+    let runtime = marked_runtime(&ProgressRecorder::new());
+    let mut headers = HeaderMap::new();
+    headers.insert("x-freedom-request-id", HeaderValue::from_static("80000"));
+    let request = runtime.spawn(async move {
+        core.handle(GatewayCoreRequest::ipns(
+            "example.org",
+            Method::GET,
+            headers,
+        ))
+        .await
+    });
+    wait_until(&recorder, |recorder| {
+        active(recorder, "gateway_request").contains(&80_000)
+    });
+    assert!(active(&recorder, "gateway_request").contains(&80_000));
+
+    request.abort();
+    wait_until(&recorder, |recorder| {
+        !active(recorder, "gateway_request").contains(&80_000)
+    });
+    assert!(active(&recorder, "gateway_request").is_empty());
+    let phases = phases_of(&recorder, 80_000);
+    assert_eq!(phases.first().unwrap().0, "request_start", "{phases:?}");
+    assert_eq!(phases.last().unwrap(), &cancelled(), "{phases:?}");
+}
+
+/// A streamed body dropped after its first chunk never reaches
+/// `gateway_stream_done`: its entry still leaves `active`, as cancelled.
+/// Read to its end, or a `HEAD`, it ends as completed, and nothing is
+/// cancelled.
+#[test]
+fn a_streamed_body_dropped_midway_leaves_active_as_cancelled() {
+    use futures::StreamExt;
+
+    init_progress_tracing();
+    let recorder = ProgressRecorder::new();
+    // Four 64 KiB chunks.
+    let (store, cid) = store_with(&vec![5u8; 256 * 1024]);
+    let node = OnlineNode::builder(store)
+        .routing_mode(RoutingMode::Offline)
+        .progress(recorder.clone())
+        .build();
+    let runtime = marked_runtime(&ProgressRecorder::new());
+    let core = node.gateway_core();
+    runtime.block_on(async {
+        let response = core.handle(request(&cid, 80_001)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap().len(), 64 * 1024);
+        assert!(active(&recorder, "gateway_request").contains(&80_001));
+        drop(body);
+
+        let response = core.handle(request(&cid, 80_002)).await;
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .len(),
+            256 * 1024
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-freedom-request-id", HeaderValue::from_static("80003"));
+        let response = core
+            .handle(GatewayCoreRequest::ipfs(&cid, Method::HEAD, headers))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty());
+    });
+    assert!(active(&recorder, "gateway_request").is_empty());
+    let dropped = phases_of(&recorder, 80_001);
+    assert!(
+        dropped.contains(&("request_done".into(), "streaming".into(), "active".into())),
+        "{dropped:?}"
+    );
+    assert_eq!(dropped.last().unwrap(), &cancelled(), "{dropped:?}");
+    for id in [80_002, 80_003] {
+        let phases = phases_of(&recorder, id);
+        assert_eq!(phases.last().unwrap().2, "completed", "{id}: {phases:?}");
+        assert!(!phases.contains(&cancelled()), "{id}: {phases:?}");
+    }
+}
