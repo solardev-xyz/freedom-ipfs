@@ -553,12 +553,9 @@ fn ipv6_outside_the_fixed_forms_waits_or_is_refused_until_the_prefixes_are_known
         ),
         Err(AddressRefusal::Nat64Unknown)
     );
-    // IPv4, and the fixed forms, are judged as always.
-    for state in [
-        Nat64State::Pending,
-        Nat64State::Unknown(Vec::new()),
-        Nat64State::Incomplete(Vec::new()),
-    ] {
+    // IPv4, and the fixed forms, are judged as always while pending or
+    // unknown.
+    for state in [Nat64State::Pending, Nat64State::Unknown(Vec::new())] {
         for text in [
             "8.8.8.8",
             "::ffff:8.8.8.8",
@@ -575,6 +572,34 @@ fn ipv6_outside_the_fixed_forms_waits_or_is_refused_until_the_prefixes_are_known
             "private use"
         );
     }
+}
+
+#[test]
+fn while_incomplete_only_ipv4_and_ipv4_mapped_addresses_can_pass() {
+    let state = Nat64State::Incomplete(Vec::new());
+    for text in ["8.8.8.8", "::ffff:8.8.8.8"] {
+        assert!(check_address(ip(text), &state).is_ok(), "{text}");
+    }
+    for text in [
+        "64:ff9b::808:808",
+        "2002:808:808::1",
+        "2a00:1::1",
+        "2620:4f:8000::1",
+    ] {
+        assert_eq!(
+            check_address(ip(text), &state),
+            Err(AddressRefusal::Nat64Incomplete),
+            "{text}"
+        );
+    }
+    assert_eq!(
+        refused_by(check_address(ip("10.0.0.1"), &state)),
+        "private use"
+    );
+    assert_eq!(
+        refused_by(check_address(ip("::ffff:10.0.0.1"), &state)),
+        "private use"
+    );
 }
 
 #[test]

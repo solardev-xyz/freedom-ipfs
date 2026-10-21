@@ -67,7 +67,7 @@ pub enum AddressRefusal {
     #[error("IPv6 outside the fixed forms while NAT64 discovery has failed")]
     Nat64Unknown,
     /// NAT64 discovery learned more prefixes than it keeps.
-    #[error("IPv6 outside the fixed forms while NAT64 discovery is incomplete")]
+    #[error("IPv6 while NAT64 discovery is incomplete")]
     Nat64Incomplete,
 }
 
@@ -87,9 +87,13 @@ pub enum AddressRefusal {
 ///   - every learned prefix in `nat64` the address is under, in every
 ///     state: the IPv4 address at RFC 6052's place. A learned prefix inside
 ///     a fixed form's space decides too.
-/// - **Then `nat64`'s state:** an address under neither fixed form (the
-///   well-known prefix, 6to4) is refused while discovery is pending,
-///   unknown or incomplete. The fixed forms are exempt from that only.
+/// - **Then `nat64`'s state:**
+///   - **incomplete:** every IPv6 address is refused, before any fixed
+///     form's success (only an IPv4-mapped one, judged as IPv4, passes): a
+///     prefix past the bound was dropped, and it could map any of them;
+///   - **pending or unknown:** an address under neither fixed form (the
+///     well-known prefix, 6to4) is refused; the fixed forms are exempt from
+///     that only.
 ///
 /// 6rd, 6over4 and 6a44, whose embedding depends on configuration, are
 /// judged as the IPv6 address alone.
@@ -132,6 +136,12 @@ fn check_v6(v6: Ipv6Addr, nat64: &Nat64State) -> Result<IpAddr, AddressRefusal> 
         if !GLOBAL_UNICAST.contains_v6(v6) {
             return Err(AddressRefusal::NotGlobalUnicast);
         }
+    }
+    // Past the prefix bound, a dropped prefix could map any IPv6 address,
+    // a fixed form's included: every one is refused (only an IPv4-mapped
+    // address, judged above as IPv4, can pass).
+    if let Nat64State::Incomplete(_) = nat64 {
+        return Err(AddressRefusal::Nat64Incomplete);
     }
     // Every embedding the address can be read with must pass: its fixed
     // form's, ISATAP's, and every learned prefix's it is under, so a
