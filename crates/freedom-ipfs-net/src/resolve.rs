@@ -28,8 +28,8 @@ use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::TokioResolver;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
-use crate::capability::NetworkCapability;
-use crate::gate::{check_address, classify_host, AddressRefusal, Target};
+use crate::capability::{NetworkCapability, Revoked};
+use crate::gate::{check_address, classify_host, AddressRefusal, Nat64State, Target};
 use crate::policy::Nat64Handle;
 
 /// A boxed lookup in flight.
@@ -89,8 +89,11 @@ impl NameLookup for HickoryLookup {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ResolveRefused {
-    #[error("the network capability is revoked")]
-    Revoked,
+    /// The capability is revoked: before the lookup, while it or the wait
+    /// for NAT64 discovery ran, or as the answer settled. The [`Revoked`]
+    /// is its source, so reqwest's error still reads as revoked.
+    #[error("{0}")]
+    Revoked(#[from] Revoked),
     #[error("the name isn't one the gate accepts: {0}")]
     Target(crate::gate::Refusal),
     #[error("an onion name is never resolved here")]
@@ -127,30 +130,37 @@ impl GateResolver {
     }
 
     /// The addresses `host` may be connected to: at least one, or an error.
+    ///
+    /// The lookup and any wait for NAT64 discovery run under a permit of
+    /// the capability: revoked meanwhile, they are dropped and this fails
+    /// with [`ResolveRefused::Revoked`]. It is asked once more just before
+    /// the addresses are returned.
     pub(crate) async fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, ResolveRefused> {
-        self.capability
-            .check()
-            .map_err(|_| ResolveRefused::Revoked)?;
+        let permit = self.capability.admit()?;
+        let addrs = permit.run(self.resolve_admitted(host)).await??;
+        self.capability.check()?;
+        Ok(addrs)
+    }
+
+    async fn resolve_admitted(&self, host: &str) -> Result<Vec<IpAddr>, ResolveRefused> {
         let answers = match classify_host(host).map_err(ResolveRefused::Target)? {
             Target::Onion(_) => return Err(ResolveRefused::Onion),
             Target::Ip(ip) => vec![ip],
             Target::Name(name) => self.lookup.lookup(&name).await?,
         };
-        // Revoked while the lookup ran: nothing connects.
-        self.capability
-            .check()
-            .map_err(|_| ResolveRefused::Revoked)?;
         if answers.is_empty() {
             return Err(ResolveRefused::Empty);
         }
         let Some(handle) = &self.addresses else {
             return Ok(answers);
         };
-        let mut handle = handle.clone();
+        // Every answer is judged against one settled state: an answer
+        // accepted before discovery changed it might be refused after.
+        let state = settled(&answers, handle.clone()).await;
         let mut accepted = Vec::new();
         let mut first_refusal = None;
         for ip in answers {
-            match check_waiting(ip, &mut handle).await {
+            match check_address(ip, &state) {
                 Ok(connect) => {
                     if !accepted.contains(&connect) {
                         accepted.push(connect);
@@ -169,23 +179,32 @@ impl GateResolver {
     }
 }
 
-/// The address policy for `ip`, waiting while NAT64 discovery is pending for
-/// as long as something may still publish; the caller's deadline (reqwest's
-/// connect timeout, the operation's deadline) bounds the wait.
+/// The NAT64 state to judge `answers` by: the current one once none of them
+/// waits for discovery, or once nothing will publish again. The caller's
+/// deadline (reqwest's connect timeout, the operation's deadline) bounds
+/// the wait.
+pub(crate) async fn settled(answers: &[IpAddr], mut handle: Nat64Handle) -> Nat64State {
+    loop {
+        let state = handle.current();
+        let waits = answers.iter().any(|ip| {
+            matches!(
+                check_address(*ip, &state),
+                Err(AddressRefusal::Nat64Pending)
+            )
+        });
+        if !waits || !handle.changed().await {
+            return state;
+        }
+    }
+}
+
+/// The address policy for `ip`, once NAT64 discovery has settled for it
+/// (see [`settled`]).
 pub(crate) async fn check_waiting(
     ip: IpAddr,
     handle: &mut Nat64Handle,
 ) -> Result<IpAddr, AddressRefusal> {
-    loop {
-        match check_address(ip, &handle.current()) {
-            Err(AddressRefusal::Nat64Pending) => {
-                if !handle.changed().await {
-                    return Err(AddressRefusal::Nat64Pending);
-                }
-            }
-            result => return result,
-        }
-    }
+    check_address(ip, &settled(&[ip], handle.clone()).await)
 }
 
 impl Resolve for GateResolver {
@@ -367,9 +386,90 @@ mod tests {
         let resolver = GateResolver::new(table.clone(), capability, None);
         assert!(matches!(
             resolver.resolve_host("example.com").await,
-            Err(ResolveRefused::Revoked)
+            Err(ResolveRefused::Revoked(_))
         ));
         assert_eq!(table.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Revoked while an answer waits for NAT64 discovery: discovery then
+    /// accepts it, and still nothing is returned (#46 review, 46-M1).
+    #[tokio::test]
+    async fn revoked_during_a_nat64_wait_returns_no_address() {
+        let table = Table::with(&[("public.example", Ok(vec!["2a00:1::1"]))]);
+        let capability = NetworkCapability::new();
+        let (publisher, handle) = Nat64Handle::channel(Nat64State::Pending);
+        let resolver = GateResolver::new(table, capability.clone(), Some(handle));
+        let resolving = tokio::spawn(async move { resolver.resolve_host("public.example").await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!resolving.is_finished(), "the answer waits for discovery");
+        assert_eq!(capability.permits(), 1);
+        capability.revoke();
+        // The wait is dropped at the revoke, not when discovery answers.
+        tokio::time::timeout(std::time::Duration::from_secs(1), capability.quiesced())
+            .await
+            .expect("the wait is dropped at the revoke");
+        publisher.publish(Nat64State::NONE);
+        let result = resolving.await.unwrap();
+        assert!(
+            matches!(result, Err(ResolveRefused::Revoked(_))),
+            "{result:?}"
+        );
+        assert_eq!(capability.permits(), 0);
+    }
+
+    /// Revoked after the answer settled, as it is returned: nothing is
+    /// returned either.
+    #[tokio::test]
+    async fn revoked_as_the_answer_settles_returns_no_address() {
+        /// A lookup that revokes the capability as it answers.
+        #[derive(Debug)]
+        struct RevokingLookup(NetworkCapability);
+
+        impl NameLookup for RevokingLookup {
+            fn lookup(&self, _: &str) -> LookupFuture {
+                self.0.revoke();
+                Box::pin(async { Ok(vec!["8.8.8.8".parse().unwrap()]) })
+            }
+        }
+
+        let capability = NetworkCapability::new();
+        let resolver = GateResolver::new(
+            Arc::new(RevokingLookup(capability.clone())),
+            capability,
+            None,
+        );
+        assert!(matches!(
+            resolver.resolve_host("example.com").await,
+            Err(ResolveRefused::Revoked(_))
+        ));
+    }
+
+    /// Answers are judged against one settled state: an answer that passed
+    /// under the pending state (a fixed form) is refused once discovery
+    /// learns a prefix over it, though another answer was what waited (#46
+    /// adversarial review, P1).
+    #[tokio::test]
+    async fn answers_accepted_before_nat64_settles_are_judged_again() {
+        let fixed = "2002:808:808:7f00:0:100::";
+        let waiting = "2a00:1:2:3:a9:fea9:fe00:0";
+        let table = Table::with(&[("mixed.example", Ok(vec![fixed, waiting]))]);
+        let (publisher, handle) = Nat64Handle::channel(Nat64State::Pending);
+        let resolver = GateResolver::new(table, NetworkCapability::new(), Some(handle));
+        let mut resolving =
+            tokio::spawn(async move { resolver.resolve_host("mixed.example").await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut resolving)
+                .await
+                .is_err()
+        );
+        let overlap = Nat64Prefix::new("2002:808:808::".parse().unwrap(), 48).unwrap();
+        let waiting_prefix = Nat64Prefix::new("2a00:1:2:3::".parse().unwrap(), 64).unwrap();
+        publisher.publish(Nat64State::known([overlap, waiting_prefix]));
+        let result = resolving.await.unwrap();
+        assert!(
+            matches!(result, Err(ResolveRefused::AllRefused(_))),
+            "both answers are refused in the settled state, got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -392,7 +492,7 @@ mod tests {
     #[test]
     fn its_texts_never_say_timeout() {
         for err in [
-            ResolveRefused::Revoked,
+            ResolveRefused::Revoked(Revoked),
             ResolveRefused::Onion,
             ResolveRefused::Empty,
             ResolveRefused::AllRefused(AddressRefusal::Nat64Pending),

@@ -16,7 +16,14 @@
 //!   `direct` in the policy's own hop loop;
 //! - **each new connection,** in a connector layer that runs before
 //!   reqwest's resolver: a revoked client starts no DNS lookup and opens no
-//!   socket, whatever asked for the connection.
+//!   socket, whatever asked for the connection. The connection is made
+//!   under a permit of the capability ([`NetworkCapability::admit`]), so a
+//!   revoke while it resolves or connects drops it, and the capability's
+//!   quiescence waits until it has been dropped.
+//!
+//! A request sent over a connection already in the pool opens no new
+//! connection: revoking stops new ones, and the teardown closes the open
+//! ones.
 //!
 //! Under `direct` the policy follows redirects itself (design 0007, "The
 //! gate", check 4): every client is built with `Policy::none()` and no
@@ -33,10 +40,10 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use reqwest::header::{
-    HeaderName, HeaderValue, AUTHORIZATION, COOKIE, LOCATION, PROXY_AUTHORIZATION,
+    HeaderName, HeaderValue, AUTHORIZATION, COOKIE, HOST, LOCATION, PROXY_AUTHORIZATION, REFERER,
 };
 use reqwest::redirect::Policy;
-use reqwest::{IntoUrl, StatusCode};
+use reqwest::StatusCode;
 use serde::Serialize;
 use tower_layer::Layer;
 use tower_service::Service;
@@ -145,7 +152,9 @@ type BoxError = Box<dyn StdError + Send + Sync>;
 
 /// A connector layer that asks the capability before each new connection,
 /// before reqwest's resolver or proxy connection: once revoked, the
-/// connection fails at once, and nothing is resolved or dialed.
+/// connection fails at once, and nothing is resolved or dialed. A
+/// connection in progress holds a permit of the capability, and is dropped
+/// when the capability is revoked, its resolution or connect included.
 #[derive(Clone, Debug)]
 struct CapabilityLayer(NetworkCapability);
 
@@ -180,12 +189,22 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
+    /// The connection is made under a permit of the capability: refused at
+    /// once if it is revoked, and otherwise dropped (its resolution or
+    /// connect aborted) as soon as it is, so the capability's quiescence
+    /// waits for it.
     fn call(&mut self, request: R) -> Self::Future {
-        if let Err(revoked) = self.capability.check() {
-            return Box::pin(async move { Err(Box::new(revoked) as BoxError) });
-        }
+        let permit = match self.capability.admit() {
+            Ok(permit) => permit,
+            Err(revoked) => return Box::pin(async move { Err(Box::new(revoked) as BoxError) }),
+        };
         let connecting = self.inner.call(request);
-        Box::pin(async move { connecting.await.map_err(Into::into) })
+        Box::pin(async move {
+            match permit.run(connecting).await {
+                Ok(connected) => connected.map_err(Into::into),
+                Err(revoked) => Err(Box::new(revoked) as BoxError),
+            }
+        })
     }
 }
 
@@ -316,18 +335,32 @@ impl HttpClient {
     }
 
     /// A GET request for `url`, as reqwest's `Client::get` starts one.
-    pub fn get<U: IntoUrl>(&self, url: U) -> HttpRequest {
-        let client = match &self.inner.transport {
-            Transport::Legacy(client)
-            | Transport::Direct {
+    ///
+    /// Under `direct`, the URL's text is read as [`parse_url`] reads a
+    /// configured endpoint before reqwest sees it: `http` or `https`, and no
+    /// userinfo, which reqwest would turn into an `Authorization` header. A
+    /// refused URL fails the request with [`HttpError::Refused`], and
+    /// nothing is sent.
+    pub fn get(&self, url: impl AsRef<str>) -> HttpRequest {
+        let raw = url.as_ref();
+        let builder = match &self.inner.transport {
+            Transport::Legacy(client) => client
+                .as_ref()
+                .map(|client| client.get(raw))
+                .map_err(|err| HttpError::Unavailable(err.clone())),
+            Transport::Direct {
                 untrusted: client, ..
-            } => client.as_ref().map_err(|err| err.clone()),
-            Transport::Unavailable(err) => Err(err.clone()),
+            } => match parse_url(raw) {
+                Err(refusal) => Err(Refused::Target(refusal).into()),
+                Ok(url) => client
+                    .as_ref()
+                    .map(|client| client.get(url))
+                    .map_err(|err| HttpError::Unavailable(err.clone())),
+            },
+            Transport::Unavailable(err) => Err(HttpError::Unavailable(err.clone())),
         };
         HttpRequest {
-            builder: client
-                .map(|client| client.get(url))
-                .map_err(HttpError::Unavailable),
+            builder,
             client: self.clone(),
         }
     }
@@ -425,8 +458,13 @@ async fn follow(
     inner: &ClientInner,
     request: reqwest::Request,
 ) -> Result<reqwest::Response, HttpError> {
-    let deadline = Instant::now() + inner.config.timeout;
-    let fixed = request.headers().clone();
+    // A timeout too long to be a deadline (`Duration::MAX`) is none.
+    let deadline = Instant::now().checked_add(inner.config.timeout);
+    let mut fixed = request.headers().clone();
+    // No hop sends a `Referer`, the caller's own included, and each hop's
+    // `Host` is its own target's, which reqwest writes.
+    fixed.remove(REFERER);
+    fixed.remove(HOST);
     let mut url = request.url().clone();
     let mut credentials = true;
     let mut hops = 0;
@@ -439,13 +477,11 @@ async fn follow(
                 headers.remove(name);
             }
         }
-        let response = client
-            .get(url.clone())
-            .headers(headers)
-            .timeout(deadline.saturating_duration_since(Instant::now()))
-            .send()
-            .await
-            .map_err(from_reqwest)?;
+        let mut hop = client.get(url.clone()).headers(headers);
+        if let Some(deadline) = deadline {
+            hop = hop.timeout(deadline.saturating_duration_since(Instant::now()));
+        }
+        let response = hop.send().await.map_err(from_reqwest)?;
         if inner.config.max_redirects == 0 || !is_followed(response.status()) {
             return Ok(response);
         }
@@ -468,7 +504,7 @@ async fn follow(
 async fn admit<'a>(
     inner: &'a ClientInner,
     url: &Url,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<&'a reqwest::Client, HttpError> {
     let target = classify_url(url).map_err(Refused::Target)?;
     if target.target.is_onion() {
@@ -492,11 +528,15 @@ async fn admit<'a>(
                 if let Target::Ip(ip) = target.target {
                     let mut handle = handle.clone();
                     let check = check_waiting(ip, &mut handle);
-                    match tokio::time::timeout_at(deadline.into(), check).await {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(refusal)) => return Err(Refused::Address(refusal).into()),
-                        Err(_) => return Err(Refused::Address(AddressRefusal::Nat64Pending).into()),
-                    }
+                    let checked = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline.into(), check)
+                            .await
+                            .map_err(|_| HttpError::Timeout)?,
+                        None => check.await,
+                    };
+                    checked.map_err(Refused::Address)?;
+                    // Revoked while it waited: nothing is sent.
+                    inner.network.capability().check()?;
                 }
                 untrusted
             }
@@ -572,6 +612,23 @@ pub enum HttpError {
     /// The redirect budget ran out.
     #[error("too many redirects")]
     TooManyRedirects,
+    /// The operation's deadline passed before the hop was sent, while its
+    /// IP literal waited for NAT64 discovery: a timeout, which the gateway
+    /// answers with 504, as it does reqwest's own.
+    #[error("operation timed out: the deadline passed while NAT64 discovery was pending")]
+    Timeout,
+}
+
+impl HttpError {
+    /// Whether the operation timed out: its deadline passed, here or in
+    /// reqwest.
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            Self::Timeout => true,
+            Self::Http(err) => err.is_timeout(),
+            _ => false,
+        }
+    }
 }
 
 /// Why the policy refused a hop. Each text names the rule, never the target.
@@ -653,6 +710,182 @@ mod tests {
                 "{name}: a connection was opened"
             );
         }
+    }
+
+    /// A resolver held until released: it reports the moment it is asked,
+    /// then answers `address` once `release` is notified (the #45 review's
+    /// probes, round 2).
+    #[derive(Clone)]
+    struct HeldResolver {
+        address: std::net::SocketAddr,
+        asked: std::sync::mpsc::Sender<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl reqwest::dns::Resolve for HeldResolver {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            self.asked.send(()).unwrap();
+            let (release, address) = (self.release.clone(), self.address);
+            Box::pin(async move {
+                release.notified().await;
+                Ok(Box::new(std::iter::once(address)) as reqwest::dns::Addrs)
+            })
+        }
+    }
+
+    /// Revoked while the connector's resolution is pending, after every
+    /// check passed: the resolution's answer is never connected to, and the
+    /// capability's quiescence comes once the attempt has been dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revocation_while_resolution_is_held_prevents_the_later_connect() {
+        for redirects in [10, 0] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (asked, was_asked) = std::sync::mpsc::channel();
+            let release = Arc::new(tokio::sync::Notify::new());
+            let capability = NetworkCapability::new();
+            let config = ClientConfig::new(Duration::from_secs(5), redirects);
+            let reqwest = legacy_builder(config, &capability)
+                .no_proxy()
+                .dns_resolver(Arc::new(HeldResolver {
+                    address,
+                    asked,
+                    release: release.clone(),
+                }))
+                .build()
+                .unwrap();
+            let request = tokio::spawn(async move {
+                reqwest
+                    .get(format!("http://held.test:{}/", address.port()))
+                    .send()
+                    .await
+                    .map_err(from_reqwest)
+            });
+            tokio::task::spawn_blocking(move || {
+                was_asked.recv_timeout(Duration::from_secs(2)).unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(capability.permits(), 1);
+            capability.revoke();
+            tokio::time::timeout(Duration::from_secs(2), capability.quiesced())
+                .await
+                .expect("the held attempt is dropped");
+            release.notify_one();
+            let accepted =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+            assert!(
+                accepted.is_err(),
+                "{redirects}: a socket was opened after revocation by an attempt that passed the layer"
+            );
+            let result = request.await.unwrap();
+            assert!(
+                matches!(result, Err(HttpError::Revoked(_))),
+                "{redirects}: {result:?}"
+            );
+        }
+    }
+
+    /// A connector whose connect is held until released: it records
+    /// whether it connected, and when it is dropped.
+    #[derive(Clone)]
+    struct HeldConnect {
+        release: Arc<tokio::sync::Notify>,
+        connected: Arc<std::sync::atomic::AtomicBool>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Service<()> for HeldConnect {
+        type Response = ();
+        type Error = BoxError;
+        type Future = Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, (): ()) -> Self::Future {
+            let held = self.clone();
+            Box::pin(async move {
+                let _dropped = SetOnDrop(held.dropped.clone());
+                held.release.notified().await;
+                held.connected
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    /// The same, with the connect held rather than the resolution, through
+    /// the layer alone: revoked while connecting, the connect is dropped
+    /// before it completes, quiescence comes only after that drop, and a
+    /// release afterwards connects nothing.
+    #[tokio::test]
+    async fn revocation_while_the_connect_is_held_drops_it_before_quiescence() {
+        let capability = NetworkCapability::new();
+        let held = HeldConnect {
+            release: Arc::new(tokio::sync::Notify::new()),
+            connected: Default::default(),
+            dropped: Default::default(),
+        };
+        let mut connector = CapabilityLayer(capability.clone()).layer(held.clone());
+        let connecting = tokio::spawn(connector.call(()));
+        tokio::task::yield_now().await;
+        assert_eq!(capability.permits(), 1);
+        assert!(!held.dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        capability.revoke();
+        tokio::time::timeout(Duration::from_secs(2), capability.quiesced())
+            .await
+            .expect("quiescence once the work is dropped");
+        assert!(
+            held.dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "quiescence before the connect was dropped"
+        );
+        held.release.notify_one();
+        let err = connecting.await.unwrap().unwrap_err();
+        assert!(err.is::<Revoked>(), "{err:?}");
+        assert!(!held.connected.load(std::sync::atomic::Ordering::SeqCst));
+        // And a connection asked for now is refused before the connector.
+        let err = connector.call(()).await.unwrap_err();
+        assert!(err.is::<Revoked>(), "{err:?}");
+        assert_eq!(capability.permits(), 0);
+    }
+
+    /// The hop loop's own wait for NAT64 discovery, for an IP literal:
+    /// revoked meanwhile, the hop is refused as the wait ends, before
+    /// anything is dispatched, even over a connection already in a pool
+    /// (#46 review, 46-M1).
+    #[tokio::test]
+    async fn a_literal_admitted_after_a_revoke_is_refused_before_dispatch() {
+        use crate::gate::{ConfiguredTargets, Nat64State};
+        use crate::policy::{Nat64Handle, NetworkPolicy};
+        let (publisher, handle) = Nat64Handle::channel(Nat64State::Pending);
+        let policy = NetworkPolicy::direct(
+            ConfiguredTargets::new(),
+            Url::parse("https://dns.example/dns-query").unwrap(),
+            Addresses::Checked(handle),
+        )
+        .unwrap();
+        let network = Network::with_lookup(policy, Some(crate::resolve::system_lookup()));
+        let client = network.http_client(ClientConfig::new(Duration::from_secs(5), 0));
+        let url = Url::parse("http://[2a00:1::1]:9/").unwrap();
+        let inner = client.inner.clone();
+        let admitting = tokio::spawn(async move { admit(&inner, &url, None).await.map(drop) });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!admitting.is_finished(), "the literal waits for discovery");
+        network.revoke();
+        publisher.publish(Nat64State::NONE);
+        let result = admitting.await.unwrap();
+        assert!(matches!(result, Err(HttpError::Revoked(_))), "{result:?}");
     }
 
     #[test]
