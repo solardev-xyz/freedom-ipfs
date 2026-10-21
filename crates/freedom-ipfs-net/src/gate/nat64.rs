@@ -86,6 +86,11 @@ fn embedded_at(addr: Ipv6Addr, len: u8) -> Ipv4Addr {
 
 /// What NAT64 discovery knows of the network's prefixes (design 0007,
 /// "States"). The host's discovery keeps it; the gate reads it.
+///
+/// Every prefix a state holds is applied, whatever the state: learned
+/// prefixes are kept for the process's life, so a failed refresh never
+/// forgets one, and a prefix only adds refusals. The state decides only
+/// whether IPv6 outside the fixed forms is refused as well.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Nat64State {
     /// The first query hasn't settled. An IPv6 target outside the fixed
@@ -96,11 +101,13 @@ pub enum Nat64State {
     /// Every resolver learned has answered: the union of their prefixes.
     /// An empty set means none of them advertises a prefix.
     Known(Vec<Nat64Prefix>),
-    /// A resolver failed: IPv6 targets outside the fixed forms are refused.
-    Unknown,
+    /// A resolver failed: IPv6 targets outside the fixed forms are refused,
+    /// and the prefixes learned before still apply.
+    Unknown(Vec<Nat64Prefix>),
     /// More than [`Nat64State::MAX_PREFIXES`] prefixes were learned: IPv6
-    /// targets outside the fixed forms are refused.
-    Incomplete,
+    /// targets outside the fixed forms are refused, and the first
+    /// [`Nat64State::MAX_PREFIXES`] still apply.
+    Incomplete(Vec<Nat64Prefix>),
 }
 
 impl Nat64State {
@@ -113,23 +120,56 @@ impl Nat64State {
     pub const NONE: Self = Self::Known(Vec::new());
 
     /// The state for `prefixes`, the union of every answer: [`Known`] with
-    /// each distinct prefix once, or [`Incomplete`] past
-    /// [`Nat64State::MAX_PREFIXES`].
+    /// each distinct prefix once, or [`Incomplete`] with the first
+    /// [`Nat64State::MAX_PREFIXES`] past that.
     ///
     /// [`Known`]: Nat64State::Known
     /// [`Incomplete`]: Nat64State::Incomplete
     pub fn known(prefixes: impl IntoIterator<Item = Nat64Prefix>) -> Self {
-        let mut distinct: Vec<Nat64Prefix> = Vec::new();
-        for prefix in prefixes {
-            if !distinct.contains(&prefix) {
-                if distinct.len() == Self::MAX_PREFIXES {
-                    return Self::Incomplete;
-                }
-                distinct.push(prefix);
+        match distinct(prefixes) {
+            Ok(prefixes) => Self::Known(prefixes),
+            Err(first) => Self::Incomplete(first),
+        }
+    }
+
+    /// The state after a resolver failed, with every prefix learned so far:
+    /// [`Unknown`], or [`Incomplete`] past [`Nat64State::MAX_PREFIXES`].
+    ///
+    /// [`Unknown`]: Nat64State::Unknown
+    /// [`Incomplete`]: Nat64State::Incomplete
+    pub fn unknown(prefixes: impl IntoIterator<Item = Nat64Prefix>) -> Self {
+        match distinct(prefixes) {
+            Ok(prefixes) => Self::Unknown(prefixes),
+            Err(first) => Self::Incomplete(first),
+        }
+    }
+
+    /// The learned prefixes it holds, applied in every state.
+    pub fn prefixes(&self) -> &[Nat64Prefix] {
+        match self {
+            Self::Pending => &[],
+            Self::Known(prefixes) | Self::Unknown(prefixes) | Self::Incomplete(prefixes) => {
+                prefixes
             }
         }
-        Self::Known(distinct)
     }
+}
+
+/// Each distinct prefix once: `Err` with the first
+/// [`Nat64State::MAX_PREFIXES`] if there are more.
+fn distinct(
+    prefixes: impl IntoIterator<Item = Nat64Prefix>,
+) -> Result<Vec<Nat64Prefix>, Vec<Nat64Prefix>> {
+    let mut distinct: Vec<Nat64Prefix> = Vec::new();
+    for prefix in prefixes {
+        if !distinct.contains(&prefix) {
+            if distinct.len() == Nat64State::MAX_PREFIXES {
+                return Err(distinct);
+            }
+            distinct.push(prefix);
+        }
+    }
+    Ok(distinct)
 }
 
 #[cfg(test)]
@@ -206,7 +246,15 @@ mod tests {
         );
         assert_eq!(
             Nat64State::known((1..=17).map(prefix)),
-            Nat64State::Incomplete
+            Nat64State::Incomplete((1..=16).map(prefix).collect())
+        );
+        assert_eq!(
+            Nat64State::unknown((1..=16).map(prefix)),
+            Nat64State::Unknown((1..=16).map(prefix).collect())
+        );
+        assert_eq!(
+            Nat64State::unknown((1..=17).map(prefix)),
+            Nat64State::Incomplete((1..=16).map(prefix).collect())
         );
         // No prefix, as after NODATA from every resolver: known and empty.
         assert_eq!(Nat64State::known([]), Nat64State::NONE);

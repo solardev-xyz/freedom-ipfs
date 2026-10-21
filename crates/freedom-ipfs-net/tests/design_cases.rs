@@ -118,8 +118,12 @@ fn onions_are_classified_wherever_they_appear() {
         classify_multiaddr(&multiaddr("/dns/X.ONION./tcp/80")),
         Ok(Target::Onion("x.onion".into()))
     );
-    for dns in ["/dns4", "/dns6", "/dnsaddr"] {
-        let addr = multiaddr(&format!("{dns}/sub.abc.onion"));
+    for text in [
+        "/dns4/sub.abc.onion/tcp/80",
+        "/dns6/sub.abc.onion/udp/443/quic-v1",
+        "/dnsaddr/sub.abc.onion",
+    ] {
+        let addr = multiaddr(text);
         assert_eq!(
             classify_multiaddr(&addr),
             Ok(Target::Onion("sub.abc.onion".into()))
@@ -188,7 +192,7 @@ fn urls_are_http_or_https_without_userinfo() {
     );
     assert_eq!(parse_url("http:/example.com"), Err(Refusal::InvalidUrl));
     assert_eq!(parse_url("http:///example.com"), Err(Refusal::EmptyHost));
-    assert_eq!(parse_url("http://example.com /"), Err(Refusal::InvalidUrl));
+    assert_eq!(parse_url("http://example.com /"), Err(Refusal::InvalidHost));
     assert_eq!(parse_url("http://exa\tmple.com/"), Err(Refusal::InvalidUrl));
     // A backslash ends the authority, as the WHATWG rules read it: the host
     // is the one before it, never one after an `@` behind it.
@@ -534,23 +538,26 @@ fn ipv6_outside_the_fixed_forms_waits_or_is_refused_until_the_prefixes_are_known
         Err(AddressRefusal::Nat64Pending)
     );
     assert_eq!(
-        check_address(global, &Nat64State::Unknown),
+        check_address(global, &Nat64State::Unknown(Vec::new())),
         Err(AddressRefusal::Nat64Unknown)
     );
     assert_eq!(
-        check_address(global, &Nat64State::Incomplete),
+        check_address(global, &Nat64State::Incomplete(Vec::new())),
         Err(AddressRefusal::Nat64Incomplete)
     );
     // ISATAP's prefix isn't fixed either.
     assert_eq!(
-        check_address(ip("2a00:1::200:5efe:808:808"), &Nat64State::Unknown),
+        check_address(
+            ip("2a00:1::200:5efe:808:808"),
+            &Nat64State::Unknown(Vec::new())
+        ),
         Err(AddressRefusal::Nat64Unknown)
     );
     // IPv4, and the fixed forms, are judged as always.
     for state in [
         Nat64State::Pending,
-        Nat64State::Unknown,
-        Nat64State::Incomplete,
+        Nat64State::Unknown(Vec::new()),
+        Nat64State::Incomplete(Vec::new()),
     ] {
         for text in [
             "8.8.8.8",
@@ -581,7 +588,10 @@ fn past_sixteen_prefixes_ipv6_outside_the_fixed_forms_is_refused() {
         Ok(target)
     );
     let state = Nat64State::known((1..=17).map(prefix));
-    assert_eq!(state, Nat64State::Incomplete);
+    assert_eq!(
+        state,
+        Nat64State::Incomplete((1..=16).map(prefix).collect())
+    );
     assert_eq!(
         check_address(target, &state),
         Err(AddressRefusal::Nat64Incomplete)
@@ -616,4 +626,50 @@ fn configured_targets_are_exempt_by_exact_host_and_port() {
     assert_eq!(configured.add_url(&with_userinfo), Err(Refusal::Userinfo));
     let ftp = Url::parse("ftp://example.com/").unwrap();
     assert_eq!(configured.add_url(&ftp), Err(Refusal::Scheme));
+}
+
+#[test]
+fn only_the_authority_must_be_printable_ascii() {
+    // The path, query and fragment may hold Unicode, spaces, `%` and
+    // control bytes: the parser percent-encodes them, and the host is what
+    // the gate classifies.
+    for raw in [
+        "https://router.example/routé/v1",
+        "https://router.example/a b?q=é#frag é",
+        "https://router.example/%41%42",
+        "https://router.example/a\u{1}b",
+        "https://router.example/?x=\u{7f}",
+    ] {
+        let url = parse_url(raw).unwrap_or_else(|err| panic!("{raw:?}: {err}"));
+        assert!(url.as_str().is_ascii(), "{url}");
+        assert_eq!(
+            classify_url(&url).unwrap().target,
+            Target::Name("router.example".into()),
+            "{raw:?}"
+        );
+    }
+    assert_eq!(parse_url("https://bücher.de/routé"), Err(Refusal::NonAscii));
+    assert_eq!(parse_url("http://exam ple.com/"), Err(Refusal::InvalidHost));
+    assert_eq!(
+        parse_url("http://exa\u{1}mple.com/"),
+        Err(Refusal::InvalidHost)
+    );
+}
+
+#[test]
+fn what_the_parser_would_strip_is_refused_anywhere() {
+    // Tabs and newlines are dropped anywhere, and controls and spaces at the
+    // ends: either could move where the authority ends.
+    for raw in [
+        "http://exa\tmple.com/",
+        "http://example.com/\n",
+        "http://example.com/a\rb",
+        "http://127.0.0.1\t@example.com/",
+        " http://example.com/",
+        "http://example.com/ ",
+        "\u{0}http://example.com/",
+        "http://example.com/\u{1f}",
+    ] {
+        assert_eq!(parse_url(raw), Err(Refusal::InvalidUrl), "{raw:?}");
+    }
 }

@@ -995,6 +995,8 @@ version = "0.4.6"
 dependencies = [
  "data-encoding",
  "http",
+ "libp2p-core",
+ "libp2p-tcp",
  "multiaddr",
  "reqwest",
  "serde",

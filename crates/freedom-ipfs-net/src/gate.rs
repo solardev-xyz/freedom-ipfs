@@ -33,7 +33,8 @@ pub mod table;
 pub use address::{check_address, AddressRefusal, Form};
 pub use cidr::Cidr;
 pub use classify::{
-    classify_host, classify_multiaddr, classify_url, parse_url, Refusal, Target, UrlTarget,
+    classify_dialed, classify_host, classify_multiaddr, classify_url, parse_url, DialTarget,
+    Refusal, Shape, Target, UrlTarget,
 };
 pub use configured::ConfiguredTargets;
 pub use nat64::{Nat64Prefix, Nat64State};

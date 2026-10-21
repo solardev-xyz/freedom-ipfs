@@ -77,17 +77,19 @@ pub enum AddressRefusal {
 /// - **IPv4:** refused in any of [`IPV4_REFUSED`]'s blocks.
 /// - **IPv4-mapped IPv6** (`::ffff:0:0/96`) is classified as its IPv4
 ///   address, and the connection goes to that IPv4 address.
-/// - **NAT64's well-known prefix** (`64:ff9b::/96`) passes only if its IPv4
-///   address does; the connection goes to the IPv6 address.
-/// - **Other IPv6** is refused in a named block or outside global unicast.
-///   Inside it:
-///   - 6to4 (`2002::/16`) passes only if its IPv4 address does. It is a
-///     fixed form, so NAT64 discovery's state doesn't matter;
-///   - an ISATAP interface identifier, under any prefix, passes only if its
-///     IPv4 address does;
-///   - then `nat64` decides: while it is pending, unknown or incomplete the
-///     address is refused; once known, an address under a learned prefix
-///     passes only if the IPv4 address at RFC 6052's place does.
+/// - **Other IPv6** is refused in a named block, or outside global unicast
+///   unless it is under NAT64's well-known prefix. Then every embedding it
+///   can be read with must pass:
+///   - NAT64's well-known prefix (`64:ff9b::/96`): its last 32 bits; the
+///     connection goes to the IPv6 address;
+///   - 6to4 (`2002::/16`): bits 16–47;
+///   - an ISATAP interface identifier, under any prefix: its last 32 bits;
+///   - every learned prefix in `nat64` the address is under, in every
+///     state: the IPv4 address at RFC 6052's place. A learned prefix inside
+///     a fixed form's space decides too.
+/// - **Then `nat64`'s state:** an address under neither fixed form (the
+///   well-known prefix, 6to4) is refused while discovery is pending,
+///   unknown or incomplete. The fixed forms are exempt from that only.
 ///
 /// 6rd, 6over4 and 6a44, whose embedding depends on configuration, are
 /// judged as the IPv6 address alone.
@@ -115,20 +117,27 @@ fn check_embedded(form: Form, v4: Ipv4Addr) -> Result<(), AddressRefusal> {
 }
 
 fn check_v6(v6: Ipv6Addr, nat64: &Nat64State) -> Result<IpAddr, AddressRefusal> {
+    // Classified as the IPv4 address, and connected to as one: no IPv6
+    // packet is sent, so no translator, and no learned prefix, is involved.
     if let Some(v4) = v6.to_ipv4_mapped() {
         return check_v4(v4).map(|()| IpAddr::V4(v4));
     }
-    if NAT64_WELL_KNOWN.contains_v6(v6) {
-        check_embedded(Form::Nat64WellKnown, last_32(v6))?;
-        return Ok(IpAddr::V6(v6));
-    }
-    for rows in [IPV6_REFUSED_OUTSIDE, IPV6_REFUSED_INSIDE] {
-        if let Some((block, row)) = refused_row(rows, IpAddr::V6(v6)) {
-            return Err(AddressRefusal::Block { block, row });
+    let well_known = NAT64_WELL_KNOWN.contains_v6(v6);
+    if !well_known {
+        for rows in [IPV6_REFUSED_OUTSIDE, IPV6_REFUSED_INSIDE] {
+            if let Some((block, row)) = refused_row(rows, IpAddr::V6(v6)) {
+                return Err(AddressRefusal::Block { block, row });
+            }
+        }
+        if !GLOBAL_UNICAST.contains_v6(v6) {
+            return Err(AddressRefusal::NotGlobalUnicast);
         }
     }
-    if !GLOBAL_UNICAST.contains_v6(v6) {
-        return Err(AddressRefusal::NotGlobalUnicast);
+    // Every embedding the address can be read with must pass: its fixed
+    // form's, ISATAP's, and every learned prefix's it is under, so a
+    // network-specific prefix inside a fixed form's space still decides.
+    if well_known {
+        check_embedded(Form::Nat64WellKnown, last_32(v6))?;
     }
     let six_to_four = SIX_TO_FOUR.contains_v6(v6);
     if six_to_four {
@@ -138,21 +147,21 @@ fn check_v6(v6: Ipv6Addr, nat64: &Nat64State) -> Result<IpAddr, AddressRefusal> 
     if is_isatap(v6) {
         check_embedded(Form::Isatap, last_32(v6))?;
     }
-    if six_to_four {
+    for prefix in nat64.prefixes() {
+        if let Some(v4) = prefix.embedded_ipv4(v6) {
+            check_embedded(Form::Nat64Learned(*prefix), v4)?;
+        }
+    }
+    // The fixed forms are exempt only from the refusals for what discovery
+    // doesn't know yet.
+    if well_known || six_to_four {
         return Ok(IpAddr::V6(v6));
     }
     match nat64 {
         Nat64State::Pending => Err(AddressRefusal::Nat64Pending),
-        Nat64State::Unknown => Err(AddressRefusal::Nat64Unknown),
-        Nat64State::Incomplete => Err(AddressRefusal::Nat64Incomplete),
-        Nat64State::Known(prefixes) => {
-            for prefix in prefixes {
-                if let Some(v4) = prefix.embedded_ipv4(v6) {
-                    check_embedded(Form::Nat64Learned(*prefix), v4)?;
-                }
-            }
-            Ok(IpAddr::V6(v6))
-        }
+        Nat64State::Unknown(_) => Err(AddressRefusal::Nat64Unknown),
+        Nat64State::Incomplete(_) => Err(AddressRefusal::Nat64Incomplete),
+        Nat64State::Known(_) => Ok(IpAddr::V6(v6)),
     }
 }
 

@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 
 use url::Url;
 
-use super::classify::{canonical, classify_url, Refusal, Target};
+use super::classify::{canonical, classify_url, DialTarget, Refusal, Target};
 
 /// The targets configuration names: the delegated routers and the DoH
 /// endpoint in `ipfs.start`, and the proxy's endpoint. They are exempt from
@@ -43,6 +43,15 @@ impl ConfiguredTargets {
     /// port.
     pub fn contains(&self, target: &Target, port: u16) -> bool {
         self.targets.contains(&(target.clone(), port))
+    }
+
+    /// Whether a dialed multiaddr's target is configured, at the port it
+    /// reaches: an HTTP provider without `/tcp` at its effective port (80,
+    /// or 443 for HTTPS). A `/dnsaddr`, which reaches no port of its own,
+    /// never is.
+    pub fn contains_dial(&self, dial: &DialTarget) -> bool {
+        dial.port
+            .is_some_and(|port| self.contains(&dial.target, port))
     }
 
     pub fn is_empty(&self) -> bool {
