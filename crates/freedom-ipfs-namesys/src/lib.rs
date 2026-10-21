@@ -326,9 +326,10 @@ impl CloudflareDohResolver {
     ///   only those it owns: a record owned by any other name is ignored.
     ///
     /// Real DoH JSON names every record's owner. An alias, or a record of
-    /// the kind asked for, without one (its `name` missing or null) can't be
-    /// placed in the chain: the lookup is refused, whatever the answers'
-    /// order.
+    /// the kind asked for, without a valid one (its `name` missing, null,
+    /// or not a name the gate's classifier accepts: empty, blank, padded)
+    /// can't be placed in the chain: the lookup is refused, whatever the
+    /// answers' order. A record of another kind is left alone.
     fn owned_answers<'a>(
         &self,
         answers: &'a [DohAnswer],
@@ -337,9 +338,9 @@ impl CloudflareDohResolver {
     ) -> Result<ChainStep<'a>> {
         if answers
             .iter()
-            .any(|answer| answer.name.is_none() && (answer.is_cname() || wanted(answer)))
+            .any(|answer| (answer.is_cname() || wanted(answer)) && answer.owner().is_none())
         {
-            return Err(chain.refused("an answer doesn't name its owner"));
+            return Err(chain.refused("an answer doesn't name a valid owner"));
         }
         loop {
             let owned = answers
@@ -1066,13 +1067,20 @@ impl DohAnswer {
         self.record_type == Some(DNS_TYPE_CNAME)
     }
 
-    /// Whether `name` (canonical: lowercase, no trailing dot) owns the
-    /// record. A record without an owner is no name's.
+    /// The record's owner, canonical as the gate's classifier makes a name
+    /// (lowercase, one trailing dot removed): `None` when it has none, or
+    /// one the classifier refuses or reads as an address.
+    fn owner(&self) -> Option<String> {
+        match classify_host(self.name.as_deref()?) {
+            Ok(Target::Name(name) | Target::Onion(name)) => Some(name),
+            Ok(Target::Ip(_)) | Err(_) => None,
+        }
+    }
+
+    /// Whether `name` (canonical) owns the record. A record without a valid
+    /// owner is no name's.
     fn is_owned_by(&self, name: &str) -> bool {
-        self.name.as_deref().is_some_and(|owner| {
-            let owner = owner.strip_suffix('.').unwrap_or(owner);
-            owner.eq_ignore_ascii_case(name)
-        })
+        self.owner().is_some_and(|owner| owner == name)
     }
 }
 
@@ -1635,6 +1643,72 @@ mod tests {
             "{:?}",
             asked.lock().unwrap()
         );
+    }
+
+    /// Malformed owners, for AAAA and TXT as for A (#47 adversarial review
+    /// round 5): an empty, blank, tabbed or padded owner on an alias or on a
+    /// record of the kind asked for refuses the lookup under `direct`; the
+    /// well-formed control resolves.
+    #[tokio::test]
+    async fn malformed_owners_refuse_aaaa_and_txt_lookups_too() {
+        let mut answers = vec![
+            (
+                "good.test",
+                "28",
+                r#"[{"name":"good.test.","type":5,"TTL":60,"data":"alias.test."},{"name":"alias.test.","type":28,"TTL":60,"data":"2a00:1::1"}]"#,
+            ),
+            (
+                "_dnslink.good.test",
+                "TXT",
+                r#"[{"name":"_dnslink.good.test.","type":5,"TTL":60,"data":"_dnslink.alias.test."},{"name":"_dnslink.alias.test.","type":16,"TTL":60,"data":"\"dnslink=/ipfs/bafkqaddwgevxmmraojswg33smq\""}]"#,
+            ),
+        ];
+        let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+        for (label, owner) in [
+            ("empty", ""),
+            ("space", " "),
+            ("tab", "\\t"),
+            ("padded", "x.test. "),
+        ] {
+            answers.push((
+                leak(format!("alias-{label}.test")),
+                "28",
+                leak(format!(
+                    r#"[{{"name":"alias-{label}.test.","type":5,"TTL":60,"data":"safe.test."}},{{"name":"{owner}","type":5,"TTL":60,"data":"secret.onion."}},{{"name":"safe.test.","type":28,"TTL":60,"data":"2a00:1::2"}}]"#
+                )),
+            ));
+            answers.push((
+                leak(format!("_dnslink.record-{label}.test")),
+                "TXT",
+                leak(format!(
+                    r#"[{{"name":"_dnslink.record-{label}.test.","type":16,"TTL":60,"data":"\"dnslink=/ipfs/bafkqaddwgevxmmraojswg33smq\""}},{{"name":"{owner}","type":16,"TTL":60,"data":"\"dnslink=/ipfs/other\""}}]"#
+                )),
+            ));
+        }
+        let (endpoint, _) = answering_doh(answers).await;
+        let direct = direct_resolver(&endpoint);
+        assert_eq!(
+            direct
+                .ip_lookup_type("good.test", DNS_TYPE_AAAA)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            direct.txt_lookup("_dnslink.good.test").await.unwrap().len(),
+            1
+        );
+        for label in ["empty", "space", "tab", "padded"] {
+            let aaaa = direct
+                .ip_lookup_type(&format!("alias-{label}.test"), DNS_TYPE_AAAA)
+                .await;
+            assert!(aaaa.is_err(), "{label}: {aaaa:?}");
+            let txt = direct
+                .txt_lookup(&format!("_dnslink.record-{label}.test"))
+                .await;
+            assert!(txt.is_err(), "{label}: {txt:?}");
+        }
     }
 
     /// A record whose owner is outside the chain is ignored under `direct`
