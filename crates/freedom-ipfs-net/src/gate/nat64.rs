@@ -4,8 +4,9 @@
 //! An IPv6-only network can translate through a network-specific prefix of
 //! its own (RFC 6052), which may reach private IPv4 addresses. Addresses
 //! under it look like ordinary global unicast, so in `direct` mode the gate
-//! needs the prefixes discovery has learned, and refuses IPv6 outside the
-//! fixed forms while it doesn't know them. Discovery itself (which
+//! needs the prefixes discovery has learned: while discovery is pending,
+//! every IPv6 target but an IPv4-mapped one waits for it, and while it is
+//! unknown, IPv6 outside the fixed forms is refused. Discovery itself (which
 //! resolvers, the queries, refresh) belongs to the host; this module holds
 //! its result and the RFC 6052 arithmetic.
 
@@ -89,15 +90,19 @@ fn embedded_at(addr: Ipv6Addr, len: u8) -> Ipv4Addr {
 ///
 /// Every prefix a known or unknown state holds is applied: learned prefixes
 /// are kept for the process's life, so a failed refresh never forgets one,
-/// and a prefix only adds refusals. The state decides what else is refused:
-/// IPv6 outside the fixed forms while pending or unknown, and every IPv6
-/// address but an IPv4-mapped one while incomplete.
+/// and a prefix only adds refusals. The state decides what else waits or is
+/// refused: every IPv6 address but an IPv4-mapped one waits while pending,
+/// IPv6 outside the fixed forms is refused while unknown, and every IPv6
+/// address but an IPv4-mapped one is refused while incomplete.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Nat64State {
-    /// The first query hasn't settled. An IPv6 target outside the fixed
-    /// forms waits for it, within its own deadline: the gate refuses it with
-    /// [`AddressRefusal::Nat64Pending`](super::AddressRefusal::Nat64Pending),
-    /// and the caller asks again once the state changes.
+    /// The first query hasn't settled. Every IPv6 target but an IPv4-mapped
+    /// one waits for it, within its own deadline, fixed forms included: the
+    /// first answer may teach a prefix under one. The gate refuses such a
+    /// target with
+    /// [`AddressRefusal::Nat64Pending`](super::AddressRefusal::Nat64Pending)
+    /// (unless its own reading already refuses it), and the caller asks
+    /// again once the state changes.
     Pending,
     /// Every resolver learned has answered: the union of their prefixes.
     /// An empty set means none of them advertises a prefix.
