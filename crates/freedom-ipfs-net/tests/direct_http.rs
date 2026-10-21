@@ -721,3 +721,44 @@ async fn a_hop_over_a_pooled_connection_after_the_revoke_is_refused() {
     assert_eq!(*paths.lock().unwrap(), ["/before"]);
     assert_eq!(connections.load(Ordering::SeqCst), 1);
 }
+
+/// The startup race under a fixed form, for an IP literal in the hop loop
+/// (#46 adversarial review round 2): a 6to4 literal waits for discovery
+/// while it is pending, and the learned `2002:808:808::/48` then reads its
+/// bits as `127.0.0.1`: refused. An IPv4-mapped literal never waits.
+#[tokio::test]
+async fn a_fixed_form_literal_waits_for_discovery_too() {
+    let (publisher, handle) = Nat64Handle::channel(Nat64State::Pending);
+    let client = checked_with(&[], handle).http_client(PROVIDER);
+    let mapped = tokio::time::timeout(
+        Duration::from_secs(1),
+        get(&client, "http://[::ffff:127.0.0.1]:9/"),
+    )
+    .await
+    .expect("an IPv4-mapped literal doesn't wait");
+    assert!(
+        is_refused(&mapped, |r| matches!(
+            r,
+            Refused::Address(AddressRefusal::Block { .. })
+        )),
+        "an IPv4-mapped literal is judged at once: {mapped:?}"
+    );
+    let request =
+        tokio::spawn(async move { get(&client, "http://[2002:808:808:7f00:0:100::]:9/").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !request.is_finished(),
+        "the 6to4 literal waits for discovery"
+    );
+    let prefix =
+        freedom_ipfs_net::gate::Nat64Prefix::new("2002:808:808::".parse().unwrap(), 48).unwrap();
+    publisher.publish(Nat64State::known([prefix]));
+    let result = request.await.unwrap();
+    assert!(
+        is_refused(&result, |r| matches!(
+            r,
+            Refused::Address(AddressRefusal::Embedded { .. })
+        )),
+        "{result:?}"
+    );
+}

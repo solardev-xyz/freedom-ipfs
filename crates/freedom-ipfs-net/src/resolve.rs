@@ -489,6 +489,165 @@ mod tests {
         ));
     }
 
+    /// The startup race under a fixed form (design 0007, #46 adversarial
+    /// review round 2): while discovery is pending, a 6to4 answer waits like
+    /// any IPv6 one, and the prefix the first answer teaches decides it:
+    /// under `2002:808:808::/48` its bits read `127.0.0.1`. With no covering
+    /// prefix, it passes once discovery answers; IPv4 and IPv4-mapped
+    /// answers never wait.
+    #[tokio::test]
+    async fn a_fixed_form_answer_waits_for_discovery_too() {
+        let fixed = "2002:808:808:7f00:0:100::";
+        let table = Table::with(&[
+            ("sixtofour.example", Ok(vec![fixed])),
+            ("wkp.example", Ok(vec!["64:ff9b::808:808"])),
+            ("v4.example", Ok(vec!["8.8.8.8"])),
+            ("mapped.example", Ok(vec!["::ffff:8.8.4.4"])),
+        ]);
+        for (prefixes, refused) in [
+            (
+                vec![Nat64Prefix::new("2002:808:808::".parse().unwrap(), 48).unwrap()],
+                true,
+            ),
+            (Vec::new(), false),
+        ] {
+            let (publisher, handle) = Nat64Handle::channel(Nat64State::Pending);
+            let resolver = GateResolver::new(table.clone(), NetworkCapability::new(), Some(handle));
+            // IPv4 and IPv4-mapped answers are judged at once.
+            let at_once = |name: &'static str| {
+                let resolver = resolver.clone();
+                async move {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        resolver.resolve_host(name),
+                    )
+                    .await
+                    .unwrap_or_else(|_| panic!("{name} waited"))
+                    .unwrap()
+                }
+            };
+            assert_eq!(at_once("v4.example").await, ips(&["8.8.8.8"]));
+            assert_eq!(at_once("mapped.example").await, ips(&["8.8.4.4"]));
+            let waiting = {
+                let resolver = resolver.clone();
+                tokio::spawn(async move { resolver.resolve_host("sixtofour.example").await })
+            };
+            let wkp = {
+                let resolver = resolver.clone();
+                tokio::spawn(async move { resolver.resolve_host("wkp.example").await })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(
+                !waiting.is_finished(),
+                "the 6to4 answer waits for discovery"
+            );
+            assert!(!wkp.is_finished(), "the well-known-prefix answer waits too");
+            publisher.publish(Nat64State::known(prefixes));
+            let result = waiting.await.unwrap();
+            if refused {
+                assert!(
+                    matches!(
+                        result,
+                        Err(ResolveRefused::AllRefused(AddressRefusal::Embedded { .. }))
+                    ),
+                    "{result:?}"
+                );
+            } else {
+                assert_eq!(result.unwrap(), ips(&[fixed]));
+            }
+            assert_eq!(wkp.await.unwrap().unwrap(), ips(&["64:ff9b::808:808"]));
+        }
+    }
+
+    /// A lookup held until released: it answers `answer` then.
+    #[derive(Debug)]
+    struct HeldLookup {
+        answer: IpAddr,
+        asked: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl NameLookup for HeldLookup {
+        fn lookup(&self, _: &str) -> LookupFuture {
+            let (answer, release) = (self.answer, self.release.clone());
+            self.asked.notify_one();
+            Box::pin(async move {
+                release.notified().await;
+                Ok(vec![answer])
+            })
+        }
+    }
+
+    /// The two kinds of publication that refuse an address that passed
+    /// before: a prefix added (under it, the address embeds
+    /// `169.254.169.254`), and an incomplete state.
+    fn refusing_publications() -> Vec<(&'static str, Nat64State)> {
+        let prefix = Nat64Prefix::new("2a00:1:2:3::".parse().unwrap(), 64).unwrap();
+        vec![
+            ("a prefix added", Nat64State::known([prefix])),
+            ("incomplete", Nat64State::Incomplete(vec![prefix])),
+        ]
+    }
+
+    /// Design 0007, "publication and checks" (a): a publication made while a
+    /// lookup is in flight is the state its answers are judged against: the
+    /// check reads the state once its answers are in hand.
+    #[tokio::test]
+    async fn a_publication_during_a_lookup_judges_its_answers() {
+        for (kind, published) in refusing_publications() {
+            let (publisher, handle) = Nat64Handle::channel(Nat64State::NONE);
+            let asked = std::sync::Arc::new(tokio::sync::Notify::new());
+            let release = std::sync::Arc::new(tokio::sync::Notify::new());
+            let lookup = HeldLookup {
+                answer: "2a00:1:2:3:a9:fea9:fe00:0".parse().unwrap(),
+                asked: asked.clone(),
+                release: release.clone(),
+            };
+            let resolver =
+                GateResolver::new(Arc::new(lookup), NetworkCapability::new(), Some(handle));
+            let resolving =
+                tokio::spawn(async move { resolver.resolve_host("held.example").await });
+            asked.notified().await;
+            publisher.publish(published);
+            release.notify_one();
+            let result = resolving.await.unwrap();
+            assert!(
+                matches!(result, Err(ResolveRefused::AllRefused(_))),
+                "{kind}: {result:?}"
+            );
+        }
+        // The control: no publication, and the same answer passes.
+        let (_publisher, handle) = Nat64Handle::channel(Nat64State::NONE);
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let lookup = HeldLookup {
+            answer: "2a00:1:2:3:a9:fea9:fe00:0".parse().unwrap(),
+            asked: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release: release.clone(),
+        };
+        let resolver = GateResolver::new(Arc::new(lookup), NetworkCapability::new(), Some(handle));
+        release.notify_one();
+        assert!(resolver.resolve_host("held.example").await.is_ok());
+    }
+
+    /// (c): a lookup begun after a publication uses the new state.
+    #[tokio::test]
+    async fn a_lookup_begun_after_a_publication_uses_it() {
+        let table = Table::with(&[("v6.example", Ok(vec!["2a00:1:2:3:a9:fea9:fe00:0"]))]);
+        for (kind, published) in refusing_publications() {
+            let (publisher, handle) = Nat64Handle::channel(Nat64State::NONE);
+            let resolver = GateResolver::new(table.clone(), NetworkCapability::new(), Some(handle));
+            assert!(resolver.resolve_host("v6.example").await.is_ok(), "{kind}");
+            publisher.publish(published);
+            assert!(
+                matches!(
+                    resolver.resolve_host("v6.example").await,
+                    Err(ResolveRefused::AllRefused(_))
+                ),
+                "{kind}"
+            );
+        }
+    }
+
     #[test]
     fn its_texts_never_say_timeout() {
         for err in [
