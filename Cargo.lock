@@ -928,6 +928,7 @@ dependencies = [
  "clap",
  "freedom-ipfs-core",
  "freedom-ipfs-namesys",
+ "freedom-ipfs-net",
  "freedom-ipfs-retrieval",
  "freedom-ipfs-routing",
  "freedom-ipfs-store",
@@ -973,6 +974,7 @@ version = "0.4.6"
 dependencies = [
  "async-trait",
  "cid",
+ "freedom-ipfs-net",
  "futures",
  "ipld-core",
  "libp2p-identity",
@@ -992,8 +994,12 @@ name = "freedom-ipfs-net"
 version = "0.4.6"
 dependencies = [
  "data-encoding",
+ "http",
  "multiaddr",
+ "reqwest",
+ "serde",
  "thiserror 2.0.18",
+ "tokio",
  "url",
 ]
 
@@ -1005,6 +1011,7 @@ dependencies = [
  "cid",
  "freedom-ipfs-core",
  "freedom-ipfs-namesys",
+ "freedom-ipfs-net",
  "freedom-ipfs-routing",
  "freedom-ipfs-store",
  "futures",
@@ -1032,6 +1039,7 @@ dependencies = [
  "async-trait",
  "cid",
  "freedom-ipfs-namesys",
+ "freedom-ipfs-net",
  "futures",
  "ipld-core",
  "libp2p",

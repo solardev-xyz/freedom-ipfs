@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use cid::Cid;
+use freedom_ipfs_net::{ClientConfig, HttpClient, HttpError};
 use futures::stream::{FuturesUnordered, StreamExt};
 use ipld_core::ipld::Ipld;
 use libp2p_identity::{PeerId, PublicKey};
@@ -23,6 +24,12 @@ const LIBP2P_KEY_CODEC: u64 = 0x72;
 const IDENTITY_HASH: u64 = 0x00;
 const DEFAULT_NAME_CACHE_TTL: Duration = Duration::from_secs(60);
 const DEFAULT_NAMESYS_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// The DoH and delegated IPNS clients' configuration: a 10 s timeout, and
+/// reqwest's default redirects.
+pub const HTTP_CLIENT_CONFIG: ClientConfig = ClientConfig::new(
+    DEFAULT_NAMESYS_HTTP_TIMEOUT,
+    ClientConfig::REQWEST_DEFAULT_REDIRECTS,
+);
 const DNS_TYPE_CNAME: u16 = 5;
 const DNS_TYPE_TXT: u16 = 16;
 const DNS_TYPE_A: u16 = 1;
@@ -45,6 +52,19 @@ pub enum NamesysError {
     InvalidIpnsSignature,
     #[error("http resolver: {0}")]
     Http(#[from] reqwest::Error),
+    /// The request wasn't sent: the network's capability is revoked, or
+    /// its client couldn't be built.
+    #[error("http resolver: {0}")]
+    Network(HttpError),
+}
+
+impl From<HttpError> for NamesysError {
+    fn from(err: HttpError) -> Self {
+        match err {
+            HttpError::Http(err) => Self::Http(err),
+            other => Self::Network(other),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, NamesysError>;
@@ -218,24 +238,36 @@ struct CachedName {
 
 #[derive(Debug, Clone)]
 pub struct CloudflareDohResolver {
-    client: reqwest::Client,
+    client: HttpClient,
     endpoint: String,
 }
 
 impl Default for CloudflareDohResolver {
     fn default() -> Self {
         Self {
-            client: timeout_http_client(DEFAULT_NAMESYS_HTTP_TIMEOUT),
-            endpoint: "https://cloudflare-dns.com/dns-query".to_string(),
+            client: HttpClient::legacy(HTTP_CLIENT_CONFIG),
+            endpoint: DEFAULT_DOH_ENDPOINT.to_string(),
         }
     }
 }
+
+/// The DoH endpoint a resolver asks unless told another.
+pub const DEFAULT_DOH_ENDPOINT: &str = "https://cloudflare-dns.com/dns-query";
 
 impl CloudflareDohResolver {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
             ..Self::default()
+        }
+    }
+
+    /// A resolver for `endpoint` that sends through `client`: a network's
+    /// client for [`HTTP_CLIENT_CONFIG`], whose capability every query asks.
+    pub fn with_client(endpoint: impl Into<String>, client: HttpClient) -> Self {
+        Self {
+            client,
+            endpoint: endpoint.into(),
         }
     }
 
@@ -342,7 +374,7 @@ impl DnsTxtResolver for CloudflareDohResolver {
 #[derive(Debug, Clone)]
 pub struct DelegatedIpnsResolver {
     endpoints: Vec<String>,
-    client: reqwest::Client,
+    client: HttpClient,
 }
 
 impl Default for DelegatedIpnsResolver {
@@ -361,6 +393,16 @@ impl DelegatedIpnsResolver {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        Self::with_endpoints_and_client(endpoints, HttpClient::legacy(HTTP_CLIENT_CONFIG))
+    }
+
+    /// A resolver for `endpoints` that sends through `client`: a network's
+    /// client for [`HTTP_CLIENT_CONFIG`], whose capability every lookup asks.
+    pub fn with_endpoints_and_client<I, S>(endpoints: I, client: HttpClient) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let mut endpoints = endpoints
             .into_iter()
             .map(|endpoint| endpoint.into().trim_end_matches('/').to_string())
@@ -369,10 +411,7 @@ impl DelegatedIpnsResolver {
         if endpoints.is_empty() {
             endpoints.push(DEFAULT_DELEGATED_ROUTER.to_string());
         }
-        Self {
-            endpoints,
-            client: timeout_http_client(DEFAULT_NAMESYS_HTTP_TIMEOUT),
-        }
+        Self { endpoints, client }
     }
 
     async fn resolve_ipns_from_endpoint(&self, endpoint: &str, name: &str) -> Result<IpnsRecord> {
@@ -823,14 +862,6 @@ fn unquote_txt(input: &str) -> String {
     }
 
     output
-}
-
-fn timeout_http_client(timeout: Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(timeout)
-        .timeout(timeout)
-        .build()
-        .expect("namesystem HTTP client config is valid")
 }
 
 #[derive(Debug, Deserialize)]
