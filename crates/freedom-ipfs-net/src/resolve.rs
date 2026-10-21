@@ -444,12 +444,11 @@ mod tests {
         ));
     }
 
-    /// Answers are judged against one settled state: an answer that passed
-    /// under the pending state (a fixed form) is refused once discovery
-    /// learns a prefix over it, though another answer was what waited (#46
-    /// adversarial review, P1).
+    /// Answers are judged against one settled state: a fixed-form answer
+    /// waits for discovery beside an ordinary one, and is refused once
+    /// discovery learns a prefix over it (#46 adversarial review, P1).
     #[tokio::test]
-    async fn answers_accepted_before_nat64_settles_are_judged_again() {
+    async fn every_answer_is_judged_against_one_settled_state() {
         let fixed = "2002:808:808:7f00:0:100::";
         let waiting = "2a00:1:2:3:a9:fea9:fe00:0";
         let table = Table::with(&[("mixed.example", Ok(vec![fixed, waiting]))]);
