@@ -22,6 +22,7 @@ use freedom_ipfs_core::{
     Result as CoreResult, CODEC_DAG_PB, DEFAULT_MAX_BLOCK_SIZE, HASH_IDENTITY, HASH_SHA2_256,
 };
 use freedom_ipfs_namesys::{CloudflareDohResolver, DnsTxtResolver, DEFAULT_DOH_ENDPOINT};
+use freedom_ipfs_net::transport::Transports;
 use freedom_ipfs_net::{ClientConfig, DialPolicy, HttpClient, HttpError};
 use freedom_ipfs_routing::{Provider, ProviderRoutingClient};
 use freedom_ipfs_store::{CachedProviderRecord, SqliteBlockStore};
@@ -44,7 +45,7 @@ use libp2p_stream::{Control as StreamControl, IncomingStreams};
 use multihash::Multihash;
 use multihash_codetable::{Code, MultihashDigest};
 use prost::Message;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
 use std::fmt::Debug;
 use std::future::Future;
@@ -656,6 +657,7 @@ impl HttpRetriever {
         AddressExpansion {
             resolver,
             policy: self.client.network().dial_policy(),
+            configured_answers: self.bitswap_state.configured_answers.clone(),
         }
     }
 
@@ -4803,9 +4805,14 @@ impl HttpRetriever {
         if let Some(client) = client.as_ref() {
             return Ok(client.clone());
         }
-        let spawned =
-            SharedBitswapClient::spawn(self.instance.as_ref(), self.limits(), self.memory())
-                .await?;
+        let spawned = SharedBitswapClient::spawn(
+            self.instance.as_ref(),
+            self.limits(),
+            self.memory(),
+            Some(&Transports::new(self.client.network())),
+            self.bitswap_state.configured_answers.clone(),
+        )
+        .await?;
         *client = Some(spawned.clone());
         Ok(spawned)
     }
@@ -8067,17 +8074,28 @@ struct ConnectionErrorBackoff {
 impl SharedBitswapClient {
     /// Builds the shared swarm and spawns its task: in `instance`'s task
     /// set, so the instance's cancellation ends it and drops the swarm and
-    /// its connections, or on the ambient runtime without one.
+    /// its connections, or on the ambient runtime without one. The swarm
+    /// dials through `transports`, the retriever's network's (see
+    /// [`build_bitswap_swarm`]).
     async fn spawn(
         instance: Option<&InstanceContext>,
         limits: Option<&SharedLimits>,
         memory: Option<&MemoryBudget>,
+        transports: Option<&Transports>,
+        configured: ConfiguredAnswers,
     ) -> Result<Self> {
-        let swarm = build_bitswap_swarm(limits).await?;
+        let swarm = build_bitswap_swarm(limits, transports).await?;
         let mut control = swarm.behaviour().stream.new_control();
         let incoming = accept_bitswap_streams(&mut control)?;
         let (commands, receiver) = mpsc::channel(64);
-        let task = run_shared_bitswap_swarm(swarm, control, incoming, receiver, memory.cloned());
+        let task = run_shared_bitswap_swarm(
+            swarm,
+            control,
+            incoming,
+            receiver,
+            memory.cloned(),
+            configured,
+        );
         match instance {
             Some(instance) => drop(instance.spawn(task)),
             None => drop(tokio::spawn(task)),
@@ -8354,6 +8372,7 @@ async fn run_shared_bitswap_swarm(
     incoming: Vec<IncomingStreams>,
     mut commands: mpsc::Receiver<BitswapCommand>,
     memory: Option<MemoryBudget>,
+    configured: ConfiguredAnswers,
 ) {
     let mut incoming = select_all(incoming);
     // Incoming streams answer no one request: their reads reserve from the
@@ -8395,6 +8414,7 @@ async fn run_shared_bitswap_swarm(
                     &mut connection_wait_started,
                     &connected_peers,
                     &mut connection_dial_contexts,
+                    &configured,
                 );
             }
             _ = deferred_prune.tick(), if !deferred_dials.is_empty() => {
@@ -8431,6 +8451,7 @@ async fn run_shared_bitswap_swarm(
                         &mut connection_wait_started,
                         &connected_peers,
                         &mut connection_dial_contexts,
+                        &configured,
                     );
                 }
                 if command.cids.is_empty() {
@@ -8542,7 +8563,7 @@ async fn run_shared_bitswap_swarm(
                         let addr = dial.addr;
                         let transport = bitswap_transport_label(&addr);
                         let dial_addr = addr.with_p2p(peer_id).unwrap_or_else(|addr| addr);
-                        match swarm.dial(dial_addr) {
+                        match dial_bitswap_addr(&mut swarm, dial_addr, &configured) {
                             Ok(()) => {
                                 started_dial_peers.insert(peer_id);
                                 connection_dial_contexts.insert(peer_id, dial_context.clone());
@@ -8735,7 +8756,7 @@ async fn run_shared_bitswap_swarm(
                     let addr = dial.addr;
                     let transport = bitswap_transport_label(&addr);
                     let dial_addr = addr.with_p2p(peer_id).unwrap_or_else(|addr| addr);
-                    match swarm.dial(dial_addr.clone()) {
+                    match dial_bitswap_addr(&mut swarm, dial_addr.clone(), &configured) {
                         Ok(()) => {
                             started_dial_peers.insert(peer_id);
                             connection_dial_contexts.insert(peer_id, dial_context.clone());
@@ -9282,6 +9303,7 @@ fn retry_deferred_bitswap_dials(
     connection_wait_started: &mut HashMap<PeerId, Instant>,
     connected_peers: &HashMap<PeerId, usize>,
     connection_dial_contexts: &mut HashMap<PeerId, BitswapDialContext>,
+    configured: &ConfiguredAnswers,
 ) {
     let dropped = prune_deferred_bitswap_dials(
         deferred,
@@ -9302,7 +9324,7 @@ fn retry_deferred_bitswap_dials(
         let mut capped = false;
         let mut last_error = None;
         for addr in &dial.addrs {
-            match swarm.dial(addr.clone()) {
+            match dial_bitswap_addr(swarm, addr.clone(), configured) {
                 Ok(()) => started = true,
                 Err(err) if is_shared_connection_cap_denial(&err) => {
                     capped = true;
@@ -9818,39 +9840,63 @@ fn bitswap_connection_limits() -> connection_limits::ConnectionLimits {
         .with_max_established(Some(BITSWAP_MAX_ESTABLISHED_CONNECTIONS))
 }
 
+/// The shared Bitswap swarm: through `transports`, a network's (design
+/// 0007, check 3: the gate wraps the transport, so it covers every dial the
+/// swarm makes, identify's included), or built as before without them.
 async fn build_bitswap_swarm(
     limits: Option<&SharedLimits>,
+    transports: Option<&Transports>,
 ) -> Result<libp2p::Swarm<BitswapBehaviour>> {
+    let error = |err: &dyn std::fmt::Display| RetrievalError::Bitswap(err.to_string());
     let shared_limit = Toggle::from(limits.map(SharedLimits::bitswap_connection_limit));
-    let swarm = SwarmBuilder::with_new_identity()
+    let Some(transports) = transports else {
+        return Ok(SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                (tls::Config::new, noise::Config::new),
+                yamux::Config::default,
+            )
+            .map_err(|err| error(&err))?
+            .with_quic()
+            // WebSocket providers need DNS names preserved for WSS SNI, so
+            // this transport has its own explicit Cloudflare resolver
+            // instead of the builder's system-DNS websocket shortcut.
+            .with_other_transport(cloudflare_websocket_transport)
+            .map_err(|err| error(&err))?
+            .with_behaviour(|key| bitswap_behaviour(key, shared_limit))
+            .map_err(|err| error(&err))?
+            .with_swarm_config(|cfg| {
+                cfg.with_idle_connection_timeout(BITSWAP_IDLE_CONNECTION_TIMEOUT)
+            })
+            .with_connection_timeout(BITSWAP_CONNECTION_TIMEOUT)
+            .build());
+    };
+    Ok(SwarmBuilder::with_new_identity()
         .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            (tls::Config::new, noise::Config::new),
-            yamux::Config::default,
-        )
-        .map_err(|err| RetrievalError::Bitswap(err.to_string()))?
-        .with_quic()
-        // WebSocket providers need DNS names preserved for WSS SNI, so this
-        // transport has its own explicit Cloudflare resolver instead of the
-        // builder's system-DNS websocket shortcut.
-        .with_other_transport(cloudflare_websocket_transport)
-        .map_err(|err| RetrievalError::Bitswap(err.to_string()))?
-        .with_behaviour(|key| BitswapBehaviour {
-            stream: libp2p_stream::Behaviour::new(),
-            identify: identify::Behaviour::new(identify::Config::new(
-                format!("freedom-ipfs/{}", env!("CARGO_PKG_VERSION")),
-                key.public(),
-            )),
-            ping: ping::Behaviour::new(ping::Config::new()),
-            limits: connection_limits::Behaviour::new(bitswap_connection_limits()),
-            shared_limit,
-        })
-        .map_err(|err| RetrievalError::Bitswap(err.to_string()))?
+        .with_other_transport(|key| transports.bitswap(key))
+        .map_err(|err| error(&err))?
+        .with_behaviour(|key| bitswap_behaviour(key, shared_limit))
+        .map_err(|err| error(&err))?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(BITSWAP_IDLE_CONNECTION_TIMEOUT))
         .with_connection_timeout(BITSWAP_CONNECTION_TIMEOUT)
-        .build();
-    Ok(swarm)
+        .build())
+}
+
+fn bitswap_behaviour(
+    key: &libp2p::identity::Keypair,
+    shared_limit: Toggle<SharedConnectionLimit>,
+) -> BitswapBehaviour {
+    BitswapBehaviour {
+        stream: libp2p_stream::Behaviour::new(),
+        identify: identify::Behaviour::new(identify::Config::new(
+            format!("freedom-ipfs/{}", env!("CARGO_PKG_VERSION")),
+            key.public(),
+        )),
+        ping: ping::Behaviour::new(ping::Config::new()),
+        limits: connection_limits::Behaviour::new(bitswap_connection_limits()),
+        shared_limit,
+    }
 }
 
 fn cloudflare_websocket_transport(
@@ -9945,6 +9991,9 @@ struct BitswapBookkeeping {
     /// The DoH resolver Bitswap's address expansion asks: the network's
     /// DoH endpoint, through a client of the network, built on first use.
     dns: std::sync::OnceLock<Arc<CloudflareDohResolver>>,
+    /// The addresses candidate choice admitted as configured targets'
+    /// answers, which the swarm dials as such.
+    configured_answers: ConfiguredAnswers,
     dnsaddr_cache: tokio::sync::Mutex<SharedDnsaddrCache>,
     dns_ip_cache: tokio::sync::Mutex<SharedDnsIpCache>,
     top_level_provider_preconnect_counts: tokio::sync::Mutex<HashMap<String, usize>>,
@@ -10003,6 +10052,15 @@ impl BitswapProviderAddrQuality {
     }
 }
 
+/// The addresses candidate choice admitted as a configured target's
+/// answer: a configured name and port whose A or AAAA answer replaced the
+/// name keep their exemption, and the swarm dials such an address as one
+/// ([`freedom_ipfs_net::transport::dial_configured_answer`]). Bounded:
+/// past [`MAX_CONFIGURED_ANSWERS`] it starts afresh.
+type ConfiguredAnswers = Arc<std::sync::Mutex<HashSet<Multiaddr>>>;
+
+const MAX_CONFIGURED_ANSWERS: usize = 1024;
+
 /// What Bitswap's candidate choice runs under (design 0007, checks 1 and
 /// 2): the retriever's network's dial policy, and the DoH resolver its
 /// address expansion asks, the network's.
@@ -10010,6 +10068,7 @@ impl BitswapProviderAddrQuality {
 struct AddressExpansion {
     resolver: Arc<CloudflareDohResolver>,
     policy: DialPolicy,
+    configured_answers: ConfiguredAnswers,
 }
 
 impl AddressExpansion {
@@ -10028,6 +10087,7 @@ impl AddressExpansion {
                 network.http_client(freedom_ipfs_namesys::HTTP_CLIENT_CONFIG),
             )),
             policy: network.dial_policy(),
+            configured_answers: ConfiguredAnswers::default(),
         }
     }
 }
@@ -10216,7 +10276,7 @@ async fn bitswap_peers_with_quality_using_caches_with_options(
         }
     }
 
-    let peers = judged_and_cut(gathered, &expansion.policy, deadline, &mut quality).await;
+    let peers = judged_and_cut(gathered, expansion, deadline, &mut quality).await;
     BitswapProviderCandidates { peers, quality }
 }
 
@@ -10232,10 +10292,11 @@ type GatheredPeer = (PeerId, Vec<(Multiaddr, Option<String>)>);
 /// them all.
 async fn judged_and_cut(
     gathered: Vec<GatheredPeer>,
-    policy: &DialPolicy,
+    expansion: &AddressExpansion,
     deadline: tokio::time::Instant,
     quality: &mut BitswapProviderAddrQuality,
 ) -> Vec<BitswapPeer> {
+    let policy = &expansion.policy;
     let settled = if policy.admits_everything() {
         None
     } else {
@@ -10263,6 +10324,7 @@ async fn judged_and_cut(
                     .as_ref()
                     .is_some_and(|settled| check_candidate(settled, &addr, via.as_deref()).is_ok());
             if admitted {
+                remember_configured_answer(settled.as_ref(), &addr, via.as_deref(), expansion);
                 kept.push(addr);
             } else {
                 quality.supported_addr_count = quality.supported_addr_count.saturating_sub(1);
@@ -10914,6 +10976,55 @@ async fn expand_provider_multiaddrs_with_origins(
     }
 
     expanded
+}
+
+/// Records `addr` as a configured target's answer, if candidate choice
+/// admitted it as one: the name it replaced is configured.
+fn remember_configured_answer(
+    settled: Option<&DialPolicy>,
+    addr: &Multiaddr,
+    via: Option<&str>,
+    expansion: &AddressExpansion,
+) {
+    let (Some(settled), Some(original)) =
+        (settled, via.and_then(|via| Multiaddr::from_str(via).ok()))
+    else {
+        return;
+    };
+    if !settled.is_configured_answer(&original, addr) {
+        return;
+    }
+    let mut answers = expansion
+        .configured_answers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if answers.len() >= MAX_CONFIGURED_ANSWERS {
+        answers.clear();
+    }
+    answers.insert(addr.clone());
+}
+
+/// Dials `addr` through the swarm, as a configured target's answer when
+/// candidate choice admitted it as one, so the transport's inner gate
+/// keeps that exemption for this dial only.
+fn dial_bitswap_addr(
+    swarm: &mut libp2p::Swarm<BitswapBehaviour>,
+    addr: Multiaddr,
+    configured: &ConfiguredAnswers,
+) -> std::result::Result<(), libp2p::swarm::DialError> {
+    let mut candidate = addr.clone();
+    if matches!(candidate.iter().last(), Some(Protocol::P2p(_))) {
+        candidate.pop();
+    }
+    let is_configured = configured
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&candidate);
+    if is_configured {
+        freedom_ipfs_net::transport::dial_configured_answer(&addr, || swarm.dial(addr.clone()))
+    } else {
+        swarm.dial(addr)
+    }
 }
 
 /// A candidate address under `policy`: an answer by the name it replaced
@@ -13215,8 +13326,8 @@ mod shared_limits_tests {
         });
 
         // Two nodes' swarms: the first's connection fills the shared cap.
-        let mut first = build_bitswap_swarm(Some(&limits)).await.unwrap();
-        let mut second = build_bitswap_swarm(Some(&limits)).await.unwrap();
+        let mut first = build_bitswap_swarm(Some(&limits), None).await.unwrap();
+        let mut second = build_bitswap_swarm(Some(&limits), None).await.unwrap();
         first.dial(addr.clone()).unwrap();
         established(&mut first).await;
         assert_eq!(limits.bitswap_connections(), 1);
@@ -13237,7 +13348,7 @@ mod shared_limits_tests {
         assert_eq!(limits.bitswap_connections(), 1);
 
         // A swarm built without shared limits isn't counted.
-        let mut free = build_bitswap_swarm(None).await.unwrap();
+        let mut free = build_bitswap_swarm(None, None).await.unwrap();
         free.dial(addr).unwrap();
         established(&mut free).await;
         assert_eq!(limits.bitswap_connections(), 1);
@@ -15463,19 +15574,24 @@ mod bitswap_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn bitswap_client_swarm_does_not_listen_for_inbound_peers() {
-        let swarm = build_bitswap_swarm(None).await.unwrap();
+        let swarm = build_bitswap_swarm(None, None).await.unwrap();
 
         assert_eq!(swarm.listeners().count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn shared_bitswap_swarm_exits_when_commands_close() {
-        let swarm = build_bitswap_swarm(None).await.unwrap();
+        let swarm = build_bitswap_swarm(None, None).await.unwrap();
         let mut control = swarm.behaviour().stream.new_control();
         let incoming = accept_bitswap_streams(&mut control).unwrap();
         let (commands, receiver) = mpsc::channel(1);
         let task = tokio::spawn(run_shared_bitswap_swarm(
-            swarm, control, incoming, receiver, None,
+            swarm,
+            control,
+            incoming,
+            receiver,
+            None,
+            ConfiguredAnswers::default(),
         ));
 
         drop(commands);
@@ -15506,7 +15622,10 @@ mod bitswap_tests {
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
         let (peer_id, addr, swarm_task, stream_task, want_seen) =
             spawn_bitswap_peer_waiting_for_stream_close(cid).await;
-        let client = SharedBitswapClient::spawn(None, None, None).await.unwrap();
+        let client =
+            SharedBitswapClient::spawn(None, None, None, None, ConfiguredAnswers::default())
+                .await
+                .unwrap();
         let fetch_task = tokio::spawn(async move {
             client
                 .fetch(
@@ -15808,7 +15927,7 @@ mod bitswap_tests {
             ])
             .await;
 
-        let mut swarm = build_bitswap_swarm(None).await.unwrap();
+        let mut swarm = build_bitswap_swarm(None, None).await.unwrap();
         let mut control = swarm.behaviour().stream.new_control();
         swarm
             .dial(addr.with_p2p(peer_id).unwrap_or_else(|addr| addr))
@@ -15858,7 +15977,10 @@ mod bitswap_tests {
                 (second, second_data.to_vec()),
             ])
             .await;
-        let client = SharedBitswapClient::spawn(None, None, None).await.unwrap();
+        let client =
+            SharedBitswapClient::spawn(None, None, None, None, ConfiguredAnswers::default())
+                .await
+                .unwrap();
 
         let result = client
             .fetch_many(
@@ -15899,7 +16021,10 @@ mod bitswap_tests {
                 (second, second_data.to_vec()),
             ])
             .await;
-        let client = SharedBitswapClient::spawn(None, None, None).await.unwrap();
+        let client =
+            SharedBitswapClient::spawn(None, None, None, None, ConfiguredAnswers::default())
+                .await
+                .unwrap();
 
         let result = client
             .fetch_many(
@@ -16010,7 +16135,10 @@ mod bitswap_tests {
 
     #[tokio::test]
     async fn shared_bitswap_client_fetch_many_rejects_empty_batch() {
-        let client = SharedBitswapClient::spawn(None, None, None).await.unwrap();
+        let client =
+            SharedBitswapClient::spawn(None, None, None, None, ConfiguredAnswers::default())
+                .await
+                .unwrap();
         let err = client.fetch_many(Vec::new(), Vec::new()).await.unwrap_err();
 
         assert!(
@@ -21118,14 +21246,136 @@ mod bitswap_tests {
     async fn spawn_bitswap_actor(
         limits: &SharedLimits,
     ) -> (mpsc::Sender<BitswapCommand>, tokio::task::JoinHandle<()>) {
-        let swarm = build_bitswap_swarm(Some(limits)).await.unwrap();
+        let swarm = build_bitswap_swarm(Some(limits), None).await.unwrap();
         let mut control = swarm.behaviour().stream.new_control();
         let incoming = accept_bitswap_streams(&mut control).unwrap();
         let (commands, receiver) = mpsc::channel(64);
         let task = tokio::spawn(run_shared_bitswap_swarm(
-            swarm, control, incoming, receiver, None,
+            swarm,
+            control,
+            incoming,
+            receiver,
+            None,
+            ConfiguredAnswers::default(),
         ));
         (commands, task)
+    }
+
+    /// A shared Bitswap swarm's task through `network`'s transports.
+    async fn spawn_bitswap_actor_through(
+        limits: &SharedLimits,
+        network: &freedom_ipfs_net::Network,
+    ) -> (mpsc::Sender<BitswapCommand>, tokio::task::JoinHandle<()>) {
+        let swarm = build_bitswap_swarm(Some(limits), Some(&Transports::new(network)))
+            .await
+            .unwrap();
+        let mut control = swarm.behaviour().stream.new_control();
+        let incoming = accept_bitswap_streams(&mut control).unwrap();
+        let (commands, receiver) = mpsc::channel(64);
+        let task = tokio::spawn(run_shared_bitswap_swarm(
+            swarm,
+            control,
+            incoming,
+            receiver,
+            None,
+            ConfiguredAnswers::default(),
+        ));
+        (commands, task)
+    }
+
+    /// A TCP listener that counts the connections it accepts.
+    fn bitswap_canary() -> (Multiaddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = format!(
+            "/ip4/127.0.0.1/tcp/{}",
+            listener.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = accepted.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (addr, accepted)
+    }
+
+    async fn canary_reached(accepted: &std::sync::atomic::AtomicUsize, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while tokio::time::Instant::now() < deadline {
+            if accepted.load(Ordering::SeqCst) > 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        accepted.load(Ordering::SeqCst) > 0
+    }
+
+    /// The #45 lifecycle review's probe (finding 1), for Bitswap's immediate
+    /// dials: the work is queued, then the network revoked before the swarm
+    /// dials; the swarm's transport refuses the dial, and the canary sees
+    /// nothing. Unrevoked (the control), the same dial reaches it.
+    #[tokio::test]
+    async fn a_bitswap_dial_queued_before_the_revoke_opens_no_socket() {
+        for revoked in [true, false] {
+            let limits = SharedLimits::new(LimitSizes::default());
+            let network = freedom_ipfs_net::Network::legacy();
+            let (canary, accepted) = bitswap_canary();
+            let (commands, task) = spawn_bitswap_actor_through(&limits, &network).await;
+            let peer = libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id();
+            let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, b"queued");
+            // On this one thread, the swarm's task hasn't run yet: the
+            // command is queued, and nothing is dialed.
+            let _waiting = send_fetch(&commands, cid, peer, canary).await;
+            if revoked {
+                network.revoke();
+            }
+            let reached =
+                canary_reached(&accepted, Duration::from_secs(if revoked { 1 } else { 5 })).await;
+            task.abort();
+            assert_eq!(reached, !revoked, "revoked: {revoked}");
+        }
+    }
+
+    /// The same for a dial deferred behind the shared connection cap: it
+    /// waits for a slot, the network is revoked, and the slot frees; the
+    /// retried dial is refused by the transport. Unrevoked (the control),
+    /// the retried dial reaches the canary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deferred_bitswap_dial_after_the_revoke_opens_no_socket() {
+        for revoked in [true, false] {
+            let limits = SharedLimits::new(LimitSizes {
+                bitswap_connections: 1,
+                ..LimitSizes::default()
+            });
+            let holder = hold_connection_slot(&limits);
+            let network = freedom_ipfs_net::Network::legacy();
+            let (canary, accepted) = bitswap_canary();
+            let (commands, task) = spawn_bitswap_actor_through(&limits, &network).await;
+            let peer = libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id();
+            let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, b"deferred");
+            let _waiting = send_fetch(&commands, cid, peer, canary).await;
+            wait_until("the dial never waited for a slot", || {
+                limits.bitswap_connections_waiting() == 1
+            })
+            .await;
+            assert_eq!(accepted.load(Ordering::SeqCst), 0);
+            if revoked {
+                network.revoke();
+            }
+            drop(holder);
+            let reached =
+                canary_reached(&accepted, Duration::from_secs(if revoked { 1 } else { 5 })).await;
+            task.abort();
+            assert_eq!(reached, !revoked, "revoked: {revoked}");
+        }
     }
 
     /// A fetch command's requester, as `fetch_many_with_context` holds it:
@@ -21883,7 +22133,7 @@ mod bitswap_tests {
             let (release, released) = tokio::sync::watch::channel(false);
             let (peer, addr, _wants, peer_task, accept_task) =
                 spawn_held_bitswap_peer(vec![(cid, data)], released).await;
-            let mut swarm = build_bitswap_swarm(None).await.unwrap();
+            let mut swarm = build_bitswap_swarm(None, None).await.unwrap();
             let mut control = swarm.behaviour().stream.new_control();
             swarm
                 .dial(
@@ -22197,9 +22447,15 @@ mod bitswap_tests {
             spawn_local_bitswap_peer(cid, data).await;
         let budget = MemoryBudget::new(8 << 20);
         let _full = budget.try_reserve(budget.limit()).unwrap();
-        let client = SharedBitswapClient::spawn(None, None, Some(&budget))
-            .await
-            .unwrap();
+        let client = SharedBitswapClient::spawn(
+            None,
+            None,
+            Some(&budget),
+            None,
+            ConfiguredAnswers::default(),
+        )
+        .await
+        .unwrap();
         // A trusted and an untrusted peer: the 4 s request timeout.
         let peers = vec![
             BitswapPeer {

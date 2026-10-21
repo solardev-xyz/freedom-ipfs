@@ -285,6 +285,33 @@ impl DialPolicy {
         }
     }
 
+    /// The transport's outer gate's check (design 0007, check 3), which sits
+    /// above the DNS layer: the whole shape, an onion, and the transport,
+    /// but no address, which is checked below the resolver.
+    pub fn check_target(&self, addr: &Multiaddr) -> Result<(), DialRefusal> {
+        self.ask()?;
+        self.classify(addr).map(drop)
+    }
+
+    /// [`DialPolicy::check_now`], waiting while NAT64 discovery is pending,
+    /// for as long as something may still publish: the caller's own timeout
+    /// (a dial's) bounds the wait, which runs under a permit.
+    pub async fn check_settled(&self, addr: &Multiaddr) -> Result<(), DialRefusal> {
+        self.ask()?;
+        match self.classify(addr)? {
+            Some((ip, mut nat64)) => {
+                self.admit_after(async move {
+                    check_waiting(ip, &mut nat64)
+                        .await
+                        .map(drop)
+                        .map_err(DialRefusal::Address)
+                })
+                .await
+            }
+            None => Ok(()),
+        }
+    }
+
     /// [`DialPolicy::check_now`], waiting while NAT64 discovery is pending,
     /// until `deadline`: past it, the IPv6 literal is refused with
     /// [`AddressRefusal::Nat64Pending`].
