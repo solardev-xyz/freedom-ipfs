@@ -75,33 +75,34 @@ fn a_learned_prefix_inside_6to4_decides_too() {
                 check_address(target.into(), &Nat64State::NONE).is_ok(),
                 "{target}"
             );
-            // ...and the learned prefix refuses it, in every state that
-            // holds the prefix.
-            for state in [
-                Nat64State::known([prefix]),
-                Nat64State::unknown([prefix]),
-                Nat64State::Incomplete(vec![prefix]),
-            ] {
+            // ...and the learned prefix refuses it, known or unknown.
+            for state in [Nat64State::known([prefix]), Nat64State::unknown([prefix])] {
                 assert!(
                     refused_by_learned(check_address(target.into(), &state), prefix),
                     "{target} under /{len}, {state:?}"
                 );
             }
+            // Incomplete refuses every IPv6 address.
+            assert_eq!(
+                check_address(target.into(), &Nat64State::Incomplete(vec![prefix])),
+                Err(AddressRefusal::Nat64Incomplete)
+            );
         }
-        // A 6to4 address the learned prefix passes still passes, in every
-        // state: the fixed form is exempt from what discovery doesn't know.
+        // A 6to4 address the learned prefix passes still passes while
+        // known or unknown: the fixed form is exempt from what discovery
+        // doesn't know yet. Not while incomplete.
         let target = embed(v6("2002:808:808::"), len, Ipv4Addr::new(8, 8, 4, 4), 0);
-        for state in [
-            Nat64State::known([prefix]),
-            Nat64State::unknown([prefix]),
-            Nat64State::Incomplete(vec![prefix]),
-        ] {
+        for state in [Nat64State::known([prefix]), Nat64State::unknown([prefix])] {
             assert_eq!(
                 check_address(target.into(), &state),
                 Ok(target.into()),
                 "{state:?}"
             );
         }
+        assert_eq!(
+            check_address(target.into(), &Nat64State::Incomplete(vec![prefix])),
+            Err(AddressRefusal::Nat64Incomplete)
+        );
     }
 }
 
@@ -197,4 +198,81 @@ fn every_length_every_skipped_byte_and_overlapping_prefixes() {
     ] {
         assert!(check_address(address.into(), &state).is_err(), "{state:?}");
     }
+}
+
+/// Sixteen /32 prefixes, each from an `ipv4only.arpa` answer.
+fn sixteen() -> Vec<Nat64Prefix> {
+    (0..16u16)
+        .flat_map(|i| {
+            Nat64Prefix::in_ipv4only_answer(Ipv6Addr::new(0x2a00, i, 0xc000, 0xaa, 0, 0, 0, 0))
+        })
+        .collect()
+}
+
+/// The round-2 review's overflow: a prefix that maps a fixed form's
+/// address to loopback arrives 17th, or later, and is dropped. Every IPv6
+/// address is refused then, the fixed forms' included, through either
+/// constructor; an IPv4-mapped address is still judged as IPv4.
+#[test]
+fn past_the_bound_every_ipv6_address_is_refused() {
+    let overlapping = Nat64Prefix::in_ipv4only_answer(v6("2002:808:808::c000:aa"));
+    assert_eq!(
+        overlapping,
+        vec![Nat64Prefix::new(v6("2002:808:808::"), 96).unwrap()]
+    );
+    let target: IpAddr = "2002:808:808::7f00:1".parse().unwrap();
+    let filler = |n: u16| Nat64Prefix::new(Ipv6Addr::new(0x2a01, n, 0, 0, 0, 0, 0, 0), 32).unwrap();
+    for position in [17usize, 18, 25] {
+        // `position - 1` prefixes before it: the sixteen, then fillers.
+        let mut prefixes = sixteen();
+        prefixes.extend((0..(position - 17) as u16).map(filler));
+        prefixes.extend(overlapping.iter().copied());
+        assert_eq!(prefixes.len(), position);
+        for state in [
+            Nat64State::known(prefixes.clone()),
+            Nat64State::unknown(prefixes.clone()),
+        ] {
+            assert!(matches!(state, Nat64State::Incomplete(_)), "{state:?}");
+            assert!(!state.prefixes().contains(&overlapping[0]), "dropped");
+            assert_eq!(
+                check_address(target, &state),
+                Err(AddressRefusal::Nat64Incomplete),
+                "17+{} under {state:?}",
+                position - 17
+            );
+            for fixed in ["2002:808:808::1", "64:ff9b::808:808", "2a00:1::1"] {
+                assert_eq!(
+                    check_address(fixed.parse().unwrap(), &state),
+                    Err(AddressRefusal::Nat64Incomplete),
+                    "{fixed}"
+                );
+            }
+            // IPv4-mapped: judged as its IPv4 address.
+            assert_eq!(
+                check_address("::ffff:8.8.8.8".parse().unwrap(), &state),
+                Ok("8.8.8.8".parse().unwrap())
+            );
+            assert!(matches!(
+                check_address("::ffff:127.0.0.1".parse().unwrap(), &state),
+                Err(AddressRefusal::Block { .. })
+            ));
+            assert_eq!(
+                check_address("8.8.8.8".parse().unwrap(), &state),
+                Ok("8.8.8.8".parse().unwrap())
+            );
+        }
+    }
+    // Within the bound, the /96 itself decides.
+    let mut prefixes = sixteen();
+    prefixes.truncate(15);
+    prefixes.extend(overlapping.iter().copied());
+    let state = Nat64State::known(prefixes);
+    assert!(matches!(state, Nat64State::Known(_)));
+    assert!(matches!(
+        check_address(target, &state),
+        Err(AddressRefusal::Embedded {
+            form: Form::Nat64Learned(_),
+            ..
+        })
+    ));
 }

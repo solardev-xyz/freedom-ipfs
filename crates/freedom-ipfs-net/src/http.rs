@@ -7,13 +7,29 @@
 //! client whose configuration reqwest refused fails its requests with that
 //! error instead of panicking.
 //!
+//! The capability is asked at every boundary where a connection or a
+//! request could start (design 0007: "every socket, HTTP attempt and
+//! redirect hop asks it first"):
+//! - **each request,** in [`HttpRequest::send`];
+//! - **each redirect hop:** under the legacy policy in the client's redirect
+//!   policy, so a hop over a pooled connection is refused too; under
+//!   `direct` in the policy's own hop loop;
+//! - **each new connection,** in a connector layer that runs before
+//!   reqwest's resolver: a revoked client starts no DNS lookup and opens no
+//!   socket, whatever asked for the connection.
+//!
 //! Under `direct` the policy follows redirects itself (design 0007, "The
 //! gate", check 4): every client is built with `Policy::none()` and no
 //! proxy, and each request runs [the hop loop](HttpRequest::send).
 //!
 //! [`Network::http_client`]: crate::policy::Network::http_client
 
+use std::error::Error as StdError;
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use reqwest::header::{
@@ -22,6 +38,8 @@ use reqwest::header::{
 use reqwest::redirect::Policy;
 use reqwest::{IntoUrl, StatusCode};
 use serde::Serialize;
+use tower_layer::Layer;
+use tower_service::Service;
 use url::Url;
 
 use crate::capability::{NetworkCapability, Revoked};
@@ -80,21 +98,117 @@ fn build(builder: reqwest::ClientBuilder) -> Result<reqwest::Client, NetworkErro
         .map_err(|err| NetworkError::ClientBuild(Arc::new(err)))
 }
 
-fn legacy_builder(config: ClientConfig) -> reqwest::ClientBuilder {
+/// What each crate built before the policy, behind the capability: the
+/// same timeouts, and the same redirect behaviour (none for 0; for
+/// `max_redirects`, reqwest's `limited`, so the same "too many redirects"
+/// on the hop past it), as a custom policy that also refuses every hop once
+/// the capability is revoked. Every new connection goes through
+/// [`CapabilityLayer`] first.
+fn legacy_builder(config: ClientConfig, capability: &NetworkCapability) -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder()
         .connect_timeout(config.timeout)
-        .timeout(config.timeout);
+        .timeout(config.timeout)
+        .connector_layer(CapabilityLayer(capability.clone()));
     match config.max_redirects {
         0 => builder.redirect(Policy::none()),
-        ClientConfig::REQWEST_DEFAULT_REDIRECTS => builder,
-        hops => builder.redirect(Policy::limited(hops)),
+        max => {
+            let capability = capability.clone();
+            builder.redirect(Policy::custom(move |attempt| {
+                if capability.is_revoked() {
+                    attempt.error(Revoked)
+                } else if attempt.previous().len() > max {
+                    // As reqwest's `limited`: the first URL is the request's
+                    // own, not a redirect.
+                    attempt.error(TooManyRedirects)
+                } else {
+                    attempt.follow()
+                }
+            }))
+        }
     }
 }
 
-fn direct_builder(config: ClientConfig) -> reqwest::ClientBuilder {
+/// reqwest's own redirect-limit error, which it doesn't export: the same
+/// text.
+#[derive(Debug)]
+struct TooManyRedirects;
+
+impl fmt::Display for TooManyRedirects {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("too many redirects")
+    }
+}
+
+impl StdError for TooManyRedirects {}
+
+type BoxError = Box<dyn StdError + Send + Sync>;
+
+/// A connector layer that asks the capability before each new connection,
+/// before reqwest's resolver or proxy connection: once revoked, the
+/// connection fails at once, and nothing is resolved or dialed.
+#[derive(Clone, Debug)]
+struct CapabilityLayer(NetworkCapability);
+
+impl<S> Layer<S> for CapabilityLayer {
+    type Service = CapabilityConnector<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        CapabilityConnector {
+            inner,
+            capability: self.0.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CapabilityConnector<S> {
+    inner: S,
+    capability: NetworkCapability,
+}
+
+impl<S, R> Service<R> for CapabilityConnector<S>
+where
+    S: Service<R>,
+    S::Error: Into<BoxError>,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<S::Response, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, request: R) -> Self::Future {
+        if let Err(revoked) = self.capability.check() {
+            return Box::pin(async move { Err(Box::new(revoked) as BoxError) });
+        }
+        let connecting = self.inner.call(request);
+        Box::pin(async move { connecting.await.map_err(Into::into) })
+    }
+}
+
+/// Whether `err`, or an error it wraps, is the capability's refusal: from
+/// the redirect policy or the connector layer.
+fn is_revoked(err: &reqwest::Error) -> bool {
+    let mut source = err.source();
+    while let Some(err) = source {
+        if err.is::<Revoked>() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
+/// A `direct` client: behind the capability's connector layer, as every
+/// client is.
+fn direct_builder(config: ClientConfig, capability: &NetworkCapability) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(config.timeout)
         .timeout(config.timeout)
+        .connector_layer(CapabilityLayer(capability.clone()))
         .no_proxy()
         .redirect(Policy::none())
         .referer(false)
@@ -102,10 +216,10 @@ fn direct_builder(config: ClientConfig) -> reqwest::ClientBuilder {
 
 fn transport(network: &Network, config: ClientConfig) -> Transport {
     match network.policy().mode() {
-        Mode::Legacy => Transport::Legacy(build(legacy_builder(config))),
+        Mode::Legacy => Transport::Legacy(build(legacy_builder(config, network.capability()))),
         Mode::Direct(direct) => match (&direct.addresses, network.lookup()) {
             (Addresses::Unchecked, _) => Transport::Direct {
-                untrusted: build(direct_builder(config)),
+                untrusted: build(direct_builder(config, network.capability())),
                 configured: None,
             },
             (Addresses::Checked(handle), Some(lookup)) => {
@@ -118,9 +232,12 @@ fn transport(network: &Network, config: ClientConfig) -> Transport {
                 };
                 Transport::Direct {
                     untrusted: build(
-                        direct_builder(config).dns_resolver(resolver(Some(handle.clone()))),
+                        direct_builder(config, network.capability())
+                            .dns_resolver(resolver(Some(handle.clone()))),
                     ),
-                    configured: Some(build(direct_builder(config).dns_resolver(resolver(None)))),
+                    configured: Some(build(
+                        direct_builder(config, network.capability()).dns_resolver(resolver(None)),
+                    )),
                 }
             }
             (Addresses::Checked(_), None) => Transport::Unavailable(NetworkError::Unsupported(
@@ -161,9 +278,14 @@ impl HttpClient {
         }
     }
 
-    /// A client of a [`Network::legacy`] network of its own, whose capability
-    /// nobody else holds: what a crate's `Default` builds when no network is
-    /// given.
+    /// A client of a [`Network::legacy`] network of its own: what a crate's
+    /// `Default` builds when no network is given.
+    ///
+    /// **Its capability belongs to no node:** nothing can revoke it, so an
+    /// instance's teardown doesn't stop its requests. A node's clients come
+    /// from its network ([`Network::http_client`]); the call sites that
+    /// still build one of these in a node's paths are listed in
+    /// freedom-ipfs-gateway's `tests/network_outside_clients.rs`.
     pub fn legacy(config: ClientConfig) -> Self {
         Network::legacy().http_client(config)
     }
@@ -269,10 +391,20 @@ impl HttpRequest {
         inner.network.capability().check()?;
         let builder = self.builder?;
         match &inner.transport {
-            Transport::Legacy(_) => Ok(builder.send().await?),
+            Transport::Legacy(_) => builder.send().await.map_err(from_reqwest),
             Transport::Direct { .. } => follow(inner, builder.build()?).await,
             Transport::Unavailable(err) => Err(HttpError::Unavailable(err.clone())),
         }
+    }
+}
+
+/// reqwest's error, or the capability's refusal it carries: a refused hop
+/// or connection is [`HttpError::Revoked`].
+fn from_reqwest(err: reqwest::Error) -> HttpError {
+    if is_revoked(&err) {
+        HttpError::Revoked(Revoked)
+    } else {
+        HttpError::Http(err)
     }
 }
 
@@ -312,7 +444,8 @@ async fn follow(
             .headers(headers)
             .timeout(deadline.saturating_duration_since(Instant::now()))
             .send()
-            .await?;
+            .await
+            .map_err(from_reqwest)?;
         if inner.config.max_redirects == 0 || !is_followed(response.status()) {
             return Ok(response);
         }
@@ -458,6 +591,60 @@ pub enum Refused {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A resolver that counts the names it is asked for.
+    #[derive(Clone, Default)]
+    struct Counting(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl reqwest::dns::Resolve for Counting {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                let addrs: reqwest::dns::Addrs =
+                    Box::new(std::iter::once("127.0.0.1:9".parse().unwrap()));
+                Ok(addrs)
+            })
+        }
+    }
+
+    /// The connector layer on its own, under a client asked directly (not
+    /// through `HttpRequest::send`'s own check): once revoked, a new
+    /// connection fails before the resolver is asked or a socket opened.
+    #[tokio::test]
+    async fn a_revoked_capability_opens_no_connection_and_resolves_nothing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        for (config, name) in [
+            (ClientConfig::new(Duration::from_secs(5), 10), "followed"),
+            (ClientConfig::new(Duration::from_secs(5), 0), "unfollowed"),
+        ] {
+            let capability = NetworkCapability::new();
+            let resolver = Counting::default();
+            let client = legacy_builder(config, &capability)
+                .no_proxy()
+                .dns_resolver(Arc::new(resolver.clone()))
+                .build()
+                .unwrap();
+            capability.revoke();
+            for url in [
+                format!("http://counted.test:{port}/"),
+                format!("http://127.0.0.1:{port}/"),
+            ] {
+                let err = client.get(url).send().await.unwrap_err();
+                assert!(is_revoked(&err), "{name}: {err:?}");
+            }
+            assert_eq!(
+                resolver.0.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{name}"
+            );
+            assert!(
+                listener.accept().is_err(),
+                "{name}: a connection was opened"
+            );
+        }
+    }
 
     #[test]
     fn a_client_is_one_pointer_wide() {
