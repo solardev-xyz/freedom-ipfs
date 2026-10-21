@@ -203,6 +203,36 @@ pub struct DialTarget {
     pub shape: Shape,
 }
 
+impl DialTarget {
+    /// An HTTP provider's base URL, built from the parsed target, never from
+    /// the multiaddr's text (design 0007, check 3: "Provider URLs are built
+    /// from a multiaddr's parsed components"): `None` for any other shape.
+    ///
+    /// - The scheme is the shape's: `https` for `/https` and `/tls/http`.
+    /// - The host is the classified one: a name as [`classify_host`] leaves
+    ///   it (lowercase, no trailing dot), an IPv6 literal bracketed, and an
+    ///   IPv4-mapped address as its IPv4 address.
+    /// - The port is the one the gate judged: the `/tcp` port, or the
+    ///   scheme's default (80, or 443).
+    ///
+    /// So the URL's scheme, host and port are the ones [`classify_url`]
+    /// reads back from it.
+    pub fn http_url(&self) -> Option<Url> {
+        let scheme = match self.shape {
+            Shape::Http => "http",
+            Shape::Https => "https",
+            _ => return None,
+        };
+        let host = match &self.target {
+            Target::Name(name) | Target::Onion(name) => name.clone(),
+            Target::Ip(IpAddr::V4(ip)) => ip.to_string(),
+            Target::Ip(IpAddr::V6(ip)) => format!("[{ip}]"),
+        };
+        let port = self.port?;
+        Url::parse(&format!("{scheme}://{host}:{port}/")).ok()
+    }
+}
+
 /// The shapes of multiaddr the node dials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]

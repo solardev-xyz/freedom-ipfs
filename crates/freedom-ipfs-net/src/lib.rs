@@ -18,17 +18,22 @@
 //!   loop.
 //! - [`resolve`]: the gate's resolver, under `direct` with checked
 //!   addresses.
+//! - [`dial`]: the gate where candidates are chosen and addresses expanded
+//!   ([`DialPolicy`]), and the transports a policy's dials can use
+//!   ([`TransportPolicy`]).
 //!
 //! The legacy policy (what the crates did before) and `direct` can be built;
 //! `socks5` comes with a later part of the item.
 
 pub mod capability;
+pub mod dial;
 pub mod gate;
 pub mod http;
 pub mod policy;
 pub mod resolve;
 
 pub use capability::{NetworkCapability, Revoked};
+pub use dial::{DialPolicy, DialRefusal, TransportPolicy};
 pub use http::{ClientConfig, HttpClient, HttpError, HttpRequest, Refused};
 pub use policy::{
     Addresses, Direct, Mode, Nat64Handle, Nat64Publisher, Network, NetworkError, NetworkPolicy,

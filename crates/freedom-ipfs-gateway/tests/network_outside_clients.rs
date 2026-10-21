@@ -2,15 +2,23 @@
 //! `Network`: such a client has a capability nobody can revoke
 //! (`HttpClient::legacy`), so an instance's teardown doesn't stop it.
 //!
-//! The crates' `Default`s and plain constructors keep building them, for
-//! hosts that pass no network; a node built by `OnlineNodeBuilder` replaces
-//! each of those with its network's client. Bitswap's DNS address expansion
-//! still builds its own DoH resolver, and so its own client, on every call:
-//! design 0007's later part that takes DoH from the policy replaces those.
-//! This list changes only with such a change, so the sites to replace are
-//! never a guess.
+//! **A node built by `OnlineNodeBuilder` uses none of them.** Every client
+//! in its paths is its network's: the DoH, IPNS, routing and provider
+//! clients, and since design 0007's DoH part, the client Bitswap's DNS
+//! address expansion asks, which the retriever builds from its provider
+//! client's network (and so its DoH endpoint is the policy's).
+//!
+//! What is left:
+//! - the crates' `Default`s and plain constructors, for hosts that pass no
+//!   network; a node built by the builder replaces each of them with its
+//!   network's client;
+//! - the mobile preload's client, which only reaches the add-on's own
+//!   loopback gateway.
+//!
+//! This list changes only with such a change, so the sites are never a
+//! guess.
 
-/// `(file, pattern, occurrences)`: the source of each crate, whole.
+/// `(crate, source, pattern, occurrences)`: the source of each crate, whole.
 const SITES: &[(&str, &str, &str, usize)] = &[
     // `CloudflareDohResolver::default` and
     // `DelegatedIpnsResolver::with_endpoints`.
@@ -27,29 +35,28 @@ const SITES: &[(&str, &str, &str, usize)] = &[
         "HttpClient::legacy(",
         1,
     ),
-    // `HttpRetriever::new`.
+    // `HttpRetriever::new`. Bitswap's DNS address expansion builds its DoH
+    // client from that client's network.
     (
         "retrieval",
         include_str!("../../freedom-ipfs-retrieval/src/lib.rs"),
         "HttpClient::legacy(",
         1,
     ),
-    // Bitswap's DNS address expansion: `resolve_dnsaddr_hosts`,
-    // `resolve_dns_ip_hosts` and `expand_provider_multiaddrs`. In a node's
-    // paths, and not yet the network's.
+    // None: Bitswap's DNS address expansion asks the retriever's network's
+    // DoH endpoint, through a client of that network.
     (
         "retrieval",
         include_str!("../../freedom-ipfs-retrieval/src/lib.rs"),
         "CloudflareDohResolver::default()",
-        3,
+        0,
     ),
-    // The builder's fallback when it has no DoH client: never taken, since
-    // only an offline node has none, and an offline node resolves no name.
+    // None: the builder's DNSLink resolver always gets its network's client.
     (
         "gateway node",
         include_str!("../src/node.rs"),
         "CloudflareDohResolver::default()",
-        1,
+        0,
     ),
     (
         "gateway node",
@@ -68,6 +75,19 @@ const SITES: &[(&str, &str, &str, usize)] = &[
         include_str!("../../freedom-ipfs-mobile/src/lib.rs"),
         "CloudflareDohResolver::default()",
         0,
+    ),
+    (
+        "mobile",
+        include_str!("../../freedom-ipfs-mobile/src/lib.rs"),
+        "HttpClient::legacy(",
+        0,
+    ),
+    // The preload's client: the add-on's own loopback gateway, only.
+    (
+        "mobile",
+        include_str!("../../freedom-ipfs-mobile/src/lib.rs"),
+        "reqwest::Client::builder()",
+        1,
     ),
 ];
 

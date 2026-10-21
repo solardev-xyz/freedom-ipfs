@@ -318,6 +318,11 @@ impl HttpClient {
         self.inner.network.capability()
     }
 
+    /// The network the client belongs to: its policy and its capability.
+    pub fn network(&self) -> &Network {
+        &self.inner.network
+    }
+
     /// Why reqwest refused to build the client, if it did: every request
     /// then fails with [`HttpError::Unavailable`].
     pub fn error(&self) -> Option<&NetworkError> {

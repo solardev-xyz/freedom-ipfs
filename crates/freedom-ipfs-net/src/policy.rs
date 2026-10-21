@@ -8,6 +8,7 @@ use tokio::sync::watch;
 use url::Url;
 
 use crate::capability::NetworkCapability;
+use crate::dial::{DialPolicy, TransportPolicy};
 use crate::gate::{ConfiguredTargets, Nat64State, Refusal};
 use crate::http::{ClientConfig, HttpClient};
 use crate::resolve::{system_lookup, NameLookup};
@@ -262,6 +263,17 @@ impl Network {
 
     pub(crate) fn lookup(&self) -> Option<&Arc<dyn NameLookup>> {
         self.inner.lookup.as_ref()
+    }
+
+    /// What the network may dial, as candidate choice and address expansion
+    /// ask it (design 0007, checks 1 and 2).
+    pub fn dial_policy(&self) -> DialPolicy {
+        DialPolicy::for_policy(&self.inner.policy)
+    }
+
+    /// The transports the network's dials can use.
+    pub fn transport_policy(&self) -> TransportPolicy {
+        self.dial_policy().transports()
     }
 
     /// A new HTTP client for `config`, built by the crates' one constructor
