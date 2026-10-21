@@ -592,6 +592,9 @@ pub enum Refused {
 mod tests {
     use super::*;
 
+    /// One of the client constructors.
+    type Builder = fn(ClientConfig, &NetworkCapability) -> reqwest::ClientBuilder;
+
     /// A resolver that counts the names it is asked for.
     #[derive(Clone, Default)]
     struct Counting(Arc<std::sync::atomic::AtomicUsize>);
@@ -615,13 +618,19 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
-        for (config, name) in [
+        let builders: [(&str, Builder); 2] =
+            [("legacy", legacy_builder), ("direct", direct_builder)];
+        for ((config, followed), (kind, builder)) in [
             (ClientConfig::new(Duration::from_secs(5), 10), "followed"),
             (ClientConfig::new(Duration::from_secs(5), 0), "unfollowed"),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|config| builders.into_iter().map(move |builder| (config, builder)))
+        {
+            let name = format!("{kind}, {followed}");
             let capability = NetworkCapability::new();
             let resolver = Counting::default();
-            let client = legacy_builder(config, &capability)
+            let client = builder(config, &capability)
                 .no_proxy()
                 .dns_resolver(Arc::new(resolver.clone()))
                 .build()

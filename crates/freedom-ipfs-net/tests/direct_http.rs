@@ -543,3 +543,63 @@ async fn the_systems_resolver_reaches_a_configured_name() {
         .is_err());
     assert_eq!(other.connections(), 0);
 }
+
+/// A hop to the same host would go over the pooled connection, which asks
+/// for no new socket: the hop loop's own check refuses it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hop_over_a_pooled_connection_after_the_revoke_is_refused() {
+    use std::sync::mpsc;
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = server.local_addr().unwrap().port();
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let connections = Arc::new(AtomicUsize::new(0));
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (recorded, counted) = (paths.clone(), connections.clone());
+    std::thread::spawn(move || {
+        for stream in server.incoming() {
+            let Ok(stream) = stream else { continue };
+            counted.fetch_add(1, Ordering::SeqCst);
+            let mut reader = BufReader::new(stream);
+            // Keep-alive: every request on the connection is answered.
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
+                        break;
+                    }
+                }
+                recorded.lock().unwrap().push(path.clone());
+                let response = if path == "/before" {
+                    seen_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    "HTTP/1.1 302 Found\r\nLocation: /after\r\nContent-Length: 0\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                };
+                if reader.get_mut().write_all(response.as_bytes()).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let network = unchecked(&[]);
+    let client = network.http_client(ROUTING);
+    let request =
+        tokio::spawn(async move { get(&client, &format!("http://127.0.0.1:{port}/before")).await });
+    tokio::task::spawn_blocking(move || seen_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+        .await
+        .unwrap();
+    network.revoke();
+    release_tx.send(()).unwrap();
+    let result = request.await.unwrap();
+    assert!(matches!(result, Err(HttpError::Revoked(_))), "{result:?}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(*paths.lock().unwrap(), ["/before"]);
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
+}
