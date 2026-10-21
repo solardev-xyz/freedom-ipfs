@@ -87,10 +87,11 @@ fn embedded_at(addr: Ipv6Addr, len: u8) -> Ipv4Addr {
 /// What NAT64 discovery knows of the network's prefixes (design 0007,
 /// "States"). The host's discovery keeps it; the gate reads it.
 ///
-/// Every prefix a state holds is applied, whatever the state: learned
-/// prefixes are kept for the process's life, so a failed refresh never
-/// forgets one, and a prefix only adds refusals. The state decides only
-/// whether IPv6 outside the fixed forms is refused as well.
+/// Every prefix a known or unknown state holds is applied: learned prefixes
+/// are kept for the process's life, so a failed refresh never forgets one,
+/// and a prefix only adds refusals. The state decides what else is refused:
+/// IPv6 outside the fixed forms while pending or unknown, and every IPv6
+/// address but an IPv4-mapped one while incomplete.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Nat64State {
     /// The first query hasn't settled. An IPv6 target outside the fixed
@@ -104,9 +105,11 @@ pub enum Nat64State {
     /// A resolver failed: IPv6 targets outside the fixed forms are refused,
     /// and the prefixes learned before still apply.
     Unknown(Vec<Nat64Prefix>),
-    /// More than [`Nat64State::MAX_PREFIXES`] prefixes were learned: IPv6
-    /// targets outside the fixed forms are refused, and the first
-    /// [`Nat64State::MAX_PREFIXES`] still apply.
+    /// More than [`Nat64State::MAX_PREFIXES`] prefixes were learned, so some
+    /// were dropped, and a dropped one could map any IPv6 address: every
+    /// IPv6 target is refused, the fixed forms' included. Only an
+    /// IPv4-mapped address passes, judged as its IPv4 address. It keeps the
+    /// first [`Nat64State::MAX_PREFIXES`].
     Incomplete(Vec<Nat64Prefix>),
 }
 
