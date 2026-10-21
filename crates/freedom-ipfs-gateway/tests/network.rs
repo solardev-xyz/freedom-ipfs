@@ -466,6 +466,15 @@ fn a_host_can_revoke_first_and_an_abandoned_instance_is_revoked_too() {
     let capability = instance.network_capability();
     capability.revoke();
     assert!(instance.node().network().capability().is_revoked());
+    // With no attempt in flight, the revocation is its own quiescence.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), capability.quiesced()).await
+        })
+        .expect("quiescent at once");
     assert!(instance.shutdown(Duration::from_secs(5)).reached);
 
     // Dropped without a teardown: revoked, then cancelled, as a teardown.

@@ -892,8 +892,15 @@ impl Instance {
 
     /// The instance's network capability: every HTTP request of the node
     /// asks it first. Revoking it (the design's teardown step 2) refuses
-    /// every later request; [`Instance::begin_shutdown`] revokes it too,
-    /// before it cancels anything.
+    /// every later request, and drops every connection attempt in progress;
+    /// [`Instance::begin_shutdown`] revokes it too, before it cancels
+    /// anything.
+    ///
+    /// [`NetworkCapability::quiesced`] is the step's linearization point:
+    /// once it resolves, no attempt the capability admitted can still open
+    /// a connection. A host that must know that awaits it after revoking,
+    /// before the rest of its teardown; the instance's runtime must still
+    /// run, since the attempts are dropped as they are polled.
     pub fn network_capability(&self) -> NetworkCapability {
         self.node.network().capability().clone()
     }
@@ -970,8 +977,9 @@ impl Instance {
     ///
     /// Before any of that it revokes the network capability (the design's
     /// step 2), so nothing of the instance can open a connection while the
-    /// rest of it ends; a host may have revoked it earlier
-    /// ([`Instance::network_capability`]).
+    /// rest of it ends; a host may have revoked it earlier, and awaited its
+    /// quiescence ([`Instance::network_capability`]). Connections already
+    /// open end with the rest of the instance.
     pub fn begin_shutdown(self, drain: Duration) -> Teardown {
         let Instance {
             runtime,
