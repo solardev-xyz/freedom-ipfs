@@ -1,0 +1,98 @@
+name: Rust
+
+# The workspace's tests on every pull request, and clippy on
+# `freedom-ipfs-net`, the network policy's crate (freedom-core design 0007,
+# upstream item 3). The other crates aren't linted here.
+
+on:
+  push:
+    branches: [main, integration/rust-core]
+    paths:
+      - ".github/workflows/rust.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "ffi/**"
+      - "rust-toolchain.toml"
+      - "tests/**"
+      - "tools/**"
+      - "xtask/**"
+  pull_request:
+    paths:
+      - ".github/workflows/rust.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "ffi/**"
+      - "rust-toolchain.toml"
+      - "tests/**"
+      - "tools/**"
+      - "xtask/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # Backtraces keep their files and lines, and the cached target directory
+  # stays a fraction of full debug info's size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Show toolchain
+        run: |
+          rustup show
+          cargo --version
+          rustc --version
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      # No crate declares features today, so `--all-features` builds what a
+      # plain `cargo test` does; it keeps covering features as crates add
+      # them. The live, Kubo and soak tests are `#[ignore]`d and stay off.
+      - name: Test the workspace
+        run: cargo test --workspace --all-features --locked
+
+  clippy:
+    name: cargo clippy (freedom-ipfs-net)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Show toolchain and add clippy
+        run: |
+          rustup show
+          rustup component add clippy
+          cargo clippy --version
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      # The crate arrives in its own pull request, which may land before or
+      # after this job, so the step lints it whenever the tree has it.
+      - name: Lint freedom-ipfs-net
+        run: |
+          if cargo metadata --no-deps --format-version 1 --locked | grep -q '"name":"freedom-ipfs-net"'; then
+            cargo clippy -p freedom-ipfs-net --all-targets --all-features --locked -- -D warnings
+          else
+            echo "freedom-ipfs-net isn't in this tree yet: nothing to lint."
+          fi
