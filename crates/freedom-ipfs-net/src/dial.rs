@@ -336,15 +336,31 @@ impl DialPolicy {
         let Some((ip, nat64)) = self.classify(expanded)? else {
             return Ok(());
         };
-        if let Gate::Check { configured, .. } = &self.gate {
-            let dial = classify_dialed(original).map_err(DialRefusal::Target)?;
-            if configured.contains_dial(&dial) {
-                return Ok(());
-            }
+        if self.is_configured_answer(original, expanded) {
+            return Ok(());
         }
         check_address(ip, &nat64.current())
             .map(drop)
             .map_err(DialRefusal::Address)
+    }
+
+    /// Whether `addr`'s target and port are configured, and so exempt from
+    /// the address policy: never without checked addresses, which have no
+    /// address policy to be exempt from.
+    pub fn is_configured(&self, addr: &Multiaddr) -> bool {
+        let Gate::Check { configured, .. } = &self.gate else {
+            return false;
+        };
+        classify_dialed(addr).is_ok_and(|dial| configured.contains_dial(&dial))
+    }
+
+    /// Whether `expanded` is an answer for `original`'s configured name and
+    /// port: `original` is configured, and `expanded` is `original` with
+    /// its `/dns*` host, and only it, replaced by an IP address, so the
+    /// port and every other component are the ones the exemption was
+    /// given for.
+    pub fn is_configured_answer(&self, original: &Multiaddr, expanded: &Multiaddr) -> bool {
+        self.is_configured(original) && is_answer_for(original, expanded)
     }
 
     /// Checks an HTTP provider's base URL before it is tried, now: `http` or
@@ -417,6 +433,27 @@ impl DialPolicy {
             }
             _ => None,
         })
+    }
+}
+
+/// Whether `expanded` is `original` with its `/dns*` host component, and
+/// only it, replaced by an IP address (a `/p2p` suffix on either aside).
+fn is_answer_for(original: &Multiaddr, expanded: &Multiaddr) -> bool {
+    use multiaddr::Protocol;
+    fn without_peer(addr: &Multiaddr) -> Vec<Protocol<'_>> {
+        let mut protocols: Vec<Protocol<'_>> = addr.iter().collect();
+        if matches!(protocols.last(), Some(Protocol::P2p(_))) {
+            protocols.pop();
+        }
+        protocols
+    }
+    let (original, expanded) = (without_peer(original), without_peer(expanded));
+    match (original.split_first(), expanded.split_first()) {
+        (
+            Some((Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_), original_rest)),
+            Some((Protocol::Ip4(_) | Protocol::Ip6(_), expanded_rest)),
+        ) => original_rest == expanded_rest,
+        _ => false,
     }
 }
 

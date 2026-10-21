@@ -450,3 +450,83 @@ fn an_answers_exemption_is_its_configured_names_only() {
         Err(DialRefusal::Target(_))
     ));
 }
+
+/// The exemption is bound to the answer's port and every other component
+/// (#47 review round 2, 47-R2-m2): an answer at another port, or with
+/// another suffix, is judged as untrusted, whichever side is configured.
+#[test]
+fn a_configured_answer_keeps_its_port_and_components() {
+    let policy = checked(&["http://configured.example:4001/"]);
+    let configured = multiaddr("/dns4/configured.example/tcp/4001");
+    assert_eq!(
+        policy.check_answer_now(&configured, &multiaddr("/ip4/127.0.0.1/tcp/4001")),
+        Ok(())
+    );
+    assert!(policy.is_configured_answer(
+        &multiaddr(&format!("/dns4/configured.example/tcp/4001/p2p/{PEER}")),
+        &multiaddr("/ip4/127.0.0.1/tcp/4001")
+    ));
+    for (original, expanded) in [
+        // The configured port, answered at another.
+        (
+            "/dns4/configured.example/tcp/4001",
+            "/ip4/127.0.0.1/tcp/4002",
+        ),
+        // Another port, answered at the configured one.
+        (
+            "/dns4/configured.example/tcp/4002",
+            "/ip4/127.0.0.1/tcp/4001",
+        ),
+        // Another suffix.
+        (
+            "/dns4/configured.example/tcp/4001",
+            "/ip4/127.0.0.1/tcp/4001/ws",
+        ),
+        (
+            "/dns4/configured.example/tcp/4001",
+            "/ip4/127.0.0.1/udp/4001/quic-v1",
+        ),
+    ] {
+        let (original, expanded) = (multiaddr(original), multiaddr(expanded));
+        assert!(
+            !policy.is_configured_answer(&original, &expanded),
+            "{original} {expanded}"
+        );
+        assert!(
+            matches!(
+                policy.check_answer_now(&original, &expanded),
+                Err(DialRefusal::Address(_))
+            ),
+            "{original} {expanded}"
+        );
+    }
+}
+
+/// Design 0007, "publication and checks", for a candidate choice: (b) the
+/// state a choice read stays the one its candidates are judged against,
+/// whatever is published after it read it; (c) a choice begun after a
+/// publication uses the new state. For a prefix added and for an
+/// incomplete state.
+#[tokio::test]
+async fn a_choice_judges_its_candidates_against_the_state_it_read() {
+    let prefix =
+        freedom_ipfs_net::gate::Nat64Prefix::new("2a00:1:2:3::".parse().unwrap(), 64).unwrap();
+    for (kind, published) in [
+        ("a prefix added", Nat64State::known([prefix])),
+        ("incomplete", Nat64State::Incomplete(vec![prefix])),
+    ] {
+        let (publisher, handle) = Nat64Handle::channel(Nat64State::NONE);
+        let policy = checked_with(&[], handle);
+        let candidates = [
+            multiaddr("/ip6/2a00:1:2:3:a9:fea9:fe00:0/tcp/4001"),
+            multiaddr("/ip6/2a00:1::1/tcp/4001"),
+        ];
+        let read = policy.settled(&candidates, soon()).await.unwrap();
+        publisher.publish(published);
+        for candidate in &candidates {
+            assert_eq!(read.check_now(candidate), Ok(()), "{kind}: {candidate}");
+        }
+        let later = policy.settled(&candidates, soon()).await.unwrap();
+        assert!(later.check_now(&candidates[0]).is_err(), "{kind}");
+    }
+}

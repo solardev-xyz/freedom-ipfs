@@ -10239,9 +10239,18 @@ async fn judged_and_cut(
     let settled = if policy.admits_everything() {
         None
     } else {
+        // A configured name's answer is exempt from the address policy, so
+        // it doesn't wait for discovery; every other candidate does, one
+        // that shares the answer's address included.
         let candidates = gathered
             .iter()
-            .flat_map(|(_, addrs)| addrs.iter().map(|(addr, _)| addr.clone()))
+            .flat_map(|(_, addrs)| addrs.iter())
+            .filter(|(addr, via)| {
+                !via.as_deref()
+                    .and_then(|via| Multiaddr::from_str(via).ok())
+                    .is_some_and(|original| policy.is_configured_answer(&original, addr))
+            })
+            .map(|(addr, _)| addr.clone())
             .collect::<Vec<_>>();
         policy.settled(&candidates, deadline).await.ok()
     };
@@ -14120,6 +14129,178 @@ mod bitswap_tests {
             .collect::<Vec<_>>();
         assert!(addresses.is_empty(), "{addresses:?}");
         assert_eq!(candidates.quality.policy_refused_addr_count, 2);
+    }
+
+    /// A configured name's answer is exempt, so it doesn't wait for NAT64
+    /// discovery (#47 review round 2, 47-R2-m1, the adversarial probe): the
+    /// choice ends at once under a pending state, as with discovery done
+    /// (the control). An untrusted name answering the same address still
+    /// waits.
+    #[tokio::test]
+    async fn a_configured_answer_doesnt_wait_for_nat64_discovery() {
+        use freedom_ipfs_net::gate::{ConfiguredTargets, Nat64State};
+        use freedom_ipfs_net::{Addresses, Nat64Handle, Network, NetworkPolicy};
+        let candidates = |handle, name: &'static str| async move {
+            let mut configured = ConfiguredTargets::new();
+            configured
+                .add_url(&url::Url::parse("http://configured.example:4001/").unwrap())
+                .unwrap();
+            let network = Network::with_lookup(
+                NetworkPolicy::direct(
+                    configured,
+                    url::Url::parse("https://dns.example/dns-query").unwrap(),
+                    Addresses::Checked(handle),
+                )
+                .unwrap(),
+                None,
+            );
+            let expansion = AddressExpansion::of(&network);
+            let providers = vec![Provider::from_parts(
+                Some(POLICY_PEER.into()),
+                vec![format!("/dns6/{name}/tcp/4001/p2p/{POLICY_PEER}")],
+            )
+            .unwrap()];
+            let mut txt = DnsaddrCache::new();
+            let mut ips = HashMap::from([(
+                name.into(),
+                CachedDnsIpRecords {
+                    addrs: vec!["2a00:1::1".parse().unwrap()],
+                    log_as_cached: true,
+                },
+            )]);
+            bitswap_peers_with_quality_using_caches_with_options(
+                &providers, &mut txt, &mut ips, true, false, &expansion,
+            )
+            .await
+        };
+        let control = tokio::time::timeout(
+            Duration::from_millis(50),
+            candidates(Nat64Handle::fixed(Nat64State::NONE), "configured.example"),
+        )
+        .await
+        .expect("the positive control completes");
+        assert_eq!(control.peers.len(), 1, "the configured answer is admitted");
+
+        let (_publisher, pending) = Nat64Handle::channel(Nat64State::Pending);
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            candidates(pending.clone(), "configured.example"),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "an exempt configured answer waited for NAT64 discovery"
+        );
+        assert_eq!(result.unwrap().peers.len(), 1);
+
+        let untrusted = tokio::time::timeout(
+            Duration::from_millis(100),
+            candidates(pending, "other.example"),
+        )
+        .await;
+        assert!(
+            untrusted.is_err(),
+            "an untrusted answer didn't wait for discovery"
+        );
+    }
+
+    /// Design 0007, "publication and checks", for a choice: (a) a
+    /// publication made while a choice waits is the state all its
+    /// candidates are judged against; (c) a choice begun after a
+    /// publication uses it. For a prefix added and an incomplete state.
+    #[tokio::test]
+    async fn a_choice_uses_the_state_published_before_it_reads() {
+        use freedom_ipfs_net::gate::{Nat64Prefix, Nat64State};
+        use freedom_ipfs_net::{Addresses, Nat64Handle};
+        let prefix = Nat64Prefix::new("2a00:1:2:3::".parse().unwrap(), 64).unwrap();
+        for (kind, published) in [
+            ("a prefix added", Nat64State::known([prefix])),
+            ("incomplete", Nat64State::Incomplete(vec![prefix])),
+        ] {
+            let providers = vec![
+                Provider::from_parts(
+                    Some(POLICY_PEER.into()),
+                    vec![format!(
+                        "/ip6/2a00:1:2:3:a9:fea9:fe00:0/tcp/4001/p2p/{POLICY_PEER}"
+                    )],
+                )
+                .unwrap(),
+                Provider::from_parts(
+                    Some(POLICY_PEER.into()),
+                    vec![format!("/dns6/waiting.example/tcp/4001/p2p/{POLICY_PEER}")],
+                )
+                .unwrap(),
+            ];
+            let cached = || {
+                HashMap::from([(
+                    "waiting.example".to_string(),
+                    CachedDnsIpRecords {
+                        addrs: vec!["2a00:1::1".parse().unwrap()],
+                        log_as_cached: true,
+                    },
+                )])
+            };
+            // (a): published while the choice waits for discovery.
+            let (publisher, handle) = Nat64Handle::channel(Nat64State::Pending);
+            let expansion = AddressExpansion::of(&direct_network(
+                "https://dns.example/dns-query",
+                Addresses::Checked(handle),
+            ));
+            let mut txt = DnsaddrCache::new();
+            let mut ips = cached();
+            let mut choosing = Box::pin(bitswap_peers_with_quality_using_caches_with_options(
+                &providers, &mut txt, &mut ips, true, false, &expansion,
+            ));
+            std::future::poll_fn(|cx| {
+                assert!(choosing.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            publisher.publish(published.clone());
+            let chosen = choosing.await;
+            let addrs = chosen
+                .peers
+                .iter()
+                .flat_map(|peer| peer.addrs.iter().map(ToString::to_string))
+                .collect::<Vec<_>>();
+            match kind {
+                // 2a00:1::1 isn't under the prefix: it passes; the other
+                // embeds 169.254.169.254.
+                "a prefix added" => assert_eq!(addrs, ["/ip6/2a00:1::1/tcp/4001"], "{kind}"),
+                _ => assert!(addrs.is_empty(), "{kind}: {addrs:?}"),
+            }
+
+            // (c): a choice begun after the publication.
+            let (publisher, handle) = Nat64Handle::channel(Nat64State::NONE);
+            let expansion = AddressExpansion::of(&direct_network(
+                "https://dns.example/dns-query",
+                Addresses::Checked(handle),
+            ));
+            let choose = || {
+                let expansion = expansion.clone();
+                let providers = providers.clone();
+                async move {
+                    let mut txt = DnsaddrCache::new();
+                    let mut ips = cached();
+                    bitswap_peers_with_quality_using_caches_with_options(
+                        &providers, &mut txt, &mut ips, true, false, &expansion,
+                    )
+                    .await
+                }
+            };
+            assert_eq!(choose().await.peers[0].addrs.len(), 2, "{kind}: before");
+            publisher.publish(published);
+            let after = choose().await;
+            let addrs = after
+                .peers
+                .iter()
+                .flat_map(|peer| peer.addrs.iter().map(ToString::to_string))
+                .collect::<Vec<_>>();
+            match kind {
+                "a prefix added" => assert_eq!(addrs, ["/ip6/2a00:1::1/tcp/4001"], "{kind}"),
+                _ => assert!(addrs.is_empty(), "{kind}: {addrs:?}"),
+            }
+        }
     }
 
     /// A configured name and port keep their exemption through the answer
