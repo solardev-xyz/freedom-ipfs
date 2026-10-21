@@ -190,18 +190,62 @@ fn strip_prefix_ignoring_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str
         .then(|| &text[prefix.len()..])
 }
 
+/// A dialed multiaddr's target, with the port it reaches and its shape
+/// ([`classify_dialed`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DialTarget {
+    pub target: Target,
+    /// The port connected to: the TCP or UDP port, the onion's port, or an
+    /// HTTP provider's effective port (80, or 443 for HTTPS, when the
+    /// address names none). `None` for `/dnsaddr`, which is expanded, not
+    /// connected to. The configured-target exemption compares this port.
+    pub port: Option<u16>,
+    pub shape: Shape,
+}
+
+/// The shapes of multiaddr the node dials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Shape {
+    /// `<host>/tcp/<port>`.
+    Tcp,
+    /// `<host>/tcp/<port>/ws`, with any path (`/x-parity-ws/<path>`).
+    Ws,
+    /// `<host>/tcp/<port>/wss` or `/tls/ws`, with any path.
+    Wss,
+    /// An HTTP provider: `<host>[/tcp/<port>]/http`.
+    Http,
+    /// An HTTP provider over TLS: `<host>[/tcp/<port>]/https` or `/tls/http`.
+    Https,
+    /// `<host>/udp/<port>/quic-v1`.
+    QuicV1,
+    /// `/dnsaddr/<name>`, expanded through its TXT records before any dial.
+    Dnsaddr,
+    /// `/onion3/<address>:<port>`, or `/onion/<address>:<port>`.
+    Onion,
+}
+
 /// Classifies a multiaddr that is to be dialed, after validating its whole
-/// protocol stack (design 0007, "The gate").
+/// protocol stack (design 0007, "The gate"); see [`classify_dialed`].
+pub fn classify_multiaddr(addr: &Multiaddr) -> Result<Target, Refusal> {
+    classify_dialed(addr).map(|dial| dial.target)
+}
+
+/// Classifies a multiaddr that is to be dialed, after validating its whole
+/// protocol stack (design 0007, "The gate"), with the port it reaches and
+/// its shape.
 ///
 /// Checking the first component isn't enough: libp2p's TCP transport dials
 /// the last IP and TCP pair of an address, and its DNS layer resolves every
 /// DNS component, wherever they are. So an address is accepted only in one
-/// of the shapes the node dials, with one host component, first:
+/// of the shapes the node dials, with exactly one host component, first:
 ///
-/// - `<host>/tcp/<port>`, then nothing or exactly one of:
-///   - WebSocket: `/ws`, `/wss`, `/tls/ws`, `/tls/sni/<name>/ws`;
-///   - an HTTP provider: `/http`, `/https`, `/tls/http`,
-///     `/tls/sni/<name>/http`;
+/// - `<host>/tcp/<port>`, then nothing or one WebSocket suffix: `/ws`,
+///   `/wss` or `/tls/ws` (`/x-parity-ws/<path>` and `/x-parity-wss/<path>`
+///   count as `/ws` and `/wss`);
+/// - an HTTP provider: `<host>`, an optional `/tcp/<port>`, then `/http`,
+///   `/https` or `/tls/http`. Without `/tcp`, the port is 80 for HTTP and
+///   443 for HTTPS;
 /// - `<host>/udp/<port>/quic-v1`;
 /// - `/dnsaddr/<name>`;
 /// - `/onion3/<address>:<port>`, or `/onion/<address>:<port>`;
@@ -209,25 +253,56 @@ fn strip_prefix_ignoring_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str
 /// each optionally ending in one `/p2p/<peer>`. A host is `/ip4` or `/ip6`,
 /// a literal, or `/dns`, `/dns4` or `/dns6`, classified as
 /// [`classify_host`] does (so `/dns/x.onion` is an onion, and
-/// `/dns/127.0.0.1` a literal). `/sni` only names the TLS server: its name
-/// is never resolved or dialed, so it isn't a host and isn't classified.
+/// `/dns/127.0.0.1` a literal).
 ///
 /// Everything else is refused, wherever it appears: a second host
-/// component, `/ip6zone`, `/unix`, `/memory`, `/ipcidr`, `/p2p-circuit`,
-/// `/certhash`, `/webtransport`, `/webrtc*`, the old `/quic`.
-pub fn classify_multiaddr(addr: &Multiaddr) -> Result<Target, Refusal> {
+/// component, an extra trailing component, a second `/p2p`, `/sni` (the
+/// pinned WebSocket transport only sees TLS when `/tls` immediately precedes
+/// `/ws`, and an HTTP provider's URL would lose its TLS), `/ip6zone`,
+/// `/unix`, `/memory`, `/ipcidr`, `/p2p-circuit`, `/certhash`,
+/// `/webtransport`, `/webrtc*`, the old `/quic`.
+pub fn classify_dialed(addr: &Multiaddr) -> Result<DialTarget, Refusal> {
     let mut protocols: Vec<Protocol<'_>> = addr.iter().collect();
     if matches!(protocols.last(), Some(Protocol::P2p(_))) {
         protocols.pop();
     }
-    match protocols.as_slice() {
-        [host, Protocol::Tcp(_), rest @ ..] if after_tcp(rest) => host_target(host),
-        [host, Protocol::Udp(_), Protocol::QuicV1] => host_target(host),
-        [Protocol::Dnsaddr(name)] => classify_host(name),
-        [Protocol::Onion3(onion)] => Ok(Target::Onion(onion_name(onion.hash()))),
-        [Protocol::Onion(hash, _)] => Ok(Target::Onion(onion_name(&hash[..]))),
-        _ => Err(Refusal::Multiaddr),
-    }
+    let (target, port, shape) = match protocols.as_slice() {
+        [host, Protocol::Tcp(port), rest @ ..] => {
+            let shape = match rest {
+                [] => Shape::Tcp,
+                [Protocol::Ws(_)] => Shape::Ws,
+                [Protocol::Wss(_)] | [Protocol::Tls, Protocol::Ws(_)] => Shape::Wss,
+                [Protocol::Http] => Shape::Http,
+                [Protocol::Https] | [Protocol::Tls, Protocol::Http] => Shape::Https,
+                _ => return Err(Refusal::Multiaddr),
+            };
+            (host_target(host)?, Some(*port), shape)
+        }
+        [host, Protocol::Http] => (host_target(host)?, Some(80), Shape::Http),
+        [host, Protocol::Https] | [host, Protocol::Tls, Protocol::Http] => {
+            (host_target(host)?, Some(443), Shape::Https)
+        }
+        [host, Protocol::Udp(port), Protocol::QuicV1] => {
+            (host_target(host)?, Some(*port), Shape::QuicV1)
+        }
+        [Protocol::Dnsaddr(name)] => (classify_host(name)?, None, Shape::Dnsaddr),
+        [Protocol::Onion3(onion)] => (
+            Target::Onion(onion_name(onion.hash())),
+            Some(onion.port()),
+            Shape::Onion,
+        ),
+        [Protocol::Onion(hash, port)] => (
+            Target::Onion(onion_name(&hash[..])),
+            Some(*port),
+            Shape::Onion,
+        ),
+        _ => return Err(Refusal::Multiaddr),
+    };
+    Ok(DialTarget {
+        target,
+        port,
+        shape,
+    })
 }
 
 /// A shape's host component.
@@ -238,22 +313,6 @@ fn host_target(host: &Protocol<'_>) -> Result<Target, Refusal> {
         Protocol::Dns(name) | Protocol::Dns4(name) | Protocol::Dns6(name) => classify_host(name),
         _ => Err(Refusal::Multiaddr),
     }
-}
-
-/// What may follow `<host>/tcp/<port>`: nothing, or one WebSocket or HTTP
-/// provider suffix.
-fn after_tcp(rest: &[Protocol<'_>]) -> bool {
-    matches!(
-        rest,
-        [] | [Protocol::Ws(_)]
-            | [Protocol::Wss(_)]
-            | [Protocol::Tls, Protocol::Ws(_)]
-            | [Protocol::Tls, Protocol::Sni(_), Protocol::Ws(_)]
-            | [Protocol::Http]
-            | [Protocol::Https]
-            | [Protocol::Tls, Protocol::Http]
-            | [Protocol::Tls, Protocol::Sni(_), Protocol::Http]
-    )
 }
 
 fn ipv6_literal(text: &str) -> Result<Target, Refusal> {
