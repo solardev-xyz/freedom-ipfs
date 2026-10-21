@@ -145,21 +145,26 @@ fn a_live_capability_follows_both_hops() {
     let addr = server.local_addr().unwrap();
     let paths = Arc::new(Mutex::new(Vec::new()));
     let recorded = paths.clone();
+    // A thread per connection: the redirect may come back on the same
+    // connection or, if it isn't back in the pool yet, on a new one.
     std::thread::spawn(move || {
         for stream in server.incoming() {
             let Ok(stream) = stream else { continue };
-            let mut reader = BufReader::new(stream);
-            while let Some(path) = read_request(&mut reader) {
-                recorded.lock().unwrap().push(path.clone());
-                let response = if path == "/before" {
-                    "HTTP/1.1 302 Found\r\nLocation: /after\r\nContent-Length: 0\r\n\r\n"
-                } else {
-                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
-                };
-                if reader.get_mut().write_all(response.as_bytes()).is_err() {
-                    break;
+            let recorded = recorded.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                while let Some(path) = read_request(&mut reader) {
+                    recorded.lock().unwrap().push(path.clone());
+                    let response = if path == "/before" {
+                        "HTTP/1.1 302 Found\r\nLocation: /after\r\nContent-Length: 0\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                    };
+                    if reader.get_mut().write_all(response.as_bytes()).is_err() {
+                        break;
+                    }
                 }
-            }
+            });
         }
     });
     let runtime = tokio::runtime::Runtime::new().unwrap();
