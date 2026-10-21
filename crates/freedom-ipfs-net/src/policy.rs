@@ -268,8 +268,8 @@ mod tests {
         drop(publisher);
         assert!(!handle.changed().await);
         assert_eq!(
-            Nat64Handle::fixed(Nat64State::Unknown).current(),
-            Nat64State::Unknown
+            Nat64Handle::fixed(Nat64State::Unknown(vec![prefix])).current(),
+            Nat64State::Unknown(vec![prefix])
         );
     }
 }

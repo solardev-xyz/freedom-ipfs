@@ -1065,6 +1065,50 @@ pub fn delegated_router_endpoints(delegated_routers: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_nodes_http_clients_are_its_networks_one_per_component() {
+        let network = Network::legacy();
+        let namesys = freedom_ipfs_namesys::HTTP_CLIENT_CONFIG;
+        let routing = freedom_ipfs_routing::HTTP_CLIENT_CONFIG;
+        for (mode, delegated_ipns) in [
+            (RoutingMode::Auto, true),
+            (RoutingMode::Delegated, true),
+            (RoutingMode::LightDht, false),
+            (RoutingMode::Offline, false),
+        ] {
+            let online = mode != RoutingMode::Offline;
+            let clients = HttpClients::new(&network, mode);
+            let config = |client: &Option<HttpClient>| client.as_ref().map(HttpClient::config);
+            assert_eq!(config(&clients.doh), online.then_some(namesys), "{mode:?}");
+            assert_eq!(
+                config(&clients.ipns),
+                delegated_ipns.then_some(namesys),
+                "{mode:?}"
+            );
+            assert_eq!(
+                config(&clients.routing),
+                online.then_some(routing),
+                "{mode:?}"
+            );
+            assert_eq!(clients.provider.config(), HTTP_PROVIDER_CLIENT_CONFIG);
+            assert!(clients.error().is_none());
+        }
+        // Every client asks the network's capability.
+        let clients = HttpClients::new(&network, RoutingMode::Auto);
+        network.revoke();
+        for client in [
+            clients.doh,
+            clients.ipns,
+            clients.routing,
+            Some(clients.provider),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(client.capability().is_revoked());
+        }
+    }
     use crate::GatewayCoreRequest;
     use axum::body::to_bytes;
     use axum::http::{HeaderMap, Method, StatusCode};
