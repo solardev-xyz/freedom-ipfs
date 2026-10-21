@@ -313,40 +313,62 @@ impl CloudflareDohResolver {
     }
 
     /// Under a gated policy, the records of one response that answer for
-    /// `current` (design 0007, check 2: an alias is an expansion result):
-    /// the chain of CNAMEs the response holds is followed from `current`,
-    /// each alias classified ([`CloudflareDohResolver::admit_name`]) before
-    /// anything it owns is taken, and the `wanted` records the chain's last
-    /// name owns are returned. A record owned by any other name is ignored;
-    /// one without an owner belongs to the name the chain has reached, its
-    /// aliases followed first. `current` is left at the chain's last name,
-    /// `followed` counts the aliases, and `cname_ttl` keeps their lowest TTL.
+    /// the chain at `chain.current` (design 0007, check 2: an alias is an
+    /// expansion result). The chain of CNAMEs the response holds is followed
+    /// from there, each alias classified ([`CloudflareDohResolver::admit_name`])
+    /// before anything it owns is taken:
+    /// - a name may own one alias at most: two refuse the lookup, rather than
+    ///   one chosen by the answers' order;
+    /// - a name already met in this lookup (across its responses) refuses it:
+    ///   a loop has no last name;
+    /// - past [`MAX_DOH_CNAME_DEPTH`] aliases, nothing is taken;
+    /// - the `wanted` records are taken only from a name with no alias, and
+    ///   only those it owns: a record owned by any other name is ignored.
+    ///
+    /// A record without an owner belongs to the name the chain has reached,
+    /// and an ownerless alias is followed once.
     fn owned_answers<'a>(
         &self,
         answers: &'a [DohAnswer],
-        current: &mut String,
-        followed: &mut usize,
-        cname_ttl: &mut Option<Duration>,
+        chain: &mut AliasChain,
         wanted: impl Fn(&DohAnswer) -> bool,
-    ) -> Result<Vec<&'a DohAnswer>> {
+    ) -> Result<ChainStep<'a>> {
         let mut used = vec![false; answers.len()];
         loop {
-            let alias = answers.iter().enumerate().position(|(index, answer)| {
-                !used[index] && answer.is_cname() && answer.is_owned_by(current)
+            let owned = answers
+                .iter()
+                .enumerate()
+                .filter(|(_, answer)| answer.is_cname() && answer.name.is_some())
+                .filter(|(_, answer)| answer.is_owned_by(&chain.current))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let ownerless = answers.iter().enumerate().position(|(index, answer)| {
+                !used[index] && answer.is_cname() && answer.name.is_none()
             });
-            let Some(index) = alias else {
-                return Ok(answers
-                    .iter()
-                    .filter(|answer| wanted(answer) && answer.is_owned_by(current))
-                    .collect());
+            let alias = match (owned.as_slice(), ownerless) {
+                ([], None) => {
+                    return Ok(ChainStep::Records(
+                        answers
+                            .iter()
+                            .filter(|answer| wanted(answer) && answer.is_owned_by(&chain.current))
+                            .collect(),
+                    ))
+                }
+                ([index], _) => *index,
+                ([], Some(index)) => index,
+                _ => return Err(chain.refused("a name in its chain has several aliases")),
             };
-            if *followed == MAX_DOH_CNAME_DEPTH {
-                return Ok(Vec::new());
+            if chain.followed == MAX_DOH_CNAME_DEPTH {
+                return Ok(ChainStep::TooLong);
             }
-            used[index] = true;
-            *followed += 1;
-            *cname_ttl = min_ttl(*cname_ttl, answers[index].ttl.map(Duration::from_secs));
-            *current = self.admit_name(&answers[index].data)?;
+            used[alias] = true;
+            chain.followed += 1;
+            chain.ttl = min_ttl(chain.ttl, answers[alias].ttl.map(Duration::from_secs));
+            let next = self.admit_name(&answers[alias].data)?;
+            if !chain.visited.insert(next.clone()) {
+                return Err(chain.refused("its aliases loop"));
+            }
+            chain.current = next;
         }
     }
 
@@ -375,24 +397,24 @@ impl CloudflareDohResolver {
     async fn ip_lookup_type(&self, name: &str, record_type: u16) -> Result<Vec<IpAddr>> {
         let mut current = self.admit_name(name)?;
         if self.gated() {
-            let mut followed = 0;
-            let mut ttl = None;
+            let mut chain = AliasChain::new(name, current);
             loop {
-                let asked = current.clone();
-                let response = self.ip_lookup_response(&current, record_type).await?;
+                let asked = chain.current.clone();
+                let response = self.ip_lookup_response(&asked, record_type).await?;
                 let answers = response.answer.unwrap_or_default();
-                let owned = self.owned_answers(
-                    &answers,
-                    &mut current,
-                    &mut followed,
-                    &mut ttl,
-                    |answer| answer.record_type == Some(record_type),
-                )?;
+                let step = self.owned_answers(&answers, &mut chain, |answer| {
+                    answer.record_type == Some(record_type)
+                })?;
+                let ChainStep::Records(owned) = step else {
+                    return Ok(Vec::new());
+                };
                 let addrs = owned
                     .iter()
                     .filter_map(|answer| answer.data.parse::<IpAddr>().ok())
                     .collect::<Vec<_>>();
-                if !addrs.is_empty() || current == asked || followed == MAX_DOH_CNAME_DEPTH {
+                // An alias with nothing of its own in this response is asked
+                // for itself; `owned_answers` bounds how many.
+                if !addrs.is_empty() || chain.current == asked {
                     return Ok(addrs);
                 }
             }
@@ -435,30 +457,24 @@ impl DnsTxtResolver for CloudflareDohResolver {
         let mut current = self.admit_name(name)?;
         let mut cname_ttl = None;
         if self.gated() {
-            let mut followed = 0;
+            let mut chain = AliasChain::new(name, current);
             loop {
-                let asked = current.clone();
-                let response = self.txt_lookup_response(&current).await?;
+                let asked = chain.current.clone();
+                let response = self.txt_lookup_response(&asked).await?;
                 let answers = response.answer.unwrap_or_default();
-                let owned = self.owned_answers(
-                    &answers,
-                    &mut current,
-                    &mut followed,
-                    &mut cname_ttl,
-                    DohAnswer::is_txt,
-                )?;
+                let step = self.owned_answers(&answers, &mut chain, DohAnswer::is_txt)?;
+                let ChainStep::Records(owned) = step else {
+                    return Err(NamesysError::NotFound(name.to_string()));
+                };
                 let records = owned
                     .iter()
                     .map(|answer| DnsTxtRecord {
                         value: unquote_txt(&answer.data),
-                        ttl: min_ttl(cname_ttl, answer.ttl.map(Duration::from_secs)),
+                        ttl: min_ttl(chain.ttl, answer.ttl.map(Duration::from_secs)),
                     })
                     .collect::<Vec<_>>();
-                if !records.is_empty() || current == asked {
+                if !records.is_empty() || chain.current == asked {
                     return Ok(records);
-                }
-                if followed == MAX_DOH_CNAME_DEPTH {
-                    return Err(NamesysError::NotFound(name.to_string()));
                 }
             }
         }
@@ -988,6 +1004,45 @@ struct DohResponse {
     answer: Option<Vec<DohAnswer>>,
 }
 
+/// A gated lookup's chain of aliases, across its responses.
+struct AliasChain {
+    /// The name the lookup was asked for, for its errors.
+    asked: String,
+    /// The name the chain has reached.
+    current: String,
+    /// Every name the chain has met.
+    visited: std::collections::HashSet<String>,
+    /// The aliases followed.
+    followed: usize,
+    /// Their lowest TTL.
+    ttl: Option<Duration>,
+}
+
+impl AliasChain {
+    fn new(asked: &str, current: String) -> Self {
+        Self {
+            asked: asked.to_string(),
+            visited: std::collections::HashSet::from([current.clone()]),
+            current,
+            followed: 0,
+            ttl: None,
+        }
+    }
+
+    fn refused(&self, why: &str) -> NamesysError {
+        NamesysError::NotFound(format!("{}: {why}", self.asked))
+    }
+}
+
+/// What one response gave a gated lookup's chain.
+enum ChainStep<'a> {
+    /// The records the chain's last name owns (none, if it owns none here
+    /// and the chain moved: that name is asked for next).
+    Records(Vec<&'a DohAnswer>),
+    /// More aliases than [`MAX_DOH_CNAME_DEPTH`]: nothing is taken.
+    TooLong,
+}
+
 #[derive(Debug, Deserialize)]
 struct DohAnswer {
     /// The record's owner: under a gated policy, only the records the
@@ -1457,6 +1512,128 @@ mod tests {
             .unwrap()
             .iter()
             .any(|(name, _)| name.contains("onion")));
+    }
+
+    /// The chain's depth is its own bound, whatever the responses' layout
+    /// (#47 review round 3, 47-R3-m1): eight aliases answered one per
+    /// response resolve under `direct` as under the legacy policy, for A,
+    /// AAAA and TXT; a ninth is refused, and eight answered inline resolve
+    /// too.
+    #[tokio::test]
+    async fn eight_aliases_resolve_in_every_layout_and_a_ninth_doesnt() {
+        let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+        let mut answers = Vec::new();
+        for (prefix, links) in [("eight", 8), ("nine", 9)] {
+            for index in 0..links {
+                for kind in ["1", "28", "TXT"] {
+                    answers.push((
+                        leak(format!("{prefix}{index}.test")),
+                        kind,
+                        leak(format!(
+                            r#"[{{"name":"{prefix}{index}.test.","type":5,"TTL":60,"data":"{prefix}{}.test."}}]"#,
+                            index + 1
+                        )),
+                    ));
+                }
+            }
+            let last = format!("{prefix}{links}.test");
+            answers.push((
+                leak(last.clone()),
+                "1",
+                leak(format!(
+                    r#"[{{"name":"{last}.","type":1,"TTL":60,"data":"8.8.8.8"}}]"#
+                )),
+            ));
+            answers.push((
+                leak(last.clone()),
+                "28",
+                leak(format!(
+                    r#"[{{"name":"{last}.","type":28,"TTL":60,"data":"2a00:1::1"}}]"#
+                )),
+            ));
+            answers.push((
+                leak(last.clone()),
+                "TXT",
+                leak(format!(
+                    r#"[{{"name":"{last}.","type":16,"TTL":60,"data":"\"dnslink=/ipfs/bafkqaddwgevxmmraojswg33smq\""}}]"#
+                )),
+            ));
+        }
+        let inline = (0..8)
+            .map(|index| {
+                format!(
+                    r#"{{"name":"inline{index}.test.","type":5,"TTL":60,"data":"inline{}.test."}}"#,
+                    index + 1
+                )
+            })
+            .chain([r#"{"name":"inline8.test.","type":1,"TTL":60,"data":"8.8.8.8"}"#.to_string()])
+            .collect::<Vec<_>>()
+            .join(",");
+        answers.push(("inline0.test", "1", leak(format!("[{inline}]"))));
+        let (endpoint, _) = answering_doh(answers).await;
+        let direct = direct_resolver(&endpoint);
+        let legacy = CloudflareDohResolver::with_client(
+            &endpoint,
+            freedom_ipfs_net::Network::legacy().http_client(HTTP_CLIENT_CONFIG),
+        );
+        for (record_type, expected) in [(DNS_TYPE_A, "8.8.8.8"), (DNS_TYPE_AAAA, "2a00:1::1")] {
+            let expected = vec![expected.parse::<IpAddr>().unwrap()];
+            assert_eq!(
+                legacy
+                    .ip_lookup_type("eight0.test", record_type)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                direct
+                    .ip_lookup_type("eight0.test", record_type)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert!(direct
+                .ip_lookup_type("nine0.test", record_type)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(legacy.txt_lookup("eight0.test").await.unwrap().len(), 1);
+        assert_eq!(direct.txt_lookup("eight0.test").await.unwrap().len(), 1);
+        assert!(direct.txt_lookup("nine0.test").await.is_err());
+        assert_eq!(
+            direct
+                .ip_lookup_type("inline0.test", DNS_TYPE_A)
+                .await
+                .unwrap(),
+            vec!["8.8.8.8".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    /// A loop across responses is refused as soon as a name comes back
+    /// (#47 adversarial review round 3, 47-R3-A1), not after the depth
+    /// bound: two queries, then an error.
+    #[tokio::test]
+    async fn a_loop_across_responses_is_refused_when_a_name_comes_back() {
+        let (endpoint, asked) = answering_doh(vec![
+            ("ping.test", "1", r#"[{"name":"ping.test.","type":5,"TTL":60,"data":"pong.test."}]"#),
+            ("pong.test", "1", r#"[{"name":"pong.test.","type":5,"TTL":60,"data":"PING.test."}]"#),
+            ("_dnslink.ping.test", "TXT", r#"[{"name":"_dnslink.ping.test.","type":5,"TTL":60,"data":"_dnslink.pong.test."}]"#),
+            ("_dnslink.pong.test", "TXT", r#"[{"name":"_dnslink.pong.test.","type":5,"TTL":60,"data":"_dnslink.ping.test."}]"#),
+        ])
+        .await;
+        let direct = direct_resolver(&endpoint);
+        assert!(direct
+            .ip_lookup_type("ping.test", DNS_TYPE_A)
+            .await
+            .is_err());
+        assert!(direct.txt_lookup("_dnslink.ping.test").await.is_err());
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            4,
+            "{:?}",
+            asked.lock().unwrap()
+        );
     }
 
     /// A record whose owner is outside the chain is ignored under `direct`

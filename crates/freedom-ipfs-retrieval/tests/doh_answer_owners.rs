@@ -449,3 +449,114 @@ async fn an_inline_onion_alias_is_classified_before_its_aaaa_record() {
         "inline AAAA bypassed onion classification: {result:?}"
     );
 }
+
+fn direct_resolver(doh: &Doh) -> CloudflareDohResolver {
+    let net = network(doh, Addresses::Unchecked);
+    CloudflareDohResolver::with_client(
+        doh.url().to_string(),
+        net.http_client(HTTP_PROVIDER_CLIENT_CONFIG),
+    )
+}
+
+fn owned_txt(owner: &str, value: &str) -> Value {
+    serde_json::json!({ "name": owner, "type": 16, "TTL": 60, "data": format!("\"{value}\"") })
+}
+
+/// Aliases in a loop, or two for one name (#47 adversarial review round 3,
+/// 47-R3-A1): a lookup whose chain revisits a name has no last name, and a
+/// name with two aliases is refused rather than one chosen by the answers'
+/// order; for A and for the TXT records `/dnsaddr` reads. Each has a
+/// finite chain that resolves as its control.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_alias_loop_has_no_last_name() {
+    let doh = Doh::start(HashMap::from([
+        (
+            ("control-case.example".into(), "1".into()),
+            vec![
+                owned_cname("CONTROL-CASE.EXAMPLE.", "Alias.Example."),
+                owned_a("ALIAS.EXAMPLE", "8.8.8.8"),
+            ],
+        ),
+        (
+            ("loop.example".into(), "1".into()),
+            vec![
+                owned_cname("loop.example.", "alias.example."),
+                owned_cname("alias.example.", "LOOP.EXAMPLE."),
+                owned_a("loop.example.", "8.8.4.4"),
+            ],
+        ),
+    ]));
+    let resolver = direct_resolver(&doh);
+    let control = resolver.ip_lookup("Control-Case.Example.").await.unwrap();
+    assert_eq!(control, ["8.8.8.8".parse::<std::net::IpAddr>().unwrap()]);
+
+    let result = resolver.ip_lookup("loop.example").await;
+    assert!(
+        result.as_ref().is_err() || result.as_ref().is_ok_and(Vec::is_empty),
+        "a cyclic CNAME graph was treated as having a terminal owner: {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_aliases_for_one_name_are_refused() {
+    let doh = Doh::start(HashMap::from([
+        (
+            ("control.example".into(), "1".into()),
+            vec![
+                owned_cname("control.example.", "safe.example."),
+                owned_a("safe.example.", "8.8.8.8"),
+            ],
+        ),
+        (
+            ("branch.example".into(), "1".into()),
+            vec![
+                owned_cname("branch.example.", "safe.example."),
+                owned_cname("branch.example.", "secret.onion."),
+                owned_a("safe.example.", "8.8.4.4"),
+            ],
+        ),
+    ]));
+    let resolver = direct_resolver(&doh);
+    let control = resolver.ip_lookup("control.example").await.unwrap();
+    assert_eq!(control, ["8.8.8.8".parse::<std::net::IpAddr>().unwrap()]);
+
+    let result = resolver.ip_lookup("branch.example").await;
+    assert!(
+        result.as_ref().is_err() || result.as_ref().is_ok_and(Vec::is_empty),
+        "the first of two CNAMEs won by answer order and the other alias was never classified: {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_alias_loop_cannot_feed_a_dnsaddr_record() {
+    use freedom_ipfs_namesys::DnsTxtResolver;
+    let doh = Doh::start(HashMap::from([
+        (
+            ("_dnsaddr.control.example".into(), "TXT".into()),
+            vec![
+                owned_cname("_DNSADDR.CONTROL.EXAMPLE.", "_dnsaddr.alias.example."),
+                owned_txt("_DNSADDR.ALIAS.EXAMPLE", "dnsaddr=/ip4/8.8.8.8/tcp/4001"),
+            ],
+        ),
+        (
+            ("_dnsaddr.loop.example".into(), "TXT".into()),
+            vec![
+                owned_cname("_dnsaddr.loop.example.", "_dnsaddr.alias.example."),
+                owned_cname("_dnsaddr.alias.example.", "_DNSADDR.LOOP.EXAMPLE."),
+                owned_txt("_dnsaddr.loop.example.", "dnsaddr=/ip4/127.0.0.1/tcp/4001"),
+            ],
+        ),
+    ]));
+    let resolver = direct_resolver(&doh);
+    let control = resolver
+        .txt_lookup("_dnsaddr.control.example")
+        .await
+        .unwrap();
+    assert_eq!(control, ["dnsaddr=/ip4/8.8.8.8/tcp/4001"]);
+
+    let result = resolver.txt_lookup("_dnsaddr.loop.example").await;
+    assert!(
+        result.as_ref().is_err() || result.as_ref().is_ok_and(Vec::is_empty),
+        "a cyclic TXT CNAME graph supplied a /dnsaddr record: {result:?}"
+    );
+}
