@@ -16,7 +16,14 @@
 //!   `direct` in the policy's own hop loop;
 //! - **each new connection,** in a connector layer that runs before
 //!   reqwest's resolver: a revoked client starts no DNS lookup and opens no
-//!   socket, whatever asked for the connection.
+//!   socket, whatever asked for the connection. The connection is made
+//!   under a permit of the capability ([`NetworkCapability::admit`]), so a
+//!   revoke while it resolves or connects drops it, and the capability's
+//!   quiescence waits until it has been dropped.
+//!
+//! A request sent over a connection already in the pool opens no new
+//! connection: revoking stops new ones, and the teardown closes the open
+//! ones.
 //!
 //! Under `direct` the policy follows redirects itself (design 0007, "The
 //! gate", check 4): every client is built with `Policy::none()` and no
@@ -145,7 +152,9 @@ type BoxError = Box<dyn StdError + Send + Sync>;
 
 /// A connector layer that asks the capability before each new connection,
 /// before reqwest's resolver or proxy connection: once revoked, the
-/// connection fails at once, and nothing is resolved or dialed.
+/// connection fails at once, and nothing is resolved or dialed. A
+/// connection in progress holds a permit of the capability, and is dropped
+/// when the capability is revoked, its resolution or connect included.
 #[derive(Clone, Debug)]
 struct CapabilityLayer(NetworkCapability);
 
@@ -180,12 +189,22 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
+    /// The connection is made under a permit of the capability: refused at
+    /// once if it is revoked, and otherwise dropped (its resolution or
+    /// connect aborted) as soon as it is, so the capability's quiescence
+    /// waits for it.
     fn call(&mut self, request: R) -> Self::Future {
-        if let Err(revoked) = self.capability.check() {
-            return Box::pin(async move { Err(Box::new(revoked) as BoxError) });
-        }
+        let permit = match self.capability.admit() {
+            Ok(permit) => permit,
+            Err(revoked) => return Box::pin(async move { Err(Box::new(revoked) as BoxError) }),
+        };
         let connecting = self.inner.call(request);
-        Box::pin(async move { connecting.await.map_err(Into::into) })
+        Box::pin(async move {
+            match permit.run(connecting).await {
+                Ok(connected) => connected.map_err(Into::into),
+                Err(revoked) => Err(Box::new(revoked) as BoxError),
+            }
+        })
     }
 }
 
@@ -653,6 +672,155 @@ mod tests {
                 "{name}: a connection was opened"
             );
         }
+    }
+
+    /// A resolver held until released: it reports the moment it is asked,
+    /// then answers `address` once `release` is notified (the #45 review's
+    /// probes, round 2).
+    #[derive(Clone)]
+    struct HeldResolver {
+        address: std::net::SocketAddr,
+        asked: std::sync::mpsc::Sender<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl reqwest::dns::Resolve for HeldResolver {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            self.asked.send(()).unwrap();
+            let (release, address) = (self.release.clone(), self.address);
+            Box::pin(async move {
+                release.notified().await;
+                Ok(Box::new(std::iter::once(address)) as reqwest::dns::Addrs)
+            })
+        }
+    }
+
+    /// Revoked while the connector's resolution is pending, after every
+    /// check passed: the resolution's answer is never connected to, and the
+    /// capability's quiescence comes once the attempt has been dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revocation_while_resolution_is_held_prevents_the_later_connect() {
+        for redirects in [10, 0] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (asked, was_asked) = std::sync::mpsc::channel();
+            let release = Arc::new(tokio::sync::Notify::new());
+            let capability = NetworkCapability::new();
+            let config = ClientConfig::new(Duration::from_secs(5), redirects);
+            let reqwest = legacy_builder(config, &capability)
+                .no_proxy()
+                .dns_resolver(Arc::new(HeldResolver {
+                    address,
+                    asked,
+                    release: release.clone(),
+                }))
+                .build()
+                .unwrap();
+            let client = HttpClient::new(Ok(reqwest), capability.clone(), config);
+
+            let request = tokio::spawn(async move {
+                client
+                    .get(format!("http://held.test:{}/", address.port()))
+                    .send()
+                    .await
+            });
+            tokio::task::spawn_blocking(move || {
+                was_asked.recv_timeout(Duration::from_secs(2)).unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!(capability.permits(), 1);
+            capability.revoke();
+            tokio::time::timeout(Duration::from_secs(2), capability.quiesced())
+                .await
+                .expect("the held attempt is dropped");
+            release.notify_one();
+            let accepted =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+            assert!(
+                accepted.is_err(),
+                "{redirects}: a socket was opened after revocation by an attempt that passed the layer"
+            );
+            let result = request.await.unwrap();
+            assert!(
+                matches!(result, Err(HttpError::Revoked(_))),
+                "{redirects}: {result:?}"
+            );
+        }
+    }
+
+    /// A connector whose connect is held until released: it records
+    /// whether it connected, and when it is dropped.
+    #[derive(Clone)]
+    struct HeldConnect {
+        release: Arc<tokio::sync::Notify>,
+        connected: Arc<std::sync::atomic::AtomicBool>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Service<()> for HeldConnect {
+        type Response = ();
+        type Error = BoxError;
+        type Future = Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, (): ()) -> Self::Future {
+            let held = self.clone();
+            Box::pin(async move {
+                let _dropped = SetOnDrop(held.dropped.clone());
+                held.release.notified().await;
+                held.connected
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    /// The same, with the connect held rather than the resolution, through
+    /// the layer alone: revoked while connecting, the connect is dropped
+    /// before it completes, quiescence comes only after that drop, and a
+    /// release afterwards connects nothing.
+    #[tokio::test]
+    async fn revocation_while_the_connect_is_held_drops_it_before_quiescence() {
+        let capability = NetworkCapability::new();
+        let held = HeldConnect {
+            release: Arc::new(tokio::sync::Notify::new()),
+            connected: Default::default(),
+            dropped: Default::default(),
+        };
+        let mut connector = CapabilityLayer(capability.clone()).layer(held.clone());
+        let connecting = tokio::spawn(connector.call(()));
+        tokio::task::yield_now().await;
+        assert_eq!(capability.permits(), 1);
+        assert!(!held.dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        capability.revoke();
+        tokio::time::timeout(Duration::from_secs(2), capability.quiesced())
+            .await
+            .expect("quiescence once the work is dropped");
+        assert!(
+            held.dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "quiescence before the connect was dropped"
+        );
+        held.release.notify_one();
+        let err = connecting.await.unwrap().unwrap_err();
+        assert!(err.is::<Revoked>(), "{err:?}");
+        assert!(!held.connected.load(std::sync::atomic::Ordering::SeqCst));
+        // And a connection asked for now is refused before the connector.
+        let err = connector.call(()).await.unwrap_err();
+        assert!(err.is::<Revoked>(), "{err:?}");
+        assert_eq!(capability.permits(), 0);
     }
 
     #[test]
