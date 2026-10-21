@@ -14,18 +14,22 @@
 //! - [`policy`]: the [`NetworkPolicy`] a node runs under, and its
 //!   [`Network`], which holds the instance's [`NetworkCapability`].
 //! - [`http`]: the crates' HTTP clients, from one constructor, each request
-//!   asking the capability first.
+//!   asking the capability first, and under `direct` the policy's own hop
+//!   loop.
+//! - [`resolve`]: the gate's resolver, under `direct` with checked
+//!   addresses.
 //!
-//! Only the legacy policy, what the crates did before, can be built yet;
-//! `direct` and `socks5` come with the later parts of the item.
+//! The legacy policy (what the crates did before) and `direct` can be built;
+//! `socks5` comes with a later part of the item.
 
 pub mod capability;
 pub mod gate;
 pub mod http;
 pub mod policy;
+pub mod resolve;
 
 pub use capability::{NetworkCapability, Revoked};
-pub use http::{ClientConfig, HttpClient, HttpError, HttpRequest};
+pub use http::{ClientConfig, HttpClient, HttpError, HttpRequest, Refused};
 pub use policy::{
     Addresses, Direct, Mode, Nat64Handle, Nat64Publisher, Network, NetworkError, NetworkPolicy,
     Socks5,

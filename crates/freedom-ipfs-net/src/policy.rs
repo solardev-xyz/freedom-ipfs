@@ -5,16 +5,18 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::sync::watch;
+use url::Url;
 
 use crate::capability::NetworkCapability;
-use crate::gate::Nat64State;
-use crate::http::{build_client, ClientConfig, HttpClient};
+use crate::gate::{ConfiguredTargets, Nat64State, Refusal};
+use crate::http::{ClientConfig, HttpClient};
+use crate::resolve::{system_lookup, NameLookup};
 
 /// What a node's network may do.
 ///
-/// Only [`NetworkPolicy::legacy`] can be built so far: `direct` and
-/// `socks5` arrive with the later parts of design 0007's upstream item 3,
-/// and [`Network::new`] refuses them until then.
+/// [`NetworkPolicy::legacy`] and [`NetworkPolicy::direct`] can be built;
+/// `socks5` arrives with a later part of design 0007's upstream item 3, and
+/// [`Network::new`] refuses it until then.
 #[derive(Clone, Debug)]
 pub struct NetworkPolicy {
     mode: Mode,
@@ -29,8 +31,56 @@ impl NetworkPolicy {
         Self { mode: Mode::Legacy }
     }
 
+    /// Direct connections behind the gate (design 0007, "Modes"):
+    /// - **always:** no environment proxy (`no_proxy()`), redirects followed
+    ///   by the policy's own loop, every hop classified (an onion is refused
+    ///   before any socket), and every request and hop asking the network's
+    ///   capability;
+    /// - **with [`Addresses::Checked`]:** the address policy too, through
+    ///   the gate's resolver.
+    ///
+    /// `configured` names the delegated routers (and any other endpoint
+    /// configuration names): they and `doh`, which is added to them, are
+    /// exempt from the address policy by exact host and port. No configured
+    /// target may be an onion: `direct` has no route to one.
+    pub fn direct(
+        mut configured: ConfiguredTargets,
+        doh: Url,
+        addresses: Addresses,
+    ) -> Result<Self, NetworkError> {
+        configured.add_url(&doh).map_err(NetworkError::Configured)?;
+        if configured.has_onion() {
+            return Err(NetworkError::OnionConfigured);
+        }
+        Ok(Self {
+            mode: Mode::Direct(Direct {
+                addresses,
+                configured: Arc::new(configured),
+                doh,
+            }),
+        })
+    }
+
     pub fn mode(&self) -> &Mode {
         &self.mode
+    }
+
+    /// The DoH endpoint the policy names: `None` under
+    /// [`NetworkPolicy::legacy`], whose resolver keeps its own default.
+    pub fn doh(&self) -> Option<&str> {
+        match &self.mode {
+            Mode::Direct(direct) => Some(direct.doh.as_str()),
+            Mode::Legacy | Mode::Socks5(_) => None,
+        }
+    }
+
+    /// The targets the policy exempts from the address policy: none under
+    /// [`NetworkPolicy::legacy`], which has no address policy.
+    pub fn configured(&self) -> Option<&ConfiguredTargets> {
+        match &self.mode {
+            Mode::Direct(direct) => Some(&direct.configured),
+            Mode::Legacy | Mode::Socks5(_) => None,
+        }
     }
 }
 
@@ -46,7 +96,7 @@ impl Default for NetworkPolicy {
 pub enum Mode {
     /// See [`NetworkPolicy::legacy`].
     Legacy,
-    /// Direct connections, without the environment's proxy, behind the gate.
+    /// See [`NetworkPolicy::direct`].
     Direct(Direct),
     /// Every connection through a SOCKS5 proxy, failing closed.
     Socks5(Socks5),
@@ -54,7 +104,7 @@ pub enum Mode {
 
 /// `direct` (design 0007, "Modes"). The gate comes to it in two parts:
 /// - **always:** the classification and the capability. Onion targets and
-///   non-network multiaddrs are refused before any socket, the service's own
+///   non-network multiaddrs are refused before any socket, the policy's own
 ///   hop loop follows redirects, and revoking the capability stops every
 ///   later socket, DNS query and hop;
 /// - **with [`Addresses::Checked`]:** the address policy too, which needs
@@ -63,15 +113,22 @@ pub enum Mode {
 #[non_exhaustive]
 pub struct Direct {
     pub addresses: Addresses,
+    /// The configured targets, the DoH endpoint among them.
+    pub configured: Arc<ConfiguredTargets>,
+    /// The DoH endpoint.
+    pub doh: Url,
 }
 
 /// Whether `direct` applies the address policy.
 #[derive(Clone, Debug)]
 pub enum Addresses {
-    /// Not yet: names resolve as before, and no address is refused.
+    /// Not yet: names resolve as before (reqwest's resolver), and no
+    /// address is refused. Only the classification and the capability
+    /// apply.
     Unchecked,
     /// Every untrusted address is checked (design 0007, "Addresses"), with
-    /// what NAT64 discovery has learned.
+    /// what NAT64 discovery has learned: names through the gate's resolver,
+    /// IP literals in the hop loop.
     Checked(Nat64Handle),
 }
 
@@ -132,8 +189,8 @@ impl Nat64Publisher {
 
 /// The network an instance runs under: its policy and its capability. Every
 /// HTTP client it hands out ([`Network::http_client`]) asks the capability
-/// before each request, so revoking it ([`Network::revoke`]) refuses every
-/// later request of every one of them. Clones share both.
+/// before each request and each hop, so revoking it ([`Network::revoke`])
+/// refuses every later one of every one of them. Clones share both.
 #[derive(Clone, Debug)]
 pub struct Network {
     inner: Arc<Inner>,
@@ -143,34 +200,50 @@ pub struct Network {
 struct Inner {
     policy: NetworkPolicy,
     capability: NetworkCapability,
+    /// The gate's resolver's lookups, under `direct` with checked addresses.
+    lookup: Option<Arc<dyn NameLookup>>,
 }
 
 impl Network {
     /// The network for `policy`, with a capability of its own. Refused for a
     /// mode this version can't honour yet, never approximated: a policy
     /// that silently connected another way would fail open.
+    ///
+    /// Under `direct` with checked addresses, the gate's resolver uses the
+    /// system's DNS configuration, or Cloudflare's resolvers where it can't
+    /// be read.
     pub fn new(policy: NetworkPolicy) -> Result<Self, NetworkError> {
-        match policy.mode() {
-            Mode::Legacy => {}
-            Mode::Direct(_) => return Err(NetworkError::Unsupported("direct")),
+        let lookup = match policy.mode() {
+            Mode::Legacy => None,
+            Mode::Direct(Direct {
+                addresses: Addresses::Unchecked,
+                ..
+            }) => None,
+            Mode::Direct(Direct {
+                addresses: Addresses::Checked(_),
+                ..
+            }) => Some(system_lookup()),
             Mode::Socks5(_) => return Err(NetworkError::Unsupported("socks5")),
-        }
-        Ok(Self {
+        };
+        Ok(Self::with_lookup(policy, lookup))
+    }
+
+    /// The network for `policy` with the gate's resolver asking `lookup`:
+    /// tests, and hosts that bring their own resolver.
+    #[doc(hidden)]
+    pub fn with_lookup(policy: NetworkPolicy, lookup: Option<Arc<dyn NameLookup>>) -> Self {
+        Self {
             inner: Arc::new(Inner {
                 policy,
                 capability: NetworkCapability::new(),
+                lookup,
             }),
-        })
+        }
     }
 
     /// A [`NetworkPolicy::legacy`] network, with a capability of its own.
     pub fn legacy() -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                policy: NetworkPolicy::legacy(),
-                capability: NetworkCapability::new(),
-            }),
-        }
+        Self::with_lookup(NetworkPolicy::legacy(), None)
     }
 
     pub fn policy(&self) -> &NetworkPolicy {
@@ -181,25 +254,25 @@ impl Network {
         &self.inner.capability
     }
 
-    /// Revokes the capability: every later request of every client of this
-    /// network fails with [`crate::http::HttpError::Revoked`].
+    /// Revokes the capability: every later request and hop of every client
+    /// of this network fails with [`crate::http::HttpError::Revoked`].
     pub fn revoke(&self) {
         self.inner.capability.revoke();
     }
 
+    pub(crate) fn lookup(&self) -> Option<&Arc<dyn NameLookup>> {
+        self.inner.lookup.as_ref()
+    }
+
     /// A new HTTP client for `config`, built by the crates' one constructor
     /// for this network's policy, which asks this network's capability
-    /// before every request. Each call builds a client of its own, with its
-    /// own connection pool.
+    /// before every request and every hop. Each call builds a client of its
+    /// own, with its own connection pools.
     ///
     /// It never panics: a client that couldn't be built holds the error
     /// ([`HttpClient::error`]) and fails every request with it.
     pub fn http_client(&self, config: ClientConfig) -> HttpClient {
-        HttpClient::new(
-            build_client(config, self.policy(), self.capability()),
-            self.capability().clone(),
-            config,
-        )
+        HttpClient::new(self.clone(), config)
     }
 }
 
@@ -213,27 +286,29 @@ pub enum NetworkError {
     /// The mode isn't available in this version.
     #[error("network mode {0} isn't available yet")]
     Unsupported(&'static str),
+    /// A configured endpoint isn't an `http` or `https` URL without
+    /// userinfo.
+    #[error("a configured endpoint is refused: {0}")]
+    Configured(Refusal),
+    /// A configured target is an onion, which `direct` can't reach.
+    #[error("a configured endpoint is an onion, which direct mode can't reach")]
+    OnionConfigured,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gate::Nat64Prefix;
+    use crate::gate::{parse_url, Nat64Prefix};
+
+    fn url(text: &str) -> Url {
+        Url::parse(text).unwrap()
+    }
 
     #[test]
-    fn only_legacy_networks_can_be_built_yet() {
+    fn socks5_networks_cant_be_built_yet() {
         assert!(matches!(
             Network::new(NetworkPolicy::legacy()).map(|n| n.policy().mode().clone()),
             Ok(Mode::Legacy)
-        ));
-        let direct = NetworkPolicy {
-            mode: Mode::Direct(Direct {
-                addresses: Addresses::Unchecked,
-            }),
-        };
-        assert!(matches!(
-            Network::new(direct),
-            Err(NetworkError::Unsupported("direct"))
         ));
         let socks5 = NetworkPolicy {
             mode: Mode::Socks5(Socks5 {
@@ -243,6 +318,60 @@ mod tests {
         assert!(matches!(
             Network::new(socks5),
             Err(NetworkError::Unsupported("socks5"))
+        ));
+    }
+
+    #[test]
+    fn a_direct_policy_adds_its_doh_endpoint_and_refuses_onions() {
+        let mut configured = ConfiguredTargets::new();
+        configured
+            .add_url(&parse_url("http://127.0.0.1:5001/routing/v1").unwrap())
+            .unwrap();
+        let policy = NetworkPolicy::direct(
+            configured.clone(),
+            url("https://dns.example/dns-query"),
+            Addresses::Unchecked,
+        )
+        .unwrap();
+        assert_eq!(policy.doh(), Some("https://dns.example/dns-query"));
+        let configured_now = policy.configured().unwrap();
+        assert!(configured_now.contains(&crate::gate::Target::Name("dns.example".into()), 443));
+        assert!(
+            configured_now.contains(&crate::gate::Target::Ip("127.0.0.1".parse().unwrap()), 5001)
+        );
+        assert!(Network::new(policy).is_ok());
+
+        assert!(matches!(
+            NetworkPolicy::direct(
+                configured.clone(),
+                url("https://user:pw@dns.example/dns-query"),
+                Addresses::Unchecked,
+            ),
+            Err(NetworkError::Configured(Refusal::Userinfo))
+        ));
+        assert!(matches!(
+            NetworkPolicy::direct(
+                configured.clone(),
+                url("ftp://dns.example/"),
+                Addresses::Unchecked
+            ),
+            Err(NetworkError::Configured(Refusal::Scheme))
+        ));
+        let mut onion = configured;
+        onion
+            .add_url(&parse_url("http://router.onion/routing/v1").unwrap())
+            .unwrap();
+        assert!(matches!(
+            NetworkPolicy::direct(onion, url("https://dns.example/"), Addresses::Unchecked),
+            Err(NetworkError::OnionConfigured)
+        ));
+        assert!(matches!(
+            NetworkPolicy::direct(
+                ConfiguredTargets::new(),
+                url("https://dns.onion/"),
+                Addresses::Unchecked
+            ),
+            Err(NetworkError::OnionConfigured)
         ));
     }
 

@@ -553,15 +553,10 @@ fn ipv6_outside_the_fixed_forms_waits_or_is_refused_until_the_prefixes_are_known
         ),
         Err(AddressRefusal::Nat64Unknown)
     );
-    // IPv4, and the fixed forms, are judged as always while pending or
+    // IPv4 and IPv4-mapped addresses are judged as always while pending or
     // unknown.
     for state in [Nat64State::Pending, Nat64State::Unknown(Vec::new())] {
-        for text in [
-            "8.8.8.8",
-            "::ffff:8.8.8.8",
-            "64:ff9b::808:808",
-            "2002:808:808::1",
-        ] {
+        for text in ["8.8.8.8", "::ffff:8.8.8.8"] {
             assert!(
                 check_address(ip(text), &state).is_ok(),
                 "{text} while {state:?}"
@@ -571,6 +566,26 @@ fn ipv6_outside_the_fixed_forms_waits_or_is_refused_until_the_prefixes_are_known
             refused_by(check_address(ip("10.0.0.1"), &state)),
             "private use"
         );
+    }
+    // The fixed forms: judged as always once discovery has answered, even
+    // unknown; while it is pending they wait for its first answer, which
+    // may teach a prefix under them (design 0007, the startup race).
+    for text in ["64:ff9b::808:808", "2002:808:808::1"] {
+        assert!(check_address(ip(text), &Nat64State::Unknown(Vec::new())).is_ok());
+        assert!(check_address(ip(text), &Nat64State::NONE).is_ok());
+        assert_eq!(
+            check_address(ip(text), &Nat64State::Pending),
+            Err(AddressRefusal::Nat64Pending),
+            "{text}"
+        );
+    }
+    // A fixed form refused by its own reading is refused at once, pending
+    // or not: a prefix only adds refusals.
+    for text in ["64:ff9b::a9fe:a9fe", "2002:a9fe:a9fe::1"] {
+        assert!(matches!(
+            check_address(ip(text), &Nat64State::Pending),
+            Err(AddressRefusal::Embedded { .. })
+        ));
     }
 }
 
