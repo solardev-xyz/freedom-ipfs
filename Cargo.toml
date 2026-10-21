@@ -8,6 +8,7 @@ members = [
     "crates/freedom-ipfs-retrieval",
     "crates/freedom-ipfs-gateway",
     "crates/freedom-ipfs-mobile",
+    "crates/freedom-ipfs-net",
     "tools/mobile-web-harness",
     "xtask",
 ]
@@ -36,6 +37,7 @@ libp2p = { version = "0.56", default-features = false, features = ["dns", "ed255
 libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand", "rsa"] }
 libp2p-stream = "0.4.0-alpha"
 mime_guess = "2"
+multiaddr = { version = "0.18", default-features = false }
 multibase = "0.9"
 multihash = "0.19"
 multihash-codetable = { version = "0.2", features = ["sha2"] }
@@ -66,3 +68,4 @@ freedom-ipfs-routing = { path = "crates/freedom-ipfs-routing" }
 freedom-ipfs-retrieval = { path = "crates/freedom-ipfs-retrieval" }
 freedom-ipfs-gateway = { path = "crates/freedom-ipfs-gateway" }
 freedom-ipfs-mobile = { path = "crates/freedom-ipfs-mobile" }
+freedom-ipfs-net = { path = "crates/freedom-ipfs-net" }

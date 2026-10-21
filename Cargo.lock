@@ -988,6 +988,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "freedom-ipfs-net"
+version = "0.4.6"
+dependencies = [
+ "data-encoding",
+ "multiaddr",
+ "thiserror 2.0.18",
+ "url",
+]
+
+[[package]]
 name = "freedom-ipfs-retrieval"
 version = "0.4.6"
 dependencies = [
