@@ -368,9 +368,12 @@ impl OnlineNodeBuilder {
                     let name_resolver = CachedNameResolver::new(PersistentNameResolver::new(
                         DefaultNameResolver::new(
                             match doh {
-                                Some(client) => {
-                                    CloudflareDohResolver::with_client(DEFAULT_DOH_ENDPOINT, client)
-                                }
+                                // The policy's DoH endpoint, a configured
+                                // target; the default under the legacy policy.
+                                Some(client) => CloudflareDohResolver::with_client(
+                                    network.policy().doh().unwrap_or(DEFAULT_DOH_ENDPOINT),
+                                    client,
+                                ),
                                 None => CloudflareDohResolver::default(),
                             },
                             ipns,

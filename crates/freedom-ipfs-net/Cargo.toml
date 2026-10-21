@@ -9,6 +9,10 @@ repository.workspace = true
 [dependencies]
 # Onion addresses' base32 names, from `/onion3` and `/onion` components.
 data-encoding.workspace = true
+# The gate's resolver under `direct` with checked addresses: async and
+# cancellable, over the system's DNS configuration (D3). Already in the
+# graph through libp2p-dns, at this version; no DNSSEC feature.
+hickory-resolver = { version = "0.25", default-features = false, features = ["system-config", "tokio"] }
 # Header names and values for requests, as reqwest takes them.
 http.workspace = true
 # The multiaddrs libp2p dials; the version libp2p re-exports, so the types
@@ -19,8 +23,9 @@ reqwest.workspace = true
 # Query strings for requests, as reqwest takes them.
 serde.workspace = true
 thiserror.workspace = true
-# Only the watch channel behind NAT64 discovery's state.
-tokio = { version = "1", default-features = false, features = ["sync"] }
+# The watch channel behind NAT64 discovery's state, and the operation's
+# deadline while it waits for discovery.
+tokio = { version = "1", default-features = false, features = ["sync", "time"] }
 # WHATWG host and URL parsing: the rules reqwest's URLs follow.
 url.workspace = true
 

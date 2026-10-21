@@ -54,6 +54,11 @@ impl ConfiguredTargets {
             .is_some_and(|port| self.contains(&dial.target, port))
     }
 
+    /// Whether any configured target is an onion.
+    pub fn has_onion(&self) -> bool {
+        self.targets.iter().any(|(target, _)| target.is_onion())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.targets.is_empty()
     }
