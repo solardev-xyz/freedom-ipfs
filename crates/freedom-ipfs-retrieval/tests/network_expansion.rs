@@ -74,18 +74,21 @@ impl Doh {
                         "28" => 28,
                         _ => 0,
                     };
+                    // Each record is owned by the name asked for, as real
+                    // DoH JSON names it.
+                    let owner = format!("{name}.");
                     let answer = answers
                         .get(&(name, kind))
                         .cloned()
                         .unwrap_or_default()
                         .into_iter()
                         .map(|data| match data.strip_prefix("CNAME ") {
-                            Some(target) => {
-                                serde_json::json!({ "type": 5, "TTL": 60, "data": target })
-                            }
-                            None => {
-                                serde_json::json!({ "type": record_type, "TTL": 60, "data": data })
-                            }
+                            Some(target) => serde_json::json!({
+                                "name": owner, "type": 5, "TTL": 60, "data": target
+                            }),
+                            None => serde_json::json!({
+                                "name": owner, "type": record_type, "TTL": 60, "data": data
+                            }),
                         })
                         .collect::<Vec<_>>();
                     let body = serde_json::json!({ "Status": 0, "Answer": answer }).to_string();

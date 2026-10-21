@@ -325,28 +325,31 @@ impl CloudflareDohResolver {
     /// - the `wanted` records are taken only from a name with no alias, and
     ///   only those it owns: a record owned by any other name is ignored.
     ///
-    /// A record without an owner belongs to the name the chain has reached,
-    /// and an ownerless alias is followed once.
+    /// Real DoH JSON names every record's owner. An alias, or a record of
+    /// the kind asked for, without one (its `name` missing or null) can't be
+    /// placed in the chain: the lookup is refused, whatever the answers'
+    /// order.
     fn owned_answers<'a>(
         &self,
         answers: &'a [DohAnswer],
         chain: &mut AliasChain,
         wanted: impl Fn(&DohAnswer) -> bool,
     ) -> Result<ChainStep<'a>> {
-        let mut used = vec![false; answers.len()];
+        if answers
+            .iter()
+            .any(|answer| answer.name.is_none() && (answer.is_cname() || wanted(answer)))
+        {
+            return Err(chain.refused("an answer doesn't name its owner"));
+        }
         loop {
             let owned = answers
                 .iter()
                 .enumerate()
-                .filter(|(_, answer)| answer.is_cname() && answer.name.is_some())
-                .filter(|(_, answer)| answer.is_owned_by(&chain.current))
+                .filter(|(_, answer)| answer.is_cname() && answer.is_owned_by(&chain.current))
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>();
-            let ownerless = answers.iter().enumerate().position(|(index, answer)| {
-                !used[index] && answer.is_cname() && answer.name.is_none()
-            });
-            let alias = match (owned.as_slice(), ownerless) {
-                ([], None) => {
+            let alias = match owned.as_slice() {
+                [] => {
                     return Ok(ChainStep::Records(
                         answers
                             .iter()
@@ -354,14 +357,12 @@ impl CloudflareDohResolver {
                             .collect(),
                     ))
                 }
-                ([index], _) => *index,
-                ([], Some(index)) => index,
+                [index] => *index,
                 _ => return Err(chain.refused("a name in its chain has several aliases")),
             };
             if chain.followed == MAX_DOH_CNAME_DEPTH {
                 return Ok(ChainStep::TooLong);
             }
-            used[alias] = true;
             chain.followed += 1;
             chain.ttl = min_ttl(chain.ttl, answers[alias].ttl.map(Duration::from_secs));
             let next = self.admit_name(&answers[alias].data)?;
@@ -1066,9 +1067,9 @@ impl DohAnswer {
     }
 
     /// Whether `name` (canonical: lowercase, no trailing dot) owns the
-    /// record. A record without an owner is anyone's.
+    /// record. A record without an owner is no name's.
     fn is_owned_by(&self, name: &str) -> bool {
-        self.name.as_deref().is_none_or(|owner| {
+        self.name.as_deref().is_some_and(|owner| {
             let owner = owner.strip_suffix('.').unwrap_or(owner);
             owner.eq_ignore_ascii_case(name)
         })
@@ -1315,9 +1316,9 @@ mod tests {
                 let line = request.lines().next().unwrap_or("").to_string();
                 recorded.lock().unwrap().push(line.clone());
                 let body = if line.contains("name=_dnslink.example.test") {
-                    r#"{"Answer":[{"data":"_dnslink.secret.onion.","TTL":60,"type":5}]}"#
+                    r#"{"Answer":[{"name":"_dnslink.example.test.","data":"_dnslink.secret.onion.","TTL":60,"type":5}]}"#
                 } else {
-                    r#"{"Answer":[{"data":"\"dnslink=/ipfs/bafkqaddwgevxmmraojswg33smq\"","TTL":300,"type":16}]}"#
+                    r#"{"Answer":[{"name":"_dnslink.secret.onion.","data":"\"dnslink=/ipfs/bafkqaddwgevxmmraojswg33smq\"","TTL":300,"type":16}]}"#
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/dns-json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",

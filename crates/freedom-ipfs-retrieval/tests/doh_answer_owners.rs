@@ -346,7 +346,10 @@ async fn an_inline_onion_alias_is_classified_before_its_a_record() {
     let doh = Doh::start(HashMap::from([
         (
             ("control.example".into(), "1".into()),
-            vec![cname("public-alias.example."), a("127.0.0.1")],
+            vec![
+                owned_cname("control.example.", "public-alias.example."),
+                owned_a("public-alias.example.", "127.0.0.1"),
+            ],
         ),
         (
             ("hidden.example".into(), "1".into()),
@@ -393,8 +396,8 @@ async fn an_inline_onion_alias_is_classified_before_its_txt_record() {
     let doh = Doh::start(HashMap::from([(
         ("_dnslink.hidden.example".into(), "TXT".into()),
         vec![
-            cname("_dnslink.secret.onion."),
-            txt("dnslink=/ipfs/test".into()),
+            owned_cname("_dnslink.hidden.example.", "_dnslink.secret.onion."),
+            owned_txt("_dnslink.secret.onion.", "dnslink=/ipfs/test"),
         ],
     )]));
     let net = network(&doh, Addresses::Unchecked);
@@ -413,11 +416,11 @@ async fn an_alias_with_an_empty_label_is_never_queried() {
     let doh = Doh::start(HashMap::from([
         (
             ("root.example".into(), "1".into()),
-            vec![cname("empty-label.example..")],
+            vec![owned_cname("root.example.", "empty-label.example..")],
         ),
         (
             ("empty-label.example".into(), "1".into()),
-            vec![a("8.8.8.8")],
+            vec![owned_a("empty-label.example.", "8.8.8.8")],
         ),
     ]));
     let net = network(&doh, Addresses::Unchecked);
@@ -436,8 +439,8 @@ async fn an_inline_onion_alias_is_classified_before_its_aaaa_record() {
     let doh = Doh::start(HashMap::from([(
         ("hidden6.example".into(), "28".into()),
         vec![
-            cname("secret.onion."),
-            serde_json::json!({"type":28,"TTL":60,"data":"2a00:1::1"}),
+            owned_cname("hidden6.example.", "secret.onion."),
+            serde_json::json!({"name":"secret.onion.","type":28,"TTL":60,"data":"2a00:1::1"}),
         ],
     )]));
     let net = network(&doh, Addresses::Unchecked);
@@ -559,4 +562,192 @@ async fn an_alias_loop_cannot_feed_a_dnsaddr_record() {
         result.as_ref().is_err() || result.as_ref().is_ok_and(Vec::is_empty),
         "a cyclic TXT CNAME graph supplied a /dnsaddr record: {result:?}"
     );
+}
+
+/// A lookup through a gated (`direct`, Unchecked) resolver, by kind: `1` or
+/// `28` asks for both A and AAAA, `TXT` for TXT records.
+async fn lookup_kind(doh: &Doh, name: &str, kind: &str) -> Result<Vec<String>, String> {
+    use freedom_ipfs_namesys::{DnsTxtResolver, HTTP_CLIENT_CONFIG};
+    let net = network(doh, Addresses::Unchecked);
+    let resolver =
+        CloudflareDohResolver::with_client(doh.url().as_str(), net.http_client(HTTP_CLIENT_CONFIG));
+    if kind == "TXT" {
+        resolver
+            .txt_lookup(name)
+            .await
+            .map_err(|err| err.to_string())
+    } else {
+        resolver
+            .ip_lookup(name)
+            .await
+            .map(|ips| ips.into_iter().map(|ip| ip.to_string()).collect())
+            .map_err(|err| err.to_string())
+    }
+}
+
+/// A terminal record of `kind`, owned by `owner`.
+fn terminal(owner: &str, kind: &str) -> Value {
+    let (record_type, data) = match kind {
+        "1" => (1, "8.8.8.8"),
+        "28" => (28, "2a00:1::1"),
+        _ => (16, "dnslink=/ipfs/test"),
+    };
+    serde_json::json!({ "name": owner, "type": record_type, "TTL": 60, "data": data })
+}
+
+/// An answer without its owner can't be placed in the chain (#47 review
+/// round 4): one of two sibling aliases with its `name` missing or null
+/// doesn't turn a refused branch into a chain, for A, AAAA and TXT. The
+/// controls: a finite chain resolves, and the named branch is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_alias_without_its_owner_doesnt_turn_a_branch_into_a_chain() {
+    let mut accepted = Vec::new();
+    for kind in ["1", "28", "TXT"] {
+        for owner_form in ["absent", "null"] {
+            let finite = vec![
+                owned_cname("control.example.", "a.example."),
+                terminal("a.example.", kind),
+            ];
+            let branch = vec![
+                owned_cname("branch.example.", "a.example."),
+                owned_cname("branch.example.", "b.example."),
+                terminal("b.example.", kind),
+            ];
+            let mut stripped = vec![
+                owned_cname("stripped.example.", "a.example."),
+                owned_cname("stripped.example.", "b.example."),
+                terminal("b.example.", kind),
+            ];
+            if owner_form == "absent" {
+                stripped[1].as_object_mut().unwrap().remove("name");
+            } else {
+                stripped[1]["name"] = Value::Null;
+            }
+            let doh = Doh::start(HashMap::from([
+                (("control.example".into(), kind.into()), finite),
+                (("branch.example".into(), kind.into()), branch),
+                (("stripped.example".into(), kind.into()), stripped),
+            ]));
+            assert_eq!(
+                lookup_kind(&doh, "control.example", kind)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let named = lookup_kind(&doh, "branch.example", kind).await;
+            assert!(
+                named.is_err() || named.unwrap().is_empty(),
+                "the named branch"
+            );
+            let result = lookup_kind(&doh, "stripped.example", kind).await;
+            if result.as_ref().is_ok_and(|records| !records.is_empty()) {
+                accepted.push((kind, owner_form));
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "ownerless records made a chain: {accepted:?}"
+    );
+}
+
+/// Two ownerless aliases, or a named and an ownerless one, are refused
+/// rather than chained by the answers' order, for A and for the TXT
+/// records `/dnsaddr` reads (#47 adversarial review round 4). The controls
+/// name their owners and resolve.
+#[tokio::test(flavor = "multi_thread")]
+async fn ownerless_aliases_are_refused_not_chained() {
+    use freedom_ipfs_namesys::DnsTxtResolver;
+    let doh = Doh::start(HashMap::from([
+        (
+            ("control.example".into(), "1".into()),
+            vec![
+                owned_cname("control.example.", "control-final.example."),
+                owned_a("control-final.example.", "8.8.8.8"),
+            ],
+        ),
+        (
+            ("two-ownerless.example".into(), "1".into()),
+            vec![
+                cname("first.example."),
+                cname("second.example."),
+                owned_a("second.example.", "8.8.4.4"),
+            ],
+        ),
+        (
+            ("named-and-ownerless.example".into(), "1".into()),
+            vec![
+                owned_cname("named-and-ownerless.example.", "first.example."),
+                cname("second.example."),
+                owned_a("second.example.", "8.8.4.4"),
+            ],
+        ),
+        (
+            ("_dnsaddr.control.example".into(), "TXT".into()),
+            vec![
+                owned_cname(
+                    "_dnsaddr.control.example.",
+                    "_dnsaddr.control-final.example.",
+                ),
+                owned_txt(
+                    "_dnsaddr.control-final.example.",
+                    "dnsaddr=/ip4/8.8.8.8/tcp/4001",
+                ),
+            ],
+        ),
+        (
+            ("_dnsaddr.two-ownerless.example".into(), "TXT".into()),
+            vec![
+                cname("_dnsaddr.first.example."),
+                cname("_dnsaddr.second.example."),
+                txt("dnsaddr=/ip4/127.0.0.1/tcp/4001".into()),
+            ],
+        ),
+    ]));
+    let resolver = direct_resolver(&doh);
+    assert_eq!(
+        resolver.ip_lookup("control.example").await.unwrap(),
+        ["8.8.8.8".parse::<std::net::IpAddr>().unwrap()]
+    );
+    for name in ["two-ownerless.example", "named-and-ownerless.example"] {
+        let result = resolver.ip_lookup(name).await;
+        assert!(
+            result.as_ref().is_err() || result.as_ref().is_ok_and(Vec::is_empty),
+            "{name}: {result:?}"
+        );
+    }
+    assert_eq!(
+        resolver
+            .txt_lookup("_dnsaddr.control.example")
+            .await
+            .unwrap(),
+        ["dnsaddr=/ip4/8.8.8.8/tcp/4001"]
+    );
+    let result = resolver.txt_lookup("_dnsaddr.two-ownerless.example").await;
+    assert!(
+        result.as_ref().is_err() || result.as_ref().is_ok_and(Vec::is_empty),
+        "{result:?}"
+    );
+
+    // The legacy policy still reads ownerless answers, as before.
+    let ownerless = Doh::start(HashMap::from([(
+        ("ownerless.example".into(), "1".into()),
+        vec![a("8.8.8.8")],
+    )]));
+    let legacy_ownerless = CloudflareDohResolver::with_client(
+        ownerless.url().to_string(),
+        Network::legacy().http_client(HTTP_PROVIDER_CLIENT_CONFIG),
+    );
+    assert_eq!(
+        legacy_ownerless
+            .ip_lookup("ownerless.example")
+            .await
+            .unwrap(),
+        ["8.8.8.8".parse::<std::net::IpAddr>().unwrap()]
+    );
+    assert!(direct_resolver(&ownerless)
+        .ip_lookup("ownerless.example")
+        .await
+        .is_err());
 }
