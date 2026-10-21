@@ -196,7 +196,7 @@ impl Network {
     /// ([`HttpClient::error`]) and fails every request with it.
     pub fn http_client(&self, config: ClientConfig) -> HttpClient {
         HttpClient::new(
-            build_client(config, self.policy()),
+            build_client(config, self.policy(), self.capability()),
             self.capability().clone(),
             config,
         )

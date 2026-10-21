@@ -19,6 +19,11 @@ reqwest.workspace = true
 # Query strings for requests, as reqwest takes them.
 serde.workspace = true
 thiserror.workspace = true
+# The connector layer that asks the capability before each new connection,
+# as reqwest's `connector_layer` takes it. Already in the graph (reqwest,
+# hyper).
+tower-layer = "0.3"
+tower-service = "0.3"
 # Only the watch channel behind NAT64 discovery's state.
 tokio = { version = "1", default-features = false, features = ["sync"] }
 # WHATWG host and URL parsing: the rules reqwest's URLs follow.
