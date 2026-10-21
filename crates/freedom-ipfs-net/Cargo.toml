@@ -15,3 +15,14 @@ multiaddr.workspace = true
 thiserror.workspace = true
 # WHATWG host and URL parsing: the rules reqwest's URLs follow.
 url.workspace = true
+
+[dev-dependencies]
+# The transport whose address parsing the gate's multiaddr shapes must
+# agree with (libp2p 0.56's): tests only.
+libp2p-core = "0.43"
+libp2p-tcp = { version = "0.44", features = ["tokio"] }
+tokio.workspace = true
+# What reqwest and the http crate make of a URL the gate accepted: tests
+# only.
+http.workspace = true
+reqwest.workspace = true
