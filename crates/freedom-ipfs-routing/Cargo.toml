@@ -10,6 +10,7 @@ repository.workspace = true
 cid.workspace = true
 async-trait.workspace = true
 freedom-ipfs-namesys.workspace = true
+freedom-ipfs-net.workspace = true
 futures.workspace = true
 libp2p.workspace = true
 reqwest.workspace = true

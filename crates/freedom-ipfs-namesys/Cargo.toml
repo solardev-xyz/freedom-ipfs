@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 cid.workspace = true
+freedom-ipfs-net.workspace = true
 futures.workspace = true
 ipld-core = "0.4"
 libp2p-identity.workspace = true

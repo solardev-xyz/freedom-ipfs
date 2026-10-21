@@ -9,10 +9,23 @@ repository.workspace = true
 [dependencies]
 # Onion addresses' base32 names, from `/onion3` and `/onion` components.
 data-encoding.workspace = true
+# Header names and values for requests, as reqwest takes them.
+http.workspace = true
 # The multiaddrs libp2p dials; the version libp2p re-exports, so the types
 # are the same ones.
 multiaddr.workspace = true
+# The HTTP clients the policy builds, the crates' one constructor.
+reqwest.workspace = true
+# Query strings for requests, as reqwest takes them.
+serde.workspace = true
 thiserror.workspace = true
+# The connector layer that asks the capability before each new connection,
+# as reqwest's `connector_layer` takes it. Already in the graph (reqwest,
+# hyper).
+tower-layer = "0.3"
+tower-service = "0.3"
+# Only the watch channel behind NAT64 discovery's state.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 # WHATWG host and URL parsing: the rules reqwest's URLs follow.
 url.workspace = true
 
@@ -22,7 +35,3 @@ url.workspace = true
 libp2p-core = "0.43"
 libp2p-tcp = { version = "0.44", features = ["tokio"] }
 tokio.workspace = true
-# What reqwest and the http crate make of a URL the gate accepted: tests
-# only.
-http.workspace = true
-reqwest.workspace = true

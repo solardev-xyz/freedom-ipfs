@@ -41,6 +41,10 @@ pub use native_request::{
 mod node;
 pub mod progress;
 
+/// The network policy's crate (design 0007, upstream item 3), for hosts
+/// that build a node's [`freedom_ipfs_net::Network`].
+pub use freedom_ipfs_net as net;
+pub use freedom_ipfs_net::{Network, NetworkCapability, NetworkPolicy};
 use freedom_ipfs_retrieval::enter_memory_wait;
 pub use freedom_ipfs_retrieval::instance::Fenced;
 pub use freedom_ipfs_retrieval::{

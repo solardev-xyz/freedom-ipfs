@@ -31,6 +31,12 @@
 //! count against one set of process-wide limits. Each node also bounds its
 //! own background work ([`OnlineNode::background_queue`]).
 //!
+//! Its HTTP clients (DoH, delegated IPNS, delegated routing, HTTP
+//! providers) all come from one [`Network`] ([`OnlineNodeBuilder::network`];
+//! a legacy network of its own by default), so every request asks that
+//! network's capability first, and an [`Instance`]'s teardown revokes it
+//! before it cancels anything (design 0007, network policy).
+//!
 //! Its caches have fixed capacities, which together are its fixed
 //! reservation ([`OnlineNodeBuilder::fixed_reservation`]): the store's hot
 //! cache, and the small-body and UnixFS metadata caches that all of its
@@ -49,12 +55,13 @@ use axum::Router;
 use freedom_ipfs_core::{BlockProvider, BudgetError, Reservation};
 use freedom_ipfs_namesys::{
     CachedNameResolver, CloudflareDohResolver, DefaultNameResolver, DelegatedIpnsResolver,
-    FallbackIpnsResolver, IpnsResolver, NameResolver,
+    FallbackIpnsResolver, IpnsResolver, NameResolver, DEFAULT_DOH_ENDPOINT,
 };
+use freedom_ipfs_net::{HttpClient, Network, NetworkCapability, NetworkError};
 use freedom_ipfs_retrieval::instance::Fenced;
 use freedom_ipfs_retrieval::{
     BackgroundQueue, CancellationToken, FetchingBlockProvider, InstanceContext, MemoryBudget,
-    SharedLimits,
+    SharedLimits, HTTP_PROVIDER_CLIENT_CONFIG,
 };
 use freedom_ipfs_routing::{
     AutoRoutingClient, DelegatedRoutingClient, DhtIpnsResolver, LightDhtClient,
@@ -94,6 +101,7 @@ pub struct OnlineNodeBuilder {
     shared_limits: Option<SharedLimits>,
     memory_budget: Option<MemoryBudget>,
     progress: Option<ProgressRecorder>,
+    network: Option<Network>,
 }
 
 impl OnlineNodeBuilder {
@@ -159,6 +167,20 @@ impl OnlineNodeBuilder {
         self
     }
 
+    /// The network the node's HTTP clients belong to: each is built by the
+    /// network's one constructor for its policy, and asks the network's
+    /// capability before every request (design 0007, "Network policy").
+    /// Unless set, the node has a [`Network::legacy`] network of its own,
+    /// whose clients are exactly the ones the crates built before.
+    ///
+    /// An [`Instance`]'s teardown revokes the capability first
+    /// ([`Instance::begin_shutdown`]); [`Instance::network_capability`]
+    /// gives a host the handle to revoke it earlier.
+    pub fn network(mut self, network: Network) -> Self {
+        self.network = Some(network);
+        self
+    }
+
     /// The recorder the node's progress goes to (see [`crate::progress`]):
     /// its gateways' requests record into it wherever they are polled.
     ///
@@ -183,8 +205,14 @@ impl OnlineNodeBuilder {
     }
 
     /// Wires the node. This opens no socket and starts no task.
-    pub fn build(self) -> OnlineNode {
-        self.build_with(None)
+    ///
+    /// A client that reqwest refused to build fails each of its requests with
+    /// that error ([`freedom_ipfs_net::HttpError::Unavailable`]); an
+    /// [`Instance`] refuses to start instead.
+    pub fn build(mut self) -> OnlineNode {
+        let network = self.network.take().unwrap_or_else(Network::legacy);
+        let clients = HttpClients::new(&network, self.routing_mode);
+        self.build_with(None, network, clients)
     }
 
     /// Wires the node as an owned [`Instance`] on a runtime of its own (see
@@ -206,6 +234,13 @@ impl OnlineNodeBuilder {
         mut self,
         config: InstanceConfig,
     ) -> Result<Instance, InstanceStartError> {
+        // Its HTTP clients first: a policy reqwest refuses fails the start
+        // before anything is reserved or started.
+        let network = self.network.take().unwrap_or_else(Network::legacy);
+        let clients = HttpClients::new(&network, self.routing_mode);
+        if let Some(err) = clients.error() {
+            return Err(InstanceStartError::Network(err));
+        }
         let fixed = match &self.memory_budget {
             Some(budget) => {
                 let bytes = self.fixed_reservation();
@@ -231,7 +266,8 @@ impl OnlineNodeBuilder {
             .build()
             .map_err(InstanceStartError::Runtime)?;
         let context = InstanceContext::new(runtime.handle().clone());
-        let node = self.build_with(Some(context.clone()));
+        let capability = network.capability().clone();
+        let node = self.build_with(Some(context.clone()), network, clients);
         if let Some(lease) = &fixed {
             // The caches keep it too, for as long as their memory lives.
             node.store.keep_hot_cache_lease(lease.clone());
@@ -241,6 +277,7 @@ impl OnlineNodeBuilder {
             runtime: OwnedRuntime {
                 runtime: Some(runtime),
                 context: context.clone(),
+                capability,
             },
             context,
             node,
@@ -249,7 +286,12 @@ impl OnlineNodeBuilder {
         })
     }
 
-    fn build_with(self, instance: Option<InstanceContext>) -> OnlineNode {
+    fn build_with(
+        self,
+        instance: Option<InstanceContext>,
+        network: Network,
+        clients: HttpClients,
+    ) -> OnlineNode {
         let Self {
             store,
             routing_mode,
@@ -260,7 +302,14 @@ impl OnlineNodeBuilder {
             shared_limits,
             memory_budget,
             progress,
+            network: _,
         } = self;
+        let HttpClients {
+            doh,
+            ipns,
+            routing: routing_http,
+            provider: provider_http,
+        } = clients;
         let routing_stats = RoutingStatsHandle::default();
         // The node's background queue, shared by its retriever and by every
         // gateway built from it.
@@ -282,13 +331,24 @@ impl OnlineNodeBuilder {
                     if let Some(limits) = &shared_limits {
                         dht = dht.with_query_limiter(limits.dht_query_limiter());
                     }
-                    let delegated =
-                        DelegatedRoutingClient::with_endpoints(delegated_routers.clone());
+                    let delegated = match routing_http {
+                        Some(client) => DelegatedRoutingClient::with_endpoints_and_client(
+                            delegated_routers.clone(),
+                            client,
+                        ),
+                        None => DelegatedRoutingClient::with_endpoints(delegated_routers.clone()),
+                    };
+                    let ipns_resolver = |routers: Vec<String>| match ipns.clone() {
+                        Some(client) => {
+                            DelegatedIpnsResolver::with_endpoints_and_client(routers, client)
+                        }
+                        None => DelegatedIpnsResolver::with_endpoints(routers),
+                    };
                     let (routing, ipns): (ProviderRoutingClient, Arc<dyn IpnsResolver>) =
                         match online {
                             RoutingMode::Delegated => (
                                 ProviderRoutingClient::from(delegated),
-                                Arc::new(DelegatedIpnsResolver::with_endpoints(delegated_routers)),
+                                Arc::new(ipns_resolver(delegated_routers)),
                             ),
                             RoutingMode::LightDht => (
                                 ProviderRoutingClient::from(dht.clone()),
@@ -300,13 +360,21 @@ impl OnlineNodeBuilder {
                                     dht.clone(),
                                 )),
                                 Arc::new(FallbackIpnsResolver::new(
-                                    DelegatedIpnsResolver::with_endpoints(delegated_routers),
+                                    ipns_resolver(delegated_routers),
                                     DhtIpnsResolver::new(dht),
                                 )),
                             ),
                         };
                     let name_resolver = CachedNameResolver::new(PersistentNameResolver::new(
-                        DefaultNameResolver::new(CloudflareDohResolver::default(), ipns),
+                        DefaultNameResolver::new(
+                            match doh {
+                                Some(client) => {
+                                    CloudflareDohResolver::with_client(DEFAULT_DOH_ENDPOINT, client)
+                                }
+                                None => CloudflareDohResolver::default(),
+                            },
+                            ipns,
+                        ),
                         store.clone(),
                     ));
                     (routing, Arc::new(name_resolver))
@@ -314,7 +382,8 @@ impl OnlineNodeBuilder {
             };
         let mut provider =
             FetchingBlockProvider::new(store.clone(), routing.with_stats(routing_stats.clone()))
-                .with_background_queue(background.clone());
+                .with_background_queue(background.clone())
+                .with_http_client(provider_http);
         if let Some(instance) = &instance {
             provider = provider.with_instance(instance.clone());
         }
@@ -340,7 +409,44 @@ impl OnlineNodeBuilder {
             shared_limits,
             memory_budget,
             progress,
+            network,
         }
+    }
+}
+
+/// The HTTP clients a node's components send through, each built by its
+/// network's one constructor: one per component, as the crates built them
+/// before, so none shares another's connection pool. A routing mode builds
+/// only what it uses, as before: no namesys or routing client offline, and
+/// no delegated IPNS client for the light DHT.
+struct HttpClients {
+    doh: Option<HttpClient>,
+    ipns: Option<HttpClient>,
+    routing: Option<HttpClient>,
+    provider: HttpClient,
+}
+
+impl HttpClients {
+    fn new(network: &Network, routing_mode: RoutingMode) -> Self {
+        let online = routing_mode != RoutingMode::Offline;
+        let delegated_ipns = matches!(routing_mode, RoutingMode::Auto | RoutingMode::Delegated);
+        Self {
+            doh: online.then(|| network.http_client(freedom_ipfs_namesys::HTTP_CLIENT_CONFIG)),
+            ipns: delegated_ipns
+                .then(|| network.http_client(freedom_ipfs_namesys::HTTP_CLIENT_CONFIG)),
+            routing: online.then(|| network.http_client(freedom_ipfs_routing::HTTP_CLIENT_CONFIG)),
+            provider: network.http_client(HTTP_PROVIDER_CLIENT_CONFIG),
+        }
+    }
+
+    /// The first client reqwest refused to build, if any.
+    fn error(&self) -> Option<NetworkError> {
+        [&self.doh, &self.ipns, &self.routing]
+            .into_iter()
+            .flatten()
+            .chain([&self.provider])
+            .find_map(HttpClient::error)
+            .cloned()
     }
 }
 
@@ -360,6 +466,8 @@ pub enum InstanceStartError {
     FixedReservation { bytes: usize, source: BudgetError },
     /// Its runtime couldn't be started.
     Runtime(std::io::Error),
+    /// One of its HTTP clients couldn't be built for its network's policy.
+    Network(NetworkError),
 }
 
 impl std::fmt::Display for InstanceStartError {
@@ -371,6 +479,7 @@ impl std::fmt::Display for InstanceStartError {
                  doesn't fit in the memory budget: {source}"
             ),
             Self::Runtime(err) => write!(f, "the instance's runtime could not be started: {err}"),
+            Self::Network(err) => write!(f, "the instance's network could not be built: {err}"),
         }
     }
 }
@@ -380,6 +489,7 @@ impl std::error::Error for InstanceStartError {
         match self {
             Self::FixedReservation { source, .. } => Some(source),
             Self::Runtime(err) => Some(err),
+            Self::Network(err) => Some(err),
         }
     }
 }
@@ -388,6 +498,7 @@ impl From<InstanceStartError> for std::io::Error {
     fn from(err: InstanceStartError) -> Self {
         match err {
             InstanceStartError::Runtime(err) => err,
+            InstanceStartError::Network(_) => std::io::Error::other(err),
             other => std::io::Error::new(std::io::ErrorKind::OutOfMemory, other),
         }
     }
@@ -414,6 +525,8 @@ pub struct OnlineNode {
     memory_budget: Option<MemoryBudget>,
     /// The recorder its gateways' requests record into, if any.
     progress: Option<ProgressRecorder>,
+    /// The network its HTTP clients belong to.
+    network: Network,
 }
 
 impl OnlineNode {
@@ -431,6 +544,7 @@ impl OnlineNode {
             shared_limits: None,
             memory_budget: None,
             progress: None,
+            network: None,
         }
     }
 
@@ -528,6 +642,11 @@ impl OnlineNode {
     /// [`OnlineNodeBuilder::progress`].
     pub fn progress(&self) -> Option<&ProgressRecorder> {
         self.progress.as_ref()
+    }
+
+    /// The network its HTTP clients belong to.
+    pub fn network(&self) -> &Network {
+        &self.network
     }
 }
 
@@ -633,10 +752,13 @@ impl Drop for FixedReservation {
 struct OwnedRuntime {
     runtime: Option<Runtime>,
     context: InstanceContext,
+    capability: NetworkCapability,
 }
 
 impl Drop for OwnedRuntime {
     fn drop(&mut self) {
+        // Revoke, then cancel, as a teardown does.
+        self.capability.revoke();
         self.context.cancel();
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_background();
@@ -768,6 +890,21 @@ impl Instance {
         &self.context
     }
 
+    /// The instance's network capability: every HTTP request of the node
+    /// asks it first. Revoking it (the design's teardown step 2) refuses
+    /// every later request, and drops every connection attempt in progress;
+    /// [`Instance::begin_shutdown`] revokes it too, before it cancels
+    /// anything.
+    ///
+    /// [`NetworkCapability::quiesced`] is the step's linearization point:
+    /// once it resolves, no attempt the capability admitted can still open
+    /// a connection. A host that must know that awaits it after revoking,
+    /// before the rest of its teardown; the instance's runtime must still
+    /// run, since the attempts are dropped as they are polled.
+    pub fn network_capability(&self) -> NetworkCapability {
+        self.node.network().capability().clone()
+    }
+
     /// A new request's token: a child of the instance's root.
     pub fn request_token(&self) -> CancellationToken {
         self.context.request_token()
@@ -838,8 +975,11 @@ impl Instance {
     /// OS refuses the teardown thread, the teardown finishes at once,
     /// unproven, and the runtime winds down in the background.
     ///
-    /// Revoking the network capability (the design's step 2) comes with the
-    /// network policy (upstream item 3).
+    /// Before any of that it revokes the network capability (the design's
+    /// step 2), so nothing of the instance can open a connection while the
+    /// rest of it ends; a host may have revoked it earlier, and awaited its
+    /// quiescence ([`Instance::network_capability`]). Connections already
+    /// open end with the rest of the instance.
     pub fn begin_shutdown(self, drain: Duration) -> Teardown {
         let Instance {
             runtime,
@@ -848,6 +988,7 @@ impl Instance {
             fixed,
             progress: _,
         } = self;
+        node.network().revoke();
         context.cancel();
         let done = Arc::new((Mutex::new(None), Condvar::new()));
         let teardown = Teardown { done: done.clone() };
@@ -932,6 +1073,50 @@ pub fn delegated_router_endpoints(delegated_routers: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_nodes_http_clients_are_its_networks_one_per_component() {
+        let network = Network::legacy();
+        let namesys = freedom_ipfs_namesys::HTTP_CLIENT_CONFIG;
+        let routing = freedom_ipfs_routing::HTTP_CLIENT_CONFIG;
+        for (mode, delegated_ipns) in [
+            (RoutingMode::Auto, true),
+            (RoutingMode::Delegated, true),
+            (RoutingMode::LightDht, false),
+            (RoutingMode::Offline, false),
+        ] {
+            let online = mode != RoutingMode::Offline;
+            let clients = HttpClients::new(&network, mode);
+            let config = |client: &Option<HttpClient>| client.as_ref().map(HttpClient::config);
+            assert_eq!(config(&clients.doh), online.then_some(namesys), "{mode:?}");
+            assert_eq!(
+                config(&clients.ipns),
+                delegated_ipns.then_some(namesys),
+                "{mode:?}"
+            );
+            assert_eq!(
+                config(&clients.routing),
+                online.then_some(routing),
+                "{mode:?}"
+            );
+            assert_eq!(clients.provider.config(), HTTP_PROVIDER_CLIENT_CONFIG);
+            assert!(clients.error().is_none());
+        }
+        // Every client asks the network's capability.
+        let clients = HttpClients::new(&network, RoutingMode::Auto);
+        network.revoke();
+        for client in [
+            clients.doh,
+            clients.ipns,
+            clients.routing,
+            Some(clients.provider),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(client.capability().is_revoked());
+        }
+    }
     use crate::GatewayCoreRequest;
     use axum::body::to_bytes;
     use axum::http::{HeaderMap, Method, StatusCode};

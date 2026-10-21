@@ -22,6 +22,7 @@ use freedom_ipfs_core::{
     Result as CoreResult, CODEC_DAG_PB, DEFAULT_MAX_BLOCK_SIZE, HASH_IDENTITY, HASH_SHA2_256,
 };
 use freedom_ipfs_namesys::{CloudflareDohResolver, DnsTxtResolver};
+use freedom_ipfs_net::{ClientConfig, HttpClient, HttpError};
 use freedom_ipfs_routing::{Provider, ProviderRoutingClient};
 use freedom_ipfs_store::{CachedProviderRecord, SqliteBlockStore};
 use futures::future::{join_all, BoxFuture, FutureExt, WeakShared};
@@ -64,6 +65,9 @@ const PROVIDER_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const BAD_HTTP_PROVIDER_TTL: Duration = Duration::from_secs(10 * 60);
 const BAD_BITSWAP_PROVIDER_TTL: Duration = Duration::from_secs(30);
 const HTTP_PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
+/// The HTTP provider client's configuration: a 20 s timeout, and no
+/// redirect followed.
+pub const HTTP_PROVIDER_CLIENT_CONFIG: ClientConfig = ClientConfig::new(HTTP_PROVIDER_TIMEOUT, 0);
 const HTTP_PROVIDER_RACE_WIDTH: usize = 2;
 const HTTP_PROVIDER_HEDGE_AFTER: Duration = Duration::from_millis(250);
 const SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER: Duration = Duration::from_millis(200);
@@ -307,6 +311,10 @@ pub enum RetrievalError {
     Routing(#[from] freedom_ipfs_routing::RoutingError),
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
+    /// The request wasn't sent: the network's capability is revoked, or
+    /// its client couldn't be built.
+    #[error("http: {0}")]
+    Network(HttpError),
     #[error("core: {0}")]
     Core(#[from] freedom_ipfs_core::CoreError),
     #[error("store: {0}")]
@@ -344,6 +352,15 @@ impl RetrievalError {
 }
 
 pub type Result<T> = std::result::Result<T, RetrievalError>;
+
+impl From<HttpError> for RetrievalError {
+    fn from(err: HttpError) -> Self {
+        match err {
+            HttpError::Http(err) => Self::Http(err),
+            other => Self::Network(other),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetrievalSource {
@@ -397,7 +414,7 @@ impl RetrievalStatsInner {
 
 #[derive(Clone)]
 pub struct HttpRetriever {
-    client: reqwest::Client,
+    client: HttpClient,
     routing: ProviderRoutingClient,
     store: SqliteBlockStore,
     bitswap: Arc<tokio::sync::Mutex<Option<SharedBitswapClient>>>,
@@ -559,7 +576,7 @@ impl HttpRetriever {
     pub fn new(routing: impl Into<ProviderRoutingClient>, store: SqliteBlockStore) -> Self {
         let http_provider_fetch_limit = max_concurrent_http_provider_fetches();
         Self {
-            client: timeout_http_client(HTTP_PROVIDER_TIMEOUT),
+            client: HttpClient::legacy(HTTP_PROVIDER_CLIENT_CONFIG),
             routing: routing.into(),
             store,
             bitswap: Arc::new(tokio::sync::Mutex::new(None)),
@@ -605,6 +622,14 @@ impl HttpRetriever {
     /// limits.
     pub fn with_shared_limits(self, limits: SharedLimits) -> Self {
         self.with_accounting(|accounting| accounting.limits = Some(limits))
+    }
+
+    /// Fetches from HTTP providers through `client`: a network's client for
+    /// [`HTTP_PROVIDER_CLIENT_CONFIG`], whose capability every request asks.
+    /// Without this, the retriever has a legacy client of its own.
+    pub fn with_http_client(mut self, client: HttpClient) -> Self {
+        self.client = client;
+        self
     }
 
     /// Puts the retriever's background work in `queue`, its instance's, in
@@ -5735,6 +5760,13 @@ impl FetchingBlockProvider {
     pub fn with_instance(mut self, instance: InstanceContext) -> Self {
         self.retriever = self.retriever.with_instance(instance.clone());
         self.instance = Some(instance);
+        self
+    }
+
+    /// Fetches from HTTP providers through `client` (see
+    /// [`HttpRetriever::with_http_client`]).
+    pub fn with_http_client(mut self, client: HttpClient) -> Self {
+        self.retriever = self.retriever.with_http_client(client);
         self
     }
 
@@ -12321,15 +12353,6 @@ where
 
 fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
-}
-
-fn timeout_http_client(timeout: Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(timeout)
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("HTTP provider client config is valid")
 }
 
 /// A Bitswap answer as a fetch decodes it: only the fields it reads, every

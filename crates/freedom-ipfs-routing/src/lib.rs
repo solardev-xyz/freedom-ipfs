@@ -2,6 +2,7 @@ use cid::Cid;
 use freedom_ipfs_namesys::{
     ipns_dht_record_key, verify_ipns_record, IpnsRecord, IpnsResolver, NamesysError,
 };
+use freedom_ipfs_net::{ClientConfig, HttpClient, HttpError};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use libp2p::kad::{
@@ -64,6 +65,10 @@ const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
 pub enum RoutingError {
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
+    /// The request wasn't sent: the network's capability is revoked, or
+    /// its client couldn't be built.
+    #[error("http: {0}")]
+    Network(HttpError),
     #[error("invalid router response: {0}")]
     InvalidResponse(String),
     #[error("invalid provider url: {0}")]
@@ -73,6 +78,22 @@ pub enum RoutingError {
 }
 
 pub type Result<T> = std::result::Result<T, RoutingError>;
+
+impl From<HttpError> for RoutingError {
+    fn from(err: HttpError) -> Self {
+        match err {
+            HttpError::Http(err) => Self::Http(err),
+            other => Self::Network(other),
+        }
+    }
+}
+
+/// The delegated routing client's configuration: a 10 s timeout, and
+/// reqwest's default redirects.
+pub const HTTP_CLIENT_CONFIG: ClientConfig = ClientConfig::new(
+    DEFAULT_DELEGATED_ROUTING_TIMEOUT,
+    ClientConfig::REQWEST_DEFAULT_REDIRECTS,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provider {
@@ -321,7 +342,7 @@ impl From<LightDhtClient> for ProviderRoutingClient {
 #[derive(Debug, Clone)]
 pub struct DelegatedRoutingClient {
     endpoints: Vec<String>,
-    client: reqwest::Client,
+    client: HttpClient,
 }
 
 impl Default for DelegatedRoutingClient {
@@ -340,6 +361,16 @@ impl DelegatedRoutingClient {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        Self::with_endpoints_and_client(endpoints, HttpClient::legacy(HTTP_CLIENT_CONFIG))
+    }
+
+    /// A client for `endpoints` that sends through `client`: a network's
+    /// client for [`HTTP_CLIENT_CONFIG`], whose capability every lookup asks.
+    pub fn with_endpoints_and_client<I, S>(endpoints: I, client: HttpClient) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let mut endpoints = endpoints
             .into_iter()
             .map(|endpoint| endpoint.into().trim_end_matches('/').to_string())
@@ -348,10 +379,7 @@ impl DelegatedRoutingClient {
         if endpoints.is_empty() {
             endpoints.push(DEFAULT_DELEGATED_ROUTER.to_string());
         }
-        Self {
-            endpoints,
-            client: timeout_http_client(DEFAULT_DELEGATED_ROUTING_TIMEOUT),
-        }
+        Self { endpoints, client }
     }
 
     pub async fn providers(&self, cid: &Cid) -> Result<Vec<Provider>> {
@@ -1832,14 +1860,6 @@ fn http_url_from_multiaddr(addr: &str) -> Result<Option<Url>> {
     Url::parse(&url)
         .map(Some)
         .map_err(|_| RoutingError::InvalidProviderUrl(addr.to_string()))
-}
-
-fn timeout_http_client(timeout: Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(timeout)
-        .timeout(timeout)
-        .build()
-        .expect("delegated routing HTTP client config is valid")
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ bytes.workspace = true
 cid.workspace = true
 freedom-ipfs-core.workspace = true
 freedom-ipfs-namesys.workspace = true
+freedom-ipfs-net.workspace = true
 freedom-ipfs-routing.workspace = true
 freedom-ipfs-store.workspace = true
 futures.workspace = true

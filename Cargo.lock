@@ -928,6 +928,7 @@ dependencies = [
  "clap",
  "freedom-ipfs-core",
  "freedom-ipfs-namesys",
+ "freedom-ipfs-net",
  "freedom-ipfs-retrieval",
  "freedom-ipfs-routing",
  "freedom-ipfs-store",
@@ -973,6 +974,7 @@ version = "0.4.6"
 dependencies = [
  "async-trait",
  "cid",
+ "freedom-ipfs-net",
  "futures",
  "ipld-core",
  "libp2p-identity",
@@ -997,8 +999,11 @@ dependencies = [
  "libp2p-tcp",
  "multiaddr",
  "reqwest",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
+ "tower-layer",
+ "tower-service",
  "url",
 ]
 
@@ -1010,6 +1015,7 @@ dependencies = [
  "cid",
  "freedom-ipfs-core",
  "freedom-ipfs-namesys",
+ "freedom-ipfs-net",
  "freedom-ipfs-routing",
  "freedom-ipfs-store",
  "futures",
@@ -1037,6 +1043,7 @@ dependencies = [
  "async-trait",
  "cid",
  "freedom-ipfs-namesys",
+ "freedom-ipfs-net",
  "futures",
  "ipld-core",
  "libp2p",
