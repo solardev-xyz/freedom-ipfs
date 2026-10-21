@@ -519,6 +519,124 @@ async fn an_ipv6_literal_waits_for_nat64_discovery() {
     );
 }
 
+/// The operation's deadline passing while an IP literal waits for NAT64
+/// discovery is a timeout, not a refusal: the gateway answers 504, as for
+/// reqwest's own timeout (#46 review, 46-m3).
+#[tokio::test]
+async fn a_deadline_passing_during_the_nat64_wait_is_a_timeout() {
+    let (_publisher, handle) = Nat64Handle::channel(Nat64State::Pending);
+    let client =
+        checked_with(&[], handle).http_client(ClientConfig::new(Duration::from_millis(30), 0));
+    let result = get(&client, "http://[2a00:1::1]:9/").await;
+    let Err(err) = result else {
+        panic!("{result:?}");
+    };
+    assert!(matches!(err, HttpError::Timeout), "{err:?}");
+    assert!(err.is_timeout());
+    assert!(err.to_string().contains("timed out"), "{err}");
+}
+
+/// A literal's wait for NAT64 discovery ends after the network is revoked:
+/// the hop is refused as revoked, whatever discovery then says (#46 review,
+/// 46-M1).
+#[tokio::test]
+async fn revoked_during_a_literals_nat64_wait_sends_nothing() {
+    let (publisher, handle) = Nat64Handle::channel(Nat64State::Pending);
+    let network = checked_with(&[], handle);
+    let client = network.http_client(PROVIDER);
+    let request = tokio::spawn(async move { get(&client, "http://[2a00:1::1]:9/").await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!request.is_finished(), "the hop waits for discovery");
+    network.revoke();
+    publisher.publish(Nat64State::NONE);
+    let result = request.await.unwrap();
+    assert!(matches!(result, Err(HttpError::Revoked(_))), "{result:?}");
+}
+
+/// Userinfo in the request's own URL is refused before reqwest reads it,
+/// which would send it as `Authorization` (#46 review, 46-m1).
+#[tokio::test]
+async fn userinfo_in_the_first_url_is_refused_before_anything_is_sent() {
+    let server = Server::ok();
+    for network in [unchecked(&[]), checked(&[server.url("/")])] {
+        let client = network.http_client(ROUTING);
+        for raw in [
+            format!("http://user:pw@127.0.0.1:{}/", server.port),
+            format!("http://user@127.0.0.1:{}/", server.port),
+        ] {
+            let result = get(&client, &raw).await;
+            assert!(
+                is_refused(&result, |r| matches!(r, Refused::Target(Refusal::Userinfo))),
+                "{raw}: {result:?}"
+            );
+        }
+    }
+    assert_eq!(server.connections(), 0);
+    assert!(server.seen().is_empty());
+}
+
+/// A caller's own `Referer` is never sent, on the first request or on a
+/// redirected one (#46 review, 46-m2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_callers_referer_is_never_sent() {
+    let other = Server::ok();
+    let destination = other.url("/landed");
+    let router = Server::start(move |path| {
+        if path == "/hop" {
+            redirect(destination.clone())
+        } else {
+            (200, None)
+        }
+    });
+    let client = unchecked(&[]).http_client(ROUTING);
+    for path in ["/", "/hop"] {
+        client
+            .get(router.url(path))
+            .header("referer", "https://private.example/path")
+            .send()
+            .await
+            .unwrap();
+    }
+    let seen: Vec<Seen> = router.seen().into_iter().chain(other.seen()).collect();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert!(
+        seen.iter().all(|seen| seen.header("referer").is_none()),
+        "{seen:?}"
+    );
+}
+
+/// A caller's own `Host` doesn't follow a hop to another authority: each
+/// hop's `Host` is its target's (#46 adversarial review, P3).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_host_header_is_rebuilt_for_each_hop() {
+    let other = Server::ok();
+    let destination = other.url("/landed");
+    let router = Server::start(move |_| redirect(destination.clone()));
+    let client = unchecked(&[]).http_client(ROUTING);
+    client
+        .get(router.url("/"))
+        .header("host", "elsewhere.example")
+        .send()
+        .await
+        .unwrap();
+    let router_host = format!("127.0.0.1:{}", router.port);
+    let other_host = format!("127.0.0.1:{}", other.port);
+    assert_eq!(router.seen()[0].header("host"), Some(router_host.as_str()));
+    assert_eq!(other.seen()[0].header("host"), Some(other_host.as_str()));
+}
+
+/// A timeout too long to be a deadline is none, and doesn't panic (#46
+/// adversarial review, P3).
+#[tokio::test]
+async fn a_timeout_too_long_for_a_deadline_doesnt_panic() {
+    let server = Server::ok();
+    let client = unchecked(&[]).http_client(ClientConfig::new(Duration::MAX, 10));
+    assert_eq!(get(&client, &server.url("/")).await.unwrap(), 200);
+    let (_publisher, handle) = Nat64Handle::channel(Nat64State::NONE);
+    let client = checked_with(&[], handle).http_client(ClientConfig::new(Duration::MAX, 0));
+    assert!(get(&client, "http://127.0.0.1:9/").await.is_err());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_systems_resolver_reaches_a_configured_name() {
     // The real resolver (hickory, over the system's configuration):
