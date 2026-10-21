@@ -266,9 +266,10 @@ impl Network {
     }
 
     /// What the network may dial, as candidate choice and address expansion
-    /// ask it (design 0007, checks 1 and 2).
+    /// ask it (design 0007, checks 1 and 2): every check asks this network's
+    /// capability first.
     pub fn dial_policy(&self) -> DialPolicy {
-        DialPolicy::for_policy(&self.inner.policy)
+        DialPolicy::for_network(&self.inner.policy, &self.inner.capability)
     }
 
     /// The transports the network's dials can use.

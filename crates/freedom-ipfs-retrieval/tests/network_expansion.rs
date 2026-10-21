@@ -27,7 +27,7 @@ use multihash::Multihash;
 use url::Url;
 
 /// A DoH server answering from a table of `(name, type)` to answer data,
-/// recording every query.
+/// recording every query. An answer `CNAME <target>` is an alias record.
 struct Doh {
     port: u16,
     queries: Arc<Mutex<Vec<(String, String)>>>,
@@ -79,8 +79,13 @@ impl Doh {
                         .cloned()
                         .unwrap_or_default()
                         .into_iter()
-                        .map(|data| {
-                            serde_json::json!({ "type": record_type, "TTL": 60, "data": data })
+                        .map(|data| match data.strip_prefix("CNAME ") {
+                            Some(target) => {
+                                serde_json::json!({ "type": 5, "TTL": 60, "data": target })
+                            }
+                            None => {
+                                serde_json::json!({ "type": record_type, "TTL": 60, "data": data })
+                            }
                         })
                         .collect::<Vec<_>>();
                     let body = serde_json::json!({ "Status": 0, "Answer": answer }).to_string();
@@ -399,5 +404,169 @@ async fn providers_from_routing_and_from_the_cache_are_admitted_too() {
         .await;
         fetch.abort();
         assert_eq!(reached, dialed, "from the cache");
+    }
+}
+
+/// A configured name and port keep their exemption through expansion
+/// (#47 review, 47-M3): the configured name's loopback answer is dialed with
+/// checked addresses, as without them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_configured_names_answer_is_dialed_with_checked_addresses() {
+    let canary = Canary::start();
+    let peer = peer();
+    let doh = Doh::start(HashMap::from([(
+        ("configured.example".to_string(), "1".to_string()),
+        vec!["127.0.0.1".to_string()],
+    )]));
+    let addrs = vec![format!(
+        "/dns4/configured.example/tcp/{}/p2p/{peer}",
+        canary.port
+    )];
+    let control = fetch(&network(&doh, Addresses::Unchecked), peer, addrs.clone());
+    let reached = wait_until(Duration::from_secs(10), || canary.accepted() > 0).await;
+    control.abort();
+    assert!(reached, "the control never dialed the answer");
+
+    let mut configured = ConfiguredTargets::new();
+    configured
+        .add_url(&Url::parse(&format!("http://configured.example:{}/", canary.port)).unwrap())
+        .unwrap();
+    let gated =
+        Network::new(NetworkPolicy::direct(configured, doh.url(), checked()).unwrap()).unwrap();
+    let before = canary.accepted();
+    let allowed = fetch(&gated, peer, addrs);
+    let reached = wait_until(Duration::from_secs(10), || canary.accepted() > before).await;
+    allowed.abort();
+    assert!(reached, "the configured name's answer was refused");
+}
+
+/// Once the network is revoked, checks 1 and 2 admit nothing (#47 review,
+/// 47-M2): a fresh retriever of the revoked network never dials, where the
+/// same fetch before the revoke did.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoked_network_admits_no_candidate() {
+    let canary = Canary::start();
+    let peer = peer();
+    let doh = Doh::start(HashMap::new());
+    let network = network(&doh, Addresses::Unchecked);
+    let addrs = vec![format!("/ip4/127.0.0.1/tcp/{}/p2p/{peer}", canary.port)];
+    let control = fetch(&network, peer, addrs.clone());
+    let reached = wait_until(Duration::from_secs(10), || canary.accepted() > 0).await;
+    control.abort();
+    assert!(reached, "the control never dialed");
+
+    network.revoke();
+    let check = network.dial_policy().check_now(&addrs[0].parse().unwrap());
+    assert!(
+        matches!(check, Err(freedom_ipfs_net::DialRefusal::Revoked(_))),
+        "{check:?}"
+    );
+    let before = canary.accepted();
+    let refused = fetch(&network, peer, addrs);
+    let reached = wait_until(Duration::from_secs(3), || canary.accepted() > before).await;
+    refused.abort();
+    assert!(!reached, "a revoked network's candidate was dialed");
+}
+
+fn dns4_provider(name: &str, port: u16, peer: PeerId) -> String {
+    format!("/dns4/{name}/tcp/{port}/p2p/{peer}")
+}
+
+fn dnsaddr_provider(name: &str, _: u16, peer: PeerId) -> String {
+    format!("/dnsaddr/{name}/p2p/{peer}")
+}
+
+/// An alias is an expansion result (#47 adversarial review, 47-A1): its
+/// target is classified before it is followed, for A and TXT lookups alike.
+/// An onion alias is refused with no query for it, and nothing is dialed;
+/// an ordinary alias, the control, still resolves and is dialed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_alias_is_classified_before_it_is_followed() {
+    for lookup in ["A", "TXT"] {
+        let canary = Canary::start();
+        let peer = peer();
+        let port = canary.port;
+        let record = |target: &str| {
+            (
+                (target.to_string(), "1".to_string()),
+                vec!["127.0.0.1".to_string()],
+            )
+        };
+        let txt = |name: &str| {
+            (
+                (name.to_string(), "TXT".to_string()),
+                vec![format!("\"dnsaddr=/ip4/127.0.0.1/tcp/{port}/p2p/{peer}\"")],
+            )
+        };
+        let (provider, alias_query, onion_query, answers) = match lookup {
+            "A" => (
+                dns4_provider as fn(&str, u16, PeerId) -> String,
+                "1",
+                ("secret.onion", "1"),
+                HashMap::from([
+                    (
+                        ("hidden.example".to_string(), "1".to_string()),
+                        vec!["CNAME secret.onion.".to_string()],
+                    ),
+                    (
+                        ("plain.example".to_string(), "1".to_string()),
+                        vec!["CNAME target.example.".to_string()],
+                    ),
+                    record("target.example"),
+                    record("secret.onion"),
+                ]),
+            ),
+            _ => (
+                dnsaddr_provider as fn(&str, u16, PeerId) -> String,
+                "TXT",
+                ("_dnsaddr.secret.onion", "TXT"),
+                HashMap::from([
+                    (
+                        ("_dnsaddr.hidden.example".to_string(), "TXT".to_string()),
+                        vec!["CNAME _dnsaddr.secret.onion.".to_string()],
+                    ),
+                    (
+                        ("_dnsaddr.plain.example".to_string(), "TXT".to_string()),
+                        vec!["CNAME _dnsaddr.target.example.".to_string()],
+                    ),
+                    txt("_dnsaddr.target.example"),
+                    txt("_dnsaddr.secret.onion"),
+                ]),
+            ),
+        };
+        let doh = Doh::start(answers);
+        let network = network(&doh, Addresses::Unchecked);
+
+        let control = fetch(&network, peer, vec![provider("plain.example", port, peer)]);
+        let reached = wait_until(Duration::from_secs(10), || canary.accepted() > 0).await;
+        control.abort();
+        assert!(
+            reached,
+            "{lookup}: the ordinary alias's answer wasn't dialed"
+        );
+        assert!(doh.queries().iter().any(|(_, kind)| kind == alias_query));
+
+        let before = canary.accepted();
+        let hidden = fetch(&network, peer, vec![provider("hidden.example", port, peer)]);
+        let queried = wait_until(Duration::from_secs(5), || {
+            doh.queries()
+                .iter()
+                .any(|(name, _)| name.contains("hidden.example"))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        hidden.abort();
+        assert!(queried, "{lookup}: the alias itself was asked for");
+        assert!(
+            !doh.queries()
+                .contains(&(onion_query.0.to_string(), onion_query.1.to_string())),
+            "{lookup}: the onion alias was queried: {:?}",
+            doh.queries()
+        );
+        assert_eq!(
+            canary.accepted(),
+            before,
+            "{lookup}: the onion alias's answer was dialed"
+        );
     }
 }

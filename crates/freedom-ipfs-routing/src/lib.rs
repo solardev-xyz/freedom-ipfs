@@ -1196,7 +1196,7 @@ fn bitswap_provider_diversity(providers: &[Provider], policy: &DialPolicy) -> us
 /// transport, and with checked addresses an IP literal's address (an IPv6
 /// one isn't counted while NAT64 discovery is pending).
 fn policy_admits(addr: &str, policy: &DialPolicy) -> bool {
-    !policy.is_gated()
+    policy.admits_everything()
         || Multiaddr::from_str(addr).is_ok_and(|addr| policy.check_now(&addr).is_ok())
 }
 
@@ -1621,7 +1621,7 @@ fn supported_direct_bitswap_multiaddr(
         Ok(addr) => addr,
         Err(_) => return false,
     };
-    if policy.is_gated() && policy.check_now(&multiaddr).is_err() {
+    if !policy.admits_everything() && policy.check_now(&multiaddr).is_err() {
         return false;
     }
     let addr_peer = match multiaddr.iter().last() {

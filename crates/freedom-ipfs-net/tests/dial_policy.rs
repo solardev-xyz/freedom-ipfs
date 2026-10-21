@@ -317,3 +317,136 @@ fn a_providers_url_is_the_target_the_gate_judged() {
         assert_eq!(classify_dialed(&multiaddr(text)).unwrap().http_url(), None);
     }
 }
+
+/// Every check asks the network's capability first, in every mode (#47
+/// review, 47-M2): once revoked, nothing is admitted; a wait for NAT64
+/// discovery ends at the revoke.
+#[tokio::test]
+async fn a_revoked_network_admits_nothing() {
+    let (_publisher, handle) = Nat64Handle::channel(Nat64State::Pending);
+    for network in [
+        Network::legacy(),
+        Network::new(NetworkPolicy::direct(configured(&[]), doh(), Addresses::Unchecked).unwrap())
+            .unwrap(),
+        Network::with_lookup(
+            NetworkPolicy::direct(configured(&[]), doh(), Addresses::Checked(handle.clone()))
+                .unwrap(),
+            None,
+        ),
+    ] {
+        let policy = network.dial_policy();
+        let public = multiaddr("/ip4/8.8.8.8/tcp/4001");
+        let url = Url::parse("https://example.com/").unwrap();
+        assert_eq!(policy.check_now(&public), Ok(()));
+        assert!(policy.admits_everything() || policy.is_gated());
+        network.revoke();
+        let revoked =
+            |result: Result<(), DialRefusal>| matches!(result, Err(DialRefusal::Revoked(_)));
+        assert!(!policy.admits_everything());
+        assert!(revoked(policy.check_now(&public)));
+        assert!(revoked(policy.check(&public, soon()).await));
+        assert!(revoked(
+            policy
+                .check_answer(
+                    &multiaddr("/dns4/a.example/tcp/1"),
+                    "8.8.8.8".parse().unwrap(),
+                    soon()
+                )
+                .await
+        ));
+        assert!(revoked(
+            policy.check_answer_now(&multiaddr("/dns4/a.example/tcp/1"), &public)
+        ));
+        assert!(revoked(policy.check_url_now(&url)));
+        assert!(revoked(policy.check_url(&url, soon()).await));
+        assert!(matches!(
+            policy.settled(&[public], soon()).await,
+            Err(DialRefusal::Revoked(_))
+        ));
+    }
+
+    // Revoked while an IPv6 address waits for discovery: the wait ends, and
+    // the address isn't admitted.
+    let network = Network::with_lookup(
+        NetworkPolicy::direct(configured(&[]), doh(), Addresses::Checked(handle)).unwrap(),
+        None,
+    );
+    let policy = network.dial_policy();
+    let waiting = tokio::spawn(async move {
+        policy
+            .check(&multiaddr("/ip6/2a00:1::1/tcp/4001"), soon())
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!waiting.is_finished());
+    assert_eq!(network.capability().permits(), 1);
+    network.revoke();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the wait ends at the revoke")
+            .unwrap(),
+        Err(DialRefusal::Revoked(_))
+    ));
+}
+
+/// A settled policy judges every check against the one state it froze.
+#[tokio::test]
+async fn a_settled_policy_freezes_the_state_it_waited_for() {
+    let (publisher, handle) = Nat64Handle::channel(Nat64State::Pending);
+    let policy = checked_with(&[], handle);
+    let waiting = multiaddr("/ip6/2a00:1:2:3:a9:fea9:fe00:0/tcp/4001");
+    let fixed = multiaddr("/ip6/2002:808:808:7f00:0:100::/tcp/4001");
+    let settling = {
+        let policy = policy.clone();
+        let addrs = [waiting.clone(), fixed.clone()];
+        tokio::spawn(async move { policy.settled(&addrs, soon()).await })
+    };
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!settling.is_finished(), "it waits for discovery");
+    let overlap =
+        freedom_ipfs_net::gate::Nat64Prefix::new("2002:808:808::".parse().unwrap(), 48).unwrap();
+    publisher.publish(Nat64State::known([overlap]));
+    let settled = settling.await.unwrap().unwrap();
+    // The learned prefix makes the 6to4 address loopback: refused.
+    assert!(settled.check_now(&fixed).is_err());
+    // Discovery moves on; the settled copy doesn't.
+    publisher.publish(Nat64State::NONE);
+    assert!(settled.check_now(&fixed).is_err());
+    assert_eq!(policy.check_now(&fixed), Ok(()));
+}
+
+/// An answer keeps its name's configured exemption, for that name and port
+/// only: the same address under another name or port, or as a literal, is
+/// judged as untrusted (#47 review, 47-M3).
+#[test]
+fn an_answers_exemption_is_its_configured_names_only() {
+    let policy = checked(&["http://configured.example:4001/"]);
+    let answer = multiaddr("/ip4/127.0.0.1/tcp/4001");
+    assert_eq!(
+        policy.check_answer_now(&multiaddr("/dns4/configured.example/tcp/4001"), &answer),
+        Ok(())
+    );
+    for original in [
+        "/dns4/other.example/tcp/4001",
+        "/dns4/configured.example/tcp/4002",
+        "/ip4/127.0.0.1/tcp/4001",
+    ] {
+        assert!(
+            matches!(
+                policy.check_answer_now(&multiaddr(original), &answer),
+                Err(DialRefusal::Address(_))
+            ),
+            "{original}"
+        );
+    }
+    assert!(policy.check_now(&answer).is_err());
+    // The answer's own shape is still checked.
+    assert!(matches!(
+        policy.check_answer_now(
+            &multiaddr("/dns4/configured.example/tcp/4001"),
+            &multiaddr("/ip4/8.8.8.8/ip4/127.0.0.1/tcp/4001")
+        ),
+        Err(DialRefusal::Target(_))
+    ));
+}

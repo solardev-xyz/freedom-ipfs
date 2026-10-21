@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use cid::Cid;
-use freedom_ipfs_net::{ClientConfig, HttpClient, HttpError};
+use freedom_ipfs_net::gate::{classify_host, Refusal, Target};
+use freedom_ipfs_net::{ClientConfig, HttpClient, HttpError, Refused};
 use futures::stream::{FuturesUnordered, StreamExt};
 use ipld_core::ipld::Ipld;
 use libp2p_identity::{PeerId, PublicKey};
@@ -284,6 +285,25 @@ impl CloudflareDohResolver {
             .map_err(NamesysError::from)
     }
 
+    /// Under a gated network policy (`direct`), a name this resolver is
+    /// asked, or a CNAME's target it would follow, is classified first
+    /// (design 0007, check 2: an alias is an expansion result): an onion, an
+    /// IP literal or an invalid name is refused before any query for it.
+    /// Under the legacy policy names and aliases are queried as before.
+    fn admit_name(&self, name: &str) -> Result<String> {
+        let name = name.trim_end_matches('.').to_string();
+        if !self.client.network().dial_policy().is_gated() {
+            return Ok(name);
+        }
+        let refused = |refused: Refused| Err(NamesysError::Network(HttpError::Refused(refused)));
+        match classify_host(&name) {
+            Ok(Target::Name(_)) => Ok(name),
+            Ok(Target::Onion(_)) => refused(Refused::Onion),
+            Ok(Target::Ip(_)) => refused(Refused::Target(Refusal::InvalidHost)),
+            Err(refusal) => refused(Refused::Target(refusal)),
+        }
+    }
+
     pub async fn ip_lookup(&self, name: &str) -> Result<Vec<IpAddr>> {
         let mut addrs = self.ip_lookup_type(name, DNS_TYPE_A).await?;
         addrs.extend(self.ip_lookup_type(name, DNS_TYPE_AAAA).await?);
@@ -293,7 +313,7 @@ impl CloudflareDohResolver {
     }
 
     async fn ip_lookup_type(&self, name: &str, record_type: u16) -> Result<Vec<IpAddr>> {
-        let mut current = name.trim_end_matches('.').to_string();
+        let mut current = self.admit_name(name)?;
         let record_type_query = record_type.to_string();
 
         for _ in 0..=MAX_DOH_CNAME_DEPTH {
@@ -323,7 +343,7 @@ impl CloudflareDohResolver {
             let Some(cname) = answers.iter().find(|answer| answer.is_cname()) else {
                 return Ok(Vec::new());
             };
-            current = cname.data.trim_end_matches('.').to_string();
+            current = self.admit_name(&cname.data)?;
         }
 
         Ok(Vec::new())
@@ -342,7 +362,7 @@ impl DnsTxtResolver for CloudflareDohResolver {
     }
 
     async fn txt_lookup_with_ttl(&self, name: &str) -> Result<Vec<DnsTxtRecord>> {
-        let mut current = name.trim_end_matches('.').to_string();
+        let mut current = self.admit_name(name)?;
         let mut cname_ttl = None;
 
         for _ in 0..=MAX_DOH_CNAME_DEPTH {
@@ -364,7 +384,7 @@ impl DnsTxtResolver for CloudflareDohResolver {
                 return Ok(Vec::new());
             };
             cname_ttl = min_ttl(cname_ttl, cname.ttl.map(Duration::from_secs));
-            current = cname.data.trim_end_matches('.').to_string();
+            current = self.admit_name(&cname.data)?;
         }
 
         Err(NamesysError::NotFound(name.to_string()))
@@ -1108,6 +1128,88 @@ mod tests {
                 Duration::from_secs(60)
             )]
         );
+    }
+
+    /// Under `direct`, a DNSLink lookup's alias is classified before it is
+    /// followed (#47 adversarial review, 47-A1): an onion alias is refused
+    /// with no query for it. The legacy policy follows it, as before.
+    #[tokio::test]
+    async fn an_onion_alias_is_refused_under_direct_and_followed_under_legacy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = asked.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                let len = tokio::io::AsyncReadExt::read(&mut stream, &mut request)
+                    .await
+                    .unwrap();
+                let request = String::from_utf8_lossy(&request[..len]).to_string();
+                let line = request.lines().next().unwrap_or("").to_string();
+                recorded.lock().unwrap().push(line.clone());
+                let body = if line.contains("name=_dnslink.example.test") {
+                    r#"{"Answer":[{"data":"_dnslink.secret.onion.","TTL":60,"type":5}]}"#
+                } else {
+                    r#"{"Answer":[{"data":"\"dnslink=/ipfs/bafkqaddwgevxmmraojswg33smq\"","TTL":300,"type":16}]}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/dns-json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let endpoint = format!("http://127.0.0.1:{}/dns-query", addr.port());
+        let direct = freedom_ipfs_net::Network::new(
+            freedom_ipfs_net::NetworkPolicy::direct(
+                freedom_ipfs_net::gate::ConfiguredTargets::new(),
+                freedom_ipfs_net::gate::parse_url(&endpoint).unwrap(),
+                freedom_ipfs_net::Addresses::Unchecked,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let onion_asked = || {
+            asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("secret.onion"))
+        };
+
+        let resolver =
+            CloudflareDohResolver::with_client(&endpoint, direct.http_client(HTTP_CLIENT_CONFIG));
+        let err = resolver
+            .txt_lookup_with_ttl("_dnslink.example.test")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NamesysError::Network(HttpError::Refused(freedom_ipfs_net::Refused::Onion))
+            ),
+            "{err:?}"
+        );
+        assert!(!onion_asked());
+        // Asked directly for an onion name: refused, and not asked either.
+        assert!(resolver.ip_lookup("x.onion").await.is_err());
+        assert!(!onion_asked());
+
+        let legacy = CloudflareDohResolver::with_client(
+            &endpoint,
+            freedom_ipfs_net::Network::legacy().http_client(HTTP_CLIENT_CONFIG),
+        );
+        let records = legacy
+            .txt_lookup_with_ttl("_dnslink.example.test")
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(onion_asked());
     }
 
     #[tokio::test]

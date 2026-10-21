@@ -666,7 +666,7 @@ impl HttpRetriever {
     /// came.
     async fn admitted_providers(&self, providers: Vec<Provider>) -> Vec<Provider> {
         let policy = self.client.network().dial_policy();
-        if !policy.is_gated() {
+        if policy.admits_everything() {
             return providers;
         }
         admit_providers(providers, &policy).await
@@ -1620,7 +1620,7 @@ impl HttpRetriever {
         context: Option<RetrievalRequestContext>,
     ) -> Result<(Block, RetrievalSource)> {
         let admitted;
-        let providers = if self.client.network().dial_policy().is_gated() {
+        let providers = if !self.client.network().dial_policy().admits_everything() {
             admitted = self.admitted_providers(providers.to_vec()).await;
             &admitted[..]
         } else {
@@ -10083,7 +10083,7 @@ async fn admit_providers(providers: Vec<Provider>, policy: &DialPolicy) -> Vec<P
 /// shape, an onion, its transport). A name's addresses are checked once
 /// resolved.
 fn expandable(addr: &str, policy: &DialPolicy) -> bool {
-    !policy.is_gated()
+    policy.admits_everything()
         || Multiaddr::from_str(addr).is_ok_and(|parsed| policy.check_now(&parsed).is_ok())
 }
 
@@ -10137,7 +10137,7 @@ async fn bitswap_peers_with_quality_using_caches_with_options(
     direct_ip_candidate_only: bool,
     expansion: &AddressExpansion,
 ) -> BitswapProviderCandidates {
-    let mut peers = Vec::new();
+    let mut gathered: Vec<GatheredPeer> = Vec::new();
     let mut quality = BitswapProviderAddrQuality {
         early_peer_cap,
         direct_ip_candidate_only,
@@ -10165,9 +10165,9 @@ async fn bitswap_peers_with_quality_using_caches_with_options(
         let expanded_addrs = if direct_ip_candidate_only {
             let (addrs, skipped) = direct_ip_provider_multiaddrs(&provider.addrs);
             quality.direct_ip_candidate_skipped_addr_count += skipped;
-            addrs
+            addrs.into_iter().map(ExpandedAddr::from).collect()
         } else {
-            expand_provider_multiaddrs(
+            expand_provider_multiaddrs_with_origins(
                 &provider.addrs,
                 dnsaddr_cache,
                 dns_ip_cache,
@@ -10178,15 +10178,16 @@ async fn bitswap_peers_with_quality_using_caches_with_options(
             .await
         };
 
-        for addr in expanded_addrs {
+        for ExpandedAddr { addr, via } in expanded_addrs {
             quality.expanded_addr_count += 1;
-            match analyze_bitswap_multiaddr(&addr, provider_peer, &expansion.policy) {
+            match analyze_bitswap_multiaddr(&addr, provider_peer, &expansion.policy, via.as_deref())
+            {
                 Ok((addr_peer, dial_addr, features)) => {
                     quality.record_features(features);
                     quality.supported_addr_count += 1;
                     provider_has_supported_addr = true;
                     peer_id.get_or_insert(addr_peer);
-                    addrs.push(dial_addr);
+                    addrs.push((dial_addr, via));
                 }
                 Err((rejection, features)) => {
                     quality.record_features(features);
@@ -10201,22 +10202,80 @@ async fn bitswap_peers_with_quality_using_caches_with_options(
 
         if let Some(id) = peer_id {
             if !addrs.is_empty() {
-                addrs.sort_by_key(bitswap_addr_score);
-                addrs.dedup();
-                addrs.truncate(MAX_BITSWAP_ADDRS_PER_PEER);
-                merge_bitswap_peer(&mut peers, id, addrs);
+                match gathered.iter_mut().find(|(peer, _)| *peer == id) {
+                    Some((_, gathered_addrs)) => gathered_addrs.extend(addrs),
+                    None => gathered.push((id, addrs)),
+                }
             }
         }
 
-        if early_peer_cap && peers.len() >= MAX_BITSWAP_PEERS_PER_BLOCK {
+        if early_peer_cap && gathered.len() >= MAX_BITSWAP_PEERS_PER_BLOCK {
             quality.early_peer_cap_hit = index + 1 < providers.len();
             quality.skipped_provider_count = providers.len().saturating_sub(index + 1);
             break;
         }
     }
 
-    peers.truncate(MAX_BITSWAP_PEERS_PER_BLOCK);
+    let peers = judged_and_cut(gathered, &expansion.policy, deadline, &mut quality).await;
     BitswapProviderCandidates { peers, quality }
+}
+
+/// A peer's candidate addresses, gathered across providers before they are
+/// judged and cut, each with the address whose name it replaced, if any.
+type GatheredPeer = (PeerId, Vec<(Multiaddr, Option<String>)>);
+
+/// Every candidate gathered across all providers, judged again against one
+/// settled NAT64 state (design 0007: an address accepted before discovery
+/// changed the state might be refused after it), then each peer's
+/// addresses ranked and cut to [`MAX_BITSWAP_ADDRS_PER_PEER`], and the
+/// peers to [`MAX_BITSWAP_PEERS_PER_BLOCK`]. A revoked capability refuses
+/// them all.
+async fn judged_and_cut(
+    gathered: Vec<GatheredPeer>,
+    policy: &DialPolicy,
+    deadline: tokio::time::Instant,
+    quality: &mut BitswapProviderAddrQuality,
+) -> Vec<BitswapPeer> {
+    let settled = if policy.admits_everything() {
+        None
+    } else {
+        let candidates = gathered
+            .iter()
+            .flat_map(|(_, addrs)| addrs.iter().map(|(addr, _)| addr.clone()))
+            .collect::<Vec<_>>();
+        policy.settled(&candidates, deadline).await.ok()
+    };
+    let mut peers = Vec::new();
+    for (id, addrs) in gathered {
+        let mut kept = Vec::with_capacity(addrs.len());
+        for (addr, via) in addrs {
+            let admitted = policy.admits_everything()
+                || settled
+                    .as_ref()
+                    .is_some_and(|settled| check_candidate(settled, &addr, via.as_deref()).is_ok());
+            if admitted {
+                kept.push(addr);
+            } else {
+                quality.supported_addr_count = quality.supported_addr_count.saturating_sub(1);
+                quality.policy_refused_addr_count += 1;
+            }
+        }
+        if kept.is_empty() {
+            continue;
+        }
+        kept.sort_by_key(bitswap_addr_score);
+        kept.dedup();
+        kept.truncate(MAX_BITSWAP_ADDRS_PER_PEER);
+        peers.push(BitswapPeer {
+            id,
+            addrs: kept,
+            skip_want_have: false,
+            force_want_block: false,
+            force_want_have: false,
+        });
+    }
+    peers.truncate(MAX_BITSWAP_PEERS_PER_BLOCK);
+    peers
 }
 
 fn maybe_force_zero_http_direct_want_block_peers_with_limit(
@@ -10268,23 +10327,6 @@ fn maybe_force_trusted_bitswap_want_have_probes_with_limit(
         }
     }
     probed
-}
-
-fn merge_bitswap_peer(peers: &mut Vec<BitswapPeer>, id: PeerId, addrs: Vec<Multiaddr>) {
-    if let Some(peer) = peers.iter_mut().find(|peer| peer.id == id) {
-        peer.addrs.extend(addrs);
-        peer.addrs.sort_by_key(bitswap_addr_score);
-        peer.addrs.dedup();
-        peer.addrs.truncate(MAX_BITSWAP_ADDRS_PER_PEER);
-    } else {
-        peers.push(BitswapPeer {
-            id,
-            addrs,
-            skip_want_have: false,
-            force_want_block: false,
-            force_want_have: false,
-        });
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10679,6 +10721,44 @@ async fn resolve_dns_ip_host(
     (host, addrs)
 }
 
+/// [`expand_provider_multiaddrs_with_origins`]'s addresses alone: tests.
+#[cfg(test)]
+async fn expand_provider_multiaddrs(
+    addrs: &[String],
+    dnsaddr_cache: &mut DnsaddrCache,
+    dns_ip_cache: &mut DnsIpCache,
+    expansion: &AddressExpansion,
+    deadline: tokio::time::Instant,
+    refused: &mut usize,
+) -> Vec<String> {
+    expand_provider_multiaddrs_with_origins(
+        addrs,
+        dnsaddr_cache,
+        dns_ip_cache,
+        expansion,
+        deadline,
+        refused,
+    )
+    .await
+    .into_iter()
+    .map(|expanded| expanded.addr)
+    .collect()
+}
+
+/// An address expansion yielded: with, when an A or AAAA answer replaced a
+/// name, the address it replaced, whose name and port any later check
+/// judges a configured target's exemption by.
+struct ExpandedAddr {
+    addr: String,
+    via: Option<String>,
+}
+
+impl From<String> for ExpandedAddr {
+    fn from(addr: String) -> Self {
+        Self { addr, via: None }
+    }
+}
+
 /// A provider's addresses, expanded: each `/dnsaddr` replaced by the
 /// multiaddrs its TXT records hold, and each `/dns*` name (but a
 /// WebSocket's, which its transport resolves) by its A and AAAA answers.
@@ -10689,14 +10769,16 @@ async fn resolve_dns_ip_host(
 /// answer passes the address policy (with checked addresses) before it
 /// replaces the name, so a name whose every answer is refused is dropped,
 /// not kept. Each refusal is counted in `refused`.
-async fn expand_provider_multiaddrs(
+///
+/// Each answer keeps the address whose name it replaced ([`ExpandedAddr`]).
+async fn expand_provider_multiaddrs_with_origins(
     addrs: &[String],
     dnsaddr_cache: &mut DnsaddrCache,
     dns_ip_cache: &mut DnsIpCache,
     expansion: &AddressExpansion,
     deadline: tokio::time::Instant,
     refused: &mut usize,
-) -> Vec<String> {
+) -> Vec<ExpandedAddr> {
     let resolver = &expansion.resolver;
     let policy = &expansion.policy;
     let mut expanded_dnsaddr = Vec::new();
@@ -10750,11 +10832,11 @@ async fn expand_provider_multiaddrs(
     let mut expanded = Vec::new();
     for addr in expanded_dnsaddr {
         if websocket_multiaddr(&addr) {
-            expanded.push(addr);
+            expanded.push(ExpandedAddr::from(addr));
             continue;
         }
         let Some(dns_name) = dns_multiaddr_name(&addr) else {
-            expanded.push(addr);
+            expanded.push(ExpandedAddr::from(addr));
             continue;
         };
         let addrs = if let Some(entry) = dns_ip_cache.get_mut(&dns_name) {
@@ -10792,18 +10874,18 @@ async fn expand_provider_multiaddrs(
                             log_as_cached: true,
                         },
                     );
-                    expanded.push(addr);
+                    expanded.push(ExpandedAddr::from(addr));
                     continue;
                 }
             }
         };
         if addrs.is_empty() {
-            expanded.push(addr);
+            expanded.push(ExpandedAddr::from(addr));
             continue;
         }
         let original = Multiaddr::from_str(&addr).ok();
         for ip in addrs {
-            if policy.is_gated() {
+            if !policy.admits_everything() {
                 let admitted = match &original {
                     Some(original) => policy.check_answer(original, ip, deadline).await.is_ok(),
                     None => false,
@@ -10814,12 +10896,29 @@ async fn expand_provider_multiaddrs(
                 }
             }
             if let Some(replaced) = replace_dns_multiaddr(&addr, ip) {
-                expanded.push(replaced.to_string());
+                expanded.push(ExpandedAddr {
+                    addr: replaced.to_string(),
+                    via: Some(addr.clone()),
+                });
             }
         }
     }
 
     expanded
+}
+
+/// A candidate address under `policy`: an answer by the name it replaced
+/// (a configured name and port keep their exemption, for that answer only),
+/// any other address as it is.
+fn check_candidate(
+    policy: &DialPolicy,
+    addr: &Multiaddr,
+    via: Option<&str>,
+) -> std::result::Result<(), freedom_ipfs_net::DialRefusal> {
+    match via.and_then(|via| Multiaddr::from_str(via).ok()) {
+        Some(original) => policy.check_answer_now(&original, addr),
+        None => policy.check_now(addr),
+    }
 }
 
 /// Check 2 for a `/dnsaddr`'s TXT-derived multiaddrs: under a gated policy
@@ -10831,7 +10930,7 @@ async fn admitted_records(
     deadline: tokio::time::Instant,
     refused: &mut usize,
 ) -> Vec<String> {
-    if !policy.is_gated() {
+    if policy.admits_everything() {
         return records;
     }
     let mut admitted = Vec::with_capacity(records.len());
@@ -10938,7 +11037,7 @@ fn parse_bitswap_multiaddr(
     addr: &str,
     provider_peer: Option<PeerId>,
 ) -> Option<(PeerId, Multiaddr)> {
-    analyze_bitswap_multiaddr(addr, provider_peer, &DialPolicy::legacy())
+    analyze_bitswap_multiaddr(addr, provider_peer, &DialPolicy::legacy(), None)
         .ok()
         .map(|(peer, addr, _)| (peer, addr))
 }
@@ -10977,6 +11076,7 @@ fn analyze_bitswap_multiaddr(
     addr: &str,
     provider_peer: Option<PeerId>,
     policy: &DialPolicy,
+    via: Option<&str>,
 ) -> std::result::Result<
     (PeerId, Multiaddr, BitswapAddrFeatures),
     (BitswapAddrRejection, BitswapAddrFeatures),
@@ -11009,7 +11109,7 @@ fn analyze_bitswap_multiaddr(
     {
         return Err((BitswapAddrRejection::Transport, features));
     }
-    if policy.is_gated() && policy.check_now(&full).is_err() {
+    if !policy.admits_everything() && check_candidate(policy, &full, via).is_err() {
         return Err((BitswapAddrRejection::Policy, features));
     }
     Ok((peer_id, multiaddr, features))
@@ -13966,6 +14066,121 @@ mod bitswap_tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// One settled NAT64 state judges every provider's candidates (#47
+    /// review, 47-M1): provider 1's address passes under the pending state
+    /// by its fixed 6to4 reading, provider 2's answer waits for discovery,
+    /// and the learned prefix then makes provider 1's address loopback.
+    #[tokio::test]
+    async fn one_settled_nat64_state_judges_every_providers_candidates() {
+        use freedom_ipfs_net::gate::{Nat64Prefix, Nat64State};
+        use freedom_ipfs_net::{Addresses, Nat64Handle};
+        let (publisher, handle) = Nat64Handle::channel(Nat64State::Pending);
+        let network = direct_network("https://dns.example/dns-query", Addresses::Checked(handle));
+        let expansion = AddressExpansion::of(&network);
+        let providers = vec![
+            Provider::from_parts(
+                Some(POLICY_PEER.into()),
+                vec![format!(
+                    "/ip6/2002:808:808:7f00:0:100::/tcp/4001/p2p/{POLICY_PEER}"
+                )],
+            )
+            .unwrap(),
+            Provider::from_parts(
+                Some(POLICY_PEER.into()),
+                vec![format!("/dns6/waiting.example/tcp/4001/p2p/{POLICY_PEER}")],
+            )
+            .unwrap(),
+        ];
+        let mut txt = DnsaddrCache::new();
+        let mut ips = HashMap::from([(
+            "waiting.example".into(),
+            CachedDnsIpRecords {
+                addrs: vec!["2a00:1:2:3:a9:fea9:fe00:0".parse().unwrap()],
+                log_as_cached: true,
+            },
+        )]);
+        let mut resolving = Box::pin(bitswap_peers_with_quality_using_caches_with_options(
+            &providers, &mut txt, &mut ips, true, false, &expansion,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(resolving.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let overlap = Nat64Prefix::new("2002:808:808::".parse().unwrap(), 48).unwrap();
+        let waiting = Nat64Prefix::new("2a00:1:2:3::".parse().unwrap(), 64).unwrap();
+        publisher.publish(Nat64State::known([overlap, waiting]));
+        let candidates = resolving.await;
+        let addresses = candidates
+            .peers
+            .iter()
+            .flat_map(|peer| peer.addrs.iter().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        assert!(addresses.is_empty(), "{addresses:?}");
+        assert_eq!(candidates.quality.policy_refused_addr_count, 2);
+    }
+
+    /// A configured name and port keep their exemption through the answer
+    /// that replaces the name, for that answer only (#47 review, 47-M3):
+    /// another name answering the same address, and the address as a
+    /// literal, are refused.
+    #[tokio::test]
+    async fn a_configured_names_exemption_survives_its_expansion_only() {
+        use freedom_ipfs_net::gate::ConfiguredTargets;
+        use freedom_ipfs_net::{Network, NetworkPolicy};
+        let mut configured = ConfiguredTargets::new();
+        configured
+            .add_url(&url::Url::parse("http://configured.example:4001").unwrap())
+            .unwrap();
+        let network = Network::with_lookup(
+            NetworkPolicy::direct(
+                configured,
+                url::Url::parse("https://dns.example/dns-query").unwrap(),
+                checked_addresses(),
+            )
+            .unwrap(),
+            None,
+        );
+        let expansion = AddressExpansion::of(&network);
+        let loopback = || CachedDnsIpRecords {
+            addrs: vec!["127.0.0.1".parse().unwrap()],
+            log_as_cached: true,
+        };
+        let candidates = |addr: String| {
+            let expansion = expansion.clone();
+            async move {
+                let providers = vec![Provider::from_parts(
+                    Some(POLICY_PEER.into()),
+                    vec![format!("{addr}/p2p/{POLICY_PEER}")],
+                )
+                .unwrap()];
+                let mut txt = DnsaddrCache::new();
+                let mut ips = HashMap::from([
+                    ("configured.example".into(), loopback()),
+                    ("other.example".into(), loopback()),
+                ]);
+                bitswap_peers_with_quality_using_caches_with_options(
+                    &providers, &mut txt, &mut ips, true, false, &expansion,
+                )
+                .await
+            }
+        };
+        let configured = candidates("/dns4/configured.example/tcp/4001".into()).await;
+        assert_eq!(configured.peers.len(), 1);
+        assert_eq!(
+            configured.peers[0].addrs[0].to_string(),
+            "/ip4/127.0.0.1/tcp/4001"
+        );
+        for refused in [
+            "/dns4/other.example/tcp/4001",
+            "/dns4/configured.example/tcp/4002",
+            "/ip4/127.0.0.1/tcp/4001",
+        ] {
+            let candidates = candidates(refused.into()).await;
+            assert!(candidates.peers.is_empty(), "{refused}");
+        }
     }
 
     /// Check 1 where providers come in: under a gated policy refused

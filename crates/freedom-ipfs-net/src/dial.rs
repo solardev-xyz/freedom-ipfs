@@ -27,6 +27,7 @@ use multiaddr::Multiaddr;
 use tokio::time::Instant;
 use url::Url;
 
+use crate::capability::{NetworkCapability, Revoked};
 use crate::gate::{
     check_address, classify_dialed, classify_url, AddressRefusal, ConfiguredTargets, Nat64State,
     Refusal, Shape, Target,
@@ -63,6 +64,9 @@ impl TransportPolicy {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum DialRefusal {
+    /// The network's capability is revoked: nothing more is admitted.
+    #[error("{0}")]
+    Revoked(#[from] Revoked),
     /// Not one of the shapes the node dials, or a host the gate refuses.
     #[error("{0}")]
     Target(Refusal),
@@ -78,11 +82,20 @@ pub enum DialRefusal {
 }
 
 /// What a network may dial, as candidate choice and address expansion ask
-/// it ([`crate::Network::dial_policy`]). Clones share the NAT64 state.
+/// it ([`crate::Network::dial_policy`]). Clones share the NAT64 state and the
+/// network's capability.
+///
+/// **Every check asks the network's capability first** (design 0007, "The
+/// gate"), in every mode: once it is revoked, nothing is admitted. A check
+/// that waits for NAT64 discovery waits under a permit of the capability,
+/// so a revoke ends the wait, and asks once more before it admits.
 #[derive(Clone, Debug)]
 pub struct DialPolicy {
     transports: TransportPolicy,
     gate: Gate,
+    /// The network's capability; `None` for [`DialPolicy::legacy`], which
+    /// belongs to no network.
+    capability: Option<NetworkCapability>,
 }
 
 #[derive(Clone, Debug)]
@@ -100,18 +113,28 @@ enum Gate {
 }
 
 impl DialPolicy {
-    /// The legacy policy's: no gate, and every transport.
+    /// The legacy policy's, outside any network: no gate, every transport,
+    /// and no capability.
     pub fn legacy() -> Self {
         Self {
             transports: TransportPolicy::ALL,
             gate: Gate::Off,
+            capability: None,
         }
     }
 
-    pub(crate) fn for_policy(policy: &NetworkPolicy) -> Self {
+    pub(crate) fn for_network(policy: &NetworkPolicy, capability: &NetworkCapability) -> Self {
+        Self {
+            capability: Some(capability.clone()),
+            ..Self::for_policy(policy)
+        }
+    }
+
+    fn for_policy(policy: &NetworkPolicy) -> Self {
         match policy.mode() {
             Mode::Legacy => Self::legacy(),
             Mode::Direct(direct) => Self {
+                capability: None,
                 transports: TransportPolicy::ALL,
                 gate: match &direct.addresses {
                     Addresses::Unchecked => Gate::Classify,
@@ -128,6 +151,7 @@ impl DialPolicy {
                 let mut configured = ConfiguredTargets::new();
                 configured.add_endpoint(socks5.proxy);
                 Self {
+                    capability: None,
                     transports: TransportPolicy::TCP_ONLY,
                     gate: Gate::Check {
                         configured: Arc::new(configured),
@@ -156,6 +180,95 @@ impl DialPolicy {
         !matches!(self.gate, Gate::Off)
     }
 
+    /// Whether every check passes: no gate, and a capability that isn't
+    /// revoked. A caller may skip the checks then, as the legacy policy
+    /// did before.
+    pub fn admits_everything(&self) -> bool {
+        !self.is_gated() && self.ask().is_ok()
+    }
+
+    /// The capability, first in every check.
+    fn ask(&self) -> Result<(), DialRefusal> {
+        match &self.capability {
+            Some(capability) => capability.check().map_err(DialRefusal::Revoked),
+            None => Ok(()),
+        }
+    }
+
+    /// Runs a wait for NAT64 discovery under a permit of the capability (a
+    /// revoke ends it), and asks the capability once more before admitting.
+    async fn admit_after<F>(&self, wait: F) -> Result<(), DialRefusal>
+    where
+        F: std::future::Future<Output = Result<(), DialRefusal>>,
+    {
+        let Some(capability) = &self.capability else {
+            return wait.await;
+        };
+        let permit = capability.admit()?;
+        permit.run(wait).await??;
+        self.ask()
+    }
+
+    /// The same policy with NAT64 discovery's state frozen, once none of
+    /// `addrs` waits for it any more (or `deadline` has passed): every
+    /// check of the copy judges against that one state, so candidates
+    /// judged one after the other can't each see a different one (design
+    /// 0007: an address accepted before discovery changed the state might
+    /// be refused after it). The wait runs under a permit.
+    pub async fn settled(
+        &self,
+        addrs: &[Multiaddr],
+        deadline: Instant,
+    ) -> Result<DialPolicy, DialRefusal> {
+        self.ask()?;
+        let Gate::Check { configured, nat64 } = &self.gate else {
+            return Ok(self.clone());
+        };
+        let ips: Vec<IpAddr> = addrs
+            .iter()
+            .filter_map(|addr| match classify_dialed(addr) {
+                Ok(dial) if !configured.contains_dial(&dial) => match dial.target {
+                    Target::Ip(ip) => Some(ip),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let mut handle = nat64.clone();
+        let state = std::sync::Mutex::new(handle.current());
+        let wait = async {
+            loop {
+                let current = handle.current();
+                let waits = ips.iter().any(|ip| {
+                    matches!(
+                        check_address(*ip, &current),
+                        Err(AddressRefusal::Nat64Pending)
+                    )
+                });
+                *state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = current;
+                if !waits || !handle.changed().await {
+                    return Ok(());
+                }
+            }
+        };
+        // Past the deadline, the state as it is: a pending IPv6 address is
+        // refused.
+        let _ = tokio::time::timeout_at(deadline, self.admit_after(wait)).await;
+        self.ask()?;
+        let state = state
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(Self {
+            gate: Gate::Check {
+                configured: configured.clone(),
+                nat64: Nat64Handle::fixed(state),
+            },
+            ..self.clone()
+        })
+    }
+
     /// Checks a multiaddr to be dialed, or expanded (a `/dnsaddr`), now:
     /// its whole shape and its target (an onion is refused), the transport
     /// it needs, and with checked addresses an untrusted IP literal's
@@ -163,6 +276,7 @@ impl DialPolicy {
     /// with [`AddressRefusal::Nat64Pending`]; [`DialPolicy::check`] waits
     /// for discovery instead.
     pub fn check_now(&self, addr: &Multiaddr) -> Result<(), DialRefusal> {
+        self.ask()?;
         match self.classify(addr)? {
             Some((ip, nat64)) => check_address(ip, &nat64.current())
                 .map(drop)
@@ -175,8 +289,12 @@ impl DialPolicy {
     /// until `deadline`: past it, the IPv6 literal is refused with
     /// [`AddressRefusal::Nat64Pending`].
     pub async fn check(&self, addr: &Multiaddr, deadline: Instant) -> Result<(), DialRefusal> {
+        self.ask()?;
         match self.classify(addr)? {
-            Some((ip, nat64)) => wait_for_address(ip, nat64, deadline).await,
+            Some((ip, nat64)) => {
+                self.admit_after(wait_for_address(ip, nat64, deadline))
+                    .await
+            }
             None => Ok(()),
         }
     }
@@ -192,6 +310,7 @@ impl DialPolicy {
         ip: IpAddr,
         deadline: Instant,
     ) -> Result<(), DialRefusal> {
+        self.ask()?;
         let Gate::Check { configured, nat64 } = &self.gate else {
             return Ok(());
         };
@@ -199,7 +318,33 @@ impl DialPolicy {
         if configured.contains_dial(&dial) {
             return Ok(());
         }
-        wait_for_address(ip, nat64.clone(), deadline).await
+        self.admit_after(wait_for_address(ip, nat64.clone(), deadline))
+            .await
+    }
+
+    /// Checks an address an A or AAAA answer put in place of `original`'s
+    /// name, now: `expanded`'s own shape and transport, and, with checked
+    /// addresses, its address, unless `original`'s name and port are a
+    /// configured target. The exemption is that name's and port's only: the
+    /// same address reached any other way is judged as untrusted.
+    pub fn check_answer_now(
+        &self,
+        original: &Multiaddr,
+        expanded: &Multiaddr,
+    ) -> Result<(), DialRefusal> {
+        self.ask()?;
+        let Some((ip, nat64)) = self.classify(expanded)? else {
+            return Ok(());
+        };
+        if let Gate::Check { configured, .. } = &self.gate {
+            let dial = classify_dialed(original).map_err(DialRefusal::Target)?;
+            if configured.contains_dial(&dial) {
+                return Ok(());
+            }
+        }
+        check_address(ip, &nat64.current())
+            .map(drop)
+            .map_err(DialRefusal::Address)
     }
 
     /// Checks an HTTP provider's base URL before it is tried, now: `http` or
@@ -208,6 +353,7 @@ impl DialPolicy {
     /// discovery is pending). A name is checked when it is resolved, by the
     /// client's own resolver.
     pub fn check_url_now(&self, url: &Url) -> Result<(), DialRefusal> {
+        self.ask()?;
         match self.classify_url(url)? {
             Some((ip, nat64)) => check_address(ip, &nat64.current())
                 .map(drop)
@@ -219,8 +365,12 @@ impl DialPolicy {
     /// [`DialPolicy::check_url_now`], waiting while NAT64 discovery is
     /// pending, until `deadline`.
     pub async fn check_url(&self, url: &Url, deadline: Instant) -> Result<(), DialRefusal> {
+        self.ask()?;
         match self.classify_url(url)? {
-            Some((ip, nat64)) => wait_for_address(ip, nat64, deadline).await,
+            Some((ip, nat64)) => {
+                self.admit_after(wait_for_address(ip, nat64, deadline))
+                    .await
+            }
             None => Ok(()),
         }
     }
