@@ -1,0 +1,28 @@
+[package]
+name = "freedom-ipfs-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Onion addresses' base32 names, from `/onion3` and `/onion` components.
+data-encoding.workspace = true
+# The multiaddrs libp2p dials; the version libp2p re-exports, so the types
+# are the same ones.
+multiaddr.workspace = true
+thiserror.workspace = true
+# WHATWG host and URL parsing: the rules reqwest's URLs follow.
+url.workspace = true
+
+[dev-dependencies]
+# The transport whose address parsing the gate's multiaddr shapes must
+# agree with (libp2p 0.56's): tests only.
+libp2p-core = "0.43"
+libp2p-tcp = { version = "0.44", features = ["tokio"] }
+tokio.workspace = true
+# What reqwest and the http crate make of a URL the gate accepted: tests
+# only.
+http.workspace = true
+reqwest.workspace = true
