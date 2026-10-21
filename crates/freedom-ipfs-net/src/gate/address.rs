@@ -58,9 +58,9 @@ pub enum AddressRefusal {
         block: Cidr,
         row: &'static Row,
     },
-    /// NAT64 discovery hasn't settled: the caller waits for it, within its
-    /// own deadline, and asks again.
-    #[error("IPv6 outside the fixed forms while NAT64 discovery is pending")]
+    /// NAT64 discovery hasn't answered yet: the caller waits for it, within
+    /// its own deadline, and asks again.
+    #[error("IPv6 while NAT64 discovery is pending")]
     Nat64Pending,
     /// NAT64 discovery failed for a resolver: IPv6 outside the fixed forms
     /// is refused until it succeeds.
@@ -91,9 +91,14 @@ pub enum AddressRefusal {
 ///   - **incomplete:** every IPv6 address is refused, before any fixed
 ///     form's success (only an IPv4-mapped one, judged as IPv4, passes): a
 ///     prefix past the bound was dropped, and it could map any of them;
-///   - **pending or unknown:** an address under neither fixed form (the
-///     well-known prefix, 6to4) is refused; the fixed forms are exempt from
-///     that only.
+///   - **pending:** every IPv6 address not refused above waits for
+///     discovery's first answer ([`AddressRefusal::Nat64Pending`]), a fixed
+///     form's too: that answer may teach a prefix under a fixed form, whose
+///     reading of the same bits decides;
+///   - **unknown:** an address under neither fixed form (the well-known
+///     prefix, 6to4) is refused; the fixed forms are exempt from that only.
+///
+/// An IPv4 address, and an IPv4-mapped one, never waits.
 ///
 /// 6rd, 6over4 and 6a44, whose embedding depends on configuration, are
 /// judged as the IPv6 address alone.
@@ -162,8 +167,15 @@ fn check_v6(v6: Ipv6Addr, nat64: &Nat64State) -> Result<IpAddr, AddressRefusal> 
             check_embedded(Form::Nat64Learned(*prefix), v4)?;
         }
     }
-    // The fixed forms are exempt only from the refusals for what discovery
-    // doesn't know yet.
+    // While discovery is pending, every IPv6 address waits for its first
+    // answer, a fixed form's too: that answer may teach a prefix under a
+    // fixed form, which reads the same bits as another IPv4 address. (An
+    // address refused above stays refused: a prefix only adds refusals.)
+    if let Nat64State::Pending = nat64 {
+        return Err(AddressRefusal::Nat64Pending);
+    }
+    // Once discovery has answered, the fixed forms are exempt from the
+    // refusals for what it doesn't know.
     if well_known || six_to_four {
         return Ok(IpAddr::V6(v6));
     }
