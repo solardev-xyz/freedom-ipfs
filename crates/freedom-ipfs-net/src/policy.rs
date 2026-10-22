@@ -15,9 +15,10 @@ use crate::resolve::{system_lookup, NameLookup};
 
 /// What a node's network may do.
 ///
-/// [`NetworkPolicy::legacy`] and [`NetworkPolicy::direct`] can be built;
-/// `socks5` arrives with a later part of design 0007's upstream item 3, and
-/// [`Network::new`] refuses it until then.
+/// [`NetworkPolicy::legacy`] and [`NetworkPolicy::direct`] can be built.
+/// `NetworkPolicy::socks5` (cargo feature `socks`) describes `socks5`,
+/// whose libp2p transports exist; [`Network::new`] refuses it until its
+/// HTTP clients do too.
 #[derive(Clone, Debug)]
 pub struct NetworkPolicy {
     mode: Mode,
@@ -62,6 +63,39 @@ impl NetworkPolicy {
         })
     }
 
+    /// Every connection through a SOCKS5 proxy, failing closed (design
+    /// 0007, "Modes", `socks5`):
+    /// - `proxy` is an IP literal and a port, so reaching it needs no DNS;
+    /// - ordinary names are resolved through the proxy (Tor's `RESOLVE`),
+    ///   every answer passes the gate, and the connection goes to the
+    ///   checked address; only onions go to the proxy as names, on their
+    ///   own route;
+    /// - QUIC and the local resolvers are off.
+    ///
+    /// `configured` names the delegated routers (and any other endpoint
+    /// configuration names): they and `doh`, which is added to them, are
+    /// exempt from the address policy by exact host and port, and are
+    /// reached through the proxy like everything else. The proxy's own
+    /// endpoint isn't a target, and isn't exempt.
+    #[cfg(feature = "socks")]
+    pub fn socks5(
+        proxy: SocketAddr,
+        mut configured: ConfiguredTargets,
+        doh: Url,
+    ) -> Result<Self, NetworkError> {
+        if proxy.ip().is_unspecified() || proxy.port() == 0 {
+            return Err(NetworkError::ProxyEndpoint);
+        }
+        configured.add_url(&doh).map_err(NetworkError::Configured)?;
+        Ok(Self {
+            mode: Mode::Socks5(Socks5 {
+                proxy,
+                configured: Arc::new(configured),
+                doh,
+            }),
+        })
+    }
+
     pub fn mode(&self) -> &Mode {
         &self.mode
     }
@@ -71,7 +105,8 @@ impl NetworkPolicy {
     pub fn doh(&self) -> Option<&str> {
         match &self.mode {
             Mode::Direct(direct) => Some(direct.doh.as_str()),
-            Mode::Legacy | Mode::Socks5(_) => None,
+            Mode::Socks5(socks5) => Some(socks5.doh.as_str()),
+            Mode::Legacy => None,
         }
     }
 
@@ -80,7 +115,8 @@ impl NetworkPolicy {
     pub fn configured(&self) -> Option<&ConfiguredTargets> {
         match &self.mode {
             Mode::Direct(direct) => Some(&direct.configured),
-            Mode::Legacy | Mode::Socks5(_) => None,
+            Mode::Socks5(socks5) => Some(&socks5.configured),
+            Mode::Legacy => None,
         }
     }
 }
@@ -133,12 +169,16 @@ pub enum Addresses {
     Checked(Nat64Handle),
 }
 
-/// `socks5` (design 0007, "Modes").
+/// `socks5` (design 0007, "Modes"); see `NetworkPolicy::socks5`.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Socks5 {
     /// The proxy's endpoint: an IP literal, so reaching it needs no DNS.
     pub proxy: SocketAddr,
+    /// The configured targets, the DoH endpoint among them; not the proxy.
+    pub configured: Arc<ConfiguredTargets>,
+    /// The DoH endpoint.
+    pub doh: Url,
 }
 
 /// A view of what NAT64 discovery knows, which the host's discovery keeps
@@ -203,6 +243,10 @@ struct Inner {
     capability: NetworkCapability,
     /// The gate's resolver's lookups, under `direct` with checked addresses.
     lookup: Option<Arc<dyn NameLookup>>,
+    /// The SOCKS5 client every request through the proxy goes by, under
+    /// `socks5`: one per network.
+    #[cfg(feature = "socks")]
+    socks: Option<Arc<crate::socks::SocksClient>>,
 }
 
 impl Network {
@@ -233,11 +277,18 @@ impl Network {
     /// tests, and hosts that bring their own resolver.
     #[doc(hidden)]
     pub fn with_lookup(policy: NetworkPolicy, lookup: Option<Arc<dyn NameLookup>>) -> Self {
+        #[cfg(feature = "socks")]
+        let socks = match policy.mode() {
+            Mode::Socks5(socks5) => Some(Arc::new(crate::socks::SocksClient::new(socks5.proxy))),
+            Mode::Legacy | Mode::Direct(_) => None,
+        };
         Self {
             inner: Arc::new(Inner {
                 policy,
                 capability: NetworkCapability::new(),
                 lookup,
+                #[cfg(feature = "socks")]
+                socks,
             }),
         }
     }
@@ -263,6 +314,12 @@ impl Network {
 
     pub(crate) fn lookup(&self) -> Option<&Arc<dyn NameLookup>> {
         self.inner.lookup.as_ref()
+    }
+
+    /// The network's SOCKS5 client, under `socks5`.
+    #[cfg(feature = "socks")]
+    pub(crate) fn socks(&self) -> Option<&Arc<crate::socks::SocksClient>> {
+        self.inner.socks.as_ref()
     }
 
     /// What the network may dial, as candidate choice and address expansion
@@ -306,6 +363,9 @@ pub enum NetworkError {
     /// A configured target is an onion, which `direct` can't reach.
     #[error("a configured endpoint is an onion, which direct mode can't reach")]
     OnionConfigured,
+    /// The SOCKS5 proxy's endpoint is unspecified, or has port 0.
+    #[error("the SOCKS5 proxy's endpoint must be a specified IP address and a nonzero port")]
+    ProxyEndpoint,
 }
 
 #[cfg(test)]
@@ -326,6 +386,8 @@ mod tests {
         let socks5 = NetworkPolicy {
             mode: Mode::Socks5(Socks5 {
                 proxy: "127.0.0.1:9150".parse().unwrap(),
+                configured: Arc::new(ConfiguredTargets::new()),
+                doh: url("https://dns.example/dns-query"),
             }),
         };
         assert!(matches!(

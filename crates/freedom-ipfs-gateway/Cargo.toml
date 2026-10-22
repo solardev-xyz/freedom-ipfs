@@ -29,6 +29,11 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[features]
+# `socks5` mode (design 0007): the network crate's SOCKS5 client and libp2p
+# transport. Off by default (D2).
+socks = ["freedom-ipfs-net/socks"]
+
 [dev-dependencies]
 prost.workspace = true
 reqwest.workspace = true

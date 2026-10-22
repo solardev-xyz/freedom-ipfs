@@ -20,21 +20,29 @@
 //! network's prefixes, IPv6 addresses outside the fixed forms are refused
 //! ([`Nat64State`]).
 //!
-//! **Configured targets** (the delegated routers, the DoH endpoint, the
-//! proxy) are exempt by exact host and port ([`ConfiguredTargets`]).
+//! **Configured targets** (the delegated routers, the DoH endpoint) are
+//! exempt by exact host and port ([`ConfiguredTargets`]). A SOCKS proxy's
+//! own endpoint isn't one: it is the transport, not a target.
+//!
+//! **The onion route** takes only an [`OnionHost`]: a well-formed v3 onion
+//! address, which only the classifier's onion targets can become.
 
 mod address;
 mod cidr;
 mod classify;
 mod configured;
 mod nat64;
+mod onion;
 pub mod table;
 
 pub use address::{check_address, AddressRefusal, Form};
 pub use cidr::Cidr;
+#[cfg(feature = "socks")]
+pub(crate) use classify::canonical;
 pub use classify::{
     classify_dialed, classify_host, classify_multiaddr, classify_url, parse_url, DialTarget,
     Refusal, Shape, Target, UrlTarget,
 };
 pub use configured::ConfiguredTargets;
 pub use nat64::{Nat64Prefix, Nat64State};
+pub use onion::OnionHost;

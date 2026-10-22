@@ -45,6 +45,17 @@ tokio = { version = "1", default-features = false, features = ["sync", "time"] }
 # WHATWG host and URL parsing: the rules reqwest's URLs follow.
 url.workspace = true
 
+[features]
+# `socks5` mode's SOCKS5 client and libp2p transport (design 0007,
+# "Modes"): off by default, so mobile builds compile none of it (D2).
+socks = ["tokio/net", "tokio/io-util"]
+# A SOCKS5 test proxy, for this crate's tests and its dependents'.
+test-util = ["socks", "tokio/rt"]
+
+[[test]]
+name = "socks"
+required-features = ["test-util"]
+
 [dev-dependencies]
 # The transport whose address parsing the gate's multiaddr shapes must
 # agree with (libp2p 0.56's): tests only.

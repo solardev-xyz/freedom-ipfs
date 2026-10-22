@@ -23,10 +23,15 @@
 //!   ([`TransportPolicy`]).
 //! - [`transport`]: the gate in the libp2p transports, around and below
 //!   their DNS layer ([`transport::Gated`]), and the swarms' transports
-//!   built for a network ([`transport::Transports`]).
+//!   built for a network ([`transport::Transports`]); under `socks5`, TCP
+//!   through the proxy (`transport::Socks5Transport`).
+//! - `socks` (cargo feature `socks`): the SOCKS5 client `socks5` goes
+//!   through, and with `test-util` a test proxy (`socks::fixture`).
 //!
-//! The legacy policy (what the crates did before) and `direct` can be built;
-//! `socks5` comes with a later part of the item.
+//! The legacy policy (what the crates did before) and `direct` can be
+//! built. `socks5`'s libp2p transports exist (feature `socks`, off by
+//! default, so mobile builds compile none of it); [`Network::new`] refuses
+//! the mode until its HTTP clients do too.
 
 pub mod capability;
 pub mod dial;
@@ -34,6 +39,8 @@ pub mod gate;
 pub mod http;
 pub mod policy;
 pub mod resolve;
+#[cfg(feature = "socks")]
+pub mod socks;
 pub mod transport;
 
 pub use capability::{NetworkCapability, Revoked};

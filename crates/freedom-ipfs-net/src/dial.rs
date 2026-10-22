@@ -14,6 +14,10 @@
 //! - **Candidate choice:** an address the policy's transports can't carry
 //!   (QUIC under `socks5`) is refused like a refused target, so it goes
 //!   before candidates are ranked and cut to two per peer.
+//! - **Onions:** `direct` has no route to one. Under `socks5` the onion
+//!   route takes a well-formed v3 address ([`OnionHost`]) over TCP or
+//!   WebSocket, as `/onion3` or an onion `/dns*`; any other onion (a
+//!   malformed or v2 address, a `/dnsaddr`, QUIC) is refused.
 //!
 //! Under the legacy policy there is no gate: every address passes, as
 //! before. The transports are the last word (design 0007, check 3): these
@@ -29,8 +33,8 @@ use url::Url;
 
 use crate::capability::{NetworkCapability, Revoked};
 use crate::gate::{
-    check_address, classify_dialed, classify_url, AddressRefusal, ConfiguredTargets, Nat64State,
-    Refusal, Shape, Target,
+    check_address, classify_dialed, classify_url, AddressRefusal, ConfiguredTargets, DialTarget,
+    Nat64State, OnionHost, Refusal, Shape, Target,
 };
 use crate::policy::{Addresses, Mode, Nat64Handle, NetworkPolicy};
 use crate::resolve::check_waiting;
@@ -40,17 +44,38 @@ use crate::resolve::check_waiting;
 #[non_exhaustive]
 pub struct TransportPolicy {
     quic: bool,
+    proxied: bool,
 }
 
 impl TransportPolicy {
     /// Every transport the node has: the legacy policy's and `direct`'s.
-    pub const ALL: Self = Self { quic: true };
-    /// TCP only, as under `socks5`: a SOCKS proxy carries no QUIC.
-    pub const TCP_ONLY: Self = Self { quic: false };
+    pub const ALL: Self = Self {
+        quic: true,
+        proxied: false,
+    };
+    /// TCP only, without a proxy.
+    pub const TCP_ONLY: Self = Self {
+        quic: false,
+        proxied: false,
+    };
+    /// `socks5`'s: TCP and WebSocket through the proxy, which carries no
+    /// QUIC, resolves every ordinary name (Tor's `RESOLVE`) and reaches
+    /// onions.
+    pub const SOCKS5: Self = Self {
+        quic: false,
+        proxied: true,
+    };
 
     /// Whether QUIC is dialed.
     pub fn quic(&self) -> bool {
         self.quic
+    }
+
+    /// Whether the dials go through a SOCKS proxy: a `/dns*` name is then
+    /// resolved by the transport, through the proxy, never ahead of it, and
+    /// onions have a route.
+    pub fn proxied(&self) -> bool {
+        self.proxied
     }
 
     /// Whether a dialed shape goes over a transport the policy has.
@@ -73,6 +98,10 @@ pub enum DialRefusal {
     /// An onion: `direct` has no route to one.
     #[error("an onion can't be reached in direct mode")]
     Onion,
+    /// An onion the onion route doesn't take: a malformed or v2 address, a
+    /// `/dnsaddr`, or a transport other than TCP or WebSocket.
+    #[error("the onion route takes only a v3 onion address, over TCP or WebSocket")]
+    OnionRoute,
     /// The address policy refuses the address.
     #[error("{0}")]
     Address(AddressRefusal),
@@ -144,21 +173,18 @@ impl DialPolicy {
                     },
                 },
             },
-            // Never built yet (`Network::new` refuses it): the design's
-            // socks5 learns no NAT64 prefix, so only the fixed forms apply,
-            // and its proxy is its one configured target.
-            Mode::Socks5(socks5) => {
-                let mut configured = ConfiguredTargets::new();
-                configured.add_endpoint(socks5.proxy);
-                Self {
-                    capability: None,
-                    transports: TransportPolicy::TCP_ONLY,
-                    gate: Gate::Check {
-                        configured: Arc::new(configured),
-                        nat64: Nat64Handle::fixed(Nat64State::known([])),
-                    },
-                }
-            }
+            // socks5 learns no NAT64 prefix (the exit makes every
+            // connection), so only the fixed forms apply. Its configured
+            // targets are the policy's: the proxy's own endpoint is the
+            // transport, never a target through it.
+            Mode::Socks5(socks5) => Self {
+                capability: None,
+                transports: TransportPolicy::SOCKS5,
+                gate: Gate::Check {
+                    configured: socks5.configured.clone(),
+                    nat64: Nat64Handle::fixed(Nat64State::known([])),
+                },
+            },
         }
     }
 
@@ -426,7 +452,13 @@ impl DialPolicy {
         }
         let target = classify_url(url).map_err(DialRefusal::Target)?;
         if target.target.is_onion() {
-            return Err(DialRefusal::Onion);
+            // The onion route for HTTP (design 0007, "The onion route") is
+            // the onion client's, which doesn't exist yet: no URL takes it.
+            return Err(if self.transports.proxied {
+                DialRefusal::OnionRoute
+            } else {
+                DialRefusal::Onion
+            });
         }
         Ok(match (&self.gate, &target.target) {
             (Gate::Check { configured, nat64 }, Target::Ip(ip))
@@ -447,7 +479,7 @@ impl DialPolicy {
         }
         let dial = classify_dialed(addr).map_err(DialRefusal::Target)?;
         if dial.target.is_onion() {
-            return Err(DialRefusal::Onion);
+            self.onion_route(&dial)?;
         }
         if !self.transports.carries(dial.shape) {
             return Err(DialRefusal::Transport);
@@ -460,6 +492,24 @@ impl DialPolicy {
             }
             _ => None,
         })
+    }
+}
+
+impl DialPolicy {
+    /// Whether an onion target has a route: only through a proxy, and only
+    /// a well-formed v3 address over TCP or WebSocket.
+    fn onion_route(&self, dial: &DialTarget) -> Result<(), DialRefusal> {
+        if !self.transports.proxied {
+            return Err(DialRefusal::Onion);
+        }
+        match dial.shape {
+            Shape::Tcp | Shape::Ws | Shape::Wss | Shape::Onion
+                if OnionHost::new(&dial.target).is_some() =>
+            {
+                Ok(())
+            }
+            _ => Err(DialRefusal::OnionRoute),
+        }
     }
 }
 
