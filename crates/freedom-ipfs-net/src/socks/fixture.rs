@@ -71,6 +71,8 @@ struct Config {
 #[derive(Debug, Default)]
 struct Shared {
     config: Mutex<Config>,
+    /// Every greeting's methods, refused ones included.
+    greetings: Mutex<Vec<Vec<u8>>>,
     requests: Mutex<Vec<Request>>,
     connections: AtomicUsize,
     /// The local addresses of the proxy's own connections to the listeners
@@ -133,6 +135,13 @@ impl SocksFixture {
     /// proxy without Tor's extension does.
     pub fn refuse_resolve(&self) {
         self.config().resolve_unsupported = true;
+    }
+
+    /// The methods every greeting so far offered, in order: those of a
+    /// greeting the proxy refused (no method it accepts) included, which
+    /// leave no [`Request`].
+    pub fn greetings(&self) -> Vec<Vec<u8>> {
+        self.shared.greetings.lock().unwrap().clone()
     }
 
     /// Every request so far, in order.
@@ -410,6 +419,7 @@ async fn exchange(stream: &mut TcpStream, shared: &Shared) -> std::io::Result<()
     stream.read_exact(&mut head).await?;
     let mut methods = vec![0u8; usize::from(head[1])];
     stream.read_exact(&mut methods).await?;
+    shared.greetings.lock().unwrap().push(methods.clone());
     let accepted = shared.config.lock().unwrap().methods.clone();
     let Some(method) = accepted.into_iter().find(|method| methods.contains(method)) else {
         stream.write_all(&[5, 0xFF]).await?;

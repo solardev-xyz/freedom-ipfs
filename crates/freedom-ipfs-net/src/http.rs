@@ -90,7 +90,8 @@ impl ClientConfig {
 }
 
 /// The reqwest clients a policy builds for one config: the one constructor.
-#[derive(Debug)]
+/// Its `Debug` names the mode only: a reqwest client's would print its
+/// proxy's URL, and under `socks5` that holds the network's credentials.
 enum Transport {
     /// Exactly what each crate built before the policy: `connect_timeout`
     /// and `timeout` set to the config's, reqwest's default redirect policy
@@ -124,13 +125,24 @@ enum Transport {
     Unavailable(NetworkError),
 }
 
+impl fmt::Debug for Transport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Legacy(_) => "Transport::Legacy",
+            Self::Direct { .. } => "Transport::Direct",
+            #[cfg(feature = "socks")]
+            Self::Socks5 { .. } => "Transport::Socks5",
+            Self::Unavailable(_) => "Transport::Unavailable",
+        })
+    }
+}
+
 /// The onion route's HTTP client (design 0007, "The onion route"): it takes
 /// only an [`OnionUrl`], and checks the URL's classification again before
 /// it sends, since reqwest's connector can't see the destination and
 /// `socks5h://` skips the resolver. Anything else is refused before it
 /// sends.
 #[cfg(feature = "socks")]
-#[derive(Debug)]
 struct OnionClient(reqwest::Client);
 
 #[cfg(feature = "socks")]
@@ -351,10 +363,21 @@ fn socks5_transport(
             addresses,
         ))
     };
+    // Every client authenticates with the network's own credentials (design
+    // 0007, "Stream isolation"), every hop of its redirects included: they
+    // go to the proxy in the SOCKS5 handshake, never in a request header.
+    // hyper-util's connector then offers username/password alone, and fails
+    // if the proxy picks another method: no fallback to no authentication.
+    let credentials = client.credentials();
     let through = |scheme: &str| {
-        reqwest::Proxy::all(format!("{scheme}://{}", socks5.proxy))
-            .map(|proxy| direct_builder(config, network.capability()).proxy(proxy))
-            .map_err(|err| NetworkError::ClientBuild(Arc::new(err)))
+        reqwest::Proxy::all(format!(
+            "{scheme}://{}:{}@{}",
+            credentials.username(),
+            credentials.password(),
+            socks5.proxy
+        ))
+        .map(|proxy| direct_builder(config, network.capability()).proxy(proxy))
+        .map_err(|err| NetworkError::ClientBuild(Arc::new(err)))
     };
     // socks5 learns no NAT64 prefix: only the fixed forms apply.
     let untrusted = crate::policy::Nat64Handle::fixed(Nat64State::known([]));
@@ -1060,7 +1083,7 @@ mod tests {
             Addresses::Checked(handle),
         )
         .unwrap();
-        let network = Network::with_lookup(policy, Some(crate::resolve::system_lookup()));
+        let network = Network::with_lookup(policy, Some(crate::resolve::system_lookup())).unwrap();
         let client = network.http_client(ClientConfig::new(Duration::from_secs(5), 0));
         let url = Url::parse("http://[2a00:1::1]:9/").unwrap();
         let inner = client.inner.clone();

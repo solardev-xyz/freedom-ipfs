@@ -49,11 +49,15 @@ url.workspace = true
 # ("[2001:db8::1]"); 0.1.21 sends it as an address (design 0007, "What can
 # be honored"). A floor only, for this crate's dependents' locks too.
 hyper-util = { version = "0.1.21", default-features = false, optional = true }
+# The 128 random bits of each `socks5` network's SOCKS5 password (design
+# 0007, "Stream isolation"), from the operating system, fallibly. Already
+# in the graph (rand_core 0.9, through hickory).
+getrandom = { version = "0.3", optional = true }
 
 [features]
 # `socks5` mode's SOCKS5 client and libp2p transport (design 0007,
 # "Modes"): off by default, so mobile builds compile none of it (D2).
-socks = ["tokio/net", "tokio/io-util", "reqwest/socks", "dep:hyper-util"]
+socks = ["tokio/net", "tokio/io-util", "reqwest/socks", "dep:hyper-util", "dep:getrandom"]
 # A SOCKS5 test proxy, for this crate's tests and its dependents'.
 test-util = ["socks", "tokio/rt"]
 
@@ -67,6 +71,10 @@ required-features = ["test-util"]
 
 [[test]]
 name = "socks_env_proxy"
+required-features = ["test-util"]
+
+[[test]]
+name = "socks_isolation"
 required-features = ["test-util"]
 
 [dev-dependencies]

@@ -9,14 +9,19 @@
 //!   route only, to an [`OnionHost`] by name.
 //!
 //! One client per network, so every request the network sends through the
-//! proxy authenticates the same way (`SocksAuth`). The proxy's endpoint
-//! is an IP literal: reaching it needs no DNS. Nothing here has a deadline
-//! of its own: the dial's caller bounds it (a swarm's connection timeout),
-//! and the network's capability drops it.
+//! proxy authenticates the same way (`SocksAuth`): with the network's own
+//! credentials (RFC 1929), so the proxy keeps its streams on circuits of
+//! their own (design 0007, "Stream isolation"). The greeting offers only
+//! username/password: a proxy that won't take it fails the request, and
+//! nothing falls back to no authentication. The proxy's endpoint is an IP
+//! literal: reaching it needs no DNS. Nothing here has a deadline of its
+//! own: the dial's caller bounds it (a swarm's connection timeout), and the
+//! network's capability drops it.
 
 #[cfg(feature = "test-util")]
 pub mod fixture;
 
+use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -28,7 +33,11 @@ use crate::gate::OnionHost;
 use crate::resolve::{LookupError, LookupFuture, NameLookup};
 
 const VERSION: u8 = 5;
+#[cfg(test)]
 const NO_AUTH: u8 = 0x00;
+/// RFC 1929's method, and its sub-negotiation's version.
+const USER_PASS: u8 = 0x02;
+const USER_PASS_VERSION: u8 = 0x01;
 const CONNECT: u8 = 0x01;
 /// Tor's `RESOLVE` extension.
 const RESOLVE: u8 = 0xF0;
@@ -43,32 +52,118 @@ pub(crate) struct SocksClient {
     auth: SocksAuth,
 }
 
-/// How the client authenticates to the proxy: the one method its greeting
-/// offers. A proxy that picks another fails the request; nothing falls back.
+/// A network's SOCKS5 credentials (RFC 1929; design 0007, "Stream
+/// isolation"): a fixed username, and a password of 128 random bits from
+/// the operating system, in hex, made when the network is built. Every
+/// stream the network sends through the proxy carries them, so Arti keeps
+/// its streams on circuits of their own, apart from every other network's.
 ///
-/// Whether each instance sends credentials of its own, so that the proxy
-/// keeps its streams on circuits of their own, is design 0007's open
-/// question 11. Credentials would be a second variant, offered alone, sent
-/// by RFC 1929's sub-negotiation in [`SocksAuth::authenticate`], and made
-/// once per network where the network builds its client.
+/// Never shown: `Debug` prints neither part, nothing implements `Display`,
+/// and no error or log carries them. They leave the process only to the
+/// proxy.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SocksCredentials {
+    username: &'static str,
+    password: String,
+}
+
+impl SocksCredentials {
+    /// The username every network sends: only the password tells networks
+    /// apart.
+    pub(crate) const USERNAME: &'static str = "freedom-ipfs";
+
+    /// New credentials, the password's 16 bytes from `random`: the OS's
+    /// randomness ([`os_random`]), or a test's. Its failure fails them:
+    /// nothing falls back to a fixed password, or to no authentication.
+    pub(crate) fn new(random: Random) -> Result<Self, RandomFailed> {
+        let mut bytes = [0u8; 16];
+        random(&mut bytes)?;
+        let password = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        Ok(Self {
+            username: Self::USERNAME,
+            password,
+        })
+    }
+
+    pub(crate) fn username(&self) -> &str {
+        self.username
+    }
+
+    pub(crate) fn password(&self) -> &str {
+        &self.password
+    }
+
+    /// RFC 1929's request: the version, then each part with its length.
+    fn request(&self) -> Vec<u8> {
+        let (user, pass) = (self.username.as_bytes(), self.password.as_bytes());
+        let mut request = Vec::with_capacity(3 + user.len() + pass.len());
+        request.push(USER_PASS_VERSION);
+        // Both are far under 255 bytes: a fixed name, and 32 hex digits.
+        request.push(user.len() as u8);
+        request.extend_from_slice(user);
+        request.push(pass.len() as u8);
+        request.extend_from_slice(pass);
+        request
+    }
+}
+
+impl fmt::Debug for SocksCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SocksCredentials(redacted)")
+    }
+}
+
+/// Where the password's bits come from: fills the buffer, or fails.
+pub(crate) type Random = fn(&mut [u8]) -> Result<(), RandomFailed>;
+
+/// The operating system's randomness, through its fallible API.
+pub(crate) fn os_random(bytes: &mut [u8]) -> Result<(), RandomFailed> {
+    getrandom::fill(bytes).map_err(|_| RandomFailed)
+}
+
+/// The operating system's randomness failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the operating system's randomness failed")]
+pub struct RandomFailed;
+
+/// How the client authenticates to the proxy: the one method its greeting
+/// offers, username/password, alone. A proxy that picks another fails the
+/// request; nothing falls back.
 #[derive(Clone, Debug)]
 pub(crate) enum SocksAuth {
-    /// No authentication (method `0x00`).
-    None,
+    /// RFC 1929, with the network's credentials (method `0x02`).
+    UserPass(SocksCredentials),
 }
 
 impl SocksAuth {
     /// The method the greeting offers, alone.
     fn method(&self) -> u8 {
         match self {
-            Self::None => NO_AUTH,
+            Self::UserPass(_) => USER_PASS,
         }
     }
 
     /// The method's sub-negotiation, once the proxy has picked it.
-    async fn authenticate(&self, _stream: &mut TcpStream) -> Result<(), SocksError> {
+    async fn authenticate(&self, stream: &mut TcpStream) -> Result<(), SocksError> {
         match self {
-            Self::None => Ok(()),
+            Self::UserPass(credentials) => {
+                stream
+                    .write_all(&credentials.request())
+                    .await
+                    .map_err(SocksError::Io)?;
+                let mut status = [0u8; 2];
+                stream
+                    .read_exact(&mut status)
+                    .await
+                    .map_err(SocksError::Io)?;
+                if status[0] != USER_PASS_VERSION {
+                    return Err(SocksError::Protocol);
+                }
+                if status[1] != 0 {
+                    return Err(SocksError::CredentialsRefused);
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -106,10 +201,18 @@ enum Bound {
 }
 
 impl SocksClient {
-    pub(crate) fn new(proxy: SocketAddr) -> Self {
+    /// The client of a network whose credentials are `credentials`.
+    pub(crate) fn new(proxy: SocketAddr, credentials: SocksCredentials) -> Self {
         Self {
             proxy,
-            auth: SocksAuth::None,
+            auth: SocksAuth::UserPass(credentials),
+        }
+    }
+
+    /// The credentials every stream of its network carries.
+    pub(crate) fn credentials(&self) -> &SocksCredentials {
+        match &self.auth {
+            SocksAuth::UserPass(credentials) => credentials,
         }
     }
 
@@ -258,6 +361,9 @@ pub enum SocksError {
     /// The proxy didn't accept the one authentication method offered.
     #[error("the SOCKS5 proxy refused the authentication method")]
     MethodRefused,
+    /// The proxy refused the network's credentials.
+    #[error("the SOCKS5 proxy refused the credentials")]
+    CredentialsRefused,
     /// The proxy refused the request, with this reply code.
     #[error("the SOCKS5 proxy refused the request (reply {0:#04x})")]
     Refused(u8),
@@ -274,30 +380,78 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
 
-    /// A proxy that answers the greeting with `choice`, then the request
-    /// with `reply`, raw, and returns what the client sent.
+    /// Fills with 0x11: credentials a test can predict.
+    fn elevens(bytes: &mut [u8]) -> Result<(), RandomFailed> {
+        bytes.fill(0x11);
+        Ok(())
+    }
+
+    fn credentials() -> SocksCredentials {
+        SocksCredentials::new(elevens).unwrap()
+    }
+
+    fn client(proxy: SocketAddr) -> SocksClient {
+        SocksClient::new(proxy, credentials())
+    }
+
+    /// What the client sends first: the greeting offering username and
+    /// password alone, then RFC 1929's request with `credentials()`.
+    fn greeting_and_credentials() -> Vec<u8> {
+        let mut sent = vec![5, 1, USER_PASS, USER_PASS_VERSION, 12];
+        sent.extend_from_slice(b"freedom-ipfs");
+        sent.push(32);
+        sent.extend_from_slice("11".repeat(16).as_bytes());
+        sent
+    }
+
+    /// A proxy that answers the greeting with `choice`, RFC 1929's request
+    /// (if it chose that method) with `status`, then the request with
+    /// `reply`, raw, and returns what the client sent.
     async fn scripted(
         choice: [u8; 2],
+        status: [u8; 2],
         reply: Vec<u8>,
     ) -> (SocketAddr, tokio::task::JoinHandle<Vec<u8>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut greeting = [0u8; 3];
-            stream.read_exact(&mut greeting).await.unwrap();
+            // The greeting, by the count of methods it declares.
+            let mut head = [0u8; 2];
+            stream.read_exact(&mut head).await.unwrap();
+            let mut methods = vec![0u8; usize::from(head[1])];
+            stream.read_exact(&mut methods).await.unwrap();
             stream.write_all(&choice).await.unwrap();
-            let mut seen = greeting.to_vec();
-            if choice[1] == NO_AUTH {
-                let mut request = vec![0u8; 512];
-                let n = stream.read(&mut request).await.unwrap();
-                seen.extend_from_slice(&request[..n]);
-                stream.write_all(&reply).await.unwrap();
+            let mut seen = [head.as_slice(), &methods].concat();
+            if choice[1] != USER_PASS {
+                return seen;
             }
+            let mut head = [0u8; 2];
+            stream.read_exact(&mut head).await.unwrap();
+            let mut user = vec![0u8; usize::from(head[1])];
+            stream.read_exact(&mut user).await.unwrap();
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await.unwrap();
+            let mut pass = vec![0u8; usize::from(len[0])];
+            stream.read_exact(&mut pass).await.unwrap();
+            seen.extend_from_slice(&head);
+            seen.extend_from_slice(&user);
+            seen.extend_from_slice(&len);
+            seen.extend_from_slice(&pass);
+            stream.write_all(&status).await.unwrap();
+            if status != [USER_PASS_VERSION, 0] {
+                return seen;
+            }
+            let mut request = vec![0u8; 512];
+            let n = stream.read(&mut request).await.unwrap();
+            seen.extend_from_slice(&request[..n]);
+            stream.write_all(&reply).await.unwrap();
             seen
         });
         (addr, task)
     }
+
+    const ACCEPTED: [u8; 2] = [USER_PASS_VERSION, 0];
 
     #[tokio::test]
     async fn resolve_takes_one_address_and_nothing_else() {
@@ -321,10 +475,11 @@ mod tests {
             (vec![5, 4, 0, 1, 0, 0, 0, 0, 0, 0], None),
         ];
         for (reply, expected) in cases {
-            let (proxy, seen) = scripted([5, NO_AUTH], reply.clone()).await;
-            let answer = SocksClient::new(proxy).resolve("example.com").await;
+            let (proxy, seen) = scripted([5, USER_PASS], ACCEPTED, reply.clone()).await;
+            let answer = client(proxy).resolve("example.com").await;
             assert_eq!(answer.as_ref().ok(), expected.as_ref(), "{reply:?}");
-            let mut sent = vec![5, 1, NO_AUTH, 5, RESOLVE, 0, 3, 11];
+            let mut sent = greeting_and_credentials();
+            sent.extend_from_slice(&[5, RESOLVE, 0, 3, 11]);
             sent.extend_from_slice(b"example.com");
             sent.extend_from_slice(&[0, 0]);
             assert_eq!(seen.await.unwrap(), sent);
@@ -334,17 +489,18 @@ mod tests {
     #[tokio::test]
     async fn connect_sends_an_ip_literal_or_an_onion_name() {
         let ok = vec![5, 0, 0, 1, 0, 0, 0, 0, 0, 0];
-        let (proxy, seen) = scripted([5, NO_AUTH], ok.clone()).await;
-        SocksClient::new(proxy)
+        let (proxy, seen) = scripted([5, USER_PASS], ACCEPTED, ok.clone()).await;
+        client(proxy)
             .connect_ip("[2001:db8::1]:4001".parse().unwrap())
             .await
             .unwrap();
-        let mut sent = vec![5, 1, NO_AUTH, 5, CONNECT, 0, ATYP_IPV6];
+        let mut sent = greeting_and_credentials();
+        sent.extend_from_slice(&[5, CONNECT, 0, ATYP_IPV6]);
         sent.extend_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
         sent.extend_from_slice(&4001u16.to_be_bytes());
         assert_eq!(seen.await.unwrap(), sent);
 
-        let (proxy, seen) = scripted([5, NO_AUTH], ok).await;
+        let (proxy, seen) = scripted([5, USER_PASS], ACCEPTED, ok).await;
         let onion = format!(
             "{}.onion",
             data_encoding::BASE32_NOPAD
@@ -352,25 +508,43 @@ mod tests {
                 .to_ascii_lowercase()
         );
         let host = OnionHost::new(&crate::gate::Target::Onion(onion.clone())).unwrap();
-        SocksClient::new(proxy)
-            .connect_onion(&host, 80)
-            .await
-            .unwrap();
-        let mut sent = vec![5, 1, NO_AUTH, 5, CONNECT, 0, ATYP_DOMAIN, 62];
+        client(proxy).connect_onion(&host, 80).await.unwrap();
+        let mut sent = greeting_and_credentials();
+        sent.extend_from_slice(&[5, CONNECT, 0, ATYP_DOMAIN, 62]);
         sent.extend_from_slice(onion.as_bytes());
         sent.extend_from_slice(&80u16.to_be_bytes());
         assert_eq!(seen.await.unwrap(), sent);
     }
 
     #[tokio::test]
-    async fn a_refused_method_or_a_broken_reply_fails() {
-        // The proxy wants another method: nothing more is sent.
-        let (proxy, seen) = scripted([5, 0xFF], Vec::new()).await;
+    async fn a_proxy_that_wont_take_the_credentials_fails_with_no_fallback() {
+        // It picks no authentication, or none acceptable: nothing more is
+        // sent, the credentials included.
+        for choice in [[5, NO_AUTH], [5, 0xFF]] {
+            let (proxy, seen) = scripted(choice, ACCEPTED, Vec::new()).await;
+            assert!(matches!(
+                client(proxy).resolve("example.com").await,
+                Err(SocksError::MethodRefused)
+            ));
+            assert_eq!(seen.await.unwrap(), [5, 1, USER_PASS], "{choice:?}");
+        }
+        // It refuses them: nothing more is sent.
+        let (proxy, seen) = scripted([5, USER_PASS], [USER_PASS_VERSION, 1], Vec::new()).await;
         assert!(matches!(
-            SocksClient::new(proxy).resolve("example.com").await,
-            Err(SocksError::MethodRefused)
+            client(proxy).resolve("example.com").await,
+            Err(SocksError::CredentialsRefused)
         ));
-        assert_eq!(seen.await.unwrap(), [5, 1, NO_AUTH]);
+        assert_eq!(seen.await.unwrap(), greeting_and_credentials());
+        // Its RFC 1929 reply is in another version.
+        let (proxy, _) = scripted([5, USER_PASS], [5, 0], Vec::new()).await;
+        assert!(matches!(
+            client(proxy).resolve("example.com").await,
+            Err(SocksError::Protocol)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_broken_reply_fails() {
         for reply in [
             // Another version, a nonzero reserved byte, an unknown type.
             vec![4, 0, 0, 1, 8, 8, 4, 4, 0, 0],
@@ -379,28 +553,70 @@ mod tests {
             // Truncated.
             vec![5, 0, 0, 1, 8, 8],
         ] {
-            let (proxy, _) = scripted([5, NO_AUTH], reply.clone()).await;
+            let (proxy, _) = scripted([5, USER_PASS], ACCEPTED, reply.clone()).await;
             assert!(
-                SocksClient::new(proxy)
-                    .resolve("example.com")
-                    .await
-                    .is_err(),
+                client(proxy).resolve("example.com").await.is_err(),
                 "{reply:?}"
             );
         }
         let refused = vec![5, 7, 0, 1, 0, 0, 0, 0, 0, 0];
-        let (proxy, _) = scripted([5, NO_AUTH], refused).await;
+        let (proxy, _) = scripted([5, USER_PASS], ACCEPTED, refused).await;
         assert!(matches!(
-            SocksClient::new(proxy).resolve("example.com").await,
+            client(proxy).resolve("example.com").await,
             Err(SocksError::Refused(7))
         ));
         // A name SOCKS5 can't carry is refused before the proxy is asked.
         let long = "a".repeat(256);
         assert!(matches!(
-            SocksClient::new("127.0.0.1:9".parse().unwrap())
-                .resolve(&long)
-                .await,
+            client("127.0.0.1:9".parse().unwrap()).resolve(&long).await,
             Err(SocksError::NameTooLong)
         ));
+    }
+
+    #[test]
+    fn credentials_are_the_fixed_username_and_128_random_bits() {
+        let one = SocksCredentials::new(os_random).unwrap();
+        let two = SocksCredentials::new(os_random).unwrap();
+        assert_eq!(one.username(), SocksCredentials::USERNAME);
+        assert_eq!(one.password().len(), 32);
+        assert!(one.password().bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(one.password(), two.password());
+        // The OS's randomness failing fails them: no fixed password.
+        fn failing(_: &mut [u8]) -> Result<(), RandomFailed> {
+            Err(RandomFailed)
+        }
+        assert_eq!(SocksCredentials::new(failing), Err(RandomFailed));
+    }
+
+    #[tokio::test]
+    async fn the_credentials_are_never_shown() {
+        let credentials = SocksCredentials::new(os_random).unwrap();
+        let client = SocksClient::new("127.0.0.1:9".parse().unwrap(), credentials.clone());
+        let mut shown = vec![
+            format!("{credentials:?}"),
+            format!("{:?}", SocksAuth::UserPass(credentials.clone())),
+            format!("{client:?}"),
+            format!("{client:#?}"),
+        ];
+        // Every error, as its text and its Debug, a real one included.
+        let unreachable = client.resolve("example.com").await.unwrap_err();
+        let errors = [
+            unreachable,
+            SocksError::Protocol,
+            SocksError::MethodRefused,
+            SocksError::CredentialsRefused,
+            SocksError::Refused(1),
+            SocksError::EmptyAnswer,
+            SocksError::NameTooLong,
+        ];
+        for error in &errors {
+            shown.push(error.to_string());
+            shown.push(format!("{error:?}"));
+        }
+        shown.push(RandomFailed.to_string());
+        for text in shown {
+            assert!(!text.contains(credentials.password()), "{text}");
+            assert!(!text.contains(SocksCredentials::USERNAME), "{text}");
+        }
     }
 }
