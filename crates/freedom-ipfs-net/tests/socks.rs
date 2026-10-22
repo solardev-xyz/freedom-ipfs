@@ -11,18 +11,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use freedom_ipfs_net::gate::ConfiguredTargets;
-use freedom_ipfs_net::socks::fixture::{Answer, Destination, Request, SocksFixture};
+use freedom_ipfs_net::socks::fixture::{
+    Answer, ClientHelloCatcher, Destination, Request, SocksFixture,
+};
 use freedom_ipfs_net::transport::{SwarmTransport, Transports};
-use freedom_ipfs_net::{DialRefusal, Network, NetworkError, NetworkPolicy, TransportPolicy};
+use freedom_ipfs_net::{
+    ClientConfig, DialRefusal, Network, NetworkError, NetworkPolicy, TransportPolicy,
+};
 use libp2p::core::transport::{DialOpts, PortUse, TransportError};
 use libp2p::core::Endpoint;
 use libp2p::identity::Keypair;
 use libp2p::{Multiaddr, Transport};
-use tokio::io::AsyncReadExt;
 use url::Url;
 
 const PEER: &str = "12D3KooWAC7ALVECw2xQHccT3hSUcQU7pJ3hvwV77w1kEevC5kKG";
 const ONION3: &str = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd";
+const CONFIG: ClientConfig = ClientConfig::new(Duration::from_secs(5), 10);
 
 fn opts() -> DialOpts {
     DialOpts {
@@ -524,86 +528,25 @@ async fn the_greeting_offers_one_method_and_never_falls_back() {
 #[tokio::test(flavor = "multi_thread")]
 async fn wss_keeps_the_name_for_tls() {
     let fixture = SocksFixture::start().await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let hello_at = listener.local_addr().unwrap();
-    let hello = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut bytes = Vec::new();
-        let mut buffer = [0u8; 4096];
-        loop {
-            let n = stream.read(&mut buffer).await.unwrap();
-            if n == 0 {
-                return None;
-            }
-            bytes.extend_from_slice(&buffer[..n]);
-            if let Some(name) = client_hello_server_name(&bytes) {
-                return Some(name);
-            }
-        }
-    });
+    let hello = ClientHelloCatcher::start().await;
     fixture.answer("ws.example", Answer::Ip("8.8.8.8".parse().unwrap()));
-    fixture.forward(Destination::Ip(public(443)), hello_at);
+    fixture.forward(Destination::Ip(public(443)), hello.addr());
     let network = socks5(&fixture, ConfiguredTargets::new());
     let [_, (_, mut transport)] = stacks(&network);
     let addr = multiaddr(&format!("/dns4/ws.example/tcp/443/wss/p2p/{PEER}"));
     let _ = dial_through(&mut transport, &addr, Duration::from_secs(2)).await;
-    let name = tokio::time::timeout(Duration::from_secs(2), hello)
-        .await
-        .expect("a ClientHello")
-        .unwrap();
-    assert_eq!(name.as_deref(), Some("ws.example"));
+    assert!(wait_until(Duration::from_secs(2), || !hello.names().is_empty()).await);
+    assert_eq!(hello.names(), [Some("ws.example".to_string())]);
     let requests = fixture.requests();
     assert_eq!(resolves(&requests), ["ws.example"]);
     assert_eq!(connects(&requests), [Destination::Ip(public(443))]);
 }
 
-/// The server name a TLS ClientHello in `bytes` carries, once it has all
-/// arrived.
-fn client_hello_server_name(bytes: &[u8]) -> Option<String> {
-    fn u16_at(bytes: &[u8], at: usize) -> Option<usize> {
-        Some(usize::from(u16::from_be_bytes([
-            *bytes.get(at)?,
-            *bytes.get(at + 1)?,
-        ])))
-    }
-    // The record header, then the handshake header (type 1, ClientHello).
-    if bytes.first() != Some(&22) || bytes.get(5) != Some(&1) {
-        return None;
-    }
-    let end = 5 + u16_at(bytes, 3)?;
-    if bytes.len() < end {
-        return None;
-    }
-    // Version and random, then the session ID, the cipher suites and the
-    // compression methods.
-    let mut at = 9 + 2 + 32;
-    at += 1 + usize::from(*bytes.get(at)?);
-    at += 2 + u16_at(bytes, at)?;
-    at += 1 + usize::from(*bytes.get(at)?);
-    let extensions_end = at + 2 + u16_at(bytes, at)?;
-    at += 2;
-    while at + 4 <= extensions_end.min(end) {
-        let kind = u16_at(bytes, at)?;
-        let len = u16_at(bytes, at + 2)?;
-        if kind == 0 {
-            // The server name list: its length, then type 0 (host name),
-            // the name's length and the name.
-            let name_len = u16_at(bytes, at + 4 + 3)?;
-            let start = at + 4 + 5;
-            return std::str::from_utf8(bytes.get(start..start + name_len)?)
-                .ok()
-                .map(str::to_string);
-        }
-        at += 4 + len;
-    }
-    None
-}
-
 /// `socks5` policies: the proxy is an IP literal and a port, the DoH
-/// endpoint is a configured target, the proxy's own endpoint isn't, and a
-/// network isn't built until its HTTP clients exist.
+/// endpoint is a configured target, and the proxy's own endpoint isn't. A
+/// network of one has its HTTP clients and its transports.
 #[test]
-fn a_socks5_policy_names_its_proxy_and_isnt_a_network_yet() {
+fn a_socks5_policy_names_its_proxy() {
     for proxy in ["0.0.0.0:9150", "[::]:9150", "127.0.0.1:0"] {
         assert!(matches!(
             NetworkPolicy::socks5(proxy.parse().unwrap(), ConfiguredTargets::new(), doh()),
@@ -626,12 +569,12 @@ fn a_socks5_policy_names_its_proxy_and_isnt_a_network_yet() {
         &freedom_ipfs_net::gate::Target::Ip("127.0.0.1".parse().unwrap()),
         9150
     ));
-    assert!(matches!(
-        Network::new(policy.clone()),
-        Err(NetworkError::Unsupported("socks5"))
-    ));
-    let network = Network::with_lookup(policy, None);
+    let network = Network::new(policy).unwrap();
     assert_eq!(network.transport_policy(), TransportPolicy::SOCKS5);
+    assert_eq!(
+        network.http_client(CONFIG).error().map(ToString::to_string),
+        None
+    );
     // An onion endpoint can be configured: socks5 has a route to it.
     let mut onion = ConfiguredTargets::new();
     onion
@@ -641,9 +584,9 @@ fn a_socks5_policy_names_its_proxy_and_isnt_a_network_yet() {
 }
 
 /// Candidate choice under `socks5`: QUIC is refused before the cut; the
-/// onion route admits a well-formed v3 address over TCP or WebSocket and
-/// nothing else; an onion URL has no route yet. Under `direct` (the
-/// control) every onion is refused as `direct` refuses them.
+/// onion route admits a well-formed v3 address over TCP, WebSocket or HTTP
+/// (an HTTP provider's multiaddr, or its URL) and nothing else. Under
+/// `direct` (the control) every onion is refused as `direct` refuses them.
 #[tokio::test]
 async fn the_dial_policy_knows_the_proxy() {
     let fixture = SocksFixture::start().await;
@@ -669,6 +612,8 @@ async fn the_dial_policy_knows_the_proxy() {
         format!("/dns/{ONION3}.onion/tcp/4001"),
         format!("/dns4/www.{ONION3}.onion/tcp/443/wss"),
         format!("/dns6/{ONION3}.onion/tcp/80/ws"),
+        format!("/dns/{ONION3}.onion/tcp/443/https"),
+        format!("/dns/{ONION3}.onion/http"),
     ] {
         let addr = multiaddr(&format!("{admitted}/p2p/{PEER}"));
         assert_eq!(policy.check_now(&addr), Ok(()), "{admitted}");
@@ -683,7 +628,7 @@ async fn the_dial_policy_knows_the_proxy() {
         "/dns/foo.onion/tcp/80".to_string(),
         format!("/dnsaddr/{ONION3}.onion"),
         format!("/dns/{ONION3}.onion/udp/4001/quic-v1"),
-        format!("/dns/{ONION3}.onion/tcp/443/https"),
+        "/dns/foo.onion/tcp/443/https".to_string(),
     ] {
         let addr = multiaddr(&refused);
         assert_eq!(
@@ -698,11 +643,13 @@ async fn the_dial_policy_knows_the_proxy() {
         );
     }
     let onion_url = Url::parse(&format!("http://{ONION3}.onion/")).unwrap();
+    assert_eq!(policy.check_url_now(&onion_url), Ok(()));
+    assert_eq!(direct.check_url_now(&onion_url), Err(DialRefusal::Onion));
+    let malformed = Url::parse("http://foo.onion/").unwrap();
     assert_eq!(
-        policy.check_url_now(&onion_url),
+        policy.check_url_now(&malformed),
         Err(DialRefusal::OnionRoute)
     );
-    assert_eq!(direct.check_url_now(&onion_url), Err(DialRefusal::Onion));
     // Literals pass the address table, with no NAT64 prefix learned.
     assert!(policy
         .check_now(&multiaddr("/ip4/10.0.0.1/tcp/4001"))
@@ -718,4 +665,48 @@ async fn the_dial_policy_knows_the_proxy() {
         policy.check_now(&multiaddr("/ip6/2002:808:808::/tcp/4001")),
         Ok(())
     );
+}
+
+/// The onion route sends the host it checked (#50 review, round 1): an
+/// onion `/dns*` written with a trailing dot or in capitals is connected as
+/// the classified host (lowercase, no trailing dot), over TCP and under a
+/// WebSocket, whose TLS names that host too. The canonical spelling is the
+/// control.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_onion_multiaddr_is_sent_by_the_name_that_was_checked() {
+    let onion = format!("{ONION3}.onion");
+    let upper = ONION3.to_ascii_uppercase();
+    for written in [
+        onion.clone(),
+        format!("{onion}."),
+        format!("{upper}.ONION"),
+        format!("{upper}.onion."),
+    ] {
+        let fixture = SocksFixture::start().await;
+        let hello = ClientHelloCatcher::start().await;
+        fixture.forward(Destination::Name(onion.clone(), 443), hello.addr());
+        let network = socks5(&fixture, ConfiguredTargets::new());
+        let [(_, mut dht), (_, mut bitswap)] = stacks(&network);
+        for (stack, addr) in [
+            (0, format!("/dns/{written}/tcp/4001")),
+            (1, format!("/dns4/{written}/tcp/4002")),
+            (1, format!("/dns/{written}/tcp/443/wss")),
+        ] {
+            let transport = if stack == 0 { &mut dht } else { &mut bitswap };
+            let addr = multiaddr(&format!("{addr}/p2p/{PEER}"));
+            let _ = dial_through(transport, &addr, Duration::from_secs(2)).await;
+        }
+        assert_eq!(
+            connects(&fixture.requests()),
+            [
+                Destination::Name(onion.clone(), 4001),
+                Destination::Name(onion.clone(), 4002),
+                Destination::Name(onion.clone(), 443),
+            ],
+            "{written}"
+        );
+        assert_eq!(resolves(&fixture.requests()), Vec::<String>::new());
+        assert!(wait_until(Duration::from_secs(2), || !hello.names().is_empty()).await);
+        assert_eq!(hello.names(), [Some(onion.clone())], "{written}");
+    }
 }

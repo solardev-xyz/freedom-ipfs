@@ -159,6 +159,226 @@ impl Drop for SocksFixture {
     }
 }
 
+/// A listener that reads the TLS ClientHello each connection opens with,
+/// records the server name it carries (SNI; `None` without one), and drops
+/// the connection.
+#[derive(Debug)]
+pub struct ClientHelloCatcher {
+    addr: SocketAddr,
+    names: Arc<Mutex<Vec<Option<String>>>>,
+    task: JoinHandle<()>,
+}
+
+impl ClientHelloCatcher {
+    pub async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let names = Arc::new(Mutex::new(Vec::new()));
+        let recorded = names.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut buffer).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+                        }
+                        if let Some(name) = client_hello_server_name(&bytes) {
+                            recorded.lock().unwrap().push(name);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self { addr, names, task }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// The server names of the ClientHellos received so far.
+    pub fn names(&self) -> Vec<Option<String>> {
+        self.names.lock().unwrap().clone()
+    }
+}
+
+impl Drop for ClientHelloCatcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The server name a complete TLS ClientHello at the start of `bytes`
+/// carries: `None` until it has all arrived, `Some(None)` without one.
+fn client_hello_server_name(bytes: &[u8]) -> Option<Option<String>> {
+    fn u16_at(bytes: &[u8], at: usize) -> Option<usize> {
+        Some(usize::from(u16::from_be_bytes([
+            *bytes.get(at)?,
+            *bytes.get(at + 1)?,
+        ])))
+    }
+    // The record header, then the handshake header (type 1, ClientHello).
+    if bytes.len() < 6 {
+        return None;
+    }
+    if bytes[0] != 22 || bytes[5] != 1 {
+        return Some(None);
+    }
+    let end = 5 + u16_at(bytes, 3)?;
+    if bytes.len() < end {
+        return None;
+    }
+    let hello = &bytes[..end];
+    // Version and random, then the session ID, the cipher suites and the
+    // compression methods.
+    let mut at = 9 + 2 + 32;
+    let parsed = (|| {
+        at += 1 + usize::from(*hello.get(at)?);
+        at += 2 + u16_at(hello, at)?;
+        at += 1 + usize::from(*hello.get(at)?);
+        let extensions_end = at + 2 + u16_at(hello, at)?;
+        at += 2;
+        while at + 4 <= extensions_end.min(end) {
+            let kind = u16_at(hello, at)?;
+            let len = u16_at(hello, at + 2)?;
+            if kind == 0 {
+                // The server name list: its length, then type 0 (host
+                // name), the name's length and the name.
+                let name_len = u16_at(hello, at + 4 + 3)?;
+                let start = at + 4 + 5;
+                return std::str::from_utf8(hello.get(start..start + name_len)?)
+                    .ok()
+                    .map(str::to_string);
+            }
+            at += 4 + len;
+        }
+        None
+    })();
+    Some(parsed)
+}
+
+/// An HTTP/1.1 server that records each request's path and `Host` header,
+/// and answers it from `respond`, given the path and the host: a status, a
+/// `Location` if any, and a body. Each connection carries one request.
+#[derive(Debug)]
+pub struct HttpServer {
+    addr: SocketAddr,
+    requests: Arc<Mutex<Vec<ServedRequest>>>,
+    task: JoinHandle<()>,
+}
+
+/// A request an [`HttpServer`] served: its path, and its `Host` header.
+pub type ServedRequest = (String, Option<String>);
+
+/// An [`HttpServer`]'s answer.
+#[derive(Clone, Debug)]
+pub struct Reply {
+    pub status: u16,
+    pub location: Option<String>,
+    pub body: String,
+}
+
+impl Reply {
+    pub fn ok(body: &str) -> Self {
+        Self {
+            status: 200,
+            location: None,
+            body: body.to_string(),
+        }
+    }
+
+    pub fn redirect(location: &str) -> Self {
+        Self {
+            status: 302,
+            location: Some(location.to_string()),
+            body: String::new(),
+        }
+    }
+}
+
+impl HttpServer {
+    pub async fn start(
+        respond: impl Fn(&str, Option<&str>) -> Reply + Send + Sync + 'static,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let respond = Arc::new(respond);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let (recorded, respond) = (recorded.clone(), respond.clone());
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut buffer).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buffer[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).into_owned();
+                    let mut lines = head.split("\r\n");
+                    let path = lines
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .to_string();
+                    let host = lines.find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("host")
+                            .then(|| value.trim().to_string())
+                    });
+                    recorded.lock().unwrap().push((path.clone(), host.clone()));
+                    let reply = respond(&path, host.as_deref());
+                    let location = reply
+                        .location
+                        .map(|location| format!("Location: {location}\r\n"))
+                        .unwrap_or_default();
+                    let response = format!(
+                        "HTTP/1.1 {} X\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        reply.status,
+                        reply.body.len(),
+                        reply.body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        Self {
+            addr,
+            requests,
+            task,
+        }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Each request's path and `Host` header, in order.
+    pub fn requests(&self) -> Vec<ServedRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Drop for HttpServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 async fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
     let _ = exchange(&mut stream, &shared).await;
 }

@@ -15,9 +15,10 @@
 //!   (QUIC under `socks5`) is refused like a refused target, so it goes
 //!   before candidates are ranked and cut to two per peer.
 //! - **Onions:** `direct` has no route to one. Under `socks5` the onion
-//!   route takes a well-formed v3 address ([`OnionHost`]) over TCP or
-//!   WebSocket, as `/onion3` or an onion `/dns*`; any other onion (a
-//!   malformed or v2 address, a `/dnsaddr`, QUIC) is refused.
+//!   route takes a well-formed v3 address ([`OnionHost`]) over TCP,
+//!   WebSocket or HTTP: `/onion3`, an onion `/dns*`, and an HTTP provider's
+//!   onion URL. Any other onion (a malformed or v2 address, a `/dnsaddr`,
+//!   QUIC) is refused.
 //!
 //! Under the legacy policy there is no gate: every address passes, as
 //! before. The transports are the last word (design 0007, check 3): these
@@ -99,8 +100,8 @@ pub enum DialRefusal {
     #[error("an onion can't be reached in direct mode")]
     Onion,
     /// An onion the onion route doesn't take: a malformed or v2 address, a
-    /// `/dnsaddr`, or a transport other than TCP or WebSocket.
-    #[error("the onion route takes only a v3 onion address, over TCP or WebSocket")]
+    /// `/dnsaddr`, or a transport other than TCP, WebSocket or HTTP.
+    #[error("the onion route takes only a v3 onion address, over TCP, WebSocket or HTTP")]
     OnionRoute,
     /// The address policy refuses the address.
     #[error("{0}")]
@@ -452,13 +453,13 @@ impl DialPolicy {
         }
         let target = classify_url(url).map_err(DialRefusal::Target)?;
         if target.target.is_onion() {
-            // The onion route for HTTP (design 0007, "The onion route") is
-            // the onion client's, which doesn't exist yet: no URL takes it.
-            return Err(if self.transports.proxied {
-                DialRefusal::OnionRoute
-            } else {
-                DialRefusal::Onion
-            });
+            // The onion route for HTTP (design 0007, "The onion route"): the
+            // onion client's, through the proxy only.
+            if !self.transports.proxied {
+                return Err(DialRefusal::Onion);
+            }
+            OnionHost::new(&target.target).ok_or(DialRefusal::OnionRoute)?;
+            return Ok(None);
         }
         Ok(match (&self.gate, &target.target) {
             (Gate::Check { configured, nat64 }, Target::Ip(ip))
@@ -497,13 +498,13 @@ impl DialPolicy {
 
 impl DialPolicy {
     /// Whether an onion target has a route: only through a proxy, and only
-    /// a well-formed v3 address over TCP or WebSocket.
+    /// a well-formed v3 address over TCP, WebSocket or HTTP.
     fn onion_route(&self, dial: &DialTarget) -> Result<(), DialRefusal> {
         if !self.transports.proxied {
             return Err(DialRefusal::Onion);
         }
         match dial.shape {
-            Shape::Tcp | Shape::Ws | Shape::Wss | Shape::Onion
+            Shape::Tcp | Shape::Ws | Shape::Wss | Shape::Onion | Shape::Http | Shape::Https
                 if OnionHost::new(&dial.target).is_some() =>
             {
                 Ok(())

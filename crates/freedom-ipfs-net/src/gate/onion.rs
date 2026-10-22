@@ -1,8 +1,9 @@
 //! The onion route's host (design 0007, "The onion route").
 
 use data_encoding::BASE32_NOPAD;
+use url::Url;
 
-use super::classify::Target;
+use super::classify::{classify_url, Target};
 
 /// The length of a v3 onion address's label: 35 bytes in base32.
 const V3_LABEL_LEN: usize = 56;
@@ -54,6 +55,49 @@ impl OnionHost {
     /// The host name, as the proxy receives it.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// An `http` or `https` URL, without userinfo, whose host is an
+/// [`OnionHost`], spelled exactly as that host: the only thing the onion
+/// route's HTTP client takes (design 0007, "The onion route"). Only
+/// [`OnionUrl::new`] makes one, from a URL the classifier found to be an
+/// onion's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnionUrl(Url);
+
+impl OnionUrl {
+    /// `url`, if the classifier reads it as an `http` or `https` URL
+    /// without userinfo whose host is a well-formed v3 onion address, with
+    /// its host written as the classified [`OnionHost`]: lowercase, without
+    /// a trailing dot. So the host the proxy receives (and the request's
+    /// `Host`, and TLS's server name) is the host that was checked. The
+    /// scheme, port, path and query are kept.
+    pub fn new(url: &Url) -> Option<Self> {
+        let target = classify_url(url).ok()?;
+        let host = OnionHost::new(&target.target)?;
+        let mut sent = url.clone();
+        sent.set_host(Some(host.as_str())).ok()?;
+        (sent.host_str() == Some(host.as_str())).then_some(Self(sent))
+    }
+
+    /// The host the URL names, if it is a well-formed onion spelled
+    /// exactly as the classifier writes it.
+    pub fn host(&self) -> Option<OnionHost> {
+        let target = classify_url(&self.0).ok()?;
+        let host = OnionHost::new(&target.target)?;
+        (self.0.host_str() == Some(host.as_str())).then_some(host)
+    }
+
+    pub fn as_url(&self) -> &Url {
+        &self.0
+    }
+
+    /// Any URL, unchecked: only for the tests of the onion client's own
+    /// second check.
+    #[cfg(test)]
+    pub(crate) fn unchecked(url: Url) -> Self {
+        Self(url)
     }
 }
 
@@ -117,6 +161,54 @@ mod tests {
         // Not onions at all.
         for other in ["example.com", "127.0.0.1"] {
             assert_eq!(OnionHost::new(&classify_host(other).unwrap()), None);
+        }
+    }
+
+    #[test]
+    fn only_an_onion_url_the_classifier_accepts_is_one() {
+        let v3 = v3_label(3);
+        for accepted in [
+            format!("http://{v3}.onion/"),
+            format!("https://www.{v3}.onion:8443/a?b"),
+        ] {
+            let url = Url::parse(&accepted).unwrap();
+            assert_eq!(OnionUrl::new(&url).unwrap().as_url(), &url);
+        }
+        // Written another way, the URL is rebuilt with the host as checked:
+        // the scheme, port, path and query stay.
+        for (written, sent) in [
+            (
+                format!("http://{v3}.onion./x"),
+                format!("http://{v3}.onion/x"),
+            ),
+            (
+                format!("https://WWW.{}.ONION.:8443/a?b#c", v3.to_ascii_uppercase()),
+                format!("https://www.{v3}.onion:8443/a?b#c"),
+            ),
+        ] {
+            let url = OnionUrl::new(&Url::parse(&written).unwrap()).unwrap();
+            assert_eq!(url.as_url().as_str(), sent, "{written}");
+            assert_eq!(
+                url.host().map(|host| host.as_str().to_string()),
+                url.as_url().host_str().map(str::to_string)
+            );
+        }
+        // A URL spelled otherwise than its classified host is no onion URL
+        // the client sends.
+        let unchecked = OnionUrl::unchecked(Url::parse(&format!("http://{v3}.onion./")).unwrap());
+        assert_eq!(unchecked.host(), None);
+        for refused in [
+            "http://example.com/".to_string(),
+            "http://127.0.0.1/".to_string(),
+            "http://foo.onion/".to_string(),
+            format!("ftp://{v3}.onion/"),
+            format!("http://user@{v3}.onion/"),
+        ] {
+            assert_eq!(
+                OnionUrl::new(&Url::parse(&refused).unwrap()),
+                None,
+                "{refused}"
+            );
         }
     }
 }

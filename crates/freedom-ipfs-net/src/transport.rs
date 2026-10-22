@@ -58,7 +58,7 @@ pub use socks::{Socks5DialError, Socks5Transport};
 
 use crate::capability::{NetworkCapability, Revoked};
 use crate::dial::{DialPolicy, DialRefusal};
-use crate::gate::AddressRefusal;
+use crate::gate::{classify_host, AddressRefusal, OnionHost};
 use crate::policy::{Mode, Network};
 
 /// The most TXT lookups one `/dnsaddr` dial makes, nested ones included:
@@ -219,6 +219,16 @@ where
                 policy
                     .check_target(&addr)
                     .map_err(|refusal| TransportError::Other(GatedError::Refused(refusal)))?;
+                // Through a proxy, an onion goes on as the host that was
+                // checked, however its `/dns*` component spelled it: the
+                // proxy, TLS and the WebSocket handshake below see that host.
+                // (Elsewhere no onion gets past the check, or there is no
+                // gate.)
+                let addr = if policy.transports().proxied() {
+                    onion_as_checked(addr)
+                } else {
+                    addr
+                };
                 let dial: GatedDial<T> = match dnsaddr {
                     Some(resolver) if is_dnsaddr(&addr) => {
                         dial_dnsaddr(self.inner.clone(), *resolver, policy, addr, opts).boxed()
@@ -351,6 +361,32 @@ fn ip_and_port(addr: &Multiaddr) -> Option<(IpAddr, u16)> {
         }
     }
     Some((ip?, port?))
+}
+
+/// `addr` with an onion `/dns*` host component written as its
+/// [`OnionHost`] (lowercase, without a trailing dot); any other address as
+/// it is.
+fn onion_as_checked(addr: Multiaddr) -> Multiaddr {
+    let host = match addr.iter().next() {
+        Some(Protocol::Dns(name) | Protocol::Dns4(name) | Protocol::Dns6(name)) => {
+            classify_host(&name)
+                .ok()
+                .and_then(|target| OnionHost::new(&target))
+        }
+        _ => None,
+    };
+    let Some(host) = host else {
+        return addr;
+    };
+    addr.iter()
+        .enumerate()
+        .map(|(index, protocol)| match (index, protocol) {
+            (0, Protocol::Dns(_)) => Protocol::Dns(host.as_str().to_string().into()),
+            (0, Protocol::Dns4(_)) => Protocol::Dns4(host.as_str().to_string().into()),
+            (0, Protocol::Dns6(_)) => Protocol::Dns6(host.as_str().to_string().into()),
+            (_, protocol) => protocol,
+        })
+        .collect()
 }
 
 fn is_dnsaddr(addr: &Multiaddr) -> bool {

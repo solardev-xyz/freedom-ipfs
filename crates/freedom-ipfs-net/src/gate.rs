@@ -45,4 +45,4 @@ pub use classify::{
 };
 pub use configured::ConfiguredTargets;
 pub use nat64::{Nat64Prefix, Nat64State};
-pub use onion::OnionHost;
+pub use onion::{OnionHost, OnionUrl};
