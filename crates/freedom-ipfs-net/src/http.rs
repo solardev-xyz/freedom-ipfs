@@ -62,7 +62,7 @@ use url::Url;
 
 use crate::capability::{NetworkCapability, Revoked};
 #[cfg(feature = "socks")]
-use crate::gate::{check_address, Nat64State, OnionHost, OnionUrl};
+use crate::gate::{check_address, Nat64State, OnionUrl};
 use crate::gate::{classify_url, parse_url, AddressRefusal, Refusal, Target};
 use crate::policy::{Addresses, Mode, Network, NetworkError};
 use crate::resolve::{check_waiting, GateResolver};
@@ -135,11 +135,10 @@ struct OnionClient(reqwest::Client);
 
 #[cfg(feature = "socks")]
 impl OnionClient {
+    /// The URL's host must still be a well-formed onion, spelled exactly
+    /// as classified: the host the proxy receives is the host checked.
     fn get(&self, url: &OnionUrl) -> Result<reqwest::RequestBuilder, HttpError> {
-        let still_onion = classify_url(url.as_url())
-            .ok()
-            .and_then(|target| OnionHost::new(&target.target));
-        if still_onion.is_none() {
+        if url.host().is_none() {
             return Err(Refused::OnionRoute.into());
         }
         Ok(self.0.get(url.as_url().clone()))
@@ -1099,12 +1098,16 @@ mod tests {
             panic!("a socks5 client");
         };
         let onion = onion.as_ref().unwrap();
+        let v3 = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion";
         for refused in [
-            "http://example.com/",
-            "http://127.0.0.1/",
-            "http://foo.onion/",
+            "http://example.com/".to_string(),
+            "http://127.0.0.1/".to_string(),
+            "http://foo.onion/".to_string(),
+            // A well-formed onion, spelled otherwise than classified. (A
+            // `Url` holds an http host lowercase already.)
+            format!("http://{v3}./"),
         ] {
-            let url = OnionUrl::unchecked(Url::parse(refused).unwrap());
+            let url = OnionUrl::unchecked(Url::parse(&refused).unwrap());
             assert!(
                 matches!(
                     onion.get(&url),
@@ -1114,7 +1117,6 @@ mod tests {
             );
         }
         assert_eq!(fixture.connections(), 0);
-        let v3 = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion";
         let url = OnionUrl::new(&Url::parse(&format!("http://{v3}/")).unwrap()).unwrap();
         let _ = onion.get(&url).unwrap().send().await;
         let requests = fixture.requests();

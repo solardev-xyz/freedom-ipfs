@@ -475,3 +475,71 @@ async fn the_revoke_drops_a_request_held_in_resolve() {
     assert!(matches!(result, Err(HttpError::Revoked(_))), "{result:?}");
     assert_eq!(connects(&fixture.requests()), []);
 }
+
+/// The onion route sends the host it checked (#50 review, round 1): an
+/// onion URL written with a trailing dot or in capitals is connected, named
+/// in `Host`, and named to TLS, as the classified host (lowercase, no
+/// trailing dot), directly and when a redirect leads into the route. The
+/// canonical spelling is the control.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_onion_is_sent_by_the_name_that_was_checked() {
+    let upper = ONION3.to_ascii_uppercase();
+    for written in [
+        onion(),
+        format!("{}.", onion()),
+        format!("{upper}.ONION"),
+        format!("{upper}.onion."),
+    ] {
+        let fixture = SocksFixture::start().await;
+        let written_location = written.clone();
+        let server = HttpServer::start(move |path, _| {
+            if path == "/in" {
+                Reply::redirect(&format!("http://{written_location}/x"))
+            } else {
+                Reply::ok("onion")
+            }
+        })
+        .await;
+        let hello = ClientHelloCatcher::start().await;
+        fixture.answer("clear.example", Answer::Ip("8.8.8.8".parse().unwrap()));
+        fixture.forward(ip("8.8.8.8:80"), server.addr());
+        fixture.forward(name(&onion(), 80), server.addr());
+        fixture.forward(name(&onion(), 443), hello.addr());
+        let client = socks5(&fixture, ConfiguredTargets::new()).http_client(CONFIG);
+
+        // Directly, over HTTP and HTTPS.
+        let response = client
+            .get(format!("http://{written}/x"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.text().await.unwrap(), "onion", "{written}");
+        let _ = client.get(format!("https://{written}/")).send().await;
+        assert!(wait_until(Duration::from_secs(2), || !hello.names().is_empty()).await);
+        assert_eq!(hello.names(), [Some(onion())], "{written}");
+
+        // Through a redirect from a clearnet name.
+        let response = client.get("http://clear.example/in").send().await.unwrap();
+        assert_eq!(response.text().await.unwrap(), "onion", "{written}");
+
+        assert_eq!(
+            connects(&fixture.requests()),
+            [
+                name(&onion(), 80),
+                name(&onion(), 443),
+                ip("8.8.8.8:80"),
+                name(&onion(), 80)
+            ],
+            "{written}"
+        );
+        assert_eq!(
+            server.requests(),
+            [
+                ("/x".to_string(), Some(onion())),
+                ("/in".to_string(), Some("clear.example".to_string())),
+                ("/x".to_string(), Some(onion())),
+            ],
+            "{written}"
+        );
+    }
+}

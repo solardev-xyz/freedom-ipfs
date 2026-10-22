@@ -666,3 +666,47 @@ async fn the_dial_policy_knows_the_proxy() {
         Ok(())
     );
 }
+
+/// The onion route sends the host it checked (#50 review, round 1): an
+/// onion `/dns*` written with a trailing dot or in capitals is connected as
+/// the classified host (lowercase, no trailing dot), over TCP and under a
+/// WebSocket, whose TLS names that host too. The canonical spelling is the
+/// control.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_onion_multiaddr_is_sent_by_the_name_that_was_checked() {
+    let onion = format!("{ONION3}.onion");
+    let upper = ONION3.to_ascii_uppercase();
+    for written in [
+        onion.clone(),
+        format!("{onion}."),
+        format!("{upper}.ONION"),
+        format!("{upper}.onion."),
+    ] {
+        let fixture = SocksFixture::start().await;
+        let hello = ClientHelloCatcher::start().await;
+        fixture.forward(Destination::Name(onion.clone(), 443), hello.addr());
+        let network = socks5(&fixture, ConfiguredTargets::new());
+        let [(_, mut dht), (_, mut bitswap)] = stacks(&network);
+        for (stack, addr) in [
+            (0, format!("/dns/{written}/tcp/4001")),
+            (1, format!("/dns4/{written}/tcp/4002")),
+            (1, format!("/dns/{written}/tcp/443/wss")),
+        ] {
+            let transport = if stack == 0 { &mut dht } else { &mut bitswap };
+            let addr = multiaddr(&format!("{addr}/p2p/{PEER}"));
+            let _ = dial_through(transport, &addr, Duration::from_secs(2)).await;
+        }
+        assert_eq!(
+            connects(&fixture.requests()),
+            [
+                Destination::Name(onion.clone(), 4001),
+                Destination::Name(onion.clone(), 4002),
+                Destination::Name(onion.clone(), 443),
+            ],
+            "{written}"
+        );
+        assert_eq!(resolves(&fixture.requests()), Vec::<String>::new());
+        assert!(wait_until(Duration::from_secs(2), || !hello.names().is_empty()).await);
+        assert_eq!(hello.names(), [Some(onion.clone())], "{written}");
+    }
+}
