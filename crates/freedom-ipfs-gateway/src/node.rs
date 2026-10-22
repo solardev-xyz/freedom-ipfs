@@ -367,15 +367,16 @@ impl OnlineNodeBuilder {
                         };
                     let name_resolver = CachedNameResolver::new(PersistentNameResolver::new(
                         DefaultNameResolver::new(
-                            match doh {
-                                // The policy's DoH endpoint, a configured
-                                // target; the default under the legacy policy.
-                                Some(client) => CloudflareDohResolver::with_client(
-                                    network.policy().doh().unwrap_or(DEFAULT_DOH_ENDPOINT),
-                                    client,
-                                ),
-                                None => CloudflareDohResolver::default(),
-                            },
+                            // The policy's DoH endpoint, a configured target
+                            // (the default under the legacy policy), through
+                            // the network's client: an online node always has
+                            // one.
+                            CloudflareDohResolver::with_client(
+                                network.policy().doh().unwrap_or(DEFAULT_DOH_ENDPOINT),
+                                doh.unwrap_or_else(|| {
+                                    network.http_client(freedom_ipfs_namesys::HTTP_CLIENT_CONFIG)
+                                }),
+                            ),
                             ipns,
                         ),
                         store.clone(),

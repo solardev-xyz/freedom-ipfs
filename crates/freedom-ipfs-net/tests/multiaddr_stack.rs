@@ -4,9 +4,10 @@
 //! component wherever it is. So a public address first must not hide the
 //! address the transport actually reads, or an onion behind it.
 //!
-//! Out of scope here: that a refused hidden-onion shape causes no DNS or
-//! TXT query, and that `/dnsaddr` results are judged by the same shapes,
-//! come with expansion and the transports.
+//! That a refused hidden-onion shape causes no DNS or TXT query, and that
+//! `/dnsaddr` results are judged by the same shapes, are retrieval's tests
+//! (Bitswap's address expansion: `tests/network_expansion.rs` and its unit
+//! tests); the transports' own check comes with them.
 
 use std::net::IpAddr;
 use std::time::Duration;
