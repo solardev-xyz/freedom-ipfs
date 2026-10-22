@@ -139,6 +139,7 @@ fn checked_with(configured: ConfiguredTargets) -> Network {
         .unwrap(),
         None,
     )
+    .unwrap()
 }
 
 fn checked() -> Network {

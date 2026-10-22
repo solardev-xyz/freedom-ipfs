@@ -13936,6 +13936,7 @@ mod bitswap_tests {
             .unwrap(),
             None,
         )
+        .unwrap()
     }
 
     fn checked_addresses() -> freedom_ipfs_net::Addresses {
@@ -14300,7 +14301,8 @@ mod bitswap_tests {
                 )
                 .unwrap(),
                 None,
-            );
+            )
+            .unwrap();
             let expansion = AddressExpansion::of(&network);
             let providers = vec![Provider::from_parts(
                 Some(POLICY_PEER.into()),
@@ -14470,7 +14472,8 @@ mod bitswap_tests {
             )
             .unwrap(),
             None,
-        );
+        )
+        .unwrap();
         let expansion = AddressExpansion::of(&network);
         let loopback = || CachedDnsIpRecords {
             addrs: vec!["127.0.0.1".parse().unwrap()],
@@ -14530,6 +14533,7 @@ mod bitswap_tests {
             .unwrap(),
             None,
         )
+        .unwrap()
     }
 
     fn random_peer() -> PeerId {
@@ -14671,7 +14675,8 @@ mod bitswap_tests {
             )
             .unwrap(),
             None,
-        );
+        )
+        .unwrap();
         // One resolver for both, which asks through a direct client: only
         // the policy differs.
         let resolver = Arc::new(CloudflareDohResolver::with_client(
@@ -22015,7 +22020,8 @@ mod bitswap_tests {
             )
             .unwrap(),
             None,
-        );
+        )
+        .unwrap();
         let mut swarm = build_bitswap_swarm(None, Some(&Transports::new(&network)))
             .await
             .unwrap();

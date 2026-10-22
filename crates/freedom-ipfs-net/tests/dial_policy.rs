@@ -46,6 +46,7 @@ fn checked_with(urls: &[&str], handle: Nat64Handle) -> DialPolicy {
         NetworkPolicy::direct(configured(urls), doh(), Addresses::Checked(handle)).unwrap(),
         None,
     )
+    .unwrap()
     .dial_policy()
 }
 
@@ -332,7 +333,8 @@ async fn a_revoked_network_admits_nothing() {
             NetworkPolicy::direct(configured(&[]), doh(), Addresses::Checked(handle.clone()))
                 .unwrap(),
             None,
-        ),
+        )
+        .unwrap(),
     ] {
         let policy = network.dial_policy();
         let public = multiaddr("/ip4/8.8.8.8/tcp/4001");
@@ -370,7 +372,8 @@ async fn a_revoked_network_admits_nothing() {
     let network = Network::with_lookup(
         NetworkPolicy::direct(configured(&[]), doh(), Addresses::Checked(handle)).unwrap(),
         None,
-    );
+    )
+    .unwrap();
     let policy = network.dial_policy();
     let waiting = tokio::spawn(async move {
         policy

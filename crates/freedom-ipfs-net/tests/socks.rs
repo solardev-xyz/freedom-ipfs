@@ -50,6 +50,7 @@ fn socks5(fixture: &SocksFixture, configured: ConfiguredTargets) -> Network {
         NetworkPolicy::socks5(fixture.addr(), configured, doh()).unwrap(),
         None,
     )
+    .unwrap()
 }
 
 /// Both swarms' stacks for `network`.
@@ -496,10 +497,9 @@ async fn the_revoke_stops_every_request_through_the_proxy() {
     assert_eq!(connects(&fixture.requests()), []);
 }
 
-/// The greeting offers one method, no authentication, and a proxy that
-/// accepts only another fails the dial: nothing is requested. (Whether each
-/// instance authenticates with credentials of its own is design 0007's open
-/// question 11.)
+/// The greeting offers username/password alone, with the network's
+/// credentials (design 0007, "Stream isolation"): a proxy that accepts
+/// only no authentication fails the dial, and nothing is requested.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_greeting_offers_one_method_and_never_falls_back() {
     let fixture = SocksFixture::start().await;
@@ -509,16 +509,17 @@ async fn the_greeting_offers_one_method_and_never_falls_back() {
     let _ = dial_through(&mut transport, &addr, Duration::from_secs(2)).await;
     let requests = fixture.requests();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].methods, [0x00]);
-    assert_eq!(requests[0].credentials, None);
+    assert_eq!(requests[0].methods, [0x02]);
+    assert!(requests[0].credentials.is_some());
 
-    fixture.accept_methods(&[0x02]);
+    fixture.accept_methods(&[0x00]);
     let result = dial_through(&mut transport, &addr, Duration::from_secs(2)).await;
     assert!(
         matches!(&result, Some(Err(err)) if err.contains("authentication method")),
         "{result:?}"
     );
     assert_eq!(fixture.requests().len(), 1);
+    assert_eq!(fixture.greetings(), [vec![0x02], vec![0x02]]);
     assert_eq!(fixture.connections(), 2);
 }
 
@@ -600,6 +601,7 @@ async fn the_dial_policy_knows_the_proxy() {
         .unwrap(),
         None,
     )
+    .unwrap()
     .dial_policy();
     assert!(policy.transports().proxied());
     assert!(!direct.transports().proxied());

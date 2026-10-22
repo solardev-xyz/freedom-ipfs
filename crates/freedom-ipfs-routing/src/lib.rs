@@ -2550,6 +2550,7 @@ mod tests {
             .unwrap(),
             None,
         )
+        .unwrap()
         .dial_policy()
     }
 
@@ -3593,7 +3594,8 @@ mod tests {
                 )
                 .unwrap(),
                 None,
-            );
+            )
+            .unwrap();
             let dht = LightDhtClient::new(vec![format!("{server_addr}/p2p/{server_peer}")])
                 .with_query_timeout(Duration::from_secs(3))
                 .with_network(&network);

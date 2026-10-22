@@ -180,7 +180,7 @@ fn checked_with(urls: &[String], handle: Nat64Handle) -> Network {
         ("other.test", loopback()),
         ("empty.test", Vec::new()),
     ]);
-    Network::with_lookup(policy, Some(Arc::new(table)))
+    Network::with_lookup(policy, Some(Arc::new(table))).unwrap()
 }
 
 fn checked(urls: &[String]) -> Network {

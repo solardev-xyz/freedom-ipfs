@@ -257,7 +257,10 @@ impl Network {
     ///
     /// Under `direct` with checked addresses, the gate's resolver uses the
     /// system's DNS configuration, or Cloudflare's resolvers where it can't
-    /// be read. Under `socks5` it asks the proxy (`RESOLVE`).
+    /// be read. Under `socks5` it asks the proxy (`RESOLVE`), and every
+    /// stream carries the network's own SOCKS5 credentials (design 0007,
+    /// "Stream isolation"), made here from the operating system's
+    /// randomness: if that fails, so does this.
     pub fn new(policy: NetworkPolicy) -> Result<Self, NetworkError> {
         let lookup = match policy.mode() {
             Mode::Legacy => None,
@@ -276,32 +279,78 @@ impl Network {
             #[cfg(not(feature = "socks"))]
             Mode::Socks5(_) => return Err(NetworkError::Unsupported("socks5")),
         };
-        Ok(Self::with_lookup(policy, lookup))
+        Self::with_lookup(policy, lookup)
     }
 
     /// The network for `policy` with the gate's resolver asking `lookup`:
-    /// tests, and hosts that bring their own resolver.
+    /// tests, and hosts that bring their own resolver. Under `socks5`, its
+    /// credentials come from the operating system's randomness, whose
+    /// failure fails it.
     #[doc(hidden)]
-    pub fn with_lookup(policy: NetworkPolicy, lookup: Option<Arc<dyn NameLookup>>) -> Self {
+    pub fn with_lookup(
+        policy: NetworkPolicy,
+        lookup: Option<Arc<dyn NameLookup>>,
+    ) -> Result<Self, NetworkError> {
         #[cfg(feature = "socks")]
+        {
+            Self::with_lookup_and_random(policy, lookup, crate::socks::os_random)
+        }
+        #[cfg(not(feature = "socks"))]
+        {
+            Ok(Self::build(policy, lookup))
+        }
+    }
+
+    /// [`Network::with_lookup`], with the credentials' bits from `random`:
+    /// a test's failing randomness. Nothing falls back to a fixed password
+    /// or to no authentication.
+    #[cfg(feature = "socks")]
+    #[doc(hidden)]
+    pub fn with_lookup_and_random(
+        policy: NetworkPolicy,
+        lookup: Option<Arc<dyn NameLookup>>,
+        random: fn(&mut [u8]) -> Result<(), crate::socks::RandomFailed>,
+    ) -> Result<Self, NetworkError> {
         let socks = match policy.mode() {
-            Mode::Socks5(socks5) => Some(Arc::new(crate::socks::SocksClient::new(socks5.proxy))),
+            Mode::Socks5(socks5) => Some(Arc::new(crate::socks::SocksClient::new(
+                socks5.proxy,
+                crate::socks::SocksCredentials::new(random)
+                    .map_err(|_| NetworkError::Credentials)?,
+            ))),
             Mode::Legacy | Mode::Direct(_) => None,
         };
+        Ok(Self {
+            inner: Arc::new(Inner {
+                policy,
+                capability: NetworkCapability::new(),
+                lookup,
+                socks,
+            }),
+        })
+    }
+
+    #[cfg(not(feature = "socks"))]
+    fn build(policy: NetworkPolicy, lookup: Option<Arc<dyn NameLookup>>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 policy,
                 capability: NetworkCapability::new(),
                 lookup,
-                #[cfg(feature = "socks")]
-                socks,
             }),
         }
     }
 
     /// A [`NetworkPolicy::legacy`] network, with a capability of its own.
     pub fn legacy() -> Self {
-        Self::with_lookup(NetworkPolicy::legacy(), None)
+        Self {
+            inner: Arc::new(Inner {
+                policy: NetworkPolicy::legacy(),
+                capability: NetworkCapability::new(),
+                lookup: None,
+                #[cfg(feature = "socks")]
+                socks: None,
+            }),
+        }
     }
 
     pub fn policy(&self) -> &NetworkPolicy {
@@ -372,6 +421,10 @@ pub enum NetworkError {
     /// The SOCKS5 proxy's endpoint is unspecified, or has port 0.
     #[error("the SOCKS5 proxy's endpoint must be a specified IP address and a nonzero port")]
     ProxyEndpoint,
+    /// The network's SOCKS5 credentials couldn't be made: the operating
+    /// system's randomness failed.
+    #[error("the SOCKS5 credentials couldn't be made: the operating system's randomness failed")]
+    Credentials,
 }
 
 #[cfg(test)]
