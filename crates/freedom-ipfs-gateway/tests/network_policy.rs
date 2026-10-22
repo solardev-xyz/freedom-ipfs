@@ -3,16 +3,15 @@
 //! - **content through the proxy:** an HTTP provider at a public address,
 //!   which the proxy maps to a local trustless gateway, serves a block;
 //! - **the instance:** "no socket is opened after the stop's
-//!   acknowledgement", seen by the proxy and by the provider;
-//! - **the light DHT:** its swarms dial through the proxy, and stop at the
-//!   revoke.
+//!   acknowledgement", seen by the proxy and by the provider.
 //!
-//! The canary case is `network_policy_canary.rs`.
+//! The canary case is `network_policy_canary.rs`, and the light DHT's
+//! `network_policy_dht.rs`.
 
 mod policy_support;
 
-use std::net::{SocketAddr, TcpListener};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,7 +25,7 @@ use freedom_ipfs_gateway::{
 use freedom_ipfs_net::socks::fixture::{Destination, HttpServer, Reply, SocksFixture};
 use freedom_ipfs_net::{ClientConfig, HttpError};
 use freedom_ipfs_store::SqliteBlockStore;
-use policy_support::{configured, doh, node, not_found, PEER_A, PEER_B, PEER_C};
+use policy_support::{configured, doh, node, not_found, Silent, PEER_C};
 
 /// A trustless gateway on loopback, serving `data` as `cid`'s raw block.
 async fn trustless(cid: Cid, data: &'static str) -> HttpServer {
@@ -93,31 +92,6 @@ async fn under_socks5_content_loads_through_the_proxy() {
         .requests()
         .iter()
         .any(|request| request.is_connect() && request.destination == Destination::Ip(public)));
-}
-
-/// A provider that accepts and never answers, counting its connections.
-struct Silent {
-    addr: SocketAddr,
-    accepted: Arc<AtomicUsize>,
-}
-
-impl Silent {
-    fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let accepted = Arc::new(AtomicUsize::new(0));
-        let counted = accepted.clone();
-        let held = Arc::new(Mutex::new(Vec::new()));
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                counted.fetch_add(1, Ordering::SeqCst);
-                if let Ok(stream) = stream {
-                    held.lock().unwrap().push(stream);
-                }
-            }
-        });
-        Self { addr, accepted }
-    }
 }
 
 fn wait_for(what: &str, timeout: Duration, mut done: impl FnMut() -> bool) {
@@ -216,84 +190,4 @@ fn under_socks5_no_connection_opens_after_the_stop() {
     );
     assert!(matches!(result, Err(HttpError::Revoked(_))), "{result:?}");
     assert_eq!(fixture.connections(), proxied);
-}
-
-/// The light DHT under `socks5` (the library allows it, though
-/// freedom-ipfsd refuses non-delegated routing there, decision D6): its
-/// swarms dial through the proxy.
-/// - A bootstrap peer at a public address, which the proxy maps to a local
-///   listener, is reached by a `CONNECT` to that address.
-/// - One at loopback is refused by the gate, and its listener sees nothing.
-/// - Once the network is revoked, a lookup opens no connection to the proxy
-///   or to either listener.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn under_socks5_the_light_dht_dials_through_the_proxy_and_stops_on_revoke() {
-    let mapped = Silent::start();
-    let loopback = Silent::start();
-    let router = HttpServer::start(|_, _| not_found()).await;
-    let doh = doh(
-        cid_from_data(CODEC_RAW, b"unused"),
-        Arc::new(Mutex::new(Vec::new())),
-    )
-    .await;
-    let fixture = SocksFixture::start().await;
-    let public: SocketAddr = "8.8.8.8:4001".parse().unwrap();
-    fixture.forward(Destination::Ip(public), mapped.addr);
-    let (configured, _, doh_url) = configured(&router, &doh);
-    let network =
-        Network::new(NetworkPolicy::socks5(fixture.addr(), configured, doh_url).unwrap()).unwrap();
-    let node = OnlineNode::builder(SqliteBlockStore::in_memory(16 * 1024 * 1024).unwrap())
-        .routing_mode(RoutingMode::LightDht)
-        .dht_bootstrap_peers([
-            format!("/ip4/8.8.8.8/tcp/4001/p2p/{PEER_A}"),
-            format!("/ip4/127.0.0.1/tcp/{}/p2p/{PEER_B}", loopback.addr.port()),
-        ])
-        .network(network.clone())
-        .build();
-    let ask = |data: &'static [u8]| {
-        let core = node.gateway_core();
-        async move {
-            tokio::time::timeout(Duration::from_secs(60), async move {
-                let response = core
-                    .handle(GatewayCoreRequest::ipfs(
-                        cid_from_data(CODEC_RAW, data).to_string(),
-                        Method::GET,
-                        HeaderMap::new(),
-                    ))
-                    .await;
-                let _ = to_bytes(response.into_body(), usize::MAX).await;
-            })
-            .await
-            .expect("the gateway answers, head and body");
-        }
-    };
-    ask(b"a block the light DHT looks up").await;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while mapped.accepted.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        mapped.accepted.load(Ordering::SeqCst) > 0,
-        "the bootstrap peer was never reached through the proxy"
-    );
-    assert!(fixture
-        .requests()
-        .iter()
-        .any(|request| request.is_connect() && request.destination == Destination::Ip(public)));
-    assert_eq!(loopback.accepted.load(Ordering::SeqCst), 0);
-
-    network.revoke();
-    let (proxied, reached) = (
-        fixture.connections(),
-        mapped.accepted.load(Ordering::SeqCst),
-    );
-    ask(b"another block, after the revoke").await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        fixture.connections(),
-        proxied,
-        "a connection after the revoke"
-    );
-    assert_eq!(mapped.accepted.load(Ordering::SeqCst), reached);
-    assert_eq!(loopback.accepted.load(Ordering::SeqCst), 0);
 }
