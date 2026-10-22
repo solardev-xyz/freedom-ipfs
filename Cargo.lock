@@ -4666,6 +4666,7 @@ dependencies = [
  "clap",
  "freedom-ipfs-core",
  "prost",
+ "serde_json",
 ]
 
 [[package]]
