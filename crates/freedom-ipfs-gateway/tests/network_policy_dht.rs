@@ -26,8 +26,8 @@ use freedom_ipfs_net::socks::fixture::{Destination, HttpServer, SocksFixture};
 use freedom_ipfs_net::Addresses;
 use freedom_ipfs_store::SqliteBlockStore;
 use policy_support::{
-    configured, count_datagrams, doh, not_found, private_network, Counters, Held, Run, Silent,
-    Socket, Sockets, PEER_A, PEER_B, PEER_C,
+    configured, count_datagrams, doh, not_found, private_network, private_run_checked, Counters,
+    Held, Run, Silent, Socket, Sockets, PEER_A, PEER_B, PEER_C,
 };
 
 const TEST: &str = "under_socks5_the_light_dht_dials_through_the_proxy_and_stops_on_revoke";
@@ -61,14 +61,10 @@ async fn until(mut done: impl FnMut() -> bool) {
 /// TCP peer and the QUIC one, and never the proxy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn under_socks5_the_light_dht_dials_through_the_proxy_and_stops_on_revoke() {
-    let run = private_network(TEST);
-    let private = match run {
+    let private = match private_network(TEST) {
         Run::Done => return,
         Run::Private => true,
-        Run::Here(why) => {
-            eprintln!("no private network ({why}): its counters are skipped");
-            false
-        }
+        Run::Here => false,
     };
     for proxied in [true, false] {
         let mapped = Silent::start();
@@ -113,6 +109,14 @@ async fn under_socks5_the_light_dht_dials_through_the_proxy_and_stops_on_revoke(
                 vec![loopback_peer, quic_peer],
             )
         };
+        // Under `socks5`, observed from before the network and the node are
+        // built: what their construction opens counts too.
+        let held = Held::open();
+        let counted = (proxied && private).then(|| {
+            Counters::assert_counting();
+            Counters::read()
+        });
+        let sockets = (proxied && cfg!(target_os = "linux")).then(Sockets::sample);
         let network = Network::new(policy.unwrap()).unwrap();
         let node = OnlineNode::builder(SqliteBlockStore::in_memory(16 * 1024 * 1024).unwrap())
             .routing_mode(RoutingMode::LightDht)
@@ -155,12 +159,6 @@ async fn under_socks5_the_light_dht_dials_through_the_proxy_and_stops_on_revoke(
             continue;
         }
 
-        let held = Held::open();
-        let counted = private.then(|| {
-            Counters::assert_counting();
-            Counters::read()
-        });
-        let sockets = cfg!(target_os = "linux").then(Sockets::sample);
         ask(b"a block the light DHT looks up").await;
         until(|| mapped.accepted.load(Ordering::SeqCst) > 0).await;
         assert!(
@@ -233,6 +231,7 @@ async fn under_socks5_the_light_dht_dials_through_the_proxy_and_stops_on_revoke(
                 fixture.connections() + fixture.outbound().len(),
                 "a connection outside the proxy, in the private network"
             );
+            private_run_checked(sent);
         }
     }
 }

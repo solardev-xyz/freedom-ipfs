@@ -37,8 +37,8 @@ use freedom_ipfs_gateway::{GatewayCoreRequest, Network, NetworkPolicy, OnlineNod
 use freedom_ipfs_net::socks::fixture::{Answer, Destination, HttpServer, Reply, SocksFixture};
 use freedom_ipfs_net::Addresses;
 use policy_support::{
-    configured, count_datagrams, doh, node, not_found, private_network, Counters, Held, Run,
-    Socket, Sockets, DNSLINK, PEER_A, PEER_B, PEER_C, PEER_D,
+    configured, count_datagrams, doh, node, not_found, private_network, private_run_checked,
+    Counters, Held, Run, Socket, Sockets, DNSLINK, PEER_A, PEER_B, PEER_C, PEER_D,
 };
 
 const TEST: &str = "under_socks5_the_canary_sees_nothing_and_the_proxy_everything";
@@ -235,10 +235,7 @@ async fn under_socks5_the_canary_sees_nothing_and_the_proxy_everything() {
     let private = match private_network(TEST) {
         Run::Done => return,
         Run::Private => true,
-        Run::Here(why) => {
-            eprintln!("no private network ({why}): its counters are skipped");
-            false
-        }
+        Run::Here => false,
     };
     for proxied in [true, false] {
         let blocks = if proxied {
@@ -260,6 +257,14 @@ async fn under_socks5_the_canary_sees_nothing_and_the_proxy_everything() {
         );
         fixture.forward(Destination::Ip(router.addr()), router.addr());
         fixture.forward(Destination::Ip(doh.addr()), doh.addr());
+        // Observed from before the network and the node are built: what
+        // their construction opens counts too.
+        let held = Held::open();
+        let counted = (proxied && private).then(|| {
+            Counters::assert_counting();
+            Counters::read()
+        });
+        let sockets = cfg!(target_os = "linux").then(Sockets::sample);
         let (configured, router_url, doh_url) = configured(&router, &doh);
         let policy = if proxied {
             NetworkPolicy::socks5(fixture.addr(), configured, doh_url)
@@ -267,12 +272,6 @@ async fn under_socks5_the_canary_sees_nothing_and_the_proxy_everything() {
             NetworkPolicy::direct(configured, doh_url, Addresses::Unchecked)
         };
         let node = node(Network::new(policy.unwrap()).unwrap(), &router_url);
-        let held = Held::open();
-        let counted = (proxied && private).then(|| {
-            Counters::assert_counting();
-            Counters::read()
-        });
-        let sockets = cfg!(target_os = "linux").then(Sockets::sample);
         let statuses = requests(&node, &blocks).await;
         // A late dial has its chance to arrive.
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -420,6 +419,7 @@ async fn under_socks5_the_canary_sees_nothing_and_the_proxy_everything() {
                 fixture.connections() + fixture.outbound().len(),
                 "a connection outside the proxy, in the private network"
             );
+            private_run_checked(sent);
         }
     }
 }

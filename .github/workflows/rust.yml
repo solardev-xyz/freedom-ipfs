@@ -72,7 +72,23 @@ jobs:
       # `--all-features` takes in freedom-ipfs-net's `socks` and `test-util`
       # features, which the network policy's SOCKS tests need. The live,
       # Kubo and soak tests are `#[ignore]`d and stay off.
+      # The network policy's kernel-level tests run again in a private
+      # network namespace (crates/freedom-ipfs-gateway/tests/policy_support),
+      # whose counters see every socket however short-lived. Ubuntu's
+      # runners refuse unprivileged user namespaces through AppArmor unless
+      # this is off, and FREEDOM_IPFS_REQUIRE_PRIVATE_NET makes a test that
+      # can't enter one fail rather than run in place. Each private run
+      # prints "checked in a private network" to the log.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare --user --map-root-user --net sh -c 'ip link set lo up && ip route add local 0.0.0.0/0 dev lo && ip -6 route add local ::/0 dev lo && echo "a private network works here"'
+
       - name: Test the workspace
+        env:
+          FREEDOM_IPFS_REQUIRE_PRIVATE_NET: "1"
         run: cargo test --workspace --all-features --locked
 
   clippy:

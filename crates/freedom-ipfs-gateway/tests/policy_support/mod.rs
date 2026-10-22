@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -305,6 +306,15 @@ impl Held {
 /// Marks a test's run in its private network.
 const PRIVATE: &str = "FREEDOM_IPFS_TEST_PRIVATE_NETWORK";
 
+/// Set where the private network must run (CI's Linux job): a test that
+/// can't enter one fails, rather than running in place.
+const REQUIRE: &str = "FREEDOM_IPFS_REQUIRE_PRIVATE_NET";
+
+/// What a run in the private network prints once its checks have passed
+/// ([`private_run_checked`]): its parent requires it, and repeats it where
+/// the test log shows it.
+const CHECKED: &str = "checked in a private network:";
+
 /// The private network: loopback up, and every IPv4 and IPv6 address local
 /// to it, so a datagram or a connection to any address stays on this host
 /// and is counted.
@@ -318,22 +328,43 @@ pub enum Run {
     Done,
     /// This is that run: [`Counters`] are this test's alone.
     Private,
-    /// Here, as no private network is available (the reason): the counters
-    /// mean nothing.
-    Here(String),
+    /// Here, as no private network is available, and the run doesn't
+    /// require one: the counters mean nothing, and the skip is reported
+    /// where the test log shows it.
+    Here,
 }
 
 /// Runs `test` (this binary's, by its exact name) again in a private
 /// network of its own: a user and network namespace (`unshare -rn`) where
 /// every address is local (`SETUP`), and nothing else runs. Its outcome is
-/// this run's. Where namespaces aren't available (not Linux, no `unshare`
-/// or `ip`, unprivileged user namespaces refused), says why and runs here.
+/// this run's, and it must have reached [`private_run_checked`]; the line
+/// that prints is repeated on this process's stderr, uncaptured, so the
+/// test log shows the private run happened.
+///
+/// Where namespaces aren't available (not Linux, no `unshare` or `ip`,
+/// unprivileged user namespaces refused): with
+/// `FREEDOM_IPFS_REQUIRE_PRIVATE_NET` set, the test fails; without it, it
+/// runs here, with the kernel sampler only, and the skip is written to
+/// stderr, uncaptured, so the test log shows it even when the test passes.
 pub fn private_network(test: &str) -> Run {
     if std::env::var_os(PRIVATE).is_some() {
         return Run::Private;
     }
+    let here = |why: String| {
+        assert!(
+            std::env::var_os(REQUIRE).is_none(),
+            "{REQUIRE} is set, and {test} can't enter a private network: {why}"
+        );
+        // libtest captures `eprintln!`, not a write to stderr itself.
+        let _ = writeln!(
+            std::io::stderr(),
+            "{test}: SKIPPED its private network ({why}); ran in place, with the kernel \
+             sampler only, which a socket opened and closed between two samples can pass"
+        );
+        Run::Here
+    };
     if !cfg!(target_os = "linux") {
-        return Run::Here("private networks need Linux".into());
+        return here("private networks need Linux".into());
     }
     let unshare = || {
         let mut command = Command::new("unshare");
@@ -343,12 +374,12 @@ pub fn private_network(test: &str) -> Run {
     match unshare().arg(SETUP).output() {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
-            return Run::Here(format!(
+            return here(format!(
                 "`unshare -rn` and `ip` failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ))
         }
-        Err(error) => return Run::Here(format!("no `unshare`: {error}")),
+        Err(error) => return here(format!("no `unshare`: {error}")),
     }
     let output = unshare()
         .arg(format!("{SETUP} && exec \"$0\" \"$@\""))
@@ -362,12 +393,30 @@ pub fn private_network(test: &str) -> Run {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        output.status.success() && report.contains("1 passed"),
-        "the test, in its private network: {}\n{report}",
-        output.status
-    );
+    let checked = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.find(CHECKED).map(|at| line[at..].to_string()));
+    let (true, true, Some(checked)) = (
+        output.status.success(),
+        report.contains("1 passed"),
+        checked,
+    ) else {
+        panic!(
+            "the test, in its private network: {}\n{report}",
+            output.status
+        );
+    };
+    let _ = writeln!(std::io::stderr(), "{test}: {checked}");
     Run::Done
+}
+
+/// Reports, from a run in the private network, that its checks have
+/// passed there, with what its counters saw.
+pub fn private_run_checked(sent: Counters) {
+    println!(
+        "{CHECKED} {} datagrams, {} connections",
+        sent.datagrams, sent.connects
+    );
 }
 
 /// What a network namespace has sent since it began: TCP connections
