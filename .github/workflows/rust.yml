@@ -63,9 +63,9 @@ jobs:
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
 
-      # No crate declares features today, so `--all-features` builds what a
-      # plain `cargo test` does; it keeps covering features as crates add
-      # them. The live, Kubo and soak tests are `#[ignore]`d and stay off.
+      # `--all-features` takes in freedom-ipfs-net's `socks` and `test-util`
+      # features, which the network policy's SOCKS tests need. The live,
+      # Kubo and soak tests are `#[ignore]`d and stay off.
       - name: Test the workspace
         run: cargo test --workspace --all-features --locked
 
@@ -87,12 +87,8 @@ jobs:
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
 
-      # The crate arrives in its own pull request, which may land before or
-      # after this job, so the step lints it whenever the tree has it.
+      # With every feature, and the library without any, as mobile builds it.
       - name: Lint freedom-ipfs-net
         run: |
-          if cargo metadata --no-deps --format-version 1 --locked | grep -q '"name":"freedom-ipfs-net"'; then
-            cargo clippy -p freedom-ipfs-net --all-targets --all-features --locked -- -D warnings
-          else
-            echo "freedom-ipfs-net isn't in this tree yet: nothing to lint."
-          fi
+          cargo clippy -p freedom-ipfs-net --all-targets --all-features --locked -- -D warnings
+          cargo clippy -p freedom-ipfs-net --lib --no-default-features --locked -- -D warnings
