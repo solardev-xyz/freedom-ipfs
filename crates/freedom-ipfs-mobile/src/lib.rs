@@ -2701,7 +2701,12 @@ fn split_gateway_namespace_path(path: &str) -> Option<(&'static str, String, Str
 fn insert_native_header(headers: &mut HeaderMap, name: &str, value: &str) -> Option<()> {
     let name = HeaderName::from_bytes(name.as_bytes()).ok()?;
     let value = HeaderValue::from_str(value).ok()?;
-    headers.insert(name, value);
+    // `insert` panics once the map can't grow: past 24,576 distinct names in
+    // http 1.x, or sooner after heavy collisions. The names are the caller's
+    // (a page's request, through the host), and this runs inside an
+    // `extern "C"` call, where a panic aborts the process: so a request the
+    // map can't hold is refused instead.
+    headers.try_insert(name, value).ok()?;
     Some(())
 }
 
@@ -3408,6 +3413,51 @@ mod tests {
             std::thread::sleep(self.delay);
             Ok(Some(Block::new(self.cid, self.data.clone())?))
         }
+    }
+
+    fn native_request_json_with_headers(count: usize) -> String {
+        let headers: Vec<_> = (0..count)
+            .map(|i| serde_json::json!({ "name": format!("x-h{i}"), "value": "" }))
+            .collect();
+        serde_json::json!({
+            "method": "GET",
+            "path": "/ipfs/bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e",
+            "headers": headers,
+            "request_id": 7,
+            "top_level_path": "/ipfs/bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e",
+        })
+        .to_string()
+    }
+
+    /// How many distinct names a header map takes before `try_insert`
+    /// refuses: 24,576 in http 1.x, three quarters of its largest table.
+    fn header_map_capacity() -> usize {
+        let mut map = HeaderMap::new();
+        (0..)
+            .take_while(|i| {
+                let name = HeaderName::from_bytes(format!("x-h{i}").as_bytes()).unwrap();
+                map.try_insert(name, HeaderValue::from_static("")).is_ok()
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_request_with_more_headers_than_a_map_holds_is_refused_not_a_panic() {
+        // The request's own X-Freedom headers take two entries.
+        let room = header_map_capacity() - 2;
+        assert!(room < 33_000, "{room}");
+        // `insert` panics on the name past capacity: refused instead.
+        let parsed = std::panic::catch_unwind(|| {
+            parse_native_gateway_start_request(&native_request_json_with_headers(33_000)).is_none()
+        });
+        assert_eq!(parsed.ok(), Some(true), "refused, without a panic");
+        let parsed = parse_native_gateway_start_request(&native_request_json_with_headers(room))
+            .expect("a request the map holds parses");
+        assert_eq!(parsed.request.headers.len(), room + 2);
+        assert!(
+            parse_native_gateway_start_request(&native_request_json_with_headers(room + 1))
+                .is_none()
+        );
     }
 
     #[test]
