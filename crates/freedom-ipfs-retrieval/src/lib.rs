@@ -45,7 +45,7 @@ use libp2p_stream::{Control as StreamControl, IncomingStreams};
 use multihash::Multihash;
 use multihash_codetable::{Code, MultihashDigest};
 use prost::Message;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::error::Error as StdError;
 use std::fmt::Debug;
 use std::future::Future;
@@ -657,7 +657,6 @@ impl HttpRetriever {
         AddressExpansion {
             resolver,
             policy: self.client.network().dial_policy(),
-            configured_answers: self.bitswap_state.configured_answers.clone(),
         }
     }
 
@@ -4810,7 +4809,6 @@ impl HttpRetriever {
             self.limits(),
             self.memory(),
             Some(&Transports::new(self.client.network())),
-            self.bitswap_state.configured_answers.clone(),
         )
         .await?;
         *client = Some(spawned.clone());
@@ -4862,6 +4860,7 @@ impl HttpRetriever {
                 existing.addrs.sort_by_key(bitswap_addr_score);
                 existing.addrs.dedup();
                 existing.addrs.truncate(MAX_BITSWAP_ADDRS_PER_PEER);
+                existing.keep_configured_answers_selected();
             } else {
                 session_only_peers.push(recent);
             }
@@ -5121,6 +5120,10 @@ impl HttpRetriever {
                 |(id, _seen_at, _last_latency, addrs, _success_count)| BitswapPeer {
                     id,
                     addrs,
+                    // A recent peer's addresses are dialed as untrusted: a
+                    // configured target's exemption belongs to the candidate
+                    // candidate choice admitted it for, not to an address.
+                    configured_answers: Vec::new(),
                     skip_want_have: true,
                     force_want_block: false,
                     force_want_have: false,
@@ -6178,9 +6181,47 @@ impl BlockProvider for FetchingBlockProvider {
 struct BitswapPeer {
     id: PeerId,
     addrs: Vec<Multiaddr>,
+    /// The addresses among `addrs` that candidate choice admitted, for this
+    /// candidate, as a configured target's answer (design 0007: configured
+    /// targets are exempt by exact host and port): each is dialed as one
+    /// ([`DialProvenance::ConfiguredAnswer`]), from this candidate only. The
+    /// same address reached any other way (another peer, a recent peer, a
+    /// later fetch's literal) is untrusted.
+    configured_answers: Vec<Multiaddr>,
     skip_want_have: bool,
     force_want_block: bool,
     force_want_have: bool,
+}
+
+impl BitswapPeer {
+    /// Keeps the configured answers that are still among the candidate's
+    /// addresses once they are ranked and cut: an answer that wasn't
+    /// selected grants nothing.
+    fn keep_configured_answers_selected(&mut self) {
+        let addrs = &self.addrs;
+        self.configured_answers.retain(|addr| addrs.contains(addr));
+        self.configured_answers.dedup();
+    }
+
+    /// How a dial to `addr`, one of this candidate's addresses, goes.
+    fn provenance(&self, addr: &Multiaddr) -> DialProvenance {
+        if self.configured_answers.contains(addr) {
+            DialProvenance::ConfiguredAnswer
+        } else {
+            DialProvenance::Untrusted
+        }
+    }
+}
+
+/// How a Bitswap dial's address is judged at the transport's inner gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialProvenance {
+    /// By the address policy.
+    Untrusted,
+    /// As the configured target's answer its candidate was admitted with:
+    /// exempt from the address table for that one dial
+    /// ([`freedom_ipfs_net::transport::dial_configured_answer`]).
+    ConfiguredAnswer,
 }
 
 struct SuccessfulBitswapPeer {
@@ -7769,8 +7810,9 @@ struct BitswapConnectionReady {
 /// for a slot. It holds none while it waits.
 struct DeferredBitswapDial {
     peer: PeerId,
-    /// The addresses the cap denied, in the order they were dialed.
-    addrs: Vec<Multiaddr>,
+    /// The addresses the cap denied, in the order they were dialed, each
+    /// with how its candidate's dial was to be judged: a retry keeps it.
+    addrs: Vec<(Multiaddr, DialProvenance)>,
     context: BitswapDialContext,
     /// The waiting requests' `admitted` senders, dropped when it starts.
     admitted: Vec<oneshot::Sender<()>>,
@@ -8082,20 +8124,12 @@ impl SharedBitswapClient {
         limits: Option<&SharedLimits>,
         memory: Option<&MemoryBudget>,
         transports: Option<&Transports>,
-        configured: ConfiguredAnswers,
     ) -> Result<Self> {
         let swarm = build_bitswap_swarm(limits, transports).await?;
         let mut control = swarm.behaviour().stream.new_control();
         let incoming = accept_bitswap_streams(&mut control)?;
         let (commands, receiver) = mpsc::channel(64);
-        let task = run_shared_bitswap_swarm(
-            swarm,
-            control,
-            incoming,
-            receiver,
-            memory.cloned(),
-            configured,
-        );
+        let task = run_shared_bitswap_swarm(swarm, control, incoming, receiver, memory.cloned());
         match instance {
             Some(instance) => drop(instance.spawn(task)),
             None => drop(tokio::spawn(task)),
@@ -8372,7 +8406,6 @@ async fn run_shared_bitswap_swarm(
     incoming: Vec<IncomingStreams>,
     mut commands: mpsc::Receiver<BitswapCommand>,
     memory: Option<MemoryBudget>,
-    configured: ConfiguredAnswers,
 ) {
     let mut incoming = select_all(incoming);
     // Incoming streams answer no one request: their reads reserve from the
@@ -8414,7 +8447,6 @@ async fn run_shared_bitswap_swarm(
                     &mut connection_wait_started,
                     &connected_peers,
                     &mut connection_dial_contexts,
-                    &configured,
                 );
             }
             _ = deferred_prune.tick(), if !deferred_dials.is_empty() => {
@@ -8451,7 +8483,6 @@ async fn run_shared_bitswap_swarm(
                         &mut connection_wait_started,
                         &connected_peers,
                         &mut connection_dial_contexts,
-                        &configured,
                     );
                 }
                 if command.cids.is_empty() {
@@ -8563,7 +8594,7 @@ async fn run_shared_bitswap_swarm(
                         let addr = dial.addr;
                         let transport = bitswap_transport_label(&addr);
                         let dial_addr = addr.with_p2p(peer_id).unwrap_or_else(|addr| addr);
-                        match dial_bitswap_addr(&mut swarm, dial_addr, &configured) {
+                        match dial_bitswap_addr(&mut swarm, dial_addr, dial.provenance) {
                             Ok(()) => {
                                 started_dial_peers.insert(peer_id);
                                 connection_dial_contexts.insert(peer_id, dial_context.clone());
@@ -8750,13 +8781,13 @@ async fn run_shared_bitswap_swarm(
                 );
 
                 let mut started_dial_peers = BTreeSet::new();
-                let mut capped_dials = BTreeMap::<PeerId, Vec<Multiaddr>>::new();
+                let mut capped_dials = BTreeMap::<PeerId, Vec<(Multiaddr, DialProvenance)>>::new();
                 for dial in dial_addrs {
                     let peer_id = dial.peer;
                     let addr = dial.addr;
                     let transport = bitswap_transport_label(&addr);
                     let dial_addr = addr.with_p2p(peer_id).unwrap_or_else(|addr| addr);
-                    match dial_bitswap_addr(&mut swarm, dial_addr.clone(), &configured) {
+                    match dial_bitswap_addr(&mut swarm, dial_addr.clone(), dial.provenance) {
                         Ok(()) => {
                             started_dial_peers.insert(peer_id);
                             connection_dial_contexts.insert(peer_id, dial_context.clone());
@@ -8766,7 +8797,10 @@ async fn run_shared_bitswap_swarm(
                             let connection_limit = is_connection_limit_error(&error_detail);
                             let shared_cap = is_shared_connection_cap_denial(&err);
                             if shared_cap {
-                                capped_dials.entry(peer_id).or_default().push(dial_addr);
+                                capped_dials
+                                    .entry(peer_id)
+                                    .or_default()
+                                    .push((dial_addr, dial.provenance));
                             }
                             record_dial_error(&dial_errors, peer_id, error_detail.clone()).await;
                             tracing::info!(
@@ -9303,7 +9337,6 @@ fn retry_deferred_bitswap_dials(
     connection_wait_started: &mut HashMap<PeerId, Instant>,
     connected_peers: &HashMap<PeerId, usize>,
     connection_dial_contexts: &mut HashMap<PeerId, BitswapDialContext>,
-    configured: &ConfiguredAnswers,
 ) {
     let dropped = prune_deferred_bitswap_dials(
         deferred,
@@ -9323,8 +9356,8 @@ fn retry_deferred_bitswap_dials(
         let mut started = false;
         let mut capped = false;
         let mut last_error = None;
-        for addr in &dial.addrs {
-            match dial_bitswap_addr(swarm, addr.clone(), configured) {
+        for (addr, provenance) in &dial.addrs {
+            match dial_bitswap_addr(swarm, addr.clone(), *provenance) {
                 Ok(()) => started = true,
                 Err(err) if is_shared_connection_cap_denial(&err) => {
                     capped = true;
@@ -9991,9 +10024,6 @@ struct BitswapBookkeeping {
     /// The DoH resolver Bitswap's address expansion asks: the network's
     /// DoH endpoint, through a client of the network, built on first use.
     dns: std::sync::OnceLock<Arc<CloudflareDohResolver>>,
-    /// The addresses candidate choice admitted as configured targets'
-    /// answers, which the swarm dials as such.
-    configured_answers: ConfiguredAnswers,
     dnsaddr_cache: tokio::sync::Mutex<SharedDnsaddrCache>,
     dns_ip_cache: tokio::sync::Mutex<SharedDnsIpCache>,
     top_level_provider_preconnect_counts: tokio::sync::Mutex<HashMap<String, usize>>,
@@ -10052,15 +10082,6 @@ impl BitswapProviderAddrQuality {
     }
 }
 
-/// The addresses candidate choice admitted as a configured target's
-/// answer: a configured name and port whose A or AAAA answer replaced the
-/// name keep their exemption, and the swarm dials such an address as one
-/// ([`freedom_ipfs_net::transport::dial_configured_answer`]). Bounded:
-/// past [`MAX_CONFIGURED_ANSWERS`] it starts afresh.
-type ConfiguredAnswers = Arc<std::sync::Mutex<HashSet<Multiaddr>>>;
-
-const MAX_CONFIGURED_ANSWERS: usize = 1024;
-
 /// What Bitswap's candidate choice runs under (design 0007, checks 1 and
 /// 2): the retriever's network's dial policy, and the DoH resolver its
 /// address expansion asks, the network's.
@@ -10068,7 +10089,6 @@ const MAX_CONFIGURED_ANSWERS: usize = 1024;
 struct AddressExpansion {
     resolver: Arc<CloudflareDohResolver>,
     policy: DialPolicy,
-    configured_answers: ConfiguredAnswers,
 }
 
 impl AddressExpansion {
@@ -10087,7 +10107,6 @@ impl AddressExpansion {
                 network.http_client(freedom_ipfs_namesys::HTTP_CLIENT_CONFIG),
             )),
             policy: network.dial_policy(),
-            configured_answers: ConfiguredAnswers::default(),
         }
     }
 }
@@ -10318,13 +10337,16 @@ async fn judged_and_cut(
     let mut peers = Vec::new();
     for (id, addrs) in gathered {
         let mut kept = Vec::with_capacity(addrs.len());
+        let mut configured_answers = Vec::new();
         for (addr, via) in addrs {
             let admitted = policy.admits_everything()
                 || settled
                     .as_ref()
                     .is_some_and(|settled| check_candidate(settled, &addr, via.as_deref()).is_ok());
             if admitted {
-                remember_configured_answer(settled.as_ref(), &addr, via.as_deref(), expansion);
+                if admitted_as_configured_answer(settled.as_ref(), &addr, via.as_deref()) {
+                    configured_answers.push(addr.clone());
+                }
                 kept.push(addr);
             } else {
                 quality.supported_addr_count = quality.supported_addr_count.saturating_sub(1);
@@ -10337,13 +10359,16 @@ async fn judged_and_cut(
         kept.sort_by_key(bitswap_addr_score);
         kept.dedup();
         kept.truncate(MAX_BITSWAP_ADDRS_PER_PEER);
-        peers.push(BitswapPeer {
+        let mut peer = BitswapPeer {
             id,
             addrs: kept,
+            configured_answers,
             skip_want_have: false,
             force_want_block: false,
             force_want_have: false,
-        });
+        };
+        peer.keep_configured_answers_selected();
+        peers.push(peer);
     }
     peers.truncate(MAX_BITSWAP_PEERS_PER_BLOCK);
     peers
@@ -10406,6 +10431,8 @@ struct BitswapDialAddress {
     peer_index: usize,
     addr_index: usize,
     addr: Multiaddr,
+    /// From the candidate the address belongs to.
+    provenance: DialProvenance,
 }
 
 fn interleaved_bitswap_dials(peers: &[BitswapPeer]) -> Vec<BitswapDialAddress> {
@@ -10423,6 +10450,7 @@ fn interleaved_bitswap_dials(peers: &[BitswapPeer]) -> Vec<BitswapDialAddress> {
                     peer_index,
                     addr_index,
                     addr: addr.clone(),
+                    provenance: peer.provenance(addr),
                 });
             }
         }
@@ -10978,52 +11006,45 @@ async fn expand_provider_multiaddrs_with_origins(
     expanded
 }
 
-/// Records `addr` as a configured target's answer, if candidate choice
-/// admitted it as one: the name it replaced is configured.
-fn remember_configured_answer(
+/// Whether candidate choice admitted `addr` as a configured target's
+/// answer: the name it replaced (`via`) is configured, with that port.
+fn admitted_as_configured_answer(
     settled: Option<&DialPolicy>,
     addr: &Multiaddr,
     via: Option<&str>,
-    expansion: &AddressExpansion,
-) {
+) -> bool {
     let (Some(settled), Some(original)) =
         (settled, via.and_then(|via| Multiaddr::from_str(via).ok()))
     else {
-        return;
+        return false;
     };
-    if !settled.is_configured_answer(&original, addr) {
-        return;
-    }
-    let mut answers = expansion
-        .configured_answers
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if answers.len() >= MAX_CONFIGURED_ANSWERS {
-        answers.clear();
-    }
-    answers.insert(addr.clone());
+    settled.is_configured_answer(&original, addr)
 }
 
-/// Dials `addr` through the swarm, as a configured target's answer when
-/// candidate choice admitted it as one, so the transport's inner gate
-/// keeps that exemption for this dial only.
+/// Dials `addr` through the swarm as its candidate's `provenance` says: as
+/// a configured target's answer only when candidate choice admitted it as
+/// one for this candidate, so the transport's inner gate keeps that
+/// exemption for this dial only.
 fn dial_bitswap_addr(
     swarm: &mut libp2p::Swarm<BitswapBehaviour>,
     addr: Multiaddr,
-    configured: &ConfiguredAnswers,
+    provenance: DialProvenance,
 ) -> std::result::Result<(), libp2p::swarm::DialError> {
-    let mut candidate = addr.clone();
-    if matches!(candidate.iter().last(), Some(Protocol::P2p(_))) {
-        candidate.pop();
-    }
-    let is_configured = configured
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains(&candidate);
-    if is_configured {
-        freedom_ipfs_net::transport::dial_configured_answer(&addr, || swarm.dial(addr.clone()))
-    } else {
-        swarm.dial(addr)
+    dial_with_provenance(&addr, provenance, || swarm.dial(addr.clone()))
+}
+
+/// Runs `dial`, which asks the transport for `addr` there and then, as
+/// `provenance` says.
+fn dial_with_provenance<R>(
+    addr: &Multiaddr,
+    provenance: DialProvenance,
+    dial: impl FnOnce() -> R,
+) -> R {
+    match provenance {
+        DialProvenance::ConfiguredAnswer => {
+            freedom_ipfs_net::transport::dial_configured_answer(addr, dial)
+        }
+        DialProvenance::Untrusted => dial(),
     }
 }
 
@@ -14475,6 +14496,217 @@ mod bitswap_tests {
         }
     }
 
+    /// A `direct` network with checked addresses (`addresses`) whose one
+    /// configured target is `configured.example` on `port`.
+    fn configured_network(
+        port: u16,
+        addresses: freedom_ipfs_net::Addresses,
+    ) -> freedom_ipfs_net::Network {
+        let mut configured = freedom_ipfs_net::gate::ConfiguredTargets::new();
+        configured
+            .add_url(&url::Url::parse(&format!("http://configured.example:{port}")).unwrap())
+            .unwrap();
+        freedom_ipfs_net::Network::with_lookup(
+            freedom_ipfs_net::NetworkPolicy::direct(
+                configured,
+                url::Url::parse("https://dns.example/dns-query").unwrap(),
+                addresses,
+            )
+            .unwrap(),
+            None,
+        )
+    }
+
+    fn random_peer() -> PeerId {
+        libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+    }
+
+    /// Candidate choice over `providers` (one address each, with its peer),
+    /// with `configured.example` answering `answers` from the cache: no
+    /// lookup goes out.
+    async fn choose_with_answers(
+        expansion: &AddressExpansion,
+        providers: &[(PeerId, String)],
+        answers: &[&str],
+    ) -> Vec<BitswapPeer> {
+        let providers = providers
+            .iter()
+            .map(|(peer, addr)| {
+                Provider::from_parts(Some(peer.to_string()), vec![format!("{addr}/p2p/{peer}")])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut txt = DnsaddrCache::new();
+        let mut ips = HashMap::from([(
+            "configured.example".to_string(),
+            CachedDnsIpRecords {
+                addrs: answers.iter().map(|ip| ip.parse().unwrap()).collect(),
+                log_as_cached: true,
+            },
+        )]);
+        bitswap_peers_with_quality_using_caches_with_options(
+            &providers, &mut txt, &mut ips, true, false, expansion,
+        )
+        .await
+        .peers
+    }
+
+    /// The #48 conformance review's probe (major finding): a configured
+    /// name's answer is exempt for its own candidate's dial of it, never for
+    /// its address. Another provider's candidate for the same address, and
+    /// another address of the configured candidate's peer, admitted before
+    /// NAT64 discovery learned a prefix under which they are loopback, and
+    /// dialed after, are judged by the address policy then and refused; the
+    /// configured answer's dial keeps its exemption.
+    #[tokio::test]
+    async fn a_configured_answer_doesnt_exempt_another_candidate_for_its_address() {
+        use freedom_ipfs_net::gate::{Nat64Prefix, Nat64State};
+        use freedom_ipfs_net::transport::Gated;
+        use freedom_ipfs_net::{Addresses, Nat64Handle};
+        use libp2p::core::transport::dummy::{DummyStream, DummyTransport};
+        use libp2p::core::transport::{DialOpts, PortUse, TransportError};
+        use libp2p::Transport as _;
+
+        let (publisher, handle) = Nat64Handle::channel(Nat64State::NONE);
+        let network = configured_network(4001, Addresses::Checked(handle));
+        let expansion = AddressExpansion::of(&network);
+        let answer = "2002:808:808:7f00:0:100::";
+        let addr: Multiaddr = format!("/ip6/{answer}/tcp/4001").parse().unwrap();
+        let other_port: Multiaddr = format!("/ip6/{answer}/tcp/4002").parse().unwrap();
+        let (configured, untrusted) = (random_peer(), random_peer());
+        let peers = choose_with_answers(
+            &expansion,
+            &[
+                (configured, "/dns6/configured.example/tcp/4001".into()),
+                (untrusted, addr.to_string()),
+                (configured, other_port.to_string()),
+            ],
+            &[answer],
+        )
+        .await;
+        assert_eq!(peers.len(), 2);
+        let dials = interleaved_bitswap_dials(&peers);
+        let provenance = |peer, addr: &Multiaddr| {
+            dials
+                .iter()
+                .find(|dial| dial.peer == peer && dial.addr == *addr)
+                .unwrap()
+                .provenance
+        };
+        assert_eq!(dials.len(), 3);
+        assert_eq!(
+            provenance(configured, &addr),
+            DialProvenance::ConfiguredAnswer
+        );
+        assert_eq!(provenance(untrusted, &addr), DialProvenance::Untrusted);
+        assert_eq!(
+            provenance(configured, &other_port),
+            DialProvenance::Untrusted
+        );
+
+        // Discovery then learns that the same bits are loopback under a
+        // network-specific prefix.
+        let prefix = Nat64Prefix::new("2002:808:808::".parse().unwrap(), 48).unwrap();
+        publisher.publish(Nat64State::known([prefix]));
+        assert!(network.dial_policy().check_now(&addr).is_err());
+        assert!(network.dial_policy().check_now(&other_port).is_err());
+
+        let mut gated = Gated::inner(DummyTransport::<DummyStream>::new(), network.dial_policy());
+        for dial in &dials {
+            let opts = DialOpts {
+                role: libp2p::core::Endpoint::Dialer,
+                port_use: PortUse::New,
+            };
+            let result = dial_with_provenance(&dial.addr, dial.provenance, || {
+                gated.dial(dial.addr.clone(), opts)
+            });
+            // The inner gate refuses with `Other`; past it, the dummy
+            // transport supports no address.
+            let passed_the_gate = matches!(result, Err(TransportError::MultiaddrNotSupported(_)));
+            assert_eq!(
+                passed_the_gate,
+                dial.peer == configured && dial.addr == addr,
+                "{} {:?}",
+                dial.addr,
+                dial.provenance
+            );
+        }
+    }
+
+    /// The #48 reviews' second case: a configured answer grants its
+    /// exemption only once selected. Answers cut by the per-peer limit, at
+    /// candidate choice or when recent addresses are merged in, are no
+    /// longer the candidate's configured answers (the control: one that
+    /// stays selected keeps its provenance).
+    #[tokio::test]
+    async fn only_a_selected_configured_answer_keeps_its_provenance() {
+        use freedom_ipfs_net::gate::Nat64State;
+        use freedom_ipfs_net::{Addresses, Nat64Handle};
+        let network = configured_network(
+            4001,
+            Addresses::Checked(Nat64Handle::fixed(Nat64State::NONE)),
+        );
+        let expansion = AddressExpansion::of(&network);
+        let peer = random_peer();
+
+        // Three answers, two kept.
+        let peers = choose_with_answers(
+            &expansion,
+            &[(peer, "/dns4/configured.example/tcp/4001".into())],
+            &["127.0.0.1", "127.0.0.2", "127.0.0.3"],
+        )
+        .await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].addrs.len(), MAX_BITSWAP_ADDRS_PER_PEER);
+        assert_eq!(peers[0].configured_answers, peers[0].addrs);
+
+        // A QUIC answer, then merged with a recent peer's TCP addresses,
+        // which rank first.
+        for (recent, kept) in [(1, true), (2, false)] {
+            let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+            let retriever = HttpRetriever::new(
+                freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+                store,
+            );
+            let mut peers = choose_with_answers(
+                &expansion,
+                &[(peer, "/dns4/configured.example/udp/4001/quic-v1".into())],
+                &["127.0.0.1"],
+            )
+            .await;
+            let quic: Multiaddr = "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap();
+            assert_eq!(peers[0].configured_answers, std::slice::from_ref(&quic));
+            let tcp = (1..=recent)
+                .map(|port| format!("/ip4/8.8.8.{port}/tcp/4001").parse().unwrap())
+                .collect::<Vec<Multiaddr>>();
+            retriever
+                .record_successful_bitswap_peer(peer, tcp, Duration::from_millis(10))
+                .await;
+            retriever
+                .insert_recent_bitswap_session_peers(&mut peers)
+                .await;
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].addrs.contains(&quic), kept, "recent: {recent}");
+            assert_eq!(
+                peers[0].configured_answers,
+                if kept { vec![quic.clone()] } else { Vec::new() },
+                "recent: {recent}"
+            );
+            let configured_dials = interleaved_bitswap_dials(&peers)
+                .into_iter()
+                .filter(|dial| dial.provenance == DialProvenance::ConfiguredAnswer)
+                .map(|dial| dial.addr)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                configured_dials,
+                if kept { vec![quic.clone()] } else { Vec::new() },
+                "recent: {recent}"
+            );
+        }
+    }
+
     /// Check 1 where providers come in: under a gated policy refused
     /// addresses and HTTP base URLs are dropped, and the provider keeps its
     /// peer ID and the rest; under the legacy policy nothing changes.
@@ -14768,6 +15000,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: ws_peer,
                 addrs: vec!["/ip4/127.0.0.4/tcp/4001/ws".parse().unwrap()],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -14775,6 +15008,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: dns_peer,
                 addrs: vec!["/dns4/provider.example/tcp/4001".parse().unwrap()],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -14782,6 +15016,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: quic_peer,
                 addrs: vec!["/ip4/127.0.0.3/udp/4001/quic-v1".parse().unwrap()],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -14789,6 +15024,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: tcp_peer,
                 addrs: vec!["/ip4/127.0.0.2/tcp/4001".parse().unwrap()],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -15275,6 +15511,7 @@ mod bitswap_tests {
                     "/ip4/127.0.0.1/tcp/1001".parse().unwrap(),
                     "/ip4/127.0.0.1/tcp/1002".parse().unwrap(),
                 ],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -15285,6 +15522,7 @@ mod bitswap_tests {
                     "/ip4/127.0.0.1/tcp/2001".parse().unwrap(),
                     "/ip4/127.0.0.1/tcp/2002".parse().unwrap(),
                 ],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -15335,6 +15573,7 @@ mod bitswap_tests {
                             .unwrap()
                     })
                     .collect(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -15390,6 +15629,7 @@ mod bitswap_tests {
                             .unwrap()
                     })
                     .collect(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -15462,6 +15702,7 @@ mod bitswap_tests {
                     "/ip4/127.0.0.1/tcp/1004".parse().unwrap(),
                     "/ip4/127.0.0.1/tcp/1005".parse().unwrap(),
                 ],
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: false,
                 force_want_have: false,
@@ -15469,6 +15710,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: second,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -15476,6 +15718,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: third,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -15483,6 +15726,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: fourth,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -15490,6 +15734,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: fifth,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -15519,6 +15764,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: first,
                 addrs: vec![first_addr, first_alt_addr.clone()],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -15526,6 +15772,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: second,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -15533,6 +15780,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: third,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -15540,6 +15788,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: fourth,
                 addrs: vec![fourth_addr],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -15586,12 +15835,7 @@ mod bitswap_tests {
         let incoming = accept_bitswap_streams(&mut control).unwrap();
         let (commands, receiver) = mpsc::channel(1);
         let task = tokio::spawn(run_shared_bitswap_swarm(
-            swarm,
-            control,
-            incoming,
-            receiver,
-            None,
-            ConfiguredAnswers::default(),
+            swarm, control, incoming, receiver, None,
         ));
 
         drop(commands);
@@ -15622,10 +15866,9 @@ mod bitswap_tests {
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
         let (peer_id, addr, swarm_task, stream_task, want_seen) =
             spawn_bitswap_peer_waiting_for_stream_close(cid).await;
-        let client =
-            SharedBitswapClient::spawn(None, None, None, None, ConfiguredAnswers::default())
-                .await
-                .unwrap();
+        let client = SharedBitswapClient::spawn(None, None, None, None)
+            .await
+            .unwrap();
         let fetch_task = tokio::spawn(async move {
             client
                 .fetch(
@@ -15633,6 +15876,7 @@ mod bitswap_tests {
                     vec![BitswapPeer {
                         id: peer_id,
                         addrs: vec![addr],
+                        configured_answers: Vec::new(),
                         skip_want_have: true,
                         force_want_block: false,
                         force_want_have: false,
@@ -15977,10 +16221,9 @@ mod bitswap_tests {
                 (second, second_data.to_vec()),
             ])
             .await;
-        let client =
-            SharedBitswapClient::spawn(None, None, None, None, ConfiguredAnswers::default())
-                .await
-                .unwrap();
+        let client = SharedBitswapClient::spawn(None, None, None, None)
+            .await
+            .unwrap();
 
         let result = client
             .fetch_many(
@@ -15988,6 +16231,7 @@ mod bitswap_tests {
                 vec![BitswapPeer {
                     id: peer_id,
                     addrs: vec![addr],
+                    configured_answers: Vec::new(),
                     skip_want_have: true,
                     force_want_block: false,
                     force_want_have: false,
@@ -16021,10 +16265,9 @@ mod bitswap_tests {
                 (second, second_data.to_vec()),
             ])
             .await;
-        let client =
-            SharedBitswapClient::spawn(None, None, None, None, ConfiguredAnswers::default())
-                .await
-                .unwrap();
+        let client = SharedBitswapClient::spawn(None, None, None, None)
+            .await
+            .unwrap();
 
         let result = client
             .fetch_many(
@@ -16032,6 +16275,7 @@ mod bitswap_tests {
                 vec![BitswapPeer {
                     id: peer_id,
                     addrs: vec![addr],
+                    configured_answers: Vec::new(),
                     skip_want_have: true,
                     force_want_block: false,
                     force_want_have: false,
@@ -16135,10 +16379,9 @@ mod bitswap_tests {
 
     #[tokio::test]
     async fn shared_bitswap_client_fetch_many_rejects_empty_batch() {
-        let client =
-            SharedBitswapClient::spawn(None, None, None, None, ConfiguredAnswers::default())
-                .await
-                .unwrap();
+        let client = SharedBitswapClient::spawn(None, None, None, None)
+            .await
+            .unwrap();
         let err = client.fetch_many(Vec::new(), Vec::new()).await.unwrap_err();
 
         assert!(
@@ -17762,6 +18005,7 @@ mod bitswap_tests {
             .map(|index| BitswapPeer {
                 id: PeerId::random(),
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: index == 0,
                 force_want_block: false,
                 force_want_have: false,
@@ -17806,6 +18050,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: trusted,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: false,
                 force_want_have: false,
@@ -17813,6 +18058,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: first,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -17820,6 +18066,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: second,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -17827,6 +18074,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: third,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -17888,6 +18136,7 @@ mod bitswap_tests {
                         "/ip6/2001:db8::1/tcp/4001".parse().unwrap(),
                         "/ip4/192.0.2.1/tcp/4001".parse().unwrap(),
                     ],
+                    configured_answers: Vec::new(),
                     skip_want_have: true,
                     force_want_block: false,
                     force_want_have: false,
@@ -17898,6 +18147,7 @@ mod bitswap_tests {
                         "/ip6/2001:db8::2/tcp/4001".parse().unwrap(),
                         "/ip4/192.0.2.2/tcp/4001".parse().unwrap(),
                     ],
+                    configured_answers: Vec::new(),
                     skip_want_have: false,
                     force_want_block: false,
                     force_want_have: false,
@@ -18216,6 +18466,7 @@ mod bitswap_tests {
             .map(|index| BitswapPeer {
                 id: PeerId::random(),
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: index < 3,
                 force_want_block: false,
                 force_want_have: false,
@@ -18383,6 +18634,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: first,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: false,
                 force_want_have: false,
@@ -18390,6 +18642,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: second,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: false,
                 force_want_have: false,
@@ -18397,6 +18650,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: third,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: false,
                 force_want_have: false,
@@ -18470,6 +18724,7 @@ mod bitswap_tests {
         let peers = vec![BitswapPeer {
             id: peer,
             addrs: Vec::new(),
+            configured_answers: Vec::new(),
             skip_want_have: true,
             force_want_block: false,
             force_want_have: false,
@@ -18742,6 +18997,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: other,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -18749,6 +19005,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: preferred,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -18802,6 +19059,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: slow,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -18809,6 +19067,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: fast,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -18928,6 +19187,7 @@ mod bitswap_tests {
         let mut peers = vec![BitswapPeer {
             id: provider_peer,
             addrs: Vec::new(),
+            configured_answers: Vec::new(),
             skip_want_have: false,
             force_want_block: false,
             force_want_have: false,
@@ -19015,6 +19275,7 @@ mod bitswap_tests {
         let peer = BitswapPeer {
             id: session_peer,
             addrs: vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()],
+            configured_answers: Vec::new(),
             skip_want_have: true,
             force_want_block: false,
             force_want_have: false,
@@ -19041,6 +19302,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: first,
                 addrs: vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()],
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: false,
                 force_want_have: false,
@@ -19048,6 +19310,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: second,
                 addrs: vec!["/ip4/127.0.0.2/tcp/4001".parse().unwrap()],
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: false,
                 force_want_have: false,
@@ -19724,6 +19987,7 @@ mod bitswap_tests {
                 "/dns4/example.com/tcp/443/wss".parse().unwrap(),
                 "/dnsaddr/bootstrap.example/tcp/4001/ws".parse().unwrap(),
             ],
+            configured_answers: Vec::new(),
             skip_want_have: false,
             force_want_block: false,
             force_want_have: false,
@@ -21251,12 +21515,7 @@ mod bitswap_tests {
         let incoming = accept_bitswap_streams(&mut control).unwrap();
         let (commands, receiver) = mpsc::channel(64);
         let task = tokio::spawn(run_shared_bitswap_swarm(
-            swarm,
-            control,
-            incoming,
-            receiver,
-            None,
-            ConfiguredAnswers::default(),
+            swarm, control, incoming, receiver, None,
         ));
         (commands, task)
     }
@@ -21273,12 +21532,7 @@ mod bitswap_tests {
         let incoming = accept_bitswap_streams(&mut control).unwrap();
         let (commands, receiver) = mpsc::channel(64);
         let task = tokio::spawn(run_shared_bitswap_swarm(
-            swarm,
-            control,
-            incoming,
-            receiver,
-            None,
-            ConfiguredAnswers::default(),
+            swarm, control, incoming, receiver, None,
         ));
         (commands, task)
     }
@@ -21378,6 +21632,157 @@ mod bitswap_tests {
         }
     }
 
+    /// A candidate's configured provenance goes with its dial through the
+    /// shared swarm's task, and with a dial deferred behind the connection
+    /// cap and retried (#48 reviews, major finding): under checked
+    /// addresses, its dial to a loopback answer reaches the canary, where
+    /// the same candidate without the provenance (the control) is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_candidates_provenance_goes_with_its_dial_and_its_retry() {
+        for deferred in [false, true] {
+            for configured in [true, false] {
+                let limits = SharedLimits::new(LimitSizes {
+                    bitswap_connections: 1,
+                    ..LimitSizes::default()
+                });
+                let holder = deferred.then(|| hold_connection_slot(&limits));
+                let (canary, accepted) = bitswap_canary();
+                let network = configured_network(canary_port(&canary), checked_addresses());
+                let (commands, task) = spawn_bitswap_actor_through(&limits, &network).await;
+                let candidate = BitswapPeer {
+                    id: random_peer(),
+                    addrs: vec![canary.clone()],
+                    configured_answers: if configured {
+                        vec![canary.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                    skip_want_have: true,
+                    force_want_block: true,
+                    force_want_have: false,
+                };
+                let cid =
+                    freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, b"provenance");
+                let _waiting = send_fetch_to(&commands, cid, candidate).await;
+                if let Some(holder) = holder {
+                    wait_until("the dial never waited for a slot", || {
+                        limits.bitswap_connections_waiting() == 1
+                    })
+                    .await;
+                    assert_eq!(accepted.load(Ordering::SeqCst), 0);
+                    drop(holder);
+                }
+                let reached = canary_reached(
+                    &accepted,
+                    Duration::from_secs(if configured { 5 } else { 2 }),
+                )
+                .await;
+                task.abort();
+                assert_eq!(
+                    reached, configured,
+                    "deferred: {deferred}, configured: {configured}"
+                );
+            }
+        }
+    }
+
+    fn canary_port(canary: &Multiaddr) -> u16 {
+        canary
+            .iter()
+            .find_map(|component| match component {
+                Protocol::Tcp(port) => Some(port),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    /// The #48 adversarial review's probe (P1): a configured name's answer
+    /// is not an address-wide, lasting exemption. The configured
+    /// candidate's dial reaches the canary (the control); later candidates
+    /// for the same address without that provenance (another provider's
+    /// peer, and the configured peer again as a recent peer) are judged by
+    /// the address policy, and the canary sees nothing more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_configured_answer_is_not_an_address_wide_permanent_exemption() {
+        let (canary, accepted) = bitswap_canary();
+        let port = canary_port(&canary);
+        let network = configured_network(port, checked_addresses());
+        let expansion = AddressExpansion::of(&network);
+        let configured = random_peer();
+        let chosen = choose_with_answers(
+            &expansion,
+            &[(configured, format!("/dns4/configured.example/tcp/{port}"))],
+            &["127.0.0.1"],
+        )
+        .await;
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].addrs, std::slice::from_ref(&canary));
+        assert_eq!(chosen[0].configured_answers, std::slice::from_ref(&canary));
+
+        async fn dial_planned(
+            network: &freedom_ipfs_net::Network,
+            peers: &[BitswapPeer],
+            accepted: &std::sync::atomic::AtomicUsize,
+            expected: usize,
+            limit: Duration,
+        ) {
+            let mut swarm = build_bitswap_swarm(None, Some(&Transports::new(network)))
+                .await
+                .unwrap();
+            for dial in interleaved_bitswap_dials(peers) {
+                let addr = dial.addr.with_p2p(dial.peer).unwrap();
+                let _ = dial_bitswap_addr(&mut swarm, addr, dial.provenance);
+            }
+            let polling = tokio::spawn(async move { while swarm.next().await.is_some() {} });
+            let deadline = tokio::time::Instant::now() + limit;
+            while accepted.load(Ordering::SeqCst) < expected
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            polling.abort();
+        }
+
+        dial_planned(&network, &chosen, &accepted, 1, Duration::from_secs(5)).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "the control");
+
+        // The configured peer, recorded as a success, comes back as a
+        // recent peer; another peer has the same address as a literal.
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            SqliteBlockStore::in_memory(1024 * 1024).unwrap(),
+        );
+        retriever
+            .record_successful_bitswap_peer(
+                configured,
+                chosen[0].addrs.clone(),
+                Duration::from_millis(10),
+            )
+            .await;
+        let mut later = vec![BitswapPeer {
+            id: random_peer(),
+            addrs: vec![canary.clone()],
+            configured_answers: Vec::new(),
+            skip_want_have: false,
+            force_want_block: false,
+            force_want_have: false,
+        }];
+        assert_eq!(
+            retriever
+                .insert_recent_bitswap_session_peers(&mut later)
+                .await,
+            1
+        );
+        assert_eq!(later.len(), 2);
+        assert!(later.iter().all(|peer| peer.addrs == [canary.clone()]));
+        dial_planned(&network, &later, &accepted, 2, Duration::from_secs(3)).await;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "an untrusted dial inherited a configured name's exemption"
+        );
+    }
+
     /// A fetch command's requester, as `fetch_many_with_context` holds it:
     /// dropping it drops the response receiver and the liveness together.
     struct WaitingFetch {
@@ -21391,18 +21796,28 @@ mod bitswap_tests {
         peer: PeerId,
         addr: Multiaddr,
     ) -> WaitingFetch {
+        let candidate = BitswapPeer {
+            id: peer,
+            addrs: vec![addr],
+            configured_answers: Vec::new(),
+            skip_want_have: true,
+            force_want_block: true,
+            force_want_have: false,
+        };
+        send_fetch_to(commands, cid, candidate).await
+    }
+
+    async fn send_fetch_to(
+        commands: &mpsc::Sender<BitswapCommand>,
+        cid: Cid,
+        candidate: BitswapPeer,
+    ) -> WaitingFetch {
         let (respond, response) = oneshot::channel();
         let requester = Arc::new(());
         commands
             .send(BitswapCommand {
                 cids: vec![cid],
-                peers: vec![BitswapPeer {
-                    id: peer,
-                    addrs: vec![addr],
-                    skip_want_have: true,
-                    force_want_block: true,
-                    force_want_have: false,
-                }],
+                peers: vec![candidate],
                 sent_at: Instant::now(),
                 respond: Some(respond),
                 requester: Arc::downgrade(&requester),
@@ -22101,6 +22516,7 @@ mod bitswap_tests {
                 .map(|n| BitswapPeer {
                     id: PeerId::random(),
                     addrs: vec!["/ip4/127.0.0.1/tcp/9".parse().unwrap()],
+                    configured_answers: Vec::new(),
                     skip_want_have: n == 0,
                     force_want_block: false,
                     force_want_have: false,
@@ -22325,6 +22741,7 @@ mod bitswap_tests {
                     vec![BitswapPeer {
                         id: peer_id,
                         addrs: vec![addr],
+                        configured_answers: Vec::new(),
                         skip_want_have: true,
                         force_want_block: true,
                         force_want_have: false,
@@ -22373,6 +22790,7 @@ mod bitswap_tests {
                 vec![BitswapPeer {
                     id: peer_id,
                     addrs: vec![addr],
+                    configured_answers: Vec::new(),
                     skip_want_have: true,
                     force_want_block: true,
                     force_want_have: false,
@@ -22412,6 +22830,7 @@ mod bitswap_tests {
                 vec![BitswapPeer {
                     id: peer_id,
                     addrs: vec![addr],
+                    configured_answers: Vec::new(),
                     skip_want_have: true,
                     force_want_block: false,
                     force_want_have: false,
@@ -22447,20 +22866,15 @@ mod bitswap_tests {
             spawn_local_bitswap_peer(cid, data).await;
         let budget = MemoryBudget::new(8 << 20);
         let _full = budget.try_reserve(budget.limit()).unwrap();
-        let client = SharedBitswapClient::spawn(
-            None,
-            None,
-            Some(&budget),
-            None,
-            ConfiguredAnswers::default(),
-        )
-        .await
-        .unwrap();
+        let client = SharedBitswapClient::spawn(None, None, Some(&budget), None)
+            .await
+            .unwrap();
         // A trusted and an untrusted peer: the 4 s request timeout.
         let peers = vec![
             BitswapPeer {
                 id: trusted,
                 addrs: vec![trusted_addr],
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: true,
                 force_want_have: false,
@@ -22468,6 +22882,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: untrusted,
                 addrs: vec![untrusted_addr],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: true,
                 force_want_have: false,

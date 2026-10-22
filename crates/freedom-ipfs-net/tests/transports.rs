@@ -692,3 +692,76 @@ async fn a_configured_answer_is_exempt_for_its_own_dial_only() {
     });
     assert!(!refused_shape);
 }
+
+/// The exemption ends with its call even when the dial panics (#48 review,
+/// both reports' minor finding): unwinding puts the thread's previous state
+/// back, so a later dial of the same address on that thread is untrusted.
+#[test]
+fn a_configured_answer_exemption_is_restored_when_the_dial_panics() {
+    let counting = Counting::default();
+    let mut gated =
+        freedom_ipfs_net::transport::Gated::inner(counting.clone(), checked().dial_policy());
+    let answer = multiaddr(&format!("/ip4/127.0.0.1/tcp/4001/p2p/{PEER}"));
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        freedom_ipfs_net::transport::dial_configured_answer(&answer, || {
+            panic!("the synchronous swarm dial panicked")
+        });
+    }));
+    assert!(unwound.is_err());
+
+    assert!(
+        gated.dial(answer, opts()).is_err(),
+        "the panicking call left its configured-address exemption installed"
+    );
+    assert!(counting.dialed().is_empty());
+}
+
+/// A call inside another restores the outer one's exemption when it ends,
+/// by returning or by unwinding, and the outer one's end restores none.
+#[test]
+fn a_nested_configured_answer_restores_the_outer_one() {
+    let counting = Counting::default();
+    let mut gated =
+        freedom_ipfs_net::transport::Gated::inner(counting.clone(), checked().dial_policy());
+    let outer = multiaddr(&format!("/ip4/127.0.0.1/tcp/4001/p2p/{PEER}"));
+    let inner = multiaddr(&format!("/ip4/127.0.0.1/tcp/4002/p2p/{PEER}"));
+    for panics in [false, true] {
+        let (outer_after_inner, inner_after_inner) =
+            freedom_ipfs_net::transport::dial_configured_answer(&outer, || {
+                let nested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    freedom_ipfs_net::transport::dial_configured_answer(&inner, || {
+                        assert!(gated.dial(inner.clone(), opts()).is_ok());
+                        assert!(gated.dial(outer.clone(), opts()).is_err());
+                        if panics {
+                            panic!("the nested dial panicked");
+                        }
+                    })
+                }));
+                assert_eq!(nested.is_err(), panics);
+                (
+                    gated.dial(outer.clone(), opts()).is_ok(),
+                    gated.dial(inner.clone(), opts()).is_ok(),
+                )
+            });
+        assert!(outer_after_inner, "panics: {panics}");
+        assert!(!inner_after_inner, "panics: {panics}");
+        assert!(
+            gated.dial(outer.clone(), opts()).is_err(),
+            "panics: {panics}"
+        );
+        assert!(
+            gated.dial(inner.clone(), opts()).is_err(),
+            "panics: {panics}"
+        );
+    }
+    assert_eq!(
+        counting.dialed(),
+        [
+            inner.to_string(),
+            outer.to_string(),
+            inner.to_string(),
+            outer.to_string()
+        ]
+    );
+}

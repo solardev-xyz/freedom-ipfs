@@ -290,12 +290,34 @@ thread_local! {
 /// exemption is that address's and port's, for this call only: a dial the
 /// transport makes later, or for another address, is judged as untrusted,
 /// and the shape, the classification and the capability still apply.
+///
+/// The exemption ends with the call however it ends, an unwinding panic
+/// included, and a call inside another restores the outer one's.
 pub fn dial_configured_answer<R>(addr: &Multiaddr, dial: impl FnOnce() -> R) -> R {
-    let exempt = ip_and_port(addr);
-    let previous = CONFIGURED_ANSWER.with(|cell| cell.replace(exempt));
-    let result = dial();
-    CONFIGURED_ANSWER.with(|cell| cell.replace(previous));
-    result
+    let _scope = ConfiguredAnswerScope::enter(ip_and_port(addr));
+    dial()
+}
+
+/// [`dial_configured_answer`]'s exemption for as long as it lives: the
+/// thread's previous one is put back when it drops, on return and on
+/// unwinding alike.
+struct ConfiguredAnswerScope {
+    previous: Option<(IpAddr, u16)>,
+}
+
+impl ConfiguredAnswerScope {
+    fn enter(exempt: Option<(IpAddr, u16)>) -> Self {
+        Self {
+            previous: CONFIGURED_ANSWER.with(|cell| cell.replace(exempt)),
+        }
+    }
+}
+
+impl Drop for ConfiguredAnswerScope {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        CONFIGURED_ANSWER.with(|cell| cell.replace(previous));
+    }
 }
 
 /// The inner gate's check: the policy's, but for the address a configured
