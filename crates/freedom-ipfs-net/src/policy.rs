@@ -293,7 +293,7 @@ impl Network {
     ) -> Result<Self, NetworkError> {
         #[cfg(feature = "socks")]
         {
-            Self::with_lookup_and_random(policy, lookup, crate::socks::os_random)
+            Self::build_with_random(policy, lookup, crate::socks::os_random)
         }
         #[cfg(not(feature = "socks"))]
         {
@@ -302,11 +302,23 @@ impl Network {
     }
 
     /// [`Network::with_lookup`], with the credentials' bits from `random`:
-    /// a test's failing randomness. Nothing falls back to a fixed password
-    /// or to no authentication.
-    #[cfg(feature = "socks")]
+    /// a test's failing randomness. Only tests and `test-util` have it, so
+    /// no host can give two networks the same credentials. Nothing falls
+    /// back to a fixed password or to no authentication.
+    #[cfg(all(feature = "socks", any(test, feature = "test-util")))]
     #[doc(hidden)]
     pub fn with_lookup_and_random(
+        policy: NetworkPolicy,
+        lookup: Option<Arc<dyn NameLookup>>,
+        random: fn(&mut [u8]) -> Result<(), crate::socks::RandomFailed>,
+    ) -> Result<Self, NetworkError> {
+        Self::build_with_random(policy, lookup, random)
+    }
+
+    /// The network, its SOCKS5 credentials (under `socks5`) from `random`:
+    /// the operating system's, except in tests.
+    #[cfg(feature = "socks")]
+    fn build_with_random(
         policy: NetworkPolicy,
         lookup: Option<Arc<dyn NameLookup>>,
         random: fn(&mut [u8]) -> Result<(), crate::socks::RandomFailed>,
