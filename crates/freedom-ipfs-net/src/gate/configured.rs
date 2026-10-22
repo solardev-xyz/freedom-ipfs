@@ -8,11 +8,14 @@ use url::Url;
 use super::classify::{canonical, classify_url, DialTarget, Refusal, Target};
 
 /// The targets configuration names: the delegated routers and the DoH
-/// endpoint in `ipfs.start`, and the proxy's endpoint. They are exempt from
-/// the address policy by exact host and port, including when one is local.
-/// Everything learned from the network is untrusted, a redirect from a
-/// configured endpoint included, unless it reaches a configured host and
-/// port itself.
+/// endpoint in `ipfs.start`. They are exempt from the address policy by
+/// exact host and port, including when one is local. Everything learned
+/// from the network is untrusted, a redirect from a configured endpoint
+/// included, unless it reaches a configured host and port itself.
+///
+/// A SOCKS proxy's own endpoint isn't a target: the transport connects to
+/// it, and every target goes through it. So a target at the proxy's
+/// address, reached through the proxy, is untrusted like any other.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConfiguredTargets {
     targets: HashSet<(Target, u16)>,
@@ -32,7 +35,7 @@ impl ConfiguredTargets {
         Ok(())
     }
 
-    /// Adds a socket address, such as the proxy's.
+    /// Adds a socket address: an endpoint configured by address and port.
     pub fn add_endpoint(&mut self, endpoint: SocketAddr) {
         self.targets
             .insert((Target::Ip(canonical(endpoint.ip())), endpoint.port()));

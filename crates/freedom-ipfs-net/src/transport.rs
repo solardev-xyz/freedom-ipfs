@@ -23,8 +23,14 @@
 //!
 //! Under the legacy policy the transports are those the crates built before,
 //! by the same constructors, behind a capability-only outer gate.
+//!
+//! Under `socks5` (cargo feature `socks`) every dial goes through the proxy
+//! (`Socks5Transport`), behind the outer gate: no QUIC, no DNS layer, and
+//! no `/dnsaddr` expansion, which would need a local lookup.
 
 mod select_security;
+#[cfg(feature = "socks")]
+mod socks;
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -47,6 +53,8 @@ use multiaddr::{Multiaddr, Protocol};
 use parking_lot::Mutex;
 
 pub use select_security::SelectSecurityUpgrade;
+#[cfg(feature = "socks")]
+pub use socks::{Socks5DialError, Socks5Transport};
 
 use crate::capability::{NetworkCapability, Revoked};
 use crate::dial::{DialPolicy, DialRefusal};
@@ -486,6 +494,54 @@ impl Transports {
         !matches!(self.network.policy().mode(), Mode::Legacy)
     }
 
+    fn is_socks5(&self) -> bool {
+        matches!(self.network.policy().mode(), Mode::Socks5(_))
+    }
+
+    /// TCP through the network's proxy, under `socks5`.
+    #[cfg(feature = "socks")]
+    fn socks5(&self) -> Result<Socks5Transport, TransportBuildError> {
+        let client = self
+            .network
+            .socks()
+            .ok_or("a socks5 network without its SOCKS client")?;
+        Ok(Socks5Transport::new(
+            client.clone(),
+            self.network.dial_policy(),
+        ))
+    }
+
+    /// The DHT's transport under `socks5`: TCP (TLS or Noise, then Yamux)
+    /// through the proxy, behind the outer gate.
+    #[cfg(feature = "socks")]
+    fn socks5_dht(&self, keypair: &Keypair) -> Result<SwarmTransport, TransportBuildError> {
+        let tcp = upgraded(self.socks5()?, keypair)?;
+        Ok(self.outer(tcp, false).boxed())
+    }
+
+    /// Bitswap's transport under `socks5`: TCP (TLS or Noise, then Yamux),
+    /// or WebSocket (Noise, then Yamux), each through the proxy, behind the
+    /// outer gate.
+    #[cfg(feature = "socks")]
+    fn socks5_bitswap(&self, keypair: &Keypair) -> Result<SwarmTransport, TransportBuildError> {
+        let tcp = upgraded(self.socks5()?, keypair)?;
+        let websocket = websocket_upgraded(self.socks5()?, keypair)?;
+        let both = tcp
+            .or_transport(websocket)
+            .map(|either, _| either.into_inner());
+        Ok(self.outer(both, false).boxed())
+    }
+
+    #[cfg(not(feature = "socks"))]
+    fn socks5_dht(&self, _keypair: &Keypair) -> Result<SwarmTransport, TransportBuildError> {
+        Err(NO_SOCKS.into())
+    }
+
+    #[cfg(not(feature = "socks"))]
+    fn socks5_bitswap(&self, _keypair: &Keypair) -> Result<SwarmTransport, TransportBuildError> {
+        Err(NO_SOCKS.into())
+    }
+
     fn outer<T>(&self, inner: T, expand_dnsaddr: bool) -> Gated<T> {
         let capability = self.network.capability().clone();
         let policy = self.network.dial_policy();
@@ -502,6 +558,9 @@ impl Transports {
     /// `direct`, with the outer gate above the DNS layer (expanding
     /// `/dnsaddr` itself) and the inner gate below it.
     pub fn dht(&self, keypair: &Keypair) -> Result<SwarmTransport, TransportBuildError> {
+        if self.is_socks5() {
+            return self.socks5_dht(keypair);
+        }
         let tcp = tcp_upgraded(keypair)?;
         let quic = quic_transport(keypair);
         let direct = tcp.or_transport(quic).map(|either, _| either.into_inner());
@@ -519,6 +578,9 @@ impl Transports {
     /// `direct`, with the outer gate above both and the inner gate below
     /// the DNS layer and below TCP and QUIC.
     pub fn bitswap(&self, keypair: &Keypair) -> Result<SwarmTransport, TransportBuildError> {
+        if self.is_socks5() {
+            return self.socks5_bitswap(keypair);
+        }
         let gated = self.gated();
         let policy = self.network.dial_policy();
         let direct = tcp_upgraded(keypair)?
@@ -542,13 +604,30 @@ impl Transports {
     }
 }
 
+/// Why a `socks5` network's transports can't be built without the `socks`
+/// feature: never a direct dial instead.
+#[cfg(not(feature = "socks"))]
+const NO_SOCKS: &str = "socks5 needs freedom-ipfs-net's socks feature";
+
 /// TCP with TLS or Noise, then Yamux: what `SwarmBuilder::with_tcp` builds
 /// for `(tls::Config::new, noise::Config::new)` and
 /// `yamux::Config::default`.
 fn tcp_upgraded(keypair: &Keypair) -> Result<SwarmTransport, TransportBuildError> {
+    upgraded(tcp::tokio::Transport::new(tcp::Config::default()), keypair)
+}
+
+/// `stream` (TCP, or TCP through a proxy) with TLS or Noise, then Yamux.
+fn upgraded<T>(stream: T, keypair: &Keypair) -> Result<SwarmTransport, TransportBuildError>
+where
+    T: Transport + Send + Unpin + 'static,
+    T::Output: futures::AsyncRead + futures::AsyncWrite + Unpin + Send + 'static,
+    T::Error: Send + Sync + 'static,
+    T::Dial: Send + 'static,
+    T::ListenerUpgrade: Send + 'static,
+{
     let security =
         SelectSecurityUpgrade::new(tls::Config::new(keypair)?, noise::Config::new(keypair)?);
-    Ok(tcp::tokio::Transport::new(tcp::Config::default())
+    Ok(stream
         .upgrade(Version::V1Lazy)
         .authenticate(security)
         .multiplex(yamux::Config::default())

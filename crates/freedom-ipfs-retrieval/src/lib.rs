@@ -10698,7 +10698,7 @@ async fn prefetch_bitswap_dns_expansions(
             }
         })
         .filter(|addr| expandable(addr, policy))
-        .filter(|addr| !websocket_multiaddr(addr))
+        .filter(|addr| !websocket_multiaddr(addr) && !policy.transports().proxied())
         .filter_map(|addr| dns_multiaddr_name(&addr))
         .filter(|host| !dns_ip_cache.contains_key(host))
         .collect::<BTreeSet<_>>()
@@ -10927,10 +10927,14 @@ async fn expand_provider_multiaddrs_with_origins(
     }
 
     // Each address here passed the policy: a provider's own above, a TXT
-    // record in `admitted_records`.
+    // record in `admitted_records`. A name is resolved here unless its
+    // transport resolves it: a WebSocket's, and every one through a proxy
+    // (design 0007: under `socks5`, names are resolved through the proxy,
+    // never by a local resolver).
+    let names_at_the_transport = policy.transports().proxied();
     let mut expanded = Vec::new();
     for addr in expanded_dnsaddr {
-        if websocket_multiaddr(&addr) {
+        if websocket_multiaddr(&addr) || names_at_the_transport {
             expanded.push(ExpandedAddr::from(addr));
             continue;
         }
@@ -11240,7 +11244,8 @@ fn analyze_bitswap_multiaddr(
     let peer_id = addr_peer
         .or(provider_peer)
         .ok_or((BitswapAddrRejection::MissingPeer, features))?;
-    if let Some(reason) = unsupported_bitswap_addr_reason(&multiaddr) {
+    let onions = policy.transports().proxied();
+    if let Some(reason) = unsupported_bitswap_addr_reason_with(&multiaddr, onions) {
         return Err((reason, features));
     }
     if !policy.transports().quic()
@@ -11261,12 +11266,22 @@ fn parse_peer_id(id: &str) -> Option<PeerId> {
 }
 
 fn unsupported_bitswap_addr_reason(addr: &Multiaddr) -> Option<BitswapAddrRejection> {
+    unsupported_bitswap_addr_reason_with(addr, false)
+}
+
+/// [`unsupported_bitswap_addr_reason`], where `onions` says whether the
+/// transports reach `/onion3` (TCP to an onion service, through a proxy).
+fn unsupported_bitswap_addr_reason_with(
+    addr: &Multiaddr,
+    onions: bool,
+) -> Option<BitswapAddrRejection> {
     let mut has_tcp = false;
     let mut has_udp = false;
     let mut has_quic = false;
     for protocol in addr.iter() {
         match protocol {
             Protocol::Tcp(_) => has_tcp = true,
+            Protocol::Onion3(_) if onions => has_tcp = true,
             Protocol::Udp(_) => has_udp = true,
             Protocol::Quic | Protocol::QuicV1 => has_quic = true,
             Protocol::P2pCircuit => return Some(BitswapAddrRejection::Relay),
@@ -14633,6 +14648,127 @@ mod bitswap_tests {
                 dial.provenance
             );
         }
+    }
+
+    /// Candidate choice under `socks5` (design 0007: names are resolved
+    /// through the proxy, never by a local resolver): a `/dns*` address
+    /// stays a name for the transport's `RESOLVE`, with no DoH lookup; QUIC
+    /// goes before the per-peer cut; a well-formed `/onion3` is a
+    /// candidate, a malformed onion isn't. Under `direct` (the control) the
+    /// name is looked up through DoH, QUIC is kept, and onions are refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn under_socks5_candidate_choice_leaves_names_to_the_proxy() {
+        use freedom_ipfs_net::socks::fixture::SocksFixture;
+        let (doh, asked) = bitswap_canary();
+        let doh_url = format!("http://127.0.0.1:{}/dns-query", canary_port(&doh));
+        let direct = direct_network(&doh_url, freedom_ipfs_net::Addresses::Unchecked);
+        let fixture = SocksFixture::start().await;
+        let socks5 = freedom_ipfs_net::Network::with_lookup(
+            freedom_ipfs_net::NetworkPolicy::socks5(
+                fixture.addr(),
+                freedom_ipfs_net::gate::ConfiguredTargets::new(),
+                url::Url::parse(&doh_url).unwrap(),
+            )
+            .unwrap(),
+            None,
+        );
+        // One resolver for both, which asks through a direct client: only
+        // the policy differs.
+        let resolver = Arc::new(CloudflareDohResolver::with_client(
+            &doh_url,
+            direct.http_client(freedom_ipfs_namesys::HTTP_CLIENT_CONFIG),
+        ));
+        let onion3 = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd";
+        let (named, quic, onion, malformed) =
+            (random_peer(), random_peer(), random_peer(), random_peer());
+        let providers = [
+            (named, "/dns4/peer.example/tcp/4001".to_string()),
+            (quic, "/ip4/8.8.8.8/udp/4001/quic-v1".to_string()),
+            (quic, "/ip4/8.8.4.4/tcp/4001".to_string()),
+            (onion, format!("/onion3/{onion3}:4001")),
+            (malformed, "/dns4/foo.onion/tcp/4001".to_string()),
+        ]
+        .map(|(peer, addr)| {
+            Provider::from_parts(Some(peer.to_string()), vec![format!("{addr}/p2p/{peer}")])
+                .unwrap()
+        });
+        for proxied in [true, false] {
+            let expansion = AddressExpansion {
+                resolver: resolver.clone(),
+                policy: if proxied {
+                    socks5.dial_policy()
+                } else {
+                    direct.dial_policy()
+                },
+            };
+            let before = asked.load(Ordering::SeqCst);
+            let peers = bitswap_peers_with_quality_using_caches_with_options(
+                &providers,
+                &mut DnsaddrCache::new(),
+                &mut DnsIpCache::new(),
+                false,
+                false,
+                &expansion,
+            )
+            .await
+            .peers;
+            let chosen = |peer: PeerId| {
+                peers
+                    .iter()
+                    .find(|candidate| candidate.id == peer)
+                    .map(|candidate| {
+                        candidate
+                            .addrs
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                    })
+            };
+            if proxied {
+                assert_eq!(
+                    chosen(named),
+                    Some(vec!["/dns4/peer.example/tcp/4001".to_string()])
+                );
+                assert_eq!(
+                    chosen(quic),
+                    Some(vec!["/ip4/8.8.4.4/tcp/4001".to_string()])
+                );
+                assert_eq!(chosen(onion), Some(vec![format!("/onion3/{onion3}:4001")]));
+                assert_eq!(chosen(malformed), None);
+                assert_eq!(
+                    asked.load(Ordering::SeqCst),
+                    before,
+                    "a DoH lookup under socks5"
+                );
+            } else {
+                // The DoH endpoint drops every connection: with no answer,
+                // the name is left to the transport's own DNS layer.
+                assert_eq!(
+                    chosen(named),
+                    Some(vec!["/dns4/peer.example/tcp/4001".to_string()])
+                );
+                assert_eq!(chosen(quic).map(|addrs| addrs.len()), Some(2));
+                assert_eq!(chosen(onion), None);
+                assert_eq!(chosen(malformed), None);
+                assert!(
+                    asked.load(Ordering::SeqCst) > before,
+                    "the control looks the name up"
+                );
+            }
+        }
+        // Under the legacy policy, as before, `/onion3` isn't an address the
+        // transports carry.
+        let legacy = bitswap_peers_with_quality_using_caches_with_options(
+            &providers[3..4],
+            &mut DnsaddrCache::new(),
+            &mut DnsIpCache::new(),
+            false,
+            false,
+            &AddressExpansion::legacy(),
+        )
+        .await;
+        assert!(legacy.peers.is_empty());
+        assert_eq!(legacy.quality.unsupported_transport_addr_count, 1);
     }
 
     /// The #48 reviews' second case: a configured answer grants its
@@ -21694,6 +21830,66 @@ mod bitswap_tests {
                 _ => None,
             })
             .unwrap()
+    }
+
+    /// The retriever's Bitswap swarm under `socks5` dials through the proxy:
+    /// a TCP address is a `CONNECT` to that address, which reaches the
+    /// listener the proxy maps it to; a name is resolved through the proxy
+    /// first; QUIC never reaches the proxy, nor any socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_bitswap_swarm_dials_through_the_proxy() {
+        use freedom_ipfs_net::socks::fixture::{Answer, Destination, SocksFixture};
+        let fixture = SocksFixture::start().await;
+        let (canary, accepted) = bitswap_canary();
+        let public: std::net::SocketAddr = "8.8.8.8:4001".parse().unwrap();
+        let local: std::net::SocketAddr = format!("127.0.0.1:{}", canary_port(&canary))
+            .parse()
+            .unwrap();
+        fixture.forward(Destination::Ip(public), local);
+        fixture.answer("peer.example", Answer::Ip("8.8.8.8".parse().unwrap()));
+        let network = freedom_ipfs_net::Network::with_lookup(
+            freedom_ipfs_net::NetworkPolicy::socks5(
+                fixture.addr(),
+                freedom_ipfs_net::gate::ConfiguredTargets::new(),
+                url::Url::parse("https://dns.example/dns-query").unwrap(),
+            )
+            .unwrap(),
+            None,
+        );
+        let mut swarm = build_bitswap_swarm(None, Some(&Transports::new(&network)))
+            .await
+            .unwrap();
+        let peer = random_peer();
+        for addr in [
+            "/ip4/8.8.8.8/tcp/4001",
+            "/dns4/peer.example/tcp/4001",
+            "/ip4/8.8.8.8/udp/4001/quic-v1",
+        ] {
+            let addr: Multiaddr = format!("{addr}/p2p/{peer}").parse().unwrap();
+            let _ = dial_bitswap_addr(&mut swarm, addr, DialProvenance::Untrusted);
+        }
+        let polling = tokio::spawn(async move { while swarm.next().await.is_some() {} });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while accepted.load(Ordering::SeqCst) < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        polling.abort();
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        let requests = fixture.requests();
+        let connects = requests
+            .iter()
+            .filter(|request| request.is_connect())
+            .map(|request| request.destination.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(connects, [Destination::Ip(public), Destination::Ip(public)]);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.is_resolve())
+                .count(),
+            1
+        );
+        assert_eq!(fixture.connections(), 3);
     }
 
     /// The #48 adversarial review's probe (P1): a configured name's answer
