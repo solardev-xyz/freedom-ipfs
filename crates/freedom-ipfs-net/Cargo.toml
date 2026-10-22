@@ -1,0 +1,77 @@
+[package]
+name = "freedom-ipfs-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Onion addresses' base32 names, from `/onion3` and `/onion` components.
+data-encoding.workspace = true
+# The gate's resolver under `direct` with checked addresses: async and
+# cancellable, over the system's DNS configuration (D3). Already in the
+# graph through libp2p-dns, at this version; no DNSSEC feature.
+hickory-resolver = { version = "0.25", default-features = false, features = ["system-config", "tokio"] }
+# The SelectSecurityUpgrade copied from libp2p (decision D10): its protocol
+# names, as libp2p's own. Already in the graph.
+either = "1"
+# Futures for the gated transports' dials.
+futures.workspace = true
+# Header names and values for requests, as reqwest takes them.
+http.workspace = true
+# The libp2p transports the gate wraps, and those it builds for the swarms:
+# the workspace's own version and features.
+libp2p.workspace = true
+# The multiaddrs libp2p dials; the version libp2p re-exports, so the types
+# are the same ones.
+multiaddr.workspace = true
+# The gated transports' inner transport, shared with their dial futures,
+# as libp2p-dns shares it.
+parking_lot.workspace = true
+# The HTTP clients the policy builds, the crates' one constructor.
+reqwest.workspace = true
+# Query strings for requests, as reqwest takes them.
+serde.workspace = true
+thiserror.workspace = true
+# The connector layer that asks the capability before each new connection,
+# as reqwest's `connector_layer` takes it. Already in the graph (reqwest,
+# hyper).
+tower-layer = "0.3"
+tower-service = "0.3"
+# The watch channel behind NAT64 discovery's state, and the operation's
+# deadline while it waits for discovery.
+tokio = { version = "1", default-features = false, features = ["sync", "time"] }
+# WHATWG host and URL parsing: the rules reqwest's URLs follow.
+url.workspace = true
+# Under `socks5`, reqwest's SOCKS connector is hyper-util's: 0.1.20 and
+# older send a resolved IPv6 address to the proxy as a domain
+# ("[2001:db8::1]"); 0.1.21 sends it as an address (design 0007, "What can
+# be honored"). A floor only, for this crate's dependents' locks too.
+hyper-util = { version = "0.1.21", default-features = false, optional = true }
+
+[features]
+# `socks5` mode's SOCKS5 client and libp2p transport (design 0007,
+# "Modes"): off by default, so mobile builds compile none of it (D2).
+socks = ["tokio/net", "tokio/io-util", "reqwest/socks", "dep:hyper-util"]
+# A SOCKS5 test proxy, for this crate's tests and its dependents'.
+test-util = ["socks", "tokio/rt"]
+
+[[test]]
+name = "socks"
+required-features = ["test-util"]
+
+[[test]]
+name = "socks_http"
+required-features = ["test-util"]
+
+[[test]]
+name = "socks_env_proxy"
+required-features = ["test-util"]
+
+[dev-dependencies]
+# The transport whose address parsing the gate's multiaddr shapes must
+# agree with (libp2p 0.56's): tests only.
+libp2p-core = "0.43"
+libp2p-tcp = { version = "0.44", features = ["tokio"] }
+tokio.workspace = true

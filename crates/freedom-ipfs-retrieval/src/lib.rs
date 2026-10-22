@@ -21,7 +21,9 @@ use freedom_ipfs_core::{
     block_data_range, verify_block, Block, BlockProvider, CoreError, ReservedVec,
     Result as CoreResult, CODEC_DAG_PB, DEFAULT_MAX_BLOCK_SIZE, HASH_IDENTITY, HASH_SHA2_256,
 };
-use freedom_ipfs_namesys::{CloudflareDohResolver, DnsTxtResolver};
+use freedom_ipfs_namesys::{CloudflareDohResolver, DnsTxtResolver, DEFAULT_DOH_ENDPOINT};
+use freedom_ipfs_net::transport::Transports;
+use freedom_ipfs_net::{ClientConfig, DialPolicy, HttpClient, HttpError};
 use freedom_ipfs_routing::{Provider, ProviderRoutingClient};
 use freedom_ipfs_store::{CachedProviderRecord, SqliteBlockStore};
 use futures::future::{join_all, BoxFuture, FutureExt, WeakShared};
@@ -64,6 +66,9 @@ const PROVIDER_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const BAD_HTTP_PROVIDER_TTL: Duration = Duration::from_secs(10 * 60);
 const BAD_BITSWAP_PROVIDER_TTL: Duration = Duration::from_secs(30);
 const HTTP_PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
+/// The HTTP provider client's configuration: a 20 s timeout, and no
+/// redirect followed.
+pub const HTTP_PROVIDER_CLIENT_CONFIG: ClientConfig = ClientConfig::new(HTTP_PROVIDER_TIMEOUT, 0);
 const HTTP_PROVIDER_RACE_WIDTH: usize = 2;
 const HTTP_PROVIDER_HEDGE_AFTER: Duration = Duration::from_millis(250);
 const SINGLE_HTTP_PROVIDER_SELF_HEDGE_AFTER: Duration = Duration::from_millis(200);
@@ -307,6 +312,10 @@ pub enum RetrievalError {
     Routing(#[from] freedom_ipfs_routing::RoutingError),
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
+    /// The request wasn't sent: the network's capability is revoked, or
+    /// its client couldn't be built.
+    #[error("http: {0}")]
+    Network(HttpError),
     #[error("core: {0}")]
     Core(#[from] freedom_ipfs_core::CoreError),
     #[error("store: {0}")]
@@ -344,6 +353,15 @@ impl RetrievalError {
 }
 
 pub type Result<T> = std::result::Result<T, RetrievalError>;
+
+impl From<HttpError> for RetrievalError {
+    fn from(err: HttpError) -> Self {
+        match err {
+            HttpError::Http(err) => Self::Http(err),
+            other => Self::Network(other),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetrievalSource {
@@ -397,7 +415,7 @@ impl RetrievalStatsInner {
 
 #[derive(Clone)]
 pub struct HttpRetriever {
-    client: reqwest::Client,
+    client: HttpClient,
     routing: ProviderRoutingClient,
     store: SqliteBlockStore,
     bitswap: Arc<tokio::sync::Mutex<Option<SharedBitswapClient>>>,
@@ -559,7 +577,7 @@ impl HttpRetriever {
     pub fn new(routing: impl Into<ProviderRoutingClient>, store: SqliteBlockStore) -> Self {
         let http_provider_fetch_limit = max_concurrent_http_provider_fetches();
         Self {
-            client: timeout_http_client(HTTP_PROVIDER_TIMEOUT),
+            client: HttpClient::legacy(HTTP_PROVIDER_CLIENT_CONFIG),
             routing: routing.into(),
             store,
             bitswap: Arc::new(tokio::sync::Mutex::new(None)),
@@ -605,6 +623,60 @@ impl HttpRetriever {
     /// limits.
     pub fn with_shared_limits(self, limits: SharedLimits) -> Self {
         self.with_accounting(|accounting| accounting.limits = Some(limits))
+    }
+
+    /// Fetches from HTTP providers through `client`: a network's client for
+    /// [`HTTP_PROVIDER_CLIENT_CONFIG`], whose capability every request asks.
+    /// Without this, the retriever has a legacy client of its own.
+    ///
+    /// The client's network is the retriever's (design 0007, checks 1 and
+    /// 2): providers are chosen under its policy, and Bitswap's address
+    /// expansion asks its policy's DoH endpoint through a client of that
+    /// network, built on first use. So the retriever's Bitswap bookkeeping
+    /// starts afresh here.
+    pub fn with_http_client(mut self, client: HttpClient) -> Self {
+        self.client = client;
+        self.bitswap_state = Arc::new(BitswapBookkeeping::default());
+        self
+    }
+
+    /// What Bitswap's candidate choice runs under: the network's dial
+    /// policy, and the DoH resolver its address expansion asks.
+    fn address_expansion(&self) -> AddressExpansion {
+        let resolver = self
+            .bitswap_state
+            .dns
+            .get_or_init(|| {
+                let network = self.client.network();
+                Arc::new(CloudflareDohResolver::with_client(
+                    network.policy().doh().unwrap_or(DEFAULT_DOH_ENDPOINT),
+                    network.http_client(freedom_ipfs_namesys::HTTP_CLIENT_CONFIG),
+                ))
+            })
+            .clone();
+        AddressExpansion {
+            resolver,
+            policy: self.client.network().dial_policy(),
+        }
+    }
+
+    /// Check 1 (design 0007, "The gate"), where providers come in: under a
+    /// gated policy, every provider address and HTTP base URL the policy
+    /// refuses is dropped, and counted, before anything is expanded,
+    /// resolved or tried. Under the legacy policy, providers are as they
+    /// came.
+    async fn admitted_providers(&self, providers: Vec<Provider>) -> Vec<Provider> {
+        let policy = self.client.network().dial_policy();
+        if policy.admits_everything() {
+            return providers;
+        }
+        admit_providers(providers, &policy).await
+    }
+
+    /// The routing's providers for `cid`, as the policy admits them.
+    async fn lookup_providers(&self, cid: &Cid) -> freedom_ipfs_routing::Result<Vec<Provider>> {
+        let providers = self.routing.providers(cid).await?;
+        Ok(self.admitted_providers(providers).await)
     }
 
     /// Puts the retriever's background work in `queue`, its instance's, in
@@ -936,6 +1008,7 @@ impl HttpRetriever {
         let provider_cache_started = Instant::now();
         let providers = match self.cached_providers(cid)? {
             Some(providers) => {
+                let providers = self.admitted_providers(providers).await;
                 tracing::info!(
                     phase = "provider_cache",
                     cid = %cid,
@@ -955,7 +1028,7 @@ impl HttpRetriever {
                 let recent_peers = self.recent_bitswap_peers_for_fetch().await;
                 let (providers, provider_lookup_elapsed_ms) = if recent_peers.is_empty() {
                     let routing_started = Instant::now();
-                    let provider_lookup = self.routing.providers(cid);
+                    let provider_lookup = self.lookup_providers(cid);
                     tokio::pin!(provider_lookup);
                     let late_peers = self
                         .wait_for_recent_bitswap_peers_for_fetch(BITSWAP_SESSION_LATE_PEER_WAIT);
@@ -1182,7 +1255,7 @@ impl HttpRetriever {
                                 elapsed_ms = pre_lookup_started.elapsed().as_millis()
                             );
                             let routing_started = Instant::now();
-                            match self.routing.providers(cid).await {
+                            match self.lookup_providers(cid).await {
                                 Ok(providers) => (providers, routing_started.elapsed().as_millis()),
                                 Err(err) => {
                                     tracing::info!(
@@ -1204,7 +1277,7 @@ impl HttpRetriever {
                                 elapsed_ms = pre_lookup_started.elapsed().as_millis()
                             );
                             let routing_started = Instant::now();
-                            let provider_lookup = self.routing.providers(cid);
+                            let provider_lookup = self.lookup_providers(cid);
                             tokio::pin!(provider_lookup);
                             let providers = tokio::select! {
                                 shortcut_result = &mut shortcut => {
@@ -1405,7 +1478,7 @@ impl HttpRetriever {
                     initial_error = %err
                 );
                 let routing_started = Instant::now();
-                let refreshed = match self.routing.providers(cid).await {
+                let refreshed = match self.lookup_providers(cid).await {
                     Ok(providers) => {
                         tracing::info!(
                             phase = "provider_lookup",
@@ -1434,7 +1507,7 @@ impl HttpRetriever {
                 };
                 let same_providers = same_provider_set(&providers, &refreshed);
                 let same_bitswap_peers = if request_timeout {
-                    same_bitswap_peer_set(&providers, &refreshed).await
+                    same_bitswap_peer_set(&providers, &refreshed, &self.address_expansion()).await
                 } else {
                     false
                 };
@@ -1547,6 +1620,13 @@ impl HttpRetriever {
         providers: &[Provider],
         context: Option<RetrievalRequestContext>,
     ) -> Result<(Block, RetrievalSource)> {
+        let admitted;
+        let providers = if !self.client.network().dial_policy().admits_everything() {
+            admitted = self.admitted_providers(providers.to_vec()).await;
+            &admitted[..]
+        } else {
+            providers
+        };
         let fetch = Box::pin(
             self.with_fetch_memory(self.fetch_from_providers_admitted(cid, providers, context)),
         );
@@ -4044,6 +4124,7 @@ impl HttpRetriever {
     ) -> BitswapProviderCandidates {
         let direct_ip_candidate_only = candidate_mode.direct_ip_candidate_only()
             || bitswap_direct_ip_provider_candidates_only_enabled();
+        let expansion = self.address_expansion();
         if direct_ip_candidate_only {
             let mut dnsaddr_cache = DnsaddrCache::new();
             let mut dns_ip_cache = DnsIpCache::new();
@@ -4053,12 +4134,13 @@ impl HttpRetriever {
                 &mut dns_ip_cache,
                 bitswap_early_provider_peer_cap_enabled(),
                 true,
+                &expansion,
             )
             .await;
         }
 
         let Some(cache_scope) = bitswap_dns_expansion_cache_scope(context) else {
-            return bitswap_peers_with_quality(providers).await;
+            return bitswap_peers_with_quality(providers, &expansion).await;
         };
 
         let mut dnsaddr_cache = DnsaddrCache::new();
@@ -4070,6 +4152,7 @@ impl HttpRetriever {
             providers,
             &mut dnsaddr_cache,
             &mut dns_ip_cache,
+            &expansion,
         )
         .await;
         self.record_bitswap_dns_expansion_caches(&dnsaddr_cache, &dns_ip_cache)
@@ -4110,6 +4193,7 @@ impl HttpRetriever {
             providers,
             &mut dns_caches.dnsaddr_cache,
             &mut dns_caches.dns_ip_cache,
+            &self.address_expansion(),
         )
         .await;
         self.record_bitswap_dns_expansion_caches(
@@ -4136,7 +4220,13 @@ impl HttpRetriever {
         let mut dns_ip_cache = DnsIpCache::new();
         self.seed_bitswap_dns_expansion_caches(providers, &mut dnsaddr_cache, &mut dns_ip_cache)
             .await;
-        prefetch_bitswap_dns_expansions(providers, &mut dnsaddr_cache, &mut dns_ip_cache).await;
+        prefetch_bitswap_dns_expansions(
+            providers,
+            &mut dnsaddr_cache,
+            &mut dns_ip_cache,
+            &self.address_expansion(),
+        )
+        .await;
         self.record_bitswap_dns_expansion_caches(&dnsaddr_cache, &dns_ip_cache)
             .await;
         BitswapDnsExpansionCaches {
@@ -4404,6 +4494,8 @@ impl HttpRetriever {
             unsupported_transport_addr_count = quality.unsupported_transport_addr_count,
             missing_peer_addr_count = quality.missing_peer_addr_count,
             unparsable_addr_count = quality.unparsable_addr_count,
+            policy_refused_addr_count = quality.policy_refused_addr_count,
+            transport_refused_addr_count = quality.transport_refused_addr_count,
             addr_with_relay_count = quality.addr_with_relay_count,
             addr_with_webtransport_count = quality.addr_with_webtransport_count,
             addr_with_webrtc_count = quality.addr_with_webrtc_count,
@@ -4712,9 +4804,13 @@ impl HttpRetriever {
         if let Some(client) = client.as_ref() {
             return Ok(client.clone());
         }
-        let spawned =
-            SharedBitswapClient::spawn(self.instance.as_ref(), self.limits(), self.memory())
-                .await?;
+        let spawned = SharedBitswapClient::spawn(
+            self.instance.as_ref(),
+            self.limits(),
+            self.memory(),
+            Some(&Transports::new(self.client.network())),
+        )
+        .await?;
         *client = Some(spawned.clone());
         Ok(spawned)
     }
@@ -4764,6 +4860,7 @@ impl HttpRetriever {
                 existing.addrs.sort_by_key(bitswap_addr_score);
                 existing.addrs.dedup();
                 existing.addrs.truncate(MAX_BITSWAP_ADDRS_PER_PEER);
+                existing.keep_configured_answers_selected();
             } else {
                 session_only_peers.push(recent);
             }
@@ -5023,6 +5120,10 @@ impl HttpRetriever {
                 |(id, _seen_at, _last_latency, addrs, _success_count)| BitswapPeer {
                     id,
                     addrs,
+                    // A recent peer's addresses are dialed as untrusted: a
+                    // configured target's exemption belongs to the candidate
+                    // candidate choice admitted it for, not to an address.
+                    configured_answers: Vec::new(),
                     skip_want_have: true,
                     force_want_block: false,
                     force_want_have: false,
@@ -5738,6 +5839,13 @@ impl FetchingBlockProvider {
         self
     }
 
+    /// Fetches from HTTP providers through `client` (see
+    /// [`HttpRetriever::with_http_client`]).
+    pub fn with_http_client(mut self, client: HttpClient) -> Self {
+        self.retriever = self.retriever.with_http_client(client);
+        self
+    }
+
     /// Counts the provider's fetches against `limits`, process-wide limits
     /// shared with every other node built with them (see [`limits`]).
     /// Without this, nothing changes.
@@ -6073,9 +6181,47 @@ impl BlockProvider for FetchingBlockProvider {
 struct BitswapPeer {
     id: PeerId,
     addrs: Vec<Multiaddr>,
+    /// The addresses among `addrs` that candidate choice admitted, for this
+    /// candidate, as a configured target's answer (design 0007: configured
+    /// targets are exempt by exact host and port): each is dialed as one
+    /// ([`DialProvenance::ConfiguredAnswer`]), from this candidate only. The
+    /// same address reached any other way (another peer, a recent peer, a
+    /// later fetch's literal) is untrusted.
+    configured_answers: Vec<Multiaddr>,
     skip_want_have: bool,
     force_want_block: bool,
     force_want_have: bool,
+}
+
+impl BitswapPeer {
+    /// Keeps the configured answers that are still among the candidate's
+    /// addresses once they are ranked and cut: an answer that wasn't
+    /// selected grants nothing.
+    fn keep_configured_answers_selected(&mut self) {
+        let addrs = &self.addrs;
+        self.configured_answers.retain(|addr| addrs.contains(addr));
+        self.configured_answers.dedup();
+    }
+
+    /// How a dial to `addr`, one of this candidate's addresses, goes.
+    fn provenance(&self, addr: &Multiaddr) -> DialProvenance {
+        if self.configured_answers.contains(addr) {
+            DialProvenance::ConfiguredAnswer
+        } else {
+            DialProvenance::Untrusted
+        }
+    }
+}
+
+/// How a Bitswap dial's address is judged at the transport's inner gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialProvenance {
+    /// By the address policy.
+    Untrusted,
+    /// As the configured target's answer its candidate was admitted with:
+    /// exempt from the address table for that one dial
+    /// ([`freedom_ipfs_net::transport::dial_configured_answer`]).
+    ConfiguredAnswer,
 }
 
 struct SuccessfulBitswapPeer {
@@ -7664,8 +7810,9 @@ struct BitswapConnectionReady {
 /// for a slot. It holds none while it waits.
 struct DeferredBitswapDial {
     peer: PeerId,
-    /// The addresses the cap denied, in the order they were dialed.
-    addrs: Vec<Multiaddr>,
+    /// The addresses the cap denied, in the order they were dialed, each
+    /// with how its candidate's dial was to be judged: a retry keeps it.
+    addrs: Vec<(Multiaddr, DialProvenance)>,
     context: BitswapDialContext,
     /// The waiting requests' `admitted` senders, dropped when it starts.
     admitted: Vec<oneshot::Sender<()>>,
@@ -7969,13 +8116,16 @@ struct ConnectionErrorBackoff {
 impl SharedBitswapClient {
     /// Builds the shared swarm and spawns its task: in `instance`'s task
     /// set, so the instance's cancellation ends it and drops the swarm and
-    /// its connections, or on the ambient runtime without one.
+    /// its connections, or on the ambient runtime without one. The swarm
+    /// dials through `transports`, the retriever's network's (see
+    /// [`build_bitswap_swarm`]).
     async fn spawn(
         instance: Option<&InstanceContext>,
         limits: Option<&SharedLimits>,
         memory: Option<&MemoryBudget>,
+        transports: Option<&Transports>,
     ) -> Result<Self> {
-        let swarm = build_bitswap_swarm(limits).await?;
+        let swarm = build_bitswap_swarm(limits, transports).await?;
         let mut control = swarm.behaviour().stream.new_control();
         let incoming = accept_bitswap_streams(&mut control)?;
         let (commands, receiver) = mpsc::channel(64);
@@ -8444,7 +8594,7 @@ async fn run_shared_bitswap_swarm(
                         let addr = dial.addr;
                         let transport = bitswap_transport_label(&addr);
                         let dial_addr = addr.with_p2p(peer_id).unwrap_or_else(|addr| addr);
-                        match swarm.dial(dial_addr) {
+                        match dial_bitswap_addr(&mut swarm, dial_addr, dial.provenance) {
                             Ok(()) => {
                                 started_dial_peers.insert(peer_id);
                                 connection_dial_contexts.insert(peer_id, dial_context.clone());
@@ -8631,13 +8781,13 @@ async fn run_shared_bitswap_swarm(
                 );
 
                 let mut started_dial_peers = BTreeSet::new();
-                let mut capped_dials = BTreeMap::<PeerId, Vec<Multiaddr>>::new();
+                let mut capped_dials = BTreeMap::<PeerId, Vec<(Multiaddr, DialProvenance)>>::new();
                 for dial in dial_addrs {
                     let peer_id = dial.peer;
                     let addr = dial.addr;
                     let transport = bitswap_transport_label(&addr);
                     let dial_addr = addr.with_p2p(peer_id).unwrap_or_else(|addr| addr);
-                    match swarm.dial(dial_addr.clone()) {
+                    match dial_bitswap_addr(&mut swarm, dial_addr.clone(), dial.provenance) {
                         Ok(()) => {
                             started_dial_peers.insert(peer_id);
                             connection_dial_contexts.insert(peer_id, dial_context.clone());
@@ -8647,7 +8797,10 @@ async fn run_shared_bitswap_swarm(
                             let connection_limit = is_connection_limit_error(&error_detail);
                             let shared_cap = is_shared_connection_cap_denial(&err);
                             if shared_cap {
-                                capped_dials.entry(peer_id).or_default().push(dial_addr);
+                                capped_dials
+                                    .entry(peer_id)
+                                    .or_default()
+                                    .push((dial_addr, dial.provenance));
                             }
                             record_dial_error(&dial_errors, peer_id, error_detail.clone()).await;
                             tracing::info!(
@@ -9203,8 +9356,8 @@ fn retry_deferred_bitswap_dials(
         let mut started = false;
         let mut capped = false;
         let mut last_error = None;
-        for addr in &dial.addrs {
-            match swarm.dial(addr.clone()) {
+        for (addr, provenance) in &dial.addrs {
+            match dial_bitswap_addr(swarm, addr.clone(), *provenance) {
                 Ok(()) => started = true,
                 Err(err) if is_shared_connection_cap_denial(&err) => {
                     capped = true;
@@ -9720,39 +9873,63 @@ fn bitswap_connection_limits() -> connection_limits::ConnectionLimits {
         .with_max_established(Some(BITSWAP_MAX_ESTABLISHED_CONNECTIONS))
 }
 
+/// The shared Bitswap swarm: through `transports`, a network's (design
+/// 0007, check 3: the gate wraps the transport, so it covers every dial the
+/// swarm makes, identify's included), or built as before without them.
 async fn build_bitswap_swarm(
     limits: Option<&SharedLimits>,
+    transports: Option<&Transports>,
 ) -> Result<libp2p::Swarm<BitswapBehaviour>> {
+    let error = |err: &dyn std::fmt::Display| RetrievalError::Bitswap(err.to_string());
     let shared_limit = Toggle::from(limits.map(SharedLimits::bitswap_connection_limit));
-    let swarm = SwarmBuilder::with_new_identity()
+    let Some(transports) = transports else {
+        return Ok(SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                (tls::Config::new, noise::Config::new),
+                yamux::Config::default,
+            )
+            .map_err(|err| error(&err))?
+            .with_quic()
+            // WebSocket providers need DNS names preserved for WSS SNI, so
+            // this transport has its own explicit Cloudflare resolver
+            // instead of the builder's system-DNS websocket shortcut.
+            .with_other_transport(cloudflare_websocket_transport)
+            .map_err(|err| error(&err))?
+            .with_behaviour(|key| bitswap_behaviour(key, shared_limit))
+            .map_err(|err| error(&err))?
+            .with_swarm_config(|cfg| {
+                cfg.with_idle_connection_timeout(BITSWAP_IDLE_CONNECTION_TIMEOUT)
+            })
+            .with_connection_timeout(BITSWAP_CONNECTION_TIMEOUT)
+            .build());
+    };
+    Ok(SwarmBuilder::with_new_identity()
         .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            (tls::Config::new, noise::Config::new),
-            yamux::Config::default,
-        )
-        .map_err(|err| RetrievalError::Bitswap(err.to_string()))?
-        .with_quic()
-        // WebSocket providers need DNS names preserved for WSS SNI, so this
-        // transport has its own explicit Cloudflare resolver instead of the
-        // builder's system-DNS websocket shortcut.
-        .with_other_transport(cloudflare_websocket_transport)
-        .map_err(|err| RetrievalError::Bitswap(err.to_string()))?
-        .with_behaviour(|key| BitswapBehaviour {
-            stream: libp2p_stream::Behaviour::new(),
-            identify: identify::Behaviour::new(identify::Config::new(
-                format!("freedom-ipfs/{}", env!("CARGO_PKG_VERSION")),
-                key.public(),
-            )),
-            ping: ping::Behaviour::new(ping::Config::new()),
-            limits: connection_limits::Behaviour::new(bitswap_connection_limits()),
-            shared_limit,
-        })
-        .map_err(|err| RetrievalError::Bitswap(err.to_string()))?
+        .with_other_transport(|key| transports.bitswap(key))
+        .map_err(|err| error(&err))?
+        .with_behaviour(|key| bitswap_behaviour(key, shared_limit))
+        .map_err(|err| error(&err))?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(BITSWAP_IDLE_CONNECTION_TIMEOUT))
         .with_connection_timeout(BITSWAP_CONNECTION_TIMEOUT)
-        .build();
-    Ok(swarm)
+        .build())
+}
+
+fn bitswap_behaviour(
+    key: &libp2p::identity::Keypair,
+    shared_limit: Toggle<SharedConnectionLimit>,
+) -> BitswapBehaviour {
+    BitswapBehaviour {
+        stream: libp2p_stream::Behaviour::new(),
+        identify: identify::Behaviour::new(identify::Config::new(
+            format!("freedom-ipfs/{}", env!("CARGO_PKG_VERSION")),
+            key.public(),
+        )),
+        ping: ping::Behaviour::new(ping::Config::new()),
+        limits: connection_limits::Behaviour::new(bitswap_connection_limits()),
+        shared_limit,
+    }
 }
 
 fn cloudflare_websocket_transport(
@@ -9801,6 +9978,12 @@ struct BitswapProviderAddrQuality {
     unsupported_transport_addr_count: usize,
     missing_peer_addr_count: usize,
     unparsable_addr_count: usize,
+    /// Addresses the network policy refused (design 0007, checks 1 and 2):
+    /// a TXT-derived multiaddr or an A/AAAA answer in expansion, or an
+    /// address at candidate choice.
+    policy_refused_addr_count: usize,
+    /// Addresses the policy's transports can't carry (QUIC under `socks5`).
+    transport_refused_addr_count: usize,
     addr_with_relay_count: usize,
     addr_with_webtransport_count: usize,
     addr_with_webrtc_count: usize,
@@ -9838,6 +10021,9 @@ struct SharedCachedDnsIpRecords {
 /// which every node and fetch clones, stays small.
 #[derive(Default)]
 struct BitswapBookkeeping {
+    /// The DoH resolver Bitswap's address expansion asks: the network's
+    /// DoH endpoint, through a client of the network, built on first use.
+    dns: std::sync::OnceLock<Arc<CloudflareDohResolver>>,
     dnsaddr_cache: tokio::sync::Mutex<SharedDnsaddrCache>,
     dns_ip_cache: tokio::sync::Mutex<SharedDnsIpCache>,
     top_level_provider_preconnect_counts: tokio::sync::Mutex<HashMap<String, usize>>,
@@ -9868,6 +10054,8 @@ impl BitswapProviderAddrQuality {
             + self.unsupported_transport_addr_count
             + self.missing_peer_addr_count
             + self.unparsable_addr_count
+            + self.policy_refused_addr_count
+            + self.transport_refused_addr_count
     }
 
     fn record_rejection(&mut self, rejection: BitswapAddrRejection) {
@@ -9881,6 +10069,8 @@ impl BitswapProviderAddrQuality {
             }
             BitswapAddrRejection::MissingPeer => self.missing_peer_addr_count += 1,
             BitswapAddrRejection::InvalidMultiaddr => self.unparsable_addr_count += 1,
+            BitswapAddrRejection::Policy => self.policy_refused_addr_count += 1,
+            BitswapAddrRejection::Transport => self.transport_refused_addr_count += 1,
         }
     }
 
@@ -9892,20 +10082,114 @@ impl BitswapProviderAddrQuality {
     }
 }
 
-async fn bitswap_peers(providers: &[Provider]) -> Vec<BitswapPeer> {
-    bitswap_peers_with_quality(providers).await.peers
+/// What Bitswap's candidate choice runs under (design 0007, checks 1 and
+/// 2): the retriever's network's dial policy, and the DoH resolver its
+/// address expansion asks, the network's.
+#[derive(Clone)]
+struct AddressExpansion {
+    resolver: Arc<CloudflareDohResolver>,
+    policy: DialPolicy,
 }
 
-async fn bitswap_peers_with_quality(providers: &[Provider]) -> BitswapProviderCandidates {
+impl AddressExpansion {
+    /// A legacy network's: tests.
+    #[cfg(test)]
+    fn legacy() -> Self {
+        Self::of(&freedom_ipfs_net::Network::legacy())
+    }
+
+    /// A network's, as a retriever of that network builds it: tests.
+    #[cfg(test)]
+    fn of(network: &freedom_ipfs_net::Network) -> Self {
+        Self {
+            resolver: Arc::new(CloudflareDohResolver::with_client(
+                network.policy().doh().unwrap_or(DEFAULT_DOH_ENDPOINT),
+                network.http_client(freedom_ipfs_namesys::HTTP_CLIENT_CONFIG),
+            )),
+            policy: network.dial_policy(),
+        }
+    }
+}
+
+/// How long candidate choice waits for NAT64 discovery, for an IPv6
+/// address while discovery is pending: a Bitswap connection's own timeout.
+fn nat64_candidate_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + BITSWAP_CONNECTION_TIMEOUT
+}
+
+/// Check 1 for a list of providers: each address the policy refuses
+/// (its whole shape, an onion, a transport the policy lacks, and with
+/// checked addresses an IP literal's address) and each HTTP base URL it
+/// refuses is dropped, and counted. A provider keeps its peer ID.
+async fn admit_providers(providers: Vec<Provider>, policy: &DialPolicy) -> Vec<Provider> {
+    let deadline = nat64_candidate_deadline();
+    let mut refused_addr_count = 0usize;
+    let mut refused_url_count = 0usize;
+    let mut admitted = Vec::with_capacity(providers.len());
+    for mut provider in providers {
+        let mut addrs = Vec::with_capacity(provider.addrs.len());
+        for addr in std::mem::take(&mut provider.addrs) {
+            match Multiaddr::from_str(&addr) {
+                Ok(parsed) if policy.check(&parsed, deadline).await.is_ok() => addrs.push(addr),
+                _ => refused_addr_count += 1,
+            }
+        }
+        provider.addrs = addrs;
+        let mut urls = Vec::with_capacity(provider.http_urls.len());
+        for url in std::mem::take(&mut provider.http_urls) {
+            if policy.check_url(&url, deadline).await.is_ok() {
+                urls.push(url);
+            } else {
+                refused_url_count += 1;
+            }
+        }
+        provider.http_urls = urls;
+        admitted.push(provider);
+    }
+    if refused_addr_count > 0 || refused_url_count > 0 {
+        tracing::info!(
+            phase = "network_policy_providers",
+            provider_count = admitted.len(),
+            refused_addr_count,
+            refused_url_count
+        );
+    }
+    admitted
+}
+
+/// Whether the policy lets `addr` be expanded or resolved: every address
+/// without a gate; otherwise one the policy doesn't refuse whole (its
+/// shape, an onion, its transport). A name's addresses are checked once
+/// resolved.
+fn expandable(addr: &str, policy: &DialPolicy) -> bool {
+    policy.admits_everything()
+        || Multiaddr::from_str(addr).is_ok_and(|parsed| policy.check_now(&parsed).is_ok())
+}
+
+async fn bitswap_peers(providers: &[Provider], expansion: &AddressExpansion) -> Vec<BitswapPeer> {
+    bitswap_peers_with_quality(providers, expansion).await.peers
+}
+
+async fn bitswap_peers_with_quality(
+    providers: &[Provider],
+    expansion: &AddressExpansion,
+) -> BitswapProviderCandidates {
     let mut dnsaddr_cache = DnsaddrCache::new();
     let mut dns_ip_cache = DnsIpCache::new();
-    bitswap_peers_with_quality_using_caches(providers, &mut dnsaddr_cache, &mut dns_ip_cache).await
+    bitswap_peers_with_quality_using_caches(
+        providers,
+        &mut dnsaddr_cache,
+        &mut dns_ip_cache,
+        expansion,
+    )
+    .await
 }
 
 async fn bitswap_peers_with_quality_using_caches(
     providers: &[Provider],
     dnsaddr_cache: &mut DnsaddrCache,
     dns_ip_cache: &mut DnsIpCache,
+    expansion: &AddressExpansion,
 ) -> BitswapProviderCandidates {
     bitswap_peers_with_quality_using_caches_with_options(
         providers,
@@ -9913,25 +10197,34 @@ async fn bitswap_peers_with_quality_using_caches(
         dns_ip_cache,
         bitswap_early_provider_peer_cap_enabled(),
         bitswap_direct_ip_provider_candidates_only_enabled(),
+        expansion,
     )
     .await
 }
 
+/// The Bitswap peers to try for `providers`: each provider's addresses,
+/// expanded (`/dnsaddr` through TXT records, `/dns*` through A and AAAA
+/// answers, both checked by the policy), then every address the node can't
+/// dial dropped (unsupported shapes, and those the policy or its
+/// transports refuse) **before** each peer's addresses are ranked and cut
+/// to [`MAX_BITSWAP_ADDRS_PER_PEER`].
 async fn bitswap_peers_with_quality_using_caches_with_options(
     providers: &[Provider],
     dnsaddr_cache: &mut DnsaddrCache,
     dns_ip_cache: &mut DnsIpCache,
     early_peer_cap: bool,
     direct_ip_candidate_only: bool,
+    expansion: &AddressExpansion,
 ) -> BitswapProviderCandidates {
-    let mut peers = Vec::new();
+    let mut gathered: Vec<GatheredPeer> = Vec::new();
     let mut quality = BitswapProviderAddrQuality {
         early_peer_cap,
         direct_ip_candidate_only,
         ..BitswapProviderAddrQuality::default()
     };
+    let deadline = nat64_candidate_deadline();
     if !early_peer_cap && !direct_ip_candidate_only {
-        prefetch_bitswap_dns_expansions(providers, dnsaddr_cache, dns_ip_cache).await;
+        prefetch_bitswap_dns_expansions(providers, dnsaddr_cache, dns_ip_cache, expansion).await;
     }
 
     for (index, provider) in providers.iter().enumerate() {
@@ -9951,20 +10244,29 @@ async fn bitswap_peers_with_quality_using_caches_with_options(
         let expanded_addrs = if direct_ip_candidate_only {
             let (addrs, skipped) = direct_ip_provider_multiaddrs(&provider.addrs);
             quality.direct_ip_candidate_skipped_addr_count += skipped;
-            addrs
+            addrs.into_iter().map(ExpandedAddr::from).collect()
         } else {
-            expand_provider_multiaddrs(&provider.addrs, dnsaddr_cache, dns_ip_cache).await
+            expand_provider_multiaddrs_with_origins(
+                &provider.addrs,
+                dnsaddr_cache,
+                dns_ip_cache,
+                expansion,
+                deadline,
+                &mut quality.policy_refused_addr_count,
+            )
+            .await
         };
 
-        for addr in expanded_addrs {
+        for ExpandedAddr { addr, via } in expanded_addrs {
             quality.expanded_addr_count += 1;
-            match analyze_bitswap_multiaddr(&addr, provider_peer) {
+            match analyze_bitswap_multiaddr(&addr, provider_peer, &expansion.policy, via.as_deref())
+            {
                 Ok((addr_peer, dial_addr, features)) => {
                     quality.record_features(features);
                     quality.supported_addr_count += 1;
                     provider_has_supported_addr = true;
                     peer_id.get_or_insert(addr_peer);
-                    addrs.push(dial_addr);
+                    addrs.push((dial_addr, via));
                 }
                 Err((rejection, features)) => {
                     quality.record_features(features);
@@ -9979,22 +10281,97 @@ async fn bitswap_peers_with_quality_using_caches_with_options(
 
         if let Some(id) = peer_id {
             if !addrs.is_empty() {
-                addrs.sort_by_key(bitswap_addr_score);
-                addrs.dedup();
-                addrs.truncate(MAX_BITSWAP_ADDRS_PER_PEER);
-                merge_bitswap_peer(&mut peers, id, addrs);
+                match gathered.iter_mut().find(|(peer, _)| *peer == id) {
+                    Some((_, gathered_addrs)) => gathered_addrs.extend(addrs),
+                    None => gathered.push((id, addrs)),
+                }
             }
         }
 
-        if early_peer_cap && peers.len() >= MAX_BITSWAP_PEERS_PER_BLOCK {
+        if early_peer_cap && gathered.len() >= MAX_BITSWAP_PEERS_PER_BLOCK {
             quality.early_peer_cap_hit = index + 1 < providers.len();
             quality.skipped_provider_count = providers.len().saturating_sub(index + 1);
             break;
         }
     }
 
-    peers.truncate(MAX_BITSWAP_PEERS_PER_BLOCK);
+    let peers = judged_and_cut(gathered, expansion, deadline, &mut quality).await;
     BitswapProviderCandidates { peers, quality }
+}
+
+/// A peer's candidate addresses, gathered across providers before they are
+/// judged and cut, each with the address whose name it replaced, if any.
+type GatheredPeer = (PeerId, Vec<(Multiaddr, Option<String>)>);
+
+/// Every candidate gathered across all providers, judged again against one
+/// settled NAT64 state (design 0007: an address accepted before discovery
+/// changed the state might be refused after it), then each peer's
+/// addresses ranked and cut to [`MAX_BITSWAP_ADDRS_PER_PEER`], and the
+/// peers to [`MAX_BITSWAP_PEERS_PER_BLOCK`]. A revoked capability refuses
+/// them all.
+async fn judged_and_cut(
+    gathered: Vec<GatheredPeer>,
+    expansion: &AddressExpansion,
+    deadline: tokio::time::Instant,
+    quality: &mut BitswapProviderAddrQuality,
+) -> Vec<BitswapPeer> {
+    let policy = &expansion.policy;
+    let settled = if policy.admits_everything() {
+        None
+    } else {
+        // A configured name's answer is exempt from the address policy, so
+        // it doesn't wait for discovery; every other candidate does, one
+        // that shares the answer's address included.
+        let candidates = gathered
+            .iter()
+            .flat_map(|(_, addrs)| addrs.iter())
+            .filter(|(addr, via)| {
+                !via.as_deref()
+                    .and_then(|via| Multiaddr::from_str(via).ok())
+                    .is_some_and(|original| policy.is_configured_answer(&original, addr))
+            })
+            .map(|(addr, _)| addr.clone())
+            .collect::<Vec<_>>();
+        policy.settled(&candidates, deadline).await.ok()
+    };
+    let mut peers = Vec::new();
+    for (id, addrs) in gathered {
+        let mut kept = Vec::with_capacity(addrs.len());
+        let mut configured_answers = Vec::new();
+        for (addr, via) in addrs {
+            let admitted = policy.admits_everything()
+                || settled
+                    .as_ref()
+                    .is_some_and(|settled| check_candidate(settled, &addr, via.as_deref()).is_ok());
+            if admitted {
+                if admitted_as_configured_answer(settled.as_ref(), &addr, via.as_deref()) {
+                    configured_answers.push(addr.clone());
+                }
+                kept.push(addr);
+            } else {
+                quality.supported_addr_count = quality.supported_addr_count.saturating_sub(1);
+                quality.policy_refused_addr_count += 1;
+            }
+        }
+        if kept.is_empty() {
+            continue;
+        }
+        kept.sort_by_key(bitswap_addr_score);
+        kept.dedup();
+        kept.truncate(MAX_BITSWAP_ADDRS_PER_PEER);
+        let mut peer = BitswapPeer {
+            id,
+            addrs: kept,
+            configured_answers,
+            skip_want_have: false,
+            force_want_block: false,
+            force_want_have: false,
+        };
+        peer.keep_configured_answers_selected();
+        peers.push(peer);
+    }
+    peers.truncate(MAX_BITSWAP_PEERS_PER_BLOCK);
+    peers
 }
 
 fn maybe_force_zero_http_direct_want_block_peers_with_limit(
@@ -10048,29 +10425,14 @@ fn maybe_force_trusted_bitswap_want_have_probes_with_limit(
     probed
 }
 
-fn merge_bitswap_peer(peers: &mut Vec<BitswapPeer>, id: PeerId, addrs: Vec<Multiaddr>) {
-    if let Some(peer) = peers.iter_mut().find(|peer| peer.id == id) {
-        peer.addrs.extend(addrs);
-        peer.addrs.sort_by_key(bitswap_addr_score);
-        peer.addrs.dedup();
-        peer.addrs.truncate(MAX_BITSWAP_ADDRS_PER_PEER);
-    } else {
-        peers.push(BitswapPeer {
-            id,
-            addrs,
-            skip_want_have: false,
-            force_want_block: false,
-            force_want_have: false,
-        });
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BitswapDialAddress {
     peer: PeerId,
     peer_index: usize,
     addr_index: usize,
     addr: Multiaddr,
+    /// From the candidate the address belongs to.
+    provenance: DialProvenance,
 }
 
 fn interleaved_bitswap_dials(peers: &[BitswapPeer]) -> Vec<BitswapDialAddress> {
@@ -10088,6 +10450,7 @@ fn interleaved_bitswap_dials(peers: &[BitswapPeer]) -> Vec<BitswapDialAddress> {
                     peer_index,
                     addr_index,
                     addr: addr.clone(),
+                    provenance: peer.provenance(addr),
                 });
             }
         }
@@ -10288,22 +10651,29 @@ fn prune_shared_dns_ip_cache_len(cache: &mut SharedDnsIpCache) {
     }
 }
 
+/// Resolves, ahead of candidate choice, every `/dnsaddr` and `/dns*` name
+/// the providers' addresses (and their `/dnsaddr` records) hold, through
+/// `expansion`'s resolver, into the caches. Under a gated policy, nothing
+/// is resolved for an address the policy refuses whole.
 async fn prefetch_bitswap_dns_expansions(
     providers: &[Provider],
     dnsaddr_cache: &mut DnsaddrCache,
     dns_ip_cache: &mut DnsIpCache,
+    expansion: &AddressExpansion,
 ) {
     let started = Instant::now();
+    let policy = &expansion.policy;
     let dnsaddr_hosts = providers
         .iter()
         .flat_map(|provider| provider.addrs.iter())
+        .filter(|addr| expandable(addr, policy))
         .filter_map(|addr| dnsaddr_host(addr).map(str::to_string))
         .filter(|host| !dnsaddr_cache.contains_key(host))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
     let dnsaddr_host_count = dnsaddr_hosts.len();
-    for (host, records) in resolve_dnsaddr_hosts(dnsaddr_hosts).await {
+    for (host, records) in resolve_dnsaddr_hosts(dnsaddr_hosts, &expansion.resolver).await {
         dnsaddr_cache.insert(
             host,
             CachedDnsaddrRecords {
@@ -10316,6 +10686,7 @@ async fn prefetch_bitswap_dns_expansions(
     let dns_names = providers
         .iter()
         .flat_map(|provider| provider.addrs.iter())
+        .filter(|addr| expandable(addr, policy))
         .flat_map(|addr| {
             if let Some(host) = dnsaddr_host(addr) {
                 dnsaddr_cache
@@ -10326,14 +10697,15 @@ async fn prefetch_bitswap_dns_expansions(
                 vec![addr.clone()]
             }
         })
-        .filter(|addr| !websocket_multiaddr(addr))
+        .filter(|addr| expandable(addr, policy))
+        .filter(|addr| !websocket_multiaddr(addr) && !policy.transports().proxied())
         .filter_map(|addr| dns_multiaddr_name(&addr))
         .filter(|host| !dns_ip_cache.contains_key(host))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
     let dns_ip_host_count = dns_names.len();
-    for (host, addrs) in resolve_dns_ip_hosts(dns_names).await {
+    for (host, addrs) in resolve_dns_ip_hosts(dns_names, &expansion.resolver).await {
         dns_ip_cache.insert(
             host,
             CachedDnsIpRecords {
@@ -10353,8 +10725,10 @@ async fn prefetch_bitswap_dns_expansions(
     }
 }
 
-async fn resolve_dnsaddr_hosts(hosts: Vec<String>) -> Vec<(String, Vec<String>)> {
-    let resolver = Arc::new(CloudflareDohResolver::default());
+async fn resolve_dnsaddr_hosts(
+    hosts: Vec<String>,
+    resolver: &Arc<CloudflareDohResolver>,
+) -> Vec<(String, Vec<String>)> {
     let mut pending = FuturesUnordered::<BoxFuture<'static, (String, Vec<String>)>>::new();
     let mut hosts = hosts.into_iter();
     for _ in 0..BITSWAP_DNS_PREFETCH_CONCURRENCY {
@@ -10401,8 +10775,10 @@ async fn resolve_dnsaddr_host(
     (host, records)
 }
 
-async fn resolve_dns_ip_hosts(hosts: Vec<String>) -> Vec<(String, Vec<IpAddr>)> {
-    let resolver = Arc::new(CloudflareDohResolver::default());
+async fn resolve_dns_ip_hosts(
+    hosts: Vec<String>,
+    resolver: &Arc<CloudflareDohResolver>,
+) -> Vec<(String, Vec<IpAddr>)> {
     let mut pending = FuturesUnordered::<BoxFuture<'static, (String, Vec<IpAddr>)>>::new();
     let mut hosts = hosts.into_iter();
     for _ in 0..BITSWAP_DNS_PREFETCH_CONCURRENCY {
@@ -10444,15 +10820,73 @@ async fn resolve_dns_ip_host(
     (host, addrs)
 }
 
+/// [`expand_provider_multiaddrs_with_origins`]'s addresses alone: tests.
+#[cfg(test)]
 async fn expand_provider_multiaddrs(
     addrs: &[String],
     dnsaddr_cache: &mut DnsaddrCache,
     dns_ip_cache: &mut DnsIpCache,
+    expansion: &AddressExpansion,
+    deadline: tokio::time::Instant,
+    refused: &mut usize,
 ) -> Vec<String> {
-    let resolver = CloudflareDohResolver::default();
+    expand_provider_multiaddrs_with_origins(
+        addrs,
+        dnsaddr_cache,
+        dns_ip_cache,
+        expansion,
+        deadline,
+        refused,
+    )
+    .await
+    .into_iter()
+    .map(|expanded| expanded.addr)
+    .collect()
+}
+
+/// An address expansion yielded: with, when an A or AAAA answer replaced a
+/// name, the address it replaced, whose name and port any later check
+/// judges a configured target's exemption by.
+struct ExpandedAddr {
+    addr: String,
+    via: Option<String>,
+}
+
+impl From<String> for ExpandedAddr {
+    fn from(addr: String) -> Self {
+        Self { addr, via: None }
+    }
+}
+
+/// A provider's addresses, expanded: each `/dnsaddr` replaced by the
+/// multiaddrs its TXT records hold, and each `/dns*` name (but a
+/// WebSocket's, which its transport resolves) by its A and AAAA answers.
+///
+/// Under a gated policy (design 0007, check 2): an address the policy
+/// refuses whole is neither expanded nor resolved; every TXT-derived
+/// multiaddr is checked whole, as a provider's own; and every A or AAAA
+/// answer passes the address policy (with checked addresses) before it
+/// replaces the name, so a name whose every answer is refused is dropped,
+/// not kept. Each refusal is counted in `refused`.
+///
+/// Each answer keeps the address whose name it replaced ([`ExpandedAddr`]).
+async fn expand_provider_multiaddrs_with_origins(
+    addrs: &[String],
+    dnsaddr_cache: &mut DnsaddrCache,
+    dns_ip_cache: &mut DnsIpCache,
+    expansion: &AddressExpansion,
+    deadline: tokio::time::Instant,
+    refused: &mut usize,
+) -> Vec<ExpandedAddr> {
+    let resolver = &expansion.resolver;
+    let policy = &expansion.policy;
     let mut expanded_dnsaddr = Vec::new();
 
     for addr in addrs {
+        if !expandable(addr, policy) {
+            *refused += 1;
+            continue;
+        }
         let Some(host) = dnsaddr_host(addr) else {
             expanded_dnsaddr.push(addr.clone());
             continue;
@@ -10466,7 +10900,8 @@ async fn expand_provider_multiaddrs(
                 record_count = entry.records.len()
             );
             entry.log_as_cached = true;
-            expanded_dnsaddr.extend(entry.records.iter().cloned());
+            let records = entry.records.clone();
+            expanded_dnsaddr.extend(admitted_records(records, policy, deadline, refused).await);
             continue;
         }
         let lookup = format!("_dnsaddr.{host}");
@@ -10488,17 +10923,23 @@ async fn expand_provider_multiaddrs(
                 log_as_cached: true,
             },
         );
-        expanded_dnsaddr.extend(records);
+        expanded_dnsaddr.extend(admitted_records(records, policy, deadline, refused).await);
     }
 
+    // Each address here passed the policy: a provider's own above, a TXT
+    // record in `admitted_records`. A name is resolved here unless its
+    // transport resolves it: a WebSocket's, and every one through a proxy
+    // (design 0007: under `socks5`, names are resolved through the proxy,
+    // never by a local resolver).
+    let names_at_the_transport = policy.transports().proxied();
     let mut expanded = Vec::new();
     for addr in expanded_dnsaddr {
-        if websocket_multiaddr(&addr) {
-            expanded.push(addr);
+        if websocket_multiaddr(&addr) || names_at_the_transport {
+            expanded.push(ExpandedAddr::from(addr));
             continue;
         }
         let Some(dns_name) = dns_multiaddr_name(&addr) else {
-            expanded.push(addr);
+            expanded.push(ExpandedAddr::from(addr));
             continue;
         };
         let addrs = if let Some(entry) = dns_ip_cache.get_mut(&dns_name) {
@@ -10536,24 +10977,115 @@ async fn expand_provider_multiaddrs(
                             log_as_cached: true,
                         },
                     );
-                    expanded.push(addr);
+                    expanded.push(ExpandedAddr::from(addr));
                     continue;
                 }
             }
         };
         if addrs.is_empty() {
-            expanded.push(addr);
+            expanded.push(ExpandedAddr::from(addr));
             continue;
         }
-        expanded.extend(
-            addrs
-                .into_iter()
-                .map(|ip| replace_dns_multiaddr(&addr, ip))
-                .filter_map(|addr| addr.map(|addr| addr.to_string())),
-        );
+        let original = Multiaddr::from_str(&addr).ok();
+        for ip in addrs {
+            if !policy.admits_everything() {
+                let admitted = match &original {
+                    Some(original) => policy.check_answer(original, ip, deadline).await.is_ok(),
+                    None => false,
+                };
+                if !admitted {
+                    *refused += 1;
+                    continue;
+                }
+            }
+            if let Some(replaced) = replace_dns_multiaddr(&addr, ip) {
+                expanded.push(ExpandedAddr {
+                    addr: replaced.to_string(),
+                    via: Some(addr.clone()),
+                });
+            }
+        }
     }
 
     expanded
+}
+
+/// Whether candidate choice admitted `addr` as a configured target's
+/// answer: the name it replaced (`via`) is configured, with that port.
+fn admitted_as_configured_answer(
+    settled: Option<&DialPolicy>,
+    addr: &Multiaddr,
+    via: Option<&str>,
+) -> bool {
+    let (Some(settled), Some(original)) =
+        (settled, via.and_then(|via| Multiaddr::from_str(via).ok()))
+    else {
+        return false;
+    };
+    settled.is_configured_answer(&original, addr)
+}
+
+/// Dials `addr` through the swarm as its candidate's `provenance` says: as
+/// a configured target's answer only when candidate choice admitted it as
+/// one for this candidate, so the transport's inner gate keeps that
+/// exemption for this dial only.
+fn dial_bitswap_addr(
+    swarm: &mut libp2p::Swarm<BitswapBehaviour>,
+    addr: Multiaddr,
+    provenance: DialProvenance,
+) -> std::result::Result<(), libp2p::swarm::DialError> {
+    dial_with_provenance(&addr, provenance, || swarm.dial(addr.clone()))
+}
+
+/// Runs `dial`, which asks the transport for `addr` there and then, as
+/// `provenance` says.
+fn dial_with_provenance<R>(
+    addr: &Multiaddr,
+    provenance: DialProvenance,
+    dial: impl FnOnce() -> R,
+) -> R {
+    match provenance {
+        DialProvenance::ConfiguredAnswer => {
+            freedom_ipfs_net::transport::dial_configured_answer(addr, dial)
+        }
+        DialProvenance::Untrusted => dial(),
+    }
+}
+
+/// A candidate address under `policy`: an answer by the name it replaced
+/// (a configured name and port keep their exemption, for that answer only),
+/// any other address as it is.
+fn check_candidate(
+    policy: &DialPolicy,
+    addr: &Multiaddr,
+    via: Option<&str>,
+) -> std::result::Result<(), freedom_ipfs_net::DialRefusal> {
+    match via.and_then(|via| Multiaddr::from_str(via).ok()) {
+        Some(original) => policy.check_answer_now(&original, addr),
+        None => policy.check_now(addr),
+    }
+}
+
+/// Check 2 for a `/dnsaddr`'s TXT-derived multiaddrs: under a gated policy
+/// each is checked whole, as a provider's own address, and a refused one
+/// is dropped and counted.
+async fn admitted_records(
+    records: Vec<String>,
+    policy: &DialPolicy,
+    deadline: tokio::time::Instant,
+    refused: &mut usize,
+) -> Vec<String> {
+    if policy.admits_everything() {
+        return records;
+    }
+    let mut admitted = Vec::with_capacity(records.len());
+    for record in records {
+        match Multiaddr::from_str(&record) {
+            Ok(addr) if policy.check(&addr, deadline).await.is_ok() => admitted.push(record),
+            _ => *refused += 1,
+        }
+    }
+    admitted
 }
 
 fn direct_ip_provider_multiaddrs(addrs: &[String]) -> (Vec<String>, usize) {
@@ -10650,7 +11182,7 @@ fn parse_bitswap_multiaddr(
     addr: &str,
     provider_peer: Option<PeerId>,
 ) -> Option<(PeerId, Multiaddr)> {
-    analyze_bitswap_multiaddr(addr, provider_peer)
+    analyze_bitswap_multiaddr(addr, provider_peer, &DialPolicy::legacy(), None)
         .ok()
         .map(|(peer, addr, _)| (peer, addr))
 }
@@ -10664,6 +11196,11 @@ enum BitswapAddrRejection {
     WebRtc,
     Certhash,
     UnsupportedTransport,
+    /// The network policy refuses it (design 0007, "Candidate choice knows
+    /// the transports").
+    Policy,
+    /// The policy's transports can't carry it: QUIC under `socks5`.
+    Transport,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -10674,19 +11211,28 @@ struct BitswapAddrFeatures {
     certhash: bool,
 }
 
+/// A Bitswap candidate address, or why it isn't one: an address the node
+/// can't dial is refused here, before candidates are ranked and cut, so a
+/// peer never keeps only addresses that can't be used. Under `policy`, that
+/// is also an address its transports can't carry (QUIC under `socks5`),
+/// and one the policy refuses (its shape, an onion, and with checked
+/// addresses an IP literal's address).
 fn analyze_bitswap_multiaddr(
     addr: &str,
     provider_peer: Option<PeerId>,
+    policy: &DialPolicy,
+    via: Option<&str>,
 ) -> std::result::Result<
     (PeerId, Multiaddr, BitswapAddrFeatures),
     (BitswapAddrRejection, BitswapAddrFeatures),
 > {
-    let mut multiaddr = Multiaddr::from_str(addr).map_err(|_| {
+    let full = Multiaddr::from_str(addr).map_err(|_| {
         (
             BitswapAddrRejection::InvalidMultiaddr,
             BitswapAddrFeatures::default(),
         )
     })?;
+    let mut multiaddr = full.clone();
     let addr_peer = match multiaddr.iter().last() {
         Some(Protocol::P2p(peer)) => {
             multiaddr.pop();
@@ -10698,10 +11244,21 @@ fn analyze_bitswap_multiaddr(
     let peer_id = addr_peer
         .or(provider_peer)
         .ok_or((BitswapAddrRejection::MissingPeer, features))?;
-    unsupported_bitswap_addr_reason(&multiaddr)
-        .map_or(Ok((peer_id, multiaddr, features)), |reason| {
-            Err((reason, features))
-        })
+    let onions = policy.transports().proxied();
+    if let Some(reason) = unsupported_bitswap_addr_reason_with(&multiaddr, onions) {
+        return Err((reason, features));
+    }
+    if !policy.transports().quic()
+        && multiaddr
+            .iter()
+            .any(|protocol| matches!(protocol, Protocol::Quic | Protocol::QuicV1))
+    {
+        return Err((BitswapAddrRejection::Transport, features));
+    }
+    if !policy.admits_everything() && check_candidate(policy, &full, via).is_err() {
+        return Err((BitswapAddrRejection::Policy, features));
+    }
+    Ok((peer_id, multiaddr, features))
 }
 
 fn parse_peer_id(id: &str) -> Option<PeerId> {
@@ -10709,12 +11266,22 @@ fn parse_peer_id(id: &str) -> Option<PeerId> {
 }
 
 fn unsupported_bitswap_addr_reason(addr: &Multiaddr) -> Option<BitswapAddrRejection> {
+    unsupported_bitswap_addr_reason_with(addr, false)
+}
+
+/// [`unsupported_bitswap_addr_reason`], where `onions` says whether the
+/// transports reach `/onion3` (TCP to an onion service, through a proxy).
+fn unsupported_bitswap_addr_reason_with(
+    addr: &Multiaddr,
+    onions: bool,
+) -> Option<BitswapAddrRejection> {
     let mut has_tcp = false;
     let mut has_udp = false;
     let mut has_quic = false;
     for protocol in addr.iter() {
         match protocol {
             Protocol::Tcp(_) => has_tcp = true,
+            Protocol::Onion3(_) if onions => has_tcp = true,
             Protocol::Udp(_) => has_udp = true,
             Protocol::Quic | Protocol::QuicV1 => has_quic = true,
             Protocol::P2pCircuit => return Some(BitswapAddrRejection::Relay),
@@ -10855,12 +11422,20 @@ fn same_provider_set(left: &[Provider], right: &[Provider]) -> bool {
     normalized_provider_set(left) == normalized_provider_set(right)
 }
 
-async fn same_bitswap_peer_set(left: &[Provider], right: &[Provider]) -> bool {
-    normalized_bitswap_peer_set(left).await == normalized_bitswap_peer_set(right).await
+async fn same_bitswap_peer_set(
+    left: &[Provider],
+    right: &[Provider],
+    expansion: &AddressExpansion,
+) -> bool {
+    normalized_bitswap_peer_set(left, expansion).await
+        == normalized_bitswap_peer_set(right, expansion).await
 }
 
-async fn normalized_bitswap_peer_set(providers: &[Provider]) -> BTreeSet<(String, Vec<String>)> {
-    bitswap_peers(providers)
+async fn normalized_bitswap_peer_set(
+    providers: &[Provider],
+    expansion: &AddressExpansion,
+) -> BTreeSet<(String, Vec<String>)> {
+    bitswap_peers(providers, expansion)
         .await
         .into_iter()
         .map(|peer| {
@@ -12323,15 +12898,6 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
-fn timeout_http_client(timeout: Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(timeout)
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("HTTP provider client config is valid")
-}
-
 /// A Bitswap answer as a fetch decodes it: only the fields it reads, every
 /// byte field a view of the received message, never a copy, so no field a
 /// peer controls allocates beside the charged message. What it doesn't read
@@ -12796,8 +13362,8 @@ mod shared_limits_tests {
         });
 
         // Two nodes' swarms: the first's connection fills the shared cap.
-        let mut first = build_bitswap_swarm(Some(&limits)).await.unwrap();
-        let mut second = build_bitswap_swarm(Some(&limits)).await.unwrap();
+        let mut first = build_bitswap_swarm(Some(&limits), None).await.unwrap();
+        let mut second = build_bitswap_swarm(Some(&limits), None).await.unwrap();
         first.dial(addr.clone()).unwrap();
         established(&mut first).await;
         assert_eq!(limits.bitswap_connections(), 1);
@@ -12818,7 +13384,7 @@ mod shared_limits_tests {
         assert_eq!(limits.bitswap_connections(), 1);
 
         // A swarm built without shared limits isn't counted.
-        let mut free = build_bitswap_swarm(None).await.unwrap();
+        let mut free = build_bitswap_swarm(None, None).await.unwrap();
         free.dial(addr).unwrap();
         established(&mut free).await;
         assert_eq!(limits.bitswap_connections(), 1);
@@ -13354,6 +13920,977 @@ mod bitswap_tests {
         );
     }
 
+    const POLICY_PEER: &str = "12D3KooWAC7ALVECw2xQHccT3hSUcQU7pJ3hvwV77w1kEevC5kKG";
+
+    /// A `direct` network whose DoH endpoint is `doh`.
+    fn direct_network(
+        doh: &str,
+        addresses: freedom_ipfs_net::Addresses,
+    ) -> freedom_ipfs_net::Network {
+        freedom_ipfs_net::Network::with_lookup(
+            freedom_ipfs_net::NetworkPolicy::direct(
+                freedom_ipfs_net::gate::ConfiguredTargets::new(),
+                url::Url::parse(doh).unwrap(),
+                addresses,
+            )
+            .unwrap(),
+            None,
+        )
+    }
+
+    fn checked_addresses() -> freedom_ipfs_net::Addresses {
+        freedom_ipfs_net::Addresses::Checked(freedom_ipfs_net::Nat64Handle::fixed(
+            freedom_ipfs_net::gate::Nat64State::NONE,
+        ))
+    }
+
+    /// The expansion caches, filled: no lookup goes out.
+    fn filled_caches() -> (DnsaddrCache, DnsIpCache) {
+        let records = [
+            format!("/ip4/8.8.8.8/tcp/4001/p2p/{POLICY_PEER}"),
+            format!("/ip4/8.8.8.8/ip4/127.0.0.1/tcp/4001/p2p/{POLICY_PEER}"),
+            format!("/ip4/127.0.0.1/tcp/4001/p2p/{POLICY_PEER}"),
+            format!("/dns4/x.onion/tcp/4001/p2p/{POLICY_PEER}"),
+            "/dns4/example.com/tcp/443/tls/sni/example.com/ws".to_string(),
+        ];
+        let dnsaddr_cache = HashMap::from([(
+            "peers.example".to_string(),
+            CachedDnsaddrRecords {
+                records: records.to_vec(),
+                log_as_cached: true,
+            },
+        )]);
+        let ips = |list: &[&str]| CachedDnsIpRecords {
+            addrs: list.iter().map(|ip| ip.parse().unwrap()).collect(),
+            log_as_cached: true,
+        };
+        let dns_ip_cache = HashMap::from([
+            (
+                "private.example".to_string(),
+                ips(&["127.0.0.1", "64:ff9b::7f00:1"]),
+            ),
+            ("mixed.example".to_string(), ips(&["10.0.0.1", "8.8.4.4"])),
+            ("x.onion".to_string(), ips(&[])),
+        ]);
+        (dnsaddr_cache, dns_ip_cache)
+    }
+
+    /// Check 2 (design 0007): every multiaddr a `/dnsaddr` TXT answer yields
+    /// is checked whole, and every A or AAAA answer before it replaces the
+    /// name; refused ones are dropped and counted. The legacy policy expands
+    /// as before.
+    #[tokio::test]
+    async fn expansion_checks_every_txt_derived_multiaddr_and_every_answer() {
+        let addrs = [
+            "/dnsaddr/peers.example".to_string(),
+            "/dns4/private.example/tcp/4001".to_string(),
+            "/dns4/mixed.example/tcp/4001".to_string(),
+        ];
+        let peer = |addr: &str| format!("{addr}/p2p/{POLICY_PEER}");
+        let cases: [(AddressExpansion, Vec<String>, usize); 3] = [
+            (
+                AddressExpansion::of(&direct_network(
+                    "https://dns.example/dns-query",
+                    checked_addresses(),
+                )),
+                vec![
+                    peer("/ip4/8.8.8.8/tcp/4001"),
+                    "/ip4/8.8.4.4/tcp/4001".into(),
+                ],
+                // The second host, loopback, the onion and `/sni`; both
+                // private.example answers (loopback, DNS64 of loopback);
+                // 10.0.0.1.
+                7,
+            ),
+            (
+                AddressExpansion::of(&direct_network(
+                    "https://dns.example/dns-query",
+                    freedom_ipfs_net::Addresses::Unchecked,
+                )),
+                vec![
+                    peer("/ip4/8.8.8.8/tcp/4001"),
+                    peer("/ip4/127.0.0.1/tcp/4001"),
+                    "/ip4/127.0.0.1/tcp/4001".into(),
+                    "/ip6/64:ff9b::7f00:1/tcp/4001".into(),
+                    "/ip4/10.0.0.1/tcp/4001".into(),
+                    "/ip4/8.8.4.4/tcp/4001".into(),
+                ],
+                // Shapes only: the second host, the onion and `/sni`.
+                3,
+            ),
+            (
+                AddressExpansion::legacy(),
+                vec![
+                    peer("/ip4/8.8.8.8/tcp/4001"),
+                    peer("/ip4/8.8.8.8/ip4/127.0.0.1/tcp/4001"),
+                    peer("/ip4/127.0.0.1/tcp/4001"),
+                    "/dns4/example.com/tcp/443/tls/sni/example.com/ws".into(),
+                    peer("/dns4/x.onion/tcp/4001"),
+                    "/ip4/127.0.0.1/tcp/4001".into(),
+                    "/ip6/64:ff9b::7f00:1/tcp/4001".into(),
+                    "/ip4/10.0.0.1/tcp/4001".into(),
+                    "/ip4/8.8.4.4/tcp/4001".into(),
+                ],
+                0,
+            ),
+        ];
+        for (expansion, expected, refused) in cases {
+            let (mut dnsaddr_cache, mut dns_ip_cache) = filled_caches();
+            let mut counted = 0;
+            let mut expanded = expand_provider_multiaddrs(
+                &addrs,
+                &mut dnsaddr_cache,
+                &mut dns_ip_cache,
+                &expansion,
+                nat64_candidate_deadline(),
+                &mut counted,
+            )
+            .await;
+            let mut expected = expected;
+            expanded.sort();
+            expected.sort();
+            assert_eq!(expanded, expected, "gated: {}", expansion.policy.is_gated());
+            assert_eq!(counted, refused, "gated: {}", expansion.policy.is_gated());
+        }
+    }
+
+    /// A listener that counts the connections it accepts: a DoH endpoint
+    /// that answers nothing.
+    fn counting_listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = accepted.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (port, accepted)
+    }
+
+    /// The design's hidden onion: a public address first, an onion name
+    /// after it. Refused whole, before any expansion: no DNS or TXT query
+    /// goes out for it, from candidate choice itself as from the retriever.
+    #[tokio::test]
+    async fn a_hidden_onion_is_neither_expanded_nor_resolved() {
+        let (port, accepted) = counting_listener();
+        let network = direct_network(
+            &format!("http://127.0.0.1:{port}/dns-query"),
+            freedom_ipfs_net::Addresses::Unchecked,
+        );
+        let expansion = AddressExpansion::of(&network);
+        let hidden = |addr: &str| {
+            Provider::from_parts(
+                Some(POLICY_PEER.to_string()),
+                vec![format!("{addr}/p2p/{POLICY_PEER}")],
+            )
+            .unwrap()
+        };
+        let providers = [
+            "/ip4/8.8.8.8/dns/x.onion/tcp/4001",
+            "/ip4/8.8.8.8/dns4/x.onion/tcp/4001",
+            "/ip4/8.8.8.8/dnsaddr/peers.example",
+            "/dns4/x.onion/tcp/4001",
+            "/dnsaddr/peers.onion",
+        ]
+        .map(hidden);
+        let candidates = bitswap_peers_with_quality(&providers, &expansion).await;
+        assert!(candidates.peers.is_empty());
+        assert_eq!(
+            candidates.quality.policy_refused_addr_count,
+            providers.len()
+        );
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(ProviderRoutingClient::Offline, store)
+            .with_http_client(network.http_client(HTTP_PROVIDER_CLIENT_CONFIG));
+        assert!(retriever
+            .admitted_providers(providers.to_vec())
+            .await
+            .iter()
+            .all(|provider| provider.addrs.is_empty()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 0, "a lookup went out");
+
+        // The same name, not hidden: looked up, at the policy's endpoint.
+        let named = [hidden("/dns4/name.example/tcp/4001")];
+        let _ = bitswap_peers_with_quality(&named, &expansion).await;
+        assert!(accepted.load(Ordering::SeqCst) > 0);
+    }
+
+    /// Candidate choice drops what the policy can't dial before each
+    /// peer's addresses are ranked and cut to two: under a TCP-only view, a
+    /// peer with two QUIC addresses (ranked first) and one TCP address keeps
+    /// the TCP one, and with checked addresses refused targets go the same
+    /// way.
+    #[tokio::test]
+    async fn candidate_choice_drops_what_the_policy_cant_dial_before_the_cut() {
+        use freedom_ipfs_net::TransportPolicy;
+        let peer = |addr: &str| format!("{addr}/p2p/{POLICY_PEER}");
+        let quic_first = [Provider::from_parts(
+            Some(POLICY_PEER.to_string()),
+            vec![
+                peer("/ip4/8.8.8.8/udp/4001/quic-v1"),
+                peer("/ip4/8.8.4.4/udp/4001/quic-v1"),
+                peer("/ip4/1.1.1.1/tcp/4001/ws"),
+            ],
+        )
+        .unwrap()];
+        let dialed = |candidates: &BitswapProviderCandidates| {
+            candidates.peers[0]
+                .addrs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        let all = bitswap_peers_with_quality(&quic_first, &AddressExpansion::legacy()).await;
+        assert_eq!(
+            dialed(&all),
+            [
+                "/ip4/8.8.8.8/udp/4001/quic-v1",
+                "/ip4/8.8.4.4/udp/4001/quic-v1"
+            ]
+        );
+        let mut tcp_only = AddressExpansion::legacy();
+        tcp_only.policy = tcp_only.policy.with_transports(TransportPolicy::TCP_ONLY);
+        let candidates = bitswap_peers_with_quality(&quic_first, &tcp_only).await;
+        assert_eq!(dialed(&candidates), ["/ip4/1.1.1.1/tcp/4001/ws"]);
+        assert_eq!(candidates.quality.transport_refused_addr_count, 2);
+
+        let private_first = [Provider::from_parts(
+            Some(POLICY_PEER.to_string()),
+            vec![
+                peer("/ip4/127.0.0.1/tcp/4001"),
+                peer("/ip4/10.0.0.1/tcp/4001"),
+                peer("/ip4/1.1.1.1/tcp/4001/ws"),
+            ],
+        )
+        .unwrap()];
+        let legacy = bitswap_peers_with_quality(&private_first, &AddressExpansion::legacy()).await;
+        assert_eq!(
+            dialed(&legacy),
+            ["/ip4/127.0.0.1/tcp/4001", "/ip4/10.0.0.1/tcp/4001"]
+        );
+        let checked = AddressExpansion::of(&direct_network(
+            "https://dns.example/dns-query",
+            checked_addresses(),
+        ));
+        let candidates = bitswap_peers_with_quality(&private_first, &checked).await;
+        assert_eq!(dialed(&candidates), ["/ip4/1.1.1.1/tcp/4001/ws"]);
+        assert_eq!(candidates.quality.policy_refused_addr_count, 2);
+
+        // Direct-IP candidates only, which skips expansion: the analysis
+        // itself drops them.
+        let candidates = bitswap_peers_with_quality_using_caches_with_options(
+            &private_first,
+            &mut DnsaddrCache::new(),
+            &mut DnsIpCache::new(),
+            false,
+            true,
+            &checked,
+        )
+        .await;
+        assert_eq!(dialed(&candidates), ["/ip4/1.1.1.1/tcp/4001/ws"]);
+        assert_eq!(candidates.quality.policy_refused_addr_count, 2);
+    }
+
+    /// The retriever's expansion resolver belongs to its provider client's
+    /// network, even when it was built before that client was given.
+    #[tokio::test]
+    async fn the_expansion_resolver_follows_the_provider_clients_network() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let retriever = HttpRetriever::new(ProviderRoutingClient::Offline, store);
+        let _ = retriever.address_expansion();
+        let network = direct_network(
+            "http://127.0.0.1:9/dns-query",
+            freedom_ipfs_net::Addresses::Unchecked,
+        );
+        let retriever =
+            retriever.with_http_client(network.http_client(HTTP_PROVIDER_CLIENT_CONFIG));
+        network.revoke();
+        let err = retriever
+            .address_expansion()
+            .resolver
+            .txt_lookup("_dnsaddr.example.com")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                freedom_ipfs_namesys::NamesysError::Network(HttpError::Revoked(_))
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// One settled NAT64 state judges every provider's candidates (#47
+    /// review, 47-M1): provider 1's address passes under the pending state
+    /// by its fixed 6to4 reading, provider 2's answer waits for discovery,
+    /// and the learned prefix then makes provider 1's address loopback.
+    #[tokio::test]
+    async fn one_settled_nat64_state_judges_every_providers_candidates() {
+        use freedom_ipfs_net::gate::{Nat64Prefix, Nat64State};
+        use freedom_ipfs_net::{Addresses, Nat64Handle};
+        let (publisher, handle) = Nat64Handle::channel(Nat64State::Pending);
+        let network = direct_network("https://dns.example/dns-query", Addresses::Checked(handle));
+        let expansion = AddressExpansion::of(&network);
+        let providers = vec![
+            Provider::from_parts(
+                Some(POLICY_PEER.into()),
+                vec![format!(
+                    "/ip6/2002:808:808:7f00:0:100::/tcp/4001/p2p/{POLICY_PEER}"
+                )],
+            )
+            .unwrap(),
+            Provider::from_parts(
+                Some(POLICY_PEER.into()),
+                vec![format!("/dns6/waiting.example/tcp/4001/p2p/{POLICY_PEER}")],
+            )
+            .unwrap(),
+        ];
+        let mut txt = DnsaddrCache::new();
+        let mut ips = HashMap::from([(
+            "waiting.example".into(),
+            CachedDnsIpRecords {
+                addrs: vec!["2a00:1:2:3:a9:fea9:fe00:0".parse().unwrap()],
+                log_as_cached: true,
+            },
+        )]);
+        let mut resolving = Box::pin(bitswap_peers_with_quality_using_caches_with_options(
+            &providers, &mut txt, &mut ips, true, false, &expansion,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(resolving.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let overlap = Nat64Prefix::new("2002:808:808::".parse().unwrap(), 48).unwrap();
+        let waiting = Nat64Prefix::new("2a00:1:2:3::".parse().unwrap(), 64).unwrap();
+        publisher.publish(Nat64State::known([overlap, waiting]));
+        let candidates = resolving.await;
+        let addresses = candidates
+            .peers
+            .iter()
+            .flat_map(|peer| peer.addrs.iter().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        assert!(addresses.is_empty(), "{addresses:?}");
+        assert_eq!(candidates.quality.policy_refused_addr_count, 2);
+    }
+
+    /// A configured name's answer is exempt, so it doesn't wait for NAT64
+    /// discovery (#47 review round 2, 47-R2-m1, the adversarial probe): the
+    /// choice ends at once under a pending state, as with discovery done
+    /// (the control). An untrusted name answering the same address still
+    /// waits.
+    #[tokio::test]
+    async fn a_configured_answer_doesnt_wait_for_nat64_discovery() {
+        use freedom_ipfs_net::gate::{ConfiguredTargets, Nat64State};
+        use freedom_ipfs_net::{Addresses, Nat64Handle, Network, NetworkPolicy};
+        let candidates = |handle, name: &'static str| async move {
+            let mut configured = ConfiguredTargets::new();
+            configured
+                .add_url(&url::Url::parse("http://configured.example:4001/").unwrap())
+                .unwrap();
+            let network = Network::with_lookup(
+                NetworkPolicy::direct(
+                    configured,
+                    url::Url::parse("https://dns.example/dns-query").unwrap(),
+                    Addresses::Checked(handle),
+                )
+                .unwrap(),
+                None,
+            );
+            let expansion = AddressExpansion::of(&network);
+            let providers = vec![Provider::from_parts(
+                Some(POLICY_PEER.into()),
+                vec![format!("/dns6/{name}/tcp/4001/p2p/{POLICY_PEER}")],
+            )
+            .unwrap()];
+            let mut txt = DnsaddrCache::new();
+            let mut ips = HashMap::from([(
+                name.into(),
+                CachedDnsIpRecords {
+                    addrs: vec!["2a00:1::1".parse().unwrap()],
+                    log_as_cached: true,
+                },
+            )]);
+            bitswap_peers_with_quality_using_caches_with_options(
+                &providers, &mut txt, &mut ips, true, false, &expansion,
+            )
+            .await
+        };
+        let control = tokio::time::timeout(
+            Duration::from_millis(50),
+            candidates(Nat64Handle::fixed(Nat64State::NONE), "configured.example"),
+        )
+        .await
+        .expect("the positive control completes");
+        assert_eq!(control.peers.len(), 1, "the configured answer is admitted");
+
+        let (_publisher, pending) = Nat64Handle::channel(Nat64State::Pending);
+        let result = tokio::time::timeout(
+            Duration::from_millis(50),
+            candidates(pending.clone(), "configured.example"),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "an exempt configured answer waited for NAT64 discovery"
+        );
+        assert_eq!(result.unwrap().peers.len(), 1);
+
+        let untrusted = tokio::time::timeout(
+            Duration::from_millis(100),
+            candidates(pending, "other.example"),
+        )
+        .await;
+        assert!(
+            untrusted.is_err(),
+            "an untrusted answer didn't wait for discovery"
+        );
+    }
+
+    /// Design 0007, "publication and checks", for a choice: (a) a
+    /// publication made while a choice waits is the state all its
+    /// candidates are judged against; (c) a choice begun after a
+    /// publication uses it. For a prefix added and an incomplete state.
+    #[tokio::test]
+    async fn a_choice_uses_the_state_published_before_it_reads() {
+        use freedom_ipfs_net::gate::{Nat64Prefix, Nat64State};
+        use freedom_ipfs_net::{Addresses, Nat64Handle};
+        let prefix = Nat64Prefix::new("2a00:1:2:3::".parse().unwrap(), 64).unwrap();
+        for (kind, published) in [
+            ("a prefix added", Nat64State::known([prefix])),
+            ("incomplete", Nat64State::Incomplete(vec![prefix])),
+        ] {
+            let providers = vec![
+                Provider::from_parts(
+                    Some(POLICY_PEER.into()),
+                    vec![format!(
+                        "/ip6/2a00:1:2:3:a9:fea9:fe00:0/tcp/4001/p2p/{POLICY_PEER}"
+                    )],
+                )
+                .unwrap(),
+                Provider::from_parts(
+                    Some(POLICY_PEER.into()),
+                    vec![format!("/dns6/waiting.example/tcp/4001/p2p/{POLICY_PEER}")],
+                )
+                .unwrap(),
+            ];
+            let cached = || {
+                HashMap::from([(
+                    "waiting.example".to_string(),
+                    CachedDnsIpRecords {
+                        addrs: vec!["2a00:1::1".parse().unwrap()],
+                        log_as_cached: true,
+                    },
+                )])
+            };
+            // (a): published while the choice waits for discovery.
+            let (publisher, handle) = Nat64Handle::channel(Nat64State::Pending);
+            let expansion = AddressExpansion::of(&direct_network(
+                "https://dns.example/dns-query",
+                Addresses::Checked(handle),
+            ));
+            let mut txt = DnsaddrCache::new();
+            let mut ips = cached();
+            let mut choosing = Box::pin(bitswap_peers_with_quality_using_caches_with_options(
+                &providers, &mut txt, &mut ips, true, false, &expansion,
+            ));
+            std::future::poll_fn(|cx| {
+                assert!(choosing.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            publisher.publish(published.clone());
+            let chosen = choosing.await;
+            let addrs = chosen
+                .peers
+                .iter()
+                .flat_map(|peer| peer.addrs.iter().map(ToString::to_string))
+                .collect::<Vec<_>>();
+            match kind {
+                // 2a00:1::1 isn't under the prefix: it passes; the other
+                // embeds 169.254.169.254.
+                "a prefix added" => assert_eq!(addrs, ["/ip6/2a00:1::1/tcp/4001"], "{kind}"),
+                _ => assert!(addrs.is_empty(), "{kind}: {addrs:?}"),
+            }
+
+            // (c): a choice begun after the publication.
+            let (publisher, handle) = Nat64Handle::channel(Nat64State::NONE);
+            let expansion = AddressExpansion::of(&direct_network(
+                "https://dns.example/dns-query",
+                Addresses::Checked(handle),
+            ));
+            let choose = || {
+                let expansion = expansion.clone();
+                let providers = providers.clone();
+                async move {
+                    let mut txt = DnsaddrCache::new();
+                    let mut ips = cached();
+                    bitswap_peers_with_quality_using_caches_with_options(
+                        &providers, &mut txt, &mut ips, true, false, &expansion,
+                    )
+                    .await
+                }
+            };
+            assert_eq!(choose().await.peers[0].addrs.len(), 2, "{kind}: before");
+            publisher.publish(published);
+            let after = choose().await;
+            let addrs = after
+                .peers
+                .iter()
+                .flat_map(|peer| peer.addrs.iter().map(ToString::to_string))
+                .collect::<Vec<_>>();
+            match kind {
+                "a prefix added" => assert_eq!(addrs, ["/ip6/2a00:1::1/tcp/4001"], "{kind}"),
+                _ => assert!(addrs.is_empty(), "{kind}: {addrs:?}"),
+            }
+        }
+    }
+
+    /// A configured name and port keep their exemption through the answer
+    /// that replaces the name, for that answer only (#47 review, 47-M3):
+    /// another name answering the same address, and the address as a
+    /// literal, are refused.
+    #[tokio::test]
+    async fn a_configured_names_exemption_survives_its_expansion_only() {
+        use freedom_ipfs_net::gate::ConfiguredTargets;
+        use freedom_ipfs_net::{Network, NetworkPolicy};
+        let mut configured = ConfiguredTargets::new();
+        configured
+            .add_url(&url::Url::parse("http://configured.example:4001").unwrap())
+            .unwrap();
+        let network = Network::with_lookup(
+            NetworkPolicy::direct(
+                configured,
+                url::Url::parse("https://dns.example/dns-query").unwrap(),
+                checked_addresses(),
+            )
+            .unwrap(),
+            None,
+        );
+        let expansion = AddressExpansion::of(&network);
+        let loopback = || CachedDnsIpRecords {
+            addrs: vec!["127.0.0.1".parse().unwrap()],
+            log_as_cached: true,
+        };
+        let candidates = |addr: String| {
+            let expansion = expansion.clone();
+            async move {
+                let providers = vec![Provider::from_parts(
+                    Some(POLICY_PEER.into()),
+                    vec![format!("{addr}/p2p/{POLICY_PEER}")],
+                )
+                .unwrap()];
+                let mut txt = DnsaddrCache::new();
+                let mut ips = HashMap::from([
+                    ("configured.example".into(), loopback()),
+                    ("other.example".into(), loopback()),
+                ]);
+                bitswap_peers_with_quality_using_caches_with_options(
+                    &providers, &mut txt, &mut ips, true, false, &expansion,
+                )
+                .await
+            }
+        };
+        let configured = candidates("/dns4/configured.example/tcp/4001".into()).await;
+        assert_eq!(configured.peers.len(), 1);
+        assert_eq!(
+            configured.peers[0].addrs[0].to_string(),
+            "/ip4/127.0.0.1/tcp/4001"
+        );
+        for refused in [
+            "/dns4/other.example/tcp/4001",
+            "/dns4/configured.example/tcp/4002",
+            "/ip4/127.0.0.1/tcp/4001",
+        ] {
+            let candidates = candidates(refused.into()).await;
+            assert!(candidates.peers.is_empty(), "{refused}");
+        }
+    }
+
+    /// A `direct` network with checked addresses (`addresses`) whose one
+    /// configured target is `configured.example` on `port`.
+    fn configured_network(
+        port: u16,
+        addresses: freedom_ipfs_net::Addresses,
+    ) -> freedom_ipfs_net::Network {
+        let mut configured = freedom_ipfs_net::gate::ConfiguredTargets::new();
+        configured
+            .add_url(&url::Url::parse(&format!("http://configured.example:{port}")).unwrap())
+            .unwrap();
+        freedom_ipfs_net::Network::with_lookup(
+            freedom_ipfs_net::NetworkPolicy::direct(
+                configured,
+                url::Url::parse("https://dns.example/dns-query").unwrap(),
+                addresses,
+            )
+            .unwrap(),
+            None,
+        )
+    }
+
+    fn random_peer() -> PeerId {
+        libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+    }
+
+    /// Candidate choice over `providers` (one address each, with its peer),
+    /// with `configured.example` answering `answers` from the cache: no
+    /// lookup goes out.
+    async fn choose_with_answers(
+        expansion: &AddressExpansion,
+        providers: &[(PeerId, String)],
+        answers: &[&str],
+    ) -> Vec<BitswapPeer> {
+        let providers = providers
+            .iter()
+            .map(|(peer, addr)| {
+                Provider::from_parts(Some(peer.to_string()), vec![format!("{addr}/p2p/{peer}")])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut txt = DnsaddrCache::new();
+        let mut ips = HashMap::from([(
+            "configured.example".to_string(),
+            CachedDnsIpRecords {
+                addrs: answers.iter().map(|ip| ip.parse().unwrap()).collect(),
+                log_as_cached: true,
+            },
+        )]);
+        bitswap_peers_with_quality_using_caches_with_options(
+            &providers, &mut txt, &mut ips, true, false, expansion,
+        )
+        .await
+        .peers
+    }
+
+    /// The #48 conformance review's probe (major finding): a configured
+    /// name's answer is exempt for its own candidate's dial of it, never for
+    /// its address. Another provider's candidate for the same address, and
+    /// another address of the configured candidate's peer, admitted before
+    /// NAT64 discovery learned a prefix under which they are loopback, and
+    /// dialed after, are judged by the address policy then and refused; the
+    /// configured answer's dial keeps its exemption.
+    #[tokio::test]
+    async fn a_configured_answer_doesnt_exempt_another_candidate_for_its_address() {
+        use freedom_ipfs_net::gate::{Nat64Prefix, Nat64State};
+        use freedom_ipfs_net::transport::Gated;
+        use freedom_ipfs_net::{Addresses, Nat64Handle};
+        use libp2p::core::transport::dummy::{DummyStream, DummyTransport};
+        use libp2p::core::transport::{DialOpts, PortUse, TransportError};
+        use libp2p::Transport as _;
+
+        let (publisher, handle) = Nat64Handle::channel(Nat64State::NONE);
+        let network = configured_network(4001, Addresses::Checked(handle));
+        let expansion = AddressExpansion::of(&network);
+        let answer = "2002:808:808:7f00:0:100::";
+        let addr: Multiaddr = format!("/ip6/{answer}/tcp/4001").parse().unwrap();
+        let other_port: Multiaddr = format!("/ip6/{answer}/tcp/4002").parse().unwrap();
+        let (configured, untrusted) = (random_peer(), random_peer());
+        let peers = choose_with_answers(
+            &expansion,
+            &[
+                (configured, "/dns6/configured.example/tcp/4001".into()),
+                (untrusted, addr.to_string()),
+                (configured, other_port.to_string()),
+            ],
+            &[answer],
+        )
+        .await;
+        assert_eq!(peers.len(), 2);
+        let dials = interleaved_bitswap_dials(&peers);
+        let provenance = |peer, addr: &Multiaddr| {
+            dials
+                .iter()
+                .find(|dial| dial.peer == peer && dial.addr == *addr)
+                .unwrap()
+                .provenance
+        };
+        assert_eq!(dials.len(), 3);
+        assert_eq!(
+            provenance(configured, &addr),
+            DialProvenance::ConfiguredAnswer
+        );
+        assert_eq!(provenance(untrusted, &addr), DialProvenance::Untrusted);
+        assert_eq!(
+            provenance(configured, &other_port),
+            DialProvenance::Untrusted
+        );
+
+        // Discovery then learns that the same bits are loopback under a
+        // network-specific prefix.
+        let prefix = Nat64Prefix::new("2002:808:808::".parse().unwrap(), 48).unwrap();
+        publisher.publish(Nat64State::known([prefix]));
+        assert!(network.dial_policy().check_now(&addr).is_err());
+        assert!(network.dial_policy().check_now(&other_port).is_err());
+
+        let mut gated = Gated::inner(DummyTransport::<DummyStream>::new(), network.dial_policy());
+        for dial in &dials {
+            let opts = DialOpts {
+                role: libp2p::core::Endpoint::Dialer,
+                port_use: PortUse::New,
+            };
+            let result = dial_with_provenance(&dial.addr, dial.provenance, || {
+                gated.dial(dial.addr.clone(), opts)
+            });
+            // The inner gate refuses with `Other`; past it, the dummy
+            // transport supports no address.
+            let passed_the_gate = matches!(result, Err(TransportError::MultiaddrNotSupported(_)));
+            assert_eq!(
+                passed_the_gate,
+                dial.peer == configured && dial.addr == addr,
+                "{} {:?}",
+                dial.addr,
+                dial.provenance
+            );
+        }
+    }
+
+    /// Candidate choice under `socks5` (design 0007: names are resolved
+    /// through the proxy, never by a local resolver): a `/dns*` address
+    /// stays a name for the transport's `RESOLVE`, with no DoH lookup; QUIC
+    /// goes before the per-peer cut; a well-formed `/onion3` is a
+    /// candidate, a malformed onion isn't. Under `direct` (the control) the
+    /// name is looked up through DoH, QUIC is kept, and onions are refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn under_socks5_candidate_choice_leaves_names_to_the_proxy() {
+        use freedom_ipfs_net::socks::fixture::SocksFixture;
+        let (doh, asked) = bitswap_canary();
+        let doh_url = format!("http://127.0.0.1:{}/dns-query", canary_port(&doh));
+        let direct = direct_network(&doh_url, freedom_ipfs_net::Addresses::Unchecked);
+        let fixture = SocksFixture::start().await;
+        let socks5 = freedom_ipfs_net::Network::with_lookup(
+            freedom_ipfs_net::NetworkPolicy::socks5(
+                fixture.addr(),
+                freedom_ipfs_net::gate::ConfiguredTargets::new(),
+                url::Url::parse(&doh_url).unwrap(),
+            )
+            .unwrap(),
+            None,
+        );
+        // One resolver for both, which asks through a direct client: only
+        // the policy differs.
+        let resolver = Arc::new(CloudflareDohResolver::with_client(
+            &doh_url,
+            direct.http_client(freedom_ipfs_namesys::HTTP_CLIENT_CONFIG),
+        ));
+        let onion3 = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd";
+        let (named, quic, onion, malformed) =
+            (random_peer(), random_peer(), random_peer(), random_peer());
+        let providers = [
+            (named, "/dns4/peer.example/tcp/4001".to_string()),
+            (quic, "/ip4/8.8.8.8/udp/4001/quic-v1".to_string()),
+            (quic, "/ip4/8.8.4.4/tcp/4001".to_string()),
+            (onion, format!("/onion3/{onion3}:4001")),
+            (malformed, "/dns4/foo.onion/tcp/4001".to_string()),
+        ]
+        .map(|(peer, addr)| {
+            Provider::from_parts(Some(peer.to_string()), vec![format!("{addr}/p2p/{peer}")])
+                .unwrap()
+        });
+        for proxied in [true, false] {
+            let expansion = AddressExpansion {
+                resolver: resolver.clone(),
+                policy: if proxied {
+                    socks5.dial_policy()
+                } else {
+                    direct.dial_policy()
+                },
+            };
+            let before = asked.load(Ordering::SeqCst);
+            let peers = bitswap_peers_with_quality_using_caches_with_options(
+                &providers,
+                &mut DnsaddrCache::new(),
+                &mut DnsIpCache::new(),
+                false,
+                false,
+                &expansion,
+            )
+            .await
+            .peers;
+            let chosen = |peer: PeerId| {
+                peers
+                    .iter()
+                    .find(|candidate| candidate.id == peer)
+                    .map(|candidate| {
+                        candidate
+                            .addrs
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                    })
+            };
+            if proxied {
+                assert_eq!(
+                    chosen(named),
+                    Some(vec!["/dns4/peer.example/tcp/4001".to_string()])
+                );
+                assert_eq!(
+                    chosen(quic),
+                    Some(vec!["/ip4/8.8.4.4/tcp/4001".to_string()])
+                );
+                assert_eq!(chosen(onion), Some(vec![format!("/onion3/{onion3}:4001")]));
+                assert_eq!(chosen(malformed), None);
+                assert_eq!(
+                    asked.load(Ordering::SeqCst),
+                    before,
+                    "a DoH lookup under socks5"
+                );
+            } else {
+                // The DoH endpoint drops every connection: with no answer,
+                // the name is left to the transport's own DNS layer.
+                assert_eq!(
+                    chosen(named),
+                    Some(vec!["/dns4/peer.example/tcp/4001".to_string()])
+                );
+                assert_eq!(chosen(quic).map(|addrs| addrs.len()), Some(2));
+                assert_eq!(chosen(onion), None);
+                assert_eq!(chosen(malformed), None);
+                assert!(
+                    asked.load(Ordering::SeqCst) > before,
+                    "the control looks the name up"
+                );
+            }
+        }
+        // Under the legacy policy, as before, `/onion3` isn't an address the
+        // transports carry.
+        let legacy = bitswap_peers_with_quality_using_caches_with_options(
+            &providers[3..4],
+            &mut DnsaddrCache::new(),
+            &mut DnsIpCache::new(),
+            false,
+            false,
+            &AddressExpansion::legacy(),
+        )
+        .await;
+        assert!(legacy.peers.is_empty());
+        assert_eq!(legacy.quality.unsupported_transport_addr_count, 1);
+    }
+
+    /// The #48 reviews' second case: a configured answer grants its
+    /// exemption only once selected. Answers cut by the per-peer limit, at
+    /// candidate choice or when recent addresses are merged in, are no
+    /// longer the candidate's configured answers (the control: one that
+    /// stays selected keeps its provenance).
+    #[tokio::test]
+    async fn only_a_selected_configured_answer_keeps_its_provenance() {
+        use freedom_ipfs_net::gate::Nat64State;
+        use freedom_ipfs_net::{Addresses, Nat64Handle};
+        let network = configured_network(
+            4001,
+            Addresses::Checked(Nat64Handle::fixed(Nat64State::NONE)),
+        );
+        let expansion = AddressExpansion::of(&network);
+        let peer = random_peer();
+
+        // Three answers, two kept.
+        let peers = choose_with_answers(
+            &expansion,
+            &[(peer, "/dns4/configured.example/tcp/4001".into())],
+            &["127.0.0.1", "127.0.0.2", "127.0.0.3"],
+        )
+        .await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].addrs.len(), MAX_BITSWAP_ADDRS_PER_PEER);
+        assert_eq!(peers[0].configured_answers, peers[0].addrs);
+
+        // A QUIC answer, then merged with a recent peer's TCP addresses,
+        // which rank first.
+        for (recent, kept) in [(1, true), (2, false)] {
+            let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+            let retriever = HttpRetriever::new(
+                freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+                store,
+            );
+            let mut peers = choose_with_answers(
+                &expansion,
+                &[(peer, "/dns4/configured.example/udp/4001/quic-v1".into())],
+                &["127.0.0.1"],
+            )
+            .await;
+            let quic: Multiaddr = "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap();
+            assert_eq!(peers[0].configured_answers, std::slice::from_ref(&quic));
+            let tcp = (1..=recent)
+                .map(|port| format!("/ip4/8.8.8.{port}/tcp/4001").parse().unwrap())
+                .collect::<Vec<Multiaddr>>();
+            retriever
+                .record_successful_bitswap_peer(peer, tcp, Duration::from_millis(10))
+                .await;
+            retriever
+                .insert_recent_bitswap_session_peers(&mut peers)
+                .await;
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].addrs.contains(&quic), kept, "recent: {recent}");
+            assert_eq!(
+                peers[0].configured_answers,
+                if kept { vec![quic.clone()] } else { Vec::new() },
+                "recent: {recent}"
+            );
+            let configured_dials = interleaved_bitswap_dials(&peers)
+                .into_iter()
+                .filter(|dial| dial.provenance == DialProvenance::ConfiguredAnswer)
+                .map(|dial| dial.addr)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                configured_dials,
+                if kept { vec![quic.clone()] } else { Vec::new() },
+                "recent: {recent}"
+            );
+        }
+    }
+
+    /// Check 1 where providers come in: under a gated policy refused
+    /// addresses and HTTP base URLs are dropped, and the provider keeps its
+    /// peer ID and the rest; under the legacy policy nothing changes.
+    #[tokio::test]
+    async fn providers_come_in_through_the_policy() {
+        let providers = vec![Provider::from_parts(
+            Some(POLICY_PEER.to_string()),
+            vec![
+                format!("/ip4/127.0.0.1/tcp/4001/p2p/{POLICY_PEER}"),
+                "/ip4/127.0.0.1/tcp/8080/http".to_string(),
+                "/dns4/x.onion/tcp/80/http".to_string(),
+                "/dns4/example.com/tcp/443/https".to_string(),
+                format!("/ip4/8.8.8.8/ip4/127.0.0.1/tcp/4001/p2p/{POLICY_PEER}"),
+            ],
+        )
+        .unwrap()];
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let legacy = HttpRetriever::new(ProviderRoutingClient::Offline, store.clone());
+        assert_eq!(
+            legacy.admitted_providers(providers.clone()).await,
+            providers
+        );
+
+        let urls = |providers: &[Provider]| {
+            providers[0]
+                .http_urls
+                .iter()
+                .map(|url| url.to_string())
+                .collect::<Vec<_>>()
+        };
+        for (addresses, kept_addrs, kept_urls) in [
+            (
+                freedom_ipfs_net::Addresses::Unchecked,
+                3,
+                vec!["http://127.0.0.1:8080/", "https://example.com/"],
+            ),
+            (checked_addresses(), 1, vec!["https://example.com/"]),
+        ] {
+            let network = direct_network("https://dns.example/dns-query", addresses);
+            let retriever = HttpRetriever::new(ProviderRoutingClient::Offline, store.clone())
+                .with_http_client(network.http_client(HTTP_PROVIDER_CLIENT_CONFIG));
+            let admitted = retriever.admitted_providers(providers.clone()).await;
+            assert_eq!(admitted[0].id, providers[0].id);
+            assert_eq!(admitted[0].addrs.len(), kept_addrs, "{admitted:?}");
+            assert_eq!(urls(&admitted), kept_urls);
+        }
+    }
+
     #[tokio::test]
     async fn cached_dns_expansion_reuses_dnsaddr_and_ip_results() {
         let mut dnsaddr_cache = HashMap::from([(
@@ -13381,6 +14918,9 @@ mod bitswap_tests {
             ],
             &mut dnsaddr_cache,
             &mut dns_ip_cache,
+            &AddressExpansion::legacy(),
+            nat64_candidate_deadline(),
+            &mut 0,
         )
         .await;
 
@@ -13560,7 +15100,7 @@ mod bitswap_tests {
                 .unwrap(),
         ];
 
-        let candidates = bitswap_peers_with_quality(&providers).await;
+        let candidates = bitswap_peers_with_quality(&providers, &AddressExpansion::legacy()).await;
         let quality = candidates.quality;
 
         assert_eq!(candidates.peers.len(), 1);
@@ -13596,6 +15136,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: ws_peer,
                 addrs: vec!["/ip4/127.0.0.4/tcp/4001/ws".parse().unwrap()],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -13603,6 +15144,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: dns_peer,
                 addrs: vec!["/dns4/provider.example/tcp/4001".parse().unwrap()],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -13610,6 +15152,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: quic_peer,
                 addrs: vec!["/ip4/127.0.0.3/udp/4001/quic-v1".parse().unwrap()],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -13617,6 +15160,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: tcp_peer,
                 addrs: vec!["/ip4/127.0.0.2/tcp/4001".parse().unwrap()],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -13654,6 +15198,7 @@ mod bitswap_tests {
             &mut dns_ip_cache,
             true,
             false,
+            &AddressExpansion::legacy(),
         )
         .await;
 
@@ -13716,6 +15261,7 @@ mod bitswap_tests {
             &mut dns_ip_cache,
             false,
             true,
+            &AddressExpansion::legacy(),
         )
         .await;
 
@@ -14076,7 +15622,7 @@ mod bitswap_tests {
         )
         .unwrap()];
 
-        let peers = bitswap_peers(&providers).await;
+        let peers = bitswap_peers(&providers, &AddressExpansion::legacy()).await;
 
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].addrs.len(), MAX_BITSWAP_ADDRS_PER_PEER);
@@ -14101,6 +15647,7 @@ mod bitswap_tests {
                     "/ip4/127.0.0.1/tcp/1001".parse().unwrap(),
                     "/ip4/127.0.0.1/tcp/1002".parse().unwrap(),
                 ],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -14111,6 +15658,7 @@ mod bitswap_tests {
                     "/ip4/127.0.0.1/tcp/2001".parse().unwrap(),
                     "/ip4/127.0.0.1/tcp/2002".parse().unwrap(),
                 ],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -14161,6 +15709,7 @@ mod bitswap_tests {
                             .unwrap()
                     })
                     .collect(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -14216,6 +15765,7 @@ mod bitswap_tests {
                             .unwrap()
                     })
                     .collect(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -14288,6 +15838,7 @@ mod bitswap_tests {
                     "/ip4/127.0.0.1/tcp/1004".parse().unwrap(),
                     "/ip4/127.0.0.1/tcp/1005".parse().unwrap(),
                 ],
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: false,
                 force_want_have: false,
@@ -14295,6 +15846,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: second,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -14302,6 +15854,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: third,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -14309,6 +15862,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: fourth,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -14316,6 +15870,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: fifth,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -14345,6 +15900,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: first,
                 addrs: vec![first_addr, first_alt_addr.clone()],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -14352,6 +15908,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: second,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -14359,6 +15916,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: third,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -14366,6 +15924,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: fourth,
                 addrs: vec![fourth_addr],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -14400,14 +15959,14 @@ mod bitswap_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn bitswap_client_swarm_does_not_listen_for_inbound_peers() {
-        let swarm = build_bitswap_swarm(None).await.unwrap();
+        let swarm = build_bitswap_swarm(None, None).await.unwrap();
 
         assert_eq!(swarm.listeners().count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn shared_bitswap_swarm_exits_when_commands_close() {
-        let swarm = build_bitswap_swarm(None).await.unwrap();
+        let swarm = build_bitswap_swarm(None, None).await.unwrap();
         let mut control = swarm.behaviour().stream.new_control();
         let incoming = accept_bitswap_streams(&mut control).unwrap();
         let (commands, receiver) = mpsc::channel(1);
@@ -14443,7 +16002,9 @@ mod bitswap_tests {
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
         let (peer_id, addr, swarm_task, stream_task, want_seen) =
             spawn_bitswap_peer_waiting_for_stream_close(cid).await;
-        let client = SharedBitswapClient::spawn(None, None, None).await.unwrap();
+        let client = SharedBitswapClient::spawn(None, None, None, None)
+            .await
+            .unwrap();
         let fetch_task = tokio::spawn(async move {
             client
                 .fetch(
@@ -14451,6 +16012,7 @@ mod bitswap_tests {
                     vec![BitswapPeer {
                         id: peer_id,
                         addrs: vec![addr],
+                        configured_answers: Vec::new(),
                         skip_want_have: true,
                         force_want_block: false,
                         force_want_have: false,
@@ -14745,7 +16307,7 @@ mod bitswap_tests {
             ])
             .await;
 
-        let mut swarm = build_bitswap_swarm(None).await.unwrap();
+        let mut swarm = build_bitswap_swarm(None, None).await.unwrap();
         let mut control = swarm.behaviour().stream.new_control();
         swarm
             .dial(addr.with_p2p(peer_id).unwrap_or_else(|addr| addr))
@@ -14795,7 +16357,9 @@ mod bitswap_tests {
                 (second, second_data.to_vec()),
             ])
             .await;
-        let client = SharedBitswapClient::spawn(None, None, None).await.unwrap();
+        let client = SharedBitswapClient::spawn(None, None, None, None)
+            .await
+            .unwrap();
 
         let result = client
             .fetch_many(
@@ -14803,6 +16367,7 @@ mod bitswap_tests {
                 vec![BitswapPeer {
                     id: peer_id,
                     addrs: vec![addr],
+                    configured_answers: Vec::new(),
                     skip_want_have: true,
                     force_want_block: false,
                     force_want_have: false,
@@ -14836,7 +16401,9 @@ mod bitswap_tests {
                 (second, second_data.to_vec()),
             ])
             .await;
-        let client = SharedBitswapClient::spawn(None, None, None).await.unwrap();
+        let client = SharedBitswapClient::spawn(None, None, None, None)
+            .await
+            .unwrap();
 
         let result = client
             .fetch_many(
@@ -14844,6 +16411,7 @@ mod bitswap_tests {
                 vec![BitswapPeer {
                     id: peer_id,
                     addrs: vec![addr],
+                    configured_answers: Vec::new(),
                     skip_want_have: true,
                     force_want_block: false,
                     force_want_have: false,
@@ -14947,7 +16515,9 @@ mod bitswap_tests {
 
     #[tokio::test]
     async fn shared_bitswap_client_fetch_many_rejects_empty_batch() {
-        let client = SharedBitswapClient::spawn(None, None, None).await.unwrap();
+        let client = SharedBitswapClient::spawn(None, None, None, None)
+            .await
+            .unwrap();
         let err = client.fetch_many(Vec::new(), Vec::new()).await.unwrap_err();
 
         assert!(
@@ -16571,6 +18141,7 @@ mod bitswap_tests {
             .map(|index| BitswapPeer {
                 id: PeerId::random(),
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: index == 0,
                 force_want_block: false,
                 force_want_have: false,
@@ -16615,6 +18186,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: trusted,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: false,
                 force_want_have: false,
@@ -16622,6 +18194,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: first,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -16629,6 +18202,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: second,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -16636,6 +18210,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: third,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -16697,6 +18272,7 @@ mod bitswap_tests {
                         "/ip6/2001:db8::1/tcp/4001".parse().unwrap(),
                         "/ip4/192.0.2.1/tcp/4001".parse().unwrap(),
                     ],
+                    configured_answers: Vec::new(),
                     skip_want_have: true,
                     force_want_block: false,
                     force_want_have: false,
@@ -16707,6 +18283,7 @@ mod bitswap_tests {
                         "/ip6/2001:db8::2/tcp/4001".parse().unwrap(),
                         "/ip4/192.0.2.2/tcp/4001".parse().unwrap(),
                     ],
+                    configured_answers: Vec::new(),
                     skip_want_have: false,
                     force_want_block: false,
                     force_want_have: false,
@@ -17025,6 +18602,7 @@ mod bitswap_tests {
             .map(|index| BitswapPeer {
                 id: PeerId::random(),
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: index < 3,
                 force_want_block: false,
                 force_want_have: false,
@@ -17192,6 +18770,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: first,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: false,
                 force_want_have: false,
@@ -17199,6 +18778,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: second,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: false,
                 force_want_have: false,
@@ -17206,6 +18786,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: third,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: false,
                 force_want_have: false,
@@ -17279,6 +18860,7 @@ mod bitswap_tests {
         let peers = vec![BitswapPeer {
             id: peer,
             addrs: Vec::new(),
+            configured_answers: Vec::new(),
             skip_want_have: true,
             force_want_block: false,
             force_want_have: false,
@@ -17551,6 +19133,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: other,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -17558,6 +19141,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: preferred,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -17611,6 +19195,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: slow,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -17618,6 +19203,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: fast,
                 addrs: Vec::new(),
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: false,
                 force_want_have: false,
@@ -17737,6 +19323,7 @@ mod bitswap_tests {
         let mut peers = vec![BitswapPeer {
             id: provider_peer,
             addrs: Vec::new(),
+            configured_answers: Vec::new(),
             skip_want_have: false,
             force_want_block: false,
             force_want_have: false,
@@ -17824,6 +19411,7 @@ mod bitswap_tests {
         let peer = BitswapPeer {
             id: session_peer,
             addrs: vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()],
+            configured_answers: Vec::new(),
             skip_want_have: true,
             force_want_block: false,
             force_want_have: false,
@@ -17850,6 +19438,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: first,
                 addrs: vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()],
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: false,
                 force_want_have: false,
@@ -17857,6 +19446,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: second,
                 addrs: vec!["/ip4/127.0.0.2/tcp/4001".parse().unwrap()],
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: false,
                 force_want_have: false,
@@ -18533,6 +20123,7 @@ mod bitswap_tests {
                 "/dns4/example.com/tcp/443/wss".parse().unwrap(),
                 "/dnsaddr/bootstrap.example/tcp/4001/ws".parse().unwrap(),
             ],
+            configured_answers: Vec::new(),
             skip_want_have: false,
             force_want_block: false,
             force_want_have: false,
@@ -20055,7 +21646,7 @@ mod bitswap_tests {
     async fn spawn_bitswap_actor(
         limits: &SharedLimits,
     ) -> (mpsc::Sender<BitswapCommand>, tokio::task::JoinHandle<()>) {
-        let swarm = build_bitswap_swarm(Some(limits)).await.unwrap();
+        let swarm = build_bitswap_swarm(Some(limits), None).await.unwrap();
         let mut control = swarm.behaviour().stream.new_control();
         let incoming = accept_bitswap_streams(&mut control).unwrap();
         let (commands, receiver) = mpsc::channel(64);
@@ -20063,6 +21654,329 @@ mod bitswap_tests {
             swarm, control, incoming, receiver, None,
         ));
         (commands, task)
+    }
+
+    /// A shared Bitswap swarm's task through `network`'s transports.
+    async fn spawn_bitswap_actor_through(
+        limits: &SharedLimits,
+        network: &freedom_ipfs_net::Network,
+    ) -> (mpsc::Sender<BitswapCommand>, tokio::task::JoinHandle<()>) {
+        let swarm = build_bitswap_swarm(Some(limits), Some(&Transports::new(network)))
+            .await
+            .unwrap();
+        let mut control = swarm.behaviour().stream.new_control();
+        let incoming = accept_bitswap_streams(&mut control).unwrap();
+        let (commands, receiver) = mpsc::channel(64);
+        let task = tokio::spawn(run_shared_bitswap_swarm(
+            swarm, control, incoming, receiver, None,
+        ));
+        (commands, task)
+    }
+
+    /// A TCP listener that counts the connections it accepts.
+    fn bitswap_canary() -> (Multiaddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = format!(
+            "/ip4/127.0.0.1/tcp/{}",
+            listener.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = accepted.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (addr, accepted)
+    }
+
+    async fn canary_reached(accepted: &std::sync::atomic::AtomicUsize, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while tokio::time::Instant::now() < deadline {
+            if accepted.load(Ordering::SeqCst) > 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        accepted.load(Ordering::SeqCst) > 0
+    }
+
+    /// The #45 lifecycle review's probe (finding 1), for Bitswap's immediate
+    /// dials: the work is queued, then the network revoked before the swarm
+    /// dials; the swarm's transport refuses the dial, and the canary sees
+    /// nothing. Unrevoked (the control), the same dial reaches it.
+    #[tokio::test]
+    async fn a_bitswap_dial_queued_before_the_revoke_opens_no_socket() {
+        for revoked in [true, false] {
+            let limits = SharedLimits::new(LimitSizes::default());
+            let network = freedom_ipfs_net::Network::legacy();
+            let (canary, accepted) = bitswap_canary();
+            let (commands, task) = spawn_bitswap_actor_through(&limits, &network).await;
+            let peer = libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id();
+            let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, b"queued");
+            // On this one thread, the swarm's task hasn't run yet: the
+            // command is queued, and nothing is dialed.
+            let _waiting = send_fetch(&commands, cid, peer, canary).await;
+            if revoked {
+                network.revoke();
+            }
+            let reached =
+                canary_reached(&accepted, Duration::from_secs(if revoked { 1 } else { 5 })).await;
+            task.abort();
+            assert_eq!(reached, !revoked, "revoked: {revoked}");
+        }
+    }
+
+    /// The same for a dial deferred behind the shared connection cap: it
+    /// waits for a slot, the network is revoked, and the slot frees; the
+    /// retried dial is refused by the transport. Unrevoked (the control),
+    /// the retried dial reaches the canary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deferred_bitswap_dial_after_the_revoke_opens_no_socket() {
+        for revoked in [true, false] {
+            let limits = SharedLimits::new(LimitSizes {
+                bitswap_connections: 1,
+                ..LimitSizes::default()
+            });
+            let holder = hold_connection_slot(&limits);
+            let network = freedom_ipfs_net::Network::legacy();
+            let (canary, accepted) = bitswap_canary();
+            let (commands, task) = spawn_bitswap_actor_through(&limits, &network).await;
+            let peer = libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id();
+            let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, b"deferred");
+            let _waiting = send_fetch(&commands, cid, peer, canary).await;
+            wait_until("the dial never waited for a slot", || {
+                limits.bitswap_connections_waiting() == 1
+            })
+            .await;
+            assert_eq!(accepted.load(Ordering::SeqCst), 0);
+            if revoked {
+                network.revoke();
+            }
+            drop(holder);
+            let reached =
+                canary_reached(&accepted, Duration::from_secs(if revoked { 1 } else { 5 })).await;
+            task.abort();
+            assert_eq!(reached, !revoked, "revoked: {revoked}");
+        }
+    }
+
+    /// A candidate's configured provenance goes with its dial through the
+    /// shared swarm's task, and with a dial deferred behind the connection
+    /// cap and retried (#48 reviews, major finding): under checked
+    /// addresses, its dial to a loopback answer reaches the canary, where
+    /// the same candidate without the provenance (the control) is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_candidates_provenance_goes_with_its_dial_and_its_retry() {
+        for deferred in [false, true] {
+            for configured in [true, false] {
+                let limits = SharedLimits::new(LimitSizes {
+                    bitswap_connections: 1,
+                    ..LimitSizes::default()
+                });
+                let holder = deferred.then(|| hold_connection_slot(&limits));
+                let (canary, accepted) = bitswap_canary();
+                let network = configured_network(canary_port(&canary), checked_addresses());
+                let (commands, task) = spawn_bitswap_actor_through(&limits, &network).await;
+                let candidate = BitswapPeer {
+                    id: random_peer(),
+                    addrs: vec![canary.clone()],
+                    configured_answers: if configured {
+                        vec![canary.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                    skip_want_have: true,
+                    force_want_block: true,
+                    force_want_have: false,
+                };
+                let cid =
+                    freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, b"provenance");
+                let _waiting = send_fetch_to(&commands, cid, candidate).await;
+                if let Some(holder) = holder {
+                    wait_until("the dial never waited for a slot", || {
+                        limits.bitswap_connections_waiting() == 1
+                    })
+                    .await;
+                    assert_eq!(accepted.load(Ordering::SeqCst), 0);
+                    drop(holder);
+                }
+                let reached = canary_reached(
+                    &accepted,
+                    Duration::from_secs(if configured { 5 } else { 2 }),
+                )
+                .await;
+                task.abort();
+                assert_eq!(
+                    reached, configured,
+                    "deferred: {deferred}, configured: {configured}"
+                );
+            }
+        }
+    }
+
+    fn canary_port(canary: &Multiaddr) -> u16 {
+        canary
+            .iter()
+            .find_map(|component| match component {
+                Protocol::Tcp(port) => Some(port),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    /// The retriever's Bitswap swarm under `socks5` dials through the proxy:
+    /// a TCP address is a `CONNECT` to that address, which reaches the
+    /// listener the proxy maps it to; a name is resolved through the proxy
+    /// first; QUIC never reaches the proxy, nor any socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_bitswap_swarm_dials_through_the_proxy() {
+        use freedom_ipfs_net::socks::fixture::{Answer, Destination, SocksFixture};
+        let fixture = SocksFixture::start().await;
+        let (canary, accepted) = bitswap_canary();
+        let public: std::net::SocketAddr = "8.8.8.8:4001".parse().unwrap();
+        let local: std::net::SocketAddr = format!("127.0.0.1:{}", canary_port(&canary))
+            .parse()
+            .unwrap();
+        fixture.forward(Destination::Ip(public), local);
+        fixture.answer("peer.example", Answer::Ip("8.8.8.8".parse().unwrap()));
+        let network = freedom_ipfs_net::Network::with_lookup(
+            freedom_ipfs_net::NetworkPolicy::socks5(
+                fixture.addr(),
+                freedom_ipfs_net::gate::ConfiguredTargets::new(),
+                url::Url::parse("https://dns.example/dns-query").unwrap(),
+            )
+            .unwrap(),
+            None,
+        );
+        let mut swarm = build_bitswap_swarm(None, Some(&Transports::new(&network)))
+            .await
+            .unwrap();
+        let peer = random_peer();
+        for addr in [
+            "/ip4/8.8.8.8/tcp/4001",
+            "/dns4/peer.example/tcp/4001",
+            "/ip4/8.8.8.8/udp/4001/quic-v1",
+        ] {
+            let addr: Multiaddr = format!("{addr}/p2p/{peer}").parse().unwrap();
+            let _ = dial_bitswap_addr(&mut swarm, addr, DialProvenance::Untrusted);
+        }
+        let polling = tokio::spawn(async move { while swarm.next().await.is_some() {} });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while accepted.load(Ordering::SeqCst) < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        polling.abort();
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        let requests = fixture.requests();
+        let connects = requests
+            .iter()
+            .filter(|request| request.is_connect())
+            .map(|request| request.destination.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(connects, [Destination::Ip(public), Destination::Ip(public)]);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.is_resolve())
+                .count(),
+            1
+        );
+        assert_eq!(fixture.connections(), 3);
+    }
+
+    /// The #48 adversarial review's probe (P1): a configured name's answer
+    /// is not an address-wide, lasting exemption. The configured
+    /// candidate's dial reaches the canary (the control); later candidates
+    /// for the same address without that provenance (another provider's
+    /// peer, and the configured peer again as a recent peer) are judged by
+    /// the address policy, and the canary sees nothing more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_configured_answer_is_not_an_address_wide_permanent_exemption() {
+        let (canary, accepted) = bitswap_canary();
+        let port = canary_port(&canary);
+        let network = configured_network(port, checked_addresses());
+        let expansion = AddressExpansion::of(&network);
+        let configured = random_peer();
+        let chosen = choose_with_answers(
+            &expansion,
+            &[(configured, format!("/dns4/configured.example/tcp/{port}"))],
+            &["127.0.0.1"],
+        )
+        .await;
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].addrs, std::slice::from_ref(&canary));
+        assert_eq!(chosen[0].configured_answers, std::slice::from_ref(&canary));
+
+        async fn dial_planned(
+            network: &freedom_ipfs_net::Network,
+            peers: &[BitswapPeer],
+            accepted: &std::sync::atomic::AtomicUsize,
+            expected: usize,
+            limit: Duration,
+        ) {
+            let mut swarm = build_bitswap_swarm(None, Some(&Transports::new(network)))
+                .await
+                .unwrap();
+            for dial in interleaved_bitswap_dials(peers) {
+                let addr = dial.addr.with_p2p(dial.peer).unwrap();
+                let _ = dial_bitswap_addr(&mut swarm, addr, dial.provenance);
+            }
+            let polling = tokio::spawn(async move { while swarm.next().await.is_some() {} });
+            let deadline = tokio::time::Instant::now() + limit;
+            while accepted.load(Ordering::SeqCst) < expected
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            polling.abort();
+        }
+
+        dial_planned(&network, &chosen, &accepted, 1, Duration::from_secs(5)).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "the control");
+
+        // The configured peer, recorded as a success, comes back as a
+        // recent peer; another peer has the same address as a literal.
+        let retriever = HttpRetriever::new(
+            freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
+            SqliteBlockStore::in_memory(1024 * 1024).unwrap(),
+        );
+        retriever
+            .record_successful_bitswap_peer(
+                configured,
+                chosen[0].addrs.clone(),
+                Duration::from_millis(10),
+            )
+            .await;
+        let mut later = vec![BitswapPeer {
+            id: random_peer(),
+            addrs: vec![canary.clone()],
+            configured_answers: Vec::new(),
+            skip_want_have: false,
+            force_want_block: false,
+            force_want_have: false,
+        }];
+        assert_eq!(
+            retriever
+                .insert_recent_bitswap_session_peers(&mut later)
+                .await,
+            1
+        );
+        assert_eq!(later.len(), 2);
+        assert!(later.iter().all(|peer| peer.addrs == [canary.clone()]));
+        dial_planned(&network, &later, &accepted, 2, Duration::from_secs(3)).await;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "an untrusted dial inherited a configured name's exemption"
+        );
     }
 
     /// A fetch command's requester, as `fetch_many_with_context` holds it:
@@ -20078,18 +21992,28 @@ mod bitswap_tests {
         peer: PeerId,
         addr: Multiaddr,
     ) -> WaitingFetch {
+        let candidate = BitswapPeer {
+            id: peer,
+            addrs: vec![addr],
+            configured_answers: Vec::new(),
+            skip_want_have: true,
+            force_want_block: true,
+            force_want_have: false,
+        };
+        send_fetch_to(commands, cid, candidate).await
+    }
+
+    async fn send_fetch_to(
+        commands: &mpsc::Sender<BitswapCommand>,
+        cid: Cid,
+        candidate: BitswapPeer,
+    ) -> WaitingFetch {
         let (respond, response) = oneshot::channel();
         let requester = Arc::new(());
         commands
             .send(BitswapCommand {
                 cids: vec![cid],
-                peers: vec![BitswapPeer {
-                    id: peer,
-                    addrs: vec![addr],
-                    skip_want_have: true,
-                    force_want_block: true,
-                    force_want_have: false,
-                }],
+                peers: vec![candidate],
                 sent_at: Instant::now(),
                 respond: Some(respond),
                 requester: Arc::downgrade(&requester),
@@ -20788,6 +22712,7 @@ mod bitswap_tests {
                 .map(|n| BitswapPeer {
                     id: PeerId::random(),
                     addrs: vec!["/ip4/127.0.0.1/tcp/9".parse().unwrap()],
+                    configured_answers: Vec::new(),
                     skip_want_have: n == 0,
                     force_want_block: false,
                     force_want_have: false,
@@ -20820,7 +22745,7 @@ mod bitswap_tests {
             let (release, released) = tokio::sync::watch::channel(false);
             let (peer, addr, _wants, peer_task, accept_task) =
                 spawn_held_bitswap_peer(vec![(cid, data)], released).await;
-            let mut swarm = build_bitswap_swarm(None).await.unwrap();
+            let mut swarm = build_bitswap_swarm(None, None).await.unwrap();
             let mut control = swarm.behaviour().stream.new_control();
             swarm
                 .dial(
@@ -21012,6 +22937,7 @@ mod bitswap_tests {
                     vec![BitswapPeer {
                         id: peer_id,
                         addrs: vec![addr],
+                        configured_answers: Vec::new(),
                         skip_want_have: true,
                         force_want_block: true,
                         force_want_have: false,
@@ -21060,6 +22986,7 @@ mod bitswap_tests {
                 vec![BitswapPeer {
                     id: peer_id,
                     addrs: vec![addr],
+                    configured_answers: Vec::new(),
                     skip_want_have: true,
                     force_want_block: true,
                     force_want_have: false,
@@ -21099,6 +23026,7 @@ mod bitswap_tests {
                 vec![BitswapPeer {
                     id: peer_id,
                     addrs: vec![addr],
+                    configured_answers: Vec::new(),
                     skip_want_have: true,
                     force_want_block: false,
                     force_want_have: false,
@@ -21134,7 +23062,7 @@ mod bitswap_tests {
             spawn_local_bitswap_peer(cid, data).await;
         let budget = MemoryBudget::new(8 << 20);
         let _full = budget.try_reserve(budget.limit()).unwrap();
-        let client = SharedBitswapClient::spawn(None, None, Some(&budget))
+        let client = SharedBitswapClient::spawn(None, None, Some(&budget), None)
             .await
             .unwrap();
         // A trusted and an untrusted peer: the 4 s request timeout.
@@ -21142,6 +23070,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: trusted,
                 addrs: vec![trusted_addr],
+                configured_answers: Vec::new(),
                 skip_want_have: true,
                 force_want_block: true,
                 force_want_have: false,
@@ -21149,6 +23078,7 @@ mod bitswap_tests {
             BitswapPeer {
                 id: untrusted,
                 addrs: vec![untrusted_addr],
+                configured_answers: Vec::new(),
                 skip_want_have: false,
                 force_want_block: true,
                 force_want_have: false,

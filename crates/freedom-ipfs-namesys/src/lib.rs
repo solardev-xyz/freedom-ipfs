@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use cid::Cid;
+use freedom_ipfs_net::gate::{classify_host, Refusal, Target};
+use freedom_ipfs_net::{ClientConfig, HttpClient, HttpError, Refused};
 use futures::stream::{FuturesUnordered, StreamExt};
 use ipld_core::ipld::Ipld;
 use libp2p_identity::{PeerId, PublicKey};
@@ -23,6 +25,12 @@ const LIBP2P_KEY_CODEC: u64 = 0x72;
 const IDENTITY_HASH: u64 = 0x00;
 const DEFAULT_NAME_CACHE_TTL: Duration = Duration::from_secs(60);
 const DEFAULT_NAMESYS_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// The DoH and delegated IPNS clients' configuration: a 10 s timeout, and
+/// reqwest's default redirects.
+pub const HTTP_CLIENT_CONFIG: ClientConfig = ClientConfig::new(
+    DEFAULT_NAMESYS_HTTP_TIMEOUT,
+    ClientConfig::REQWEST_DEFAULT_REDIRECTS,
+);
 const DNS_TYPE_CNAME: u16 = 5;
 const DNS_TYPE_TXT: u16 = 16;
 const DNS_TYPE_A: u16 = 1;
@@ -45,6 +53,19 @@ pub enum NamesysError {
     InvalidIpnsSignature,
     #[error("http resolver: {0}")]
     Http(#[from] reqwest::Error),
+    /// The request wasn't sent: the network's capability is revoked, or
+    /// its client couldn't be built.
+    #[error("http resolver: {0}")]
+    Network(HttpError),
+}
+
+impl From<HttpError> for NamesysError {
+    fn from(err: HttpError) -> Self {
+        match err {
+            HttpError::Http(err) => Self::Http(err),
+            other => Self::Network(other),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, NamesysError>;
@@ -218,24 +239,36 @@ struct CachedName {
 
 #[derive(Debug, Clone)]
 pub struct CloudflareDohResolver {
-    client: reqwest::Client,
+    client: HttpClient,
     endpoint: String,
 }
 
 impl Default for CloudflareDohResolver {
     fn default() -> Self {
         Self {
-            client: timeout_http_client(DEFAULT_NAMESYS_HTTP_TIMEOUT),
-            endpoint: "https://cloudflare-dns.com/dns-query".to_string(),
+            client: HttpClient::legacy(HTTP_CLIENT_CONFIG),
+            endpoint: DEFAULT_DOH_ENDPOINT.to_string(),
         }
     }
 }
+
+/// The DoH endpoint a resolver asks unless told another.
+pub const DEFAULT_DOH_ENDPOINT: &str = "https://cloudflare-dns.com/dns-query";
 
 impl CloudflareDohResolver {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
             ..Self::default()
+        }
+    }
+
+    /// A resolver for `endpoint` that sends through `client`: a network's
+    /// client for [`HTTP_CLIENT_CONFIG`], whose capability every query asks.
+    pub fn with_client(endpoint: impl Into<String>, client: HttpClient) -> Self {
+        Self {
+            client,
+            endpoint: endpoint.into(),
         }
     }
 
@@ -252,6 +285,95 @@ impl CloudflareDohResolver {
             .map_err(NamesysError::from)
     }
 
+    /// Under a gated network policy (`direct`), a name this resolver is
+    /// asked, or a CNAME's target it would follow, is classified first
+    /// (design 0007, check 2: an alias is an expansion result): an onion, an
+    /// IP literal or an invalid name is refused before any query for it.
+    /// Under the legacy policy names and aliases are queried as before.
+    ///
+    /// The name classified is the text as it came, and the name asked for
+    /// is the classifier's canonical one: one trailing dot removed, and an
+    /// empty label left by another refused, not trimmed away.
+    fn admit_name(&self, name: &str) -> Result<String> {
+        if !self.gated() {
+            return Ok(name.trim_end_matches('.').to_string());
+        }
+        let refused = |refused: Refused| Err(NamesysError::Network(HttpError::Refused(refused)));
+        match classify_host(name) {
+            Ok(Target::Name(name)) => Ok(name),
+            Ok(Target::Onion(_)) => refused(Refused::Onion),
+            Ok(Target::Ip(_)) => refused(Refused::Target(Refusal::InvalidHost)),
+            Err(refusal) => refused(Refused::Target(refusal)),
+        }
+    }
+
+    /// Whether the resolver's network has a gate (`direct`).
+    fn gated(&self) -> bool {
+        self.client.network().dial_policy().is_gated()
+    }
+
+    /// Under a gated policy, the records of one response that answer for
+    /// the chain at `chain.current` (design 0007, check 2: an alias is an
+    /// expansion result). The chain of CNAMEs the response holds is followed
+    /// from there, each alias classified ([`CloudflareDohResolver::admit_name`])
+    /// before anything it owns is taken:
+    /// - a name may own one alias at most: two refuse the lookup, rather than
+    ///   one chosen by the answers' order;
+    /// - a name already met in this lookup (across its responses) refuses it:
+    ///   a loop has no last name;
+    /// - past [`MAX_DOH_CNAME_DEPTH`] aliases, nothing is taken;
+    /// - the `wanted` records are taken only from a name with no alias, and
+    ///   only those it owns: a record owned by any other name is ignored.
+    ///
+    /// Real DoH JSON names every record's owner. An alias, or a record of
+    /// the kind asked for, without a valid one (its `name` missing, null,
+    /// or not a name the gate's classifier accepts: empty, blank, padded)
+    /// can't be placed in the chain: the lookup is refused, whatever the
+    /// answers' order. A record of another kind is left alone.
+    fn owned_answers<'a>(
+        &self,
+        answers: &'a [DohAnswer],
+        chain: &mut AliasChain,
+        wanted: impl Fn(&DohAnswer) -> bool,
+    ) -> Result<ChainStep<'a>> {
+        if answers
+            .iter()
+            .any(|answer| (answer.is_cname() || wanted(answer)) && answer.owner().is_none())
+        {
+            return Err(chain.refused("an answer doesn't name a valid owner"));
+        }
+        loop {
+            let owned = answers
+                .iter()
+                .enumerate()
+                .filter(|(_, answer)| answer.is_cname() && answer.is_owned_by(&chain.current))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let alias = match owned.as_slice() {
+                [] => {
+                    return Ok(ChainStep::Records(
+                        answers
+                            .iter()
+                            .filter(|answer| wanted(answer) && answer.is_owned_by(&chain.current))
+                            .collect(),
+                    ))
+                }
+                [index] => *index,
+                _ => return Err(chain.refused("a name in its chain has several aliases")),
+            };
+            if chain.followed == MAX_DOH_CNAME_DEPTH {
+                return Ok(ChainStep::TooLong);
+            }
+            chain.followed += 1;
+            chain.ttl = min_ttl(chain.ttl, answers[alias].ttl.map(Duration::from_secs));
+            let next = self.admit_name(&answers[alias].data)?;
+            if !chain.visited.insert(next.clone()) {
+                return Err(chain.refused("its aliases loop"));
+            }
+            chain.current = next;
+        }
+    }
+
     pub async fn ip_lookup(&self, name: &str) -> Result<Vec<IpAddr>> {
         let mut addrs = self.ip_lookup_type(name, DNS_TYPE_A).await?;
         addrs.extend(self.ip_lookup_type(name, DNS_TYPE_AAAA).await?);
@@ -260,24 +382,48 @@ impl CloudflareDohResolver {
         Ok(addrs)
     }
 
-    async fn ip_lookup_type(&self, name: &str, record_type: u16) -> Result<Vec<IpAddr>> {
-        let mut current = name.trim_end_matches('.').to_string();
+    async fn ip_lookup_response(&self, name: &str, record_type: u16) -> Result<DohResponse> {
         let record_type_query = record_type.to_string();
+        Ok(self
+            .client
+            .get(&self.endpoint)
+            .query(&[("name", name), ("type", record_type_query.as_str())])
+            .header("accept", "application/dns-json")
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<DohResponse>()
+            .await?)
+    }
+
+    async fn ip_lookup_type(&self, name: &str, record_type: u16) -> Result<Vec<IpAddr>> {
+        let mut current = self.admit_name(name)?;
+        if self.gated() {
+            let mut chain = AliasChain::new(name, current);
+            loop {
+                let asked = chain.current.clone();
+                let response = self.ip_lookup_response(&asked, record_type).await?;
+                let answers = response.answer.unwrap_or_default();
+                let step = self.owned_answers(&answers, &mut chain, |answer| {
+                    answer.record_type == Some(record_type)
+                })?;
+                let ChainStep::Records(owned) = step else {
+                    return Ok(Vec::new());
+                };
+                let addrs = owned
+                    .iter()
+                    .filter_map(|answer| answer.data.parse::<IpAddr>().ok())
+                    .collect::<Vec<_>>();
+                // An alias with nothing of its own in this response is asked
+                // for itself; `owned_answers` bounds how many.
+                if !addrs.is_empty() || chain.current == asked {
+                    return Ok(addrs);
+                }
+            }
+        }
 
         for _ in 0..=MAX_DOH_CNAME_DEPTH {
-            let response = self
-                .client
-                .get(&self.endpoint)
-                .query(&[
-                    ("name", current.as_str()),
-                    ("type", record_type_query.as_str()),
-                ])
-                .header("accept", "application/dns-json")
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<DohResponse>()
-                .await?;
+            let response = self.ip_lookup_response(&current, record_type).await?;
             let answers = response.answer.unwrap_or_default();
             let addrs = answers
                 .iter()
@@ -291,7 +437,7 @@ impl CloudflareDohResolver {
             let Some(cname) = answers.iter().find(|answer| answer.is_cname()) else {
                 return Ok(Vec::new());
             };
-            current = cname.data.trim_end_matches('.').to_string();
+            current = self.admit_name(&cname.data)?;
         }
 
         Ok(Vec::new())
@@ -310,8 +456,30 @@ impl DnsTxtResolver for CloudflareDohResolver {
     }
 
     async fn txt_lookup_with_ttl(&self, name: &str) -> Result<Vec<DnsTxtRecord>> {
-        let mut current = name.trim_end_matches('.').to_string();
+        let mut current = self.admit_name(name)?;
         let mut cname_ttl = None;
+        if self.gated() {
+            let mut chain = AliasChain::new(name, current);
+            loop {
+                let asked = chain.current.clone();
+                let response = self.txt_lookup_response(&asked).await?;
+                let answers = response.answer.unwrap_or_default();
+                let step = self.owned_answers(&answers, &mut chain, DohAnswer::is_txt)?;
+                let ChainStep::Records(owned) = step else {
+                    return Err(NamesysError::NotFound(name.to_string()));
+                };
+                let records = owned
+                    .iter()
+                    .map(|answer| DnsTxtRecord {
+                        value: unquote_txt(&answer.data),
+                        ttl: min_ttl(chain.ttl, answer.ttl.map(Duration::from_secs)),
+                    })
+                    .collect::<Vec<_>>();
+                if !records.is_empty() || chain.current == asked {
+                    return Ok(records);
+                }
+            }
+        }
 
         for _ in 0..=MAX_DOH_CNAME_DEPTH {
             let response = self.txt_lookup_response(&current).await?;
@@ -332,7 +500,7 @@ impl DnsTxtResolver for CloudflareDohResolver {
                 return Ok(Vec::new());
             };
             cname_ttl = min_ttl(cname_ttl, cname.ttl.map(Duration::from_secs));
-            current = cname.data.trim_end_matches('.').to_string();
+            current = self.admit_name(&cname.data)?;
         }
 
         Err(NamesysError::NotFound(name.to_string()))
@@ -342,7 +510,7 @@ impl DnsTxtResolver for CloudflareDohResolver {
 #[derive(Debug, Clone)]
 pub struct DelegatedIpnsResolver {
     endpoints: Vec<String>,
-    client: reqwest::Client,
+    client: HttpClient,
 }
 
 impl Default for DelegatedIpnsResolver {
@@ -361,6 +529,16 @@ impl DelegatedIpnsResolver {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        Self::with_endpoints_and_client(endpoints, HttpClient::legacy(HTTP_CLIENT_CONFIG))
+    }
+
+    /// A resolver for `endpoints` that sends through `client`: a network's
+    /// client for [`HTTP_CLIENT_CONFIG`], whose capability every lookup asks.
+    pub fn with_endpoints_and_client<I, S>(endpoints: I, client: HttpClient) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let mut endpoints = endpoints
             .into_iter()
             .map(|endpoint| endpoint.into().trim_end_matches('/').to_string())
@@ -369,10 +547,7 @@ impl DelegatedIpnsResolver {
         if endpoints.is_empty() {
             endpoints.push(DEFAULT_DELEGATED_ROUTER.to_string());
         }
-        Self {
-            endpoints,
-            client: timeout_http_client(DEFAULT_NAMESYS_HTTP_TIMEOUT),
-        }
+        Self { endpoints, client }
     }
 
     async fn resolve_ipns_from_endpoint(&self, endpoint: &str, name: &str) -> Result<IpnsRecord> {
@@ -825,22 +1000,56 @@ fn unquote_txt(input: &str) -> String {
     output
 }
 
-fn timeout_http_client(timeout: Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(timeout)
-        .timeout(timeout)
-        .build()
-        .expect("namesystem HTTP client config is valid")
-}
-
 #[derive(Debug, Deserialize)]
 struct DohResponse {
     #[serde(rename = "Answer")]
     answer: Option<Vec<DohAnswer>>,
 }
 
+/// A gated lookup's chain of aliases, across its responses.
+struct AliasChain {
+    /// The name the lookup was asked for, for its errors.
+    asked: String,
+    /// The name the chain has reached.
+    current: String,
+    /// Every name the chain has met.
+    visited: std::collections::HashSet<String>,
+    /// The aliases followed.
+    followed: usize,
+    /// Their lowest TTL.
+    ttl: Option<Duration>,
+}
+
+impl AliasChain {
+    fn new(asked: &str, current: String) -> Self {
+        Self {
+            asked: asked.to_string(),
+            visited: std::collections::HashSet::from([current.clone()]),
+            current,
+            followed: 0,
+            ttl: None,
+        }
+    }
+
+    fn refused(&self, why: &str) -> NamesysError {
+        NamesysError::NotFound(format!("{}: {why}", self.asked))
+    }
+}
+
+/// What one response gave a gated lookup's chain.
+enum ChainStep<'a> {
+    /// The records the chain's last name owns (none, if it owns none here
+    /// and the chain moved: that name is asked for next).
+    Records(Vec<&'a DohAnswer>),
+    /// More aliases than [`MAX_DOH_CNAME_DEPTH`]: nothing is taken.
+    TooLong,
+}
+
 #[derive(Debug, Deserialize)]
 struct DohAnswer {
+    /// The record's owner: under a gated policy, only the records the
+    /// queried name, or an admitted alias of it, owns are taken.
+    name: Option<String>,
     data: String,
     #[serde(rename = "TTL")]
     ttl: Option<u64>,
@@ -856,6 +1065,22 @@ impl DohAnswer {
 
     fn is_cname(&self) -> bool {
         self.record_type == Some(DNS_TYPE_CNAME)
+    }
+
+    /// The record's owner, canonical as the gate's classifier makes a name
+    /// (lowercase, one trailing dot removed): `None` when it has none, or
+    /// one the classifier refuses or reads as an address.
+    fn owner(&self) -> Option<String> {
+        match classify_host(self.name.as_deref()?) {
+            Ok(Target::Name(name) | Target::Onion(name)) => Some(name),
+            Ok(Target::Ip(_)) | Err(_) => None,
+        }
+    }
+
+    /// Whether `name` (canonical) owns the record. A record without a valid
+    /// owner is no name's.
+    fn is_owned_by(&self, name: &str) -> bool {
+        self.owner().is_some_and(|owner| owner == name)
     }
 }
 
@@ -1077,6 +1302,499 @@ mod tests {
                 Duration::from_secs(60)
             )]
         );
+    }
+
+    /// Under `direct`, a DNSLink lookup's alias is classified before it is
+    /// followed (#47 adversarial review, 47-A1): an onion alias is refused
+    /// with no query for it. The legacy policy follows it, as before.
+    #[tokio::test]
+    async fn an_onion_alias_is_refused_under_direct_and_followed_under_legacy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = asked.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                let len = tokio::io::AsyncReadExt::read(&mut stream, &mut request)
+                    .await
+                    .unwrap();
+                let request = String::from_utf8_lossy(&request[..len]).to_string();
+                let line = request.lines().next().unwrap_or("").to_string();
+                recorded.lock().unwrap().push(line.clone());
+                let body = if line.contains("name=_dnslink.example.test") {
+                    r#"{"Answer":[{"name":"_dnslink.example.test.","data":"_dnslink.secret.onion.","TTL":60,"type":5}]}"#
+                } else {
+                    r#"{"Answer":[{"name":"_dnslink.secret.onion.","data":"\"dnslink=/ipfs/bafkqaddwgevxmmraojswg33smq\"","TTL":300,"type":16}]}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/dns-json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let endpoint = format!("http://127.0.0.1:{}/dns-query", addr.port());
+        let direct = freedom_ipfs_net::Network::new(
+            freedom_ipfs_net::NetworkPolicy::direct(
+                freedom_ipfs_net::gate::ConfiguredTargets::new(),
+                freedom_ipfs_net::gate::parse_url(&endpoint).unwrap(),
+                freedom_ipfs_net::Addresses::Unchecked,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let onion_asked = || {
+            asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("secret.onion"))
+        };
+
+        let resolver =
+            CloudflareDohResolver::with_client(&endpoint, direct.http_client(HTTP_CLIENT_CONFIG));
+        let err = resolver
+            .txt_lookup_with_ttl("_dnslink.example.test")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NamesysError::Network(HttpError::Refused(freedom_ipfs_net::Refused::Onion))
+            ),
+            "{err:?}"
+        );
+        assert!(!onion_asked());
+        // Asked directly for an onion name: refused, and not asked either.
+        assert!(resolver.ip_lookup("x.onion").await.is_err());
+        assert!(!onion_asked());
+
+        let legacy = CloudflareDohResolver::with_client(
+            &endpoint,
+            freedom_ipfs_net::Network::legacy().http_client(HTTP_CLIENT_CONFIG),
+        );
+        let records = legacy
+            .txt_lookup_with_ttl("_dnslink.example.test")
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(onion_asked());
+    }
+
+    /// A DoH server answering raw JSON Answer arrays by `(name, type)`,
+    /// recording every query's name and type.
+    async fn answering_doh(
+        answers: Vec<(&'static str, &'static str, &'static str)>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = asked.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                let len = tokio::io::AsyncReadExt::read(&mut stream, &mut request)
+                    .await
+                    .unwrap();
+                let request = String::from_utf8_lossy(&request[..len]).to_string();
+                let target = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                let query = target.split_once('?').map_or("", |(_, query)| query);
+                let field = |key: &str| {
+                    query
+                        .split('&')
+                        .find_map(|pair| pair.strip_prefix(&format!("{key}=")))
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let (name, kind) = (field("name"), field("type"));
+                recorded.lock().unwrap().push((name.clone(), kind.clone()));
+                let answer = answers
+                    .iter()
+                    .find(|(n, k, _)| *n == name && *k == kind)
+                    .map_or("[]", |(_, _, answer)| answer);
+                let body = format!(r#"{{"Status":0,"Answer":{answer}}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/dns-json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        (format!("http://127.0.0.1:{}/dns-query", addr.port()), asked)
+    }
+
+    fn direct_resolver(endpoint: &str) -> CloudflareDohResolver {
+        let network = freedom_ipfs_net::Network::new(
+            freedom_ipfs_net::NetworkPolicy::direct(
+                freedom_ipfs_net::gate::ConfiguredTargets::new(),
+                freedom_ipfs_net::gate::parse_url(endpoint).unwrap(),
+                freedom_ipfs_net::Addresses::Unchecked,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        CloudflareDohResolver::with_client(endpoint, network.http_client(HTTP_CLIENT_CONFIG))
+    }
+
+    /// An alias and its final record in one response (#47 review round 2,
+    /// 47-R2-M1): under `direct` the alias is classified before the record
+    /// it owns is taken, for A, AAAA and TXT alike. An ordinary inline alias
+    /// (the control) still resolves; an onion one is refused. Under the
+    /// legacy policy the onion one resolves, as before.
+    #[tokio::test]
+    async fn an_inline_alias_is_classified_before_its_record() {
+        let (endpoint, asked) = answering_doh(vec![
+            ("plain.test", "1", r#"[{"name":"plain.test.","type":5,"TTL":60,"data":"alias.test."},{"name":"alias.test.","type":1,"TTL":60,"data":"8.8.8.8"}]"#),
+            ("hidden.test", "1", r#"[{"name":"hidden.test.","type":5,"TTL":60,"data":"secret.onion."},{"name":"secret.onion.","type":1,"TTL":60,"data":"8.8.8.8"}]"#),
+            ("plain.test", "28", r#"[{"name":"plain.test.","type":5,"TTL":60,"data":"alias.test."},{"name":"alias.test.","type":28,"TTL":60,"data":"2a00:1::1"}]"#),
+            ("hidden.test", "28", r#"[{"name":"hidden.test.","type":5,"TTL":60,"data":"secret.onion."},{"name":"secret.onion.","type":28,"TTL":60,"data":"2a00:1::1"}]"#),
+            ("_dnslink.plain.test", "TXT", r#"[{"name":"_dnslink.plain.test.","type":5,"TTL":60,"data":"_dnslink.alias.test."},{"name":"_dnslink.alias.test.","type":16,"TTL":60,"data":"\"dnslink=/ipfs/bafkqaddwgevxmmraojswg33smq\""}]"#),
+            ("_dnslink.hidden.test", "TXT", r#"[{"name":"_dnslink.hidden.test.","type":5,"TTL":60,"data":"_dnslink.secret.onion."},{"name":"_dnslink.secret.onion.","type":16,"TTL":60,"data":"\"dnslink=/ipfs/bafkqaddwgevxmmraojswg33smq\""}]"#),
+        ])
+        .await;
+        let direct = direct_resolver(&endpoint);
+        let legacy = CloudflareDohResolver::with_client(
+            &endpoint,
+            freedom_ipfs_net::Network::legacy().http_client(HTTP_CLIENT_CONFIG),
+        );
+        for (kind, plain, hidden) in [
+            (
+                "A",
+                direct.ip_lookup_type("plain.test", DNS_TYPE_A).await,
+                direct.ip_lookup_type("hidden.test", DNS_TYPE_A).await,
+            ),
+            (
+                "AAAA",
+                direct.ip_lookup_type("plain.test", DNS_TYPE_AAAA).await,
+                direct.ip_lookup_type("hidden.test", DNS_TYPE_AAAA).await,
+            ),
+        ] {
+            assert_eq!(plain.unwrap().len(), 1, "{kind}: the control resolves");
+            assert!(
+                matches!(
+                    hidden,
+                    Err(NamesysError::Network(HttpError::Refused(
+                        freedom_ipfs_net::Refused::Onion
+                    )))
+                ),
+                "{kind}: {hidden:?}"
+            );
+        }
+        assert_eq!(
+            direct
+                .txt_lookup("_dnslink.plain.test")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(direct.txt_lookup("_dnslink.hidden.test").await.is_err());
+        // The legacy policy takes any record of the type, as before.
+        assert_eq!(
+            legacy
+                .ip_lookup_type("hidden.test", DNS_TYPE_A)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            legacy
+                .txt_lookup("_dnslink.hidden.test")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // No query for the onion name was ever made.
+        assert!(!asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(name, _)| name.contains("onion")));
+    }
+
+    /// The chain's depth is its own bound, whatever the responses' layout
+    /// (#47 review round 3, 47-R3-m1): eight aliases answered one per
+    /// response resolve under `direct` as under the legacy policy, for A,
+    /// AAAA and TXT; a ninth is refused, and eight answered inline resolve
+    /// too.
+    #[tokio::test]
+    async fn eight_aliases_resolve_in_every_layout_and_a_ninth_doesnt() {
+        let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+        let mut answers = Vec::new();
+        for (prefix, links) in [("eight", 8), ("nine", 9)] {
+            for index in 0..links {
+                for kind in ["1", "28", "TXT"] {
+                    answers.push((
+                        leak(format!("{prefix}{index}.test")),
+                        kind,
+                        leak(format!(
+                            r#"[{{"name":"{prefix}{index}.test.","type":5,"TTL":60,"data":"{prefix}{}.test."}}]"#,
+                            index + 1
+                        )),
+                    ));
+                }
+            }
+            let last = format!("{prefix}{links}.test");
+            answers.push((
+                leak(last.clone()),
+                "1",
+                leak(format!(
+                    r#"[{{"name":"{last}.","type":1,"TTL":60,"data":"8.8.8.8"}}]"#
+                )),
+            ));
+            answers.push((
+                leak(last.clone()),
+                "28",
+                leak(format!(
+                    r#"[{{"name":"{last}.","type":28,"TTL":60,"data":"2a00:1::1"}}]"#
+                )),
+            ));
+            answers.push((
+                leak(last.clone()),
+                "TXT",
+                leak(format!(
+                    r#"[{{"name":"{last}.","type":16,"TTL":60,"data":"\"dnslink=/ipfs/bafkqaddwgevxmmraojswg33smq\""}}]"#
+                )),
+            ));
+        }
+        let inline = (0..8)
+            .map(|index| {
+                format!(
+                    r#"{{"name":"inline{index}.test.","type":5,"TTL":60,"data":"inline{}.test."}}"#,
+                    index + 1
+                )
+            })
+            .chain([r#"{"name":"inline8.test.","type":1,"TTL":60,"data":"8.8.8.8"}"#.to_string()])
+            .collect::<Vec<_>>()
+            .join(",");
+        answers.push(("inline0.test", "1", leak(format!("[{inline}]"))));
+        let (endpoint, _) = answering_doh(answers).await;
+        let direct = direct_resolver(&endpoint);
+        let legacy = CloudflareDohResolver::with_client(
+            &endpoint,
+            freedom_ipfs_net::Network::legacy().http_client(HTTP_CLIENT_CONFIG),
+        );
+        for (record_type, expected) in [(DNS_TYPE_A, "8.8.8.8"), (DNS_TYPE_AAAA, "2a00:1::1")] {
+            let expected = vec![expected.parse::<IpAddr>().unwrap()];
+            assert_eq!(
+                legacy
+                    .ip_lookup_type("eight0.test", record_type)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                direct
+                    .ip_lookup_type("eight0.test", record_type)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert!(direct
+                .ip_lookup_type("nine0.test", record_type)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(legacy.txt_lookup("eight0.test").await.unwrap().len(), 1);
+        assert_eq!(direct.txt_lookup("eight0.test").await.unwrap().len(), 1);
+        assert!(direct.txt_lookup("nine0.test").await.is_err());
+        assert_eq!(
+            direct
+                .ip_lookup_type("inline0.test", DNS_TYPE_A)
+                .await
+                .unwrap(),
+            vec!["8.8.8.8".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    /// A loop across responses is refused as soon as a name comes back
+    /// (#47 adversarial review round 3, 47-R3-A1), not after the depth
+    /// bound: two queries, then an error.
+    #[tokio::test]
+    async fn a_loop_across_responses_is_refused_when_a_name_comes_back() {
+        let (endpoint, asked) = answering_doh(vec![
+            ("ping.test", "1", r#"[{"name":"ping.test.","type":5,"TTL":60,"data":"pong.test."}]"#),
+            ("pong.test", "1", r#"[{"name":"pong.test.","type":5,"TTL":60,"data":"PING.test."}]"#),
+            ("_dnslink.ping.test", "TXT", r#"[{"name":"_dnslink.ping.test.","type":5,"TTL":60,"data":"_dnslink.pong.test."}]"#),
+            ("_dnslink.pong.test", "TXT", r#"[{"name":"_dnslink.pong.test.","type":5,"TTL":60,"data":"_dnslink.ping.test."}]"#),
+        ])
+        .await;
+        let direct = direct_resolver(&endpoint);
+        assert!(direct
+            .ip_lookup_type("ping.test", DNS_TYPE_A)
+            .await
+            .is_err());
+        assert!(direct.txt_lookup("_dnslink.ping.test").await.is_err());
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            4,
+            "{:?}",
+            asked.lock().unwrap()
+        );
+    }
+
+    /// Malformed owners, for AAAA and TXT as for A (#47 adversarial review
+    /// round 5): an empty, blank, tabbed or padded owner on an alias or on a
+    /// record of the kind asked for refuses the lookup under `direct`; the
+    /// well-formed control resolves.
+    #[tokio::test]
+    async fn malformed_owners_refuse_aaaa_and_txt_lookups_too() {
+        let mut answers = vec![
+            (
+                "good.test",
+                "28",
+                r#"[{"name":"good.test.","type":5,"TTL":60,"data":"alias.test."},{"name":"alias.test.","type":28,"TTL":60,"data":"2a00:1::1"}]"#,
+            ),
+            (
+                "_dnslink.good.test",
+                "TXT",
+                r#"[{"name":"_dnslink.good.test.","type":5,"TTL":60,"data":"_dnslink.alias.test."},{"name":"_dnslink.alias.test.","type":16,"TTL":60,"data":"\"dnslink=/ipfs/bafkqaddwgevxmmraojswg33smq\""}]"#,
+            ),
+        ];
+        let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+        for (label, owner) in [
+            ("empty", ""),
+            ("space", " "),
+            ("tab", "\\t"),
+            ("padded", "x.test. "),
+        ] {
+            answers.push((
+                leak(format!("alias-{label}.test")),
+                "28",
+                leak(format!(
+                    r#"[{{"name":"alias-{label}.test.","type":5,"TTL":60,"data":"safe.test."}},{{"name":"{owner}","type":5,"TTL":60,"data":"secret.onion."}},{{"name":"safe.test.","type":28,"TTL":60,"data":"2a00:1::2"}}]"#
+                )),
+            ));
+            answers.push((
+                leak(format!("_dnslink.record-{label}.test")),
+                "TXT",
+                leak(format!(
+                    r#"[{{"name":"_dnslink.record-{label}.test.","type":16,"TTL":60,"data":"\"dnslink=/ipfs/bafkqaddwgevxmmraojswg33smq\""}},{{"name":"{owner}","type":16,"TTL":60,"data":"\"dnslink=/ipfs/other\""}}]"#
+                )),
+            ));
+        }
+        let (endpoint, _) = answering_doh(answers).await;
+        let direct = direct_resolver(&endpoint);
+        assert_eq!(
+            direct
+                .ip_lookup_type("good.test", DNS_TYPE_AAAA)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            direct.txt_lookup("_dnslink.good.test").await.unwrap().len(),
+            1
+        );
+        for label in ["empty", "space", "tab", "padded"] {
+            let aaaa = direct
+                .ip_lookup_type(&format!("alias-{label}.test"), DNS_TYPE_AAAA)
+                .await;
+            assert!(aaaa.is_err(), "{label}: {aaaa:?}");
+            let txt = direct
+                .txt_lookup(&format!("_dnslink.record-{label}.test"))
+                .await;
+            assert!(txt.is_err(), "{label}: {txt:?}");
+        }
+    }
+
+    /// A record whose owner is outside the chain is ignored under `direct`
+    /// (#47 adversarial review round 2): an A record owned by another name,
+    /// with no alias leading to it; the same record owned by the queried
+    /// name (the control) is taken.
+    #[tokio::test]
+    async fn a_record_owned_outside_the_chain_is_ignored() {
+        let (endpoint, _) = answering_doh(vec![
+            ("own.test", "1", r#"[{"name":"own.test.","type":1,"TTL":60,"data":"8.8.8.8"}]"#),
+            ("other.test", "1", r#"[{"name":"unrelated.test.","type":1,"TTL":60,"data":"8.8.8.8"}]"#),
+            ("_dnslink.other.test", "TXT", r#"[{"name":"_dnslink.unrelated.test.","type":16,"TTL":60,"data":"\"dnslink=/ipfs/bafkqaddwgevxmmraojswg33smq\""}]"#),
+        ])
+        .await;
+        let direct = direct_resolver(&endpoint);
+        assert_eq!(
+            direct.ip_lookup("own.test").await.unwrap(),
+            vec!["8.8.8.8".parse::<IpAddr>().unwrap()]
+        );
+        assert!(direct.ip_lookup("other.test").await.unwrap().is_empty());
+        assert!(direct
+            .txt_lookup("_dnslink.other.test")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A name is classified as written under `direct` (#47 review round 2,
+    /// 47-R2-m3): one trailing dot is removed, and an empty label left by
+    /// more is refused, not trimmed into another name, for the name asked
+    /// and for an alias. The legacy policy trims, as before.
+    #[tokio::test]
+    async fn trailing_dots_are_classified_not_trimmed() {
+        let (endpoint, asked) = answering_doh(vec![
+            (
+                "one-dot.test",
+                "1",
+                r#"[{"name":"one-dot.test.","type":1,"TTL":60,"data":"8.8.8.8"}]"#,
+            ),
+            (
+                "via-alias.test",
+                "1",
+                r#"[{"name":"via-alias.test.","type":5,"TTL":60,"data":"empty-label.test.."}]"#,
+            ),
+            (
+                "via-good-alias.test",
+                "1",
+                r#"[{"name":"via-good-alias.test.","type":5,"TTL":60,"data":"one-dot.test."}]"#,
+            ),
+        ])
+        .await;
+        let direct = direct_resolver(&endpoint);
+        // One dot: the canonical name is asked for.
+        assert_eq!(direct.ip_lookup("one-dot.test.").await.unwrap().len(), 1);
+        assert_eq!(
+            direct.ip_lookup("via-good-alias.test").await.unwrap().len(),
+            1
+        );
+        // Several dots: refused, the trimmed name never asked for.
+        for name in ["two-dots.test..", "three-dots.test..."] {
+            assert!(direct.ip_lookup(name).await.is_err(), "{name}");
+        }
+        assert!(direct.ip_lookup("via-alias.test").await.is_err());
+        let asked_names = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        for never in ["two-dots.test", "three-dots.test", "empty-label.test"] {
+            assert!(
+                !asked_names.iter().any(|name| name == never),
+                "{never}: {asked_names:?}"
+            );
+        }
+        // The legacy policy trims every dot, as before.
+        let legacy = CloudflareDohResolver::with_client(
+            &endpoint,
+            freedom_ipfs_net::Network::legacy().http_client(HTTP_CLIENT_CONFIG),
+        );
+        let _ = legacy.ip_lookup("two-dots.test..").await;
+        assert!(asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(name, _)| name == "two-dots.test"));
     }
 
     #[tokio::test]

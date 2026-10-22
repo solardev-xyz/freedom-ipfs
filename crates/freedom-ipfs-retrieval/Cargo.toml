@@ -11,6 +11,7 @@ bytes.workspace = true
 cid.workspace = true
 freedom-ipfs-core.workspace = true
 freedom-ipfs-namesys.workspace = true
+freedom-ipfs-net.workspace = true
 freedom-ipfs-routing.workspace = true
 freedom-ipfs-store.workspace = true
 futures.workspace = true
@@ -28,6 +29,10 @@ unsigned-varint.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+# `socks5`'s candidate choice and the SOCKS5 test proxy, in tests.
+freedom-ipfs-net = { workspace = true, features = ["test-util"] }
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+# The admission's counts, read from its events in tests.
+tracing-subscriber.workspace = true

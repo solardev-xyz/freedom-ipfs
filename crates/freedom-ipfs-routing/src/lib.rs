@@ -2,6 +2,9 @@ use cid::Cid;
 use freedom_ipfs_namesys::{
     ipns_dht_record_key, verify_ipns_record, IpnsRecord, IpnsResolver, NamesysError,
 };
+use freedom_ipfs_net::gate::classify_dialed;
+use freedom_ipfs_net::transport::Transports;
+use freedom_ipfs_net::{ClientConfig, DialPolicy, HttpClient, HttpError, Network};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use libp2p::kad::{
@@ -64,8 +67,14 @@ const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
 pub enum RoutingError {
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
+    /// The request wasn't sent: the network's capability is revoked, or
+    /// its client couldn't be built.
+    #[error("http: {0}")]
+    Network(HttpError),
     #[error("invalid router response: {0}")]
     InvalidResponse(String),
+    /// No longer produced: an address no provider URL can be built from adds
+    /// no URL ([`Provider::from_parts`]).
     #[error("invalid provider url: {0}")]
     InvalidProviderUrl(String),
     #[error("dht: {0}")]
@@ -73,6 +82,22 @@ pub enum RoutingError {
 }
 
 pub type Result<T> = std::result::Result<T, RoutingError>;
+
+impl From<HttpError> for RoutingError {
+    fn from(err: HttpError) -> Self {
+        match err {
+            HttpError::Http(err) => Self::Http(err),
+            other => Self::Network(other),
+        }
+    }
+}
+
+/// The delegated routing client's configuration: a 10 s timeout, and
+/// reqwest's default redirects.
+pub const HTTP_CLIENT_CONFIG: ClientConfig = ClientConfig::new(
+    DEFAULT_DELEGATED_ROUTING_TIMEOUT,
+    ClientConfig::REQWEST_DEFAULT_REDIRECTS,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provider {
@@ -82,13 +107,17 @@ pub struct Provider {
 }
 
 impl Provider {
+    /// A provider record's peer and addresses, with the base URL of each
+    /// address that is an HTTP provider's.
+    ///
+    /// It no longer fails: an address no URL can be built from (not one of
+    /// the shapes the node dials, or no valid host) adds no URL, and the
+    /// provider keeps its other addresses. The `Result` stays for callers.
     pub fn from_parts(id: Option<String>, addrs: Vec<String>) -> Result<Self> {
-        let mut http_urls = Vec::new();
-        for addr in &addrs {
-            if let Some(url) = http_url_from_multiaddr(addr)? {
-                http_urls.push(url);
-            }
-        }
+        let http_urls = addrs
+            .iter()
+            .filter_map(|addr| http_url_from_multiaddr(addr))
+            .collect();
         Ok(Self {
             id,
             addrs,
@@ -321,7 +350,7 @@ impl From<LightDhtClient> for ProviderRoutingClient {
 #[derive(Debug, Clone)]
 pub struct DelegatedRoutingClient {
     endpoints: Vec<String>,
-    client: reqwest::Client,
+    client: HttpClient,
 }
 
 impl Default for DelegatedRoutingClient {
@@ -340,6 +369,16 @@ impl DelegatedRoutingClient {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        Self::with_endpoints_and_client(endpoints, HttpClient::legacy(HTTP_CLIENT_CONFIG))
+    }
+
+    /// A client for `endpoints` that sends through `client`: a network's
+    /// client for [`HTTP_CLIENT_CONFIG`], whose capability every lookup asks.
+    pub fn with_endpoints_and_client<I, S>(endpoints: I, client: HttpClient) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let mut endpoints = endpoints
             .into_iter()
             .map(|endpoint| endpoint.into().trim_end_matches('/').to_string())
@@ -348,10 +387,13 @@ impl DelegatedRoutingClient {
         if endpoints.is_empty() {
             endpoints.push(DEFAULT_DELEGATED_ROUTER.to_string());
         }
-        Self {
-            endpoints,
-            client: timeout_http_client(DEFAULT_DELEGATED_ROUTING_TIMEOUT),
-        }
+        Self { endpoints, client }
+    }
+
+    /// What its client's network may dial: the providers it counts toward
+    /// its targets are the ones that network can reach.
+    fn dial_policy(&self) -> DialPolicy {
+        self.client.network().dial_policy()
     }
 
     pub async fn providers(&self, cid: &Cid) -> Result<Vec<Provider>> {
@@ -393,7 +435,7 @@ impl DelegatedRoutingClient {
                 Ok(providers) if !providers.is_empty() => {
                     saw_provider_response = true;
                     merged_providers = merge_provider_lists(merged_providers, providers)?;
-                    if bitswap_provider_diversity(&merged_providers)
+                    if bitswap_provider_diversity(&merged_providers, &self.dial_policy())
                         >= MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY
                     {
                         return Ok(merged_providers);
@@ -535,8 +577,12 @@ impl DelegatedRoutingClient {
                 .await?
                 .error_for_status()?;
             let response_headers_elapsed_ms = started.elapsed().as_millis();
-            let response =
-                limited_response_providers(response, MAX_DELEGATED_ROUTING_RESPONSE_BYTES).await?;
+            let response = limited_response_providers(
+                response,
+                MAX_DELEGATED_ROUTING_RESPONSE_BYTES,
+                &self.dial_policy(),
+            )
+            .await?;
             Ok((response, response_headers_elapsed_ms))
         }
         .await;
@@ -721,7 +767,8 @@ impl AutoRoutingClient {
         stats: Option<&RoutingStatsHandle>,
         skip_single_wss_dht_fallback: bool,
     ) -> Result<Vec<Provider>> {
-        let bitswap_provider_count = bitswap_provider_diversity(&providers);
+        let policy = self.delegated.dial_policy();
+        let bitswap_provider_count = bitswap_provider_diversity(&providers, &policy);
         if bitswap_provider_count >= MIN_DELEGATED_BITSWAP_PROVIDER_DIVERSITY {
             return Ok(providers);
         }
@@ -734,7 +781,7 @@ impl AutoRoutingClient {
             fallback = "light_dht"
         );
         if skip_single_wss_dht_fallback
-            && single_supported_wss_or_dnsaddr_bitswap_provider(&providers)
+            && single_supported_wss_or_dnsaddr_bitswap_provider(&providers, &policy)
         {
             tracing::info!(
                 phase = "provider_diversity_low",
@@ -767,7 +814,7 @@ impl AutoRoutingClient {
                     cid = %cid,
                     provider_count = merged.len(),
                     dht_provider_count,
-                    bitswap_provider_count = bitswap_provider_diversity(&merged),
+                    bitswap_provider_count = bitswap_provider_diversity(&merged, &policy),
                     fallback = "light_dht",
                     ok = true
                 );
@@ -871,6 +918,9 @@ pub struct LightDhtClient {
     /// A limit on queries in flight, shared with other clients (a host's
     /// process-wide limit); `None` adds no limit.
     query_limiter: Option<Arc<tokio::sync::Semaphore>>,
+    /// The network its swarms dial through: `None` builds the transports as
+    /// before, outside any network.
+    transports: Option<Arc<Transports>>,
 }
 
 impl Default for LightDhtClient {
@@ -883,6 +933,7 @@ impl Default for LightDhtClient {
             query_timeout: DEFAULT_DHT_QUERY_TIMEOUT,
             max_providers: DEFAULT_MAX_DHT_PROVIDERS,
             query_limiter: None,
+            transports: None,
         }
     }
 }
@@ -916,6 +967,22 @@ impl LightDhtClient {
     /// ends when the query's future is dropped.
     pub fn with_query_limiter(mut self, limiter: Arc<tokio::sync::Semaphore>) -> Self {
         self.query_limiter = Some(limiter);
+        self
+    }
+
+    /// Dials through `network`'s transports (design 0007, check 3): every
+    /// dial of its swarms, Kademlia's and identify's own included, asks the
+    /// network's capability, and under `direct` passes the gate. Without
+    /// this, the swarms are built as before, outside any network.
+    pub fn with_network(mut self, network: &Network) -> Self {
+        self.transports = Some(Arc::new(Transports::new(network)));
+        self
+    }
+
+    /// Dials through `transports`: tests, with their own DNS configuration.
+    #[doc(hidden)]
+    pub fn with_transports(mut self, transports: Transports) -> Self {
+        self.transports = Some(Arc::new(transports));
         self
     }
 
@@ -1061,7 +1128,7 @@ impl LightDhtClient {
     }
 
     async fn bootstrapped_swarm(&self) -> Result<libp2p::Swarm<DhtBehaviour>> {
-        let mut swarm = build_dht_swarm(self.query_timeout).await?;
+        let mut swarm = build_dht_swarm(self.query_timeout, self.transports.as_deref()).await?;
         let mut bootstrap_count = 0usize;
         for addr in &self.bootstrap_peers {
             let Some((peer, addr)) = parse_p2p_multiaddr(addr) else {
@@ -1072,6 +1139,8 @@ impl LightDhtClient {
             swarm.add_peer_address(peer, addr.clone());
             if let Ok(dial_addr) = addr.with_p2p(peer) {
                 if let Err(err) = swarm.dial(dial_addr) {
+                    // Refused by the transport's gate (a revoked capability,
+                    // an address the policy refuses), or rejected otherwise.
                     tracing::debug!(peer = %peer, error = %err, "DHT bootstrap dial rejected");
                 }
             }
@@ -1127,13 +1196,41 @@ impl IpnsResolver for DhtIpnsResolver {
     }
 }
 
-fn bitswap_provider_diversity(providers: &[Provider]) -> usize {
+/// The providers with a peer ID and an address the policy can dial
+/// (design 0007, "Candidate choice knows the transports"): under the legacy
+/// policy, any address.
+fn bitswap_provider_diversity(providers: &[Provider], policy: &DialPolicy) -> usize {
     providers
         .iter()
-        .filter(|provider| provider.id.is_some() && !provider.addrs.is_empty())
+        .filter(|provider| {
+            provider.id.is_some()
+                && provider
+                    .addrs
+                    .iter()
+                    .any(|addr| policy_admits(addr, policy))
+        })
         .filter_map(provider_dedupe_key)
         .collect::<HashSet<_>>()
         .len()
+}
+
+/// Whether the policy can dial `addr`, as candidate choice will judge it:
+/// every address under the legacy policy; otherwise its shape, target and
+/// transport, and with checked addresses an IP literal's address (an IPv6
+/// one isn't counted while NAT64 discovery is pending).
+fn policy_admits(addr: &str, policy: &DialPolicy) -> bool {
+    policy.admits_everything()
+        || Multiaddr::from_str(addr).is_ok_and(|addr| policy.check_now(&addr).is_ok())
+}
+
+/// The providers' HTTP base URLs the policy admits, as retrieval will try
+/// them.
+fn dialable_http_url_count(providers: &[Provider], policy: &DialPolicy) -> usize {
+    providers
+        .iter()
+        .flat_map(|provider| provider.http_urls.iter())
+        .filter(|url| policy.check_url_now(url).is_ok())
+        .count()
 }
 
 fn merge_provider_lists(
@@ -1228,15 +1325,20 @@ struct DelegatedResponseStats {
     http_provider_count: usize,
 }
 
+/// The providers in a delegated router's response, read up to `max_bytes`.
+/// A streamed response returns early once it holds enough providers the
+/// `policy` can reach.
 async fn limited_response_providers(
     response: reqwest::Response,
     max_bytes: usize,
+    policy: &DialPolicy,
 ) -> Result<LimitedProviderResponse> {
     limited_response_providers_with_direct_bitswap_target(
         response,
         max_bytes,
         streaming_delegated_direct_bitswap_target_enabled(),
         streaming_delegated_direct_bitswap_target_min_elapsed(),
+        policy,
     )
     .await
 }
@@ -1246,6 +1348,7 @@ async fn limited_response_providers_with_direct_bitswap_target(
     max_bytes: usize,
     direct_bitswap_target_enabled: bool,
     direct_bitswap_target_min_elapsed: Duration,
+    policy: &DialPolicy,
 ) -> Result<LimitedProviderResponse> {
     let started = Instant::now();
     let started_tokio = tokio::time::Instant::now();
@@ -1325,14 +1428,16 @@ async fn limited_response_providers_with_direct_bitswap_target(
             let line = buffered.drain(..=newline_index).collect::<Vec<_>>();
             append_provider_response_line(&line, &mut providers)?;
             line_count = line_count.saturating_add(1);
-            if first_http_provider_elapsed.is_none() && http_provider_url_count(&providers) > 0 {
+            if first_http_provider_elapsed.is_none()
+                && dialable_http_url_count(&providers, policy) > 0
+            {
                 first_http_provider_elapsed = Some(started.elapsed());
                 first_http_provider_deadline = Some(
                     tokio::time::Instant::now() + STREAMING_DELEGATED_FIRST_HTTP_PROVIDER_GRACE,
                 );
             }
-            if should_return_streamed_providers(&providers) {
-                let target_kind = streamed_provider_target_kind(&providers);
+            if should_return_streamed_providers(&providers, policy) {
+                let target_kind = streamed_provider_target_kind(&providers, policy);
                 let providers = limit_delegated_providers(providers);
                 return Ok(LimitedProviderResponse {
                     stats: DelegatedResponseStats {
@@ -1350,7 +1455,7 @@ async fn limited_response_providers_with_direct_bitswap_target(
             }
             if direct_bitswap_target_enabled
                 && direct_bitswap_target_deadline.is_none()
-                && supported_direct_bitswap_provider_diversity(&providers)
+                && supported_direct_bitswap_provider_diversity(&providers, policy)
                     >= STREAMING_DELEGATED_DIRECT_BITSWAP_PROVIDER_TARGET
             {
                 direct_bitswap_target_elapsed = Some(started.elapsed());
@@ -1366,7 +1471,7 @@ async fn limited_response_providers_with_direct_bitswap_target(
     if !trim_ascii_whitespace(&buffered).is_empty() {
         line_count = line_count.saturating_add(1);
     }
-    if first_http_provider_elapsed.is_none() && http_provider_url_count(&providers) > 0 {
+    if first_http_provider_elapsed.is_none() && dialable_http_url_count(&providers, policy) > 0 {
         first_http_provider_elapsed = Some(started.elapsed());
     }
     let direct_bitswap_target_met = direct_bitswap_target_elapsed.is_some();
@@ -1410,12 +1515,15 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
-fn should_return_streamed_providers(providers: &[Provider]) -> bool {
-    streamed_provider_target_kind(providers).is_some()
+fn should_return_streamed_providers(providers: &[Provider], policy: &DialPolicy) -> bool {
+    streamed_provider_target_kind(providers, policy).is_some()
 }
 
-fn streamed_provider_target_kind(providers: &[Provider]) -> Option<&'static str> {
-    if http_provider_url_count(providers) >= STREAMING_DELEGATED_HTTP_PROVIDER_TARGET {
+fn streamed_provider_target_kind(
+    providers: &[Provider],
+    policy: &DialPolicy,
+) -> Option<&'static str> {
+    if dialable_http_url_count(providers, policy) >= STREAMING_DELEGATED_HTTP_PROVIDER_TARGET {
         Some("http_provider")
     } else if providers.len() >= MAX_DELEGATED_ROUTING_PROVIDERS {
         Some("max_providers")
@@ -1460,7 +1568,10 @@ fn lab_skip_low_diversity_dht_for_single_wss_enabled() -> bool {
     std::env::var_os(LAB_SKIP_LOW_DIVERSITY_DHT_FOR_SINGLE_WSS_ENV).is_some()
 }
 
-fn supported_direct_bitswap_provider_diversity(providers: &[Provider]) -> usize {
+fn supported_direct_bitswap_provider_diversity(
+    providers: &[Provider],
+    policy: &DialPolicy,
+) -> usize {
     providers
         .iter()
         .filter(|provider| {
@@ -1468,6 +1579,7 @@ fn supported_direct_bitswap_provider_diversity(providers: &[Provider]) -> usize 
                 supported_direct_bitswap_multiaddr(
                     addr,
                     provider.id.as_deref().and_then(parse_peer_id),
+                    policy,
                 )
             })
         })
@@ -1476,7 +1588,10 @@ fn supported_direct_bitswap_provider_diversity(providers: &[Provider]) -> usize 
         .len()
 }
 
-fn single_supported_wss_or_dnsaddr_bitswap_provider(providers: &[Provider]) -> bool {
+fn single_supported_wss_or_dnsaddr_bitswap_provider(
+    providers: &[Provider],
+    policy: &DialPolicy,
+) -> bool {
     let mut provider_keys = HashSet::new();
     for provider in providers {
         let Some(key) = provider_dedupe_key(provider) else {
@@ -1486,10 +1601,10 @@ fn single_supported_wss_or_dnsaddr_bitswap_provider(providers: &[Provider]) -> b
         let mut has_supported_wss_or_dnsaddr = false;
         for addr in &provider.addrs {
             if bitswap_multiaddr_uses_dnsaddr(addr) {
-                has_supported_wss_or_dnsaddr = true;
+                has_supported_wss_or_dnsaddr |= policy_admits(addr, policy);
                 continue;
             }
-            if !supported_direct_bitswap_multiaddr(addr, provider_peer) {
+            if !supported_direct_bitswap_multiaddr(addr, provider_peer, policy) {
                 continue;
             }
             if !bitswap_multiaddr_uses_wss(addr) {
@@ -1518,11 +1633,20 @@ fn bitswap_multiaddr_uses_dnsaddr(addr: &str) -> bool {
     })
 }
 
-fn supported_direct_bitswap_multiaddr(addr: &str, provider_peer: Option<PeerId>) -> bool {
+/// Whether `addr` is a direct Bitswap address the policy can dial: TCP or
+/// QUIC, with a peer, and not an HTTP provider's.
+fn supported_direct_bitswap_multiaddr(
+    addr: &str,
+    provider_peer: Option<PeerId>,
+    policy: &DialPolicy,
+) -> bool {
     let mut multiaddr = match Multiaddr::from_str(addr) {
         Ok(addr) => addr,
         Err(_) => return false,
     };
+    if !policy.admits_everything() && policy.check_now(&multiaddr).is_err() {
+        return false;
+    }
     let addr_peer = match multiaddr.iter().last() {
         Some(Protocol::P2p(peer)) => {
             multiaddr.pop();
@@ -1615,42 +1739,48 @@ struct DhtBehaviour {
     limits: connection_limits::Behaviour,
 }
 
-async fn build_dht_swarm(query_timeout: Duration) -> Result<libp2p::Swarm<DhtBehaviour>> {
+/// The light DHT's swarm: through `transports` when the client has a
+/// network (design 0007, check 3: the gate wraps the transport, so it
+/// covers Kademlia's and identify's own dials), or built as before.
+async fn build_dht_swarm(
+    query_timeout: Duration,
+    transports: Option<&Transports>,
+) -> Result<libp2p::Swarm<DhtBehaviour>> {
+    let error = |err: &dyn std::fmt::Display| RoutingError::Dht(err.to_string());
+    let Some(transports) = transports else {
+        return SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                (tls::Config::new, noise::Config::new),
+                yamux::Config::default,
+            )
+            .map_err(|err| error(&err))?
+            .with_quic()
+            // Avoid libp2p's system DNS path: iOS devices do not expose a
+            // Unix-style /etc/resolv.conf, and bootstrap/provider addresses
+            // often arrive as /dnsaddr multiaddrs.
+            .with_dns_config(
+                libp2p::dns::ResolverConfig::cloudflare(),
+                libp2p::dns::ResolverOpts::default(),
+            )
+            .with_behaviour(move |key| dht_behaviour(key, query_timeout))
+            .map_err(|err| error(&err))
+            .map(|builder| {
+                builder
+                    .with_swarm_config(|cfg| {
+                        cfg.with_idle_connection_timeout(DHT_IDLE_CONNECTION_TIMEOUT)
+                    })
+                    .with_connection_timeout(DHT_CONNECTION_TIMEOUT)
+                    .build()
+            });
+    };
     SwarmBuilder::with_new_identity()
         .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            (tls::Config::new, noise::Config::new),
-            yamux::Config::default,
-        )
-        .map_err(|err| RoutingError::Dht(err.to_string()))?
-        .with_quic()
-        // Avoid libp2p's system DNS path: iOS devices do not expose a
-        // Unix-style /etc/resolv.conf, and bootstrap/provider addresses often
-        // arrive as /dnsaddr multiaddrs.
-        .with_dns_config(
-            libp2p::dns::ResolverConfig::cloudflare(),
-            libp2p::dns::ResolverOpts::default(),
-        )
-        .with_behaviour(move |key| {
-            let peer_id = key.public().to_peer_id();
-            let store = MemoryStore::new(peer_id);
-            let mut config = kad::Config::new(kad::PROTOCOL_NAME);
-            config.set_query_timeout(query_timeout);
-            config.set_periodic_bootstrap_interval(None);
-            let mut behaviour = kad::Behaviour::with_config(peer_id, store, config);
-            behaviour.set_mode(Some(kad::Mode::Client));
-            DhtBehaviour {
-                kad: behaviour,
-                identify: identify::Behaviour::new(identify::Config::new(
-                    format!("freedom-ipfs/{}", env!("CARGO_PKG_VERSION")),
-                    key.public(),
-                )),
-                ping: ping::Behaviour::new(ping::Config::new()),
-                limits: connection_limits::Behaviour::new(dht_connection_limits()),
-            }
-        })
-        .map_err(|err| RoutingError::Dht(err.to_string()))
+        .with_other_transport(|key| transports.dht(key))
+        .map_err(|err| error(&err))?
+        .with_behaviour(move |key| dht_behaviour(key, query_timeout))
+        .map_err(|err| error(&err))
         .map(|builder| {
             builder
                 .with_swarm_config(|cfg| {
@@ -1659,6 +1789,25 @@ async fn build_dht_swarm(query_timeout: Duration) -> Result<libp2p::Swarm<DhtBeh
                 .with_connection_timeout(DHT_CONNECTION_TIMEOUT)
                 .build()
         })
+}
+
+fn dht_behaviour(key: &libp2p::identity::Keypair, query_timeout: Duration) -> DhtBehaviour {
+    let peer_id = key.public().to_peer_id();
+    let store = MemoryStore::new(peer_id);
+    let mut config = kad::Config::new(kad::PROTOCOL_NAME);
+    config.set_query_timeout(query_timeout);
+    config.set_periodic_bootstrap_interval(None);
+    let mut behaviour = kad::Behaviour::with_config(peer_id, store, config);
+    behaviour.set_mode(Some(kad::Mode::Client));
+    DhtBehaviour {
+        kad: behaviour,
+        identify: identify::Behaviour::new(identify::Config::new(
+            format!("freedom-ipfs/{}", env!("CARGO_PKG_VERSION")),
+            key.public(),
+        )),
+        ping: ping::Behaviour::new(ping::Config::new()),
+        limits: connection_limits::Behaviour::new(dht_connection_limits()),
+    }
 }
 
 fn providers_from_dht(
@@ -1794,52 +1943,16 @@ fn parse_p2p_multiaddr(addr: &str) -> Option<(PeerId, Multiaddr)> {
     Some((peer, multiaddr))
 }
 
-fn http_url_from_multiaddr(addr: &str) -> Result<Option<Url>> {
-    let parts: Vec<&str> = addr.split('/').filter(|part| !part.is_empty()).collect();
-    let Some(http_pos) = parts
-        .iter()
-        .position(|part| *part == "http" || *part == "https")
-    else {
-        return Ok(None);
-    };
-    let scheme =
-        if parts[http_pos] == "https" || parts.get(http_pos.wrapping_sub(1)) == Some(&"tls") {
-            "https"
-        } else {
-            "http"
-        };
-
-    let host = parts
-        .windows(2)
-        .find_map(|pair| match pair[0] {
-            "dns" | "dns4" | "dns6" | "ip4" | "ip6" => Some(pair[1]),
-            _ => None,
-        })
-        .ok_or_else(|| RoutingError::InvalidProviderUrl(addr.to_string()))?;
-    let port = parts.windows(2).find_map(|pair| {
-        if pair[0] == "tcp" {
-            Some(pair[1])
-        } else {
-            None
-        }
-    });
-
-    let url = if let Some(port) = port {
-        format!("{scheme}://{host}:{port}")
-    } else {
-        format!("{scheme}://{host}")
-    };
-    Url::parse(&url)
-        .map(Some)
-        .map_err(|_| RoutingError::InvalidProviderUrl(addr.to_string()))
-}
-
-fn timeout_http_client(timeout: Duration) -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(timeout)
-        .timeout(timeout)
-        .build()
-        .expect("delegated routing HTTP client config is valid")
+/// An HTTP provider's base URL, built from the multiaddr's parsed
+/// components, never by joining its text (design 0007, "The gate"): the
+/// scheme, host and port the gate judged (`classify_dialed`), an IPv6 host
+/// bracketed, and without `/tcp` the scheme's default port. `None` for an
+/// address that isn't an HTTP provider's, or isn't one of the shapes the
+/// node dials: `/tls/sni/<name>/http` among them, until the TLS server name
+/// is taken from `/sni`.
+fn http_url_from_multiaddr(addr: &str) -> Option<Url> {
+    let addr = Multiaddr::from_str(addr).ok()?;
+    classify_dialed(&addr).ok()?.http_url()
 }
 
 #[cfg(test)]
@@ -1989,7 +2102,10 @@ mod tests {
         assert!(providers
             .iter()
             .any(|provider| provider.id.as_deref() == Some("peer-b")));
-        assert_eq!(bitswap_provider_diversity(&providers), 2);
+        assert_eq!(
+            bitswap_provider_diversity(&providers, &DialPolicy::legacy()),
+            2
+        );
         for task in [first_task, second_task] {
             task.abort();
             let _ = task.await;
@@ -2330,17 +2446,221 @@ mod tests {
         );
     }
 
+    /// The provider URL converter reads the multiaddr as the gate does
+    /// (#44 adversarial review, round 2): the scheme, host and port of the
+    /// URL it builds are the gate's. Splitting the text on `/` read a DNS
+    /// label that looks like a protocol as the protocol.
+    #[test]
+    fn gate_http_shape_matches_the_real_provider_url_converter() {
+        use freedom_ipfs_net::gate::{classify_url, Shape};
+        for (text, expected_shape, expected_port, expected_url) in [
+            ("/dns/https/http", Shape::Http, 80, "http://https/"),
+            ("/dns/http/https", Shape::Https, 443, "https://http/"),
+            ("/dns/tls/http", Shape::Http, 80, "http://tls/"),
+            (
+                "/dns/example.com/http",
+                Shape::Http,
+                80,
+                "http://example.com/",
+            ),
+            (
+                "/dns/example.com/https",
+                Shape::Https,
+                443,
+                "https://example.com/",
+            ),
+            (
+                "/dns/example.com/tls/http",
+                Shape::Https,
+                443,
+                "https://example.com/",
+            ),
+            (
+                "/dns4/example.com/tcp/8443/tls/http",
+                Shape::Https,
+                8443,
+                "https://example.com:8443/",
+            ),
+            (
+                "/ip6/2001:db8::1/tcp/8080/http",
+                Shape::Http,
+                8080,
+                "http://[2001:db8::1]:8080/",
+            ),
+            (
+                "/ip6/2001:db8::1/https",
+                Shape::Https,
+                443,
+                "https://[2001:db8::1]/",
+            ),
+        ] {
+            let addr: Multiaddr = text.parse().unwrap();
+            let dial = classify_dialed(&addr).unwrap();
+            assert_eq!(dial.shape, expected_shape, "{text}");
+            assert_eq!(dial.port, Some(expected_port), "{text}");
+            let provider = Provider::from_parts(None, vec![text.to_owned()]).unwrap();
+            let url = &provider.http_urls[0];
+            assert_eq!(url.as_str(), expected_url, "{text}");
+            let read = classify_url(url).unwrap();
+            assert_eq!(read.secure, dial.shape == Shape::Https, "{text}");
+            assert_eq!(read.target, dial.target, "{text}");
+            assert_eq!(
+                Some(read.port),
+                dial.port,
+                "{text}: the gate's port must equal the converter's destination port"
+            );
+        }
+    }
+
+    /// IPv6 providers now have a URL; `/tls/sni/<name>/http` has none, rather
+    /// than one downgraded to plain HTTP; and an address the gate refuses
+    /// adds no URL, while the provider keeps its other ones.
+    #[test]
+    fn provider_urls_come_only_from_the_shapes_the_node_dials() {
+        let provider = Provider::from_parts(
+            Some("peer".into()),
+            vec![
+                "/ip6/2001:db8::1/tcp/8080/http".into(),
+                "/dns4/example.com/tcp/443/tls/sni/example.com/http".into(),
+                "/ip4/8.8.8.8/ip4/127.0.0.1/tcp/80/http".into(),
+                "/dns4/example.com/tcp/443/http/extra".into(),
+                "/dns4/a..b/tcp/80/http".into(),
+                "/dns4/example.com/tcp/443/https".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(provider.addrs.len(), 6);
+        assert_eq!(
+            provider
+                .http_urls
+                .iter()
+                .map(Url::as_str)
+                .collect::<Vec<_>>(),
+            ["http://[2001:db8::1]:8080/", "https://example.com/"]
+        );
+    }
+
+    fn direct_policy(addresses: freedom_ipfs_net::Addresses) -> DialPolicy {
+        freedom_ipfs_net::Network::with_lookup(
+            freedom_ipfs_net::NetworkPolicy::direct(
+                freedom_ipfs_net::gate::ConfiguredTargets::new(),
+                Url::parse("https://dns.example/dns-query").unwrap(),
+                addresses,
+            )
+            .unwrap(),
+            None,
+        )
+        .dial_policy()
+    }
+
+    /// The diversity counters count only addresses the policy can dial
+    /// (design 0007, "Candidate choice knows the transports"); the legacy
+    /// policy counts as before.
+    #[test]
+    fn diversity_counts_only_what_the_policy_can_dial() {
+        use freedom_ipfs_net::gate::Nat64State;
+        use freedom_ipfs_net::{Addresses, Nat64Handle, TransportPolicy};
+        let peer = Keypair::generate_ed25519().public().to_peer_id();
+        let refused_only = vec![Provider::from_parts(
+            Some(peer.to_string()),
+            vec![
+                format!("/ip4/8.8.8.8/dns/x.onion/tcp/4001/p2p/{peer}"),
+                format!("/dns4/x.onion/tcp/4001/p2p/{peer}"),
+                "/dns4/x.onion/tcp/443/https".to_string(),
+            ],
+        )
+        .unwrap()];
+        let legacy = DialPolicy::legacy();
+        let unchecked = direct_policy(Addresses::Unchecked);
+        assert_eq!(bitswap_provider_diversity(&refused_only, &legacy), 1);
+        assert_eq!(
+            supported_direct_bitswap_provider_diversity(&refused_only, &legacy),
+            1
+        );
+        assert_eq!(dialable_http_url_count(&refused_only, &legacy), 1);
+        assert_eq!(bitswap_provider_diversity(&refused_only, &unchecked), 0);
+        assert_eq!(
+            supported_direct_bitswap_provider_diversity(&refused_only, &unchecked),
+            0
+        );
+        assert_eq!(dialable_http_url_count(&refused_only, &unchecked), 0);
+
+        // A loopback peer passes without the address table, not with it.
+        let loopback = vec![Provider::from_parts(
+            Some(peer.to_string()),
+            vec![format!("/ip4/127.0.0.1/tcp/4001/p2p/{peer}")],
+        )
+        .unwrap()];
+        let checked = direct_policy(Addresses::Checked(Nat64Handle::fixed(Nat64State::NONE)));
+        assert_eq!(
+            supported_direct_bitswap_provider_diversity(&loopback, &unchecked),
+            1
+        );
+        assert_eq!(
+            supported_direct_bitswap_provider_diversity(&loopback, &checked),
+            0
+        );
+        assert_eq!(bitswap_provider_diversity(&loopback, &checked), 0);
+
+        // QUIC only, under a TCP-only policy: not dialable.
+        let quic_only = vec![Provider::from_parts(
+            Some(peer.to_string()),
+            vec![format!("/ip4/8.8.8.8/udp/4001/quic-v1/p2p/{peer}")],
+        )
+        .unwrap()];
+        assert_eq!(
+            supported_direct_bitswap_provider_diversity(&quic_only, &unchecked),
+            1
+        );
+        let tcp_only = unchecked.clone().with_transports(TransportPolicy::TCP_ONLY);
+        assert_eq!(
+            supported_direct_bitswap_provider_diversity(&quic_only, &tcp_only),
+            0
+        );
+
+        // A `/dnsaddr` for an onion doesn't make a single WSS or `/dnsaddr`
+        // provider.
+        let onion_dnsaddr = vec![Provider::from_parts(
+            Some(peer.to_string()),
+            vec![format!("/dnsaddr/peers.onion/p2p/{peer}")],
+        )
+        .unwrap()];
+        assert!(single_supported_wss_or_dnsaddr_bitswap_provider(
+            &onion_dnsaddr,
+            &legacy
+        ));
+        assert!(!single_supported_wss_or_dnsaddr_bitswap_provider(
+            &onion_dnsaddr,
+            &unchecked
+        ));
+    }
+
     #[test]
     fn rejects_malformed_delegated_provider_responses() {
         assert!(matches!(
             parse_provider_response("not-json").unwrap_err(),
             RoutingError::InvalidResponse(_)
         ));
-        assert!(matches!(
-            parse_provider_response(r#"{"Providers":[{"Addrs":["/tcp/443/tls/http"]}]}"#)
-                .unwrap_err(),
-            RoutingError::InvalidProviderUrl(_)
-        ));
+    }
+
+    /// An address no provider URL can be built from drops that URL, not the
+    /// provider: it keeps its other addresses and URLs.
+    #[test]
+    fn an_address_without_a_url_drops_the_url_not_the_provider() {
+        let providers = parse_provider_response(
+            r#"{"Providers":[{"ID":"peer","Addrs":["/tcp/443/tls/http","/dns4/example.com/tcp/443/tls/http","/ip4/8.8.8.8/tcp/4001"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].addrs.len(), 3);
+        assert_eq!(
+            providers[0]
+                .http_urls
+                .iter()
+                .map(Url::as_str)
+                .collect::<Vec<_>>(),
+            ["https://example.com/"]
+        );
     }
 
     #[test]
@@ -2426,7 +2746,11 @@ mod tests {
 
         let response = tokio::time::timeout(
             Duration::from_millis(500),
-            limited_response_providers(response, MAX_DELEGATED_ROUTING_RESPONSE_BYTES),
+            limited_response_providers(
+                response,
+                MAX_DELEGATED_ROUTING_RESPONSE_BYTES,
+                &DialPolicy::legacy(),
+            ),
         )
         .await
         .unwrap()
@@ -2468,7 +2792,11 @@ mod tests {
 
         let response = tokio::time::timeout(
             Duration::from_millis(800),
-            limited_response_providers(response, MAX_DELEGATED_ROUTING_RESPONSE_BYTES),
+            limited_response_providers(
+                response,
+                MAX_DELEGATED_ROUTING_RESPONSE_BYTES,
+                &DialPolicy::legacy(),
+            ),
         )
         .await
         .unwrap()
@@ -2518,6 +2846,7 @@ mod tests {
                 MAX_DELEGATED_ROUTING_RESPONSE_BYTES,
                 true,
                 Duration::ZERO,
+                &DialPolicy::legacy(),
             ),
         )
         .await
@@ -2525,7 +2854,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            supported_direct_bitswap_provider_diversity(&response.providers),
+            supported_direct_bitswap_provider_diversity(&response.providers, &DialPolicy::legacy()),
             STREAMING_DELEGATED_DIRECT_BITSWAP_PROVIDER_TARGET
         );
         assert_eq!(response.stats.target_kind, Some("direct_bitswap"));
@@ -2582,6 +2911,7 @@ mod tests {
                 MAX_DELEGATED_ROUTING_RESPONSE_BYTES,
                 true,
                 Duration::ZERO,
+                &DialPolicy::legacy(),
             ),
         )
         .await
@@ -2633,6 +2963,7 @@ mod tests {
                 MAX_DELEGATED_ROUTING_RESPONSE_BYTES,
                 true,
                 min_elapsed,
+                &DialPolicy::legacy(),
             ),
         )
         .await
@@ -2670,7 +3001,10 @@ mod tests {
             Provider::from_parts(None, vec!["/ip4/127.0.0.2/tcp/4002".to_string()]).unwrap(),
         ];
 
-        assert_eq!(supported_direct_bitswap_provider_diversity(&providers), 1);
+        assert_eq!(
+            supported_direct_bitswap_provider_diversity(&providers, &DialPolicy::legacy()),
+            1
+        );
     }
 
     #[test]
@@ -2683,7 +3017,8 @@ mod tests {
         )
         .unwrap()];
         assert!(single_supported_wss_or_dnsaddr_bitswap_provider(
-            &single_wss
+            &single_wss,
+            &DialPolicy::legacy()
         ));
 
         let single_dnsaddr = vec![Provider::from_parts(
@@ -2692,7 +3027,8 @@ mod tests {
         )
         .unwrap()];
         assert!(single_supported_wss_or_dnsaddr_bitswap_provider(
-            &single_dnsaddr
+            &single_dnsaddr,
+            &DialPolicy::legacy()
         ));
 
         let mixed_wss_and_tcp = vec![Provider::from_parts(
@@ -2704,7 +3040,8 @@ mod tests {
         )
         .unwrap()];
         assert!(!single_supported_wss_or_dnsaddr_bitswap_provider(
-            &mixed_wss_and_tcp
+            &mixed_wss_and_tcp,
+            &DialPolicy::legacy()
         ));
 
         let two_wss = vec![
@@ -2719,7 +3056,10 @@ mod tests {
             )
             .unwrap(),
         ];
-        assert!(!single_supported_wss_or_dnsaddr_bitswap_provider(&two_wss));
+        assert!(!single_supported_wss_or_dnsaddr_bitswap_provider(
+            &two_wss,
+            &DialPolicy::legacy()
+        ));
 
         let http_only = vec![Provider::from_parts(
             Some(peer.to_string()),
@@ -2727,7 +3067,8 @@ mod tests {
         )
         .unwrap()];
         assert!(!single_supported_wss_or_dnsaddr_bitswap_provider(
-            &http_only
+            &http_only,
+            &DialPolicy::legacy()
         ));
     }
 
@@ -2783,7 +3124,9 @@ mod tests {
         let response = reqwest::get(format!("http://{addr}/routing/v1/providers/test"))
             .await
             .unwrap();
-        let err = limited_response_providers(response, 4).await.unwrap_err();
+        let err = limited_response_providers(response, 4, &DialPolicy::legacy())
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, RoutingError::InvalidResponse(_)));
         task.await.unwrap();
@@ -2981,7 +3324,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn light_dht_swarm_is_client_mode_and_has_no_listeners() {
-        let swarm = build_dht_swarm(Duration::from_secs(5)).await.unwrap();
+        let swarm = build_dht_swarm(Duration::from_secs(5), None).await.unwrap();
 
         assert!(matches!(swarm.behaviour().kad.mode(), kad::Mode::Client));
         assert_eq!(swarm.listeners().count(), 0);
@@ -3144,6 +3487,163 @@ mod tests {
             }
         });
         (peer_id, addr, task)
+    }
+
+    /// A canary: a TCP listener that counts the connections it accepts.
+    fn transport_canary() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = accepted.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (port, accepted)
+    }
+
+    async fn reached(accepted: &std::sync::atomic::AtomicUsize, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while tokio::time::Instant::now() < deadline {
+            if accepted.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        accepted.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
+    /// The #45 lifecycle review's probe (finding 1): a node's DHT dials
+    /// through its network, so once the network is revoked it opens no
+    /// socket; unrevoked (the control), the same lookup dials the bootstrap
+    /// peer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoked_networks_dht_opens_no_socket() {
+        for revoked in [true, false] {
+            let (port, accepted) = transport_canary();
+            let peer = Keypair::generate_ed25519().public().to_peer_id();
+            let network = freedom_ipfs_net::Network::legacy();
+            let dht = LightDhtClient::new(vec![format!("/ip4/127.0.0.1/tcp/{port}/p2p/{peer}")])
+                .with_query_timeout(Duration::from_secs(1))
+                .with_network(&network);
+            if revoked {
+                network.revoke();
+            }
+            let cid = Cid::new_v1(0x55, Multihash::<64>::wrap(0x12, &[7; 32]).unwrap());
+            let query = tokio::spawn(async move { dht.providers(&cid).await });
+            let reached =
+                reached(&accepted, Duration::from_secs(if revoked { 1 } else { 5 })).await;
+            query.abort();
+            assert_eq!(reached, !revoked, "revoked: {revoked}");
+        }
+    }
+
+    /// A DHT peer answers closer peers with a private address: with checked
+    /// addresses Kademlia's own dial to it is refused by the transport, and
+    /// the canary sees nothing; without the address table (the control), it
+    /// is dialed. The bootstrap peer is a configured target, so it is
+    /// reached in both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kad_learned_private_address_never_reaches_a_canary() {
+        use freedom_ipfs_net::gate::{ConfiguredTargets, Nat64State};
+        use freedom_ipfs_net::{Addresses, Nat64Handle, Network, NetworkPolicy};
+        for checked in [true, false] {
+            let (canary_port, accepted) = transport_canary();
+            let mut server = build_listening_only_dht_server();
+            let server_peer = *server.local_peer_id();
+            server
+                .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+                .unwrap();
+            let server_addr = loop {
+                if let SwarmEvent::NewListenAddr { address, .. } = server.select_next_some().await {
+                    break address;
+                }
+            };
+            let learned = Keypair::generate_ed25519().public().to_peer_id();
+            server.behaviour_mut().kad.add_address(
+                &learned,
+                format!("/ip4/127.0.0.1/tcp/{canary_port}").parse().unwrap(),
+            );
+            let task = tokio::spawn(async move {
+                loop {
+                    let _ = server.select_next_some().await;
+                }
+            });
+
+            let mut configured = ConfiguredTargets::new();
+            let server_socket = match server_addr.iter().collect::<Vec<_>>().as_slice() {
+                [Protocol::Ip4(ip), Protocol::Tcp(port)] => {
+                    std::net::SocketAddr::new((*ip).into(), *port)
+                }
+                other => panic!("{other:?}"),
+            };
+            configured.add_endpoint(server_socket);
+            let addresses = if checked {
+                Addresses::Checked(Nat64Handle::fixed(Nat64State::NONE))
+            } else {
+                Addresses::Unchecked
+            };
+            let network = Network::with_lookup(
+                NetworkPolicy::direct(
+                    configured,
+                    url::Url::parse("https://dns.example/dns-query").unwrap(),
+                    addresses,
+                )
+                .unwrap(),
+                None,
+            );
+            let dht = LightDhtClient::new(vec![format!("{server_addr}/p2p/{server_peer}")])
+                .with_query_timeout(Duration::from_secs(3))
+                .with_network(&network);
+            let cid = Cid::new_v1(0x55, Multihash::<64>::wrap(0x12, &[9; 32]).unwrap());
+            // The server itself never dials it: it can't dial at all.
+            assert!(!reached(&accepted, Duration::from_millis(300)).await);
+            let query = tokio::spawn(async move { dht.providers(&cid).await });
+            let reached =
+                reached(&accepted, Duration::from_secs(if checked { 4 } else { 10 })).await;
+            query.abort();
+            task.abort();
+            assert_eq!(reached, !checked, "checked: {checked}");
+        }
+    }
+
+    /// A DHT server that never dials: it answers, and its closer-peer
+    /// answers are the only way the canary's address reaches the client.
+    #[derive(NetworkBehaviour)]
+    #[behaviour(prelude = "libp2p::swarm::derive_prelude")]
+    struct ListeningOnlyServer {
+        kad: kad::Behaviour<MemoryStore>,
+        limits: connection_limits::Behaviour,
+    }
+
+    fn build_listening_only_dht_server() -> libp2p::Swarm<ListeningOnlyServer> {
+        SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_tcp(
+                tcp::Config::default(),
+                (tls::Config::new, noise::Config::new),
+                yamux::Config::default,
+            )
+            .unwrap()
+            .with_behaviour(|key| {
+                let peer_id = key.public().to_peer_id();
+                let mut config = kad::Config::new(kad::PROTOCOL_NAME);
+                config.set_periodic_bootstrap_interval(None);
+                let mut kad =
+                    kad::Behaviour::with_config(peer_id, MemoryStore::new(peer_id), config);
+                kad.set_mode(Some(kad::Mode::Server));
+                ListeningOnlyServer {
+                    kad,
+                    limits: connection_limits::Behaviour::new(
+                        connection_limits::ConnectionLimits::default()
+                            .with_max_pending_outgoing(Some(0)),
+                    ),
+                }
+            })
+            .unwrap()
+            .build()
     }
 
     async fn build_local_dht_server() -> libp2p::Swarm<kad::Behaviour<MemoryStore>> {
