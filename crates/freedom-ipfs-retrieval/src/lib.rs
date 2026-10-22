@@ -17155,43 +17155,45 @@ mod bitswap_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn prefers_scored_fast_http_provider_in_initial_race_width() {
+        const FAST: usize = 0;
+        const SLOW_A: usize = 1;
+        const SLOW_B: usize = 2;
         let expected = b"verified scored HTTP provider block";
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, expected);
-        let slow_requests = Arc::new(AtomicU64::new(0));
-        let fast_requests = Arc::new(AtomicU64::new(0));
-        let (slow_a_addr, slow_a_task) = spawn_hanging_http_provider(slow_requests.clone()).await;
-        let (slow_b_addr, slow_b_task) = spawn_hanging_http_provider(slow_requests.clone()).await;
-        let (fast_addr, fast_task) =
-            spawn_counting_http_provider(expected.to_vec(), Duration::ZERO, fast_requests.clone())
-                .await;
+        // The fast provider is scored on a block of its own, so its requests
+        // for `cid` are the race's alone.
+        let scoring = b"scores the fast HTTP provider";
+        let scoring_cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, scoring);
+        let (addrs, arrivals, providers_task) = spawn_ordered_http_providers(vec![
+            HashMap::from([(cid, expected.to_vec()), (scoring_cid, scoring.to_vec())]),
+            HashMap::new(),
+            HashMap::new(),
+        ])
+        .await;
+        let http_addr = |provider: usize| {
+            format!(
+                "/ip4/{}/tcp/{}/http",
+                addrs[provider].ip(),
+                addrs[provider].port()
+            )
+        };
         let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
         let retriever = HttpRetriever::new(
             freedom_ipfs_routing::DelegatedRoutingClient::new("http://127.0.0.1:9/routing/v1"),
             store.clone(),
         );
-        let fast_only_provider = Provider::from_parts(
-            None,
-            vec![format!(
-                "/ip4/{}/tcp/{}/http",
-                fast_addr.ip(),
-                fast_addr.port()
-            )],
-        )
-        .unwrap_or_else(|_| panic!("failed to build fast HTTP provider"));
+        let fast_only_provider = Provider::from_parts(None, vec![http_addr(FAST)])
+            .unwrap_or_else(|_| panic!("failed to build fast HTTP provider"));
 
         let (_block, source) = retriever
-            .fetch_from_providers_with_source(&cid, &[fast_only_provider], None)
+            .fetch_from_providers_with_source(&scoring_cid, &[fast_only_provider], None)
             .await
             .unwrap();
         assert_eq!(source, RetrievalSource::HttpProvider);
 
         let mixed_provider = Provider::from_parts(
             None,
-            vec![
-                format!("/ip4/{}/tcp/{}/http", slow_a_addr.ip(), slow_a_addr.port()),
-                format!("/ip4/{}/tcp/{}/http", slow_b_addr.ip(), slow_b_addr.port()),
-                format!("/ip4/{}/tcp/{}/http", fast_addr.ip(), fast_addr.port()),
-            ],
+            vec![http_addr(SLOW_A), http_addr(SLOW_B), http_addr(FAST)],
         )
         .unwrap_or_else(|_| panic!("failed to build mixed HTTP providers"));
 
@@ -17203,19 +17205,52 @@ mod bitswap_tests {
         .await
         .expect("scored HTTP provider fetch timed out")
         .unwrap();
+        let elapsed = started.elapsed();
 
         assert_eq!(source, RetrievalSource::HttpProvider);
         assert_eq!(block.data(), expected);
-        assert!(
-            started.elapsed() < HTTP_PROVIDER_HEDGE_AFTER,
-            "scored fast provider should be in the initial race window"
-        );
-        assert_eq!(fast_requests.load(Ordering::Relaxed), 2);
-        assert_eq!(slow_requests.load(Ordering::Relaxed), 1);
         assert_eq!(store.get(&cid).unwrap().unwrap().data(), expected);
-        slow_a_task.abort();
-        slow_b_task.abort();
-        fast_task.abort();
+
+        // The race's requests, in the order they were made. The fast
+        // provider read its request for `cid` before it answered; a slow
+        // provider's request may come after the race has returned, or never,
+        // when the fast provider answers before the race has polled it.
+        let race = arrivals
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|arrival| arrival.provider != FAST || arrival.cid == Some(cid))
+            .map(|arrival| arrival.provider)
+            .collect::<Vec<_>>();
+        let asked = |provider: usize| race.iter().filter(|&&asked| asked == provider).count();
+        assert_eq!(asked(FAST), 1, "requests in race order: {race:?}");
+        assert!(
+            asked(SLOW_A) <= 1 && asked(SLOW_B) <= 1,
+            "requests in race order: {race:?}"
+        );
+        // The scored provider is in the initial window, with the first slow
+        // one: when it was asked, at most that slow provider had been.
+        // Reached only through the hedge, it would follow both.
+        let fast_at = race.iter().position(|&asked| asked == FAST).unwrap();
+        assert!(
+            fast_at <= 1,
+            "scored fast provider should be in the initial race window: {race:?}"
+        );
+        // The second slow provider is asked only through the hedge, which
+        // fires when no request has completed within its delay (as can
+        // happen under load): after the fast provider, and not before the
+        // delay.
+        if let Some(slow_b_at) = race.iter().position(|&asked| asked == SLOW_B) {
+            assert!(
+                slow_b_at > fast_at,
+                "second slow provider asked before the scored one: {race:?}"
+            );
+            assert!(
+                elapsed >= HTTP_PROVIDER_HEDGE_AFTER,
+                "second slow provider asked before the hedge could fire ({elapsed:?})"
+            );
+        }
+        providers_task.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -20632,14 +20667,24 @@ mod bitswap_tests {
     async fn single_http_provider_races_recent_bitswap_peer_by_default() {
         let data = b"single http gives recent peer short grace";
         let cid = freedom_ipfs_core::cid_from_data(freedom_ipfs_core::CODEC_RAW, data);
-        let (session_peer_id, session_addr, session_swarm, session_stream) =
-            spawn_delayed_multi_block_bitswap_peer(
-                vec![(cid, data.to_vec())],
-                Duration::from_millis(75),
-            )
-            .await;
         let http_requests = Arc::new(AtomicU64::new(0));
         let (http_addr, http_task) = spawn_hanging_http_provider(http_requests.clone()).await;
+        // The recent peer answers only once the HTTP provider has been
+        // asked, so Bitswap wins only if the provider is raced alongside
+        // it. Were the provider asked only after a grace for the peer, the
+        // grace would end unanswered and the fetch hang on the provider.
+        let asked = http_requests.clone();
+        let (session_peer_id, session_addr, session_swarm, session_stream) =
+            spawn_gated_multi_block_bitswap_peer(vec![(cid, data.to_vec())], move || {
+                let asked = asked.clone();
+                async move {
+                    while asked.load(Ordering::Relaxed) == 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }
+                .boxed()
+            })
+            .await;
         let response = format!(
             r#"{{"Providers":[{{"ID":"slow-http","Addrs":["/ip4/127.0.0.1/tcp/{}/http"]}}]}}"#,
             http_addr.port()
@@ -20659,17 +20704,32 @@ mod bitswap_tests {
             )
             .await;
 
+        let started = Instant::now();
         let (block, source) = tokio::time::timeout(
             Duration::from_secs(2),
             retriever.fetch_block_with_source(&cid),
         )
         .await
-        .unwrap()
+        .expect("fetch timed out: was the HTTP provider raced with the recent peer?")
         .unwrap();
+        let elapsed = started.elapsed();
 
         assert_eq!(source, RetrievalSource::Bitswap);
         assert_eq!(block.data(), data);
-        assert_eq!(http_requests.load(Ordering::Relaxed), 1);
+        // The provider was asked once. A second request can only be the
+        // single provider's self hedge, which fires when Bitswap is slow
+        // to answer (as it can be under load), and never before its delay.
+        let http_requests = http_requests.load(Ordering::Relaxed);
+        assert!(
+            (1..=2).contains(&http_requests),
+            "HTTP provider asked {http_requests} times"
+        );
+        if http_requests == 2 {
+            assert!(
+                elapsed >= single_http_provider_self_hedge_after(),
+                "a second HTTP request came before the self hedge could fire ({elapsed:?})"
+            );
+        }
 
         tokio::time::timeout(Duration::from_secs(5), session_stream)
             .await
@@ -21058,6 +21118,106 @@ mod bitswap_tests {
             }
         });
         (addr, task)
+    }
+
+    /// A connection an ordered HTTP provider accepted: which provider, and
+    /// the block its request asked for, once read.
+    #[derive(Clone, Copy, Debug)]
+    struct OrderedHttpArrival {
+        provider: usize,
+        cid: Option<Cid>,
+    }
+
+    /// HTTP providers on listeners of their own, whose connections one task
+    /// accepts and logs in the order it takes them; of connections waiting
+    /// together, the lower provider's is taken first. A provider answers a
+    /// request for one of its blocks, and never answers any other.
+    async fn spawn_ordered_http_providers(
+        providers: Vec<HashMap<Cid, Vec<u8>>>,
+    ) -> (
+        Vec<SocketAddr>,
+        Arc<std::sync::Mutex<Vec<OrderedHttpArrival>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mut listeners = Vec::new();
+        for _ in &providers {
+            listeners.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+        }
+        let addrs = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect();
+        let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = arrivals.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let accepted = std::future::poll_fn(|cx| {
+                    for (provider, listener) in listeners.iter().enumerate() {
+                        match listener.poll_accept(cx) {
+                            std::task::Poll::Ready(Ok((stream, _))) => {
+                                return std::task::Poll::Ready(Some((provider, stream)));
+                            }
+                            std::task::Poll::Ready(Err(_)) => {
+                                return std::task::Poll::Ready(None);
+                            }
+                            std::task::Poll::Pending => {}
+                        }
+                    }
+                    std::task::Poll::Pending
+                })
+                .await;
+                let Some((provider, mut stream)) = accepted else {
+                    break;
+                };
+                let arrival = {
+                    let mut log = log.lock().unwrap();
+                    log.push(OrderedHttpArrival {
+                        provider,
+                        cid: None,
+                    });
+                    log.len() - 1
+                };
+                let blocks = providers[provider].clone();
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let Some(cid) = read_http_request_cid(&mut stream).await else {
+                        return;
+                    };
+                    log.lock().unwrap()[arrival].cid = Some(cid);
+                    let Some(data) = blocks.get(&cid) else {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        return;
+                    };
+                    let mut response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        data.len()
+                    )
+                    .into_bytes();
+                    response.extend_from_slice(data);
+                    let _ = stream.write_all(&response).await;
+                });
+            }
+        });
+        (addrs, arrivals, task)
+    }
+
+    /// The block an HTTP provider request asks for, from its request line
+    /// (`GET /ipfs/<cid>?format=raw HTTP/1.1`); `None` if the connection
+    /// ends before the request does.
+    async fn read_http_request_cid(stream: &mut tokio::net::TcpStream) -> Option<Cid> {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).await.ok()?;
+            if read == 0 || request.len() > 64 * 1024 {
+                return None;
+            }
+            request.extend_from_slice(&buffer[..read]);
+        }
+        let request = String::from_utf8_lossy(&request);
+        let path = request.split_whitespace().nth(1)?;
+        let cid = path.strip_prefix("/ipfs/")?.split('?').next()?;
+        Cid::try_from(cid).ok()
     }
 
     async fn spawn_redirecting_http_provider(
@@ -23350,6 +23510,28 @@ mod bitswap_tests {
         tokio::task::JoinHandle<()>,
         tokio::task::JoinHandle<()>,
     ) {
+        spawn_gated_multi_block_bitswap_peer(blocks, move || {
+            async move {
+                if !response_delay.is_zero() {
+                    tokio::time::sleep(response_delay).await;
+                }
+            }
+            .boxed()
+        })
+        .await
+    }
+
+    /// A Bitswap peer that answers each want for one of `blocks` once the
+    /// future `answer_gate` makes for that want has resolved.
+    async fn spawn_gated_multi_block_bitswap_peer(
+        blocks: Vec<(Cid, Vec<u8>)>,
+        mut answer_gate: impl FnMut() -> BoxFuture<'static, ()> + Send + 'static,
+    ) -> (
+        PeerId,
+        Multiaddr,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let mut swarm = SwarmBuilder::with_new_identity()
             .with_tokio()
             .with_tcp(
@@ -23393,9 +23575,7 @@ mod bitswap_tests {
                 let mut cid_bytes = entry.block.as_slice();
                 let cid = Cid::read_bytes(&mut cid_bytes).unwrap();
                 let data = blocks.remove(&cid).expect("requested known block");
-                if !response_delay.is_zero() {
-                    tokio::time::sleep(response_delay).await;
-                }
+                answer_gate().await;
 
                 let response = BitswapMessage {
                     payload: vec![BlockPayload {
