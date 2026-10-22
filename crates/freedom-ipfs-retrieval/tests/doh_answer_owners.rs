@@ -751,3 +751,162 @@ async fn ownerless_aliases_are_refused_not_chained() {
         .await
         .is_err());
 }
+
+/// Owners must be names the gate's classifier accepts (#47 adversarial
+/// review round 5): an alias, or a record of the kind asked for, whose owner
+/// is empty, blank or padded refuses the lookup, so it can't hide a branch
+/// or slip in beside a valid record; a non-string owner refuses without a
+/// panic; and a malformed owner on a record of another kind leaves a valid
+/// answer alone. Each case has a well-formed control.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_alias_with_a_malformed_owner_cannot_hide_a_branch() {
+    let mut answers = HashMap::from([(
+        ("control-r5.example".into(), "1".into()),
+        vec![
+            owned_cname("control-r5.example.", "safe-r5.example."),
+            owned_a("safe-r5.example.", "8.8.8.8"),
+        ],
+    )]);
+    for (label, owner) in [
+        ("empty", ""),
+        ("space", " "),
+        ("padded", "padded-r5.example. "),
+        ("tab", "\t"),
+    ] {
+        let name = format!("{label}-r5.example");
+        answers.insert(
+            (name.clone(), "1".into()),
+            vec![
+                owned_cname(&format!("{name}."), "safe-r5.example."),
+                serde_json::json!({
+                    "name": owner, "type": 5, "TTL": 60, "data": "secret.onion."
+                }),
+                owned_a("safe-r5.example.", "8.8.4.4"),
+            ],
+        );
+    }
+    let doh = Doh::start(answers);
+    let resolver = direct_resolver(&doh);
+    assert_eq!(
+        resolver.ip_lookup("control-r5.example").await.unwrap(),
+        ["8.8.8.8".parse::<std::net::IpAddr>().unwrap()]
+    );
+    let mut accepted = Vec::new();
+    for label in ["empty", "space", "padded", "tab"] {
+        let name = format!("{label}-r5.example");
+        let result = resolver.ip_lookup(&name).await;
+        if result.as_ref().is_ok_and(|records| !records.is_empty()) {
+            accepted.push((label, result.unwrap()));
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "malformed CNAME owners hid a second alias: {accepted:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_requested_record_with_a_malformed_owner_refuses_the_answer() {
+    let mut answers = HashMap::from([(
+        ("control-record-r5.example".into(), "1".into()),
+        vec![owned_a("control-record-r5.example.", "8.8.8.8")],
+    )]);
+    for (label, owner) in [("empty", ""), ("space", " "), ("tab", "\t")] {
+        let name = format!("{label}-record-r5.example");
+        answers.insert(
+            (name.clone(), "1".into()),
+            vec![
+                owned_a(&format!("{name}."), "8.8.8.8"),
+                serde_json::json!({
+                    "name": owner, "type": 1, "TTL": 60, "data": "8.8.4.4"
+                }),
+            ],
+        );
+    }
+    let doh = Doh::start(answers);
+    let resolver = direct_resolver(&doh);
+    assert_eq!(
+        resolver
+            .ip_lookup("control-record-r5.example")
+            .await
+            .unwrap(),
+        ["8.8.8.8".parse::<std::net::IpAddr>().unwrap()]
+    );
+    let mut accepted = Vec::new();
+    for label in ["empty", "space", "tab"] {
+        let name = format!("{label}-record-r5.example");
+        let result = resolver.ip_lookup(&name).await;
+        if result.as_ref().is_ok_and(|records| !records.is_empty()) {
+            accepted.push((label, result.unwrap()));
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "malformed requested-record owners did not refuse: {accepted:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_string_owner_refuses_without_a_panic() {
+    let forms = [
+        Value::Bool(true),
+        serde_json::json!(7),
+        serde_json::json!([]),
+        serde_json::json!({}),
+    ];
+    for (index, owner) in forms.into_iter().enumerate() {
+        let name = format!("non-string-{index}-r5.example");
+        let doh = Doh::start(HashMap::from([(
+            (name.clone(), "1".into()),
+            vec![
+                owned_a(&format!("{name}."), "8.8.8.8"),
+                serde_json::json!({
+                    "name": owner, "type": 5, "TTL": 60, "data": "secret.onion."
+                }),
+            ],
+        )]));
+        assert!(direct_resolver(&doh).ip_lookup(&name).await.is_err());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_owner_on_an_unrequested_kind_doesnt_refuse() {
+    use freedom_ipfs_namesys::DnsTxtResolver;
+    let doh = Doh::start(HashMap::from([
+        (
+            ("unrequested-r5.example".into(), "1".into()),
+            vec![
+                owned_a("unrequested-r5.example.", "8.8.8.8"),
+                serde_json::json!({"type":16,"TTL":60,"data":"ignored"}),
+                serde_json::json!({"name":null,"type":16,"TTL":60,"data":"ignored"}),
+                serde_json::json!({"name":"","type":16,"TTL":60,"data":"ignored"}),
+                serde_json::json!({"name":" ","type":16,"TTL":60,"data":"ignored"}),
+            ],
+        ),
+        (
+            ("_dnslink.unrequested-r5.example".into(), "TXT".into()),
+            vec![
+                owned_txt(
+                    "_dnslink.unrequested-r5.example.",
+                    "dnslink=/ipfs/bafkqaddwgevxmmraojswg33smq",
+                ),
+                serde_json::json!({"type":1,"TTL":60,"data":"127.0.0.1"}),
+                serde_json::json!({"name":null,"type":28,"TTL":60,"data":"::1"}),
+                serde_json::json!({"name":"","type":1,"TTL":60,"data":"127.0.0.1"}),
+                serde_json::json!({"name":" ","type":28,"TTL":60,"data":"::1"}),
+            ],
+        ),
+    ]));
+    let resolver = direct_resolver(&doh);
+    assert_eq!(
+        resolver.ip_lookup("unrequested-r5.example").await.unwrap(),
+        ["8.8.8.8".parse::<std::net::IpAddr>().unwrap()]
+    );
+    assert_eq!(
+        resolver
+            .txt_lookup("_dnslink.unrequested-r5.example")
+            .await
+            .unwrap(),
+        ["dnslink=/ipfs/bafkqaddwgevxmmraojswg33smq"]
+    );
+}
