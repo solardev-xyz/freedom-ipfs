@@ -321,7 +321,9 @@ impl OnlineNodeBuilder {
                     Arc::new(PersistentNameResolver::cache_only(store.clone())),
                 ),
                 online => {
-                    let mut dht = LightDhtClient::default();
+                    // The DHT's swarms dial through the node's network: its
+                    // capability, and its gate under `direct`.
+                    let mut dht = LightDhtClient::default().with_network(&network);
                     if let Some(timeout) = dht_query_timeout {
                         dht = dht.with_query_timeout(timeout);
                     }

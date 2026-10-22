@@ -21,6 +21,9 @@
 //! - [`dial`]: the gate where candidates are chosen and addresses expanded
 //!   ([`DialPolicy`]), and the transports a policy's dials can use
 //!   ([`TransportPolicy`]).
+//! - [`transport`]: the gate in the libp2p transports, around and below
+//!   their DNS layer ([`transport::Gated`]), and the swarms' transports
+//!   built for a network ([`transport::Transports`]).
 //!
 //! The legacy policy (what the crates did before) and `direct` can be built;
 //! `socks5` comes with a later part of the item.
@@ -31,6 +34,7 @@ pub mod gate;
 pub mod http;
 pub mod policy;
 pub mod resolve;
+pub mod transport;
 
 pub use capability::{NetworkCapability, Revoked};
 pub use dial::{DialPolicy, DialRefusal, TransportPolicy};
