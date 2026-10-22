@@ -73,6 +73,9 @@ struct Shared {
     config: Mutex<Config>,
     requests: Mutex<Vec<Request>>,
     connections: AtomicUsize,
+    /// The local addresses of the proxy's own connections to the listeners
+    /// it forwards to.
+    outbound: Mutex<Vec<SocketAddr>>,
 }
 
 /// The test proxy. It stops when dropped.
@@ -140,6 +143,13 @@ impl SocksFixture {
     /// The connections accepted so far.
     pub fn connections(&self) -> usize {
         self.shared.connections.load(Ordering::SeqCst)
+    }
+
+    /// The local addresses of the proxy's own connections to the listeners
+    /// it forwarded `CONNECT`s to: in the same process, they tell the
+    /// proxy's sockets apart from those of the code under test.
+    pub fn outbound(&self) -> Vec<SocketAddr> {
+        self.shared.outbound.lock().unwrap().clone()
     }
 
     /// Stops accepting: later connections are refused, as by a proxy that
@@ -267,11 +277,14 @@ fn client_hello_server_name(bytes: &[u8]) -> Option<Option<String>> {
 
 /// An HTTP/1.1 server that records each request's path and `Host` header,
 /// and answers it from `respond`, given the path and the host: a status, a
-/// `Location` if any, and a body. Each connection carries one request.
+/// `Location` if any, and a body. Each connection carries one request. It
+/// counts the connections it accepts, those that carry no request
+/// included.
 #[derive(Debug)]
 pub struct HttpServer {
     addr: SocketAddr,
     requests: Arc<Mutex<Vec<ServedRequest>>>,
+    connections: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
 
@@ -312,12 +325,15 @@ impl HttpServer {
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = requests.clone();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = connections.clone();
         let respond = Arc::new(respond);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     continue;
                 };
+                accepted.fetch_add(1, Ordering::SeqCst);
                 let (recorded, respond) = (recorded.clone(), respond.clone());
                 tokio::spawn(async move {
                     let mut head = Vec::new();
@@ -359,8 +375,14 @@ impl HttpServer {
         Self {
             addr,
             requests,
+            connections,
             task,
         }
+    }
+
+    /// The connections accepted so far, with or without a request.
+    pub fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -452,6 +474,9 @@ async fn exchange(stream: &mut TcpStream, shared: &Shared) -> std::io::Result<()
             }) else {
                 return reply(stream, 0x04, None).await;
             };
+            if let Ok(local) = target.local_addr() {
+                shared.outbound.lock().unwrap().push(local);
+            }
             reply(stream, 0x00, Some("0.0.0.0".parse().unwrap())).await?;
             let _ = tokio::io::copy_bidirectional(stream, &mut target).await;
             Ok(())

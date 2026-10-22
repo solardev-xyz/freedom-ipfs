@@ -97,6 +97,7 @@ pub struct OnlineNodeBuilder {
     delegated_routers: Vec<String>,
     dht_query_timeout: Option<Duration>,
     dht_max_providers: Option<usize>,
+    dht_bootstrap_peers: Option<Vec<String>>,
     gateway_config: GatewayConfig,
     shared_limits: Option<SharedLimits>,
     memory_budget: Option<MemoryBudget>,
@@ -132,6 +133,18 @@ impl OnlineNodeBuilder {
     /// default unless set.
     pub fn dht_max_providers(mut self, max_providers: usize) -> Self {
         self.dht_max_providers = Some(max_providers);
+        self
+    }
+
+    /// The light DHT's bootstrap peers instead of its defaults: tests, which
+    /// need peers they control.
+    #[doc(hidden)]
+    pub fn dht_bootstrap_peers<I, S>(mut self, peers: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.dht_bootstrap_peers = Some(peers.into_iter().map(Into::into).collect());
         self
     }
 
@@ -298,6 +311,7 @@ impl OnlineNodeBuilder {
             delegated_routers,
             dht_query_timeout,
             dht_max_providers,
+            dht_bootstrap_peers,
             gateway_config,
             shared_limits,
             memory_budget,
@@ -323,7 +337,11 @@ impl OnlineNodeBuilder {
                 online => {
                     // The DHT's swarms dial through the node's network: its
                     // capability, and its gate under `direct`.
-                    let mut dht = LightDhtClient::default().with_network(&network);
+                    let dht = match dht_bootstrap_peers {
+                        Some(peers) => LightDhtClient::new(peers),
+                        None => LightDhtClient::default(),
+                    };
+                    let mut dht = dht.with_network(&network);
                     if let Some(timeout) = dht_query_timeout {
                         dht = dht.with_query_timeout(timeout);
                     }
@@ -546,6 +564,7 @@ impl OnlineNode {
             delegated_routers: vec![DEFAULT_DELEGATED_ROUTER.to_string()],
             dht_query_timeout: None,
             dht_max_providers: None,
+            dht_bootstrap_peers: None,
             gateway_config: GatewayConfig::default(),
             shared_limits: None,
             memory_budget: None,

@@ -28,8 +28,8 @@ pub fn not_found() -> Reply {
 }
 
 /// A DoH endpoint (JSON) on loopback: `_dnslink.site.example` answers with
-/// `cid`; every other question has no answer. It records each question as
-/// `name/type`.
+/// `cid`, `canary.example`'s A question with `127.0.0.1`; every other
+/// question has no answer. It records each question as `name/type`.
 pub async fn doh(cid: Cid, questions: Arc<Mutex<Vec<String>>>) -> HttpServer {
     HttpServer::start(move |path, _| {
         let query = path.split_once('?').map_or("", |(_, query)| query);
@@ -48,6 +48,12 @@ pub async fn doh(cid: Cid, questions: Arc<Mutex<Vec<String>>>) -> HttpServer {
             serde_json::json!({ "Status": 0, "Answer": [
                 { "name": owner, "type": 16, "TTL": 60,
                   "data": format!("\"dnslink=/ipfs/{cid}\"") },
+            ]})
+        } else if name.trim_end_matches('.') == "canary.example"
+            && matches!(kind.as_str(), "A" | "1")
+        {
+            serde_json::json!({ "Status": 0, "Answer": [
+                { "name": "canary.example", "type": 1, "TTL": 60, "data": "127.0.0.1" },
             ]})
         } else {
             serde_json::json!({ "Status": 3 })
