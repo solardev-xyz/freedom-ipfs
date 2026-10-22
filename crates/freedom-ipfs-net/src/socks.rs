@@ -19,11 +19,13 @@ pub mod fixture;
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::gate::OnionHost;
+use crate::resolve::{LookupError, LookupFuture, NameLookup};
 
 const VERSION: u8 = 5;
 const NO_AUTH: u8 = 0x00;
@@ -68,6 +70,26 @@ impl SocksAuth {
         match self {
             Self::None => Ok(()),
         }
+    }
+}
+
+/// The gate's resolver's lookup under `socks5`: Tor's `RESOLVE` through the
+/// network's proxy, one address per name, never a local resolver. The gate's
+/// resolver checks the answer.
+#[derive(Debug)]
+pub(crate) struct SocksLookup(pub(crate) Arc<SocksClient>);
+
+impl NameLookup for SocksLookup {
+    fn lookup(&self, name: &str) -> LookupFuture {
+        let client = self.0.clone();
+        let name = name.to_string();
+        Box::pin(async move {
+            client
+                .resolve(&name)
+                .await
+                .map(|ip| vec![ip])
+                .map_err(|err| LookupError(err.to_string()))
+        })
     }
 }
 

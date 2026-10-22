@@ -1,8 +1,9 @@
 //! The onion route's host (design 0007, "The onion route").
 
 use data_encoding::BASE32_NOPAD;
+use url::Url;
 
-use super::classify::Target;
+use super::classify::{classify_url, Target};
 
 /// The length of a v3 onion address's label: 35 bytes in base32.
 const V3_LABEL_LEN: usize = 56;
@@ -54,6 +55,34 @@ impl OnionHost {
     /// The host name, as the proxy receives it.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// An `http` or `https` URL, without userinfo, whose host is an
+/// [`OnionHost`]: the only thing the onion route's HTTP client takes
+/// (design 0007, "The onion route"). Only [`OnionUrl::new`] makes one, from
+/// a URL the classifier found to be an onion's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnionUrl(Url);
+
+impl OnionUrl {
+    /// `url`, if the classifier reads it as an `http` or `https` URL
+    /// without userinfo whose host is a well-formed v3 onion address.
+    pub fn new(url: &Url) -> Option<Self> {
+        let target = classify_url(url).ok()?;
+        OnionHost::new(&target.target)?;
+        Some(Self(url.clone()))
+    }
+
+    pub fn as_url(&self) -> &Url {
+        &self.0
+    }
+
+    /// Any URL, unchecked: only for the tests of the onion client's own
+    /// second check.
+    #[cfg(test)]
+    pub(crate) fn unchecked(url: Url) -> Self {
+        Self(url)
     }
 }
 
@@ -117,6 +146,31 @@ mod tests {
         // Not onions at all.
         for other in ["example.com", "127.0.0.1"] {
             assert_eq!(OnionHost::new(&classify_host(other).unwrap()), None);
+        }
+    }
+
+    #[test]
+    fn only_an_onion_url_the_classifier_accepts_is_one() {
+        let v3 = v3_label(3);
+        for accepted in [
+            format!("http://{v3}.onion/"),
+            format!("https://www.{v3}.onion:8443/a?b"),
+        ] {
+            let url = Url::parse(&accepted).unwrap();
+            assert_eq!(OnionUrl::new(&url).unwrap().as_url(), &url);
+        }
+        for refused in [
+            "http://example.com/".to_string(),
+            "http://127.0.0.1/".to_string(),
+            "http://foo.onion/".to_string(),
+            format!("ftp://{v3}.onion/"),
+            format!("http://user@{v3}.onion/"),
+        ] {
+            assert_eq!(
+                OnionUrl::new(&Url::parse(&refused).unwrap()),
+                None,
+                "{refused}"
+            );
         }
     }
 }

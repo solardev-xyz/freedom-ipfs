@@ -29,9 +29,9 @@
 //!   through, and with `test-util` a test proxy (`socks::fixture`).
 //!
 //! The legacy policy (what the crates did before) and `direct` can be
-//! built. `socks5`'s libp2p transports exist (feature `socks`, off by
-//! default, so mobile builds compile none of it); [`Network::new`] refuses
-//! the mode until its HTTP clients do too.
+//! built, and `socks5` with the feature `socks` (off by default, so mobile
+//! builds compile none of it): its HTTP clients ([`http`]) and its libp2p
+//! transports. Without the feature, [`Network::new`] refuses `socks5`.
 
 pub mod capability;
 pub mod dial;

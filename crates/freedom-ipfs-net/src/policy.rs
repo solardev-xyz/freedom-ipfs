@@ -15,10 +15,8 @@ use crate::resolve::{system_lookup, NameLookup};
 
 /// What a node's network may do.
 ///
-/// [`NetworkPolicy::legacy`] and [`NetworkPolicy::direct`] can be built.
-/// `NetworkPolicy::socks5` (cargo feature `socks`) describes `socks5`,
-/// whose libp2p transports exist; [`Network::new`] refuses it until its
-/// HTTP clients do too.
+/// [`NetworkPolicy::legacy`] and [`NetworkPolicy::direct`] can be built,
+/// and with the cargo feature `socks`, `NetworkPolicy::socks5`.
 #[derive(Clone, Debug)]
 pub struct NetworkPolicy {
     mode: Mode,
@@ -76,7 +74,8 @@ impl NetworkPolicy {
     /// configuration names): they and `doh`, which is added to them, are
     /// exempt from the address policy by exact host and port, and are
     /// reached through the proxy like everything else. The proxy's own
-    /// endpoint isn't a target, and isn't exempt.
+    /// endpoint isn't a target, and isn't exempt (design 0007 as amended by
+    /// freedom-core #158).
     #[cfg(feature = "socks")]
     pub fn socks5(
         proxy: SocketAddr,
@@ -251,12 +250,14 @@ struct Inner {
 
 impl Network {
     /// The network for `policy`, with a capability of its own. Refused for a
-    /// mode this version can't honour yet, never approximated: a policy
-    /// that silently connected another way would fail open.
+    /// mode this build can't honour, never approximated: a policy that
+    /// silently connected another way would fail open. `socks5` needs the
+    /// cargo feature `socks`, which brings both its HTTP clients and its
+    /// libp2p transports.
     ///
     /// Under `direct` with checked addresses, the gate's resolver uses the
     /// system's DNS configuration, or Cloudflare's resolvers where it can't
-    /// be read.
+    /// be read. Under `socks5` it asks the proxy (`RESOLVE`).
     pub fn new(policy: NetworkPolicy) -> Result<Self, NetworkError> {
         let lookup = match policy.mode() {
             Mode::Legacy => None,
@@ -268,6 +269,11 @@ impl Network {
                 addresses: Addresses::Checked(_),
                 ..
             }) => Some(system_lookup()),
+            // Its lookups are `RESOLVE`'s, through the network's SOCKS
+            // client.
+            #[cfg(feature = "socks")]
+            Mode::Socks5(_) => None,
+            #[cfg(not(feature = "socks"))]
             Mode::Socks5(_) => return Err(NetworkError::Unsupported("socks5")),
         };
         Ok(Self::with_lookup(policy, lookup))
@@ -377,8 +383,9 @@ mod tests {
         Url::parse(text).unwrap()
     }
 
+    #[cfg(not(feature = "socks"))]
     #[test]
-    fn socks5_networks_cant_be_built_yet() {
+    fn socks5_networks_need_the_socks_feature() {
         assert!(matches!(
             Network::new(NetworkPolicy::legacy()).map(|n| n.policy().mode().clone()),
             Ok(Mode::Legacy)

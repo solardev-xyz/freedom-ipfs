@@ -29,6 +29,17 @@
 //! gate", check 4): every client is built with `Policy::none()` and no
 //! proxy, and each request runs [the hop loop](HttpRequest::send).
 //!
+//! Under `socks5` (cargo feature `socks`) the same hop loop runs, and every
+//! client goes through the policy's proxy and no other: the environment's
+//! proxy variables don't apply.
+//! - **Ordinary names** go to clients with `socks5://`, whose resolver is the
+//!   gate's over Tor's `RESOLVE`: the answer is checked (the untrusted
+//!   client's) and the proxy is handed the checked address. The resolver
+//!   never answers an empty success, so no name reaches the proxy that way.
+//! - **Onions** go to the onion client, with `socks5h://`, so the proxy
+//!   gets the name. It takes only a [`crate::gate::OnionUrl`], and checks
+//!   its classification again before it sends.
+//!
 //! [`Network::http_client`]: crate::policy::Network::http_client
 
 use std::error::Error as StdError;
@@ -50,6 +61,8 @@ use tower_service::Service;
 use url::Url;
 
 use crate::capability::{NetworkCapability, Revoked};
+#[cfg(feature = "socks")]
+use crate::gate::{check_address, Nat64State, OnionHost, OnionUrl};
 use crate::gate::{classify_url, parse_url, AddressRefusal, Refusal, Target};
 use crate::policy::{Addresses, Mode, Network, NetworkError};
 use crate::resolve::{check_waiting, GateResolver};
@@ -95,8 +108,57 @@ enum Transport {
         /// takes answers as they come. `None` under unchecked addresses.
         configured: Option<Result<reqwest::Client, NetworkError>>,
     },
+    /// `socks5`: `direct`'s clients, through the proxy. The hop loop picks
+    /// one client per hop.
+    #[cfg(feature = "socks")]
+    Socks5 {
+        /// An untrusted target's: `socks5://`, its names through the gate's
+        /// resolver over `RESOLVE`, which checks every answer.
+        untrusted: Result<reqwest::Client, NetworkError>,
+        /// A configured target's: the same, taking answers as they come.
+        configured: Result<reqwest::Client, NetworkError>,
+        /// An onion's: `socks5h://`, so the proxy gets the name.
+        onion: Result<OnionClient, NetworkError>,
+    },
     /// A mode this version can't build clients for.
     Unavailable(NetworkError),
+}
+
+/// The onion route's HTTP client (design 0007, "The onion route"): it takes
+/// only an [`OnionUrl`], and checks the URL's classification again before
+/// it sends, since reqwest's connector can't see the destination and
+/// `socks5h://` skips the resolver. Anything else is refused before it
+/// sends.
+#[cfg(feature = "socks")]
+#[derive(Debug)]
+struct OnionClient(reqwest::Client);
+
+#[cfg(feature = "socks")]
+impl OnionClient {
+    fn get(&self, url: &OnionUrl) -> Result<reqwest::RequestBuilder, HttpError> {
+        let still_onion = classify_url(url.as_url())
+            .ok()
+            .and_then(|target| OnionHost::new(&target.target));
+        if still_onion.is_none() {
+            return Err(Refused::OnionRoute.into());
+        }
+        Ok(self.0.get(url.as_url().clone()))
+    }
+}
+
+/// The onion client's resolver, which reqwest never asks under
+/// `socks5h://`: if it ever did, it would get an error, never an address.
+#[cfg(feature = "socks")]
+#[derive(Debug)]
+struct NoLookup;
+
+#[cfg(feature = "socks")]
+impl reqwest::dns::Resolve for NoLookup {
+    fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async {
+            Err(Box::new(crate::resolve::ResolveRefused::Onion) as Box<dyn StdError + Send + Sync>)
+        })
+    }
 }
 
 fn build(builder: reqwest::ClientBuilder) -> Result<reqwest::Client, NetworkError> {
@@ -263,7 +325,48 @@ fn transport(network: &Network, config: ClientConfig) -> Transport {
                 "checked addresses without a resolver",
             )),
         },
+        #[cfg(feature = "socks")]
+        Mode::Socks5(socks5) => socks5_transport(network, socks5, config),
+        #[cfg(not(feature = "socks"))]
         Mode::Socks5(_) => Transport::Unavailable(NetworkError::Unsupported("socks5")),
+    }
+}
+
+/// `socks5`'s clients: `direct`'s, with the policy's proxy as their only
+/// one.
+#[cfg(feature = "socks")]
+fn socks5_transport(
+    network: &Network,
+    socks5: &crate::policy::Socks5,
+    config: ClientConfig,
+) -> Transport {
+    let Some(client) = network.socks() else {
+        return Transport::Unavailable(NetworkError::Unsupported("socks5 without its client"));
+    };
+    let lookup: Arc<dyn crate::resolve::NameLookup> =
+        Arc::new(crate::socks::SocksLookup(client.clone()));
+    let resolver = |addresses| {
+        Arc::new(GateResolver::new(
+            lookup.clone(),
+            network.capability().clone(),
+            addresses,
+        ))
+    };
+    let through = |scheme: &str| {
+        reqwest::Proxy::all(format!("{scheme}://{}", socks5.proxy))
+            .map(|proxy| direct_builder(config, network.capability()).proxy(proxy))
+            .map_err(|err| NetworkError::ClientBuild(Arc::new(err)))
+    };
+    // socks5 learns no NAT64 prefix: only the fixed forms apply.
+    let untrusted = crate::policy::Nat64Handle::fixed(Nat64State::known([]));
+    Transport::Socks5 {
+        untrusted: through("socks5")
+            .and_then(|builder| build(builder.dns_resolver(resolver(Some(untrusted))))),
+        configured: through("socks5")
+            .and_then(|builder| build(builder.dns_resolver(resolver(None)))),
+        onion: through("socks5h")
+            .and_then(|builder| build(builder.dns_resolver(Arc::new(NoLookup))))
+            .map(OnionClient),
     }
 }
 
@@ -335,6 +438,16 @@ impl HttpClient {
                 .as_ref()
                 .err()
                 .or_else(|| configured.as_ref().and_then(|client| client.as_ref().err())),
+            #[cfg(feature = "socks")]
+            Transport::Socks5 {
+                untrusted,
+                configured,
+                onion,
+            } => untrusted
+                .as_ref()
+                .err()
+                .or_else(|| configured.as_ref().err())
+                .or_else(|| onion.as_ref().err()),
             Transport::Unavailable(err) => Some(err),
         }
     }
@@ -354,6 +467,18 @@ impl HttpClient {
                 .map(|client| client.get(raw))
                 .map_err(|err| HttpError::Unavailable(err.clone())),
             Transport::Direct {
+                untrusted: client, ..
+            } => match parse_url(raw) {
+                Err(refusal) => Err(Refused::Target(refusal).into()),
+                Ok(url) => client
+                    .as_ref()
+                    .map(|client| client.get(url))
+                    .map_err(|err| HttpError::Unavailable(err.clone())),
+            },
+            // The request is only built here: the hop loop sends each hop
+            // through the client its target takes.
+            #[cfg(feature = "socks")]
+            Transport::Socks5 {
                 untrusted: client, ..
             } => match parse_url(raw) {
                 Err(refusal) => Err(Refused::Target(refusal).into()),
@@ -431,6 +556,8 @@ impl HttpRequest {
         match &inner.transport {
             Transport::Legacy(_) => builder.send().await.map_err(from_reqwest),
             Transport::Direct { .. } => follow(inner, builder.build()?).await,
+            #[cfg(feature = "socks")]
+            Transport::Socks5 { .. } => follow(inner, builder.build()?).await,
             Transport::Unavailable(err) => Err(HttpError::Unavailable(err.clone())),
         }
     }
@@ -475,14 +602,14 @@ async fn follow(
     let mut hops = 0;
     loop {
         inner.network.capability().check()?;
-        let client = admit(inner, &url, deadline).await?;
+        let route = admit(inner, &url, deadline).await?;
         let mut headers = fixed.clone();
         if !credentials {
             for name in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION] {
                 headers.remove(name);
             }
         }
-        let mut hop = client.get(url.clone()).headers(headers);
+        let mut hop = route.get(&url)?.headers(headers);
         if let Some(deadline) = deadline {
             hop = hop.timeout(deadline.saturating_duration_since(Instant::now()));
         }
@@ -505,13 +632,63 @@ async fn follow(
     }
 }
 
-/// The client for a hop to `url`, once its target is admitted.
+/// The client a hop goes through: an ordinary one, or the onion route's
+/// with the hop's onion URL.
+enum Route<'a> {
+    Client(&'a reqwest::Client),
+    #[cfg(feature = "socks")]
+    Onion(&'a OnionClient, OnionUrl),
+}
+
+impl Route<'_> {
+    fn get(&self, url: &Url) -> Result<reqwest::RequestBuilder, HttpError> {
+        match self {
+            Self::Client(client) => Ok(client.get(url.clone())),
+            #[cfg(feature = "socks")]
+            Self::Onion(client, onion) => client.get(onion),
+        }
+    }
+}
+
+/// The route for a hop to `url`, once its target is admitted: under
+/// `direct` or `socks5`, chosen again for every hop.
 async fn admit<'a>(
     inner: &'a ClientInner,
     url: &Url,
     deadline: Option<Instant>,
-) -> Result<&'a reqwest::Client, HttpError> {
+) -> Result<Route<'a>, HttpError> {
     let target = classify_url(url).map_err(Refused::Target)?;
+    #[cfg(feature = "socks")]
+    if let (
+        Transport::Socks5 {
+            untrusted,
+            configured,
+            onion,
+        },
+        Mode::Socks5(socks5),
+    ) = (&inner.transport, inner.network.policy().mode())
+    {
+        if target.target.is_onion() {
+            let url = OnionUrl::new(url).ok_or(Refused::OnionRoute)?;
+            let onion = onion
+                .as_ref()
+                .map_err(|err| HttpError::Unavailable(err.clone()))?;
+            return Ok(Route::Onion(onion, url));
+        }
+        let client = if socks5.configured.contains(&target.target, target.port) {
+            configured
+        } else {
+            // An IP literal never needs the resolver: it is checked here.
+            if let Target::Ip(ip) = target.target {
+                check_address(ip, &Nat64State::known([])).map_err(Refused::Address)?;
+            }
+            untrusted
+        };
+        return client
+            .as_ref()
+            .map(Route::Client)
+            .map_err(|err| HttpError::Unavailable(err.clone()));
+    }
     if target.target.is_onion() {
         return Err(Refused::Onion.into());
     }
@@ -550,6 +727,7 @@ async fn admit<'a>(
     };
     client
         .as_ref()
+        .map(Route::Client)
         .map_err(|err| HttpError::Unavailable(err.clone()))
 }
 
@@ -644,6 +822,9 @@ pub enum Refused {
     Target(Refusal),
     #[error("an onion can't be reached in direct mode")]
     Onion,
+    /// An onion the onion route doesn't take: not a well-formed v3 address.
+    #[error("the onion route takes only a v3 onion address")]
+    OnionRoute,
     #[error("{0}")]
     Address(AddressRefusal),
     #[error("a redirect's Location can't be read")]
@@ -891,6 +1072,57 @@ mod tests {
         publisher.publish(Nat64State::NONE);
         let result = admitting.await.unwrap();
         assert!(matches!(result, Err(HttpError::Revoked(_))), "{result:?}");
+    }
+
+    /// The onion client checks its URL's classification again before it
+    /// sends (design 0007, "The onion route"): handed an ordinary name, or
+    /// a malformed onion, it refuses, and nothing reaches the proxy. A
+    /// well-formed onion (the control) is sent to the proxy by name.
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn the_onion_client_refuses_anything_but_an_onion() {
+        use crate::gate::{ConfiguredTargets, OnionUrl};
+        use crate::policy::NetworkPolicy;
+        use crate::socks::fixture::{Destination, SocksFixture};
+        let fixture = SocksFixture::start().await;
+        let network = Network::new(
+            NetworkPolicy::socks5(
+                fixture.addr(),
+                ConfiguredTargets::new(),
+                Url::parse("https://dns.example/dns-query").unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let client = network.http_client(ClientConfig::new(Duration::from_secs(2), 0));
+        let Transport::Socks5 { onion, .. } = &client.inner.transport else {
+            panic!("a socks5 client");
+        };
+        let onion = onion.as_ref().unwrap();
+        for refused in [
+            "http://example.com/",
+            "http://127.0.0.1/",
+            "http://foo.onion/",
+        ] {
+            let url = OnionUrl::unchecked(Url::parse(refused).unwrap());
+            assert!(
+                matches!(
+                    onion.get(&url),
+                    Err(HttpError::Refused(Refused::OnionRoute))
+                ),
+                "{refused}"
+            );
+        }
+        assert_eq!(fixture.connections(), 0);
+        let v3 = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion";
+        let url = OnionUrl::new(&Url::parse(&format!("http://{v3}/")).unwrap()).unwrap();
+        let _ = onion.get(&url).unwrap().send().await;
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].destination,
+            Destination::Name(v3.to_string(), 80)
+        );
     }
 
     #[test]
