@@ -57,6 +57,39 @@ pub struct StoreOptions {
     pub max_page_count: Option<u32>,
     /// SQLite's page cache in KiB (`PRAGMA cache_size = -N`).
     pub cache_kib: Option<u32>,
+    /// Where SQLite keeps temporary tables, indices and sorts that outgrow
+    /// the page cache: [`TempStore::Default`], today's, or in memory.
+    pub temp_store: TempStore,
+}
+
+/// Where SQLite keeps a store's temporary data (`PRAGMA temp_store`): the
+/// temporary tables and indices its statements build, and the sorts that
+/// outgrow the page cache.
+///
+/// **What the store's statements can put there:**
+/// - The eviction scan (`ORDER BY last_accessed_at, inserted_at`) reads the
+///   `last_accessed_at` index and sorts only the right part, one group of
+///   blocks with the same second at a time: a CID and a timestamp per row,
+///   for the blocks touched within one second.
+/// - The name cache's pruning sorts the same way, over at most a few hundred
+///   names.
+/// - [`SqliteBlockStore::export_car`] sorts every block with its data
+///   (`ORDER BY inserted_at`, with no index). In memory, that is a second
+///   copy of the store while it runs. It collects every block anyway.
+/// - Everything else reads or writes single rows, counts, sums, or deletes by
+///   key or by expiry, and needs no temporary data.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TempStore {
+    /// SQLite's default. A file store writes temporary data that outgrows the
+    /// page cache to a temporary file, in the system's temporary directory.
+    /// An in-memory store keeps it in memory regardless.
+    #[default]
+    Default,
+    /// In memory (`PRAGMA temp_store = MEMORY`): no temporary file at all.
+    /// This is for a host confined to writing only the store's own directory
+    /// (freedom-core's design 0010). The memory is the temporary data's size
+    /// (above).
+    Memory,
 }
 
 impl StoreOptions {
@@ -135,6 +168,9 @@ impl SqliteBlockStore {
     fn with_connection(conn: Connection, options: StoreOptions) -> Result<Self> {
         let max_bytes = options.effective_max_bytes();
         let hot_bytes = options.hot_bytes();
+        if options.temp_store == TempStore::Memory {
+            conn.execute_batch("PRAGMA temp_store = MEMORY;")?;
+        }
         if let Some(pages) = options.max_page_count {
             // SQLite answers the cap it installed, which isn't the one asked
             // for when the database already has more pages or the value is
@@ -1173,6 +1209,58 @@ mod tests {
         );
         let store = SqliteBlockStore::in_memory_with(StoreOptions::default()).unwrap();
         assert_eq!(pragma(&store, "temp_store"), 2);
+    }
+
+    #[test]
+    fn the_temp_store_option_keeps_temporary_data_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        // Today's default: a file store keeps SQLite's default; an in-memory
+        // store keeps its temporary data in memory regardless.
+        let file = SqliteBlockStore::open(dir.path().join("default.sqlite3"), 0).unwrap();
+        assert_eq!(pragma(&file, "temp_store"), 0);
+        assert_eq!(
+            pragma(&SqliteBlockStore::in_memory(0).unwrap(), "temp_store"),
+            2
+        );
+        let memory = SqliteBlockStore::open_with(
+            dir.path().join("memory.sqlite3"),
+            StoreOptions {
+                temp_store: TempStore::Memory,
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(pragma(&memory, "temp_store"), 2);
+    }
+
+    /// A sort far past the page cache (every block's data, with a page cache
+    /// of a few pages) completes with its temporary data in memory.
+    #[test]
+    fn a_sort_past_the_page_cache_completes_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteBlockStore::open_with(
+            dir.path().join("spill.sqlite3"),
+            StoreOptions {
+                temp_store: TempStore::Memory,
+                cache_kib: Some(16),
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        // 4 MiB of blocks: past SQLite's 1 MiB minimum before a sort spills.
+        let blocks: Vec<Vec<u8>> = (0..512u32)
+            .map(|i| {
+                let mut data = vec![0u8; 8192];
+                data[..4].copy_from_slice(&i.to_be_bytes());
+                data
+            })
+            .collect();
+        for data in &blocks {
+            let cid = cid_from_data(CODEC_RAW, data);
+            store.put_block(&cid, data).unwrap();
+        }
+        let car = store.export_car().unwrap();
+        assert!(car.len() > 512 * 8192, "{}", car.len());
     }
 
     #[test]
