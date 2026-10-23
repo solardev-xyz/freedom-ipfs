@@ -56,11 +56,14 @@ hyper-util = { version = "0.1.21", default-features = false, optional = true }
 # 0007, "Stream isolation"), from the operating system, fallibly. Already
 # in the graph (rand_core 0.9, through hickory).
 getrandom = { version = "0.3", optional = true }
+# The SOCKS5 exchange's bytes and checks, shared with the blocking driver
+# freedom-radicled uses (design 0008); this crate's async driver is on it.
+freedom-ipfs-socks = { workspace = true, optional = true }
 
 [features]
 # `socks5` mode's SOCKS5 client and libp2p transport (design 0007,
 # "Modes"): off by default, so mobile builds compile none of it (D2).
-socks = ["tokio/net", "tokio/io-util", "reqwest/socks", "dep:hyper-util", "dep:getrandom"]
+socks = ["tokio/net", "tokio/io-util", "reqwest/socks", "dep:hyper-util", "dep:getrandom", "dep:freedom-ipfs-socks"]
 # A SOCKS5 test proxy, for this crate's tests and its dependents'.
 test-util = ["socks", "tokio/rt"]
 

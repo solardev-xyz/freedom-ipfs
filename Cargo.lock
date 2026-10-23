@@ -1011,6 +1011,7 @@ dependencies = [
  "data-encoding",
  "either",
  "freedom-ipfs-addr",
+ "freedom-ipfs-socks",
  "futures",
  "getrandom 0.3.4",
  "hickory-resolver",
@@ -1082,6 +1083,15 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "freedom-ipfs-socks"
+version = "0.4.6"
+dependencies = [
+ "data-encoding",
+ "freedom-ipfs-addr",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -10,6 +10,7 @@ members = [
     "crates/freedom-ipfs-mobile",
     "crates/freedom-ipfs-net",
     "crates/freedom-ipfs-addr",
+    "crates/freedom-ipfs-socks",
     "tools/mobile-web-harness",
     "xtask",
 ]
@@ -71,3 +72,4 @@ freedom-ipfs-gateway = { path = "crates/freedom-ipfs-gateway" }
 freedom-ipfs-mobile = { path = "crates/freedom-ipfs-mobile" }
 freedom-ipfs-net = { path = "crates/freedom-ipfs-net" }
 freedom-ipfs-addr = { path = "crates/freedom-ipfs-addr" }
+freedom-ipfs-socks = { path = "crates/freedom-ipfs-socks" }
