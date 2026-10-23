@@ -909,6 +909,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "freedom-ipfs-addr"
+version = "0.4.6"
+dependencies = [
+ "data-encoding",
+ "thiserror 2.0.18",
+ "url",
+]
+
+[[package]]
 name = "freedom-ipfs-core"
 version = "0.4.6"
 dependencies = [
@@ -1001,6 +1010,7 @@ version = "0.4.6"
 dependencies = [
  "data-encoding",
  "either",
+ "freedom-ipfs-addr",
  "futures",
  "getrandom 0.3.4",
  "hickory-resolver",

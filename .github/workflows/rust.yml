@@ -2,7 +2,8 @@ name: Rust
 
 # The workspace's tests on every pull request, and clippy on
 # `freedom-ipfs-net`, the network policy's crate (freedom-core design 0007,
-# upstream item 3). The other crates aren't linted here.
+# upstream item 3), and `freedom-ipfs-addr`, its gate's pure half. The other
+# crates aren't linted here.
 
 # The paths are the Rust tree plus the two files the tests read with
 # `include_str!`: the add-on's packaging script and the iOS evidence template.
@@ -92,7 +93,7 @@ jobs:
         run: cargo test --workspace --all-features --locked
 
   clippy:
-    name: cargo clippy (freedom-ipfs-net)
+    name: cargo clippy (freedom-ipfs-net, freedom-ipfs-addr)
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -114,3 +115,7 @@ jobs:
         run: |
           cargo clippy -p freedom-ipfs-net --all-targets --all-features --locked -- -D warnings
           cargo clippy -p freedom-ipfs-net --lib --no-default-features --locked -- -D warnings
+      - name: Lint freedom-ipfs-addr
+        run: |
+          cargo clippy -p freedom-ipfs-addr --all-targets --all-features --locked -- -D warnings
+          cargo clippy -p freedom-ipfs-addr --lib --no-default-features --locked -- -D warnings

@@ -1,0 +1,21 @@
+[package]
+name = "freedom-ipfs-addr"
+description = "The network gate's pure half: target classification and the address policy (freedom-core design 0007), with no network stack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Onion addresses' base32 labels (v3 checks).
+data-encoding.workspace = true
+# Refusals' texts.
+thiserror.workspace = true
+# WHATWG host and URL parsing: the rules reqwest's URLs follow.
+url.workspace = true
+
+[features]
+# `OnionUrl::unchecked`, for dependents' tests that build an onion URL the
+# classifier wouldn't (freedom-ipfs-net's HTTP client tests).
+test-util = []
