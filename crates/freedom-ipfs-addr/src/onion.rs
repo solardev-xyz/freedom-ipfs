@@ -94,9 +94,10 @@ impl OnionUrl {
     }
 
     /// Any URL, unchecked: only for the tests of the onion client's own
-    /// second check.
-    #[cfg(test)]
-    pub(crate) fn unchecked(url: Url) -> Self {
+    /// second check (`test-util`, or this crate's tests).
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn unchecked(url: Url) -> Self {
         Self(url)
     }
 }
@@ -104,7 +105,7 @@ impl OnionUrl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gate::{classify_host, classify_multiaddr};
+    use crate::classify_host;
 
     /// A v3 address's label: 32 key bytes, 2 checksum bytes, the version.
     fn v3_label(version: u8) -> String {
@@ -130,10 +131,8 @@ mod tests {
                 .as_str(),
             format!("www.{v3}")
         );
-        // From a `/onion3` component.
-        let onion3 =
-            classify_multiaddr(&format!("/onion3/{}:4001", v3_label(3)).parse().unwrap()).unwrap();
-        assert_eq!(OnionHost::new(&onion3).unwrap().as_str(), v3);
+        // From a `/onion3` component: freedom-ipfs-net's dial classifier's
+        // test.
 
         for refused in [
             "onion".to_string(),
@@ -155,9 +154,8 @@ mod tests {
             assert!(target.is_onion(), "{refused}");
             assert_eq!(OnionHost::new(&target), None, "{refused}");
         }
-        // A `/onion` (v2) component.
-        let v2 = classify_multiaddr(&"/onion/aaimaq4ygg2iegci:80".parse().unwrap()).unwrap();
-        assert_eq!(OnionHost::new(&v2), None);
+        // A `/onion` (v2) component: freedom-ipfs-net's dial classifier's
+        // test.
         // Not onions at all.
         for other in ["example.com", "127.0.0.1"] {
             assert_eq!(OnionHost::new(&classify_host(other).unwrap()), None);

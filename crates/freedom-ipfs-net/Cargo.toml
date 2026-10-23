@@ -9,6 +9,9 @@ repository.workspace = true
 [dependencies]
 # Onion addresses' base32 names, from `/onion3` and `/onion` components.
 data-encoding.workspace = true
+# The gate's pure half: the classification and the address policy, which
+# `gate` re-exports.
+freedom-ipfs-addr.workspace = true
 # The gate's resolver under `direct` with checked addresses: async and
 # cancellable, over the system's DNS configuration (D3). Already in the
 # graph through libp2p-dns, at this version; no DNSSEC feature.
@@ -78,6 +81,8 @@ name = "socks_isolation"
 required-features = ["test-util"]
 
 [dev-dependencies]
+# `OnionUrl::unchecked`, for the onion client's tests.
+freedom-ipfs-addr = { workspace = true, features = ["test-util"] }
 # The transport whose address parsing the gate's multiaddr shapes must
 # agree with (libp2p 0.56's): tests only.
 libp2p-core = "0.43"

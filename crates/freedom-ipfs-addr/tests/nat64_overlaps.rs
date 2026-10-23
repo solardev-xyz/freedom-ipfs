@@ -6,7 +6,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use freedom_ipfs_net::gate::{check_address, AddressRefusal, Form, Nat64Prefix, Nat64State};
+use freedom_ipfs_addr::{check_address, AddressRefusal, Form, Nat64Prefix, Nat64State};
 
 fn v6(text: &str) -> Ipv6Addr {
     text.parse().unwrap()

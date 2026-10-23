@@ -2,8 +2,6 @@
 
 use std::net::{IpAddr, Ipv6Addr};
 
-use data_encoding::BASE32_NOPAD;
-use multiaddr::{Multiaddr, Protocol};
 use url::{Host, Url};
 
 /// What a target is, decided once, before any DNS or TXT expansion.
@@ -191,7 +189,7 @@ fn strip_prefix_ignoring_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str
 }
 
 /// A dialed multiaddr's target, with the port it reaches and its shape
-/// ([`classify_dialed`]).
+/// (`freedom-ipfs-net`'s `classify_dialed`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DialTarget {
     pub target: Target,
@@ -255,96 +253,6 @@ pub enum Shape {
     Onion,
 }
 
-/// Classifies a multiaddr that is to be dialed, after validating its whole
-/// protocol stack (design 0007, "The gate"); see [`classify_dialed`].
-pub fn classify_multiaddr(addr: &Multiaddr) -> Result<Target, Refusal> {
-    classify_dialed(addr).map(|dial| dial.target)
-}
-
-/// Classifies a multiaddr that is to be dialed, after validating its whole
-/// protocol stack (design 0007, "The gate"), with the port it reaches and
-/// its shape.
-///
-/// Checking the first component isn't enough: libp2p's TCP transport dials
-/// the last IP and TCP pair of an address, and its DNS layer resolves every
-/// DNS component, wherever they are. So an address is accepted only in one
-/// of the shapes the node dials, with exactly one host component, first:
-///
-/// - `<host>/tcp/<port>`, then nothing or one WebSocket suffix: `/ws`,
-///   `/wss` or `/tls/ws` (`/x-parity-ws/<path>` and `/x-parity-wss/<path>`
-///   count as `/ws` and `/wss`);
-/// - an HTTP provider: `<host>`, an optional `/tcp/<port>`, then `/http`,
-///   `/https` or `/tls/http`. Without `/tcp`, the port is 80 for HTTP and
-///   443 for HTTPS;
-/// - `<host>/udp/<port>/quic-v1`;
-/// - `/dnsaddr/<name>`;
-/// - `/onion3/<address>:<port>`, or `/onion/<address>:<port>`;
-///
-/// each optionally ending in one `/p2p/<peer>`. A host is `/ip4` or `/ip6`,
-/// a literal, or `/dns`, `/dns4` or `/dns6`, classified as
-/// [`classify_host`] does (so `/dns/x.onion` is an onion, and
-/// `/dns/127.0.0.1` a literal).
-///
-/// Everything else is refused, wherever it appears: a second host
-/// component, an extra trailing component, a second `/p2p`, `/sni` (the
-/// pinned WebSocket transport only sees TLS when `/tls` immediately precedes
-/// `/ws`, and an HTTP provider's URL would lose its TLS), `/ip6zone`,
-/// `/unix`, `/memory`, `/ipcidr`, `/p2p-circuit`, `/certhash`,
-/// `/webtransport`, `/webrtc*`, the old `/quic`.
-pub fn classify_dialed(addr: &Multiaddr) -> Result<DialTarget, Refusal> {
-    let mut protocols: Vec<Protocol<'_>> = addr.iter().collect();
-    if matches!(protocols.last(), Some(Protocol::P2p(_))) {
-        protocols.pop();
-    }
-    let (target, port, shape) = match protocols.as_slice() {
-        [host, Protocol::Tcp(port), rest @ ..] => {
-            let shape = match rest {
-                [] => Shape::Tcp,
-                [Protocol::Ws(_)] => Shape::Ws,
-                [Protocol::Wss(_)] | [Protocol::Tls, Protocol::Ws(_)] => Shape::Wss,
-                [Protocol::Http] => Shape::Http,
-                [Protocol::Https] | [Protocol::Tls, Protocol::Http] => Shape::Https,
-                _ => return Err(Refusal::Multiaddr),
-            };
-            (host_target(host)?, Some(*port), shape)
-        }
-        [host, Protocol::Http] => (host_target(host)?, Some(80), Shape::Http),
-        [host, Protocol::Https] | [host, Protocol::Tls, Protocol::Http] => {
-            (host_target(host)?, Some(443), Shape::Https)
-        }
-        [host, Protocol::Udp(port), Protocol::QuicV1] => {
-            (host_target(host)?, Some(*port), Shape::QuicV1)
-        }
-        [Protocol::Dnsaddr(name)] => (classify_host(name)?, None, Shape::Dnsaddr),
-        [Protocol::Onion3(onion)] => (
-            Target::Onion(onion_name(onion.hash())),
-            Some(onion.port()),
-            Shape::Onion,
-        ),
-        [Protocol::Onion(hash, port)] => (
-            Target::Onion(onion_name(&hash[..])),
-            Some(*port),
-            Shape::Onion,
-        ),
-        _ => return Err(Refusal::Multiaddr),
-    };
-    Ok(DialTarget {
-        target,
-        port,
-        shape,
-    })
-}
-
-/// A shape's host component.
-fn host_target(host: &Protocol<'_>) -> Result<Target, Refusal> {
-    match host {
-        Protocol::Ip4(ip) => Ok(Target::Ip(IpAddr::V4(*ip))),
-        Protocol::Ip6(ip) => Ok(ip_target(IpAddr::V6(*ip))),
-        Protocol::Dns(name) | Protocol::Dns4(name) | Protocol::Dns6(name) => classify_host(name),
-        _ => Err(Refusal::Multiaddr),
-    }
-}
-
 fn ipv6_literal(text: &str) -> Result<Target, Refusal> {
     let ip: Ipv6Addr = text.parse().map_err(|_| Refusal::InvalidHost)?;
     Ok(ip_target(IpAddr::V6(ip)))
@@ -355,7 +263,9 @@ fn ip_target(ip: IpAddr) -> Target {
     Target::Ip(canonical(ip))
 }
 
-pub(crate) fn canonical(ip: IpAddr) -> IpAddr {
+/// An address as the gate judges it: an IPv4-mapped IPv6 address is its
+/// IPv4 address; any other address is itself.
+pub fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
         IpAddr::V4(_) => ip,
@@ -375,13 +285,6 @@ fn name_target(name: String) -> Result<Target, Refusal> {
     } else {
         Ok(Target::Name(name))
     }
-}
-
-fn onion_name(hash: &[u8]) -> String {
-    let mut name = BASE32_NOPAD.encode(hash);
-    name.make_ascii_lowercase();
-    name.push_str(".onion");
-    name
 }
 
 #[cfg(test)]
@@ -413,6 +316,27 @@ mod tests {
     fn hosts_with_percent_space_or_controls_are_refused() {
         for host in ["ex%61mple.com", "a b", "a\tb", "a\u{7f}b", "127.0.0.%31"] {
             assert_eq!(classify_host(host), Err(Refusal::InvalidHost), "{host:?}");
+        }
+    }
+
+    /// An IPv4-mapped IPv6 address is its IPv4 address, however it is
+    /// written: a host, a bracketed literal, a URL's host, or a parsed
+    /// address ([`canonical`]).
+    #[test]
+    fn a_mapped_address_is_its_ipv4_address() {
+        let v4 = Target::Ip("127.0.0.1".parse().unwrap());
+        assert_eq!(classify_host("::ffff:127.0.0.1"), Ok(v4.clone()));
+        assert_eq!(classify_host("[::ffff:7f00:1]"), Ok(v4.clone()));
+        let url = Url::parse("http://[::ffff:7f00:1]:8080/").unwrap();
+        assert_eq!(classify_url(&url).map(|t| t.target), Ok(v4));
+        assert_eq!(
+            canonical("::ffff:10.0.0.1".parse().unwrap()),
+            "10.0.0.1".parse::<IpAddr>().unwrap()
+        );
+        // Not mapped: unchanged.
+        for ip in ["::1", "64:ff9b::a00:1", "10.0.0.1"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert_eq!(canonical(ip), ip);
         }
     }
 

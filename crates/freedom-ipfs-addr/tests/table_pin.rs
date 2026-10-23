@@ -7,13 +7,13 @@
 //! embed IPv4"). A change to the table must come with the same change to
 //! the design, and to the copy here.
 
-use freedom_ipfs_net::gate::table::{
+use freedom_ipfs_addr::table::{
     Row, EMBEDDED_FORMS, GLOBAL_UNICAST, IPV4_REFUSED, IPV6_REFUSED_INSIDE, IPV6_REFUSED_OUTSIDE,
     ISATAP_INTERFACE_IDS,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use freedom_ipfs_net::gate::{check_address, Cidr, Nat64State};
+use freedom_ipfs_addr::{check_address, Cidr, Nat64State};
 
 /// "IPv4": Refused.
 const DESIGN_IPV4: &str = r#"
