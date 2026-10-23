@@ -9,6 +9,13 @@
 //! - **The path** is trimmed, then accepted as `/ipfs/…` or `/ipns/…`, as
 //!   `ipfs://…` or `ipns://…`, or as a bare CID (`/ipfs/<cid>`). A query or
 //!   fragment is cut off. The namespace must be followed by something.
+//! - **The path's segments** are percent-decoded, as the router's `Path`
+//!   extractor decodes them: hosts send the browser's pathname, where a
+//!   space is `%20` and `ü` is `%C3%BC`. The path is split on `/` first,
+//!   then each segment is decoded exactly once, so `%252F` stays the name
+//!   `%2F`, and `+` stays a `+`. A segment that decodes to `.` or `..`, to
+//!   anything with `/`, `\` or NUL in it, or to bytes that aren't UTF-8
+//!   refuses the path: `%2F` never makes a separator.
 //! - **Headers** are passed through; a name or value `http` refuses fails the
 //!   request, as do more distinct names than a header map holds (at most
 //!   24,576, the `x-freedom-*` headers below included). Each is `{ "name", "value" }` or, equally, a `[name, value]`
@@ -21,6 +28,7 @@ use std::fmt;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 use freedom_ipfs_core::parse_cid;
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -55,7 +63,8 @@ pub struct ParsedNativeRequest {
     pub request: GatewayCoreRequest,
     /// The method, upper-cased: `GET` or `HEAD`.
     pub method_label: String,
-    /// The normalized path, with its namespace: `/ipfs/…` or `/ipns/…`.
+    /// The normalized path, with its namespace: `/ipfs/…` or `/ipns/…`,
+    /// still percent-encoded as the host sent it.
     pub rendered_path: String,
     /// `ipfs` or `ipns`.
     pub namespace_label: String,
@@ -118,6 +127,8 @@ pub fn parse_native_request(
     let path = normalize_gateway_request_path(&request.path).ok_or(NativeRequestError::Path)?;
     let (namespace, path_without_namespace, rendered_path) =
         split_gateway_namespace_path(&path).ok_or(NativeRequestError::Path)?;
+    let path_without_namespace =
+        decode_path_segments(&path_without_namespace).ok_or(NativeRequestError::Path)?;
     let mut headers = HeaderMap::new();
     for header in request.headers.into_iter().flatten() {
         insert_header(&mut headers, &header.name, &header.value)?;
@@ -204,6 +215,23 @@ fn split_gateway_namespace_path(path: &str) -> Option<(GatewayNamespace, String,
         });
     }
     None
+}
+
+/// `path` with each `/`-separated segment percent-decoded once, as axum's
+/// `Path` extractor decodes (the same crate, `percent-encoding`): `%XX`
+/// with two hex digits is a byte, anything else is kept as written. `None`
+/// when a segment decodes to `.` or `..`, holds `/`, `\` or NUL once
+/// decoded, or isn't UTF-8.
+fn decode_path_segments(path: &str) -> Option<String> {
+    let mut decoded = Vec::new();
+    for segment in path.split('/') {
+        let segment = percent_decode_str(segment).decode_utf8().ok()?;
+        if matches!(&*segment, "." | "..") || segment.contains(['/', '\\', '\0']) {
+            return None;
+        }
+        decoded.push(segment);
+    }
+    Some(decoded.join("/"))
 }
 
 fn insert_header(
@@ -443,6 +471,197 @@ mod tests {
         let repeated = parse_native_request(repeated).unwrap();
         assert_eq!(repeated.request.headers.len(), 1);
         assert_eq!(header(&repeated, "x-h"), Some("39999"));
+    }
+
+    /// What `path` parses to under `/ipfs/x/`: the gateway's path, or the
+    /// error.
+    fn inner_path(path: &str) -> Result<String, NativeRequestError> {
+        parse_native_request(NativeRequest {
+            path: format!("/ipfs/x/{path}"),
+            ..NativeRequest::default()
+        })
+        .map(|parsed| parsed.request.path)
+    }
+
+    #[test]
+    fn path_segments_are_percent_decoded_once() {
+        for (path, decoded) in [
+            ("space%20name.txt", "space name.txt"),
+            ("two%20%20spaces.txt", "two  spaces.txt"),
+            ("%C3%BCn%20%C3%AF/%C3%A7%C3%B8d%C3%A9.txt", "ün ï/çødé.txt"),
+            ("%c3%bcn%20%c3%af/", "ün ï/"),
+            ("%E6%97%A5%E6%9C%AC%E8%AA%9E.txt", "日本語.txt"),
+            ("a+b.txt", "a+b.txt"),
+            ("%252F.txt", "%2F.txt"),
+            ("%252E%252E", "%2E%2E"),
+            ("%2541", "%41"),
+            ("q%3F%23.txt", "q?#.txt"),
+            ("%zz%4", "%zz%4"),
+            ("dir//a", "dir//a"),
+            ("..a/.b/a..", "..a/.b/a.."),
+            ("%2E%2E%2E", "..."),
+        ] {
+            assert_eq!(
+                inner_path(path).as_deref(),
+                Ok(&*format!("x/{decoded}")),
+                "{path}"
+            );
+        }
+        // The CID or name is a segment too, and `/ipns/` decodes the same.
+        let ipns = parse_native_request(NativeRequest {
+            path: "/ipns/ex%61mple.com/%C3%A9t%C3%A9".into(),
+            ..NativeRequest::default()
+        })
+        .unwrap();
+        assert_eq!(ipns.request.path, "example.com/été");
+        // The label keeps the host's form.
+        assert_eq!(ipns.rendered_path, "/ipns/ex%61mple.com/%C3%A9t%C3%A9");
+        for path in [
+            "a%2Fb",
+            "a%2fb",
+            "a%5Cb",
+            "a\\b",
+            "a%00b",
+            ".",
+            "..",
+            "%2E",
+            "%2e%2E",
+            "a/%2E%2E/b",
+            "%FF.txt",
+            "%C3",
+            "%C3%28",
+            "%ED%A0%80",
+        ] {
+            assert_eq!(inner_path(path), Err(NativeRequestError::Path), "{path}");
+        }
+        // A query or fragment is cut off before decoding: an encoded one
+        // is a name's own.
+        assert_eq!(inner_path("a%3Fb?c%2Fd").as_deref(), Ok("x/a?b"));
+    }
+
+    /// A directory whose entries have the names the table below asks for,
+    /// each a file holding its own name.
+    fn named_directory(store: &freedom_ipfs_store::SqliteBlockStore) -> cid::Cid {
+        use crate::tests::{test_link, test_pb_directory, test_pb_file};
+        use freedom_ipfs_core::{cid_from_data, CODEC_DAG_PB};
+        let file = |name: &str| {
+            let block = test_pb_file(name.as_bytes());
+            let cid = cid_from_data(CODEC_DAG_PB, &block);
+            store.put_block(&cid, &block).unwrap();
+            test_link(name, &cid)
+        };
+        let sub = test_pb_directory(vec![file("çødé.txt")]);
+        let sub_cid = cid_from_data(CODEC_DAG_PB, &sub);
+        store.put_block(&sub_cid, &sub).unwrap();
+        let root = test_pb_directory(vec![
+            file("space name.txt"),
+            file("two  spaces.txt"),
+            test_link("ün ï", &sub_cid),
+            file("日本語.txt"),
+            file("a+b.txt"),
+            file("a b.txt"),
+            file("%2F.txt"),
+            file("%2E%2E"),
+            file("q?#.txt"),
+            file("%zz"),
+        ]);
+        let root_cid = cid_from_data(CODEC_DAG_PB, &root);
+        store.put_block(&root_cid, &root).unwrap();
+        root_cid
+    }
+
+    async fn status_and_body(response: axum::response::Response) -> (u16, Vec<u8>) {
+        let status = response.status().as_u16();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
+    /// The router (axum's `Path` extractor decoding the request's path)
+    /// and a native request (this parser) given the same browser path, on
+    /// the same store: the same answer for every path both take. The
+    /// native parser refuses a path whose segments decode to a separator,
+    /// a backslash, NUL, a dot segment or not UTF-8; the router decodes
+    /// those whole, and answers as the table says.
+    #[tokio::test]
+    async fn the_router_and_native_requests_decode_paths_alike() {
+        use tower::ServiceExt;
+        let store = freedom_ipfs_store::SqliteBlockStore::in_memory(1 << 20).unwrap();
+        let root = named_directory(&store);
+        let router = crate::router(store.clone());
+        let core = crate::GatewayCore::new(store);
+        // The path under the directory; what the router answers, its
+        // status and, for a 200, the file; and whether the native parser
+        // refuses the path (or answers just as the router does).
+        for (path, status, file, refused) in [
+            ("space%20name.txt", 200, "space name.txt", false),
+            ("two%20%20spaces.txt", 200, "two  spaces.txt", false),
+            (
+                "%C3%BCn%20%C3%AF/%C3%A7%C3%B8d%C3%A9.txt",
+                200,
+                "çødé.txt",
+                false,
+            ),
+            ("%E6%97%A5%E6%9C%AC%E8%AA%9E.txt", 200, "日本語.txt", false),
+            // Not `a b.txt`, which the directory also has.
+            ("a+b.txt", 200, "a+b.txt", false),
+            ("%252F.txt", 200, "%2F.txt", false),
+            ("q%3F%23.txt", 200, "q?#.txt", false),
+            ("%zz", 200, "%zz", false),
+            // Decoded once, to the name `%2E%2E`, which the gateway refuses
+            // on both paths: it would decode to a dot segment.
+            ("%252E%252E", 400, "", false),
+            ("a%2Fb.txt", 404, "", true),
+            ("a%5Cb.txt", 404, "", true),
+            ("a%00b.txt", 404, "", true),
+            ("%2E", 400, "", true),
+            ("%2E%2E", 400, "", true),
+            ("%FF.txt", 400, "", true),
+        ] {
+            let uri = format!("/ipfs/{root}/{path}");
+            let request = axum::http::Request::builder()
+                .uri(&uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let routed = status_and_body(router.clone().oneshot(request).await.unwrap()).await;
+            assert_eq!(routed.0, status, "router: {path}");
+            if status == 200 {
+                assert_eq!(routed.1, file.as_bytes(), "router: {path}");
+            }
+            let parsed = parse_native_request(NativeRequest {
+                path: uri,
+                ..NativeRequest::default()
+            });
+            if refused {
+                assert_eq!(parsed.unwrap_err(), NativeRequestError::Path, "{path}");
+                continue;
+            }
+            let native = status_and_body(core.handle(parsed.unwrap().request).await).await;
+            assert_eq!(native.0, routed.0, "native: {path}");
+            if status == 200 {
+                assert_eq!(native.1, routed.1, "native: {path}");
+            }
+        }
+    }
+
+    /// The bug this parser had: the browser's encoded path was looked up
+    /// as written, so `ün ï/çødé.txt` was not found.
+    #[tokio::test]
+    async fn a_native_request_finds_names_the_browser_encodes() {
+        let store = freedom_ipfs_store::SqliteBlockStore::in_memory(1 << 20).unwrap();
+        let root = named_directory(&store);
+        let parsed = parse_native_request_json(
+            &serde_json::json!({
+                "path": format!("/ipfs/{root}/%C3%BCn%20%C3%AF/%C3%A7%C3%B8d%C3%A9.txt"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(parsed.request.path, format!("{root}/ün ï/çødé.txt"));
+        let (status, body) =
+            status_and_body(crate::GatewayCore::new(store).handle(parsed.request).await).await;
+        assert_eq!((status, body.as_slice()), (200, "çødé.txt".as_bytes()));
     }
 
     #[test]
