@@ -28,6 +28,12 @@ const HAMT_MAX_SHARDS_VISITED: usize = 1024;
 const UNIXFS_METADATA_CACHE_MAX_BLOCK_BYTES: usize = 64 * 1024;
 const UNIXFS_PATH_CACHE_MAX_PATH_BYTES: usize = 1024;
 const UNIXFS_RANGE_BATCH_MAX_BLOCKS: usize = 4;
+/// The deepest a file's DAG may go below its root: reading it, or summing
+/// its size, walks it one call per level, and a chain of nested file nodes
+/// any deeper is refused before it can exhaust a thread's stack. Real
+/// files stay far shallower: a balanced DAG of 174 links per node needs 7
+/// levels for 2^64 bytes, and a trickle DAG under 20.
+pub const MAX_FILE_DAG_DEPTH: usize = 128;
 
 #[derive(Debug, Error)]
 pub enum UnixfsError {
@@ -1072,6 +1078,11 @@ impl UnixfsContext<'_> {
     }
 
     fn read_file_cid(&self, cid: &Cid) -> Result<Vec<u8>> {
+        self.read_file_cid_at(cid, 0)
+    }
+
+    fn read_file_cid_at(&self, cid: &Cid, depth: usize) -> Result<Vec<u8>> {
+        check_file_depth(depth)?;
         match cid.codec() {
             CODEC_RAW => Ok(self.get_block(cid)?.data().to_vec()),
             CODEC_DAG_PB => {
@@ -1081,7 +1092,7 @@ impl UnixfsContext<'_> {
                         let mut out = decoded.data.data.unwrap_or_default();
                         for link in &decoded.node.links {
                             let child = link_cid(link)?;
-                            out.extend_from_slice(&self.read_file_cid(&child)?);
+                            out.extend_from_slice(&self.read_file_cid_at(&child, depth + 1)?);
                         }
                         Ok(out)
                     }
@@ -1097,20 +1108,25 @@ impl UnixfsContext<'_> {
     }
 
     fn file_size_cid(&self, cid: &Cid) -> Result<u64> {
+        self.file_size_cid_at(cid, 0)
+    }
+
+    fn file_size_cid_at(&self, cid: &Cid, depth: usize) -> Result<u64> {
         if let Some(cache) = self.metadata_cache {
             if let Some(size) = cache.get_file_size(cid) {
                 return Ok(size);
             }
         }
 
-        let size = self.file_size_cid_uncached(cid)?;
+        let size = self.file_size_cid_uncached(cid, depth)?;
         if let Some(cache) = self.metadata_cache {
             cache.insert_file_size(cid, size);
         }
         Ok(size)
     }
 
-    fn file_size_cid_uncached(&self, cid: &Cid) -> Result<u64> {
+    fn file_size_cid_uncached(&self, cid: &Cid, depth: usize) -> Result<u64> {
+        check_file_depth(depth)?;
         match cid.codec() {
             CODEC_RAW => Ok(self.get_block(cid)?.data().len() as u64),
             CODEC_DAG_PB => {
@@ -1126,7 +1142,9 @@ impl UnixfsContext<'_> {
                             .as_ref()
                             .map_or(0, |bytes| bytes.len() as u64);
                         for link in &decoded.node.links {
-                            size = size.saturating_add(self.file_size_cid(&link_cid(link)?)?);
+                            size = size.saturating_add(
+                                self.file_size_cid_at(&link_cid(link)?, depth + 1)?,
+                            );
                         }
                         Ok(size)
                     }
@@ -1142,6 +1160,17 @@ impl UnixfsContext<'_> {
     }
 
     fn read_file_cid_range(&self, cid: &Cid, start: u64, end: u64) -> Result<Vec<u8>> {
+        self.read_file_cid_range_at(cid, start, end, 0)
+    }
+
+    fn read_file_cid_range_at(
+        &self,
+        cid: &Cid,
+        start: u64,
+        end: u64,
+        depth: usize,
+    ) -> Result<Vec<u8>> {
+        check_file_depth(depth)?;
         match cid.codec() {
             CODEC_RAW => self.get_block_range(cid, start, end),
             CODEC_DAG_PB => {
@@ -1164,7 +1193,7 @@ impl UnixfsContext<'_> {
                                 .get(index)
                                 .copied()
                                 .map(Ok)
-                                .unwrap_or_else(|| self.file_size_cid(&child))?;
+                                .unwrap_or_else(|| self.file_size_cid_at(&child, depth + 1))?;
                             if child_size == 0 {
                                 continue;
                             }
@@ -1196,10 +1225,11 @@ impl UnixfsContext<'_> {
                                     }
                                     raw_batch.clear();
                                 }
-                                out.extend_from_slice(&self.read_file_cid_range(
+                                out.extend_from_slice(&self.read_file_cid_range_at(
                                     &child,
                                     range_start,
                                     range_end,
+                                    depth + 1,
                                 )?);
                             }
                         }
@@ -1361,6 +1391,17 @@ impl UnixfsContext<'_> {
 
         Ok(None)
     }
+}
+
+/// Refuses a file node `depth` levels below its file's root past
+/// [`MAX_FILE_DAG_DEPTH`].
+fn check_file_depth(depth: usize) -> Result<()> {
+    if depth > MAX_FILE_DAG_DEPTH {
+        return Err(UnixfsError::InvalidDagPb(format!(
+            "file DAG deeper than {MAX_FILE_DAG_DEPTH} levels"
+        )));
+    }
+    Ok(())
 }
 
 fn directory_entries(links: &[PbLink]) -> Result<Vec<DirectoryEntry>> {
@@ -2091,6 +2132,82 @@ mod tests {
             read_file_range(&store, &file_cid, "", 3, 12).unwrap(),
             b"fix linked"
         );
+    }
+
+    /// A file whose root is `levels` nested file nodes above a raw leaf
+    /// holding `x`. No node records a size, so a size or range read walks
+    /// every level, as a crafted file's would.
+    fn nested_file(levels: usize) -> (CountingProvider, Cid) {
+        let mut blocks = HashMap::new();
+        let leaf = cid_from_data(CODEC_RAW, b"x");
+        blocks.insert(leaf, b"x".to_vec());
+        let mut child = leaf;
+        for _ in 0..levels {
+            let node = PbNode {
+                data: Some(
+                    UnixfsData {
+                        r#type: Some(DataType::File as i32),
+                        data: None,
+                        filesize: None,
+                        blocksizes: Vec::new(),
+                        hash_type: None,
+                        fanout: None,
+                    }
+                    .encode_to_vec(),
+                ),
+                links: vec![link("", &child)],
+            }
+            .encode_to_vec();
+            child = cid_from_data(CODEC_DAG_PB, &node);
+            blocks.insert(child, node);
+        }
+        (CountingProvider::new(blocks), child)
+    }
+
+    /// Each way to walk a file, on a thread with tokio's 2 MiB worker
+    /// stack: the bytes read, or the error.
+    fn walk_nested_file(levels: usize) -> Vec<std::result::Result<Vec<u8>, String>> {
+        let (provider, root) = nested_file(levels);
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let resolver = UnixfsResolver::new();
+                let size = |result: Result<u64>| result.map(|size| size.to_string().into_bytes());
+                [
+                    read_file(&provider, &root, ""),
+                    size(file_size(&provider, &root, "")),
+                    size(resolver.file_size_cid(&provider, &root)),
+                    resolver.read_file_cid_range(&provider, &root, 0, 0),
+                    read_file_range(&provider, &root, "", 0, 0),
+                ]
+                .into_iter()
+                .map(|result| result.map_err(|err| err.to_string()))
+                .collect()
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn file_dags_are_walked_to_the_depth_bound_and_refused_past_it() {
+        // The leaf sits MAX_FILE_DAG_DEPTH levels below the root: read.
+        for result in walk_nested_file(MAX_FILE_DAG_DEPTH) {
+            let bytes = result.unwrap();
+            assert!(bytes == b"x" || bytes == b"1", "{bytes:?}");
+        }
+        // One level more, and far deeper chains, are refused with an error.
+        // Unbounded, a chain of a few hundred levels (debug) or about 1,500
+        // (release) overflowed this stack and aborted the process.
+        for levels in [MAX_FILE_DAG_DEPTH + 1, 10_000] {
+            for result in walk_nested_file(levels) {
+                assert_eq!(
+                    result.unwrap_err(),
+                    format!("invalid dag-pb: file DAG deeper than {MAX_FILE_DAG_DEPTH} levels"),
+                    "{levels} levels"
+                );
+            }
+        }
     }
 
     #[test]
