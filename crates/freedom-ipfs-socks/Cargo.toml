@@ -1,0 +1,18 @@
+[package]
+name = "freedom-ipfs-socks"
+description = "The SOCKS5 client's byte layer, sans I/O, with a blocking driver: RFC 1929 credentials, requests, replies and Tor's RESOLVE (freedom-core designs 0007 and 0008)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The onion route's host type: only the classifier makes one.
+freedom-ipfs-addr.workspace = true
+# Errors' texts.
+thiserror.workspace = true
+
+[dev-dependencies]
+# Onion names in the tests.
+data-encoding.workspace = true

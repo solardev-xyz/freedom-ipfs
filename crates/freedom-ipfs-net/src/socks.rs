@@ -1,5 +1,8 @@
 //! The SOCKS5 client `socks5` mode goes through (design 0007, "Modes",
-//! `socks5`; cargo feature `socks`).
+//! `socks5`; cargo feature `socks`): `freedom-ipfs-socks`'s exchange on
+//! tokio's sockets. That crate holds the bytes and every check of the
+//! proxy's answers, which its blocking driver shares; this module holds the
+//! async driver.
 //!
 //! - **`RESOLVE`** (Tor's extension, command `0xF0`) resolves an ordinary
 //!   name through the proxy. The answer must be one address, which the
@@ -21,29 +24,29 @@
 #[cfg(feature = "test-util")]
 pub mod fixture;
 
-use std::fmt;
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use freedom_ipfs_socks::{
+    check_auth_status, check_choice, check_reply_head, encode_request, greeting, parse_ip,
+    resolved, Bound, Destination, CONNECT, RESOLVE,
+};
+pub use freedom_ipfs_socks::{RandomFailed, SocksError};
+// The byte layer's constants, by the names this module's tests use.
+#[cfg(test)]
+use freedom_ipfs_socks::{ATYP_DOMAIN, ATYP_IPV6, USER_PASS, USER_PASS_VERSION};
+
 use crate::gate::OnionHost;
 use crate::resolve::{LookupError, LookupFuture, NameLookup};
 
-const VERSION: u8 = 5;
 #[cfg(test)]
 const NO_AUTH: u8 = 0x00;
-/// RFC 1929's method, and its sub-negotiation's version.
-const USER_PASS: u8 = 0x02;
-const USER_PASS_VERSION: u8 = 0x01;
-const CONNECT: u8 = 0x01;
-/// Tor's `RESOLVE` extension.
-const RESOLVE: u8 = 0xF0;
-const ATYP_IPV4: u8 = 1;
-const ATYP_DOMAIN: u8 = 3;
-const ATYP_IPV6: u8 = 4;
+// The tests' own names, as they had them before the byte layer moved.
+#[cfg(test)]
+use std::net::Ipv6Addr;
 
 /// A network's SOCKS5 client.
 #[derive(Debug)]
@@ -53,78 +56,17 @@ pub(crate) struct SocksClient {
 }
 
 /// A network's SOCKS5 credentials (RFC 1929; design 0007, "Stream
-/// isolation"): a fixed username, and a password of 128 random bits from
-/// the operating system, in hex, made when the network is built. Every
-/// stream the network sends through the proxy carries them, so Arti keeps
-/// its streams on circuits of their own, apart from every other network's.
-///
-/// Never shown: `Debug` prints neither part, nothing implements `Display`,
-/// and no error or log carries them. They leave the process only to the
-/// proxy.
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct SocksCredentials {
-    username: &'static str,
-    password: String,
-}
-
-impl SocksCredentials {
-    /// The username every network sends: only the password tells networks
-    /// apart.
-    pub(crate) const USERNAME: &'static str = "freedom-ipfs";
-
-    /// New credentials, the password's 16 bytes from `random`: the OS's
-    /// randomness ([`os_random`]), or a test's. Its failure fails them:
-    /// nothing falls back to a fixed password, or to no authentication.
-    pub(crate) fn new(random: Random) -> Result<Self, RandomFailed> {
-        let mut bytes = [0u8; 16];
-        random(&mut bytes)?;
-        let password = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-        Ok(Self {
-            username: Self::USERNAME,
-            password,
-        })
-    }
-
-    pub(crate) fn username(&self) -> &str {
-        self.username
-    }
-
-    pub(crate) fn password(&self) -> &str {
-        &self.password
-    }
-
-    /// RFC 1929's request: the version, then each part with its length.
-    fn request(&self) -> Vec<u8> {
-        let (user, pass) = (self.username.as_bytes(), self.password.as_bytes());
-        let mut request = Vec::with_capacity(3 + user.len() + pass.len());
-        request.push(USER_PASS_VERSION);
-        // Both are far under 255 bytes: a fixed name, and 32 hex digits.
-        request.push(user.len() as u8);
-        request.extend_from_slice(user);
-        request.push(pass.len() as u8);
-        request.extend_from_slice(pass);
-        request
-    }
-}
-
-impl fmt::Debug for SocksCredentials {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SocksCredentials(redacted)")
-    }
-}
-
-/// Where the password's bits come from: fills the buffer, or fails.
-pub(crate) type Random = fn(&mut [u8]) -> Result<(), RandomFailed>;
+/// isolation"): `freedom-ipfs-socks`'s, a fixed username and a password of
+/// 128 random bits from the operating system, in hex, made when the network
+/// is built. Every stream the network sends through the proxy carries them,
+/// so Arti keeps its streams on circuits of their own, apart from every
+/// other network's. Never shown.
+pub(crate) use freedom_ipfs_socks::Credentials as SocksCredentials;
 
 /// The operating system's randomness, through its fallible API.
 pub(crate) fn os_random(bytes: &mut [u8]) -> Result<(), RandomFailed> {
     getrandom::fill(bytes).map_err(|_| RandomFailed)
 }
-
-/// The operating system's randomness failed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("the operating system's randomness failed")]
-pub struct RandomFailed;
 
 /// How the client authenticates to the proxy: the one method its greeting
 /// offers, username/password, alone. A proxy that picks another fails the
@@ -136,13 +78,6 @@ pub(crate) enum SocksAuth {
 }
 
 impl SocksAuth {
-    /// The method the greeting offers, alone.
-    fn method(&self) -> u8 {
-        match self {
-            Self::UserPass(_) => USER_PASS,
-        }
-    }
-
     /// The method's sub-negotiation, once the proxy has picked it.
     async fn authenticate(&self, stream: &mut TcpStream) -> Result<(), SocksError> {
         match self {
@@ -156,13 +91,7 @@ impl SocksAuth {
                     .read_exact(&mut status)
                     .await
                     .map_err(SocksError::Io)?;
-                if status[0] != USER_PASS_VERSION {
-                    return Err(SocksError::Protocol);
-                }
-                if status[1] != 0 {
-                    return Err(SocksError::CredentialsRefused);
-                }
-                Ok(())
+                check_auth_status(status)
             }
         }
     }
@@ -188,18 +117,6 @@ impl NameLookup for SocksLookup {
     }
 }
 
-/// Where a request goes.
-enum Destination<'a> {
-    Ip(SocketAddr),
-    Name(&'a str, u16),
-}
-
-/// The address a reply carries.
-enum Bound {
-    Ip(IpAddr),
-    Name,
-}
-
 impl SocksClient {
     /// The client of a network whose credentials are `credentials`.
     pub(crate) fn new(proxy: SocketAddr, credentials: SocksCredentials) -> Self {
@@ -220,10 +137,7 @@ impl SocksClient {
     /// address, never `0.0.0.0` or `::`, or an error.
     pub(crate) async fn resolve(&self, name: &str) -> Result<IpAddr, SocksError> {
         let (_, bound) = self.request(RESOLVE, Destination::Name(name, 0)).await?;
-        match bound {
-            Bound::Ip(ip) if !ip.is_unspecified() => Ok(ip),
-            Bound::Ip(_) | Bound::Name => Err(SocksError::EmptyAnswer),
-        }
+        resolved(bound)
     }
 
     /// A stream to `addr`, an address the gate checked, through the proxy.
@@ -245,6 +159,9 @@ impl SocksClient {
         Ok(stream)
     }
 
+    /// The exchange, step by step as `freedom-ipfs-socks` defines it: the
+    /// greeting and the proxy's choice, the credentials and their status,
+    /// the request, then the reply's head, bound address and port.
     async fn request(
         &self,
         command: u8,
@@ -254,9 +171,8 @@ impl SocksClient {
         let mut stream = TcpStream::connect(self.proxy)
             .await
             .map_err(SocksError::Unreachable)?;
-        let method = self.auth.method();
         stream
-            .write_all(&[VERSION, 1, method])
+            .write_all(&greeting())
             .await
             .map_err(SocksError::Io)?;
         let mut choice = [0u8; 2];
@@ -264,115 +180,33 @@ impl SocksClient {
             .read_exact(&mut choice)
             .await
             .map_err(SocksError::Io)?;
-        if choice[0] != VERSION {
-            return Err(SocksError::Protocol);
-        }
-        if choice[1] != method {
-            return Err(SocksError::MethodRefused);
-        }
+        check_choice(choice)?;
         self.auth.authenticate(&mut stream).await?;
         stream.write_all(&request).await.map_err(SocksError::Io)?;
         let mut head = [0u8; 4];
         stream.read_exact(&mut head).await.map_err(SocksError::Io)?;
-        if head[0] != VERSION || head[2] != 0 {
-            return Err(SocksError::Protocol);
-        }
-        if head[1] != 0 {
-            return Err(SocksError::Refused(head[1]));
-        }
-        let bound = read_bound(&mut stream, head[3]).await?;
+        let shape = check_reply_head(head)?;
+        let bound = match shape.ip_len() {
+            Some(len) => {
+                let mut ip = [0u8; 16];
+                stream
+                    .read_exact(&mut ip[..len])
+                    .await
+                    .map_err(SocksError::Io)?;
+                parse_ip(shape, &ip[..len])?
+            }
+            None => {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len).await.map_err(SocksError::Io)?;
+                let mut name = vec![0u8; usize::from(len[0])];
+                stream.read_exact(&mut name).await.map_err(SocksError::Io)?;
+                Bound::Name
+            }
+        };
+        let mut port = [0u8; 2];
+        stream.read_exact(&mut port).await.map_err(SocksError::Io)?;
         Ok((stream, bound))
     }
-}
-
-/// A request: the version, the command, and the destination with its port.
-fn encode_request(command: u8, destination: &Destination<'_>) -> Result<Vec<u8>, SocksError> {
-    let mut request = vec![VERSION, command, 0];
-    let port = match destination {
-        Destination::Ip(addr) => {
-            match addr.ip() {
-                IpAddr::V4(ip) => {
-                    request.push(ATYP_IPV4);
-                    request.extend_from_slice(&ip.octets());
-                }
-                IpAddr::V6(ip) => {
-                    request.push(ATYP_IPV6);
-                    request.extend_from_slice(&ip.octets());
-                }
-            }
-            addr.port()
-        }
-        Destination::Name(name, port) => {
-            let len = u8::try_from(name.len()).map_err(|_| SocksError::NameTooLong)?;
-            if len == 0 {
-                return Err(SocksError::NameTooLong);
-            }
-            request.push(ATYP_DOMAIN);
-            request.push(len);
-            request.extend_from_slice(name.as_bytes());
-            *port
-        }
-    };
-    request.extend_from_slice(&port.to_be_bytes());
-    Ok(request)
-}
-
-/// A reply's bound address and port, after its first four bytes.
-async fn read_bound(stream: &mut TcpStream, atyp: u8) -> Result<Bound, SocksError> {
-    let bound = match atyp {
-        ATYP_IPV4 => {
-            let mut ip = [0u8; 4];
-            stream.read_exact(&mut ip).await.map_err(SocksError::Io)?;
-            Bound::Ip(IpAddr::V4(Ipv4Addr::from(ip)))
-        }
-        ATYP_IPV6 => {
-            let mut ip = [0u8; 16];
-            stream.read_exact(&mut ip).await.map_err(SocksError::Io)?;
-            Bound::Ip(IpAddr::V6(Ipv6Addr::from(ip)))
-        }
-        ATYP_DOMAIN => {
-            let mut len = [0u8; 1];
-            stream.read_exact(&mut len).await.map_err(SocksError::Io)?;
-            let mut name = vec![0u8; usize::from(len[0])];
-            stream.read_exact(&mut name).await.map_err(SocksError::Io)?;
-            Bound::Name
-        }
-        _ => return Err(SocksError::Protocol),
-    };
-    let mut port = [0u8; 2];
-    stream.read_exact(&mut port).await.map_err(SocksError::Io)?;
-    Ok(bound)
-}
-
-/// Why a request through the proxy failed. Each text names the step, never
-/// the target, the answer or any credential.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum SocksError {
-    /// No connection to the proxy.
-    #[error("the SOCKS5 proxy can't be reached: {0}")]
-    Unreachable(#[source] io::Error),
-    /// The exchange with the proxy broke off.
-    #[error("the exchange with the SOCKS5 proxy failed: {0}")]
-    Io(#[source] io::Error),
-    /// The proxy answered outside the protocol.
-    #[error("the SOCKS5 proxy answered outside the protocol")]
-    Protocol,
-    /// The proxy didn't accept the one authentication method offered.
-    #[error("the SOCKS5 proxy refused the authentication method")]
-    MethodRefused,
-    /// The proxy refused the network's credentials.
-    #[error("the SOCKS5 proxy refused the credentials")]
-    CredentialsRefused,
-    /// The proxy refused the request, with this reply code.
-    #[error("the SOCKS5 proxy refused the request (reply {0:#04x})")]
-    Refused(u8),
-    /// `RESOLVE` answered no usable address.
-    #[error("the SOCKS5 proxy's RESOLVE answered no address")]
-    EmptyAnswer,
-    /// A name SOCKS5 can't carry: empty, or longer than 255 bytes.
-    #[error("the name can't be carried in a SOCKS5 request")]
-    NameTooLong,
 }
 
 #[cfg(test)]
