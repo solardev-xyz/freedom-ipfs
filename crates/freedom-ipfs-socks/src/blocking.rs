@@ -3,15 +3,18 @@
 //! (freedom-core design 0008: freedom-radicled, under heartwood's resolver
 //! thread).
 //!
-//! Every call has a deadline: the connection to the proxy and each read and
-//! write of the exchange wait at most until then, and a call past it fails
-//! as broken off ([`SocksError::Io`], `TimedOut`). A stream that
+//! Every call has one absolute deadline. The connection to the proxy waits
+//! at most until then, and so does every read and write of the exchange:
+//! each one the socket makes, not just each step, so a proxy that answers a
+//! byte at a time can't carry the exchange past it. A step that completes
+//! after the deadline fails too. A call past its deadline fails as broken
+//! off ([`SocksError::Io`], `TimedOut`). A stream that
 //! [`Client::connect_ip`] or [`Client::connect_onion`] returns has its
 //! timeouts cleared: what happens on it next is its caller's.
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use freedom_ipfs_addr::OnionHost;
 
@@ -105,7 +108,7 @@ impl Client {
 }
 
 /// The time left before `deadline`, or `TimedOut`.
-fn remaining(deadline: Instant) -> io::Result<std::time::Duration> {
+fn remaining(deadline: Instant) -> io::Result<Duration> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
         return Err(io::Error::from(io::ErrorKind::TimedOut));
@@ -113,38 +116,79 @@ fn remaining(deadline: Instant) -> io::Result<std::time::Duration> {
     Ok(left)
 }
 
-/// The exchange's stream, each read and write bounded by the deadline.
-struct Bounded {
-    stream: TcpStream,
+/// A stream whose every read and write waits at most its timeout: a
+/// socket. A trait, so a test can stand in a stream that trickles.
+trait Timed: Read + Write {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+impl Timed for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
+}
+
+/// The exchange's stream, bounded by the deadline: before every read and
+/// write the socket makes, its timeout is set to the time left, so the
+/// deadline is absolute however the bytes arrive; and a step that completes
+/// past it fails.
+struct Bounded<S> {
+    stream: S,
     deadline: Instant,
 }
 
-impl Bounded {
-    fn write_all(&mut self, bytes: &[u8]) -> Result<(), SocksError> {
-        let left = remaining(self.deadline).map_err(SocksError::Io)?;
-        self.stream
-            .set_write_timeout(Some(left))
-            .map_err(SocksError::Io)?;
-        self.stream
-            .write_all(bytes)
-            .and_then(|()| self.stream.flush())
-            .map_err(|e| SocksError::Io(timed_out(e)))
+impl<S: Timed> Bounded<S> {
+    fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), SocksError> {
+        while !bytes.is_empty() {
+            let left = remaining(self.deadline).map_err(SocksError::Io)?;
+            self.stream
+                .set_write_timeout(Some(left))
+                .map_err(SocksError::Io)?;
+            match self.stream.write(bytes) {
+                Ok(0) => return Err(SocksError::Io(io::Error::from(io::ErrorKind::WriteZero))),
+                Ok(written) => bytes = bytes.get(written..).unwrap_or_default(),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(SocksError::Io(timed_out(e))),
+            }
+        }
+        self.in_time()
     }
 
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), SocksError> {
-        let left = remaining(self.deadline).map_err(SocksError::Io)?;
-        self.stream
-            .set_read_timeout(Some(left))
-            .map_err(SocksError::Io)?;
-        self.stream
-            .read_exact(buf)
-            .map_err(|e| SocksError::Io(timed_out(e)))
+    fn read_exact(&mut self, mut buf: &mut [u8]) -> Result<(), SocksError> {
+        while !buf.is_empty() {
+            let left = remaining(self.deadline).map_err(SocksError::Io)?;
+            self.stream
+                .set_read_timeout(Some(left))
+                .map_err(SocksError::Io)?;
+            match self.stream.read(buf) {
+                Ok(0) => {
+                    return Err(SocksError::Io(io::Error::from(
+                        io::ErrorKind::UnexpectedEof,
+                    )))
+                }
+                Ok(read) => buf = std::mem::take(&mut buf).get_mut(read..).unwrap_or_default(),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(SocksError::Io(timed_out(e))),
+            }
+        }
+        self.in_time()
     }
 
     fn read_array<const N: usize>(&mut self) -> Result<[u8; N], SocksError> {
         let mut bytes = [0u8; N];
         self.read_exact(&mut bytes)?;
         Ok(bytes)
+    }
+
+    /// A step done, but only if before the deadline: one that a socket's
+    /// timer let finish late still fails.
+    fn in_time(&self) -> Result<(), SocksError> {
+        remaining(self.deadline).map(drop).map_err(SocksError::Io)
     }
 }
 
