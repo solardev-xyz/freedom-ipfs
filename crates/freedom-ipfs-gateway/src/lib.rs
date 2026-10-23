@@ -6501,7 +6501,7 @@ mod tests {
         File = 2,
     }
 
-    fn test_pb_file(data: &[u8]) -> Vec<u8> {
+    pub(crate) fn test_pb_file(data: &[u8]) -> Vec<u8> {
         TestPbNode {
             data: Some(
                 TestUnixfsData {
