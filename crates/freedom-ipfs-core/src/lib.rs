@@ -196,6 +196,15 @@ pub fn parse_car_v1(bytes: &[u8]) -> Result<CarFile> {
         let cid = Cid::read_bytes(&mut cursor)
             .map_err(|err| CoreError::InvalidCar(format!("invalid block cid: {err}")))?;
         let cid_len = cursor.position() as usize;
+        // The CID's own varints (version, codec, the multihash's code and
+        // length) are the cid crate's to read, so their encoding is checked
+        // here instead: the bytes must be the CID's canonical encoding,
+        // which a wrapped or non-minimal varint isn't.
+        if section.get(..cid_len) != Some(cid.to_bytes().as_slice()) {
+            return Err(CoreError::InvalidCar(
+                "block cid isn't canonically encoded".into(),
+            ));
+        }
         if cid_len > section.len() {
             return Err(CoreError::InvalidCar(
                 "block cid consumed beyond section".into(),
@@ -236,15 +245,36 @@ fn take_section<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Option<&
     Some(section)
 }
 
+/// A CAR length at `offset`, moving `offset` past it: an unsigned LEB128
+/// varint of at most 64 bits, minimally encoded, as a `usize`. Refused:
+/// a varint that runs past the end or past ten bytes, a tenth byte with any
+/// bit above the 64th set (unsigned-varint 0.8 accepts one, so `2^64 + n`
+/// read as `n`), a non-minimal one (a last byte of 0 after others), and a
+/// value past `usize::MAX` (on 32-bit targets).
 fn read_varint(bytes: &[u8], offset: &mut usize) -> Result<usize> {
+    let invalid = |what: &str| CoreError::InvalidCar(format!("invalid varint: {what}"));
     let input = bytes
         .get(*offset..)
-        .ok_or_else(|| CoreError::InvalidCar("unexpected end of input".into()))?;
-    let before = input.len();
-    let (value, rest) = unsigned_varint::decode::usize(input)
-        .map_err(|err| CoreError::InvalidCar(format!("invalid varint: {err}")))?;
-    *offset += before - rest.len();
-    Ok(value)
+        .ok_or_else(|| invalid("unexpected end of input"))?;
+    let mut value = 0u64;
+    for (index, &byte) in input.iter().enumerate().take(10) {
+        if index == 9 && byte > 1 {
+            return Err(invalid("past 64 bits"));
+        }
+        value |= u64::from(byte & 0x7f) << (7 * index);
+        if byte & 0x80 == 0 {
+            if byte == 0 && index > 0 {
+                return Err(invalid("not minimally encoded"));
+            }
+            *offset += index + 1;
+            return usize::try_from(value).map_err(|_| invalid("past this target's usize"));
+        }
+    }
+    Err(invalid(if input.len() < 10 {
+        "unexpected end of input"
+    } else {
+        "past 64 bits"
+    }))
 }
 
 pub fn encode_varint(value: usize) -> Vec<u8> {
@@ -271,7 +301,7 @@ mod tests {
             .into_iter()
             .chain(EMPTY_ROOTS_CAR_V1_HEADER.iter().copied())
             .collect::<Vec<u8>>();
-        for len in [usize::MAX, usize::MAX - 1, usize::MAX / 2 + 1, 1 << 40] {
+        for len in [usize::MAX, usize::MAX - 1, usize::MAX / 2 + 1] {
             let mut car = huge(len);
             car.extend_from_slice(b"header");
             assert!(
@@ -303,6 +333,102 @@ mod tests {
             parse_car_v1(&encode_car_v1(&[block])).unwrap().blocks.len(),
             1
         );
+    }
+
+    /// Review of #69: varints whose value doesn't fit were read wrapped
+    /// (unsigned-varint 0.8 takes a tenth byte's high bits, so `2^64 + n`
+    /// read as `n`), and the header or a block section was then read as
+    /// that small length. Raw encodings, which `encode_varint` can't make.
+    #[test]
+    fn car_varints_that_dont_fit_or_arent_minimal_are_refused() {
+        let data = b"x";
+        let cid = cid_from_data(CODEC_RAW, data);
+        let section = [cid.to_bytes(), data.to_vec()].concat();
+        let empty = encode_car_v1(&[]);
+        // `2^64 + n` over ten bytes; `2^32 + n` over five (past u32);
+        // `n` padded with a 0x80 and a final 0x00; eleven bytes.
+        let wrapped_64 = |n: u8| [vec![0x80 | n], vec![0x80; 8], vec![0x02]].concat();
+        let wrapped_32 = |n: u8| vec![0x80 | n, 0x80, 0x80, 0x80, 0x10];
+        let padded = |n: u8| vec![0x80 | n, 0x00];
+        let eleven = |n: u8| [vec![0x80 | n], vec![0x80; 9], vec![0x00]].concat();
+        let header_len = EMPTY_ROOTS_CAR_V1_HEADER.len() as u8;
+        for (what, varint) in [
+            ("2^64 + n", wrapped_64 as fn(u8) -> Vec<u8>),
+            ("non-minimal", padded),
+            ("eleven bytes", eleven),
+        ] {
+            let car = [varint(header_len), EMPTY_ROOTS_CAR_V1_HEADER.to_vec()].concat();
+            assert!(
+                matches!(parse_car_v1(&car), Err(CoreError::InvalidCar(_))),
+                "header, {what}"
+            );
+            let car = [empty.clone(), varint(section.len() as u8), section.clone()].concat();
+            assert!(
+                matches!(parse_car_v1(&car), Err(CoreError::InvalidCar(_))),
+                "section, {what}"
+            );
+        }
+        // Past u32: too long for the data on 64-bit, past usize on 32-bit.
+        let car = [
+            empty.clone(),
+            wrapped_32(section.len() as u8),
+            section.clone(),
+        ]
+        .concat();
+        assert!(matches!(parse_car_v1(&car), Err(CoreError::InvalidCar(_))));
+        // The control: the same section, minimally encoded.
+        let car = [empty.clone(), vec![section.len() as u8], section.clone()].concat();
+        assert_eq!(parse_car_v1(&car).unwrap().blocks.len(), 1);
+        // Exactly u64's last byte (0x01) still decodes, and is far past the
+        // end.
+        let mut max = vec![0xff; 9];
+        max.push(0x01);
+        assert!(matches!(
+            parse_car_v1(&[max, b"x".to_vec()].concat()),
+            Err(CoreError::InvalidCar(message)) if message == "invalid header length"
+                || message == "invalid varint: past this target's usize"
+        ));
+    }
+
+    /// The block's CID must be canonically encoded too: its codec varint
+    /// written non-minimally, or wrapped past 64 bits, is refused.
+    #[test]
+    fn car_block_cids_must_be_canonical() {
+        let data = b"x";
+        let canonical = cid_from_data(CODEC_RAW, data).to_bytes();
+        assert_eq!(&canonical[..2], &[0x01, 0x55]);
+        let empty = encode_car_v1(&[]);
+        let car_with = |cid: Vec<u8>| {
+            let section = [cid, data.to_vec()].concat();
+            [empty.clone(), encode_varint(section.len()), section].concat()
+        };
+        assert_eq!(
+            parse_car_v1(&car_with(canonical.clone()))
+                .unwrap()
+                .blocks
+                .len(),
+            1
+        );
+        for cid in [
+            // The codec 0x55 as `0xd5 0x00`.
+            [vec![0x01, 0xd5, 0x00], canonical[2..].to_vec()].concat(),
+            // The codec as `2^64 + 0x55`.
+            [
+                vec![0x01, 0xd5],
+                vec![0x80; 8],
+                vec![0x02],
+                canonical[2..].to_vec(),
+            ]
+            .concat(),
+        ] {
+            assert!(
+                matches!(
+                    parse_car_v1(&car_with(cid.clone())),
+                    Err(CoreError::InvalidCar(_))
+                ),
+                "{cid:02x?}"
+            );
+        }
     }
 
     #[test]
