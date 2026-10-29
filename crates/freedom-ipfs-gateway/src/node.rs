@@ -72,7 +72,7 @@ use freedom_ipfs_store::SqliteBlockStore;
 use crate::progress::ProgressRecorder;
 use crate::{
     router_with_state, GatewayCaches, GatewayConfig, GatewayCore, GatewayState,
-    PersistentNameResolver,
+    PersistentIpnsResolver, PersistentNameResolver,
 };
 
 /// How a node finds providers and IPNS records.
@@ -385,6 +385,8 @@ impl OnlineNodeBuilder {
                                 )),
                             ),
                         };
+                    // Never an older record than one this node has seen.
+                    let ipns = PersistentIpnsResolver::new(ipns, store.clone());
                     let name_resolver = CachedNameResolver::new(PersistentNameResolver::new(
                         DefaultNameResolver::new(
                             // The policy's DoH endpoint, a configured target

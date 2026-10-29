@@ -18,6 +18,23 @@ const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_HOT_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const HOT_CACHE_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_NAME_CACHE_RECORDS: i64 = 128;
+/// The most IPNS names whose newest record the store keeps.
+const MAX_IPNS_RECORDS: i64 = 128;
+
+/// The newest verified record a node has seen for one IPNS name, kept until
+/// the record stops being valid so that an older record can't replace it
+/// (see `put_ipns_record`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredIpnsRecord {
+    pub value: String,
+    pub sequence: u64,
+    /// The record's EOL validity, RFC 3339 as it was signed.
+    pub validity: String,
+    /// The record's TTL, in nanoseconds.
+    pub ttl: u64,
+    /// When `validity` passes, in seconds since the Unix epoch.
+    pub expires_at: u64,
+}
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -241,6 +258,15 @@ impl SqliteBlockStore {
             );
             CREATE INDEX IF NOT EXISTS name_cache_updated_at
                 ON name_cache(updated_at);
+            CREATE TABLE IF NOT EXISTS ipns_records (
+                name TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL,
+                sequence BLOB NOT NULL,
+                validity TEXT NOT NULL,
+                ttl BLOB NOT NULL,
+                expires_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
@@ -586,6 +612,102 @@ impl SqliteBlockStore {
             return Ok(None);
         }
         Ok(Some(resolved_target))
+    }
+
+    /// Keeps `record` as the newest record for the IPNS `name` (its
+    /// canonical spelling), replacing what the store holds. The caller has
+    /// compared the two: the store keeps whatever it is given. A record past
+    /// its validity isn't kept.
+    pub fn put_ipns_record(&self, name: &str, record: &StoredIpnsRecord) -> Result<()> {
+        let now = now_secs();
+        if record.expires_at <= now {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        let stored = cached_unless_full(conn.execute(
+            r#"
+            INSERT INTO ipns_records(name, value, sequence, validity, ttl, expires_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(name) DO UPDATE SET
+                value = excluded.value,
+                sequence = excluded.sequence,
+                validity = excluded.validity,
+                ttl = excluded.ttl,
+                expires_at = excluded.expires_at,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                name,
+                record.value,
+                record.sequence.to_be_bytes(),
+                record.validity,
+                record.ttl.to_be_bytes(),
+                i64::try_from(record.expires_at).unwrap_or(i64::MAX),
+                now as i64
+            ],
+        ))?;
+        if !stored {
+            // The store is full and the old record stays: still the newest
+            // this node knows to be valid, so it keeps answering.
+            return Ok(());
+        }
+        conn.execute(
+            "DELETE FROM ipns_records WHERE expires_at <= ?1",
+            params![now as i64],
+        )?;
+        conn.execute(
+            r#"
+            DELETE FROM ipns_records
+            WHERE name IN (
+                SELECT name FROM ipns_records
+                ORDER BY updated_at DESC, name DESC
+                LIMIT -1 OFFSET ?1
+            )
+            "#,
+            params![MAX_IPNS_RECORDS],
+        )?;
+        Ok(())
+    }
+
+    /// The newest record the store keeps for the IPNS `name`, while it is
+    /// still valid.
+    pub fn get_ipns_record(&self, name: &str) -> Result<Option<StoredIpnsRecord>> {
+        let conn = self.conn.lock();
+        let row = conn
+            .query_row(
+                "SELECT value, sequence, validity, ttl, expires_at FROM ipns_records WHERE name = ?1",
+                params![name],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((value, sequence, validity, ttl, expires_at)) = row else {
+            return Ok(None);
+        };
+        let expires_at = u64::try_from(expires_at).unwrap_or(0);
+        let (Ok(sequence), Ok(ttl)) = (<[u8; 8]>::try_from(sequence), <[u8; 8]>::try_from(ttl))
+        else {
+            conn.execute("DELETE FROM ipns_records WHERE name = ?1", params![name])?;
+            return Ok(None);
+        };
+        if expires_at <= now_secs() {
+            conn.execute("DELETE FROM ipns_records WHERE name = ?1", params![name])?;
+            return Ok(None);
+        }
+        Ok(Some(StoredIpnsRecord {
+            value,
+            sequence: u64::from_be_bytes(sequence),
+            validity,
+            ttl: u64::from_be_bytes(ttl),
+            expires_at,
+        }))
     }
 
     pub fn mark_bad_provider(&self, peer_or_url: &str, reason: &str, ttl: Duration) -> Result<()> {
@@ -2043,6 +2165,53 @@ mod tests {
             Some("/ipfs/bafkqaddwgevxmmraojswg33smq")
         );
         assert!(store.get_name_record("missing.test").unwrap().is_none());
+    }
+
+    fn ipns_record(sequence: u64, expires_at: u64) -> StoredIpnsRecord {
+        StoredIpnsRecord {
+            value: format!("/ipfs/bafkq{sequence}"),
+            sequence,
+            validity: "2126-01-01T00:00:00Z".into(),
+            ttl: u64::MAX,
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn keeps_the_ipns_record_it_is_given_until_its_validity_passes() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let future = now_secs() + 3600;
+        assert_eq!(store.get_ipns_record("k51name").unwrap(), None);
+        // Sequences and TTLs past i64 round-trip.
+        let record = ipns_record(u64::MAX, future);
+        store.put_ipns_record("k51name", &record).unwrap();
+        assert_eq!(store.get_ipns_record("k51name").unwrap(), Some(record));
+        let replaced = ipns_record(3, future);
+        store.put_ipns_record("k51name", &replaced).unwrap();
+        assert_eq!(store.get_ipns_record("k51name").unwrap(), Some(replaced));
+        // A record whose validity has passed is neither kept nor answered.
+        store
+            .put_ipns_record("k51other", &ipns_record(1, now_secs()))
+            .unwrap();
+        assert_eq!(store.get_ipns_record("k51other").unwrap(), None);
+        store
+            .conn
+            .lock()
+            .execute("UPDATE ipns_records SET expires_at = 1", [])
+            .unwrap();
+        assert_eq!(store.get_ipns_record("k51name").unwrap(), None);
+        // At most MAX_IPNS_RECORDS names, the oldest updates dropped.
+        for index in 0..(MAX_IPNS_RECORDS + 2) {
+            store
+                .put_ipns_record(&format!("k51-{index:03}"), &ipns_record(1, future))
+                .unwrap();
+        }
+        let count: i64 = store
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM ipns_records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, MAX_IPNS_RECORDS);
     }
 
     #[test]
