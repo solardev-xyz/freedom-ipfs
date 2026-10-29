@@ -1,6 +1,5 @@
 use cid::Cid;
 use freedom_ipfs_core::{Block, BlockProvider, CODEC_DAG_PB, CODEC_RAW};
-use multihash::Multihash;
 use prost::Message;
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
@@ -16,6 +15,14 @@ const HAMT_MAX_SHARDS_VISITED: usize = 1024;
 const UNIXFS_METADATA_CACHE_MAX_BLOCK_BYTES: usize = 64 * 1024;
 const UNIXFS_PATH_CACHE_MAX_PATH_BYTES: usize = 1024;
 const UNIXFS_RANGE_BATCH_MAX_BLOCKS: usize = 4;
+/// The most links one dag-pb node may have, and the most block sizes its
+/// UnixFS data may list. They are counted on the wire before anything is
+/// decoded: prost decodes each link into a 64-byte struct (and each block
+/// size into 8 bytes) whatever it holds, so a 2 MiB block of empty links
+/// decoded to 1,048,576 links, 64 MiB. A block is at most 2 MiB, and a link
+/// naming a real CID takes about 40 bytes of it, so no real node comes near
+/// this; a HAMT shard has at most 256.
+pub const MAX_DAG_PB_LINKS: usize = 65_536;
 
 #[derive(Debug, Error)]
 pub enum UnixfsError {
@@ -1097,8 +1104,117 @@ fn ranges_intersect(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool 
     a_start <= b_end && b_start <= a_end
 }
 
+/// A dag-pb block, decoded as the dag-pb spec requires
+/// (ipld.io/specs/codecs/dag-pb, "Strictness"), and as go-codec-dagpb
+/// (Kubo's) and `@ipld/dag-pb` decode it:
+/// - **PBNode:** only Links (field 2) and Data (field 1), each
+///   length-delimited; Data at most once, before the first Link or after
+///   the last (the spec allows both orders, and IPFS data has both), never
+///   between two;
+/// - **PBLink:** only Hash (1, bytes), Name (2, a string) and Tsize (3, a
+///   varint), each at most once and in that order; Hash present, and a
+///   CID; Name UTF-8;
+/// - nothing else: no other field, no group, no wrong wire type, no byte
+///   past the last field.
+///
+/// The links are counted first, without decoding ([`MAX_DAG_PB_LINKS`]).
 fn decode_pb_node(data: &[u8]) -> Result<PbNode> {
-    PbNode::decode(data).map_err(|err| UnixfsError::InvalidDagPb(err.to_string()))
+    // PBNode's links are field 2, each length-delimited.
+    check_repeated_count(data, 2, false, "links")?;
+    let invalid = |what: &str| UnixfsError::InvalidDagPb(format!("PBNode: {what}"));
+    let mut rest = data;
+    let mut node = PbNode::default();
+    // Set when Data ends a run of Links: no Link may follow.
+    let mut links_ended = false;
+    while !rest.is_empty() {
+        let (field, value) = length_delimited_field(&mut rest).map_err(invalid)?;
+        match field {
+            1 if node.data.is_some() => return Err(invalid("Data more than once")),
+            1 => {
+                links_ended = !node.links.is_empty();
+                node.data = Some(value.to_vec());
+            }
+            2 if links_ended => return Err(invalid("Links on both sides of Data")),
+            2 => node.links.push(decode_pb_link(value)?),
+            _ => return Err(invalid("a field other than Links and Data")),
+        }
+    }
+    Ok(node)
+}
+
+/// One PBLink, decoded strictly (see [`decode_pb_node`]).
+fn decode_pb_link(bytes: &[u8]) -> Result<PbLink> {
+    let invalid = |what: &str| UnixfsError::InvalidDagPb(format!("PBLink: {what}"));
+    let mut rest = bytes;
+    let mut link = PbLink::default();
+    let mut last = 0;
+    while !rest.is_empty() {
+        let key = read_varint(&mut rest).ok_or_else(|| invalid("a truncated key"))?;
+        let (field, wire_type) = (key >> 3, key & 7);
+        if field <= last {
+            return Err(invalid(if field == last {
+                "a field more than once"
+            } else {
+                "fields out of order (Hash, Name, Tsize)"
+            }));
+        }
+        last = field;
+        match (field, wire_type) {
+            (1, 2) => {
+                let hash =
+                    take_length_delimited(&mut rest).ok_or_else(|| invalid("a truncated Hash"))?;
+                cid_from_bytes(hash).ok_or_else(|| invalid("a Hash that isn't a CID"))?;
+                link.hash = Some(hash.to_vec());
+            }
+            (2, 2) => {
+                let name =
+                    take_length_delimited(&mut rest).ok_or_else(|| invalid("a truncated Name"))?;
+                let name =
+                    std::str::from_utf8(name).map_err(|_| invalid("a Name that isn't UTF-8"))?;
+                link.name = Some(name.to_string());
+            }
+            (3, 0) => {
+                link.tsize =
+                    Some(read_varint(&mut rest).ok_or_else(|| invalid("a truncated Tsize"))?);
+            }
+            (1..=3, _) => return Err(invalid("a field of the wrong wire type")),
+            _ => return Err(invalid("a field other than Hash, Name and Tsize")),
+        }
+    }
+    if link.hash.is_none() {
+        return Err(invalid("no Hash"));
+    }
+    Ok(link)
+}
+
+/// A length-delimited field off the front of `rest`: its number and value.
+fn length_delimited_field<'a>(
+    rest: &mut &'a [u8],
+) -> std::result::Result<(u64, &'a [u8]), &'static str> {
+    let key = read_varint(rest).ok_or("a truncated key")?;
+    if key & 7 != 2 {
+        return Err("a field that isn't length-delimited");
+    }
+    let value = take_length_delimited(rest).ok_or("a truncated field")?;
+    Ok((key >> 3, value))
+}
+
+/// A length and that many bytes off the front of `rest`.
+fn take_length_delimited<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let len = usize::try_from(read_varint(rest)?).ok()?;
+    let value = rest.get(..len)?;
+    *rest = &rest[len..];
+    Some(value)
+}
+
+/// A CID's bytes, all of them, in the CID's one encoding: CIDv0 (a bare
+/// SHA-256 multihash) or CIDv1. `Cid::read_bytes` alone also takes a
+/// varint that isn't minimal, or one past 64 bits (it keeps the low bits),
+/// as a different CID; Kubo refuses both.
+fn cid_from_bytes(bytes: &[u8]) -> Option<Cid> {
+    let mut cursor = Cursor::new(bytes);
+    let cid = Cid::read_bytes(&mut cursor).ok()?;
+    (cursor.position() as usize == bytes.len() && cid.to_bytes() == bytes).then_some(cid)
 }
 
 fn decode_unixfs_data(node: &PbNode) -> Result<UnixfsData> {
@@ -1106,7 +1222,97 @@ fn decode_unixfs_data(node: &PbNode) -> Result<UnixfsData> {
         .data
         .as_deref()
         .ok_or_else(|| UnixfsError::InvalidDagPb("missing UnixFS data".into()))?;
+    // UnixFS Data's blocksizes are field 4, varints, packed or not.
+    check_repeated_count(data, 4, true, "block sizes")?;
     UnixfsData::decode(data).map_err(|err| UnixfsError::InvalidDagPb(err.to_string()))
+}
+
+/// Refuses `message` when prost would decode more than [`MAX_DAG_PB_LINKS`]
+/// values into its repeated `field`, counted on the wire without decoding,
+/// or when its wire format is broken (prost refuses that too).
+fn check_repeated_count(message: &[u8], field: u64, varints: bool, what: &str) -> Result<()> {
+    let count = repeated_count(message, field, varints)
+        .ok_or_else(|| UnixfsError::InvalidDagPb("malformed protobuf".into()))?;
+    if count > MAX_DAG_PB_LINKS {
+        return Err(UnixfsError::InvalidDagPb(format!(
+            "more than {MAX_DAG_PB_LINKS} {what}"
+        )));
+    }
+    Ok(())
+}
+
+/// How many values prost would decode into the repeated `field` of the
+/// protobuf `message`, read off the wire as prost reads it: each
+/// length-delimited occurrence of a message field, or for a varint field
+/// (`varints`) each varint occurrence and each varint in a packed one.
+/// Fields inside groups are skipped, as prost skips them. `None` when the
+/// message's own wire format is broken, as prost would find it: the values'
+/// contents (a link's own fields) are prost's to check when it decodes them.
+fn repeated_count(message: &[u8], field: u64, varints: bool) -> Option<usize> {
+    // prost's recursion limit: inside the 100th open group, nothing but
+    // that group's end is read.
+    const MAX_GROUP_DEPTH: usize = 100;
+    let mut rest = message;
+    let mut groups = Vec::new();
+    let mut count = 0usize;
+    while !rest.is_empty() {
+        let key = read_varint(&mut rest)?;
+        let (number, wire_type) = (key >> 3, key & 7);
+        if number == 0 {
+            return None;
+        }
+        if groups.len() >= MAX_GROUP_DEPTH && wire_type != 4 {
+            return None;
+        }
+        let counted = groups.is_empty() && number == field;
+        match wire_type {
+            0 => {
+                read_varint(&mut rest)?;
+                if counted && varints {
+                    count += 1;
+                }
+            }
+            1 => rest = rest.get(8..)?,
+            2 => {
+                let len = usize::try_from(read_varint(&mut rest)?).ok()?;
+                let value = rest.get(..len)?;
+                rest = &rest[len..];
+                if counted {
+                    count += if varints {
+                        // A packed run: each varint ends on a byte below 0x80.
+                        value.iter().filter(|byte| **byte < 0x80).count()
+                    } else {
+                        1
+                    };
+                }
+            }
+            3 => groups.push(number),
+            4 => {
+                if groups.pop() != Some(number) {
+                    return None;
+                }
+            }
+            5 => rest = rest.get(4..)?,
+            _ => return None,
+        }
+    }
+    groups.is_empty().then_some(count)
+}
+
+/// A protobuf varint off the front of `bytes`.
+fn read_varint(bytes: &mut &[u8]) -> Option<u64> {
+    let mut value = 0u64;
+    for (index, &byte) in bytes.iter().enumerate().take(10) {
+        value |= u64::from(byte & 0x7f) << (7 * index);
+        if byte < 0x80 {
+            if index == 9 && byte > 1 {
+                return None;
+            }
+            *bytes = &bytes[index + 1..];
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn data_type(data: &UnixfsData) -> Result<DataType> {
@@ -1195,17 +1401,8 @@ fn link_cid(link: &PbLink) -> Result<Cid> {
         .hash
         .as_deref()
         .ok_or_else(|| UnixfsError::InvalidDagPb("link is missing hash".into()))?;
-
-    let mut cursor = Cursor::new(bytes);
-    if let Ok(cid) = Cid::read_bytes(&mut cursor) {
-        if cursor.position() as usize == bytes.len() {
-            return Ok(cid);
-        }
-    }
-
-    let mh = Multihash::<64>::from_bytes(bytes)
-        .map_err(|err| UnixfsError::InvalidDagPb(format!("invalid link multihash: {err}")))?;
-    Ok(Cid::new_v1(CODEC_DAG_PB, mh))
+    // A decoded link's Hash is a CID (decode_pb_node checked it).
+    cid_from_bytes(bytes).ok_or_else(|| UnixfsError::InvalidDagPb("link hash isn't a CID".into()))
 }
 
 #[cfg(test)]
@@ -1215,6 +1412,7 @@ mod tests {
         block_data_range, cid_from_data, Block, Result as CoreResult, CODEC_DAG_PB, CODEC_RAW,
     };
     use freedom_ipfs_store::SqliteBlockStore;
+    use multihash::Multihash;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -1752,6 +1950,435 @@ mod tests {
             read_file_range(&store, &file_cid, "", 3, 12).unwrap(),
             b"fix linked"
         );
+    }
+
+    /// The dag-pb spec's strictness (ipld.io/specs/codecs/dag-pb), as
+    /// go-codec-dagpb (Kubo's) and `@ipld/dag-pb` decode: each form the
+    /// rules allow decodes, and each way to break them is refused.
+    #[test]
+    fn dag_pb_is_decoded_strictly() {
+        let cid = cid_from_data(CODEC_RAW, b"x").to_bytes();
+        let v0 = Cid::new_v0(Multihash::<64>::wrap(0x12, &[7; 32]).unwrap())
+            .unwrap()
+            .to_bytes();
+        let bytes_field = |field: u64, value: &[u8]| {
+            let mut out = key(field, 2);
+            prost::encoding::encode_varint(value.len() as u64, &mut out);
+            out.extend_from_slice(value);
+            out
+        };
+        let varint_field = |field: u64, value: u64| {
+            let mut out = key(field, 0);
+            prost::encoding::encode_varint(value, &mut out);
+            out
+        };
+        let link = |fields: &[Vec<u8>]| bytes_field(2, &fields.concat());
+        let hash = bytes_field(1, &cid);
+        let name = bytes_field(2, b"a.txt");
+        let tsize = varint_field(3, 9);
+        let data = bytes_field(1, b"\x08\x01");
+
+        for (allowed, what) in [
+            (Vec::new(), "an empty node"),
+            (data.clone(), "Data alone"),
+            (
+                link(std::slice::from_ref(&hash)),
+                "a link with only its Hash",
+            ),
+            (
+                link(&[hash.clone(), tsize.clone()]),
+                "Hash and Tsize, no Name",
+            ),
+            (
+                link(&[bytes_field(1, &v0), name.clone(), tsize.clone()]),
+                "a CIDv0 Hash",
+            ),
+            (
+                [
+                    link(&[hash.clone(), name.clone(), tsize.clone()]),
+                    link(std::slice::from_ref(&hash)),
+                    data.clone(),
+                ]
+                .concat(),
+                "Links, then Data",
+            ),
+            (
+                [
+                    data.clone(),
+                    link(&[hash.clone(), name.clone(), tsize.clone()]),
+                    link(std::slice::from_ref(&hash)),
+                ]
+                .concat(),
+                "Data, then Links",
+            ),
+            (
+                [bytes_field(1, &[]), link(std::slice::from_ref(&hash))].concat(),
+                "an empty Data, then a Link",
+            ),
+            (bytes_field(1, &[]), "an empty Data"),
+        ] {
+            assert!(decode_pb_node(&allowed).is_ok(), "{what}");
+        }
+
+        for (broken, error) in [
+            (
+                [
+                    link(std::slice::from_ref(&hash)),
+                    data.clone(),
+                    link(std::slice::from_ref(&hash)),
+                ]
+                .concat(),
+                "PBNode: Links on both sides of Data",
+            ),
+            (
+                [data.clone(), data.clone()].concat(),
+                "PBNode: Data more than once",
+            ),
+            (
+                [
+                    data.clone(),
+                    link(std::slice::from_ref(&hash)),
+                    data.clone(),
+                ]
+                .concat(),
+                "PBNode: Data more than once",
+            ),
+            (
+                bytes_field(3, b"x"),
+                "PBNode: a field other than Links and Data",
+            ),
+            (
+                varint_field(1, 1),
+                "PBNode: a field that isn't length-delimited",
+            ),
+            (
+                [key(9, 3), key(9, 4)].concat(),
+                "PBNode: a field that isn't length-delimited",
+            ),
+            // Caught first by the link count's scan of the wire.
+            (vec![0x12, 0x05, 0x0a], "malformed protobuf"),
+            (vec![0x12], "malformed protobuf"),
+            (link(&[]), "PBLink: no Hash"),
+            (link(std::slice::from_ref(&name)), "PBLink: no Hash"),
+            (
+                link(&[name.clone(), hash.clone()]),
+                "PBLink: fields out of order (Hash, Name, Tsize)",
+            ),
+            (
+                link(&[tsize.clone(), hash.clone()]),
+                "PBLink: fields out of order (Hash, Name, Tsize)",
+            ),
+            (
+                link(&[hash.clone(), tsize.clone(), name.clone()]),
+                "PBLink: fields out of order (Hash, Name, Tsize)",
+            ),
+            (
+                link(&[hash.clone(), hash.clone()]),
+                "PBLink: a field more than once",
+            ),
+            (
+                link(&[hash.clone(), name.clone(), name.clone()]),
+                "PBLink: a field more than once",
+            ),
+            (
+                link(&[hash.clone(), vec![0x18, 0x01, 0x18, 0x02]]),
+                "PBLink: a field more than once",
+            ),
+            (
+                link(&[hash.clone(), bytes_field(4, b"x")]),
+                "PBLink: a field other than Hash, Name and Tsize",
+            ),
+            (
+                link(&[hash.clone(), bytes_field(3, b"9")]),
+                "PBLink: a field of the wrong wire type",
+            ),
+            (
+                link(&[varint_field(1, 1)]),
+                "PBLink: a field of the wrong wire type",
+            ),
+            (
+                link(&[bytes_field(1, &[0x00, 0x00])]),
+                "PBLink: a Hash that isn't a CID",
+            ),
+            (
+                link(&[bytes_field(1, &[&cid[..], &[0]].concat())]),
+                "PBLink: a Hash that isn't a CID",
+            ),
+            (
+                link(&[hash.clone(), bytes_field(2, &[0xff])]),
+                "PBLink: a Name that isn't UTF-8",
+            ),
+            (link(&[vec![0x0a, 0x05, 0x01]]), "PBLink: a truncated Hash"),
+        ] {
+            assert_eq!(
+                decode_pb_node(&broken).unwrap_err().to_string(),
+                format!("invalid dag-pb: {error}"),
+                "{broken:02x?}"
+            );
+        }
+
+        // A Hash whose CID has a varint that isn't minimal, or one past 64
+        // bits, at each of its four: version, codec, multihash code and
+        // digest length. Kubo refuses each ("varint not minimally
+        // encoded", "varints larger than uint63 not supported").
+        let mut bad_cids = Vec::new();
+        for at in 0..4 {
+            let padded = [cid[at] | 0x80, 0x00];
+            let mut past_64_bits = vec![cid[at] | 0x80];
+            past_64_bits.extend([0x80; 8]);
+            past_64_bits.push(0x02);
+            for varint in [&padded[..], &past_64_bits] {
+                bad_cids.push(link(&[bytes_field(
+                    1,
+                    &[&cid[..at], varint, &cid[at + 1..]].concat(),
+                )]));
+            }
+        }
+        // A padded CIDv0 multihash code.
+        bad_cids.push(link(&[bytes_field(
+            1,
+            &[&[0x92, 0x00][..], &v0[1..]].concat(),
+        )]));
+        for broken in bad_cids {
+            assert_eq!(
+                decode_pb_node(&broken).unwrap_err().to_string(),
+                "invalid dag-pb: PBLink: a Hash that isn't a CID",
+                "{broken:02x?}"
+            );
+        }
+    }
+
+    /// A file read through the public API, its root encoded in each order
+    /// the spec allows: Data first (prost's encoder, and older IPFS data)
+    /// and Links first (Kubo's).
+    #[test]
+    fn a_file_reads_with_data_before_or_after_its_links() {
+        let leaves = [
+            cid_from_data(CODEC_RAW, b"x"),
+            cid_from_data(CODEC_RAW, b"y"),
+        ];
+        let data_first = pb_file_with_metadata(
+            b"",
+            vec![link("", &leaves[0]), link("", &leaves[1])],
+            2,
+            vec![1, 1],
+        );
+        let node = decode_pb_node(&data_first).unwrap();
+        let mut links_first = Vec::new();
+        for link in &node.links {
+            prost::encoding::bytes::encode(2, &link.encode_to_vec(), &mut links_first);
+        }
+        prost::encoding::bytes::encode(1, node.data.as_ref().unwrap(), &mut links_first);
+        assert_eq!((data_first[0], links_first[0]), (0x0a, 0x12));
+
+        for root_block in [data_first, links_first] {
+            let root = cid_from_data(CODEC_DAG_PB, &root_block);
+            let provider = CountingProvider::new(HashMap::from([
+                (root, root_block),
+                (leaves[0], b"x".to_vec()),
+                (leaves[1], b"y".to_vec()),
+            ]));
+            assert_eq!(read_file(&provider, &root, "").unwrap(), b"xy");
+        }
+    }
+
+    /// A protobuf key.
+    fn key(field: u64, wire_type: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut value = field << 3 | wire_type;
+        while value >= 0x80 {
+            out.push(value as u8 | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+        out
+    }
+
+    #[test]
+    fn a_block_of_empty_links_is_refused_before_it_is_decoded() {
+        // 2 MiB of empty PBLinks (`0x12 0x00`): 1,048,576 links, which
+        // prost decoded to 64 MiB of link structs.
+        let block = [0x12u8, 0x00].repeat(1024 * 1024);
+        assert_eq!(
+            decode_pb_node(&block).unwrap_err().to_string(),
+            format!("invalid dag-pb: more than {MAX_DAG_PB_LINKS} links")
+        );
+        // Through the resolver too: the error, not the allocation.
+        let cid = cid_from_data(CODEC_DAG_PB, &block);
+        let provider = CountingProvider::new(HashMap::from([(cid, block)]));
+        assert!(matches!(
+            list_directory(&provider, &cid, ""),
+            Err(UnixfsError::InvalidDagPb(_))
+        ));
+        // At the bound a node decodes, one link more is refused: links each
+        // naming the smallest CID there is (identity, no bytes), as a
+        // strict dag-pb link must name one.
+        let smallest = PbLink {
+            hash: Some(Cid::new_v1(CODEC_RAW, Multihash::<64>::wrap(0, &[]).unwrap()).to_bytes()),
+            name: None,
+            tsize: None,
+        };
+        let node = |count| PbNode {
+            data: None,
+            links: vec![smallest.clone(); count],
+        };
+        let at = node(MAX_DAG_PB_LINKS).encode_to_vec();
+        assert_eq!(decode_pb_node(&at).unwrap().links.len(), MAX_DAG_PB_LINKS);
+        let over = node(MAX_DAG_PB_LINKS + 1).encode_to_vec();
+        assert_eq!(
+            decode_pb_node(&over).unwrap_err().to_string(),
+            format!("invalid dag-pb: more than {MAX_DAG_PB_LINKS} links")
+        );
+    }
+
+    #[test]
+    fn unixfs_block_sizes_are_bounded_packed_or_not() {
+        let node = |data: Vec<u8>| PbNode {
+            data: Some(data),
+            links: Vec::new(),
+        };
+        let packed = |count: usize| {
+            let mut data = key(1, 0);
+            data.push(DataType::File as u8);
+            data.extend(key(4, 2));
+            let mut len = count;
+            while len >= 0x80 {
+                data.push(len as u8 | 0x80);
+                len >>= 7;
+            }
+            data.push(len as u8);
+            data.extend(std::iter::repeat_n(1u8, count));
+            data
+        };
+        let unpacked = |count: usize| {
+            let mut data = key(1, 0);
+            data.push(DataType::File as u8);
+            for _ in 0..count {
+                data.extend(key(4, 0));
+                data.push(1);
+            }
+            data
+        };
+        for data in [packed(MAX_DAG_PB_LINKS), unpacked(MAX_DAG_PB_LINKS)] {
+            let decoded = decode_unixfs_data(&node(data)).unwrap();
+            assert_eq!(decoded.blocksizes.len(), MAX_DAG_PB_LINKS);
+        }
+        for data in [
+            packed(MAX_DAG_PB_LINKS + 1),
+            unpacked(MAX_DAG_PB_LINKS + 1),
+            // 2 MiB of one-byte block sizes: 16 MiB decoded.
+            packed(2 * 1024 * 1024 - 16),
+        ] {
+            assert_eq!(
+                decode_unixfs_data(&node(data)).unwrap_err().to_string(),
+                format!("invalid dag-pb: more than {MAX_DAG_PB_LINKS} block sizes")
+            );
+        }
+    }
+
+    /// The wire count is the number of links prost decodes, whatever else
+    /// the message holds, and a message prost refuses is refused.
+    #[test]
+    fn the_wire_count_matches_what_prost_decodes() {
+        let empty_link = [0x12u8, 0x00];
+        let full_link = PbNode {
+            data: None,
+            links: vec![link("a", &cid_from_data(CODEC_RAW, b"a"))],
+        }
+        .encode_to_vec();
+        let mut cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            full_link.clone(),
+            [full_link.clone(), empty_link.to_vec(), full_link.clone()].concat(),
+        ];
+        // Unknown fields of every wire type around the links.
+        let mut unknown = key(9, 0);
+        unknown.push(0x96);
+        unknown.push(0x01);
+        unknown.extend(key(10, 1));
+        unknown.extend([0u8; 8]);
+        unknown.extend(key(11, 5));
+        unknown.extend([0u8; 4]);
+        unknown.extend(key(12, 2));
+        unknown.push(2);
+        unknown.extend(empty_link);
+        cases.push([unknown.clone(), empty_link.to_vec(), unknown.clone()].concat());
+        // Links inside an unknown group, nested twice: prost skips them.
+        let grouped = [
+            key(13, 3),
+            empty_link.to_vec(),
+            key(14, 3),
+            empty_link.to_vec(),
+            key(14, 4),
+            key(13, 4),
+            empty_link.to_vec(),
+        ]
+        .concat();
+        cases.push(grouped);
+        // Only the empty node and real links are dag-pb: an empty link has
+        // no Hash, and unknown fields and groups aren't allowed.
+        let strict = [true, true, false, false, false];
+        assert_eq!(cases.len(), strict.len());
+        for (case, strict) in cases.iter().zip(strict) {
+            let decoded = PbNode::decode(case.as_slice()).unwrap();
+            assert_eq!(
+                repeated_count(case, 2, false),
+                Some(decoded.links.len()),
+                "{case:02x?}"
+            );
+            assert_eq!(decode_pb_node(case).is_ok(), strict, "{case:02x?}");
+        }
+        // Nested groups at prost's recursion limit (review of #63): 99 open
+        // groups may hold a field, the 100th only its own end, and a 101st
+        // can't open.
+        let nested = |depth: usize, inner: &[u8]| {
+            let mut wire = Vec::new();
+            for _ in 0..depth {
+                wire.extend(key(9, 3));
+            }
+            wire.extend(inner);
+            for _ in 0..depth {
+                wire.extend(key(9, 4));
+            }
+            wire
+        };
+        for (depth, inner, decodes) in [
+            (99, &empty_link[..], true),
+            (100, &empty_link[..], false),
+            (101, &empty_link[..], false),
+            (100, &[][..], true),
+            (101, &[][..], false),
+        ] {
+            let wire = nested(depth, inner);
+            assert_eq!(
+                PbNode::decode(wire.as_slice()).is_ok(),
+                decodes,
+                "{depth} groups, {inner:02x?}"
+            );
+            assert_eq!(
+                repeated_count(&wire, 2, false),
+                decodes.then_some(0),
+                "{depth} groups, {inner:02x?}"
+            );
+            // A group is never dag-pb.
+            assert!(decode_pb_node(&wire).is_err(), "{depth} groups");
+        }
+        // Broken messages: prost refuses them, and so does the count.
+        for broken in [
+            vec![0x12],
+            vec![0x12, 0x05, 0x00],
+            vec![0x80],
+            vec![0x00],
+            key(9, 6),
+            key(9, 4),
+            key(9, 3),
+            [key(9, 3), key(8, 4)].concat(),
+            [vec![0x08], vec![0xff; 10]].concat(),
+        ] {
+            assert!(PbNode::decode(broken.as_slice()).is_err(), "{broken:02x?}");
+            assert_eq!(repeated_count(&broken, 2, false), None, "{broken:02x?}");
+            assert!(decode_pb_node(&broken).is_err(), "{broken:02x?}");
+        }
     }
 
     #[test]
