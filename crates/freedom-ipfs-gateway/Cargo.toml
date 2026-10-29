@@ -32,3 +32,5 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+# Record validities for the IPNS cache's tests.
+time.workspace = true

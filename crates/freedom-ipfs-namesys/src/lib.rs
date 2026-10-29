@@ -165,6 +165,14 @@ where
     }
 
     async fn resolve_name_with_ttl(&self, name: &str) -> Result<ResolvedName> {
+        // An IPNS name isn't cached here, by the name as spelled and without
+        // its record's sequence or validity: a canonical IPNS cache (the
+        // gateway's `PersistentIpnsResolver`) keeps it, so another spelling,
+        // or a cached entry outliving its record's validity, can't answer
+        // with a record it has replaced.
+        if is_ipns_name(name) {
+            return self.inner.resolve_name_with_ttl(name).await;
+        }
         if let Some(value) = self.cached(name) {
             tracing::info!(
                 phase = "name_cache",
