@@ -16,6 +16,14 @@ const HAMT_MAX_SHARDS_VISITED: usize = 1024;
 const UNIXFS_METADATA_CACHE_MAX_BLOCK_BYTES: usize = 64 * 1024;
 const UNIXFS_PATH_CACHE_MAX_PATH_BYTES: usize = 1024;
 const UNIXFS_RANGE_BATCH_MAX_BLOCKS: usize = 4;
+/// The most links one dag-pb node may have, and the most block sizes its
+/// UnixFS data may list. They are counted on the wire before anything is
+/// decoded: prost decodes each link into a 64-byte struct (and each block
+/// size into 8 bytes) whatever it holds, so a 2 MiB block of empty links
+/// decoded to 1,048,576 links, 64 MiB. A block is at most 2 MiB, and a link
+/// naming a real CID takes about 40 bytes of it, so no real node comes near
+/// this; a HAMT shard has at most 256.
+pub const MAX_DAG_PB_LINKS: usize = 65_536;
 
 #[derive(Debug, Error)]
 pub enum UnixfsError {
@@ -1098,6 +1106,8 @@ fn ranges_intersect(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool 
 }
 
 fn decode_pb_node(data: &[u8]) -> Result<PbNode> {
+    // PBNode's links are field 2, each length-delimited.
+    check_repeated_count(data, 2, false, "links")?;
     PbNode::decode(data).map_err(|err| UnixfsError::InvalidDagPb(err.to_string()))
 }
 
@@ -1106,7 +1116,96 @@ fn decode_unixfs_data(node: &PbNode) -> Result<UnixfsData> {
         .data
         .as_deref()
         .ok_or_else(|| UnixfsError::InvalidDagPb("missing UnixFS data".into()))?;
+    // UnixFS Data's blocksizes are field 4, varints, packed or not.
+    check_repeated_count(data, 4, true, "block sizes")?;
     UnixfsData::decode(data).map_err(|err| UnixfsError::InvalidDagPb(err.to_string()))
+}
+
+/// Refuses `message` when prost would decode more than [`MAX_DAG_PB_LINKS`]
+/// values into its repeated `field`, counted on the wire without decoding,
+/// or when its wire format is broken (prost refuses that too).
+fn check_repeated_count(message: &[u8], field: u64, varints: bool, what: &str) -> Result<()> {
+    let count = repeated_count(message, field, varints)
+        .ok_or_else(|| UnixfsError::InvalidDagPb("malformed protobuf".into()))?;
+    if count > MAX_DAG_PB_LINKS {
+        return Err(UnixfsError::InvalidDagPb(format!(
+            "more than {MAX_DAG_PB_LINKS} {what}"
+        )));
+    }
+    Ok(())
+}
+
+/// How many values prost would decode into the repeated `field` of the
+/// protobuf `message`, read off the wire as prost reads it: each
+/// length-delimited occurrence of a message field, or for a varint field
+/// (`varints`) each varint occurrence and each varint in a packed one.
+/// Fields inside groups are skipped, as prost skips them. `None` for a
+/// broken wire format.
+fn repeated_count(message: &[u8], field: u64, varints: bool) -> Option<usize> {
+    const MAX_GROUP_DEPTH: usize = 100;
+    let mut rest = message;
+    let mut groups = Vec::new();
+    let mut count = 0usize;
+    while !rest.is_empty() {
+        let key = read_varint(&mut rest)?;
+        let (number, wire_type) = (key >> 3, key & 7);
+        if number == 0 {
+            return None;
+        }
+        let counted = groups.is_empty() && number == field;
+        match wire_type {
+            0 => {
+                read_varint(&mut rest)?;
+                if counted && varints {
+                    count += 1;
+                }
+            }
+            1 => rest = rest.get(8..)?,
+            2 => {
+                let len = usize::try_from(read_varint(&mut rest)?).ok()?;
+                let value = rest.get(..len)?;
+                rest = &rest[len..];
+                if counted {
+                    count += if varints {
+                        // A packed run: each varint ends on a byte below 0x80.
+                        value.iter().filter(|byte| **byte < 0x80).count()
+                    } else {
+                        1
+                    };
+                }
+            }
+            3 => {
+                groups.push(number);
+                if groups.len() > MAX_GROUP_DEPTH {
+                    return None;
+                }
+            }
+            4 => {
+                if groups.pop() != Some(number) {
+                    return None;
+                }
+            }
+            5 => rest = rest.get(4..)?,
+            _ => return None,
+        }
+    }
+    groups.is_empty().then_some(count)
+}
+
+/// A protobuf varint off the front of `bytes`.
+fn read_varint(bytes: &mut &[u8]) -> Option<u64> {
+    let mut value = 0u64;
+    for (index, &byte) in bytes.iter().enumerate().take(10) {
+        value |= u64::from(byte & 0x7f) << (7 * index);
+        if byte < 0x80 {
+            if index == 9 && byte > 1 {
+                return None;
+            }
+            *bytes = &bytes[index + 1..];
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn data_type(data: &UnixfsData) -> Result<DataType> {
@@ -1752,6 +1851,152 @@ mod tests {
             read_file_range(&store, &file_cid, "", 3, 12).unwrap(),
             b"fix linked"
         );
+    }
+
+    /// A protobuf key.
+    fn key(field: u64, wire_type: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut value = field << 3 | wire_type;
+        while value >= 0x80 {
+            out.push(value as u8 | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+        out
+    }
+
+    #[test]
+    fn a_block_of_empty_links_is_refused_before_it_is_decoded() {
+        // 2 MiB of empty PBLinks (`0x12 0x00`): 1,048,576 links, which
+        // prost decoded to 64 MiB of link structs.
+        let block = [0x12u8, 0x00].repeat(1024 * 1024);
+        assert_eq!(
+            decode_pb_node(&block).unwrap_err().to_string(),
+            format!("invalid dag-pb: more than {MAX_DAG_PB_LINKS} links")
+        );
+        // Through the resolver too: the error, not the allocation.
+        let cid = cid_from_data(CODEC_DAG_PB, &block);
+        let provider = CountingProvider::new(HashMap::from([(cid, block)]));
+        assert!(matches!(
+            list_directory(&provider, &cid, ""),
+            Err(UnixfsError::InvalidDagPb(_))
+        ));
+        // At the bound a node decodes, one link more is refused.
+        let at = [0x12u8, 0x00].repeat(MAX_DAG_PB_LINKS);
+        assert_eq!(decode_pb_node(&at).unwrap().links.len(), MAX_DAG_PB_LINKS);
+        let over = [0x12u8, 0x00].repeat(MAX_DAG_PB_LINKS + 1);
+        assert!(decode_pb_node(&over).is_err());
+    }
+
+    #[test]
+    fn unixfs_block_sizes_are_bounded_packed_or_not() {
+        let node = |data: Vec<u8>| PbNode {
+            data: Some(data),
+            links: Vec::new(),
+        };
+        let packed = |count: usize| {
+            let mut data = key(1, 0);
+            data.push(DataType::File as u8);
+            data.extend(key(4, 2));
+            let mut len = count;
+            while len >= 0x80 {
+                data.push(len as u8 | 0x80);
+                len >>= 7;
+            }
+            data.push(len as u8);
+            data.extend(std::iter::repeat_n(1u8, count));
+            data
+        };
+        let unpacked = |count: usize| {
+            let mut data = key(1, 0);
+            data.push(DataType::File as u8);
+            for _ in 0..count {
+                data.extend(key(4, 0));
+                data.push(1);
+            }
+            data
+        };
+        for data in [packed(MAX_DAG_PB_LINKS), unpacked(MAX_DAG_PB_LINKS)] {
+            let decoded = decode_unixfs_data(&node(data)).unwrap();
+            assert_eq!(decoded.blocksizes.len(), MAX_DAG_PB_LINKS);
+        }
+        for data in [
+            packed(MAX_DAG_PB_LINKS + 1),
+            unpacked(MAX_DAG_PB_LINKS + 1),
+            // 2 MiB of one-byte block sizes: 16 MiB decoded.
+            packed(2 * 1024 * 1024 - 16),
+        ] {
+            assert_eq!(
+                decode_unixfs_data(&node(data)).unwrap_err().to_string(),
+                format!("invalid dag-pb: more than {MAX_DAG_PB_LINKS} block sizes")
+            );
+        }
+    }
+
+    /// The wire count is the number of links prost decodes, whatever else
+    /// the message holds, and a message prost refuses is refused.
+    #[test]
+    fn the_wire_count_matches_what_prost_decodes() {
+        let empty_link = [0x12u8, 0x00];
+        let full_link = PbNode {
+            data: None,
+            links: vec![link("a", &cid_from_data(CODEC_RAW, b"a"))],
+        }
+        .encode_to_vec();
+        let mut cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            full_link.clone(),
+            [full_link.clone(), empty_link.to_vec(), full_link.clone()].concat(),
+        ];
+        // Unknown fields of every wire type around the links.
+        let mut unknown = key(9, 0);
+        unknown.push(0x96);
+        unknown.push(0x01);
+        unknown.extend(key(10, 1));
+        unknown.extend([0u8; 8]);
+        unknown.extend(key(11, 5));
+        unknown.extend([0u8; 4]);
+        unknown.extend(key(12, 2));
+        unknown.push(2);
+        unknown.extend(empty_link);
+        cases.push([unknown.clone(), empty_link.to_vec(), unknown.clone()].concat());
+        // Links inside an unknown group, nested twice: prost skips them.
+        let grouped = [
+            key(13, 3),
+            empty_link.to_vec(),
+            key(14, 3),
+            empty_link.to_vec(),
+            key(14, 4),
+            key(13, 4),
+            empty_link.to_vec(),
+        ]
+        .concat();
+        cases.push(grouped);
+        for case in &cases {
+            let decoded = PbNode::decode(case.as_slice()).unwrap();
+            assert_eq!(
+                repeated_count(case, 2, false),
+                Some(decoded.links.len()),
+                "{case:02x?}"
+            );
+            assert!(decode_pb_node(case).is_ok());
+        }
+        // Broken messages: prost refuses them, and so does the count.
+        for broken in [
+            vec![0x12],
+            vec![0x12, 0x05, 0x00],
+            vec![0x80],
+            vec![0x00],
+            key(9, 6),
+            key(9, 4),
+            key(9, 3),
+            [key(9, 3), key(8, 4)].concat(),
+            [vec![0x08], vec![0xff; 10]].concat(),
+        ] {
+            assert!(PbNode::decode(broken.as_slice()).is_err(), "{broken:02x?}");
+            assert_eq!(repeated_count(&broken, 2, false), None, "{broken:02x?}");
+            assert!(decode_pb_node(&broken).is_err(), "{broken:02x?}");
+        }
     }
 
     #[test]
