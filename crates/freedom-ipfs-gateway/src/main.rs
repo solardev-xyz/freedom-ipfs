@@ -5,7 +5,7 @@ use freedom_ipfs_core::parse_cid;
 use freedom_ipfs_gateway::{
     router_with_provider_and_name_resolver_config, GatewayConfig,
     GatewayHtmlDirectoryPrefetchConfig, GatewayHtmlPrefetchConfig, GatewayHtmlRangeWarmConfig,
-    PersistentNameResolver, DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
+    PersistentIpnsResolver, PersistentNameResolver, DEFAULT_GATEWAY_MAX_CONCURRENT_REQUESTS,
     DEFAULT_GATEWAY_REQUEST_QUEUE_TIMEOUT_MS, DEFAULT_GATEWAY_SMALL_BODY_CACHE_MAX_BYTES,
 };
 use freedom_ipfs_namesys::{
@@ -144,7 +144,11 @@ async fn main() -> Result<()> {
         let name_resolver = CachedNameResolver::new(PersistentNameResolver::new(
             DefaultNameResolver::new(
                 CloudflareDohResolver::default(),
-                ipns_resolver(args.routing_mode, delegated_router_endpoints, dht),
+                // Never an older record than one this node has seen.
+                PersistentIpnsResolver::new(
+                    ipns_resolver(args.routing_mode, delegated_router_endpoints, dht),
+                    store.clone(),
+                ),
             ),
             store,
         ));

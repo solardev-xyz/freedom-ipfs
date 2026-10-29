@@ -2224,7 +2224,11 @@ unsafe fn gateway_router_for_routing_mode(
     let name_resolver = CachedNameResolver::new(freedom_ipfs_gateway::PersistentNameResolver::new(
         DefaultNameResolver::new(
             CloudflareDohResolver::default(),
-            ipns_resolver(start_config.routing_mode, delegated_router_endpoints, dht),
+            // Never an older record than one this node has seen.
+            freedom_ipfs_gateway::PersistentIpnsResolver::new(
+                ipns_resolver(start_config.routing_mode, delegated_router_endpoints, dht),
+                node.store.clone(),
+            ),
         ),
         node.store.clone(),
     ));
