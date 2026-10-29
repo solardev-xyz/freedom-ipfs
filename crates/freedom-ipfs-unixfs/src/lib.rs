@@ -1108,7 +1108,9 @@ fn ranges_intersect(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool 
 /// (ipld.io/specs/codecs/dag-pb, "Strictness"), and as go-codec-dagpb
 /// (Kubo's) and `@ipld/dag-pb` decode it:
 /// - **PBNode:** only Links (field 2) and Data (field 1), each
-///   length-delimited; every Link before Data, and Data at most once;
+///   length-delimited; Data at most once, before the first Link or after
+///   the last (the spec allows both orders, and IPFS data has both), never
+///   between two;
 /// - **PBLink:** only Hash (1, bytes), Name (2, a string) and Tsize (3, a
 ///   varint), each at most once and in that order; Hash present, and a
 ///   CID; Name UTF-8;
@@ -1122,12 +1124,17 @@ fn decode_pb_node(data: &[u8]) -> Result<PbNode> {
     let invalid = |what: &str| UnixfsError::InvalidDagPb(format!("PBNode: {what}"));
     let mut rest = data;
     let mut node = PbNode::default();
+    // Set when Data ends a run of Links: no Link may follow.
+    let mut links_ended = false;
     while !rest.is_empty() {
         let (field, value) = length_delimited_field(&mut rest).map_err(invalid)?;
         match field {
             1 if node.data.is_some() => return Err(invalid("Data more than once")),
-            1 => node.data = Some(value.to_vec()),
-            2 if node.data.is_some() => return Err(invalid("a Link after Data")),
+            1 => {
+                links_ended = !node.links.is_empty();
+                node.data = Some(value.to_vec());
+            }
+            2 if links_ended => return Err(invalid("Links on both sides of Data")),
             2 => node.links.push(decode_pb_link(value)?),
             _ => return Err(invalid("a field other than Links and Data")),
         }
@@ -1200,11 +1207,14 @@ fn take_length_delimited<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
     Some(value)
 }
 
-/// A CID's bytes, all of them: CIDv0 (a bare SHA-256 multihash) or CIDv1.
+/// A CID's bytes, all of them, in the CID's one encoding: CIDv0 (a bare
+/// SHA-256 multihash) or CIDv1. `Cid::read_bytes` alone also takes a
+/// varint that isn't minimal, or one past 64 bits (it keeps the low bits),
+/// as a different CID; Kubo refuses both.
 fn cid_from_bytes(bytes: &[u8]) -> Option<Cid> {
     let mut cursor = Cursor::new(bytes);
     let cid = Cid::read_bytes(&mut cursor).ok()?;
-    (cursor.position() as usize == bytes.len()).then_some(cid)
+    (cursor.position() as usize == bytes.len() && cid.to_bytes() == bytes).then_some(cid)
 }
 
 fn decode_unixfs_data(node: &PbNode) -> Result<UnixfsData> {
@@ -1406,22 +1416,6 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    impl PbNode {
-        /// The node as dag-pb encodes it: every Link, then Data, each
-        /// link's fields in tag order. prost's own `encode_to_vec` puts Data
-        /// first, which the strict decoder refuses.
-        fn to_dag_pb(&self) -> Vec<u8> {
-            let mut out = Vec::new();
-            for link in &self.links {
-                prost::encoding::bytes::encode(2, &link.encode_to_vec(), &mut out);
-            }
-            if let Some(data) = &self.data {
-                prost::encoding::bytes::encode(1, data, &mut out);
-            }
-            out
-        }
-    }
-
     fn unixfs_data(kind: DataType, data: &[u8]) -> Vec<u8> {
         UnixfsData {
             r#type: Some(kind as i32),
@@ -1458,7 +1452,7 @@ mod tests {
             ),
             links,
         }
-        .to_dag_pb()
+        .encode_to_vec()
     }
 
     fn pb_directory(links: Vec<PbLink>) -> Vec<u8> {
@@ -1466,7 +1460,7 @@ mod tests {
             data: Some(unixfs_data(DataType::Directory, &[])),
             links,
         }
-        .to_dag_pb()
+        .encode_to_vec()
     }
 
     fn pb_hamt(links: Vec<PbLink>) -> Vec<u8> {
@@ -1484,7 +1478,7 @@ mod tests {
             ),
             links,
         }
-        .to_dag_pb()
+        .encode_to_vec()
     }
 
     fn link(name: &str, cid: &Cid) -> PbLink {
@@ -1959,8 +1953,8 @@ mod tests {
     }
 
     /// The dag-pb spec's strictness (ipld.io/specs/codecs/dag-pb), as
-    /// go-codec-dagpb (Kubo's) and `@ipld/dag-pb` decode: each rule's
-    /// canonical form decodes, and each way to break it is refused.
+    /// go-codec-dagpb (Kubo's) and `@ipld/dag-pb` decode: each form the
+    /// rules allow decodes, and each way to break them is refused.
     #[test]
     fn dag_pb_is_decoded_strictly() {
         let cid = cid_from_data(CODEC_RAW, b"x").to_bytes();
@@ -1984,7 +1978,7 @@ mod tests {
         let tsize = varint_field(3, 9);
         let data = bytes_field(1, b"\x08\x01");
 
-        for (canonical, what) in [
+        for (allowed, what) in [
             (Vec::new(), "an empty node"),
             (data.clone(), "Data alone"),
             (
@@ -2008,18 +2002,45 @@ mod tests {
                 .concat(),
                 "Links, then Data",
             ),
+            (
+                [
+                    data.clone(),
+                    link(&[hash.clone(), name.clone(), tsize.clone()]),
+                    link(std::slice::from_ref(&hash)),
+                ]
+                .concat(),
+                "Data, then Links",
+            ),
+            (
+                [bytes_field(1, &[]), link(std::slice::from_ref(&hash))].concat(),
+                "an empty Data, then a Link",
+            ),
             (bytes_field(1, &[]), "an empty Data"),
         ] {
-            assert!(decode_pb_node(&canonical).is_ok(), "{what}");
+            assert!(decode_pb_node(&allowed).is_ok(), "{what}");
         }
 
         for (broken, error) in [
             (
-                [data.clone(), link(std::slice::from_ref(&hash))].concat(),
-                "PBNode: a Link after Data",
+                [
+                    link(std::slice::from_ref(&hash)),
+                    data.clone(),
+                    link(std::slice::from_ref(&hash)),
+                ]
+                .concat(),
+                "PBNode: Links on both sides of Data",
             ),
             (
                 [data.clone(), data.clone()].concat(),
+                "PBNode: Data more than once",
+            ),
+            (
+                [
+                    data.clone(),
+                    link(std::slice::from_ref(&hash)),
+                    data.clone(),
+                ]
+                .concat(),
                 "PBNode: Data more than once",
             ),
             (
@@ -2060,6 +2081,10 @@ mod tests {
                 "PBLink: a field more than once",
             ),
             (
+                link(&[hash.clone(), vec![0x18, 0x01, 0x18, 0x02]]),
+                "PBLink: a field more than once",
+            ),
+            (
                 link(&[hash.clone(), bytes_field(4, b"x")]),
                 "PBLink: a field other than Hash, Name and Tsize",
             ),
@@ -2090,6 +2115,70 @@ mod tests {
                 format!("invalid dag-pb: {error}"),
                 "{broken:02x?}"
             );
+        }
+
+        // A Hash whose CID has a varint that isn't minimal, or one past 64
+        // bits, at each of its four: version, codec, multihash code and
+        // digest length. Kubo refuses each ("varint not minimally
+        // encoded", "varints larger than uint63 not supported").
+        let mut bad_cids = Vec::new();
+        for at in 0..4 {
+            let padded = [cid[at] | 0x80, 0x00];
+            let mut past_64_bits = vec![cid[at] | 0x80];
+            past_64_bits.extend([0x80; 8]);
+            past_64_bits.push(0x02);
+            for varint in [&padded[..], &past_64_bits] {
+                bad_cids.push(link(&[bytes_field(
+                    1,
+                    &[&cid[..at], varint, &cid[at + 1..]].concat(),
+                )]));
+            }
+        }
+        // A padded CIDv0 multihash code.
+        bad_cids.push(link(&[bytes_field(
+            1,
+            &[&[0x92, 0x00][..], &v0[1..]].concat(),
+        )]));
+        for broken in bad_cids {
+            assert_eq!(
+                decode_pb_node(&broken).unwrap_err().to_string(),
+                "invalid dag-pb: PBLink: a Hash that isn't a CID",
+                "{broken:02x?}"
+            );
+        }
+    }
+
+    /// A file read through the public API, its root encoded in each order
+    /// the spec allows: Data first (prost's encoder, and older IPFS data)
+    /// and Links first (Kubo's).
+    #[test]
+    fn a_file_reads_with_data_before_or_after_its_links() {
+        let leaves = [
+            cid_from_data(CODEC_RAW, b"x"),
+            cid_from_data(CODEC_RAW, b"y"),
+        ];
+        let data_first = pb_file_with_metadata(
+            b"",
+            vec![link("", &leaves[0]), link("", &leaves[1])],
+            2,
+            vec![1, 1],
+        );
+        let node = decode_pb_node(&data_first).unwrap();
+        let mut links_first = Vec::new();
+        for link in &node.links {
+            prost::encoding::bytes::encode(2, &link.encode_to_vec(), &mut links_first);
+        }
+        prost::encoding::bytes::encode(1, node.data.as_ref().unwrap(), &mut links_first);
+        assert_eq!((data_first[0], links_first[0]), (0x0a, 0x12));
+
+        for root_block in [data_first, links_first] {
+            let root = cid_from_data(CODEC_DAG_PB, &root_block);
+            let provider = CountingProvider::new(HashMap::from([
+                (root, root_block),
+                (leaves[0], b"x".to_vec()),
+                (leaves[1], b"y".to_vec()),
+            ]));
+            assert_eq!(read_file(&provider, &root, "").unwrap(), b"xy");
         }
     }
 
@@ -2133,9 +2222,9 @@ mod tests {
             data: None,
             links: vec![smallest.clone(); count],
         };
-        let at = node(MAX_DAG_PB_LINKS).to_dag_pb();
+        let at = node(MAX_DAG_PB_LINKS).encode_to_vec();
         assert_eq!(decode_pb_node(&at).unwrap().links.len(), MAX_DAG_PB_LINKS);
-        let over = node(MAX_DAG_PB_LINKS + 1).to_dag_pb();
+        let over = node(MAX_DAG_PB_LINKS + 1).encode_to_vec();
         assert_eq!(
             decode_pb_node(&over).unwrap_err().to_string(),
             format!("invalid dag-pb: more than {MAX_DAG_PB_LINKS} links")
@@ -2196,7 +2285,7 @@ mod tests {
             data: None,
             links: vec![link("a", &cid_from_data(CODEC_RAW, b"a"))],
         }
-        .to_dag_pb();
+        .encode_to_vec();
         let mut cases: Vec<Vec<u8>> = vec![
             Vec::new(),
             full_link.clone(),
