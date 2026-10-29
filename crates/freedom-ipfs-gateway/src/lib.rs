@@ -1336,8 +1336,13 @@ fn stored_ipns_record(
     max_ttl: Duration,
 ) -> Option<freedom_ipfs_store::StoredIpnsRecord> {
     let expiry = ipns_record_expiry(record)?;
-    let eol = i64::try_from(expiry.unix_timestamp_nanos()).unwrap_or(i64::MAX);
-    let eol_secs = u64::try_from(expiry.unix_timestamp()).ok()?;
+    // Exact over RFC 3339's whole range: seconds (an i64 reaches past year
+    // 9999 either way) and the nanosecond within.
+    let eol = freedom_ipfs_store::IpnsEol {
+        secs: expiry.unix_timestamp(),
+        nanos: expiry.nanosecond(),
+    };
+    let eol_secs = u64::try_from(eol.secs).ok()?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -5689,6 +5694,43 @@ mod tests {
             resolver.resolve_ipns(PEER).await,
             Err(NamesysError::NotFound(_))
         ));
+    }
+
+    /// Review of #66, round 2: two records of one sequence whose validities
+    /// both end after 2262 kept no order (an i64 of nanoseconds saturated),
+    /// so the older one, arriving last, won.
+    #[tokio::test]
+    async fn far_future_validities_order_records_of_one_sequence() {
+        let record = |value: &str, validity: &str| IpnsRecord {
+            value: value.into(),
+            sequence: 1,
+            validity: Some(validity.into()),
+            ttl: 0,
+        };
+        let newer = record("/ipfs/newer", "2400-01-01T00:00:00Z");
+        let older = record("/ipfs/older", "2300-01-01T00:00:00Z");
+        for (first, second) in [
+            (newer.clone(), older.clone()),
+            (older.clone(), newer.clone()),
+        ] {
+            let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+            let resolver = PersistentIpnsResolver::new(
+                QueuedIpnsResolver::new(vec![Ok(first), Ok(second)]),
+                store,
+            );
+            let _ = resolver.resolve_ipns(PEER).await.unwrap();
+            assert_eq!(resolver.resolve_ipns(PEER).await.unwrap(), newer);
+        }
+        // A nanosecond apart, across 2262's limit.
+        let before = record("/ipfs/before", "2262-04-11T23:47:16.854775807Z");
+        let after = record("/ipfs/after", "2262-04-11T23:47:16.854775808Z");
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let resolver = PersistentIpnsResolver::new(
+            QueuedIpnsResolver::new(vec![Ok(after.clone()), Ok(before)]),
+            store,
+        );
+        let _ = resolver.resolve_ipns(PEER).await.unwrap();
+        assert_eq!(resolver.resolve_ipns(PEER).await.unwrap(), after);
     }
 
     /// A kept record answers, under either spelling, for its TTL without
