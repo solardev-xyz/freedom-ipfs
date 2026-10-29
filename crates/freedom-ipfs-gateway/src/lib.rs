@@ -6494,6 +6494,22 @@ mod tests {
         blocksizes: Vec<u64>,
     }
 
+    impl TestPbNode {
+        /// The node as dag-pb encodes it: every Link, then Data. prost's
+        /// own `encode_to_vec` puts Data first, which UnixFS's strict
+        /// decoder refuses.
+        fn to_dag_pb(&self) -> Vec<u8> {
+            let mut out = Vec::new();
+            for link in &self.links {
+                prost::encoding::bytes::encode(2, &link.encode_to_vec(), &mut out);
+            }
+            if let Some(data) = &self.data {
+                prost::encoding::bytes::encode(1, data, &mut out);
+            }
+            out
+        }
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
     #[repr(i32)]
     enum TestDataType {
@@ -6514,7 +6530,7 @@ mod tests {
             ),
             links: Vec::new(),
         }
-        .encode_to_vec()
+        .to_dag_pb()
     }
 
     fn test_pb_file_with_links(
@@ -6534,7 +6550,7 @@ mod tests {
             ),
             links,
         }
-        .encode_to_vec()
+        .to_dag_pb()
     }
 
     pub(crate) fn test_pb_directory(links: Vec<TestPbLink>) -> Vec<u8> {
@@ -6550,7 +6566,7 @@ mod tests {
             ),
             links,
         }
-        .encode_to_vec()
+        .to_dag_pb()
     }
 
     pub(crate) fn test_link(name: &str, cid: &Cid) -> TestPbLink {
