@@ -1400,8 +1400,12 @@ where
             return Ok(kept);
         }
         let record = self.inner.resolve_ipns(name).await?;
+        // A validity that doesn't parse (a leap second, say) can't be
+        // ordered against the kept record: the record isn't answered.
         let Some(stored) = stored_ipns_record(&record, self.max_ttl) else {
-            return Ok(record);
+            return Err(NamesysError::InvalidIpnsRecord(
+                "a validity that can't be ordered".into(),
+            ));
         };
         match self.store.install_ipns_record(&key, &stored) {
             Ok(winner) => {
@@ -5731,6 +5735,61 @@ mod tests {
         );
         let _ = resolver.resolve_ipns(PEER).await.unwrap();
         assert_eq!(resolver.resolve_ipns(PEER).await.unwrap(), after);
+    }
+
+    /// Review of #66, round 3: a leap-second validity tied with the
+    /// nanosecond before it, so the earlier record could replace the later.
+    /// The resolver refuses a record whose validity is a leap second, in
+    /// either order, and the kept record stays.
+    #[tokio::test]
+    async fn a_leap_second_validity_is_never_installed_or_answered() {
+        let record = |value: &str, validity: &str| IpnsRecord {
+            value: value.into(),
+            sequence: 1,
+            validity: Some(validity.into()),
+            ttl: 0,
+        };
+        let earlier = record("/ipfs/earlier", "2400-06-30T23:59:59.999999999Z");
+        for leap in [
+            "2400-06-30T23:59:60Z",
+            "2400-06-30T23:59:60.25Z",
+            "2400-07-01T01:59:60+02:00",
+        ] {
+            let later = record("/ipfs/later", leap);
+            let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+            let resolver = PersistentIpnsResolver::new(
+                QueuedIpnsResolver::new(vec![
+                    Ok(later.clone()),
+                    Ok(earlier.clone()),
+                    Ok(later.clone()),
+                ]),
+                store.clone(),
+            );
+            assert!(
+                matches!(
+                    resolver.resolve_ipns(PEER).await,
+                    Err(NamesysError::InvalidIpnsRecord(_))
+                ),
+                "{leap}"
+            );
+            assert_eq!(
+                resolver.resolve_ipns(PEER).await.unwrap(),
+                earlier,
+                "{leap}"
+            );
+            assert!(
+                matches!(
+                    resolver.resolve_ipns(PEER).await,
+                    Err(NamesysError::InvalidIpnsRecord(_))
+                ),
+                "{leap}"
+            );
+            let kept = store
+                .get_ipns_record(&canonical_ipns_name(PEER).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(kept.value, "/ipfs/earlier", "{leap}");
+        }
     }
 
     /// A kept record answers, under either spelling, for its TTL without

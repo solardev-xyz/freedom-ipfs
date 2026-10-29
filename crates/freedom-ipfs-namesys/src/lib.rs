@@ -659,10 +659,21 @@ pub fn better_ipns_record(best: Option<IpnsRecord>, record: IpnsRecord) -> IpnsR
 /// When a record stops being valid: its EOL validity, `None` if it has
 /// none that parses (a verified record always has one).
 pub fn ipns_record_expiry(record: &IpnsRecord) -> Option<OffsetDateTime> {
-    record
-        .validity
-        .as_deref()
-        .and_then(|validity| OffsetDateTime::parse(validity, &Rfc3339).ok())
+    record.validity.as_deref().and_then(parse_ipns_validity)
+}
+
+/// An IPNS EOL validity, RFC 3339, read as Boxo reads it (Go's
+/// `RFC3339Nano`): a seconds field of 60, a leap second, in any spelling, is
+/// refused. The `time` crate reads `23:59:60` as the nanosecond before it,
+/// the same instant as `23:59:59.999999999`, so two records a leap second
+/// apart would tie, and the earlier could replace the later. Verification
+/// and every cache read the validity through this one parser.
+pub fn parse_ipns_validity(validity: &str) -> Option<OffsetDateTime> {
+    // `YYYY-MM-DDTHH:MM:SS…`: the seconds are its 18th and 19th bytes.
+    if validity.as_bytes().get(17..19) == Some(b"60".as_slice()) {
+        return None;
+    }
+    OffsetDateTime::parse(validity, &Rfc3339).ok()
 }
 
 /// One spelling for an IPNS name, whatever form it came in (a peer ID or
@@ -851,8 +862,9 @@ fn verify_ipns_record_at(name: &str, bytes: &[u8], now: OffsetDateTime) -> Resul
     }
     let validity = std::str::from_utf8(&record_data.validity)
         .map_err(|_| NamesysError::InvalidIpnsRecord("validity is not utf-8".into()))?;
-    let expires = OffsetDateTime::parse(validity, &Rfc3339)
-        .map_err(|err| NamesysError::InvalidIpnsRecord(format!("invalid validity: {err}")))?;
+    let expires = parse_ipns_validity(validity).ok_or_else(|| {
+        NamesysError::InvalidIpnsRecord("invalid validity: not RFC 3339, or a leap second".into())
+    })?;
     if expires <= now {
         return Err(NamesysError::ExpiredIpnsRecord);
     }
@@ -2181,6 +2193,42 @@ mod tests {
             resolver.resolve_ipns(&name).await.unwrap().value,
             "/ipfs/bafkqac3jobxhgzlbmq"
         );
+    }
+
+    /// Review of #66, round 3: the `time` crate read a leap second as the
+    /// nanosecond before it, so `23:59:60` and `23:59:59.999999999` tied. A
+    /// leap-second validity, in any spelling, fails verification, as it
+    /// does in Boxo; the nanosecond before it still verifies.
+    #[test]
+    fn a_leap_second_validity_fails_verification() {
+        let keypair = Keypair::generate_ed25519();
+        for validity in [
+            "2400-06-30T23:59:60Z",
+            "2400-06-30T23:59:60.5Z",
+            "2400-06-30T23:59:60.999999999Z",
+            "2400-07-01T01:59:60+02:00",
+            "2400-06-30T19:59:60-04:00",
+            "2400-06-30t23:59:60z",
+        ] {
+            let (name, record) =
+                signed_by(&keypair, "/ipfs/bafkqaddwgevxmmraojswg33smq", validity, 1);
+            assert!(
+                matches!(
+                    verify_ipns_record(&name, &record),
+                    Err(NamesysError::InvalidIpnsRecord(_))
+                ),
+                "{validity}"
+            );
+            assert_eq!(parse_ipns_validity(validity), None, "{validity}");
+        }
+        let (name, record) = signed_by(
+            &keypair,
+            "/ipfs/bafkqaddwgevxmmraojswg33smq",
+            "2400-06-30T23:59:59.999999999Z",
+            1,
+        );
+        assert!(verify_ipns_record(&name, &record).is_ok());
+        assert!(parse_ipns_validity("2400-06-30T23:59:59Z").is_some());
     }
 
     #[test]
