@@ -157,21 +157,15 @@ pub struct CarFile {
 pub fn parse_car_v1(bytes: &[u8]) -> Result<CarFile> {
     let mut offset = 0;
     let header_len = read_varint(bytes, &mut offset)?;
-    if header_len == 0 || offset + header_len > bytes.len() {
-        return Err(CoreError::InvalidCar("invalid header length".into()));
-    }
-    let header = bytes[offset..offset + header_len].to_vec();
-    offset += header_len;
+    let header = take_section(bytes, &mut offset, header_len)
+        .ok_or_else(|| CoreError::InvalidCar("invalid header length".into()))?
+        .to_vec();
 
     let mut blocks = Vec::new();
     while offset < bytes.len() {
         let section_len = read_varint(bytes, &mut offset)?;
-        if section_len == 0 || offset + section_len > bytes.len() {
-            return Err(CoreError::InvalidCar("invalid block section length".into()));
-        }
-
-        let section = &bytes[offset..offset + section_len];
-        offset += section_len;
+        let section = take_section(bytes, &mut offset, section_len)
+            .ok_or_else(|| CoreError::InvalidCar("invalid block section length".into()))?;
 
         let mut cursor = Cursor::new(section);
         let cid = Cid::read_bytes(&mut cursor)
@@ -204,6 +198,19 @@ pub fn encode_car_v1(blocks: &[CarBlock]) -> Vec<u8> {
     car
 }
 
+/// The `len` bytes at `offset`, moving `offset` past them: `None` for an
+/// empty section, or one past the end of `bytes`. A length is a varint the
+/// file gives, up to `usize::MAX`, so the end is computed without
+/// overflowing.
+fn take_section<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let end = offset
+        .checked_add(len)
+        .filter(|end| len > 0 && *end <= bytes.len())?;
+    let section = &bytes[*offset..end];
+    *offset = end;
+    Some(section)
+}
+
 fn read_varint(bytes: &[u8], offset: &mut usize) -> Result<usize> {
     let input = bytes
         .get(*offset..)
@@ -227,6 +234,51 @@ pub fn cid_from_multihash(codec: u64, mh: Multihash<64>) -> Cid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CAR whose header or section length is a varint near `usize::MAX`:
+    /// adding it to the offset overflowed (a debug build panicked there, a
+    /// release build wrapped and panicked slicing), and the add-on imports
+    /// CAR bytes inside an `extern "C"` function, where a panic aborts.
+    #[test]
+    fn car_lengths_past_the_end_are_errors_not_panics() {
+        let huge = |value: usize| encode_varint(value);
+        let header = encode_varint(EMPTY_ROOTS_CAR_V1_HEADER.len())
+            .into_iter()
+            .chain(EMPTY_ROOTS_CAR_V1_HEADER.iter().copied())
+            .collect::<Vec<u8>>();
+        for len in [usize::MAX, usize::MAX - 1, usize::MAX / 2 + 1, 1 << 40] {
+            let mut car = huge(len);
+            car.extend_from_slice(b"header");
+            assert!(
+                matches!(parse_car_v1(&car), Err(CoreError::InvalidCar(_))),
+                "header length {len}"
+            );
+            let mut car = header.clone();
+            car.extend(huge(len));
+            car.extend_from_slice(b"section");
+            assert!(
+                matches!(parse_car_v1(&car), Err(CoreError::InvalidCar(_))),
+                "section length {len}"
+            );
+        }
+        // Zero-length and just-too-long sections stay errors, and one that
+        // ends exactly at the end still parses.
+        for car in [
+            huge(0),
+            [header.clone(), huge(0)].concat(),
+            [header.clone(), huge(2), vec![1]].concat(),
+        ] {
+            assert!(matches!(parse_car_v1(&car), Err(CoreError::InvalidCar(_))));
+        }
+        let block = CarBlock {
+            cid: cid_from_data(CODEC_RAW, b"x"),
+            data: b"x".to_vec(),
+        };
+        assert_eq!(
+            parse_car_v1(&encode_car_v1(&[block])).unwrap().blocks.len(),
+            1
+        );
+    }
 
     #[test]
     fn cid_round_trips_and_verifies_raw_block() {
