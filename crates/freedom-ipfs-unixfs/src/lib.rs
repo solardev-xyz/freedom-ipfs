@@ -1139,9 +1139,12 @@ fn check_repeated_count(message: &[u8], field: u64, varints: bool, what: &str) -
 /// protobuf `message`, read off the wire as prost reads it: each
 /// length-delimited occurrence of a message field, or for a varint field
 /// (`varints`) each varint occurrence and each varint in a packed one.
-/// Fields inside groups are skipped, as prost skips them. `None` for a
-/// broken wire format.
+/// Fields inside groups are skipped, as prost skips them. `None` when the
+/// message's own wire format is broken, as prost would find it: the values'
+/// contents (a link's own fields) are prost's to check when it decodes them.
 fn repeated_count(message: &[u8], field: u64, varints: bool) -> Option<usize> {
+    // prost's recursion limit: inside the 100th open group, nothing but
+    // that group's end is read.
     const MAX_GROUP_DEPTH: usize = 100;
     let mut rest = message;
     let mut groups = Vec::new();
@@ -1150,6 +1153,9 @@ fn repeated_count(message: &[u8], field: u64, varints: bool) -> Option<usize> {
         let key = read_varint(&mut rest)?;
         let (number, wire_type) = (key >> 3, key & 7);
         if number == 0 {
+            return None;
+        }
+        if groups.len() >= MAX_GROUP_DEPTH && wire_type != 4 {
             return None;
         }
         let counted = groups.is_empty() && number == field;
@@ -1174,12 +1180,7 @@ fn repeated_count(message: &[u8], field: u64, varints: bool) -> Option<usize> {
                     };
                 }
             }
-            3 => {
-                groups.push(number);
-                if groups.len() > MAX_GROUP_DEPTH {
-                    return None;
-                }
-            }
+            3 => groups.push(number),
             4 => {
                 if groups.pop() != Some(number) {
                     return None;
@@ -1980,6 +1981,40 @@ mod tests {
                 "{case:02x?}"
             );
             assert!(decode_pb_node(case).is_ok());
+        }
+        // Nested groups at prost's recursion limit (review of #63): 99 open
+        // groups may hold a field, the 100th only its own end, and a 101st
+        // can't open.
+        let nested = |depth: usize, inner: &[u8]| {
+            let mut wire = Vec::new();
+            for _ in 0..depth {
+                wire.extend(key(9, 3));
+            }
+            wire.extend(inner);
+            for _ in 0..depth {
+                wire.extend(key(9, 4));
+            }
+            wire
+        };
+        for (depth, inner, decodes) in [
+            (99, &empty_link[..], true),
+            (100, &empty_link[..], false),
+            (101, &empty_link[..], false),
+            (100, &[][..], true),
+            (101, &[][..], false),
+        ] {
+            let wire = nested(depth, inner);
+            assert_eq!(
+                PbNode::decode(wire.as_slice()).is_ok(),
+                decodes,
+                "{depth} groups, {inner:02x?}"
+            );
+            assert_eq!(
+                repeated_count(&wire, 2, false),
+                decodes.then_some(0),
+                "{depth} groups, {inner:02x?}"
+            );
+            assert_eq!(decode_pb_node(&wire).is_ok(), decodes, "{depth} groups");
         }
         // Broken messages: prost refuses them, and so does the count.
         for broken in [
