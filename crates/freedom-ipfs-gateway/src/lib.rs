@@ -14,7 +14,10 @@ use freedom_ipfs_core::{
     btree_map_bytes, parse_cid, BlockProvider, ChargedBytes, FixedPool, HeldBytes, PoolShare,
     Reservation,
 };
-use freedom_ipfs_namesys::{NameResolver, NamesysError, ResolvedName};
+use freedom_ipfs_namesys::{
+    canonical_ipns_name, ipns_record_expiry, is_ipns_name, IpnsRecord, IpnsResolver, NameResolver,
+    NamesysError, ResolvedName,
+};
 use freedom_ipfs_retrieval::{with_retrieval_request_context, RetrievalRequestContext};
 use freedom_ipfs_store::SqliteBlockStore;
 use freedom_ipfs_unixfs::{
@@ -27,7 +30,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
@@ -1222,6 +1225,24 @@ where
         &self,
         name: &str,
     ) -> freedom_ipfs_namesys::Result<ResolvedName> {
+        // An IPNS name is cached canonically, with its record's sequence and
+        // validity (`PersistentIpnsResolver`): this cache, keyed by the name
+        // as spelled and holding only the target, would answer with a
+        // record the kept one has replaced, or one past its validity. It
+        // answers from the kept record while that is cached, and otherwise
+        // asks, writing nothing.
+        if is_ipns_name(name) {
+            if let Some(kept) = fresh_ipns_record(&self.store, name) {
+                tracing::info!(
+                    phase = "name_persistent_cache",
+                    name,
+                    cache_hit = true,
+                    ipns = true
+                );
+                return Ok(ResolvedName::new(kept.value));
+            }
+            return self.inner.resolve_name_with_ttl(name).await;
+        }
         match self.store.get_name_record(name) {
             Ok(Some(value)) => {
                 tracing::info!(
@@ -1258,6 +1279,152 @@ where
             }
         }
         Ok(resolved)
+    }
+}
+
+/// An IPNS resolver that caches each name canonically, and never answers
+/// with an older record than one it has answered with before. It keeps, in
+/// the store, the newest valid record it has resolved for each name, under
+/// the name's canonical spelling ([`canonical_ipns_name`]), so a peer ID
+/// and the `libp2p-key` CID of the same key share it:
+/// - **while the kept record's TTL lasts** (capped at an hour, as the
+///   persistent name cache, and never past its validity), it is the answer,
+///   and the network isn't asked;
+/// - **after that,** the inner resolver is asked, and its record is
+///   installed only if it is newer ([`SqliteBlockStore::install_ipns_record`],
+///   one statement, so racing lookups can't let an older record write
+///   last). The answer is whichever record the store then keeps: a router
+///   that is behind, or a stale record served again, gets the newer kept
+///   one;
+/// - **once the kept record's validity passes,** it is dropped, and never
+///   answered.
+///
+/// The generic name caches ([`PersistentNameResolver`],
+/// [`freedom_ipfs_namesys::CachedNameResolver`]) leave IPNS names to it.
+#[derive(Clone)]
+pub struct PersistentIpnsResolver<I> {
+    inner: I,
+    store: SqliteBlockStore,
+    max_ttl: Duration,
+}
+
+impl<I> PersistentIpnsResolver<I> {
+    pub fn new(inner: I, store: SqliteBlockStore) -> Self {
+        Self {
+            inner,
+            store,
+            max_ttl: DEFAULT_PERSISTENT_NAME_CACHE_TTL,
+        }
+    }
+}
+
+/// The record `kept` holds.
+fn kept_ipns_record(kept: freedom_ipfs_store::StoredIpnsRecord) -> IpnsRecord {
+    IpnsRecord {
+        value: kept.value,
+        sequence: kept.sequence,
+        validity: Some(kept.validity),
+        ttl: kept.ttl,
+    }
+}
+
+/// `record` as the store keeps it, cached for its TTL (at most `max_ttl`)
+/// from now and never past its validity: `None` without a validity that
+/// parses (a verified record always has one).
+fn stored_ipns_record(
+    record: &IpnsRecord,
+    max_ttl: Duration,
+) -> Option<freedom_ipfs_store::StoredIpnsRecord> {
+    let expiry = ipns_record_expiry(record)?;
+    // Exact over RFC 3339's whole range: seconds (an i64 reaches past year
+    // 9999 either way) and the nanosecond within.
+    let eol = freedom_ipfs_store::IpnsEol {
+        secs: expiry.unix_timestamp(),
+        nanos: expiry.nanosecond(),
+    };
+    let eol_secs = u64::try_from(eol.secs).ok()?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let cached_until = now
+        .saturating_add(Duration::from_nanos(record.ttl).min(max_ttl))
+        .as_secs()
+        .min(eol_secs);
+    Some(freedom_ipfs_store::StoredIpnsRecord {
+        value: record.value.clone(),
+        sequence: record.sequence,
+        validity: record.validity.clone()?,
+        ttl: record.ttl,
+        eol,
+        cached_until,
+    })
+}
+
+/// Seconds since the Unix epoch.
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// The kept, still-cached record for an IPNS `name`, if the store has one.
+fn fresh_ipns_record(store: &SqliteBlockStore, name: &str) -> Option<IpnsRecord> {
+    let key = canonical_ipns_name(name).ok()?;
+    match store.get_ipns_record(&key) {
+        Ok(Some(kept)) if kept.cached_until > unix_now_secs() => Some(kept_ipns_record(kept)),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!(phase = "ipns_record_store", name, error = %err);
+            None
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<I> IpnsResolver for PersistentIpnsResolver<I>
+where
+    I: IpnsResolver,
+{
+    async fn resolve_ipns(&self, name: &str) -> freedom_ipfs_namesys::Result<IpnsRecord> {
+        let Ok(key) = canonical_ipns_name(name) else {
+            return self.inner.resolve_ipns(name).await;
+        };
+        if let Some(kept) = fresh_ipns_record(&self.store, name) {
+            tracing::info!(
+                phase = "ipns_record_store",
+                name,
+                cache_hit = true,
+                sequence = kept.sequence
+            );
+            return Ok(kept);
+        }
+        let record = self.inner.resolve_ipns(name).await?;
+        // A validity that doesn't parse (a leap second, say) can't be
+        // ordered against the kept record: the record isn't answered.
+        let Some(stored) = stored_ipns_record(&record, self.max_ttl) else {
+            return Err(NamesysError::InvalidIpnsRecord(
+                "a validity that can't be ordered".into(),
+            ));
+        };
+        match self.store.install_ipns_record(&key, &stored) {
+            Ok(winner) => {
+                if winner.sequence != record.sequence {
+                    tracing::info!(
+                        phase = "ipns_record_store",
+                        name,
+                        kept_sequence = winner.sequence,
+                        resolved_sequence = record.sequence,
+                        "an older record than the one kept: answering with the kept one"
+                    );
+                }
+                Ok(kept_ipns_record(winner))
+            }
+            Err(err) => {
+                tracing::warn!(phase = "ipns_record_store", name, error = %err);
+                Ok(record)
+            }
+        }
     }
 }
 
@@ -5443,6 +5610,291 @@ mod tests {
         assert!(matches!(resource, ServedResource::File { .. }));
         assert_eq!(provider.call_count(&dir_cid), 1);
         assert_eq!(provider.call_count(&leaf_cid), 2);
+    }
+
+    /// An IPNS resolver answering each lookup with the next of `records`.
+    struct QueuedIpnsResolver(std::sync::Mutex<Vec<freedom_ipfs_namesys::Result<IpnsRecord>>>);
+
+    impl QueuedIpnsResolver {
+        fn new(records: Vec<freedom_ipfs_namesys::Result<IpnsRecord>>) -> Self {
+            Self(std::sync::Mutex::new(records))
+        }
+
+        fn left(&self) -> usize {
+            self.0.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IpnsResolver for QueuedIpnsResolver {
+        async fn resolve_ipns(&self, _name: &str) -> freedom_ipfs_namesys::Result<IpnsRecord> {
+            self.0.lock().unwrap().remove(0)
+        }
+    }
+
+    /// No DNSLink for any name.
+    struct NoDnslink;
+
+    #[async_trait::async_trait]
+    impl freedom_ipfs_namesys::DnsTxtResolver for NoDnslink {
+        async fn txt_lookup(&self, name: &str) -> freedom_ipfs_namesys::Result<Vec<String>> {
+            Err(NamesysError::NotFound(name.into()))
+        }
+    }
+
+    const PEER: &str = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+
+    /// A record of `sequence`, valid for a century, with `ttl`.
+    fn ipns_record_with(sequence: u64, ttl: Duration) -> IpnsRecord {
+        IpnsRecord {
+            value: format!("/ipfs/bafkq{sequence}"),
+            sequence,
+            validity: Some("2126-01-01T00:00:00Z".into()),
+            ttl: u64::try_from(ttl.as_nanos()).unwrap(),
+        }
+    }
+
+    /// Never cached: each lookup asks the inner resolver.
+    fn ipns_record(sequence: u64) -> IpnsRecord {
+        ipns_record_with(sequence, Duration::ZERO)
+    }
+
+    #[tokio::test]
+    async fn persistent_ipns_resolver_never_answers_with_an_older_record() {
+        let cid_form = canonical_ipns_name(PEER).unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let resolver = PersistentIpnsResolver::new(
+            QueuedIpnsResolver::new(vec![
+                Ok(ipns_record(9)),
+                Ok(ipns_record(3)),
+                Ok(ipns_record(5)),
+                Ok(ipns_record(12)),
+                Err(NamesysError::NotFound(PEER.into())),
+            ]),
+            store.clone(),
+        );
+        let sequence_kept = || {
+            store
+                .get_ipns_record(&cid_form)
+                .unwrap()
+                .map(|kept| kept.sequence)
+        };
+        assert_eq!(resolver.resolve_ipns(PEER).await.unwrap(), ipns_record(9));
+        assert_eq!(sequence_kept(), Some(9));
+        // A router behind, or a stale record served again: the newer one,
+        // still kept.
+        assert_eq!(resolver.resolve_ipns(PEER).await.unwrap(), ipns_record(9));
+        assert_eq!(sequence_kept(), Some(9));
+        // The same name spelled as its CID.
+        assert_eq!(
+            resolver.resolve_ipns(&cid_form).await.unwrap(),
+            ipns_record(9)
+        );
+        // A newer record replaces it.
+        assert_eq!(resolver.resolve_ipns(PEER).await.unwrap(), ipns_record(12));
+        assert_eq!(sequence_kept(), Some(12));
+        // A lookup that fails still fails.
+        assert!(matches!(
+            resolver.resolve_ipns(PEER).await,
+            Err(NamesysError::NotFound(_))
+        ));
+    }
+
+    /// Review of #66, round 2: two records of one sequence whose validities
+    /// both end after 2262 kept no order (an i64 of nanoseconds saturated),
+    /// so the older one, arriving last, won.
+    #[tokio::test]
+    async fn far_future_validities_order_records_of_one_sequence() {
+        let record = |value: &str, validity: &str| IpnsRecord {
+            value: value.into(),
+            sequence: 1,
+            validity: Some(validity.into()),
+            ttl: 0,
+        };
+        let newer = record("/ipfs/newer", "2400-01-01T00:00:00Z");
+        let older = record("/ipfs/older", "2300-01-01T00:00:00Z");
+        for (first, second) in [
+            (newer.clone(), older.clone()),
+            (older.clone(), newer.clone()),
+        ] {
+            let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+            let resolver = PersistentIpnsResolver::new(
+                QueuedIpnsResolver::new(vec![Ok(first), Ok(second)]),
+                store,
+            );
+            let _ = resolver.resolve_ipns(PEER).await.unwrap();
+            assert_eq!(resolver.resolve_ipns(PEER).await.unwrap(), newer);
+        }
+        // A nanosecond apart, across 2262's limit.
+        let before = record("/ipfs/before", "2262-04-11T23:47:16.854775807Z");
+        let after = record("/ipfs/after", "2262-04-11T23:47:16.854775808Z");
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let resolver = PersistentIpnsResolver::new(
+            QueuedIpnsResolver::new(vec![Ok(after.clone()), Ok(before)]),
+            store,
+        );
+        let _ = resolver.resolve_ipns(PEER).await.unwrap();
+        assert_eq!(resolver.resolve_ipns(PEER).await.unwrap(), after);
+    }
+
+    /// Review of #66, round 3: a leap-second validity tied with the
+    /// nanosecond before it, so the earlier record could replace the later.
+    /// The resolver refuses a record whose validity is a leap second, in
+    /// either order, and the kept record stays.
+    #[tokio::test]
+    async fn a_leap_second_validity_is_never_installed_or_answered() {
+        let record = |value: &str, validity: &str| IpnsRecord {
+            value: value.into(),
+            sequence: 1,
+            validity: Some(validity.into()),
+            ttl: 0,
+        };
+        let earlier = record("/ipfs/earlier", "2400-06-30T23:59:59.999999999Z");
+        for leap in [
+            "2400-06-30T23:59:60Z",
+            "2400-06-30T23:59:60.25Z",
+            "2400-07-01T01:59:60+02:00",
+        ] {
+            let later = record("/ipfs/later", leap);
+            let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+            let resolver = PersistentIpnsResolver::new(
+                QueuedIpnsResolver::new(vec![
+                    Ok(later.clone()),
+                    Ok(earlier.clone()),
+                    Ok(later.clone()),
+                ]),
+                store.clone(),
+            );
+            assert!(
+                matches!(
+                    resolver.resolve_ipns(PEER).await,
+                    Err(NamesysError::InvalidIpnsRecord(_))
+                ),
+                "{leap}"
+            );
+            assert_eq!(
+                resolver.resolve_ipns(PEER).await.unwrap(),
+                earlier,
+                "{leap}"
+            );
+            assert!(
+                matches!(
+                    resolver.resolve_ipns(PEER).await,
+                    Err(NamesysError::InvalidIpnsRecord(_))
+                ),
+                "{leap}"
+            );
+            let kept = store
+                .get_ipns_record(&canonical_ipns_name(PEER).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(kept.value, "/ipfs/earlier", "{leap}");
+        }
+    }
+
+    /// A kept record answers, under either spelling, for its TTL without
+    /// the network being asked.
+    #[tokio::test]
+    async fn an_ipns_record_is_cached_canonically_for_its_ttl() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let inner = Arc::new(QueuedIpnsResolver::new(vec![Ok(ipns_record_with(
+            9,
+            Duration::from_secs(60),
+        ))]));
+        let resolver = PersistentIpnsResolver::new(inner.clone(), store);
+        let nine = ipns_record_with(9, Duration::from_secs(60));
+        for name in [
+            PEER.to_string(),
+            canonical_ipns_name(PEER).unwrap(),
+            PEER.to_string(),
+        ] {
+            assert_eq!(resolver.resolve_ipns(&name).await.unwrap(), nine, "{name}");
+        }
+        assert_eq!(inner.left(), 0);
+    }
+
+    /// The node's name resolver stack, over `store` and `ipns`.
+    fn name_resolver_stack(
+        store: &SqliteBlockStore,
+        ipns: Arc<QueuedIpnsResolver>,
+    ) -> freedom_ipfs_namesys::CachedNameResolver<impl NameResolver> {
+        freedom_ipfs_namesys::CachedNameResolver::new(PersistentNameResolver::new(
+            freedom_ipfs_namesys::DefaultNameResolver::new(
+                NoDnslink,
+                PersistentIpnsResolver::new(ipns, store.clone()),
+            ),
+            store.clone(),
+        ))
+    }
+
+    /// Review of #66: the generic name caches, keyed by the name as spelled,
+    /// kept answering a peer ID with sequence 3 after its CID spelling had
+    /// learned sequence 9, across a restart too. They leave IPNS names to
+    /// the canonical cache now.
+    #[tokio::test]
+    async fn every_spelling_answers_with_the_newest_record_across_a_restart() {
+        let cid_form = canonical_ipns_name(PEER).unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let resolver = name_resolver_stack(
+            &store,
+            Arc::new(QueuedIpnsResolver::new(vec![
+                Ok(ipns_record(3)),
+                Ok(ipns_record(9)),
+                Ok(ipns_record(3)),
+            ])),
+        );
+        assert_eq!(resolver.resolve_name(PEER).await.unwrap(), "/ipfs/bafkq3");
+        assert_eq!(
+            resolver.resolve_name(&cid_form).await.unwrap(),
+            "/ipfs/bafkq9"
+        );
+        assert_eq!(resolver.resolve_name(PEER).await.unwrap(), "/ipfs/bafkq9");
+        // A rebuilt stack over the same store: a router still answering 3.
+        let restarted = name_resolver_stack(
+            &store,
+            Arc::new(QueuedIpnsResolver::new(vec![Ok(ipns_record(3))])),
+        );
+        assert_eq!(restarted.resolve_name(PEER).await.unwrap(), "/ipfs/bafkq9");
+        assert!(store.get_name_record(PEER).unwrap().is_none());
+    }
+
+    /// Review of #66: a record's TTL outlasting its validity kept it
+    /// answered from the generic cache. It is answered until its validity
+    /// passes, and never after.
+    #[tokio::test]
+    async fn a_record_is_never_answered_past_its_validity() {
+        let soon = time::OffsetDateTime::now_utc() + time::Duration::seconds(2);
+        let validity = soon
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let record = IpnsRecord {
+            value: "/ipfs/bafkqshort".into(),
+            sequence: 1,
+            validity: Some(validity),
+            ttl: 3_600_000_000_000,
+        };
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let ipns = Arc::new(QueuedIpnsResolver::new(vec![
+            Ok(record),
+            Err(NamesysError::NotFound(PEER.into())),
+        ]));
+        let resolver = name_resolver_stack(&store, ipns.clone());
+        assert_eq!(
+            resolver.resolve_name(PEER).await.unwrap(),
+            "/ipfs/bafkqshort"
+        );
+        // Cached, within its validity.
+        assert_eq!(
+            resolver.resolve_name(PEER).await.unwrap(),
+            "/ipfs/bafkqshort"
+        );
+        assert_eq!(ipns.left(), 1);
+        tokio::time::sleep(Duration::from_millis(3100)).await;
+        assert!(matches!(
+            resolver.resolve_name(PEER).await,
+            Err(NamesysError::NotFound(_))
+        ));
+        assert_eq!(ipns.left(), 0);
     }
 
     #[tokio::test]
