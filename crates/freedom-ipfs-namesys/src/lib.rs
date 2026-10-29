@@ -6,6 +6,7 @@ use libp2p_identity::{PeerId, PublicKey};
 use multihash::Multihash;
 use prost::Message;
 use serde::Deserialize;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -410,6 +411,9 @@ impl DelegatedIpnsResolver {
 
 #[async_trait]
 impl IpnsResolver for DelegatedIpnsResolver {
+    /// Every endpoint is asked, and the best record any of them answers
+    /// with wins ([`compare_ipns_records`]): one router's stale record
+    /// can't stand in for a newer one another router has.
     async fn resolve_ipns(&self, name: &str) -> Result<IpnsRecord> {
         if self.endpoints.len() == 1 {
             return self
@@ -422,12 +426,13 @@ impl IpnsResolver for DelegatedIpnsResolver {
             .iter()
             .map(|endpoint| self.resolve_ipns_from_endpoint(endpoint, name))
             .collect::<FuturesUnordered<_>>();
+        let mut best = None;
         let mut saw_not_found = false;
         let mut first_error = None;
 
         while let Some(result) = queries.next().await {
             match result {
-                Ok(record) => return Ok(record),
+                Ok(record) => best = Some(better_ipns_record(best, record)),
                 Err(NamesysError::NotFound(_)) => saw_not_found = true,
                 Err(err) => {
                     if first_error.is_none() {
@@ -437,6 +442,9 @@ impl IpnsResolver for DelegatedIpnsResolver {
             }
         }
 
+        if let Some(record) = best {
+            return Ok(record);
+        }
         if saw_not_found {
             Err(NamesysError::NotFound(name.to_string()))
         } else {
@@ -445,6 +453,40 @@ impl IpnsResolver for DelegatedIpnsResolver {
             }))
         }
     }
+}
+
+/// Orders two verified records of one name as IPNS does (the spec's record
+/// selection, Kubo's `ipns.Compare`): the higher sequence number is newer;
+/// at the same sequence, the later validity (expiry) wins. `Equal` when
+/// neither is newer.
+pub fn compare_ipns_records(a: &IpnsRecord, b: &IpnsRecord) -> Ordering {
+    a.sequence
+        .cmp(&b.sequence)
+        .then_with(|| ipns_record_expiry(a).cmp(&ipns_record_expiry(b)))
+}
+
+/// The newer of `best` and `record`, keeping `best` when neither is newer.
+pub fn better_ipns_record(best: Option<IpnsRecord>, record: IpnsRecord) -> IpnsRecord {
+    match best {
+        Some(best) if compare_ipns_records(&best, &record) != Ordering::Less => best,
+        _ => record,
+    }
+}
+
+/// When a record stops being valid: its EOL validity, `None` if it has
+/// none that parses (a verified record always has one).
+pub fn ipns_record_expiry(record: &IpnsRecord) -> Option<OffsetDateTime> {
+    record
+        .validity
+        .as_deref()
+        .and_then(|validity| OffsetDateTime::parse(validity, &Rfc3339).ok())
+}
+
+/// One spelling for an IPNS name, whatever form it came in (a peer ID or
+/// a `libp2p-key` CID in any base): its CIDv1, in base32. What a store
+/// keys a name's records by.
+pub fn canonical_ipns_name(name: &str) -> Result<String> {
+    normalize_ipns_name_for_routing(name)
 }
 
 async fn limited_response_bytes(
@@ -1312,8 +1354,12 @@ mod tests {
     }
 
     fn ipns_data(value: &str, validity: &str) -> Vec<u8> {
+        ipns_data_with_sequence(value, validity, 7)
+    }
+
+    fn ipns_data_with_sequence(value: &str, validity: &str, sequence: u64) -> Vec<u8> {
         let mut map = BTreeMap::new();
-        map.insert("Sequence".to_string(), Ipld::Integer(7));
+        map.insert("Sequence".to_string(), Ipld::Integer(sequence.into()));
         map.insert("TTL".to_string(), Ipld::Integer(300_000_000_000));
         map.insert(
             "Validity".to_string(),
@@ -1322,6 +1368,150 @@ mod tests {
         map.insert("ValidityType".to_string(), Ipld::Integer(0));
         map.insert("Value".to_string(), Ipld::Bytes(value.as_bytes().to_vec()));
         serde_ipld_dagcbor::to_vec(&Ipld::Map(map)).unwrap()
+    }
+
+    /// The IPNS name of `keypair`, and a v2-only record it signs.
+    fn signed_by(
+        keypair: &Keypair,
+        value: &str,
+        validity: &str,
+        sequence: u64,
+    ) -> (String, Vec<u8>) {
+        let name = Cid::new_v1(
+            LIBP2P_KEY_CODEC,
+            Multihash::<64>::from_bytes(&keypair.public().to_peer_id().to_bytes()).unwrap(),
+        )
+        .to_string();
+        let data = ipns_data_with_sequence(value, validity, sequence);
+        let mut signed = IPNS_SIGNATURE_PREFIX.to_vec();
+        signed.extend_from_slice(&data);
+        let entry = IpnsEntry {
+            value: None,
+            signature_v1: None,
+            validity_type: None,
+            validity: None,
+            sequence: None,
+            ttl: None,
+            pub_key: None,
+            signature_v2: Some(keypair.sign(&signed).unwrap()),
+            data: Some(data),
+        };
+        (name, entry.encode_to_vec())
+    }
+
+    /// A delegated router that answers one IPNS lookup with `body`, after
+    /// `delay`.
+    fn start_delayed_ipns_server(body: Vec<u8>, delay: Duration) -> String {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            std::thread::sleep(delay);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {IPNS_RECORD_CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        format!("http://{addr}/routing/v1")
+    }
+
+    #[tokio::test]
+    async fn delegated_ipns_resolver_answers_with_the_newest_record_any_router_has() {
+        let keypair = Keypair::generate_ed25519();
+        let (name, stale) = signed_by(&keypair, "/ipfs/bafkqaddwgevxmmraojswg33smq", FUTURE, 3);
+        let (_, newest) = signed_by(&keypair, "/ipfs/bafkqac3jobxhgzlbmq", FUTURE, 9);
+        // The stale record comes first, from either router: the newer one
+        // still wins.
+        for (first, second) in [
+            (stale.clone(), newest.clone()),
+            (newest.clone(), stale.clone()),
+        ] {
+            let resolver = DelegatedIpnsResolver::with_endpoints([
+                start_delayed_ipns_server(first, Duration::ZERO),
+                start_delayed_ipns_server(second, Duration::from_millis(200)),
+            ]);
+            let record = resolver.resolve_ipns(&name).await.unwrap();
+            assert_eq!(
+                (record.sequence, record.value.as_str()),
+                (9, "/ipfs/bafkqac3jobxhgzlbmq")
+            );
+        }
+        // At the same sequence, the later validity wins.
+        let (_, sooner) = signed_by(
+            &keypair,
+            "/ipfs/bafkqaddwgevxmmraojswg33smq",
+            "2125-01-01T00:00:00Z",
+            9,
+        );
+        let resolver = DelegatedIpnsResolver::with_endpoints([
+            start_delayed_ipns_server(sooner, Duration::ZERO),
+            start_delayed_ipns_server(newest, Duration::from_millis(200)),
+        ]);
+        assert_eq!(
+            resolver.resolve_ipns(&name).await.unwrap().value,
+            "/ipfs/bafkqac3jobxhgzlbmq"
+        );
+    }
+
+    #[test]
+    fn ipns_records_order_by_sequence_then_validity() {
+        let record = |sequence, validity: Option<&str>| IpnsRecord {
+            value: "/ipfs/x".into(),
+            sequence,
+            validity: validity.map(str::to_string),
+            ttl: 0,
+        };
+        let later = Some("2126-01-01T00:00:00Z");
+        let sooner = Some("2125-01-01T00:00:00Z");
+        assert_eq!(
+            compare_ipns_records(&record(2, sooner), &record(1, later)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_ipns_records(&record(1, later), &record(1, sooner)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_ipns_records(&record(1, later), &record(1, later)),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_ipns_records(&record(1, None), &record(1, sooner)),
+            std::cmp::Ordering::Less
+        );
+        // Neither newer: the first is kept.
+        let kept = better_ipns_record(
+            Some(record(1, later)),
+            IpnsRecord {
+                value: "/ipfs/y".into(),
+                ..record(1, later)
+            },
+        );
+        assert_eq!(kept.value, "/ipfs/x");
+        assert_eq!(
+            better_ipns_record(Some(record(1, later)), record(2, sooner)).sequence,
+            2
+        );
+        assert_eq!(better_ipns_record(None, record(1, later)).sequence, 1);
+    }
+
+    #[test]
+    fn an_ipns_name_has_one_canonical_spelling() {
+        let keypair = Keypair::generate_ed25519();
+        let peer_id = keypair.public().to_peer_id();
+        let (cid_name, _) = signed_by(&keypair, "/ipfs/x", FUTURE, 1);
+        let base36 = Cid::try_from(cid_name.as_str())
+            .unwrap()
+            .to_string_of_base(cid::multibase::Base::Base36Lower)
+            .unwrap();
+        let canonical = canonical_ipns_name(&peer_id.to_string()).unwrap();
+        assert_eq!(canonical, cid_name);
+        assert_eq!(canonical_ipns_name(&base36).unwrap(), canonical);
+        assert!(canonical_ipns_name("not-a-name").is_err());
     }
 
     fn start_delegated_ipns_server(

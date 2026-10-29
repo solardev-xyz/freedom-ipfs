@@ -11,7 +11,10 @@ use axum::Router;
 use bytes::Bytes;
 use cid::Cid;
 use freedom_ipfs_core::{parse_cid, BlockProvider};
-use freedom_ipfs_namesys::{NameResolver, NamesysError, ResolvedName};
+use freedom_ipfs_namesys::{
+    canonical_ipns_name, compare_ipns_records, ipns_record_expiry, IpnsRecord, IpnsResolver,
+    NameResolver, NamesysError, ResolvedName,
+};
 use freedom_ipfs_retrieval::{with_retrieval_request_context, RetrievalRequestContext};
 use freedom_ipfs_store::SqliteBlockStore;
 use freedom_ipfs_unixfs::{
@@ -810,6 +813,77 @@ where
             }
         }
         Ok(resolved)
+    }
+}
+
+/// An IPNS resolver that never answers with an older record than one it
+/// has answered with before: it keeps, in the store, the newest valid
+/// record it has resolved for each name, and when the inner resolver comes
+/// back with an older one (a router that is behind, or a stale record
+/// served again once the newer one's cache entry expired), it answers with
+/// the newer record it kept. An older record never replaces a newer one in
+/// the store. A kept record is dropped once its validity passes.
+#[derive(Clone)]
+pub struct PersistentIpnsResolver<I> {
+    inner: I,
+    store: SqliteBlockStore,
+}
+
+impl<I> PersistentIpnsResolver<I> {
+    pub fn new(inner: I, store: SqliteBlockStore) -> Self {
+        Self { inner, store }
+    }
+}
+
+#[async_trait::async_trait]
+impl<I> IpnsResolver for PersistentIpnsResolver<I>
+where
+    I: IpnsResolver,
+{
+    async fn resolve_ipns(&self, name: &str) -> freedom_ipfs_namesys::Result<IpnsRecord> {
+        let record = self.inner.resolve_ipns(name).await?;
+        let Ok(key) = canonical_ipns_name(name) else {
+            return Ok(record);
+        };
+        let kept = match self.store.get_ipns_record(&key) {
+            Ok(kept) => kept.map(|kept| IpnsRecord {
+                value: kept.value,
+                sequence: kept.sequence,
+                validity: Some(kept.validity),
+                ttl: kept.ttl,
+            }),
+            Err(err) => {
+                tracing::warn!(phase = "ipns_record_store", name, error = %err);
+                None
+            }
+        };
+        if let Some(kept) = kept {
+            if compare_ipns_records(&kept, &record) == std::cmp::Ordering::Greater {
+                tracing::info!(
+                    phase = "ipns_record_store",
+                    name,
+                    kept_sequence = kept.sequence,
+                    resolved_sequence = record.sequence,
+                    "an older record than the one kept: answering with the kept one"
+                );
+                return Ok(kept);
+            }
+        }
+        let expires_at = ipns_record_expiry(&record)
+            .and_then(|expiry| u64::try_from(expiry.unix_timestamp()).ok());
+        if let (Some(expires_at), Some(validity)) = (expires_at, record.validity.clone()) {
+            let stored = freedom_ipfs_store::StoredIpnsRecord {
+                value: record.value.clone(),
+                sequence: record.sequence,
+                validity,
+                ttl: record.ttl,
+                expires_at,
+            };
+            if let Err(err) = self.store.put_ipns_record(&key, &stored) {
+                tracing::warn!(phase = "ipns_record_store", name, error = %err);
+            }
+        }
+        Ok(record)
     }
 }
 
@@ -4406,6 +4480,67 @@ mod tests {
         assert!(matches!(resource, ServedResource::File { .. }));
         assert_eq!(provider.call_count(&dir_cid), 1);
         assert_eq!(provider.call_count(&leaf_cid), 2);
+    }
+
+    /// An IPNS resolver answering each lookup with the next of `records`.
+    struct QueuedIpnsResolver(std::sync::Mutex<Vec<freedom_ipfs_namesys::Result<IpnsRecord>>>);
+
+    #[async_trait::async_trait]
+    impl IpnsResolver for QueuedIpnsResolver {
+        async fn resolve_ipns(&self, _name: &str) -> freedom_ipfs_namesys::Result<IpnsRecord> {
+            self.0.lock().unwrap().remove(0)
+        }
+    }
+
+    fn ipns_record(sequence: u64) -> IpnsRecord {
+        IpnsRecord {
+            value: format!("/ipfs/bafkq{sequence}"),
+            sequence,
+            validity: Some("2126-01-01T00:00:00Z".into()),
+            ttl: 60_000_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_ipns_resolver_never_answers_with_an_older_record() {
+        const PEER: &str = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+        let cid_form = canonical_ipns_name(PEER).unwrap();
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let resolver = PersistentIpnsResolver::new(
+            QueuedIpnsResolver(std::sync::Mutex::new(vec![
+                Ok(ipns_record(9)),
+                Ok(ipns_record(3)),
+                Ok(ipns_record(5)),
+                Ok(ipns_record(12)),
+                Err(NamesysError::NotFound(PEER.into())),
+            ])),
+            store.clone(),
+        );
+        let sequence_kept = || {
+            store
+                .get_ipns_record(&cid_form)
+                .unwrap()
+                .map(|kept| kept.sequence)
+        };
+        assert_eq!(resolver.resolve_ipns(PEER).await.unwrap(), ipns_record(9));
+        assert_eq!(sequence_kept(), Some(9));
+        // A router behind, or a stale record served again: the newer one,
+        // still kept.
+        assert_eq!(resolver.resolve_ipns(PEER).await.unwrap(), ipns_record(9));
+        assert_eq!(sequence_kept(), Some(9));
+        // The same name spelled as its CID.
+        assert_eq!(
+            resolver.resolve_ipns(&cid_form).await.unwrap(),
+            ipns_record(9)
+        );
+        // A newer record replaces it.
+        assert_eq!(resolver.resolve_ipns(PEER).await.unwrap(), ipns_record(12));
+        assert_eq!(sequence_kept(), Some(12));
+        // A lookup that fails still fails.
+        assert!(matches!(
+            resolver.resolve_ipns(PEER).await,
+            Err(NamesysError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
