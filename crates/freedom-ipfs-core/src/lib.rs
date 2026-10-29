@@ -157,26 +157,29 @@ pub struct CarFile {
 pub fn parse_car_v1(bytes: &[u8]) -> Result<CarFile> {
     let mut offset = 0;
     let header_len = read_varint(bytes, &mut offset)?;
-    if header_len == 0 || offset + header_len > bytes.len() {
-        return Err(CoreError::InvalidCar("invalid header length".into()));
-    }
-    let header = bytes[offset..offset + header_len].to_vec();
-    offset += header_len;
+    let header = take_section(bytes, &mut offset, header_len)
+        .ok_or_else(|| CoreError::InvalidCar("invalid header length".into()))?
+        .to_vec();
 
     let mut blocks = Vec::new();
     while offset < bytes.len() {
         let section_len = read_varint(bytes, &mut offset)?;
-        if section_len == 0 || offset + section_len > bytes.len() {
-            return Err(CoreError::InvalidCar("invalid block section length".into()));
-        }
-
-        let section = &bytes[offset..offset + section_len];
-        offset += section_len;
+        let section = take_section(bytes, &mut offset, section_len)
+            .ok_or_else(|| CoreError::InvalidCar("invalid block section length".into()))?;
 
         let mut cursor = Cursor::new(section);
         let cid = Cid::read_bytes(&mut cursor)
             .map_err(|err| CoreError::InvalidCar(format!("invalid block cid: {err}")))?;
         let cid_len = cursor.position() as usize;
+        // The CID's own varints (version, codec, the multihash's code and
+        // length) are the cid crate's to read, so their encoding is checked
+        // here instead: the bytes must be the CID's canonical encoding,
+        // which a wrapped or non-minimal varint isn't.
+        if section.get(..cid_len) != Some(cid.to_bytes().as_slice()) {
+            return Err(CoreError::InvalidCar(
+                "block cid isn't canonically encoded".into(),
+            ));
+        }
         if cid_len > section.len() {
             return Err(CoreError::InvalidCar(
                 "block cid consumed beyond section".into(),
@@ -204,15 +207,49 @@ pub fn encode_car_v1(blocks: &[CarBlock]) -> Vec<u8> {
     car
 }
 
+/// The `len` bytes at `offset`, moving `offset` past them: `None` for an
+/// empty section, or one past the end of `bytes`. A length is a varint the
+/// file gives, up to `usize::MAX`, so the end is computed without
+/// overflowing.
+fn take_section<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let end = offset
+        .checked_add(len)
+        .filter(|end| len > 0 && *end <= bytes.len())?;
+    let section = &bytes[*offset..end];
+    *offset = end;
+    Some(section)
+}
+
+/// A CAR length at `offset`, moving `offset` past it: an unsigned LEB128
+/// varint of at most 64 bits, minimally encoded, as a `usize`. Refused:
+/// a varint that runs past the end or past ten bytes, a tenth byte with any
+/// bit above the 64th set (unsigned-varint 0.8 accepts one, so `2^64 + n`
+/// read as `n`), a non-minimal one (a last byte of 0 after others), and a
+/// value past `usize::MAX` (on 32-bit targets).
 fn read_varint(bytes: &[u8], offset: &mut usize) -> Result<usize> {
+    let invalid = |what: &str| CoreError::InvalidCar(format!("invalid varint: {what}"));
     let input = bytes
         .get(*offset..)
-        .ok_or_else(|| CoreError::InvalidCar("unexpected end of input".into()))?;
-    let before = input.len();
-    let (value, rest) = unsigned_varint::decode::usize(input)
-        .map_err(|err| CoreError::InvalidCar(format!("invalid varint: {err}")))?;
-    *offset += before - rest.len();
-    Ok(value)
+        .ok_or_else(|| invalid("unexpected end of input"))?;
+    let mut value = 0u64;
+    for (index, &byte) in input.iter().enumerate().take(10) {
+        if index == 9 && byte > 1 {
+            return Err(invalid("past 64 bits"));
+        }
+        value |= u64::from(byte & 0x7f) << (7 * index);
+        if byte & 0x80 == 0 {
+            if byte == 0 && index > 0 {
+                return Err(invalid("not minimally encoded"));
+            }
+            *offset += index + 1;
+            return usize::try_from(value).map_err(|_| invalid("past this target's usize"));
+        }
+    }
+    Err(invalid(if input.len() < 10 {
+        "unexpected end of input"
+    } else {
+        "past 64 bits"
+    }))
 }
 
 pub fn encode_varint(value: usize) -> Vec<u8> {
@@ -227,6 +264,147 @@ pub fn cid_from_multihash(codec: u64, mh: Multihash<64>) -> Cid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CAR whose header or section length is a varint near `usize::MAX`:
+    /// adding it to the offset overflowed (a debug build panicked there, a
+    /// release build wrapped and panicked slicing), and the add-on imports
+    /// CAR bytes inside an `extern "C"` function, where a panic aborts.
+    #[test]
+    fn car_lengths_past_the_end_are_errors_not_panics() {
+        let huge = |value: usize| encode_varint(value);
+        let header = encode_varint(EMPTY_ROOTS_CAR_V1_HEADER.len())
+            .into_iter()
+            .chain(EMPTY_ROOTS_CAR_V1_HEADER.iter().copied())
+            .collect::<Vec<u8>>();
+        for len in [usize::MAX, usize::MAX - 1, usize::MAX / 2 + 1] {
+            let mut car = huge(len);
+            car.extend_from_slice(b"header");
+            assert!(
+                matches!(parse_car_v1(&car), Err(CoreError::InvalidCar(_))),
+                "header length {len}"
+            );
+            let mut car = header.clone();
+            car.extend(huge(len));
+            car.extend_from_slice(b"section");
+            assert!(
+                matches!(parse_car_v1(&car), Err(CoreError::InvalidCar(_))),
+                "section length {len}"
+            );
+        }
+        // Zero-length and just-too-long sections stay errors, and one that
+        // ends exactly at the end still parses.
+        for car in [
+            huge(0),
+            [header.clone(), huge(0)].concat(),
+            [header.clone(), huge(2), vec![1]].concat(),
+        ] {
+            assert!(matches!(parse_car_v1(&car), Err(CoreError::InvalidCar(_))));
+        }
+        let block = CarBlock {
+            cid: cid_from_data(CODEC_RAW, b"x"),
+            data: b"x".to_vec(),
+        };
+        assert_eq!(
+            parse_car_v1(&encode_car_v1(&[block])).unwrap().blocks.len(),
+            1
+        );
+    }
+
+    /// Review of #69: varints whose value doesn't fit were read wrapped
+    /// (unsigned-varint 0.8 takes a tenth byte's high bits, so `2^64 + n`
+    /// read as `n`), and the header or a block section was then read as
+    /// that small length. Raw encodings, which `encode_varint` can't make.
+    #[test]
+    fn car_varints_that_dont_fit_or_arent_minimal_are_refused() {
+        let data = b"x";
+        let cid = cid_from_data(CODEC_RAW, data);
+        let section = [cid.to_bytes(), data.to_vec()].concat();
+        let empty = encode_car_v1(&[]);
+        // `2^64 + n` over ten bytes; `2^32 + n` over five (past u32);
+        // `n` padded with a 0x80 and a final 0x00; eleven bytes.
+        let wrapped_64 = |n: u8| [vec![0x80 | n], vec![0x80; 8], vec![0x02]].concat();
+        let wrapped_32 = |n: u8| vec![0x80 | n, 0x80, 0x80, 0x80, 0x10];
+        let padded = |n: u8| vec![0x80 | n, 0x00];
+        let eleven = |n: u8| [vec![0x80 | n], vec![0x80; 9], vec![0x00]].concat();
+        let header_len = EMPTY_ROOTS_CAR_V1_HEADER.len() as u8;
+        for (what, varint) in [
+            ("2^64 + n", wrapped_64 as fn(u8) -> Vec<u8>),
+            ("non-minimal", padded),
+            ("eleven bytes", eleven),
+        ] {
+            let car = [varint(header_len), EMPTY_ROOTS_CAR_V1_HEADER.to_vec()].concat();
+            assert!(
+                matches!(parse_car_v1(&car), Err(CoreError::InvalidCar(_))),
+                "header, {what}"
+            );
+            let car = [empty.clone(), varint(section.len() as u8), section.clone()].concat();
+            assert!(
+                matches!(parse_car_v1(&car), Err(CoreError::InvalidCar(_))),
+                "section, {what}"
+            );
+        }
+        // Past u32: too long for the data on 64-bit, past usize on 32-bit.
+        let car = [
+            empty.clone(),
+            wrapped_32(section.len() as u8),
+            section.clone(),
+        ]
+        .concat();
+        assert!(matches!(parse_car_v1(&car), Err(CoreError::InvalidCar(_))));
+        // The control: the same section, minimally encoded.
+        let car = [empty.clone(), vec![section.len() as u8], section.clone()].concat();
+        assert_eq!(parse_car_v1(&car).unwrap().blocks.len(), 1);
+        // Exactly u64's last byte (0x01) still decodes, and is far past the
+        // end.
+        let mut max = vec![0xff; 9];
+        max.push(0x01);
+        assert!(matches!(
+            parse_car_v1(&[max, b"x".to_vec()].concat()),
+            Err(CoreError::InvalidCar(message)) if message == "invalid header length"
+                || message == "invalid varint: past this target's usize"
+        ));
+    }
+
+    /// The block's CID must be canonically encoded too: its codec varint
+    /// written non-minimally, or wrapped past 64 bits, is refused.
+    #[test]
+    fn car_block_cids_must_be_canonical() {
+        let data = b"x";
+        let canonical = cid_from_data(CODEC_RAW, data).to_bytes();
+        assert_eq!(&canonical[..2], &[0x01, 0x55]);
+        let empty = encode_car_v1(&[]);
+        let car_with = |cid: Vec<u8>| {
+            let section = [cid, data.to_vec()].concat();
+            [empty.clone(), encode_varint(section.len()), section].concat()
+        };
+        assert_eq!(
+            parse_car_v1(&car_with(canonical.clone()))
+                .unwrap()
+                .blocks
+                .len(),
+            1
+        );
+        for cid in [
+            // The codec 0x55 as `0xd5 0x00`.
+            [vec![0x01, 0xd5, 0x00], canonical[2..].to_vec()].concat(),
+            // The codec as `2^64 + 0x55`.
+            [
+                vec![0x01, 0xd5],
+                vec![0x80; 8],
+                vec![0x02],
+                canonical[2..].to_vec(),
+            ]
+            .concat(),
+        ] {
+            assert!(
+                matches!(
+                    parse_car_v1(&car_with(cid.clone())),
+                    Err(CoreError::InvalidCar(_))
+                ),
+                "{cid:02x?}"
+            );
+        }
+    }
 
     #[test]
     fn cid_round_trips_and_verifies_raw_block() {

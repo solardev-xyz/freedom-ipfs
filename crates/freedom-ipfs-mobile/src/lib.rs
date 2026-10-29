@@ -1536,7 +1536,18 @@ pub unsafe extern "C" fn freedom_ipfs_node_import_car(
     }
     let node = &*ptr;
     let bytes = std::slice::from_raw_parts(data, len);
-    node.store.import_car(bytes).is_ok()
+    // The bytes are the host's, which may have them from anywhere: a panic
+    // anywhere in the import is `false`, not an abort.
+    ffi_boundary(false, || node.store.import_car(bytes).is_ok())
+}
+
+/// Runs the part of a C ABI export that reads what its caller gave it,
+/// turning a panic into `fallback`: a panic can't unwind out of an
+/// `extern "C"` function, so it would abort the host's process. Defence in
+/// depth: the parsers are meant not to panic at all. The release profile
+/// keeps `panic = "unwind"` (the default), which this needs.
+fn ffi_boundary<T>(fallback: T, body: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(fallback)
 }
 
 /// # Safety
@@ -2382,7 +2393,8 @@ pub unsafe extern "C" fn freedom_ipfs_gateway_request_start(
         Ok(request_json) => request_json,
         Err(_) => return 0,
     };
-    let parsed = match parse_native_gateway_start_request(request_json) {
+    // The request is the host's, for a page's navigation.
+    let parsed = match ffi_boundary(None, || parse_native_gateway_start_request(request_json)) {
         Some(parsed) => parsed,
         None => return 0,
     };
@@ -3151,7 +3163,7 @@ pub unsafe extern "C" fn freedom_ipfs_node_preload_path(
     }
     let node = &*ptr;
     let path = match CStr::from_ptr(path).to_str() {
-        Ok(path) => match normalize_preload_path(path) {
+        Ok(path) => match ffi_boundary(None, || normalize_preload_path(path)) {
             Some(path) => path,
             None => return 0,
         },
@@ -3396,6 +3408,42 @@ mod tests {
     use freedom_ipfs_store::CachedProviderRecord;
     use serde_json::json;
     use std::io::{Read, Write};
+
+    /// A crafted CAR is `false` through the C ABI, and a panic past the
+    /// boundary becomes the fallback instead of an abort (review of #69).
+    #[test]
+    fn importing_a_crafted_car_is_false_and_panics_stop_at_the_boundary() {
+        let data = b"x";
+        let cid = cid_from_data(CODEC_RAW, data);
+        let section = [cid.to_bytes(), data.to_vec()].concat();
+        let mut overflowing = freedom_ipfs_core::encode_car_v1(&[]);
+        overflowing.push(0x80 | section.len() as u8);
+        overflowing.extend_from_slice(&[0x80; 8]);
+        overflowing.push(0x02);
+        overflowing.extend_from_slice(&section);
+        let valid = freedom_ipfs_core::encode_car_v1(&[freedom_ipfs_core::CarBlock {
+            cid,
+            data: data.to_vec(),
+        }]);
+        unsafe {
+            let node = freedom_ipfs_node_new_in_memory();
+            assert!(!freedom_ipfs_node_import_car(
+                node,
+                overflowing.as_ptr(),
+                overflowing.len()
+            ));
+            assert_eq!(freedom_ipfs_node_block_count(node), 0);
+            assert!(freedom_ipfs_node_import_car(
+                node,
+                valid.as_ptr(),
+                valid.len()
+            ));
+            assert_eq!(freedom_ipfs_node_block_count(node), 1);
+            freedom_ipfs_node_free(node);
+        }
+        assert_eq!(ffi_boundary(7, || -> i32 { panic!("a parser bug") }), 7);
+        assert_eq!(ffi_boundary(7, || 8), 8);
+    }
 
     struct SlowTestProvider {
         cid: Cid,
