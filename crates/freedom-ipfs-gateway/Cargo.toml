@@ -42,5 +42,7 @@ freedom-ipfs-net = { workspace = true, features = ["test-util"] }
 prost.workspace = true
 reqwest.workspace = true
 tempfile.workspace = true
+# Record validities for the IPNS cache's tests.
+time.workspace = true
 # `oneshot`, to send the router a path exactly as written.
 tower = { version = "0.5", features = ["util"] }
