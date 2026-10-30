@@ -29,7 +29,9 @@ ignore = [
 
 [licenses]
 confidence-threshold = 0.9
-unused-allowed-license = "allow"
+# An allowed license no crate here uses fails the check, so the list stays
+# what the graph needs.
+unused-allowed-license = "deny"
 # webpki-roots (Mozilla's root certificates, through reqwest and
 # libp2p-websocket): data under the Community Data License Agreement,
 # permissive. Scoped to that crate, so another CDLA dependency needs its own
@@ -40,21 +42,20 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "CC0-1.0",
     "ISC",
     "MIT",
-    "MPL-2.0",
     "Unicode-3.0",
     "Zlib",
 ]
 
 [bans]
 multiple-versions = "warn"
-# The workspace's crates depend on each other by path, with no version
-# (`freedom-ipfs-core.workspace = true`), which cargo-deny counts as
-# wildcards since the crates aren't marked unpublishable. No dependency
-# from a registry is a wildcard, and `[sources]` refuses any other source.
-wildcards = "allow"
+# A wildcard version (`"*"`) fails, from any registry. The workspace's own
+# crates depend on each other by path with no version, which is allowed for
+# unpublished crates: every member is `publish = false`
+# (`[workspace.package]`), as nothing publishes them.
+wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
