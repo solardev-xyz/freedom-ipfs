@@ -562,7 +562,8 @@ mod resolv_conf {
     /// numeric one as it is, a named one as its interface's index. A name
     /// no interface has here can't be used: the fallback, reported as
     /// unparseable, with the zone named. Only the first three nameservers
-    /// count: a fourth, and its zone, are ignored.
+    /// count: a fourth, its zone, or a fourth that doesn't parse at all, is
+    /// ignored, and the lines after it are still read.
     #[test]
     fn a_nameservers_zone_is_kept_or_reported() {
         let scratch = Scratch::new("zones");
@@ -593,21 +594,37 @@ mod resolv_conf {
             SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 53, 0, 3)),
             "192.0.2.2:53".parse().unwrap(),
         ];
+        // A malformed fourth is ignored too, and a line after it is still
+        // read: its options apply.
         for (file, fourth) in [
             ("fourth", "fe80::2%4"),
             ("fourth-unknown", "fe80::2%nosuchif0"),
+            ("fourth-malformed", "not-an-address"),
         ] {
             let path = scratch.file(
                 file,
                 &format!(
                     "nameserver 192.0.2.1\nnameserver fe80::1%3\nnameserver 192.0.2.2\n\
-                     nameserver {fourth}\n"
+                     nameserver {fourth}\noptions timeout:3 attempts:4\n"
                 ),
             );
             let dns = DnsConfig::from_resolv_conf(&path);
             assert_eq!(dns.source(), &DnsSource::System, "{file}");
             assert_eq!(servers(dns.config()), first_three, "{file}");
+            assert_eq!(dns.options().timeout, Duration::from_secs(3), "{file}");
+            assert_eq!(dns.options().attempts, 4, "{file}");
         }
+        // A malformed nameserver among the first three still fails the
+        // file, as any malformed line does: the fallback, reported.
+        let path = scratch.file(
+            "third-malformed",
+            "nameserver 192.0.2.1\nnameserver 192.0.2.2\nnameserver not-an-address\n\
+             nameserver 192.0.2.3\n",
+        );
+        assert!(matches!(
+            DnsConfig::from_resolv_conf(&path).source(),
+            DnsSource::Fallback(DnsFallback::Unparseable(_))
+        ));
         let path = scratch.file("unknown", "nameserver fe80::1%nosuchif0\n");
         let dns = DnsConfig::from_resolv_conf(&path);
         match dns.source() {

@@ -156,6 +156,9 @@ impl DnsConfig {
             Ok(data) => data,
             Err(err) => return Self::fallback(DnsFallback::Unreadable(err.to_string())),
         };
+        // Only the first three nameservers are used: hickory never sees a
+        // later `nameserver` line, so a malformed one can't fail the file.
+        let data = first_nameservers_only(&data);
         let (config, options) = match hickory_resolver::system_conf::parse_resolv_conf(&data) {
             Ok(parsed) => parsed,
             Err(err) => return Self::fallback(DnsFallback::Unparseable(err.to_string())),
@@ -228,18 +231,54 @@ impl DnsConfig {
 
 /// The most nameservers a resolv.conf names that are used: glibc's,
 /// musl's and the BSDs' `MAXNS`. Later `nameserver` lines are ignored, as
-/// those resolvers ignore them.
+/// those resolvers ignore them, whatever they hold: they are removed before
+/// the file is parsed.
 #[cfg(unix)]
 const MAX_NAMESERVERS: usize = 3;
 
-/// `servers`, as hickory parsed them from the resolv.conf `data`: those of
-/// its first [`MAX_NAMESERVERS`] `nameserver` lines, each with the zone its
-/// line gives its address (hickory 0.25 builds every server's address from
-/// the IP alone). A numeric zone is the interface's index; a named one is
-/// looked up (`if_nametoindex`). Hickory gives two servers per `nameserver`
-/// line, UDP then TCP, in the file's order; a used line's zone that names
-/// no interface, or servers that don't line up with the lines, are an
-/// error. A later line's zone is never looked up.
+/// The resolv.conf `data` with every `nameserver` line after the first
+/// [`MAX_NAMESERVERS`] emptied, so neither hickory's parser nor the zone
+/// scan reads it. Every other line stays as it is, in its place, and so
+/// does the line count.
+#[cfg(unix)]
+fn first_nameservers_only(data: &[u8]) -> Vec<u8> {
+    let mut seen = 0;
+    let mut kept = Vec::with_capacity(data.len());
+    for (index, line) in data.split(|&byte| byte == b'\n').enumerate() {
+        if index > 0 {
+            kept.push(b'\n');
+        }
+        if std::str::from_utf8(line).is_ok_and(|line| directive(line).next() == Some("nameserver"))
+        {
+            seen += 1;
+            if seen > MAX_NAMESERVERS {
+                continue;
+            }
+        }
+        kept.extend_from_slice(line);
+    }
+    kept
+}
+
+/// A resolv.conf line's words, as resolv-conf (hickory's parser) reads
+/// them: a line whose first character other than a space or tab is `#` or
+/// `;` is a comment, and so is everything after one.
+#[cfg(unix)]
+fn directive(line: &str) -> std::str::SplitWhitespace<'_> {
+    line.split(['#', ';'])
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+}
+
+/// `servers`, as hickory parsed them from the resolv.conf `data` (its
+/// first [`MAX_NAMESERVERS`] `nameserver` lines, [`first_nameservers_only`]),
+/// each with the zone its line gives its address: hickory 0.25 builds every
+/// server's address from the IP alone. A numeric zone is the interface's
+/// index; a named one is looked up (`if_nametoindex`). Hickory gives two
+/// servers per `nameserver` line, UDP then TCP, in the file's order; a
+/// zone that names no interface, or servers that don't line up with the
+/// lines, are an error.
 #[cfg(unix)]
 fn zoned(servers: &[NameServerConfig], data: &[u8]) -> Result<Vec<NameServerConfig>, String> {
     let lines = nameserver_lines(data)?;
@@ -253,7 +292,6 @@ fn zoned(servers: &[NameServerConfig], data: &[u8]) -> Result<Vec<NameServerConf
     servers
         .iter()
         .zip(lines.iter().flat_map(|line| [line, line]))
-        .take(2 * MAX_NAMESERVERS)
         .map(|(server, line)| {
             if server.socket_addr.ip() != line.ip {
                 return Err(format!(
@@ -284,22 +322,20 @@ struct NameserverLine<'a> {
     zone: Option<&'a str>,
 }
 
-/// Each `nameserver` line, in the file's order, read as resolv-conf
-/// (hickory's parser) reads the lines: a line whose first character other
-/// than a space or tab is `#` or `;` is a comment, and so is everything
-/// after one.
+/// Each of the first [`MAX_NAMESERVERS`] `nameserver` lines, in the
+/// file's order, its words read as [`directive`] reads them. A later line
+/// isn't parsed.
 #[cfg(unix)]
 fn nameserver_lines(data: &[u8]) -> Result<Vec<NameserverLine<'_>>, String> {
     let mut lines = Vec::new();
     for line in data.split(|&byte| byte == b'\n') {
+        if lines.len() == MAX_NAMESERVERS {
+            break;
+        }
         let Ok(line) = std::str::from_utf8(line) else {
             continue;
         };
-        let mut words = line
-            .split(['#', ';'])
-            .next()
-            .unwrap_or("")
-            .split_whitespace();
+        let mut words = directive(line);
         if words.next() != Some("nameserver") {
             continue;
         }
