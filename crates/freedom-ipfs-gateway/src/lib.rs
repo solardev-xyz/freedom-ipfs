@@ -4222,28 +4222,49 @@ mod background_job_tests {
 
     #[test]
     fn an_instance_counts_and_fences_the_gateways_background_jobs() {
+        // One blocking thread, held busy at first: the job is counted as a
+        // blocking region when it is queued, before it starts, and a job
+        // still queued at the cancel never runs. So the test waits for the
+        // job to say it has started, not for the count.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
+            .max_blocking_threads(1)
             .enable_all()
             .build()
             .unwrap();
+        let (unhold, hold) = std::sync::mpsc::channel::<()>();
+        let occupier = runtime.spawn_blocking(move || {
+            let _ = hold.recv();
+        });
         let instance = InstanceContext::new(runtime.handle().clone());
         let jobs = BackgroundJobs::new(1, BackgroundQueue::default()).with_instance(&instance);
+        let (started_tx, started) = std::sync::mpsc::channel::<()>();
         let (release, held) = std::sync::mpsc::channel::<()>();
         let job_instance = instance.clone();
         runtime.block_on(async {
             spawn_background(&jobs, "test", async move {
                 let _ = run_blocking_background(Some(&job_instance), move || {
+                    started_tx.send(()).unwrap();
                     let _ = held.recv();
                 })
                 .await;
             });
         });
+        // Counted while it is still queued behind the busy thread.
         let deadline = Instant::now() + Duration::from_secs(5);
         while instance.blocking_regions() == 0 {
-            assert!(Instant::now() < deadline, "the job never started");
+            assert!(Instant::now() < deadline, "the job was never counted");
             std::thread::sleep(Duration::from_millis(5));
         }
+        assert!(
+            started.try_recv().is_err(),
+            "the job started on a busy pool"
+        );
+        unhold.send(()).unwrap();
+        started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the job never started");
+        runtime.block_on(occupier).unwrap();
         assert_eq!((instance.tasks(), instance.blocking_regions()), (1, 1));
         instance.cancel();
         // After the fence the gateway starts nothing new.
@@ -4254,6 +4275,7 @@ mod background_job_tests {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
             });
         });
+        // The job is running, so its receiver is there to take this.
         release.send(()).unwrap();
         assert_eq!(
             instance.wait_blocking_regions(Instant::now() + Duration::from_secs(5)),
