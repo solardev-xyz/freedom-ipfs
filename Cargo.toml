@@ -24,6 +24,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/solardev-xyz/freedom-ipfs"
 homepage = "https://github.com/solardev-xyz/freedom-ipfs"
 authors = ["Freedom IPFS contributors"]
+# Nothing publishes these crates: their users take them by git or by path.
+publish = false
 
 [workspace.dependencies]
 anyhow = "1"
