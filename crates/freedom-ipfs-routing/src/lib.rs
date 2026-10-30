@@ -1,6 +1,7 @@
 use cid::Cid;
 use freedom_ipfs_namesys::{
-    ipns_dht_record_key, verify_ipns_record, IpnsRecord, IpnsResolver, NamesysError,
+    better_ipns_record, ipns_dht_record_key, verify_ipns_record, IpnsRecord, IpnsResolver,
+    NamesysError,
 };
 use freedom_ipfs_net::gate::classify_dialed;
 use freedom_ipfs_net::transport::Transports;
@@ -1179,17 +1180,14 @@ impl IpnsResolver for DhtIpnsResolver {
                 NamesysError::NotFound(format!("DHT IPNS record for {name}: {err}"))
             })?;
 
+        // The newest valid record any peer holds: by sequence, then by
+        // validity (`compare_ipns_records`).
         let mut best = None;
         for record in records {
             let Ok(record) = verify_ipns_record(name, &record) else {
                 continue;
             };
-            if best
-                .as_ref()
-                .is_none_or(|best: &IpnsRecord| record.sequence > best.sequence)
-            {
-                best = Some(record);
-            }
+            best = Some(better_ipns_record(best, record));
         }
 
         best.ok_or_else(|| NamesysError::NotFound(name.to_string()))

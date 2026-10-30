@@ -18,6 +18,61 @@ const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_HOT_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const HOT_CACHE_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_NAME_CACHE_RECORDS: i64 = 128;
+/// The most IPNS names whose newest record the store keeps.
+const MAX_IPNS_RECORDS: i64 = 128;
+
+/// The newest verified record a node has seen for one IPNS name, kept until
+/// the record stops being valid so that an older record can't replace it
+/// (see `install_ipns_record`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredIpnsRecord {
+    pub value: String,
+    pub sequence: u64,
+    /// The record's EOL validity, RFC 3339 as it was signed.
+    pub validity: String,
+    /// The record's TTL, in nanoseconds.
+    pub ttl: u64,
+    /// When `validity` passes, exactly: seconds since the Unix epoch (as
+    /// RFC 3339 reaches them, years 0000 to 9999, negative before 1970)
+    /// and the nanosecond within that second. What orders two records of
+    /// one sequence, and when the store drops the record.
+    pub eol: IpnsEol,
+    /// Until when, in seconds since the Unix epoch, the record answers
+    /// without the network being asked again: its TTL from when it was
+    /// installed, capped by the caller, and never past `eol`.
+    pub cached_until: u64,
+}
+
+/// A record's EOL validity: seconds since the Unix epoch, and the
+/// nanosecond within that second (below 1,000,000,000). Ordered as the
+/// instant it names, in Rust and in the store's SQL alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IpnsEol {
+    pub secs: i64,
+    pub nanos: u32,
+}
+
+impl IpnsEol {
+    /// Now.
+    pub fn now() -> Self {
+        let since = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        Self {
+            secs: i64::try_from(since.as_secs()).unwrap_or(i64::MAX),
+            nanos: since.subsec_nanos(),
+        }
+    }
+}
+
+impl StoredIpnsRecord {
+    /// Whether `self` is newer than `other` as IPNS orders records: the
+    /// higher sequence, then the later validity. The store's install
+    /// applies the same order in SQL.
+    pub fn is_newer_than(&self, other: &StoredIpnsRecord) -> bool {
+        (self.sequence, self.eol) > (other.sequence, other.eol)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -241,12 +296,53 @@ impl SqliteBlockStore {
             );
             CREATE INDEX IF NOT EXISTS name_cache_updated_at
                 ON name_cache(updated_at);
+            CREATE TABLE IF NOT EXISTS ipns_records (
+                name TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL,
+                sequence BLOB NOT NULL,
+                validity TEXT NOT NULL,
+                ttl BLOB NOT NULL,
+                eol_secs INTEGER NOT NULL,
+                eol_nanos INTEGER NOT NULL,
+                cached_until INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
             );
             "#,
         )?;
+        self.migrate_ipns_records()
+    }
+
+    /// An `ipns_records` table from before EOLs were stored exactly (an
+    /// unreleased build's: a single `eol` or `expires_at` column) is
+    /// dropped and made again: its rows are a cache of records the network
+    /// still has, and can't be ordered without their exact EOLs.
+    fn migrate_ipns_records(&self) -> Result<()> {
+        let conn = self.conn.lock();
+        let exact = conn
+            .prepare("SELECT 1 FROM pragma_table_info('ipns_records') WHERE name = 'eol_nanos'")?
+            .exists([])?;
+        if !exact {
+            conn.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS ipns_records;
+                CREATE TABLE ipns_records (
+                    name TEXT PRIMARY KEY NOT NULL,
+                    value TEXT NOT NULL,
+                    sequence BLOB NOT NULL,
+                    validity TEXT NOT NULL,
+                    ttl BLOB NOT NULL,
+                    eol_secs INTEGER NOT NULL,
+                    eol_nanos INTEGER NOT NULL,
+                    cached_until INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                "#,
+            )?;
+        }
         Ok(())
     }
 
@@ -588,6 +684,98 @@ impl SqliteBlockStore {
         Ok(Some(resolved_target))
     }
 
+    /// Installs `record` for the IPNS `name` (its canonical spelling) unless
+    /// the store keeps a newer one, in one statement under the store's lock
+    /// (so two lookups that race can't let the older record write last), and
+    /// returns the winner: the record the name now has, which the caller
+    /// answers with. Newer is IPNS's order ([`StoredIpnsRecord::is_newer_than`]):
+    /// the higher sequence, then the later validity; a record of the same
+    /// sequence and validity replaces the kept one (its `cached_until`
+    /// refreshes). A kept record past its validity loses to any record, and
+    /// a `record` past its own isn't installed.
+    pub fn install_ipns_record(
+        &self,
+        name: &str,
+        record: &StoredIpnsRecord,
+    ) -> Result<StoredIpnsRecord> {
+        let now = IpnsEol::now();
+        let conn = self.conn.lock();
+        if record.eol > now {
+            // Ordered as (sequence, eol_secs, eol_nanos), lexicographically:
+            // the new record wins unless the kept one is newer, and a kept
+            // record past its validity (at or before now) always loses.
+            let written = conn.execute(
+                r#"
+                INSERT INTO ipns_records(name, value, sequence, validity, ttl, eol_secs, eol_nanos, cached_until, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(name) DO UPDATE SET
+                    value = excluded.value,
+                    sequence = excluded.sequence,
+                    validity = excluded.validity,
+                    ttl = excluded.ttl,
+                    eol_secs = excluded.eol_secs,
+                    eol_nanos = excluded.eol_nanos,
+                    cached_until = excluded.cached_until,
+                    updated_at = excluded.updated_at
+                WHERE excluded.sequence > ipns_records.sequence
+                    OR (excluded.sequence = ipns_records.sequence
+                        AND (excluded.eol_secs > ipns_records.eol_secs
+                            OR (excluded.eol_secs = ipns_records.eol_secs
+                                AND excluded.eol_nanos >= ipns_records.eol_nanos)))
+                    OR ipns_records.eol_secs < ?10
+                    OR (ipns_records.eol_secs = ?10 AND ipns_records.eol_nanos <= ?11)
+                "#,
+                params![
+                    name,
+                    record.value,
+                    // Big-endian: SQLite compares BLOBs bytewise, so this
+                    // orders as the unsigned number.
+                    record.sequence.to_be_bytes(),
+                    record.validity,
+                    record.ttl.to_be_bytes(),
+                    record.eol.secs,
+                    record.eol.nanos,
+                    i64::try_from(record.cached_until).unwrap_or(i64::MAX),
+                    now_secs() as i64,
+                    now.secs,
+                    now.nanos
+                ],
+            );
+            // A full store keeps the old row: still the newest this node
+            // knows to be valid, and the comparison below picks the winner.
+            cached_unless_full(written)?;
+        }
+        let winner = ipns_record_row(&conn, name, now)?;
+        conn.execute(
+            "DELETE FROM ipns_records WHERE eol_secs < ?1 OR (eol_secs = ?1 AND eol_nanos <= ?2)",
+            params![now.secs, now.nanos],
+        )?;
+        conn.execute(
+            r#"
+            DELETE FROM ipns_records
+            WHERE name IN (
+                SELECT name FROM ipns_records
+                ORDER BY updated_at DESC, name DESC
+                LIMIT -1 OFFSET ?1
+            )
+            "#,
+            params![MAX_IPNS_RECORDS],
+        )?;
+        // No row: `record` was past its validity, or the store couldn't
+        // write it; it is still the answer.
+        Ok(match winner {
+            Some(kept) if !record.is_newer_than(&kept) => kept,
+            _ => record.clone(),
+        })
+    }
+
+    /// The newest record the store keeps for the IPNS `name`, while it is
+    /// still valid.
+    pub fn get_ipns_record(&self, name: &str) -> Result<Option<StoredIpnsRecord>> {
+        let conn = self.conn.lock();
+        ipns_record_row(&conn, name, IpnsEol::now())
+    }
+
     pub fn mark_bad_provider(&self, peer_or_url: &str, reason: &str, ttl: Duration) -> Result<()> {
         let expires_at = now_secs().saturating_add(ttl.as_secs());
         let conn = self.conn.lock();
@@ -791,6 +979,52 @@ impl BlockProvider for SqliteBlockStore {
     fn release_block(&self, cid: &Cid) {
         self.release_cid_bytes(&block_key(cid));
     }
+}
+
+/// The IPNS record `name` has, if it is still valid at `now`.
+fn ipns_record_row(
+    conn: &Connection,
+    name: &str,
+    now: IpnsEol,
+) -> Result<Option<StoredIpnsRecord>> {
+    let row = conn
+        .query_row(
+            "SELECT value, sequence, validity, ttl, eol_secs, eol_nanos, cached_until FROM ipns_records WHERE name = ?1",
+            params![name],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, u32>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((value, sequence, validity, ttl, eol_secs, eol_nanos, cached_until)) = row else {
+        return Ok(None);
+    };
+    let (Ok(sequence), Ok(ttl)) = (<[u8; 8]>::try_from(sequence), <[u8; 8]>::try_from(ttl)) else {
+        return Ok(None);
+    };
+    let eol = IpnsEol {
+        secs: eol_secs,
+        nanos: eol_nanos,
+    };
+    if eol <= now {
+        return Ok(None);
+    }
+    Ok(Some(StoredIpnsRecord {
+        value,
+        sequence: u64::from_be_bytes(sequence),
+        validity,
+        ttl: u64::from_be_bytes(ttl),
+        eol,
+        cached_until: u64::try_from(cached_until).unwrap_or(0),
+    }))
 }
 
 fn now_secs() -> u64 {
@@ -2043,6 +2277,198 @@ mod tests {
             Some("/ipfs/bafkqaddwgevxmmraojswg33smq")
         );
         assert!(store.get_name_record("missing.test").unwrap().is_none());
+    }
+
+    /// An EOL `offset` seconds from now.
+    fn eol_in(offset: i64) -> IpnsEol {
+        let now = IpnsEol::now();
+        IpnsEol {
+            secs: now.secs + offset,
+            nanos: now.nanos,
+        }
+    }
+
+    fn ipns_record(sequence: u64, eol: IpnsEol) -> StoredIpnsRecord {
+        StoredIpnsRecord {
+            value: format!("/ipfs/bafkq{sequence}"),
+            sequence,
+            validity: "2126-01-01T00:00:00Z".into(),
+            ttl: u64::MAX,
+            eol,
+            cached_until: 0,
+        }
+    }
+
+    #[test]
+    fn installs_the_newer_ipns_record_and_answers_with_the_winner() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let later = eol_in(3600);
+        assert_eq!(store.get_ipns_record("k51name").unwrap(), None);
+        // Sequences and TTLs past i64 round-trip, and compare as numbers.
+        let top = ipns_record(u64::MAX, later);
+        assert_eq!(store.install_ipns_record("k51name", &top).unwrap(), top);
+        assert_eq!(store.get_ipns_record("k51name").unwrap(), Some(top.clone()));
+        let nine = ipns_record(9, later);
+        assert_eq!(store.install_ipns_record("k51other", &nine).unwrap(), nine);
+        // An older record loses, and the winner comes back.
+        for older in [ipns_record(3, later), ipns_record(8, eol_in(7200))] {
+            assert_eq!(store.install_ipns_record("k51other", &older).unwrap(), nine);
+        }
+        let a_nanosecond_sooner = IpnsEol {
+            secs: later.secs - i64::from(later.nanos == 0),
+            nanos: later.nanos.checked_sub(1).unwrap_or(999_999_999),
+        };
+        assert_eq!(
+            store
+                .install_ipns_record("k51other", &ipns_record(9, a_nanosecond_sooner))
+                .unwrap(),
+            nine
+        );
+        // The same sequence with a later validity wins, and so does a higher
+        // sequence with an earlier one; the same record refreshes.
+        let nine_later = ipns_record(9, eol_in(3601));
+        assert_eq!(
+            store.install_ipns_record("k51other", &nine_later).unwrap(),
+            nine_later
+        );
+        let ten = ipns_record(10, eol_in(1800));
+        assert_eq!(store.install_ipns_record("k51other", &ten).unwrap(), ten);
+        let refreshed = StoredIpnsRecord {
+            cached_until: 42,
+            ..ten.clone()
+        };
+        assert_eq!(
+            store.install_ipns_record("k51other", &refreshed).unwrap(),
+            refreshed
+        );
+        // A record past its validity is neither installed nor answered, and a
+        // kept one past its validity loses to any record.
+        let expired = ipns_record(1, IpnsEol::now());
+        assert_eq!(
+            store.install_ipns_record("k51expired", &expired).unwrap(),
+            expired
+        );
+        assert_eq!(store.get_ipns_record("k51expired").unwrap(), None);
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE ipns_records SET eol_secs = 1 WHERE name = 'k51name'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.get_ipns_record("k51name").unwrap(), None);
+        let one = ipns_record(1, later);
+        assert_eq!(store.install_ipns_record("k51name", &one).unwrap(), one);
+        // At most MAX_IPNS_RECORDS names, the oldest updates dropped.
+        for index in 0..(MAX_IPNS_RECORDS + 2) {
+            store
+                .install_ipns_record(&format!("k51-{index:03}"), &ipns_record(1, later))
+                .unwrap();
+        }
+        let count: i64 = store
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM ipns_records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, MAX_IPNS_RECORDS);
+    }
+
+    /// Review of #66, round 2: an EOL saturated to i64 nanoseconds made
+    /// every one after 2262 equal, so the last to arrive won. Pairs across
+    /// that limit, and at RFC 3339's end, keep their order both ways round.
+    #[test]
+    fn far_future_validities_keep_their_order() {
+        let eol = |secs: i64, nanos: u32| IpnsEol { secs, nanos };
+        // i64::MAX nanoseconds: 2262-04-11T23:47:16.854775807Z.
+        let limit = eol(9_223_372_036, 854_775_807);
+        for (older, newer) in [
+            // 2300 and 2400.
+            (eol(10_413_792_000, 0), eol(13_569_465_600, 0)),
+            (limit, eol(9_223_372_036, 854_775_808)),
+            (eol(9_223_372_036, 854_775_806), limit),
+            (limit, eol(9_223_372_037, 0)),
+            // 9999-12-31T23:59:59.999999998Z and .999999999Z.
+            (
+                eol(253_402_300_799, 999_999_998),
+                eol(253_402_300_799, 999_999_999),
+            ),
+            (eol(253_402_300_798, 999_999_999), eol(253_402_300_799, 0)),
+        ] {
+            let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+            let (older, newer) = (ipns_record(1, older), ipns_record(1, newer));
+            assert!(newer.is_newer_than(&older) && !older.is_newer_than(&newer));
+            assert_eq!(store.install_ipns_record("k51a", &newer).unwrap(), newer);
+            assert_eq!(store.install_ipns_record("k51a", &older).unwrap(), newer);
+            assert_eq!(store.install_ipns_record("k51b", &older).unwrap(), older);
+            assert_eq!(store.install_ipns_record("k51b", &newer).unwrap(), newer);
+            assert_eq!(store.get_ipns_record("k51a").unwrap(), Some(newer.clone()));
+            assert_eq!(store.get_ipns_record("k51b").unwrap(), Some(newer));
+        }
+    }
+
+    /// A table from before EOLs were exact (an unreleased build's) is
+    /// dropped and made again when the store opens.
+    #[test]
+    fn an_older_ipns_records_table_is_dropped_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE ipns_records (name TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL, sequence BLOB NOT NULL, validity TEXT NOT NULL, ttl BLOB NOT NULL, eol INTEGER NOT NULL, cached_until INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 INSERT INTO ipns_records VALUES ('k51name', '/ipfs/old', x'0000000000000009', '2126-01-01T00:00:00Z', x'0000000000000000', 9223372036854775807, 0, 0);",
+            )
+            .unwrap();
+        }
+        let store = SqliteBlockStore::open(&path, 1024 * 1024).unwrap();
+        assert_eq!(store.get_ipns_record("k51name").unwrap(), None);
+        let one = ipns_record(1, eol_in(3600));
+        assert_eq!(store.install_ipns_record("k51name", &one).unwrap(), one);
+        drop(store);
+        // Opened again, the exact table stays.
+        let store = SqliteBlockStore::open(&path, 1024 * 1024).unwrap();
+        assert_eq!(store.get_ipns_record("k51name").unwrap(), Some(one));
+    }
+
+    /// Review of #66: two lookups read the kept record (none) before either
+    /// installs; the older one installs last, and still loses.
+    #[test]
+    fn racing_installs_keep_the_newer_record() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let later = eol_in(3600);
+        assert_eq!(store.get_ipns_record("k51name").unwrap(), None); // the sequence-3 lookup
+        assert_eq!(store.get_ipns_record("k51name").unwrap(), None); // the sequence-9 lookup
+        let nine = ipns_record(9, later);
+        assert_eq!(store.install_ipns_record("k51name", &nine).unwrap(), nine);
+        assert_eq!(
+            store
+                .install_ipns_record("k51name", &ipns_record(3, later))
+                .unwrap(),
+            nine
+        );
+        assert_eq!(
+            store.get_ipns_record("k51name").unwrap().unwrap().sequence,
+            9
+        );
+        // Threads racing on one store: the newest always stays.
+        let threads = (1..=16u64)
+            .map(|sequence| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store
+                        .install_ipns_record("k51race", &ipns_record(sequence, later))
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            store.get_ipns_record("k51race").unwrap().unwrap().sequence,
+            16
+        );
     }
 
     #[test]
