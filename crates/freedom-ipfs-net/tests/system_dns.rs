@@ -344,6 +344,52 @@ mod resolv_conf {
         assert_eq!(dns.options().attempts, 4);
     }
 
+    /// The resolv.conf files users have, as their systems write them
+    /// (`tests/fixtures/resolv-conf/`), are the system's configuration, not
+    /// the fallback: each one's nameservers, and its options where it sets
+    /// any. None has a line the strict parser refuses: comments, `search .`,
+    /// `options edns0 trust-ad`, a zoned link-local nameserver, OpenBSD's
+    /// `lookup` and `family`, and glibc's `sortlist` all parse.
+    #[test]
+    fn the_resolv_conf_files_users_have_are_used() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("resolv-conf");
+        for (file, nameservers, ndots) in [
+            ("ubuntu-systemd-resolved-stub", &["127.0.0.53"][..], 1),
+            ("ubuntu-systemd-resolved-stub-no-search", &["127.0.0.53"], 1),
+            (
+                "systemd-resolved-uplink",
+                &["192.168.1.1", "fd00::1", "192.168.1.2"],
+                1,
+            ),
+            ("networkmanager", &["192.168.1.1", "fe80::1"], 1),
+            ("fedora-systemd-resolved-stub", &["127.0.0.53"], 1),
+            ("debian-resolvconf", &["192.168.1.1", "2001:db8::1"], 1),
+            ("debian-dhclient", &["192.168.1.1"], 1),
+            ("alpine-udhcpc", &["192.168.1.1"], 1),
+            ("docker-default-bridge", &["8.8.8.8", "8.8.4.4"], 1),
+            ("docker-user-network", &["127.0.0.11"], 0),
+            ("kubernetes-pod", &["10.96.0.10"], 5),
+            ("wsl", &["172.29.112.1"], 1),
+            ("wsl-dns-tunneling", &["10.255.255.254"], 1),
+            ("macos", &["192.168.1.1", "fe80::1"], 1),
+            ("freebsd-resolvconf", &["192.168.1.1"], 1),
+            ("openbsd", &["192.168.1.1"], 1),
+            ("glibc-options", &["192.168.1.1", "192.168.1.2"], 1),
+        ] {
+            let dns = DnsConfig::from_resolv_conf(&dir.join(file));
+            assert_eq!(dns.source(), &DnsSource::System, "{file}");
+            let expected: Vec<SocketAddr> = nameservers
+                .iter()
+                .map(|ip| SocketAddr::new(ip.parse().unwrap(), 53))
+                .collect();
+            assert_eq!(servers(dns.config()), expected, "{file}");
+            assert_eq!(dns.options().ndots, ndots, "{file}");
+        }
+    }
+
     /// A resolv.conf that is readable but malformed, or names no
     /// nameserver, takes the fallback, Cloudflare's resolvers, and says
     /// so, with the parser's reason; so does one that can't be read. A

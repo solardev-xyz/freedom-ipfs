@@ -1,0 +1,3 @@
+nameserver 192.168.1.1
+lookup file bind
+family inet4 inet6
