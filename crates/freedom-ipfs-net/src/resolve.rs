@@ -12,10 +12,17 @@
 //! names never reach it (the hop loop refuses them first), and it answers
 //! one with an error, without a lookup, in case one ever arrives.
 //!
-//! Lookups are async and cancellable: hickory's, over the system's DNS
-//! configuration or Cloudflare's resolvers where that can't be read, never
-//! `getaddrinfo` on a blocking thread, so an instance's teardown never waits
-//! for a lookup nothing can cancel.
+//! Lookups are async and cancellable: hickory's, never `getaddrinfo` on a
+//! blocking thread, so an instance's teardown never waits for a lookup
+//! nothing can cancel.
+//!
+//! **One DNS configuration** ([`DnsConfig`]) serves a `direct` network's
+//! own lookups: the gate's resolver's, and the libp2p transports' DNS layer
+//! (`/dns*`, `/dnsaddr`, WebSocket names). It is read once, when the
+//! network is built: the system's (on Unix, `/etc/resolv.conf`, parsed),
+//! or a fallback, Cloudflare's resolvers, only when that can't be read or
+//! parsed. Which one it is, and why, is [`DnsConfig::source`], for a host
+//! to report.
 
 use std::fmt;
 use std::future::Future;
@@ -23,7 +30,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use hickory_resolver::config::ResolverConfig;
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::TokioResolver;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
@@ -47,18 +54,143 @@ pub trait NameLookup: fmt::Debug + Send + Sync {
 #[error("the name couldn't be resolved: {0}")]
 pub struct LookupError(pub String);
 
-/// hickory's resolver, over the system's DNS configuration, or Cloudflare's
-/// resolvers if it can't be read.
-pub(crate) fn system_lookup() -> Arc<dyn NameLookup> {
-    let resolver = match TokioResolver::builder_tokio() {
-        Ok(builder) => builder.build(),
-        Err(_) => TokioResolver::builder_with_config(
-            ResolverConfig::cloudflare(),
-            TokioConnectionProvider::default(),
-        )
-        .build(),
-    };
-    Arc::new(HickoryLookup(resolver))
+/// The DNS configuration a `direct` network's own lookups use (see the
+/// module's documentation): the gate's resolver's and the libp2p
+/// transports' DNS layer's, chosen once, when the network is built.
+#[derive(Clone, Debug)]
+pub struct DnsConfig {
+    config: ResolverConfig,
+    options: ResolverOpts,
+    source: DnsSource,
+}
+
+/// Where a [`DnsConfig`] came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DnsSource {
+    /// The system's configuration: on Unix, `/etc/resolv.conf`, as read
+    /// and parsed; on Windows, the system's.
+    System,
+    /// The built-in fallback, Cloudflare's resolvers, because the system's
+    /// configuration couldn't be used.
+    Fallback(DnsFallback),
+    /// A configuration the host (or a test) gave ([`DnsConfig::custom`]).
+    Custom,
+}
+
+/// Why a [`DnsConfig`] is the built-in fallback.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum DnsFallback {
+    /// The system's configuration couldn't be read: the error.
+    #[error("the system's DNS configuration couldn't be read: {0}")]
+    Unreadable(String),
+    /// It was read, but couldn't be parsed, or named no nameserver: why.
+    #[error("the system's DNS configuration couldn't be parsed: {0}")]
+    Unparseable(String),
+    /// This platform has no system DNS configuration to read.
+    #[error("this platform has no system DNS configuration to read")]
+    Unsupported,
+}
+
+impl fmt::Display for DnsSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::System => f.write_str("the system's DNS configuration"),
+            Self::Fallback(why) => write!(f, "Cloudflare's resolvers, the fallback: {why}"),
+            Self::Custom => f.write_str("a DNS configuration the host gave"),
+        }
+    }
+}
+
+impl DnsConfig {
+    /// The system's configuration, read now; the fallback, and why, only
+    /// where it can't be read or parsed.
+    pub fn system() -> Self {
+        #[cfg(unix)]
+        {
+            Self::from_resolv_conf(std::path::Path::new("/etc/resolv.conf"))
+        }
+        #[cfg(windows)]
+        {
+            match hickory_resolver::system_conf::read_system_conf() {
+                Ok((config, options)) => Self {
+                    config,
+                    options,
+                    source: DnsSource::System,
+                },
+                Err(err) => Self::fallback(DnsFallback::Unreadable(err.to_string())),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self::fallback(DnsFallback::Unsupported)
+        }
+    }
+
+    /// `path` read and parsed as a resolv.conf, as [`DnsConfig::system`]
+    /// reads `/etc/resolv.conf`: the fallback, and why, where it can't be
+    /// read, can't be parsed or names no nameserver.
+    #[cfg(unix)]
+    pub fn from_resolv_conf(path: &std::path::Path) -> Self {
+        let data = match std::fs::read(path) {
+            Ok(data) => data,
+            Err(err) => return Self::fallback(DnsFallback::Unreadable(err.to_string())),
+        };
+        match hickory_resolver::system_conf::parse_resolv_conf(data) {
+            Ok((config, options)) => Self {
+                config,
+                options,
+                source: DnsSource::System,
+            },
+            Err(err) => Self::fallback(DnsFallback::Unparseable(err.to_string())),
+        }
+    }
+
+    /// A configuration the host gives whole, or a test's fixture server.
+    pub fn custom(config: ResolverConfig, options: ResolverOpts) -> Self {
+        Self {
+            config,
+            options,
+            source: DnsSource::Custom,
+        }
+    }
+
+    /// The built-in fallback, Cloudflare's resolvers, for `why`.
+    fn fallback(why: DnsFallback) -> Self {
+        Self {
+            config: ResolverConfig::cloudflare(),
+            options: ResolverOpts::default(),
+            source: DnsSource::Fallback(why),
+        }
+    }
+
+    /// Where this configuration came from: the system's, or the fallback
+    /// and why.
+    pub fn source(&self) -> &DnsSource {
+        &self.source
+    }
+
+    /// The resolvers it asks, and how.
+    pub fn config(&self) -> &ResolverConfig {
+        &self.config
+    }
+
+    pub fn options(&self) -> &ResolverOpts {
+        &self.options
+    }
+
+    /// A resolver over this configuration.
+    pub(crate) fn resolver(&self) -> TokioResolver {
+        TokioResolver::builder_with_config(self.config.clone(), TokioConnectionProvider::default())
+            .with_options(self.options.clone())
+            .build()
+    }
+
+    /// The gate's resolver's lookups over this configuration.
+    pub(crate) fn lookup(&self) -> Arc<dyn NameLookup> {
+        Arc::new(HickoryLookup(self.resolver()))
+    }
 }
 
 struct HickoryLookup(TokioResolver);

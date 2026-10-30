@@ -543,6 +543,55 @@ async fn wss_keeps_the_name_for_tls() {
     assert_eq!(connects(&requests), [Destination::Ip(public(443))]);
 }
 
+/// `socks5` reads no DNS configuration and asks no local resolver, even
+/// one given to it: a name in a `/dns4` dial through either stack, and in
+/// an HTTP request, goes to the proxy (`RESOLVE`), and a local DNS server
+/// never sees a query.
+#[tokio::test(flavor = "multi_thread")]
+async fn socks5_asks_no_local_resolver() {
+    let local = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let local_addr = local.local_addr().unwrap();
+    local.set_nonblocking(true).unwrap();
+    let config = hickory_resolver::config::ResolverConfig::from_parts(
+        None,
+        Vec::new(),
+        hickory_resolver::config::NameServerConfigGroup::from_ips_clear(
+            &[local_addr.ip()],
+            local_addr.port(),
+            true,
+        ),
+    );
+    let fixture = SocksFixture::start().await;
+    fixture.answer("peer.example", Answer::Ip("8.8.8.8".parse().unwrap()));
+    let network = Network::with_dns(
+        NetworkPolicy::socks5(fixture.addr(), ConfiguredTargets::new(), doh()).unwrap(),
+        freedom_ipfs_net::DnsConfig::custom(config, Default::default()),
+    )
+    .unwrap();
+    assert!(network.dns().is_none());
+
+    for (name, mut transport) in stacks(&network) {
+        let addr = multiaddr(&format!("/dns4/peer.example/tcp/4001/p2p/{PEER}"));
+        let _ = dial_through(&mut transport, &addr, Duration::from_secs(2)).await;
+        assert!(
+            resolves(&fixture.requests()).contains(&"peer.example".to_string()),
+            "{name}"
+        );
+    }
+    let before = resolves(&fixture.requests()).len();
+    let _ = network
+        .http_client(CONFIG)
+        .get("http://peer.example:4001/")
+        .send()
+        .await;
+    assert!(resolves(&fixture.requests()).len() > before);
+    let mut buffer = [0u8; 1500];
+    assert!(
+        local.recv_from(&mut buffer).is_err(),
+        "a query reached the local resolver"
+    );
+}
+
 /// `socks5` policies: the proxy is an IP literal and a port, the DoH
 /// endpoint is a configured target, and the proxy's own endpoint isn't. A
 /// network of one has its HTTP clients and its transports.

@@ -1083,7 +1083,8 @@ mod tests {
             Addresses::Checked(handle),
         )
         .unwrap();
-        let network = Network::with_lookup(policy, Some(crate::resolve::system_lookup())).unwrap();
+        let lookup = crate::resolve::DnsConfig::system().lookup();
+        let network = Network::with_lookup(policy, Some(lookup)).unwrap();
         let client = network.http_client(ClientConfig::new(Duration::from_secs(5), 0));
         let url = Url::parse("http://[2a00:1::1]:9/").unwrap();
         let inner = client.inner.clone();
