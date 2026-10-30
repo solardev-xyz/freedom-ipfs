@@ -94,8 +94,36 @@ impl SqliteBlockStore {
                 inserted_at INTEGER NOT NULL,
                 last_accessed_at INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS blocks_last_accessed
-                ON blocks(last_accessed_at);
+            -- Eviction's order, oldest first: the scan reads it off this
+            -- index and sorts nothing (#83). It replaces the index on
+            -- last_accessed_at alone, which made each eviction sort a whole
+            -- second's blocks.
+            CREATE INDEX IF NOT EXISTS blocks_eviction
+                ON blocks(last_accessed_at, inserted_at);
+            DROP INDEX IF EXISTS blocks_last_accessed;
+            -- The blocks' total size, kept by triggers, so the store's size
+            -- is one row's read, not a scan of every block (#83). The
+            -- triggers come first: a block written before the row exists is
+            -- in the sum that makes it, and one written after is counted by
+            -- them.
+            CREATE TABLE IF NOT EXISTS block_bytes (
+                id INTEGER PRIMARY KEY NOT NULL CHECK (id = 0),
+                bytes INTEGER NOT NULL
+            );
+            CREATE TRIGGER IF NOT EXISTS block_bytes_insert AFTER INSERT ON blocks
+            BEGIN
+                UPDATE block_bytes SET bytes = bytes + NEW.size WHERE id = 0;
+            END;
+            CREATE TRIGGER IF NOT EXISTS block_bytes_delete AFTER DELETE ON blocks
+            BEGIN
+                UPDATE block_bytes SET bytes = bytes - OLD.size WHERE id = 0;
+            END;
+            CREATE TRIGGER IF NOT EXISTS block_bytes_update AFTER UPDATE OF size ON blocks
+            BEGIN
+                UPDATE block_bytes SET bytes = bytes - OLD.size + NEW.size WHERE id = 0;
+            END;
+            INSERT OR IGNORE INTO block_bytes(id, bytes)
+                SELECT 0, COALESCE(SUM(size), 0) FROM blocks;
             CREATE TABLE IF NOT EXISTS bad_providers (
                 peer_or_url TEXT PRIMARY KEY NOT NULL,
                 reason TEXT NOT NULL,
@@ -432,14 +460,9 @@ impl SqliteBlockStore {
         Ok(true)
     }
 
+    /// The blocks' total size, as the `block_bytes` triggers keep it.
     pub fn total_bytes(&self) -> Result<u64> {
-        let total =
-            self.conn
-                .lock()
-                .query_row("SELECT COALESCE(SUM(size), 0) FROM blocks", [], |row| {
-                    row.get::<_, i64>(0)
-                })?;
-        Ok(total.max(0) as u64)
+        total_bytes_in(&self.conn.lock())
     }
 
     pub fn block_count(&self) -> Result<u64> {
@@ -509,48 +532,60 @@ impl SqliteBlockStore {
         self.evict_until_tracking(max_bytes, &[]).map(|_| ())
     }
 
+    /// Evicts the oldest blocks until the store holds `max_bytes` or less,
+    /// or only retained blocks are left: oldest by last access, then by
+    /// insertion, then by row (the order they were first stored in). One
+    /// scan of the eviction index picks them all, and one transaction
+    /// deletes them. Whether `tracked_cid_bytes` was among them is the
+    /// answer.
     fn evict_until_tracking(&self, max_bytes: u64, tracked_cid_bytes: &[u8]) -> Result<bool> {
-        let mut tracked_block_evicted = false;
-        loop {
-            let total = self.total_bytes()?;
-            if total <= max_bytes {
-                return Ok(tracked_block_evicted);
-            }
-            let retained = self.retained.lock().clone();
-            let cid_bytes = self.oldest_evictable_cid(&retained)?;
-            let Some(cid_bytes) = cid_bytes else {
-                return Ok(tracked_block_evicted);
+        let retained = self.retained.lock().clone();
+        let evicted = {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction()?;
+            let total = total_bytes_in(&tx)?;
+            let Some(mut excess) = total.checked_sub(max_bytes).filter(|excess| *excess > 0) else {
+                return Ok(false);
             };
-            let deleted = self
-                .conn
-                .lock()
-                .execute("DELETE FROM blocks WHERE cid = ?1", params![&cid_bytes])?;
-            if deleted == 0 {
-                return Ok(tracked_block_evicted);
+            let evicted = {
+                let mut oldest = tx.prepare(
+                    r#"
+                    SELECT cid, size FROM blocks
+                    ORDER BY last_accessed_at ASC, inserted_at ASC, rowid ASC
+                    "#,
+                )?;
+                let mut rows = oldest.query([])?;
+                let mut evicted = Vec::new();
+                while excess > 0 {
+                    let Some(row) = rows.next()? else {
+                        break;
+                    };
+                    let cid_bytes = row.get::<_, Vec<u8>>(0)?;
+                    if retained.contains_key(&cid_bytes) {
+                        continue;
+                    }
+                    excess = excess.saturating_sub(row.get::<_, i64>(1)?.max(0) as u64);
+                    evicted.push(cid_bytes);
+                }
+                evicted
+            };
+            {
+                let mut delete = tx.prepare("DELETE FROM blocks WHERE cid = ?1")?;
+                for cid_bytes in &evicted {
+                    delete.execute(params![cid_bytes])?;
+                }
             }
-            if !tracked_cid_bytes.is_empty() && cid_bytes == tracked_cid_bytes {
-                tracked_block_evicted = true;
-            }
-            self.hot.lock().remove(&cid_bytes);
+            tx.commit()?;
+            evicted
+        };
+        let mut hot = self.hot.lock();
+        for cid_bytes in &evicted {
+            hot.remove(cid_bytes);
         }
-    }
-
-    fn oldest_evictable_cid(&self, retained: &HashMap<Vec<u8>, usize>) -> Result<Option<Vec<u8>>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT cid FROM blocks
-            ORDER BY last_accessed_at ASC, inserted_at ASC
-            "#,
-        )?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let cid_bytes = row.get::<_, Vec<u8>>(0)?;
-            if !retained.contains_key(&cid_bytes) {
-                return Ok(Some(cid_bytes));
-            }
-        }
-        Ok(None)
+        Ok(!tracked_cid_bytes.is_empty()
+            && evicted
+                .iter()
+                .any(|cid_bytes| cid_bytes == tracked_cid_bytes))
     }
 
     fn retain_cid_bytes(&self, cid_bytes: Vec<u8>) {
@@ -600,6 +635,14 @@ fn now_secs() -> u64 {
 
 fn provider_cache_key(cid: &Cid) -> Vec<u8> {
     cid.hash().to_bytes()
+}
+
+/// The blocks' total size on `conn`, as the `block_bytes` triggers keep it.
+fn total_bytes_in(conn: &Connection) -> Result<u64> {
+    let total = conn.query_row("SELECT bytes FROM block_bytes WHERE id = 0", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    Ok(total.max(0) as u64)
 }
 
 fn block_key(cid: &Cid) -> Vec<u8> {
@@ -727,6 +770,110 @@ impl VerifiedHotCache {
 mod tests {
     use super::*;
     use freedom_ipfs_core::{cid_from_data, CODEC_DAG_PB, CODEC_RAW};
+
+    /// The eviction scan's query, for its plan.
+    const EVICTION_PLAN_QUERY: &str =
+        "SELECT cid, size FROM blocks ORDER BY last_accessed_at ASC, inserted_at ASC, rowid ASC";
+
+    /// Eviction's cost at scale (#83), measured by hand:
+    ///
+    /// `FREEDOM_IPFS_EVICTION_BLOCKS=262144 cargo test --release -p freedom-ipfs-store eviction_timing -- --ignored --nocapture`
+    ///
+    /// A file store of that many 1 KiB blocks, at its limit, every block
+    /// last touched in the same second, or one second apart. Then ten puts,
+    /// each evicting one block, and a trim of `FREEDOM_IPFS_EVICTION_TRIM`
+    /// blocks (100 by default). It prints each eviction query's plan, and
+    /// the times.
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn eviction_timing() {
+        let env = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        let blocks = env("FREEDOM_IPFS_EVICTION_BLOCKS", 262_144);
+        let trim = env("FREEDOM_IPFS_EVICTION_TRIM", 100);
+        let data = |i: usize| {
+            let mut data = vec![0u8; 1024];
+            data[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            data
+        };
+        for (layout, spread) in [("same second", false), ("one a second", true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let store =
+                SqliteBlockStore::open(dir.path().join("blocks.sqlite"), (blocks * 1024) as u64)
+                    .unwrap();
+            let started = std::time::Instant::now();
+            {
+                let mut conn = store.conn.lock();
+                let tx = conn.transaction().unwrap();
+                {
+                    let mut insert = tx
+                        .prepare(
+                            "INSERT INTO blocks(cid, codec, size, data, inserted_at, last_accessed_at) \
+                             VALUES (?1, ?2, 1024, ?3, ?4, ?4)",
+                        )
+                        .unwrap();
+                    for i in 0..blocks {
+                        let data = data(i);
+                        let cid = cid_from_data(CODEC_RAW, &data);
+                        let at = 1_000_000 + if spread { i as i64 } else { 0 };
+                        insert
+                            .execute(params![block_key(&cid), CODEC_RAW as i64, data, at])
+                            .unwrap();
+                    }
+                }
+                tx.commit().unwrap();
+            }
+            let filled = started.elapsed();
+            if !spread {
+                let conn = store.conn.lock();
+                let mut plan = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {EVICTION_PLAN_QUERY}"))
+                    .unwrap();
+                let mut rows = Vec::new();
+                let mut query = plan.query([]).unwrap();
+                while let Some(row) = query.next().unwrap() {
+                    rows.push(row.get::<_, String>(3).unwrap());
+                }
+                println!("EVICTION plan: {rows:?}");
+            }
+            let started = std::time::Instant::now();
+            for _ in 0..10 {
+                store.total_bytes().unwrap();
+            }
+            let sum = started.elapsed() / 10;
+            let started = std::time::Instant::now();
+            for _ in 0..10 {
+                let conn = store.conn.lock();
+                let mut oldest = conn.prepare(EVICTION_PLAN_QUERY).unwrap();
+                let mut rows = oldest.query([]).unwrap();
+                rows.next().unwrap().unwrap();
+            }
+            let oldest = started.elapsed() / 10;
+            println!("EVICTION {blocks} blocks, {layout}: total_bytes {sum:?}; the oldest evictable CID {oldest:?}");
+            let started = std::time::Instant::now();
+            for i in 0..10 {
+                let data = data(blocks + i);
+                store
+                    .put_block(&cid_from_data(CODEC_RAW, &data), &data)
+                    .unwrap();
+            }
+            let per_put = started.elapsed() / 10;
+            let started = std::time::Instant::now();
+            store
+                .trim_blocks_to(((blocks - trim) * 1024) as u64)
+                .unwrap();
+            let trimmed = started.elapsed();
+            assert_eq!(store.block_count().unwrap() as usize, blocks - trim);
+            println!(
+                "EVICTION {blocks} blocks, {layout}: filled in {filled:?}; a put that evicts one \
+                 block {per_put:?}; a trim of {trim} blocks {trimmed:?}"
+            );
+        }
+    }
 
     #[test]
     fn close_releases_the_file_while_clones_are_alive() {
@@ -1071,6 +1218,201 @@ mod tests {
 
         assert!(store.get(&first_cid).unwrap().is_none());
         assert_eq!(store.get(&third_cid).unwrap().unwrap().data(), third);
+    }
+
+    /// Rows straight into `blocks`, in this order, each 16 bytes with
+    /// these timestamps: `(last_accessed_at, inserted_at)`.
+    fn insert_blocks_at(store: &SqliteBlockStore, rows: &[(u8, i64, i64)]) -> Vec<Cid> {
+        let conn = store.conn.lock();
+        rows.iter()
+            .map(|&(byte, last_accessed_at, inserted_at)| {
+                let data = vec![byte; 16];
+                let cid = cid_from_data(CODEC_RAW, &data);
+                conn.execute(
+                    "INSERT INTO blocks(cid, codec, size, data, inserted_at, last_accessed_at) \
+                     VALUES (?1, ?2, 16, ?3, ?4, ?5)",
+                    params![
+                        block_key(&cid),
+                        CODEC_RAW as i64,
+                        data,
+                        inserted_at,
+                        last_accessed_at
+                    ],
+                )
+                .unwrap();
+                cid
+            })
+            .collect()
+    }
+
+    /// Eviction takes the oldest by last access, then by insertion, then
+    /// the first stored, whatever their CIDs, and passes over retained
+    /// blocks: here every block shares one second of last access but two,
+    /// and four share their insertion second too.
+    #[test]
+    fn eviction_with_tied_timestamps_takes_the_first_stored() {
+        let store = SqliteBlockStore::in_memory(1 << 20).unwrap();
+        // Bytes chosen so the CIDs' order isn't the order stored in.
+        let cids = insert_blocks_at(
+            &store,
+            &[
+                (9, 100, 50), // 0: tied with 1, 2 and 3; first stored
+                (3, 100, 50), // 1
+                (7, 100, 50), // 2
+                (1, 100, 50), // 3
+                (5, 100, 40), // 4: inserted earlier: the oldest of all
+                (8, 200, 10), // 5: touched later: the newest, though first inserted
+                (2, 100, 60), // 6: inserted later than 0..3
+            ],
+        );
+        assert_eq!(store.total_bytes().unwrap(), 7 * 16);
+        store.retain_block(&cids[1]).unwrap();
+        // Read straight from the table: a get would touch the block.
+        let kept = |store: &SqliteBlockStore| -> Vec<usize> {
+            let conn = store.conn.lock();
+            (0..cids.len())
+                .filter(|&i| {
+                    conn.prepare("SELECT 1 FROM blocks WHERE cid = ?1")
+                        .unwrap()
+                        .exists(params![block_key(&cids[i])])
+                        .unwrap()
+                })
+                .collect()
+        };
+        // Three evicted: 4, then 0, then 2 (1 is retained).
+        store.trim_blocks_to(4 * 16).unwrap();
+        assert_eq!(kept(&store), [1, 3, 5, 6]);
+        // Two more: 3 (the last of the tie), then 6.
+        store.trim_blocks_to(2 * 16).unwrap();
+        assert_eq!(kept(&store), [1, 5]);
+        // The retained block stays; 5 goes.
+        store.trim_blocks_to(0).unwrap();
+        assert_eq!(kept(&store), [1]);
+        assert_eq!(store.total_bytes().unwrap(), 16);
+    }
+
+    /// The total the triggers keep is the blocks' sum after every kind of
+    /// write: puts, a put of a stored block with other bytes, touches,
+    /// eviction, and clear.
+    #[test]
+    fn the_kept_total_is_the_blocks_sum() {
+        let store = SqliteBlockStore::in_memory(64).unwrap();
+        let sum = |store: &SqliteBlockStore| -> u64 {
+            store
+                .conn
+                .lock()
+                .query_row("SELECT COALESCE(SUM(size), 0) FROM blocks", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap() as u64
+        };
+        let mut cids = Vec::new();
+        for byte in 0..6u8 {
+            let data = vec![byte; 10 + byte as usize];
+            let cid = cid_from_data(CODEC_RAW, &data);
+            store.put_block(&cid, &data).unwrap();
+            cids.push(cid);
+            assert_eq!(store.total_bytes().unwrap(), sum(&store));
+        }
+        assert!(store.total_bytes().unwrap() <= 64);
+        // The same block again, and a row updated in place with a new size.
+        let data = vec![5u8; 15];
+        store.put_block(&cids[5], &data).unwrap();
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE blocks SET size = size + 3 WHERE cid = ?1",
+                params![block_key(&cids[5])],
+            )
+            .unwrap();
+        assert_eq!(store.total_bytes().unwrap(), sum(&store));
+        store.touch_at(&cids[5], now_secs() + 10).unwrap();
+        assert_eq!(store.total_bytes().unwrap(), sum(&store));
+        store.trim_blocks_to(0).unwrap();
+        assert_eq!((store.total_bytes().unwrap(), sum(&store)), (0, 0));
+        store.put_block(&cids[0], &[0u8; 10]).unwrap();
+        store.clear().unwrap();
+        assert_eq!((store.total_bytes().unwrap(), sum(&store)), (0, 0));
+    }
+
+    /// The eviction scan reads its order off the index, with no sort: on a
+    /// fresh store, and on one made before the index, whose single-column
+    /// index is dropped and whose total is counted once when it opens.
+    #[test]
+    fn the_eviction_scan_sorts_nothing_and_old_stores_migrate() {
+        let plan = |store: &SqliteBlockStore| -> Vec<String> {
+            let conn = store.conn.lock();
+            let mut plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {EVICTION_PLAN_QUERY}"))
+                .unwrap();
+            let mut rows = plan.query([]).unwrap();
+            let mut steps = Vec::new();
+            while let Some(row) = rows.next().unwrap() {
+                steps.push(row.get::<_, String>(3).unwrap());
+            }
+            steps
+        };
+        let indexes = |store: &SqliteBlockStore| -> Vec<String> {
+            let conn = store.conn.lock();
+            let mut names = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' \
+                     AND tbl_name = 'blocks' AND sql IS NOT NULL ORDER BY name",
+                )
+                .unwrap();
+            let mut rows = names.query([]).unwrap();
+            let mut found = Vec::new();
+            while let Some(row) = rows.next().unwrap() {
+                found.push(row.get::<_, String>(0).unwrap());
+            }
+            found
+        };
+        let fresh = SqliteBlockStore::in_memory(1 << 20).unwrap();
+        assert_eq!(plan(&fresh), ["SCAN blocks USING INDEX blocks_eviction"]);
+        assert_eq!(indexes(&fresh), ["blocks_eviction"]);
+
+        // A store as the code before #83 made it: the single-column index,
+        // no total table, and blocks already in it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE blocks (
+                    cid BLOB PRIMARY KEY NOT NULL,
+                    codec INTEGER NOT NULL,
+                    size INTEGER NOT NULL,
+                    data BLOB NOT NULL,
+                    inserted_at INTEGER NOT NULL,
+                    last_accessed_at INTEGER NOT NULL
+                );
+                CREATE INDEX blocks_last_accessed ON blocks(last_accessed_at);
+                "#,
+            )
+            .unwrap();
+            for byte in 0..3u8 {
+                let data = vec![byte; 100];
+                let cid = cid_from_data(CODEC_RAW, &data);
+                conn.execute(
+                    "INSERT INTO blocks(cid, codec, size, data, inserted_at, last_accessed_at) \
+                     VALUES (?1, ?2, 100, ?3, 1, 1)",
+                    params![block_key(&cid), CODEC_RAW as i64, data],
+                )
+                .unwrap();
+            }
+        }
+        let old = SqliteBlockStore::open(&path, 1 << 20).unwrap();
+        assert_eq!(indexes(&old), ["blocks_eviction"]);
+        assert_eq!(plan(&old), ["SCAN blocks USING INDEX blocks_eviction"]);
+        assert_eq!(old.total_bytes().unwrap(), 300);
+        drop(old);
+        // Opened again, the total isn't counted twice.
+        let again = SqliteBlockStore::open(&path, 1 << 20).unwrap();
+        assert_eq!(again.total_bytes().unwrap(), 300);
+        again.trim_blocks_to(150).unwrap();
+        assert_eq!(again.total_bytes().unwrap(), 100);
     }
 
     #[test]
