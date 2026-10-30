@@ -923,58 +923,69 @@ impl SqliteBlockStore {
 
     /// Evicts the oldest blocks until the store holds `max_bytes` or less,
     /// or only retained blocks are left: oldest by last access, then by
-    /// insertion, then by row (the order they were first stored in). One
-    /// scan of the eviction index picks them all, and one transaction
-    /// deletes them. Whether `tracked_cid_bytes` was among them is the
-    /// answer.
+    /// insertion, then by row (the order they were first stored in). It
+    /// reads the total once, then walks the eviction index in batches of
+    /// [`EVICTION_BATCH`], each after the last one's key, and deletes them in
+    /// one transaction: it holds one batch at a time, however many blocks
+    /// go. Each batch's retained check and deletes happen under the
+    /// retained set's lock, so a `retain_block` that has returned is always
+    /// seen. Whether `tracked_cid_bytes` was evicted is the answer.
+    ///
+    /// Lock order: the connection, then the retained set, then the hot
+    /// cache. `retain_block` and `release_block` take the retained set
+    /// alone, and nothing else takes it, so none waits on the connection
+    /// while holding it.
     fn evict_until_tracking(&self, max_bytes: u64, tracked_cid_bytes: &[u8]) -> Result<bool> {
-        let retained = self.retained.lock().clone();
-        let evicted = {
-            let mut conn = self.conn.lock();
-            let tx = conn.transaction()?;
-            let total = total_bytes_in(&tx)?;
-            let Some(mut excess) = total.checked_sub(max_bytes).filter(|excess| *excess > 0) else {
-                return Ok(false);
-            };
-            let evicted = {
-                let mut oldest = tx.prepare(
-                    r#"
-                    SELECT cid, size FROM blocks
-                    ORDER BY last_accessed_at ASC, inserted_at ASC, rowid ASC
-                    "#,
-                )?;
-                let mut rows = oldest.query([])?;
-                let mut evicted = Vec::new();
-                while excess > 0 {
-                    let Some(row) = rows.next()? else {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let total = total_bytes_in(&tx)?;
+        let Some(mut excess) = total.checked_sub(max_bytes).filter(|excess| *excess > 0) else {
+            return Ok(false);
+        };
+        let mut tracked_evicted = false;
+        {
+            let mut next = tx.prepare(EVICTION_BATCH_QUERY)?;
+            let mut delete = tx.prepare("DELETE FROM blocks WHERE rowid = ?1")?;
+            let mut after = (i64::MIN, i64::MIN, i64::MIN);
+            let mut batch: Vec<(Vec<u8>, u64, i64)> = Vec::with_capacity(EVICTION_BATCH);
+            while excess > 0 {
+                batch.clear();
+                let mut rows =
+                    next.query(params![after.0, after.1, after.2, EVICTION_BATCH as i64])?;
+                while let Some(row) = rows.next()? {
+                    let key = (row.get(2)?, row.get(3)?, row.get(4)?);
+                    after = key;
+                    batch.push((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)?.max(0) as u64,
+                        key.2,
+                    ));
+                }
+                drop(rows);
+                if batch.is_empty() {
+                    break;
+                }
+                let retained = self.retained.lock();
+                let mut hot = self.hot.lock();
+                for (cid_bytes, size, rowid) in batch.drain(..) {
+                    if excess == 0 {
                         break;
-                    };
-                    let cid_bytes = row.get::<_, Vec<u8>>(0)?;
+                    }
                     if retained.contains_key(&cid_bytes) {
                         continue;
                     }
-                    excess = excess.saturating_sub(row.get::<_, i64>(1)?.max(0) as u64);
-                    evicted.push(cid_bytes);
-                }
-                evicted
-            };
-            {
-                let mut delete = tx.prepare("DELETE FROM blocks WHERE cid = ?1")?;
-                for cid_bytes in &evicted {
-                    delete.execute(params![cid_bytes])?;
+                    delete.execute(params![rowid])?;
+                    excess = excess.saturating_sub(size);
+                    // The database is the source of truth: a block dropped
+                    // here before a rollback is read from it again.
+                    hot.remove(&cid_bytes);
+                    tracked_evicted |=
+                        !tracked_cid_bytes.is_empty() && cid_bytes == tracked_cid_bytes;
                 }
             }
-            tx.commit()?;
-            evicted
-        };
-        let mut hot = self.hot.lock();
-        for cid_bytes in &evicted {
-            hot.remove(cid_bytes);
         }
-        Ok(!tracked_cid_bytes.is_empty()
-            && evicted
-                .iter()
-                .any(|cid_bytes| cid_bytes == tracked_cid_bytes))
+        tx.commit()?;
+        Ok(tracked_evicted)
     }
 
     fn retain_cid_bytes(&self, cid_bytes: Vec<u8>) {
@@ -1085,6 +1096,16 @@ fn hot_cache_bytes(max_bytes: u64) -> u64 {
 /// left uncached, and the request it served goes on. SQLite rolls back the
 /// failed statement, so nothing of it is left behind; but a refused update
 /// leaves the row it would have replaced, which a metadata caller deletes.
+/// The most blocks eviction reads and holds at once.
+const EVICTION_BATCH: usize = 64;
+
+/// The next [`EVICTION_BATCH`] blocks to evict, oldest first, after the
+/// last batch's key: `(last_accessed_at, inserted_at, rowid)`. It reads
+/// them off the `blocks_eviction` index, and sorts nothing.
+const EVICTION_BATCH_QUERY: &str = "SELECT cid, size, last_accessed_at, inserted_at, rowid \
+     FROM blocks WHERE (last_accessed_at, inserted_at, rowid) > (?1, ?2, ?3) \
+     ORDER BY last_accessed_at ASC, inserted_at ASC, rowid ASC LIMIT ?4";
+
 /// The blocks' total size on `conn`, as the `block_bytes` triggers keep it.
 fn total_bytes_in(conn: &Connection) -> Result<u64> {
     let total = conn.query_row("SELECT bytes FROM block_bytes WHERE id = 0", [], |row| {
@@ -1458,10 +1479,6 @@ mod tests {
     use super::*;
     use freedom_ipfs_core::{cid_from_data, CODEC_DAG_PB, CODEC_RAW};
 
-    /// The eviction scan's query, for its plan.
-    const EVICTION_PLAN_QUERY: &str =
-        "SELECT cid, size FROM blocks ORDER BY last_accessed_at ASC, inserted_at ASC, rowid ASC";
-
     fn pragma(store: &SqliteBlockStore, name: &str) -> i64 {
         store
             .conn
@@ -1526,10 +1543,12 @@ mod tests {
             if !spread {
                 let conn = store.conn.lock();
                 let mut plan = conn
-                    .prepare(&format!("EXPLAIN QUERY PLAN {EVICTION_PLAN_QUERY}"))
+                    .prepare(&format!("EXPLAIN QUERY PLAN {EVICTION_BATCH_QUERY}"))
                     .unwrap();
                 let mut rows = Vec::new();
-                let mut query = plan.query([]).unwrap();
+                let mut query = plan
+                    .query(params![i64::MIN, i64::MIN, i64::MIN, EVICTION_BATCH as i64])
+                    .unwrap();
                 while let Some(row) = query.next().unwrap() {
                     rows.push(row.get::<_, String>(3).unwrap());
                 }
@@ -1543,8 +1562,10 @@ mod tests {
             let started = std::time::Instant::now();
             for _ in 0..10 {
                 let conn = store.conn.lock();
-                let mut oldest = conn.prepare(EVICTION_PLAN_QUERY).unwrap();
-                let mut rows = oldest.query([]).unwrap();
+                let mut oldest = conn.prepare(EVICTION_BATCH_QUERY).unwrap();
+                let mut rows = oldest
+                    .query(params![i64::MIN, i64::MIN, i64::MIN, EVICTION_BATCH as i64])
+                    .unwrap();
                 rows.next().unwrap().unwrap();
             }
             let oldest = started.elapsed() / 10;
@@ -2432,6 +2453,83 @@ mod tests {
         assert_eq!(store.total_bytes().unwrap(), 16);
     }
 
+    /// Eviction holds one batch at a time, however many blocks it evicts:
+    /// trimming 50,000 one-byte blocks peaks at no more heap than trimming
+    /// 5,000, and at a few KiB. (Holding every evicted CID, it grew with
+    /// the count: about 3 MB at 50,000.)
+    #[test]
+    fn eviction_holds_one_batch_whatever_it_evicts() {
+        let peak_for = |blocks: usize| -> isize {
+            let store = SqliteBlockStore::in_memory(1 << 30).unwrap();
+            {
+                let mut conn = store.conn.lock();
+                let tx = conn.transaction().unwrap();
+                {
+                    let mut insert = tx
+                        .prepare(
+                            "INSERT INTO blocks(cid, codec, size, data, inserted_at, last_accessed_at) \
+                             VALUES (?1, ?2, 1, ?3, 1, 1)",
+                        )
+                        .unwrap();
+                    for i in 0..blocks {
+                        let data = (i as u64).to_le_bytes();
+                        let cid = cid_from_data(CODEC_RAW, &data);
+                        insert
+                            .execute(params![block_key(&cid), CODEC_RAW as i64, &data[..]])
+                            .unwrap();
+                    }
+                }
+                tx.commit().unwrap();
+            }
+            let origin = heap::live();
+            store.trim_blocks_to(0).unwrap();
+            let peak = heap::peak() - origin;
+            assert_eq!(store.block_count().unwrap(), 0);
+            peak
+        };
+        let few = peak_for(5_000);
+        let many = peak_for(50_000);
+        assert!(
+            many < 32 * 1024,
+            "{many} bytes at the peak, trimming 50,000 blocks"
+        );
+        assert!(
+            many <= few + 1024,
+            "{few} bytes at the peak for 5,000 blocks, {many} for 50,000"
+        );
+    }
+
+    /// A block retained while a trim waits for the connection is kept: the
+    /// retained check and the deletes come after the wait, under the
+    /// retained set's lock. (With the retained set read before the wait,
+    /// the second block was deleted.)
+    #[test]
+    fn a_block_retained_while_a_trim_waits_is_kept() {
+        let store = SqliteBlockStore::in_memory(1 << 20).unwrap();
+        let cids = insert_blocks_at(&store, &[(1, 100, 1), (2, 200, 1)]);
+        let held = store.conn.lock();
+        let trimming = {
+            let store = store.clone();
+            std::thread::spawn(move || store.trim_blocks_to(0))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        store.retain_block(&cids[1]).unwrap();
+        drop(held);
+        trimming.join().unwrap().unwrap();
+        let conn = store.conn.lock();
+        let present = |cid: &Cid| {
+            conn.prepare("SELECT 1 FROM blocks WHERE cid = ?1")
+                .unwrap()
+                .exists(params![block_key(cid)])
+                .unwrap()
+        };
+        assert!(!present(&cids[0]), "the unretained block is evicted");
+        assert!(
+            present(&cids[1]),
+            "the block retained during the wait is kept"
+        );
+    }
+
     /// The total the triggers keep is the blocks' sum after every kind of
     /// write: puts, a put of a stored block with other bytes, touches,
     /// eviction, and clear.
@@ -2482,12 +2580,18 @@ mod tests {
     /// index is dropped and whose total is counted once when it opens.
     #[test]
     fn the_eviction_scan_sorts_nothing_and_old_stores_migrate() {
+        // A seek into the index after the last batch's key, then its order:
+        // no temporary B-tree.
+        const EVICTION_PLAN: [&str; 1] =
+            ["SEARCH blocks USING INDEX blocks_eviction ((last_accessed_at,inserted_at)>(?,?))"];
         let plan = |store: &SqliteBlockStore| -> Vec<String> {
             let conn = store.conn.lock();
             let mut plan = conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {EVICTION_PLAN_QUERY}"))
+                .prepare(&format!("EXPLAIN QUERY PLAN {EVICTION_BATCH_QUERY}"))
                 .unwrap();
-            let mut rows = plan.query([]).unwrap();
+            let mut rows = plan
+                .query(params![i64::MIN, i64::MIN, i64::MIN, EVICTION_BATCH as i64])
+                .unwrap();
             let mut steps = Vec::new();
             while let Some(row) = rows.next().unwrap() {
                 steps.push(row.get::<_, String>(3).unwrap());
@@ -2510,7 +2614,7 @@ mod tests {
             found
         };
         let fresh = SqliteBlockStore::in_memory(1 << 20).unwrap();
-        assert_eq!(plan(&fresh), ["SCAN blocks USING INDEX blocks_eviction"]);
+        assert_eq!(plan(&fresh), EVICTION_PLAN);
         assert_eq!(indexes(&fresh), ["blocks_eviction"]);
 
         // A store as the code before #83 made it: the single-column index,
@@ -2546,7 +2650,7 @@ mod tests {
         }
         let old = SqliteBlockStore::open(&path, 1 << 20).unwrap();
         assert_eq!(indexes(&old), ["blocks_eviction"]);
-        assert_eq!(plan(&old), ["SCAN blocks USING INDEX blocks_eviction"]);
+        assert_eq!(plan(&old), EVICTION_PLAN);
         assert_eq!(old.total_bytes().unwrap(), 300);
         drop(old);
         // Opened again, the total isn't counted twice.
