@@ -11,7 +11,7 @@ use crate::capability::NetworkCapability;
 use crate::dial::{DialPolicy, TransportPolicy};
 use crate::gate::{ConfiguredTargets, Nat64State, Refusal};
 use crate::http::{ClientConfig, HttpClient};
-use crate::resolve::{system_lookup, NameLookup};
+use crate::resolve::{DnsConfig, NameLookup};
 
 /// What a node's network may do.
 ///
@@ -242,6 +242,8 @@ struct Inner {
     capability: NetworkCapability,
     /// The gate's resolver's lookups, under `direct` with checked addresses.
     lookup: Option<Arc<dyn NameLookup>>,
+    /// The DNS configuration of the network's own lookups, under `direct`.
+    dns: Option<DnsConfig>,
     /// The SOCKS5 client every request through the proxy goes by, under
     /// `socks5`: one per network.
     #[cfg(feature = "socks")]
@@ -255,13 +257,32 @@ impl Network {
     /// cargo feature `socks`, which brings both its HTTP clients and its
     /// libp2p transports.
     ///
-    /// Under `direct` with checked addresses, the gate's resolver uses the
-    /// system's DNS configuration, or Cloudflare's resolvers where it can't
-    /// be read. Under `socks5` it asks the proxy (`RESOLVE`), and every
-    /// stream carries the network's own SOCKS5 credentials (design 0007,
-    /// "Stream isolation"), made here from the operating system's
-    /// randomness: if that fails, so does this.
+    /// Under `direct`, the network's own lookups (the gate's resolver's,
+    /// with checked addresses, and the libp2p transports' DNS layer's) use
+    /// one DNS configuration, read here: the system's, or Cloudflare's
+    /// resolvers only where it can't be read or parsed ([`Network::dns`]
+    /// says which, and why). Under `socks5` the gate's resolver asks the
+    /// proxy (`RESOLVE`), and every stream carries the network's own SOCKS5
+    /// credentials (design 0007, "Stream isolation"), made here from the
+    /// operating system's randomness: if that fails, so does this.
     pub fn new(policy: NetworkPolicy) -> Result<Self, NetworkError> {
+        let dns = is_direct(&policy).then(DnsConfig::system);
+        Self::with_dns_config(policy, dns)
+    }
+
+    /// The network for `policy`, its own lookups under `direct` over `dns`
+    /// instead of the system's configuration: a host that brings its own,
+    /// or a test's fixture server. Under the legacy policy and `socks5`,
+    /// `dns` is unused, as [`Network::new`] reads none there.
+    pub fn with_dns(policy: NetworkPolicy, dns: DnsConfig) -> Result<Self, NetworkError> {
+        let dns = is_direct(&policy).then_some(dns);
+        Self::with_dns_config(policy, dns)
+    }
+
+    fn with_dns_config(
+        policy: NetworkPolicy,
+        dns: Option<DnsConfig>,
+    ) -> Result<Self, NetworkError> {
         let lookup = match policy.mode() {
             Mode::Legacy => None,
             Mode::Direct(Direct {
@@ -271,7 +292,7 @@ impl Network {
             Mode::Direct(Direct {
                 addresses: Addresses::Checked(_),
                 ..
-            }) => Some(system_lookup()),
+            }) => dns.as_ref().map(DnsConfig::lookup),
             // Its lookups are `RESOLVE`'s, through the network's SOCKS
             // client.
             #[cfg(feature = "socks")]
@@ -279,25 +300,36 @@ impl Network {
             #[cfg(not(feature = "socks"))]
             Mode::Socks5(_) => return Err(NetworkError::Unsupported("socks5")),
         };
-        Self::with_lookup(policy, lookup)
+        Self::assemble(policy, lookup, dns)
     }
 
     /// The network for `policy` with the gate's resolver asking `lookup`:
-    /// tests, and hosts that bring their own resolver. Under `socks5`, its
-    /// credentials come from the operating system's randomness, whose
-    /// failure fails it.
+    /// tests, and hosts that bring their own resolver. Under `direct`, the
+    /// transports' DNS layer still uses the system's configuration, as
+    /// [`Network::new`] reads it. Under `socks5`, its credentials come from
+    /// the operating system's randomness, whose failure fails it.
     #[doc(hidden)]
     pub fn with_lookup(
         policy: NetworkPolicy,
         lookup: Option<Arc<dyn NameLookup>>,
     ) -> Result<Self, NetworkError> {
+        let dns = is_direct(&policy).then(DnsConfig::system);
+        Self::assemble(policy, lookup, dns)
+    }
+
+    /// The network, from its parts.
+    fn assemble(
+        policy: NetworkPolicy,
+        lookup: Option<Arc<dyn NameLookup>>,
+        dns: Option<DnsConfig>,
+    ) -> Result<Self, NetworkError> {
         #[cfg(feature = "socks")]
         {
-            Self::build_with_random(policy, lookup, crate::socks::os_random)
+            Self::build_with_random(policy, lookup, dns, crate::socks::os_random)
         }
         #[cfg(not(feature = "socks"))]
         {
-            Ok(Self::build(policy, lookup))
+            Ok(Self::build(policy, lookup, dns))
         }
     }
 
@@ -312,7 +344,8 @@ impl Network {
         lookup: Option<Arc<dyn NameLookup>>,
         random: fn(&mut [u8]) -> Result<(), crate::socks::RandomFailed>,
     ) -> Result<Self, NetworkError> {
-        Self::build_with_random(policy, lookup, random)
+        let dns = is_direct(&policy).then(DnsConfig::system);
+        Self::build_with_random(policy, lookup, dns, random)
     }
 
     /// The network, its SOCKS5 credentials (under `socks5`) from `random`:
@@ -321,6 +354,7 @@ impl Network {
     fn build_with_random(
         policy: NetworkPolicy,
         lookup: Option<Arc<dyn NameLookup>>,
+        dns: Option<DnsConfig>,
         random: fn(&mut [u8]) -> Result<(), crate::socks::RandomFailed>,
     ) -> Result<Self, NetworkError> {
         let socks = match policy.mode() {
@@ -336,18 +370,24 @@ impl Network {
                 policy,
                 capability: NetworkCapability::new(),
                 lookup,
+                dns,
                 socks,
             }),
         })
     }
 
     #[cfg(not(feature = "socks"))]
-    fn build(policy: NetworkPolicy, lookup: Option<Arc<dyn NameLookup>>) -> Self {
+    fn build(
+        policy: NetworkPolicy,
+        lookup: Option<Arc<dyn NameLookup>>,
+        dns: Option<DnsConfig>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 policy,
                 capability: NetworkCapability::new(),
                 lookup,
+                dns,
             }),
         }
     }
@@ -359,6 +399,7 @@ impl Network {
                 policy: NetworkPolicy::legacy(),
                 capability: NetworkCapability::new(),
                 lookup: None,
+                dns: None,
                 #[cfg(feature = "socks")]
                 socks: None,
             }),
@@ -381,6 +422,17 @@ impl Network {
 
     pub(crate) fn lookup(&self) -> Option<&Arc<dyn NameLookup>> {
         self.inner.lookup.as_ref()
+    }
+
+    /// The DNS configuration of the network's own lookups under `direct`
+    /// (the gate's resolver's, with checked addresses, and the libp2p
+    /// transports' DNS layer's), read once when it was built; its
+    /// [`DnsConfig::source`] says whether it is the system's or the
+    /// fallback, and why. `None` under the legacy policy, whose crates
+    /// resolve as they did before, and under `socks5`, whose names go to
+    /// the proxy.
+    pub fn dns(&self) -> Option<&DnsConfig> {
+        self.inner.dns.as_ref()
     }
 
     /// The network's SOCKS5 client, under `socks5`.
@@ -411,6 +463,11 @@ impl Network {
     pub fn http_client(&self, config: ClientConfig) -> HttpClient {
         HttpClient::new(self.clone(), config)
     }
+}
+
+/// Whether `policy` is `direct`, whose own lookups read a DNS configuration.
+fn is_direct(policy: &NetworkPolicy) -> bool {
+    matches!(policy.mode(), Mode::Direct(_))
 }
 
 /// Why a network or one of its clients can't be built.

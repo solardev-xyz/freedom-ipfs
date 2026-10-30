@@ -61,6 +61,11 @@ getrandom = { version = "0.3", optional = true }
 # freedom-radicled uses (design 0008); this crate's async driver is on it.
 freedom-ipfs-socks = { workspace = true, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# `if_nametoindex`, for a resolv.conf nameserver's named zone
+# (`fe80::1%eth0`), which hickory's parser drops. Already in the graph.
+libc = "0.2"
+
 [features]
 # `socks5` mode's SOCKS5 client and libp2p transport (design 0007,
 # "Modes"): off by default, so mobile builds compile none of it (D2).
