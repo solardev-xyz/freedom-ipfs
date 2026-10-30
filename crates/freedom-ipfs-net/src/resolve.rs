@@ -12,10 +12,36 @@
 //! names never reach it (the hop loop refuses them first), and it answers
 //! one with an error, without a lookup, in case one ever arrives.
 //!
-//! Lookups are async and cancellable: hickory's, over the system's DNS
-//! configuration or Cloudflare's resolvers where that can't be read, never
-//! `getaddrinfo` on a blocking thread, so an instance's teardown never waits
-//! for a lookup nothing can cancel.
+//! Lookups are async and cancellable: hickory's, never `getaddrinfo` on a
+//! blocking thread, so an instance's teardown never waits for a lookup
+//! nothing can cancel.
+//!
+//! **One DNS configuration** ([`DnsConfig`]) serves a `direct` network's
+//! own lookups: the gate's resolver's, and the libp2p transports' DNS layer
+//! (`/dns*`, `/dnsaddr`, WebSocket names). It is read once, when the
+//! network is built: the system's (on Unix, `/etc/resolv.conf`, parsed),
+//! or a fallback, Cloudflare's resolvers, only when that can't be read or
+//! parsed. Which one it is, and why, is [`DnsConfig::source`], for a host
+//! to report.
+//!
+//! **Every name is looked up exactly as written**, as an absolute name: a
+//! configuration's search list and domain are dropped and its `ndots` is 0,
+//! whatever the system's resolv.conf says. That is deliberate, and unlike
+//! glibc's resolver: every name freedom-ipfs resolves comes from a
+//! provider, a configuration or a peer (a multiaddr), and none should be
+//! expanded with the user's search domains. A peer's `/dns4/intranet/…`
+//! would otherwise query, and could reach, `intranet.` under the user's
+//! local domain.
+//!
+//! **A nameserver's zone** (`nameserver fe80::1%eth0`, or `%3`) is kept:
+//! hickory's parser drops it, so the zones are read beside it, a named one
+//! through `if_nametoindex`, and set on the servers' addresses. A zone that
+//! names no interface here is a configuration that can't be used: the
+//! fallback, reported as unparseable.
+//!
+//! **Only the first three nameservers** are used, as glibc's, musl's and
+//! the BSDs' resolvers use them (`MAXNS`): a later `nameserver` line, and
+//! its zone, are ignored.
 
 use std::fmt;
 use std::future::Future;
@@ -23,7 +49,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use hickory_resolver::config::ResolverConfig;
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::TokioResolver;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
@@ -47,18 +73,299 @@ pub trait NameLookup: fmt::Debug + Send + Sync {
 #[error("the name couldn't be resolved: {0}")]
 pub struct LookupError(pub String);
 
-/// hickory's resolver, over the system's DNS configuration, or Cloudflare's
-/// resolvers if it can't be read.
-pub(crate) fn system_lookup() -> Arc<dyn NameLookup> {
-    let resolver = match TokioResolver::builder_tokio() {
-        Ok(builder) => builder.build(),
-        Err(_) => TokioResolver::builder_with_config(
-            ResolverConfig::cloudflare(),
-            TokioConnectionProvider::default(),
+/// The DNS configuration a `direct` network's own lookups use (see the
+/// module's documentation): the gate's resolver's and the libp2p
+/// transports' DNS layer's, chosen once, when the network is built.
+#[derive(Clone, Debug)]
+pub struct DnsConfig {
+    config: ResolverConfig,
+    options: ResolverOpts,
+    source: DnsSource,
+}
+
+/// Where a [`DnsConfig`] came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DnsSource {
+    /// The system's configuration: on Unix, `/etc/resolv.conf`, as read
+    /// and parsed; on Windows, the system's.
+    System,
+    /// The built-in fallback, Cloudflare's resolvers, because the system's
+    /// configuration couldn't be used.
+    Fallback(DnsFallback),
+    /// A configuration the host (or a test) gave ([`DnsConfig::custom`]).
+    Custom,
+}
+
+/// Why a [`DnsConfig`] is the built-in fallback.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum DnsFallback {
+    /// The system's configuration couldn't be read: the error.
+    #[error("the system's DNS configuration couldn't be read: {0}")]
+    Unreadable(String),
+    /// It was read, but couldn't be parsed, or named no nameserver: why.
+    #[error("the system's DNS configuration couldn't be parsed: {0}")]
+    Unparseable(String),
+    /// This platform has no system DNS configuration to read.
+    #[error("this platform has no system DNS configuration to read")]
+    Unsupported,
+}
+
+impl fmt::Display for DnsSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::System => f.write_str("the system's DNS configuration"),
+            Self::Fallback(why) => write!(f, "Cloudflare's resolvers, the fallback: {why}"),
+            Self::Custom => f.write_str("a DNS configuration the host gave"),
+        }
+    }
+}
+
+impl DnsConfig {
+    /// The system's configuration, read now; the fallback, and why, only
+    /// where it can't be read or parsed.
+    pub fn system() -> Self {
+        #[cfg(unix)]
+        {
+            Self::from_resolv_conf(std::path::Path::new("/etc/resolv.conf"))
+        }
+        #[cfg(windows)]
+        {
+            match hickory_resolver::system_conf::read_system_conf() {
+                Ok((config, options)) => {
+                    Self::absolute(config.name_servers().to_vec(), options, DnsSource::System)
+                }
+                Err(err) => Self::fallback(DnsFallback::Unreadable(err.to_string())),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self::fallback(DnsFallback::Unsupported)
+        }
+    }
+
+    /// `path` read and parsed as a resolv.conf, as [`DnsConfig::system`]
+    /// reads `/etc/resolv.conf`: its first three nameservers, their zones
+    /// kept. The fallback, and why, where it can't be read, can't be
+    /// parsed, names no nameserver, or gives one of those three a zone that
+    /// names no interface here.
+    #[cfg(unix)]
+    pub fn from_resolv_conf(path: &std::path::Path) -> Self {
+        let data = match std::fs::read(path) {
+            Ok(data) => data,
+            Err(err) => return Self::fallback(DnsFallback::Unreadable(err.to_string())),
+        };
+        // Only the first three nameservers are used: hickory never sees a
+        // later `nameserver` line, so a malformed one can't fail the file.
+        let data = first_nameservers_only(&data);
+        let (config, options) = match hickory_resolver::system_conf::parse_resolv_conf(&data) {
+            Ok(parsed) => parsed,
+            Err(err) => return Self::fallback(DnsFallback::Unparseable(err.to_string())),
+        };
+        match zoned(config.name_servers(), &data) {
+            Ok(servers) => Self::absolute(servers, options, DnsSource::System),
+            Err(why) => Self::fallback(DnsFallback::Unparseable(why)),
+        }
+    }
+
+    /// A configuration the host gives whole, or a test's fixture server:
+    /// its nameservers and options, its names looked up as written (no
+    /// search list or domain, `ndots` 0).
+    pub fn custom(config: ResolverConfig, options: ResolverOpts) -> Self {
+        Self::absolute(config.name_servers().to_vec(), options, DnsSource::Custom)
+    }
+
+    /// The built-in fallback, Cloudflare's resolvers, for `why`.
+    fn fallback(why: DnsFallback) -> Self {
+        Self::absolute(
+            ResolverConfig::cloudflare().name_servers().to_vec(),
+            ResolverOpts::default(),
+            DnsSource::Fallback(why),
         )
-        .build(),
-    };
-    Arc::new(HickoryLookup(resolver))
+    }
+
+    /// `servers` with `options`, every name looked up exactly as written
+    /// (see the module's documentation): no search list, no domain, and
+    /// `ndots` 0.
+    fn absolute(
+        servers: Vec<NameServerConfig>,
+        mut options: ResolverOpts,
+        source: DnsSource,
+    ) -> Self {
+        options.ndots = 0;
+        Self {
+            config: ResolverConfig::from_parts(None, Vec::new(), servers),
+            options,
+            source,
+        }
+    }
+
+    /// Where this configuration came from: the system's, or the fallback
+    /// and why.
+    pub fn source(&self) -> &DnsSource {
+        &self.source
+    }
+
+    /// The resolvers it asks, and how.
+    pub fn config(&self) -> &ResolverConfig {
+        &self.config
+    }
+
+    pub fn options(&self) -> &ResolverOpts {
+        &self.options
+    }
+
+    /// A resolver over this configuration.
+    pub(crate) fn resolver(&self) -> TokioResolver {
+        TokioResolver::builder_with_config(self.config.clone(), TokioConnectionProvider::default())
+            .with_options(self.options.clone())
+            .build()
+    }
+
+    /// The gate's resolver's lookups over this configuration.
+    pub(crate) fn lookup(&self) -> Arc<dyn NameLookup> {
+        Arc::new(HickoryLookup(self.resolver()))
+    }
+}
+
+/// The most nameservers a resolv.conf names that are used: glibc's,
+/// musl's and the BSDs' `MAXNS`. Later `nameserver` lines are ignored, as
+/// those resolvers ignore them, whatever they hold: they are removed before
+/// the file is parsed.
+#[cfg(unix)]
+const MAX_NAMESERVERS: usize = 3;
+
+/// The resolv.conf `data` with every `nameserver` line after the first
+/// [`MAX_NAMESERVERS`] emptied, so neither hickory's parser nor the zone
+/// scan reads it. Every other line stays as it is, in its place, and so
+/// does the line count.
+#[cfg(unix)]
+fn first_nameservers_only(data: &[u8]) -> Vec<u8> {
+    let mut seen = 0;
+    let mut kept = Vec::with_capacity(data.len());
+    for (index, line) in data.split(|&byte| byte == b'\n').enumerate() {
+        if index > 0 {
+            kept.push(b'\n');
+        }
+        if std::str::from_utf8(line).is_ok_and(|line| directive(line).next() == Some("nameserver"))
+        {
+            seen += 1;
+            if seen > MAX_NAMESERVERS {
+                continue;
+            }
+        }
+        kept.extend_from_slice(line);
+    }
+    kept
+}
+
+/// A resolv.conf line's words, as resolv-conf (hickory's parser) reads
+/// them: a line whose first character other than a space or tab is `#` or
+/// `;` is a comment, and so is everything after one.
+#[cfg(unix)]
+fn directive(line: &str) -> std::str::SplitWhitespace<'_> {
+    line.split(['#', ';'])
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+}
+
+/// `servers`, as hickory parsed them from the resolv.conf `data` (its
+/// first [`MAX_NAMESERVERS`] `nameserver` lines, [`first_nameservers_only`]),
+/// each with the zone its line gives its address: hickory 0.25 builds every
+/// server's address from the IP alone. A numeric zone is the interface's
+/// index; a named one is looked up (`if_nametoindex`). Hickory gives two
+/// servers per `nameserver` line, UDP then TCP, in the file's order; a
+/// zone that names no interface, or servers that don't line up with the
+/// lines, are an error.
+#[cfg(unix)]
+fn zoned(servers: &[NameServerConfig], data: &[u8]) -> Result<Vec<NameServerConfig>, String> {
+    let lines = nameserver_lines(data)?;
+    if servers.len() != 2 * lines.len() {
+        return Err(format!(
+            "{} nameserver lines, but {} servers parsed",
+            lines.len(),
+            servers.len()
+        ));
+    }
+    servers
+        .iter()
+        .zip(lines.iter().flat_map(|line| [line, line]))
+        .map(|(server, line)| {
+            if server.socket_addr.ip() != line.ip {
+                return Err(format!(
+                    "nameserver {} parsed as {}",
+                    line.address, server.socket_addr
+                ));
+            }
+            let mut server = server.clone();
+            if let (SocketAddr::V6(addr), Some(zone)) = (&mut server.socket_addr, line.zone) {
+                let index = zone_index(zone).ok_or_else(|| {
+                    format!("nameserver {}: no interface {zone} here", line.address)
+                })?;
+                addr.set_scope_id(index);
+            }
+            Ok(server)
+        })
+        .collect()
+}
+
+/// One `nameserver` line of a resolv.conf.
+#[cfg(unix)]
+struct NameserverLine<'a> {
+    /// Its address, without the zone.
+    ip: IpAddr,
+    /// The address as written, zone included.
+    address: &'a str,
+    /// Its zone, as written: an interface's index or name.
+    zone: Option<&'a str>,
+}
+
+/// Each of the first [`MAX_NAMESERVERS`] `nameserver` lines, in the
+/// file's order, its words read as [`directive`] reads them. A later line
+/// isn't parsed.
+#[cfg(unix)]
+fn nameserver_lines(data: &[u8]) -> Result<Vec<NameserverLine<'_>>, String> {
+    let mut lines = Vec::new();
+    for line in data.split(|&byte| byte == b'\n') {
+        if lines.len() == MAX_NAMESERVERS {
+            break;
+        }
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let mut words = directive(line);
+        if words.next() != Some("nameserver") {
+            continue;
+        }
+        let Some(address) = words.next() else {
+            continue;
+        };
+        let (ip, zone) = match address.split_once('%') {
+            Some((ip, zone)) => (ip, Some(zone)),
+            None => (address, None),
+        };
+        let ip: IpAddr = ip
+            .parse()
+            .map_err(|_| format!("nameserver {address} isn't an address"))?;
+        lines.push(NameserverLine { ip, address, zone });
+    }
+    Ok(lines)
+}
+
+/// A zone's interface index: a number as it is, a name through
+/// `if_nametoindex`; `None` for a name no interface has.
+#[cfg(unix)]
+fn zone_index(zone: &str) -> Option<u32> {
+    if let Ok(index) = zone.parse::<u32>() {
+        return Some(index);
+    }
+    let name = std::ffi::CString::new(zone).ok()?;
+    // SAFETY: `name` is a NUL-terminated string that outlives the call,
+    // which only reads it.
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    (index != 0).then_some(index)
 }
 
 struct HickoryLookup(TokioResolver);
@@ -72,7 +379,8 @@ impl fmt::Debug for HickoryLookup {
 impl NameLookup for HickoryLookup {
     fn lookup(&self, name: &str) -> LookupFuture {
         let resolver = self.0.clone();
-        // A fully qualified name: the system's search domains don't apply.
+        // Looked up exactly as written, an absolute name (see the module's
+        // documentation).
         let name = format!("{name}.");
         Box::pin(async move {
             resolver

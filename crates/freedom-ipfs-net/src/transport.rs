@@ -24,6 +24,15 @@
 //! Under the legacy policy the transports are those the crates built before,
 //! by the same constructors, behind a capability-only outer gate.
 //!
+//! **DNS.** Under `direct`, the DNS layer and the `/dnsaddr` expansion ask
+//! the network's own DNS configuration ([`Network::dns`]): the one the
+//! gate's HTTP resolver asks, the system's, or the fallback only where that
+//! can't be read or parsed. Every name is looked up exactly as written,
+//! with no search list ([`crate::resolve`]): a peer's `/dns4/intranet` is
+//! `intranet.`, never the user's `intranet.<search domain>`. Under the
+//! legacy policy they ask Cloudflare's resolvers, as the crates' swarms did
+//! before.
+//!
 //! Under `socks5` (cargo feature `socks`) every dial goes through the proxy
 //! (`Socks5Transport`), behind the outer gate: no QUIC, no DNS layer, and
 //! no `/dnsaddr` expansion, which would need a local lookup.
@@ -486,6 +495,7 @@ where
 pub struct Transports {
     network: Network,
     dns: ResolverConfig,
+    options: ResolverOpts,
 }
 
 /// Why a transport couldn't be built: a security upgrade refused the
@@ -496,12 +506,21 @@ pub type TransportBuildError = Box<dyn StdError + Send + Sync>;
 pub type SwarmTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
 impl Transports {
-    /// `network`'s transports, with libp2p's DNS layer asking Cloudflare's
-    /// resolvers, as the crates' swarms did before.
+    /// `network`'s transports. Under `direct`, libp2p's DNS layer and the
+    /// `/dnsaddr` expansion ask the network's DNS configuration
+    /// ([`Network::dns`]), as its HTTP clients' resolver does; under the
+    /// legacy policy, Cloudflare's resolvers, as the crates' swarms did
+    /// before. `socks5`'s transports have no DNS layer: names go to the
+    /// proxy.
     pub fn new(network: &Network) -> Self {
+        let (dns, options) = match network.dns() {
+            Some(dns) => (dns.config().clone(), dns.options().clone()),
+            None => (ResolverConfig::cloudflare(), ResolverOpts::default()),
+        };
         Self {
             network: network.clone(),
-            dns: ResolverConfig::cloudflare(),
+            dns,
+            options,
         }
     }
 
@@ -509,6 +528,7 @@ impl Transports {
     #[doc(hidden)]
     pub fn with_dns(mut self, dns: ResolverConfig) -> Self {
         self.dns = dns;
+        self.options = ResolverOpts::default();
         self
     }
 
@@ -518,12 +538,12 @@ impl Transports {
 
     fn resolver(&self) -> TokioResolver {
         TokioResolver::builder_with_config(self.dns.clone(), TokioConnectionProvider::default())
-            .with_options(ResolverOpts::default())
+            .with_options(self.options.clone())
             .build()
     }
 
     fn dns<T>(&self, inner: T) -> libp2p::dns::tokio::Transport<T> {
-        libp2p::dns::tokio::Transport::custom(inner, self.dns.clone(), ResolverOpts::default())
+        libp2p::dns::tokio::Transport::custom(inner, self.dns.clone(), self.options.clone())
     }
 
     fn gated(&self) -> bool {

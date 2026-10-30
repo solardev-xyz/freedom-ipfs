@@ -1020,6 +1020,7 @@ dependencies = [
  "hickory-resolver",
  "http",
  "hyper-util",
+ "libc",
  "libp2p",
  "libp2p-core",
  "libp2p-tcp",

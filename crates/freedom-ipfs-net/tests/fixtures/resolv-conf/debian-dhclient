@@ -1,0 +1,3 @@
+domain home.arpa
+search home.arpa
+nameserver 192.168.1.1
