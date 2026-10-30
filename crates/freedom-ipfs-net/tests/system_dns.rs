@@ -561,7 +561,8 @@ mod resolv_conf {
     /// A nameserver's zone is kept on both its servers (UDP and TCP): a
     /// numeric one as it is, a named one as its interface's index. A name
     /// no interface has here can't be used: the fallback, reported as
-    /// unparseable, with the zone named.
+    /// unparseable, with the zone named. Only the first three nameservers
+    /// count: a fourth, and its zone, are ignored.
     #[test]
     fn a_nameservers_zone_is_kept_or_reported() {
         let scratch = Scratch::new("zones");
@@ -583,6 +584,29 @@ mod resolv_conf {
                 })
                 .collect();
             assert_eq!(zoned, [scope, scope], "{file}: UDP and TCP");
+        }
+        // Only the first three nameservers are used, as glibc's, musl's and
+        // the BSDs' resolvers use them: a usable fourth one is ignored, and
+        // so is a fourth one's zone that names no interface.
+        let first_three = [
+            "192.0.2.1:53".parse::<SocketAddr>().unwrap(),
+            SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 53, 0, 3)),
+            "192.0.2.2:53".parse().unwrap(),
+        ];
+        for (file, fourth) in [
+            ("fourth", "fe80::2%4"),
+            ("fourth-unknown", "fe80::2%nosuchif0"),
+        ] {
+            let path = scratch.file(
+                file,
+                &format!(
+                    "nameserver 192.0.2.1\nnameserver fe80::1%3\nnameserver 192.0.2.2\n\
+                     nameserver {fourth}\n"
+                ),
+            );
+            let dns = DnsConfig::from_resolv_conf(&path);
+            assert_eq!(dns.source(), &DnsSource::System, "{file}");
+            assert_eq!(servers(dns.config()), first_three, "{file}");
         }
         let path = scratch.file("unknown", "nameserver fe80::1%nosuchif0\n");
         let dns = DnsConfig::from_resolv_conf(&path);

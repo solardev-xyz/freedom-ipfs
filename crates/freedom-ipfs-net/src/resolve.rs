@@ -38,6 +38,10 @@
 //! through `if_nametoindex`, and set on the servers' addresses. A zone that
 //! names no interface here is a configuration that can't be used: the
 //! fallback, reported as unparseable.
+//!
+//! **Only the first three nameservers** are used, as glibc's, musl's and
+//! the BSDs' resolvers use them (`MAXNS`): a later `nameserver` line, and
+//! its zone, are ignored.
 
 use std::fmt;
 use std::future::Future;
@@ -142,9 +146,10 @@ impl DnsConfig {
     }
 
     /// `path` read and parsed as a resolv.conf, as [`DnsConfig::system`]
-    /// reads `/etc/resolv.conf`, its nameservers' zones kept: the fallback,
-    /// and why, where it can't be read, can't be parsed, names no
-    /// nameserver, or gives a zone that names no interface here.
+    /// reads `/etc/resolv.conf`: its first three nameservers, their zones
+    /// kept. The fallback, and why, where it can't be read, can't be
+    /// parsed, names no nameserver, or gives one of those three a zone that
+    /// names no interface here.
     #[cfg(unix)]
     pub fn from_resolv_conf(path: &std::path::Path) -> Self {
         let data = match std::fs::read(path) {
@@ -221,13 +226,20 @@ impl DnsConfig {
     }
 }
 
-/// `servers`, as hickory parsed them from the resolv.conf `data`, with the
-/// zone each `nameserver` line gives its address: hickory 0.25 builds every
-/// server's address from the IP alone. A numeric zone is the interface's
-/// index; a named one is looked up (`if_nametoindex`). Hickory gives two
-/// servers per `nameserver` line, UDP then TCP, in the file's order; a
-/// zone that names no interface, or servers that don't line up with the
-/// lines, are an error.
+/// The most nameservers a resolv.conf names that are used: glibc's,
+/// musl's and the BSDs' `MAXNS`. Later `nameserver` lines are ignored, as
+/// those resolvers ignore them.
+#[cfg(unix)]
+const MAX_NAMESERVERS: usize = 3;
+
+/// `servers`, as hickory parsed them from the resolv.conf `data`: those of
+/// its first [`MAX_NAMESERVERS`] `nameserver` lines, each with the zone its
+/// line gives its address (hickory 0.25 builds every server's address from
+/// the IP alone). A numeric zone is the interface's index; a named one is
+/// looked up (`if_nametoindex`). Hickory gives two servers per `nameserver`
+/// line, UDP then TCP, in the file's order; a used line's zone that names
+/// no interface, or servers that don't line up with the lines, are an
+/// error. A later line's zone is never looked up.
 #[cfg(unix)]
 fn zoned(servers: &[NameServerConfig], data: &[u8]) -> Result<Vec<NameServerConfig>, String> {
     let lines = nameserver_lines(data)?;
@@ -241,25 +253,43 @@ fn zoned(servers: &[NameServerConfig], data: &[u8]) -> Result<Vec<NameServerConf
     servers
         .iter()
         .zip(lines.iter().flat_map(|line| [line, line]))
-        .map(|(server, &(ip, zone))| {
-            if server.socket_addr.ip() != ip {
-                return Err(format!("nameserver {ip} parsed as {}", server.socket_addr));
+        .take(2 * MAX_NAMESERVERS)
+        .map(|(server, line)| {
+            if server.socket_addr.ip() != line.ip {
+                return Err(format!(
+                    "nameserver {} parsed as {}",
+                    line.address, server.socket_addr
+                ));
             }
             let mut server = server.clone();
-            if let (SocketAddr::V6(addr), Some(zone)) = (&mut server.socket_addr, zone) {
-                addr.set_scope_id(zone);
+            if let (SocketAddr::V6(addr), Some(zone)) = (&mut server.socket_addr, line.zone) {
+                let index = zone_index(zone).ok_or_else(|| {
+                    format!("nameserver {}: no interface {zone} here", line.address)
+                })?;
+                addr.set_scope_id(index);
             }
             Ok(server)
         })
         .collect()
 }
 
-/// Each `nameserver` line's address and zone index, in the file's order,
-/// read as resolv-conf (hickory's parser) reads the lines: a line whose
-/// first character other than a space or tab is `#` or `;` is a comment,
-/// and so is everything after one.
+/// One `nameserver` line of a resolv.conf.
 #[cfg(unix)]
-fn nameserver_lines(data: &[u8]) -> Result<Vec<(IpAddr, Option<u32>)>, String> {
+struct NameserverLine<'a> {
+    /// Its address, without the zone.
+    ip: IpAddr,
+    /// The address as written, zone included.
+    address: &'a str,
+    /// Its zone, as written: an interface's index or name.
+    zone: Option<&'a str>,
+}
+
+/// Each `nameserver` line, in the file's order, read as resolv-conf
+/// (hickory's parser) reads the lines: a line whose first character other
+/// than a space or tab is `#` or `;` is a comment, and so is everything
+/// after one.
+#[cfg(unix)]
+fn nameserver_lines(data: &[u8]) -> Result<Vec<NameserverLine<'_>>, String> {
     let mut lines = Vec::new();
     for line in data.split(|&byte| byte == b'\n') {
         let Ok(line) = std::str::from_utf8(line) else {
@@ -283,14 +313,7 @@ fn nameserver_lines(data: &[u8]) -> Result<Vec<(IpAddr, Option<u32>)>, String> {
         let ip: IpAddr = ip
             .parse()
             .map_err(|_| format!("nameserver {address} isn't an address"))?;
-        let zone = match zone {
-            None => None,
-            Some(zone) => Some(
-                zone_index(zone)
-                    .ok_or_else(|| format!("nameserver {address}: no interface {zone} here"))?,
-            ),
-        };
-        lines.push((ip, zone));
+        lines.push(NameserverLine { ip, address, zone });
     }
     Ok(lines)
 }
