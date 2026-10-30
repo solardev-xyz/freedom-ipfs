@@ -21,8 +21,9 @@ pub const DEFAULT_UNIXFS_METADATA_CACHE_CAPACITY: usize = 256;
 pub const DEFAULT_UNIXFS_METADATA_CACHE_MAX_BYTES: usize = 1024 * 1024;
 
 const HAMT_MURMUR3_X64_64: u64 = 0x22;
-const HAMT_FANOUT_256: u64 = 256;
-const HAMT_LINK_PREFIX_LEN: usize = 2;
+/// The HAMT fanouts read, as boxo reads them: the powers of two from 8 to
+/// 1024.
+const HAMT_FANOUTS: std::ops::RangeInclusive<u64> = 8..=1024;
 const HAMT_MAX_SHARDS_VISITED: usize = 1024;
 const UNIXFS_METADATA_CACHE_MAX_BLOCK_BYTES: usize = 64 * 1024;
 const UNIXFS_PATH_CACHE_MAX_PATH_BYTES: usize = 1024;
@@ -1054,10 +1055,10 @@ impl UnixfsContext<'_> {
         node: &PbNode,
         data: &UnixfsData,
     ) -> Result<Vec<DirectoryEntry>> {
-        validate_hamt(data)?;
+        let root = validate_hamt(data)?;
         let mut entries = Vec::new();
         let mut pending = Vec::new();
-        collect_hamt_entries(&node.links, &mut entries, &mut pending)?;
+        collect_hamt_entries(&node.links, root.prefix_len, &mut entries, &mut pending)?;
 
         let mut visited = 0usize;
         while let Some(cid) = pending.pop() {
@@ -1077,8 +1078,13 @@ impl UnixfsContext<'_> {
                     "HAMT bucket link did not resolve to a HAMT shard".into(),
                 ));
             }
-            validate_hamt(&shard.data)?;
-            collect_hamt_entries(&shard.node.links, &mut entries, &mut pending)?;
+            let layout = validate_hamt(&shard.data)?;
+            collect_hamt_entries(
+                &shard.node.links,
+                layout.prefix_len,
+                &mut entries,
+                &mut pending,
+            )?;
         }
 
         Ok(entries)
@@ -1327,37 +1333,10 @@ impl UnixfsContext<'_> {
     }
 
     fn find_hamt_link(&self, node: &PbNode, data: &UnixfsData, name: &str) -> Result<Option<Cid>> {
-        validate_hamt(data)?;
-        let mut pending = Vec::new();
-        if let Some(cid) = scan_hamt_links(&node.links, name, &mut pending)? {
-            return Ok(Some(cid));
-        }
-
-        let mut visited = 0usize;
-        while let Some(cid) = pending.pop() {
-            visited += 1;
-            if visited > HAMT_MAX_SHARDS_VISITED {
-                return Err(UnixfsError::InvalidDagPb(format!(
-                    "HAMT traversal exceeded {HAMT_MAX_SHARDS_VISITED} shards"
-                )));
-            }
-            if cid.codec() != CODEC_DAG_PB {
-                return Err(UnixfsError::NotDirectory);
-            }
-
-            let shard = self.dag_pb(&cid)?;
-            if shard.kind != DataType::HamtShard {
-                return Err(UnixfsError::InvalidDagPb(
-                    "HAMT bucket link did not resolve to a HAMT shard".into(),
-                ));
-            }
-            validate_hamt(&shard.data)?;
-            if let Some(cid) = scan_hamt_links(&shard.node.links, name, &mut pending)? {
-                return Ok(Some(cid));
-            }
-        }
-
-        Ok(None)
+        self.find_hamt_entry(node, data, name)?
+            .as_ref()
+            .map(link_cid)
+            .transpose()
     }
 
     fn find_hamt_link_target(
@@ -1366,37 +1345,77 @@ impl UnixfsContext<'_> {
         data: &UnixfsData,
         name: &str,
     ) -> Result<Option<LinkTarget>> {
-        validate_hamt(data)?;
-        let mut pending = Vec::new();
-        if let Some(target) = scan_hamt_link_targets(&node.links, name, &mut pending)? {
-            return Ok(Some(target));
-        }
+        self.find_hamt_entry(node, data, name)?
+            .as_ref()
+            .map(link_target)
+            .transpose()
+    }
 
-        let mut visited = 0usize;
-        while let Some(cid) = pending.pop() {
-            visited += 1;
-            if visited > HAMT_MAX_SHARDS_VISITED {
-                return Err(UnixfsError::InvalidDagPb(format!(
-                    "HAMT traversal exceeded {HAMT_MAX_SHARDS_VISITED} shards"
-                )));
+    /// `name`'s link in the HAMT whose root shard is `node`, found as the
+    /// UnixFS spec's HAMT lookup does (and boxo's): the name's
+    /// murmur3-x64-64 hash, read from its most significant end, gives each
+    /// shard log2(fanout) bits, its bucket. The shard's bitfield says
+    /// whether the bucket is occupied, and its link is the one at the
+    /// bucket's rank among the occupied buckets. That link's name starts
+    /// with the bucket's index in uppercase hex, as many digits as
+    /// fanout - 1 has: named by the index alone, it is the next level's
+    /// shard; by the index and `name`, the entry. An unoccupied bucket, or
+    /// a link named otherwise, means `name` isn't in the directory. A
+    /// lookup reads one shard a level, until the 64-bit hash has too few
+    /// bits left for a bucket: at most 21 levels, at fanout 8.
+    fn find_hamt_entry(
+        &self,
+        node: &PbNode,
+        data: &UnixfsData,
+        name: &str,
+    ) -> Result<Option<PbLink>> {
+        let hash = murmur3_x64_64(name.as_bytes());
+        let mut used = 0;
+        let mut next: Option<DecodedDagPb> = None;
+        loop {
+            let (links, data) = next.as_ref().map_or((&node.links, data), |shard| {
+                (&shard.node.links, &shard.data)
+            });
+            let shard = validate_hamt(data)?;
+            if used + shard.bits > u64::BITS {
+                return Err(UnixfsError::InvalidDagPb(
+                    "HAMT deeper than its 64-bit hash".into(),
+                ));
             }
+            let bucket = (hash << used >> (u64::BITS - shard.bits)) as usize;
+            used += shard.bits;
+            if !shard.occupied(bucket) {
+                return Ok(None);
+            }
+            let link = links.get(shard.rank(bucket)).ok_or_else(|| {
+                UnixfsError::InvalidDagPb("HAMT bitfield has more buckets than links".into())
+            })?;
+            // boxo takes the prefix's length and doesn't compare it; a link
+            // at this rank under another bucket's prefix is malformed, and
+            // the name is absent (as freedom-core's reader has it).
+            let prefix = format!("{bucket:0width$X}", width = shard.prefix_len);
+            let Some(rest) = link
+                .name
+                .as_deref()
+                .and_then(|link_name| link_name.strip_prefix(prefix.as_str()))
+            else {
+                return Ok(None);
+            };
+            if !rest.is_empty() {
+                return Ok((rest == name).then(|| link.clone()));
+            }
+            let cid = link_cid(link)?;
             if cid.codec() != CODEC_DAG_PB {
                 return Err(UnixfsError::NotDirectory);
             }
-
             let shard = self.dag_pb(&cid)?;
             if shard.kind != DataType::HamtShard {
                 return Err(UnixfsError::InvalidDagPb(
                     "HAMT bucket link did not resolve to a HAMT shard".into(),
                 ));
             }
-            validate_hamt(&shard.data)?;
-            if let Some(target) = scan_hamt_link_targets(&shard.node.links, name, &mut pending)? {
-                return Ok(Some(target));
-            }
+            next = Some(shard);
         }
-
-        Ok(None)
     }
 }
 
@@ -1428,6 +1447,7 @@ fn directory_entries(links: &[PbLink]) -> Result<Vec<DirectoryEntry>> {
 
 fn collect_hamt_entries(
     links: &[PbLink],
+    prefix_len: usize,
     entries: &mut Vec<DirectoryEntry>,
     pending: &mut Vec<Cid>,
 ) -> Result<()> {
@@ -1436,11 +1456,11 @@ fn collect_hamt_entries(
             continue;
         };
         let link_name = link_name.as_bytes();
-        if link_name.len() == HAMT_LINK_PREFIX_LEN {
+        if link_name.len() == prefix_len {
             pending.push(link_cid(link)?);
-        } else if link_name.len() > HAMT_LINK_PREFIX_LEN {
+        } else if link_name.len() > prefix_len {
             entries.push(DirectoryEntry {
-                name: String::from_utf8_lossy(&link_name[HAMT_LINK_PREFIX_LEN..]).to_string(),
+                name: String::from_utf8_lossy(&link_name[prefix_len..]).to_string(),
                 cid: link_cid(link)?,
                 size: link.tsize,
             });
@@ -1709,57 +1729,139 @@ fn find_link_target(node: &PbNode, name: &str) -> Result<Option<LinkTarget>> {
         .transpose()
 }
 
-fn validate_hamt(data: &UnixfsData) -> Result<()> {
-    if data.hash_type != Some(HAMT_MURMUR3_X64_64) || data.fanout != Some(HAMT_FANOUT_256) {
+/// A HAMT shard's layout, read from its UnixFS data as boxo's `makeShard`
+/// reads it.
+struct HamtLayout<'a> {
+    /// The hash bits a bucket takes: log2(fanout).
+    bits: u32,
+    /// The hex digits of a link's bucket prefix: as many as fanout - 1 has.
+    prefix_len: usize,
+    /// The occupied buckets: a big-endian integer whose bit `i` is bucket
+    /// `i`, its leading zero bytes possibly left out.
+    bitfield: &'a [u8],
+}
+
+impl HamtLayout<'_> {
+    fn occupied(&self, bucket: usize) -> bool {
+        let bytes = self.bitfield.len();
+        bucket / 8 < bytes && self.bitfield[bytes - 1 - bucket / 8] >> (bucket % 8) & 1 == 1
+    }
+
+    /// The occupied buckets below `bucket`: the index of its link.
+    fn rank(&self, bucket: usize) -> usize {
+        let bytes = self.bitfield.len();
+        let whole = (bucket / 8).min(bytes);
+        let mut rank: u32 = self.bitfield[bytes - whole..]
+            .iter()
+            .map(|byte| byte.count_ones())
+            .sum();
+        if bucket / 8 < bytes {
+            let below = (1u8 << (bucket % 8)) - 1;
+            rank += (self.bitfield[bytes - 1 - bucket / 8] & below).count_ones();
+        }
+        rank as usize
+    }
+}
+
+/// A HAMT shard's layout, or an error when boxo wouldn't read it: a hash
+/// other than murmur3-x64-64, a fanout other than a power of two from 8 to
+/// 1024, a bitfield wider than fanout / 8 bytes, or file fields.
+fn validate_hamt(data: &UnixfsData) -> Result<HamtLayout<'_>> {
+    let fanout = data
+        .fanout
+        .filter(|fanout| fanout.is_power_of_two() && HAMT_FANOUTS.contains(fanout));
+    let (Some(HAMT_MURMUR3_X64_64), Some(fanout)) = (data.hash_type, fanout) else {
         return Err(UnixfsError::InvalidDagPb(format!(
             "unsupported HAMT parameters hashType={:?} fanout={:?}",
             data.hash_type, data.fanout
         )));
-    }
+    };
     if data.filesize.is_some() || !data.blocksizes.is_empty() {
         return Err(UnixfsError::InvalidDagPb(
             "HAMT shard carried file-only UnixFS fields".into(),
         ));
     }
-    Ok(())
+    let bitfield = data.data.as_deref().unwrap_or_default();
+    if bitfield.len() as u64 > fanout / 8 {
+        return Err(UnixfsError::InvalidDagPb(format!(
+            "HAMT bitfield of {} bytes, more than fanout {fanout}'s {}",
+            bitfield.len(),
+            fanout / 8
+        )));
+    }
+    Ok(HamtLayout {
+        bits: fanout.trailing_zeros(),
+        prefix_len: format!("{:X}", fanout - 1).len(),
+        bitfield,
+    })
 }
 
-fn scan_hamt_links(links: &[PbLink], name: &str, pending: &mut Vec<Cid>) -> Result<Option<Cid>> {
-    for link in links {
-        let Some(link_name) = link.name.as_deref() else {
-            continue;
-        };
-        let link_name = link_name.as_bytes();
-        if link_name.len() == HAMT_LINK_PREFIX_LEN {
-            pending.push(link_cid(link)?);
-        } else if link_name.len() > HAMT_LINK_PREFIX_LEN
-            && &link_name[HAMT_LINK_PREFIX_LEN..] == name.as_bytes()
-        {
-            return link_cid(link).map(Some);
-        }
-    }
-    Ok(None)
+/// MurmurHash3 x64 128 (Austin Appleby's), its first 64 bits (`h1`): the
+/// UnixFS HAMT's hash function, multicodec murmur3-x64-64 (0x22), as
+/// go-unixfs and boxo take it from `murmur3.Sum64`.
+fn murmur3_x64_64(key: &[u8]) -> u64 {
+    murmur3_x64_128(key, 0).0
 }
 
-fn scan_hamt_link_targets(
-    links: &[PbLink],
-    name: &str,
-    pending: &mut Vec<Cid>,
-) -> Result<Option<LinkTarget>> {
-    for link in links {
-        let Some(link_name) = link.name.as_deref() else {
-            continue;
-        };
-        let link_name = link_name.as_bytes();
-        if link_name.len() == HAMT_LINK_PREFIX_LEN {
-            pending.push(link_cid(link)?);
-        } else if link_name.len() > HAMT_LINK_PREFIX_LEN
-            && &link_name[HAMT_LINK_PREFIX_LEN..] == name.as_bytes()
-        {
-            return link_target(link).map(Some);
+/// MurmurHash3 x64 128 of `key` with `seed`: `(h1, h2)`.
+fn murmur3_x64_128(key: &[u8], seed: u32) -> (u64, u64) {
+    const C1: u64 = 0x87c3_7b91_1142_53d5;
+    const C2: u64 = 0x4cf5_ad43_2745_937f;
+    let mix_k1 = |k1: u64| k1.wrapping_mul(C1).rotate_left(31).wrapping_mul(C2);
+    let mix_k2 = |k2: u64| k2.wrapping_mul(C2).rotate_left(33).wrapping_mul(C1);
+    let (mut h1, mut h2) = (u64::from(seed), u64::from(seed));
+    let mut blocks = key.chunks_exact(16);
+    for block in &mut blocks {
+        let (low, high) = block.split_at(8);
+        let k1 = u64::from_le_bytes(low.try_into().unwrap_or_default());
+        let k2 = u64::from_le_bytes(high.try_into().unwrap_or_default());
+        h1 ^= mix_k1(k1);
+        h1 = h1
+            .rotate_left(27)
+            .wrapping_add(h2)
+            .wrapping_mul(5)
+            .wrapping_add(0x52dc_e729);
+        h2 ^= mix_k2(k2);
+        h2 = h2
+            .rotate_left(31)
+            .wrapping_add(h1)
+            .wrapping_mul(5)
+            .wrapping_add(0x3849_5ab5);
+    }
+    let tail = blocks.remainder();
+    let (mut k1, mut k2) = (0u64, 0u64);
+    for (index, &byte) in tail.iter().enumerate() {
+        if index < 8 {
+            k1 |= u64::from(byte) << (8 * index);
+        } else {
+            k2 |= u64::from(byte) << (8 * (index - 8));
         }
     }
-    Ok(None)
+    if tail.len() > 8 {
+        h2 ^= mix_k2(k2);
+    }
+    if !tail.is_empty() {
+        h1 ^= mix_k1(k1);
+    }
+    let len = key.len() as u64;
+    h1 ^= len;
+    h2 ^= len;
+    h1 = h1.wrapping_add(h2);
+    h2 = h2.wrapping_add(h1);
+    h1 = fmix64(h1);
+    h2 = fmix64(h2);
+    h1 = h1.wrapping_add(h2);
+    h2 = h2.wrapping_add(h1);
+    (h1, h2)
+}
+
+fn fmix64(mut k: u64) -> u64 {
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    k ^= k >> 33;
+    k = k.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    k ^= k >> 33;
+    k
 }
 
 fn link_target(link: &PbLink) -> Result<LinkTarget> {
@@ -1837,21 +1939,52 @@ mod tests {
     }
 
     fn pb_hamt(links: Vec<PbLink>) -> Vec<u8> {
+        pb_hamt_at(256, links)
+    }
+
+    /// A HAMT shard at `fanout` as boxo writes one: each link's bucket read
+    /// from its name's hex prefix, the links in bucket order, and a
+    /// bitfield of exactly their buckets, its leading zero bytes left out.
+    fn pb_hamt_at(fanout: u64, mut links: Vec<PbLink>) -> Vec<u8> {
+        let width = format!("{:X}", fanout - 1).len();
+        let bucket_of = |link: &PbLink| {
+            usize::from_str_radix(&link.name.as_deref().unwrap()[..width], 16).unwrap()
+        };
+        links.sort_by_key(bucket_of);
+        let buckets: Vec<usize> = links.iter().map(bucket_of).collect();
+        let mut bitfield = hamt_bitfield(&buckets, (fanout / 8) as usize);
+        let zeros = bitfield.iter().take_while(|&&byte| byte == 0).count();
+        bitfield.drain(..zeros);
+        hamt_shard(fanout, bitfield, links)
+    }
+
+    /// A HAMT shard at `fanout` with exactly this bitfield and these links.
+    fn hamt_shard(fanout: u64, bitfield: Vec<u8>, links: Vec<PbLink>) -> Vec<u8> {
         PbNode {
             data: Some(
                 UnixfsData {
                     r#type: Some(DataType::HamtShard as i32),
-                    data: Some(vec![0xff; (HAMT_FANOUT_256 / 8) as usize]),
+                    data: Some(bitfield),
                     filesize: None,
                     blocksizes: Vec::new(),
                     hash_type: Some(HAMT_MURMUR3_X64_64),
-                    fanout: Some(HAMT_FANOUT_256),
+                    fanout: Some(fanout),
                 }
                 .encode_to_vec(),
             ),
             links,
         }
         .encode_to_vec()
+    }
+
+    /// A `bytes`-byte HAMT bitfield with these buckets set: a big-endian
+    /// integer whose bit `i` is bucket `i`.
+    fn hamt_bitfield(buckets: &[usize], bytes: usize) -> Vec<u8> {
+        let mut bitfield = vec![0; bytes];
+        for &bucket in buckets {
+            bitfield[bytes - 1 - bucket / 8] |= 1 << (bucket % 8);
+        }
+        bitfield
     }
 
     fn link(name: &str, cid: &Cid) -> PbLink {
@@ -2837,6 +2970,362 @@ mod tests {
         }
     }
 
+    /// `name`'s bucket at `level` of a HAMT: two uppercase hex digits of
+    /// its hash's byte `level`, most significant first.
+    fn bucket(name: &str, level: usize) -> String {
+        format!(
+            "{:02X}",
+            murmur3_x64_64(name.as_bytes()).to_be_bytes()[level]
+        )
+    }
+
+    /// `count` bits of `name`'s hash from bit `from`, most significant
+    /// first, read off the hash written out in binary.
+    fn hash_bits(name: &str, from: usize, count: usize) -> usize {
+        let binary = format!("{:064b}", murmur3_x64_64(name.as_bytes()));
+        usize::from_str_radix(&binary[from..from + count], 2).unwrap()
+    }
+
+    /// `name`'s link prefix at `level` of a HAMT at `fanout`: its bucket,
+    /// the level's log2(fanout) bits of its hash, in as many uppercase hex
+    /// digits as fanout - 1 has.
+    fn prefix_at(name: &str, fanout: u64, level: usize) -> String {
+        let bits = fanout.trailing_zeros() as usize;
+        let width = format!("{:X}", fanout - 1).len();
+        format!("{:0width$X}", hash_bits(name, level * bits, bits))
+    }
+
+    /// A chain of HAMT shards at `fanout` along `name`'s buckets at levels
+    /// 0 to `levels - 1`, each linking the next, the last linking `bottom`;
+    /// the root's CID (`bottom`'s, if `levels` is 0).
+    fn hamt_chain(
+        blocks: &mut HashMap<Cid, Vec<u8>>,
+        fanout: u64,
+        name: &str,
+        levels: usize,
+        bottom: Vec<u8>,
+    ) -> Cid {
+        let mut block = bottom;
+        for level in (0..levels).rev() {
+            let cid = cid_from_data(CODEC_DAG_PB, &block);
+            blocks.insert(cid, block);
+            block = pb_hamt_at(fanout, vec![link(&prefix_at(name, fanout, level), &cid)]);
+        }
+        let root = cid_from_data(CODEC_DAG_PB, &block);
+        blocks.insert(root, block);
+        root
+    }
+
+    /// Every fanout boxo reads, the powers of two from 8 to 1024: a name's
+    /// bucket is the next log2(fanout) bits of its hash at each level, a
+    /// link's prefix has as many hex digits as fanout - 1, and a HAMT is
+    /// read as deep as the hash has whole buckets for, and no deeper.
+    #[test]
+    fn hamts_of_every_fanout_from_8_to_1024_are_read() {
+        let file = cid_from_data(CODEC_RAW, b"x");
+        let name = "entry.txt";
+        for (fanout, width, levels) in [
+            (8, 1, 21),
+            (16, 1, 16),
+            (32, 2, 12),
+            (64, 2, 10),
+            (128, 2, 9),
+            (256, 2, 8),
+            (512, 3, 7),
+            (1024, 3, 6),
+        ] {
+            assert_eq!(prefix_at(name, fanout, 0).len(), width, "fanout {fanout}");
+            let entry_at = |level| {
+                let prefix = prefix_at(name, fanout, level);
+                pb_hamt_at(fanout, vec![link(&format!("{prefix}{name}"), &file)])
+            };
+            let mut blocks = HashMap::from([(file, b"x".to_vec())]);
+            let one = hamt_chain(&mut blocks, fanout, name, 0, entry_at(0));
+            let two = hamt_chain(&mut blocks, fanout, name, 1, entry_at(1));
+            // The entry at the last level with a whole bucket, and a shard
+            // one level below it.
+            let deepest = hamt_chain(&mut blocks, fanout, name, levels - 1, entry_at(levels - 1));
+            let empty = pb_hamt_at(fanout, Vec::new());
+            let too_deep = hamt_chain(&mut blocks, fanout, name, levels, empty);
+            let provider = CountingProvider::new(blocks);
+
+            for root in [one, two, deepest] {
+                assert_eq!(
+                    read_file(&provider, &root, name).unwrap(),
+                    b"x",
+                    "fanout {fanout}"
+                );
+            }
+            assert_eq!(
+                read_file(&provider, &too_deep, name)
+                    .unwrap_err()
+                    .to_string(),
+                "invalid dag-pb: HAMT deeper than its 64-bit hash",
+                "fanout {fanout}"
+            );
+            assert!(
+                matches!(
+                    read_file(&provider, &two, "absent.txt"),
+                    Err(UnixfsError::PathNotFound(_))
+                ),
+                "fanout {fanout}"
+            );
+            let listed = list_directory(&provider, &two, "").unwrap();
+            assert_eq!(
+                listed
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>(),
+                [name],
+                "fanout {fanout}"
+            );
+        }
+
+        // Each shard is read at its own fanout: a root at 8 takes 3 bits,
+        // its shard at 1024 the next 10.
+        let child = pb_hamt_at(
+            1024,
+            vec![link(
+                &format!("{:03X}{name}", hash_bits(name, 3, 10)),
+                &file,
+            )],
+        );
+        let child_cid = cid_from_data(CODEC_DAG_PB, &child);
+        let root = pb_hamt_at(8, vec![link(&prefix_at(name, 8, 0), &child_cid)]);
+        let root_cid = cid_from_data(CODEC_DAG_PB, &root);
+        let provider = CountingProvider::new(HashMap::from([
+            (root_cid, root),
+            (child_cid, child),
+            (file, b"x".to_vec()),
+        ]));
+        assert_eq!(read_file(&provider, &root_cid, name).unwrap(), b"x");
+
+        // Any other fanout, or no fanout, or another hash, is refused.
+        let unsupported = |fanout: Option<u64>, hash_type: Option<u64>| {
+            let shard = PbNode {
+                data: Some(
+                    UnixfsData {
+                        r#type: Some(DataType::HamtShard as i32),
+                        data: None,
+                        filesize: None,
+                        blocksizes: Vec::new(),
+                        hash_type,
+                        fanout,
+                    }
+                    .encode_to_vec(),
+                ),
+                links: Vec::new(),
+            }
+            .encode_to_vec();
+            let cid = cid_from_data(CODEC_DAG_PB, &shard);
+            let provider = CountingProvider::new(HashMap::from([(cid, shard)]));
+            let refused = format!(
+                "invalid dag-pb: unsupported HAMT parameters hashType={hash_type:?} fanout={fanout:?}"
+            );
+            assert_eq!(
+                read_file(&provider, &cid, name).unwrap_err().to_string(),
+                refused
+            );
+            assert_eq!(
+                list_directory(&provider, &cid, "").unwrap_err().to_string(),
+                refused
+            );
+        };
+        for fanout in [
+            None,
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(4),
+            Some(12),
+            Some(255),
+            Some(2048),
+        ] {
+            unsupported(fanout, Some(HAMT_MURMUR3_X64_64));
+        }
+        unsupported(Some(256), Some(0x12));
+        unsupported(Some(256), None);
+    }
+
+    /// The shard's bitfield decides, as boxo's does: an unoccupied bucket
+    /// is absent whatever the links say, the bucket's link is the one at
+    /// its rank among the occupied buckets, and a bitfield wider than
+    /// fanout / 8 bytes, or naming more buckets than there are links, is
+    /// refused. Leading zero bytes may be left out.
+    #[test]
+    fn a_hamt_lookup_follows_the_shards_bitfield() {
+        let file = cid_from_data(CODEC_RAW, b"x");
+        let other_file = cid_from_data(CODEC_RAW, b"y");
+        let name = "entry.txt";
+        let bucket = hash_bits(name, 0, 8);
+        assert!(bucket > 0, "the fixture needs a bucket above 0");
+        let entry = link(&format!("{bucket:02X}{name}"), &file);
+        let read = |bitfield: Vec<u8>, links: Vec<PbLink>| {
+            let root = hamt_shard(256, bitfield, links);
+            let cid = cid_from_data(CODEC_DAG_PB, &root);
+            let provider = CountingProvider::new(HashMap::from([
+                (cid, root),
+                (file, b"x".to_vec()),
+                (other_file, b"y".to_vec()),
+            ]));
+            read_file(&provider, &cid, name).map_err(|err| err.to_string())
+        };
+        let absent = Err(format!("path segment not found: {name}"));
+
+        // The bucket's bit set: found, the bitfield at its full 32 bytes or
+        // with its leading zero bytes left out.
+        assert_eq!(
+            read(hamt_bitfield(&[bucket], 32), vec![entry.clone()]),
+            Ok(b"x".to_vec())
+        );
+        assert_eq!(
+            read(
+                hamt_bitfield(&[bucket], bucket / 8 + 1),
+                vec![entry.clone()]
+            ),
+            Ok(b"x".to_vec())
+        );
+        // The adjacent bucket's bit instead, or no bitfield: absent, though
+        // the link names the entry under its own bucket.
+        assert_eq!(
+            read(hamt_bitfield(&[bucket ^ 1], 32), vec![entry.clone()]),
+            absent
+        );
+        assert_eq!(read(Vec::new(), vec![entry.clone()]), absent);
+        // 33 bytes, even with the extra byte zero: refused.
+        assert_eq!(
+            read(hamt_bitfield(&[bucket], 33), vec![entry.clone()]),
+            Err("invalid dag-pb: HAMT bitfield of 33 bytes, more than fanout 256's 32".into())
+        );
+        // Every bucket set, and one link: the bucket's rank is past it.
+        assert_eq!(
+            read(vec![0xff; 32], vec![entry.clone()]),
+            Err("invalid dag-pb: HAMT bitfield has more buckets than links".into())
+        );
+
+        // Two occupied buckets: the link at the bucket's rank is read, so
+        // with the links out of bucket order the entry isn't found.
+        let other = bucket ^ 0x80;
+        let other_link = link(&format!("{other:02X}other.txt"), &other_file);
+        let bitfield = hamt_bitfield(&[bucket, other], 32);
+        let (in_order, swapped) = if other < bucket {
+            (
+                vec![other_link.clone(), entry.clone()],
+                vec![entry.clone(), other_link],
+            )
+        } else {
+            (
+                vec![entry.clone(), other_link.clone()],
+                vec![other_link, entry.clone()],
+            )
+        };
+        assert_eq!(read(bitfield.clone(), in_order), Ok(b"x".to_vec()));
+        assert_eq!(read(bitfield, swapped), absent);
+    }
+
+    /// SMHasher's verification value for MurmurHash3_x64_128: each prefix
+    /// of the bytes 0..256 hashed with seed 256 - its length, then the hash
+    /// of those hashes, read as four little-endian bytes.
+    #[test]
+    fn murmur3_matches_smhashers_verification_value() {
+        let mut key = Vec::with_capacity(256);
+        let mut hashes = Vec::with_capacity(256 * 16);
+        for i in 0..256u32 {
+            let (h1, h2) = murmur3_x64_128(&key, 256 - i);
+            hashes.extend_from_slice(&h1.to_le_bytes());
+            hashes.extend_from_slice(&h2.to_le_bytes());
+            key.push(i as u8);
+        }
+        let (h1, _) = murmur3_x64_128(&hashes, 0);
+        assert_eq!(h1 as u32, 0x6384_ba69);
+        // The UnixFS HAMT's hash is the first 64 bits, with seed 0.
+        assert_eq!(murmur3_x64_64(b"hello"), murmur3_x64_128(b"hello", 0).0);
+        assert_eq!(murmur3_x64_64(b""), 0);
+    }
+
+    /// Finding 6 of design 0009: a lookup scanned every shard until it met
+    /// the name, up to 1,024 of them. It now follows the name's hash: one
+    /// shard a level, and no other shard is read.
+    #[test]
+    fn a_hamt_lookup_reads_only_the_shards_on_its_names_path() {
+        let name = "target.txt";
+        let file = cid_from_data(CODEC_RAW, b"target");
+        let mut blocks = HashMap::from([(file, b"target".to_vec())]);
+        let mut put = |block: Vec<u8>| {
+            let cid = cid_from_data(CODEC_DAG_PB, &block);
+            blocks.insert(cid, block);
+            cid
+        };
+        let path = put(pb_hamt(vec![link(
+            &format!("{}{name}", bucket(name, 1)),
+            &file,
+        )]));
+        // Every other bucket of the root holds a shard of its own.
+        let mut links = vec![link(&bucket(name, 0), &path)];
+        let mut others = Vec::new();
+        for index in 0..=255u8 {
+            let prefix = format!("{index:02X}");
+            if prefix != bucket(name, 0) {
+                let other = put(pb_hamt(vec![link(
+                    &format!("{prefix}other-{index}"),
+                    &file,
+                )]));
+                others.push(other);
+                links.push(link(&prefix, &other));
+            }
+        }
+        let root = put(pb_hamt(links));
+        let provider = CountingProvider::new(blocks);
+
+        assert_eq!(read_file(&provider, &root, name).unwrap(), b"target");
+        assert_eq!(provider.call_count(&path), 1);
+        assert!(others.iter().all(|other| provider.call_count(other) == 0));
+        // A name whose bucket holds another entry is absent, read at once.
+        assert!(matches!(
+            read_file(&provider, &root, "missing.txt"),
+            Err(UnixfsError::PathNotFound(_))
+        ));
+        let read: usize = others.iter().map(|other| provider.call_count(other)).sum();
+        assert!(read <= 1, "{read} shards read for one missing name");
+    }
+
+    /// An entry in a bucket its name doesn't hash to isn't found (the old
+    /// scan found it anywhere), and a HAMT deeper than its 64-bit hash is
+    /// refused.
+    #[test]
+    fn a_hamt_entry_is_found_only_in_its_bucket_and_depth_is_bounded() {
+        let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+        let file = cid_from_data(CODEC_RAW, b"x");
+        store.put_block(&file, b"x").unwrap();
+        let name = "misplaced.txt";
+        let wrong = format!(
+            "{:02X}",
+            murmur3_x64_64(name.as_bytes()).to_be_bytes()[0] ^ 1
+        );
+        let root = pb_hamt(vec![link(&format!("{wrong}{name}"), &file)]);
+        let root_cid = cid_from_data(CODEC_DAG_PB, &root);
+        store.put_block(&root_cid, &root).unwrap();
+        assert!(matches!(
+            read_file(&store, &root_cid, name),
+            Err(UnixfsError::PathNotFound(_))
+        ));
+
+        // Shards along every one of the name's eight buckets, and a ninth.
+        let name = "deep.txt";
+        let mut child = pb_hamt(Vec::new());
+        for level in (0..8).rev() {
+            let child_cid = cid_from_data(CODEC_DAG_PB, &child);
+            store.put_block(&child_cid, &child).unwrap();
+            child = pb_hamt(vec![link(&bucket(name, level), &child_cid)]);
+        }
+        let deep = cid_from_data(CODEC_DAG_PB, &child);
+        store.put_block(&deep, &child).unwrap();
+        assert_eq!(
+            read_file(&store, &deep, name).unwrap_err().to_string(),
+            "invalid dag-pb: HAMT deeper than its 64-bit hash"
+        );
+    }
+
     #[test]
     fn resolves_single_level_hamt_shard() {
         let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
@@ -2844,7 +3333,10 @@ mod tests {
         let file_cid = cid_from_data(CODEC_RAW, data);
         store.put_block(&file_cid, data).unwrap();
 
-        let hamt_data = pb_hamt(vec![link("ABindex.html", &file_cid)]);
+        let hamt_data = pb_hamt(vec![link(
+            &format!("{}index.html", bucket("index.html", 0)),
+            &file_cid,
+        )]);
         let hamt_cid = cid_from_data(CODEC_DAG_PB, &hamt_data);
         store.put_block(&hamt_cid, &hamt_data).unwrap();
 
@@ -2858,11 +3350,14 @@ mod tests {
         let file_cid = cid_from_data(CODEC_RAW, data);
         store.put_block(&file_cid, data).unwrap();
 
-        let child_data = pb_hamt(vec![link("CDnested.txt", &file_cid)]);
+        let child_data = pb_hamt(vec![link(
+            &format!("{}nested.txt", bucket("nested.txt", 1)),
+            &file_cid,
+        )]);
         let child_cid = cid_from_data(CODEC_DAG_PB, &child_data);
         store.put_block(&child_cid, &child_data).unwrap();
 
-        let root_data = pb_hamt(vec![link("AB", &child_cid)]);
+        let root_data = pb_hamt(vec![link(&bucket("nested.txt", 0), &child_cid)]);
         let root_cid = cid_from_data(CODEC_DAG_PB, &root_data);
         store.put_block(&root_cid, &root_data).unwrap();
 
