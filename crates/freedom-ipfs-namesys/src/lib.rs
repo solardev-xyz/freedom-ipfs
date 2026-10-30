@@ -968,40 +968,50 @@ fn parse_ipns_data(data: &[u8]) -> Result<IpnsRecordData> {
     })
 }
 
+/// The legacy (V1) fields against the signed data. Each one present must
+/// equal its signed counterpart. And once `signatureV1` or the legacy
+/// `value` is non-empty, all five must, an absent one read as its protobuf
+/// default, as the IPNS record specification and boxo's `validation.go`
+/// require: a record with a `signatureV1` and no legacy copies is refused.
 fn verify_legacy_fields_match(entry: &IpnsEntry, data: &IpnsRecordData) -> Result<()> {
-    if let Some(value) = &entry.value {
-        if value != &data.value {
-            return Err(NamesysError::InvalidIpnsRecord(
-                "legacy value does not match signed data".into(),
-            ));
-        }
-    }
-    if let Some(validity) = &entry.validity {
-        if validity != &data.validity {
-            return Err(NamesysError::InvalidIpnsRecord(
-                "legacy validity does not match signed data".into(),
-            ));
-        }
-    }
-    if let Some(validity_type) = entry.validity_type {
-        if validity_type as u64 != data.validity_type {
-            return Err(NamesysError::InvalidIpnsRecord(
-                "legacy validityType does not match signed data".into(),
-            ));
-        }
-    }
-    if let Some(sequence) = entry.sequence {
-        if sequence != data.sequence {
-            return Err(NamesysError::InvalidIpnsRecord(
-                "legacy sequence does not match signed data".into(),
-            ));
-        }
-    }
-    if let Some(ttl) = entry.ttl {
-        if ttl != data.ttl {
-            return Err(NamesysError::InvalidIpnsRecord(
-                "legacy ttl does not match signed data".into(),
-            ));
+    let non_empty =
+        |field: &Option<Vec<u8>>| field.as_deref().is_some_and(|bytes| !bytes.is_empty());
+    let all = non_empty(&entry.signature_v1) || non_empty(&entry.value);
+    // Each field: whether its legacy copy, if present, equals the signed
+    // value, and whether the signed value is the field's default.
+    let fields = [
+        (
+            "value",
+            entry.value.as_ref().map(|value| *value == data.value),
+            data.value.is_empty(),
+        ),
+        (
+            "validity",
+            entry
+                .validity
+                .as_ref()
+                .map(|validity| *validity == data.validity),
+            data.validity.is_empty(),
+        ),
+        (
+            "validityType",
+            entry
+                .validity_type
+                .map(|validity_type| u64::try_from(validity_type).ok() == Some(data.validity_type)),
+            data.validity_type == 0,
+        ),
+        (
+            "sequence",
+            entry.sequence.map(|sequence| sequence == data.sequence),
+            data.sequence == 0,
+        ),
+        ("ttl", entry.ttl.map(|ttl| ttl == data.ttl), data.ttl == 0),
+    ];
+    for (field, equal, signed_is_default) in fields {
+        if !equal.unwrap_or(!all || signed_is_default) {
+            return Err(NamesysError::InvalidIpnsRecord(format!(
+                "legacy {field} does not match signed data"
+            )));
         }
     }
     Ok(())
@@ -2028,6 +2038,139 @@ mod tests {
         ));
     }
 
+    /// freedom-core's vector `ed25519-signature-v1-alone`
+    /// (vectors/dweb-verify-cases.json): an honest V2-only record, with a
+    /// one-byte signatureV1 and none of the legacy fields. boxo compares
+    /// all five legacy fields with the signed data once signatureV1 is
+    /// there, and refuses it; so does this node now. Without the
+    /// signatureV1, or with an empty one, it verifies.
+    #[test]
+    fn a_signature_v1_without_the_legacy_fields_is_refused() {
+        let name = "k51qzi5uqu5dja9it0ilm72uimu8sunfn5hbu86wwb6yxrl8kif10fkruhtcwi";
+        let record = hex(concat!(
+            "42404036874a462beab0f610bb9d9e7f757f59ddf9adbc9f82d02975688df3d8",
+            "a425359d992b7c4c40d444daf8457d50d462c22e8891df511d996a7ed9a464c4",
+            "620b4a9801a56354544c1b00000045d964b8006556616c756558412f69706673",
+            "2f626166796265696775776a6d64647672346969616836656b6776726f766235",
+            "7a66623665673563366c6f696b7876786c787a6c776561356461626d68536571",
+            "75656e6365016856616c6964697479581e323039392d30312d30315430303a30",
+            "303a30302e3030303030303030305a6c56616c69646974795479706500120101",
+        ));
+        let now = OffsetDateTime::from_unix_timestamp(1_760_000_000).unwrap();
+        assert_eq!(
+            verify_ipns_record_at(name, &record, now)
+                .unwrap_err()
+                .to_string(),
+            "invalid IPNS record: legacy value does not match signed data"
+        );
+
+        let mut entry = IpnsEntry::decode(record.as_slice()).unwrap();
+        assert_eq!(entry.signature_v1, Some(vec![0x01]));
+        for signature_v1 in [None, Some(Vec::new())] {
+            entry.signature_v1 = signature_v1;
+            let verified = verify_ipns_record_at(name, &entry.encode_to_vec(), now).unwrap();
+            assert_eq!(
+                verified.value,
+                "/ipfs/bafybeiguwjmddvr4iiah6ekgvrovb5zfb6eg5c6loikxvxlxzlwea5dabm"
+            );
+            assert_eq!(verified.sequence, 1);
+            assert_eq!(
+                verified.validity.as_deref(),
+                Some("2099-01-01T00:00:00.000000000Z")
+            );
+            assert_eq!(verified.ttl, 300_000_000_000);
+        }
+    }
+
+    /// Once signatureV1 or the legacy value is non-empty, every legacy
+    /// field must equal the signed data, an absent one read as its
+    /// protobuf default (an empty string, or 0). Otherwise only the ones
+    /// present are compared.
+    #[test]
+    fn legacy_fields_are_all_compared_once_signature_v1_or_value_is_set() {
+        let keypair = Keypair::generate_ed25519();
+        let value = "/ipfs/bafkqaddwgevxmmraojswg33smq";
+        let (name, full) = legacy_entry(&keypair, value, 7);
+        let verify = |entry: &IpnsEntry| {
+            verify_ipns_record(&name, &entry.encode_to_vec())
+                .map(|record| record.value)
+                .map_err(|err| err.to_string())
+        };
+        let refused = |field: &str| {
+            Err(format!(
+                "invalid IPNS record: legacy {field} does not match signed data"
+            ))
+        };
+        type Clear = fn(&mut IpnsEntry);
+        let clear: [(&str, Clear); 5] = [
+            ("value", |entry| entry.value = None),
+            ("validity", |entry| entry.validity = None),
+            ("validityType", |entry| entry.validity_type = None),
+            ("sequence", |entry| entry.sequence = None),
+            ("ttl", |entry| entry.ttl = None),
+        ];
+
+        // All five copies, with a signatureV1 or without one.
+        assert_eq!(verify(&full), Ok(value.to_string()));
+        let without_v1 = IpnsEntry {
+            signature_v1: None,
+            ..full.clone()
+        };
+        assert_eq!(verify(&without_v1), Ok(value.to_string()));
+
+        for (field, clear) in clear {
+            // A signatureV1 asks for every field. An absent validityType
+            // reads as 0, EOL, which is the signed one, so it matches.
+            let mut entry = full.clone();
+            clear(&mut entry);
+            let expected = if field == "validityType" {
+                Ok(value.to_string())
+            } else {
+                refused(field)
+            };
+            assert_eq!(verify(&entry), expected, "signatureV1, no {field}");
+            // So does the legacy value, when it is there.
+            let mut entry = without_v1.clone();
+            clear(&mut entry);
+            let expected = if field == "value" || field == "validityType" {
+                Ok(value.to_string())
+            } else {
+                refused(field)
+            };
+            assert_eq!(verify(&entry), expected, "legacy value, no {field}");
+        }
+
+        // An absent field reads as its default, and matches a signed 0.
+        let (name, mut entry) = legacy_entry(&keypair, value, 0);
+        entry.sequence = None;
+        assert_eq!(
+            verify_ipns_record(&name, &entry.encode_to_vec())
+                .map(|record| record.sequence)
+                .map_err(|err| err.to_string()),
+            Ok(0)
+        );
+
+        // With neither, each field present is still compared, and the
+        // absent ones aren't.
+        let (name, full) = legacy_entry(&keypair, value, 7);
+        let only_sequence = |sequence| IpnsEntry {
+            value: None,
+            signature_v1: None,
+            validity_type: None,
+            validity: None,
+            sequence: Some(sequence),
+            ttl: None,
+            ..full.clone()
+        };
+        let verify = |entry: &IpnsEntry| {
+            verify_ipns_record(&name, &entry.encode_to_vec())
+                .map(|record| record.value)
+                .map_err(|err| err.to_string())
+        };
+        assert_eq!(verify(&only_sequence(7)), Ok(value.to_string()));
+        assert_eq!(verify(&only_sequence(8)), refused("sequence"));
+    }
+
     #[test]
     fn verifies_v2_only_ipns_record() {
         let (name, record) = signed_record("/ipfs/bafkqaddwgevxmmraojswg33smq", FUTURE, false);
@@ -2106,6 +2249,41 @@ mod tests {
         map.insert("ValidityType".to_string(), Ipld::Integer(0));
         map.insert("Value".to_string(), Ipld::Bytes(value.as_bytes().to_vec()));
         serde_ipld_dagcbor::to_vec(&Ipld::Map(map)).unwrap()
+    }
+
+    /// A record `keypair` signs for `value` at `sequence`, with a
+    /// signatureV1 and all five legacy fields copied from its signed data;
+    /// and its name. The signatureV1's bytes aren't checked, as boxo
+    /// doesn't check them.
+    fn legacy_entry(keypair: &Keypair, value: &str, sequence: u64) -> (String, IpnsEntry) {
+        let name = Cid::new_v1(
+            LIBP2P_KEY_CODEC,
+            Multihash::<64>::from_bytes(&keypair.public().to_peer_id().to_bytes()).unwrap(),
+        )
+        .to_string();
+        let data = ipns_data_with_sequence(value, FUTURE, sequence);
+        let mut signed = IPNS_SIGNATURE_PREFIX.to_vec();
+        signed.extend_from_slice(&data);
+        let entry = IpnsEntry {
+            value: Some(value.as_bytes().to_vec()),
+            signature_v1: Some(vec![0x01]),
+            validity_type: Some(ValidityType::Eol as i32),
+            validity: Some(FUTURE.as_bytes().to_vec()),
+            sequence: Some(sequence),
+            ttl: Some(300_000_000_000),
+            pub_key: None,
+            signature_v2: Some(keypair.sign(&signed).unwrap()),
+            data: Some(data),
+        };
+        (name, entry)
+    }
+
+    /// Bytes from hex.
+    fn hex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+            .collect()
     }
 
     /// The IPNS name of `keypair`, and a v2-only record it signs.
