@@ -18,7 +18,8 @@
 //!   loop.
 //! - [`resolve`]: the gate's resolver, under `direct` with checked
 //!   addresses, and the one DNS configuration a `direct` network's own
-//!   lookups use ([`DnsConfig`]): the system's, or a reported fallback.
+//!   lookups use ([`DnsConfig`]): the system's, or a reported fallback,
+//!   every name looked up exactly as written.
 //! - [`dial`]: the gate where candidates are chosen and addresses expanded
 //!   ([`DialPolicy`]), and the transports a policy's dials can use
 //!   ([`TransportPolicy`]).

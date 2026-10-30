@@ -23,6 +23,21 @@
 //! or a fallback, Cloudflare's resolvers, only when that can't be read or
 //! parsed. Which one it is, and why, is [`DnsConfig::source`], for a host
 //! to report.
+//!
+//! **Every name is looked up exactly as written**, as an absolute name: a
+//! configuration's search list and domain are dropped and its `ndots` is 0,
+//! whatever the system's resolv.conf says. That is deliberate, and unlike
+//! glibc's resolver: every name freedom-ipfs resolves comes from a
+//! provider, a configuration or a peer (a multiaddr), and none should be
+//! expanded with the user's search domains. A peer's `/dns4/intranet/…`
+//! would otherwise query, and could reach, `intranet.` under the user's
+//! local domain.
+//!
+//! **A nameserver's zone** (`nameserver fe80::1%eth0`, or `%3`) is kept:
+//! hickory's parser drops it, so the zones are read beside it, a named one
+//! through `if_nametoindex`, and set on the servers' addresses. A zone that
+//! names no interface here is a configuration that can't be used: the
+//! fallback, reported as unparseable.
 
 use std::fmt;
 use std::future::Future;
@@ -30,7 +45,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::TokioResolver;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
@@ -114,11 +129,9 @@ impl DnsConfig {
         #[cfg(windows)]
         {
             match hickory_resolver::system_conf::read_system_conf() {
-                Ok((config, options)) => Self {
-                    config,
-                    options,
-                    source: DnsSource::System,
-                },
+                Ok((config, options)) => {
+                    Self::absolute(config.name_servers().to_vec(), options, DnsSource::System)
+                }
                 Err(err) => Self::fallback(DnsFallback::Unreadable(err.to_string())),
             }
         }
@@ -129,39 +142,54 @@ impl DnsConfig {
     }
 
     /// `path` read and parsed as a resolv.conf, as [`DnsConfig::system`]
-    /// reads `/etc/resolv.conf`: the fallback, and why, where it can't be
-    /// read, can't be parsed or names no nameserver.
+    /// reads `/etc/resolv.conf`, its nameservers' zones kept: the fallback,
+    /// and why, where it can't be read, can't be parsed, names no
+    /// nameserver, or gives a zone that names no interface here.
     #[cfg(unix)]
     pub fn from_resolv_conf(path: &std::path::Path) -> Self {
         let data = match std::fs::read(path) {
             Ok(data) => data,
             Err(err) => return Self::fallback(DnsFallback::Unreadable(err.to_string())),
         };
-        match hickory_resolver::system_conf::parse_resolv_conf(data) {
-            Ok((config, options)) => Self {
-                config,
-                options,
-                source: DnsSource::System,
-            },
-            Err(err) => Self::fallback(DnsFallback::Unparseable(err.to_string())),
+        let (config, options) = match hickory_resolver::system_conf::parse_resolv_conf(&data) {
+            Ok(parsed) => parsed,
+            Err(err) => return Self::fallback(DnsFallback::Unparseable(err.to_string())),
+        };
+        match zoned(config.name_servers(), &data) {
+            Ok(servers) => Self::absolute(servers, options, DnsSource::System),
+            Err(why) => Self::fallback(DnsFallback::Unparseable(why)),
         }
     }
 
-    /// A configuration the host gives whole, or a test's fixture server.
+    /// A configuration the host gives whole, or a test's fixture server:
+    /// its nameservers and options, its names looked up as written (no
+    /// search list or domain, `ndots` 0).
     pub fn custom(config: ResolverConfig, options: ResolverOpts) -> Self {
-        Self {
-            config,
-            options,
-            source: DnsSource::Custom,
-        }
+        Self::absolute(config.name_servers().to_vec(), options, DnsSource::Custom)
     }
 
     /// The built-in fallback, Cloudflare's resolvers, for `why`.
     fn fallback(why: DnsFallback) -> Self {
+        Self::absolute(
+            ResolverConfig::cloudflare().name_servers().to_vec(),
+            ResolverOpts::default(),
+            DnsSource::Fallback(why),
+        )
+    }
+
+    /// `servers` with `options`, every name looked up exactly as written
+    /// (see the module's documentation): no search list, no domain, and
+    /// `ndots` 0.
+    fn absolute(
+        servers: Vec<NameServerConfig>,
+        mut options: ResolverOpts,
+        source: DnsSource,
+    ) -> Self {
+        options.ndots = 0;
         Self {
-            config: ResolverConfig::cloudflare(),
-            options: ResolverOpts::default(),
-            source: DnsSource::Fallback(why),
+            config: ResolverConfig::from_parts(None, Vec::new(), servers),
+            options,
+            source,
         }
     }
 
@@ -193,6 +221,94 @@ impl DnsConfig {
     }
 }
 
+/// `servers`, as hickory parsed them from the resolv.conf `data`, with the
+/// zone each `nameserver` line gives its address: hickory 0.25 builds every
+/// server's address from the IP alone. A numeric zone is the interface's
+/// index; a named one is looked up (`if_nametoindex`). Hickory gives two
+/// servers per `nameserver` line, UDP then TCP, in the file's order; a
+/// zone that names no interface, or servers that don't line up with the
+/// lines, are an error.
+#[cfg(unix)]
+fn zoned(servers: &[NameServerConfig], data: &[u8]) -> Result<Vec<NameServerConfig>, String> {
+    let lines = nameserver_lines(data)?;
+    if servers.len() != 2 * lines.len() {
+        return Err(format!(
+            "{} nameserver lines, but {} servers parsed",
+            lines.len(),
+            servers.len()
+        ));
+    }
+    servers
+        .iter()
+        .zip(lines.iter().flat_map(|line| [line, line]))
+        .map(|(server, &(ip, zone))| {
+            if server.socket_addr.ip() != ip {
+                return Err(format!("nameserver {ip} parsed as {}", server.socket_addr));
+            }
+            let mut server = server.clone();
+            if let (SocketAddr::V6(addr), Some(zone)) = (&mut server.socket_addr, zone) {
+                addr.set_scope_id(zone);
+            }
+            Ok(server)
+        })
+        .collect()
+}
+
+/// Each `nameserver` line's address and zone index, in the file's order,
+/// read as resolv-conf (hickory's parser) reads the lines: a line whose
+/// first character other than a space or tab is `#` or `;` is a comment,
+/// and so is everything after one.
+#[cfg(unix)]
+fn nameserver_lines(data: &[u8]) -> Result<Vec<(IpAddr, Option<u32>)>, String> {
+    let mut lines = Vec::new();
+    for line in data.split(|&byte| byte == b'\n') {
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let mut words = line
+            .split(['#', ';'])
+            .next()
+            .unwrap_or("")
+            .split_whitespace();
+        if words.next() != Some("nameserver") {
+            continue;
+        }
+        let Some(address) = words.next() else {
+            continue;
+        };
+        let (ip, zone) = match address.split_once('%') {
+            Some((ip, zone)) => (ip, Some(zone)),
+            None => (address, None),
+        };
+        let ip: IpAddr = ip
+            .parse()
+            .map_err(|_| format!("nameserver {address} isn't an address"))?;
+        let zone = match zone {
+            None => None,
+            Some(zone) => Some(
+                zone_index(zone)
+                    .ok_or_else(|| format!("nameserver {address}: no interface {zone} here"))?,
+            ),
+        };
+        lines.push((ip, zone));
+    }
+    Ok(lines)
+}
+
+/// A zone's interface index: a number as it is, a name through
+/// `if_nametoindex`; `None` for a name no interface has.
+#[cfg(unix)]
+fn zone_index(zone: &str) -> Option<u32> {
+    if let Ok(index) = zone.parse::<u32>() {
+        return Some(index);
+    }
+    let name = std::ffi::CString::new(zone).ok()?;
+    // SAFETY: `name` is a NUL-terminated string that outlives the call,
+    // which only reads it.
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    (index != 0).then_some(index)
+}
+
 struct HickoryLookup(TokioResolver);
 
 impl fmt::Debug for HickoryLookup {
@@ -204,7 +320,8 @@ impl fmt::Debug for HickoryLookup {
 impl NameLookup for HickoryLookup {
     fn lookup(&self, name: &str) -> LookupFuture {
         let resolver = self.0.clone();
-        // A fully qualified name: the system's search domains don't apply.
+        // Looked up exactly as written, an absolute name (see the module's
+        // documentation).
         let name = format!("{name}.");
         Box::pin(async move {
             resolver

@@ -27,8 +27,11 @@
 //! **DNS.** Under `direct`, the DNS layer and the `/dnsaddr` expansion ask
 //! the network's own DNS configuration ([`Network::dns`]): the one the
 //! gate's HTTP resolver asks, the system's, or the fallback only where that
-//! can't be read or parsed. Under the legacy policy they ask Cloudflare's
-//! resolvers, as the crates' swarms did before.
+//! can't be read or parsed. Every name is looked up exactly as written,
+//! with no search list ([`crate::resolve`]): a peer's `/dns4/intranet` is
+//! `intranet.`, never the user's `intranet.<search domain>`. Under the
+//! legacy policy they ask Cloudflare's resolvers, as the crates' swarms did
+//! before.
 //!
 //! Under `socks5` (cargo feature `socks`) every dial goes through the proxy
 //! (`Socks5Transport`), behind the outer gate: no QUIC, no DNS layer, and

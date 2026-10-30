@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, SocketAddrV6, TcpListener};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -101,6 +101,10 @@ impl Dns {
             Vec::new(),
             NameServerConfigGroup::from_ips_clear(&[self.addr.ip()], self.addr.port(), true),
         )
+    }
+
+    fn queries(&self) -> Vec<(String, RecordType)> {
+        self.queries.lock().unwrap().clone()
     }
 
     fn asked(&self, name: &str, kind: RecordType) -> bool {
@@ -260,6 +264,109 @@ async fn one_dns_configuration_serves_http_and_every_transport() {
     assert!(dns.asked(&format!("_dnsaddr.{DNSADDR}"), RecordType::TXT));
 }
 
+/// Every name is looked up exactly as written, over HTTP and through
+/// `/dns4`: a single label and two, with a configuration whose search list
+/// and domain would expand both first (its ndots is 5). A name that
+/// doesn't exist as written isn't tried under the search domain either,
+/// though the server would answer it there. The fixture server sees the
+/// names as written and nothing under the search domain.
+#[tokio::test(flavor = "multi_thread")]
+async fn names_are_looked_up_exactly_as_written() {
+    let http = Listener::start(true);
+    let canary = Listener::start(false);
+    let loopback = || vec![RData::A(A::new(127, 0, 0, 1))];
+    let dns = Dns::start(HashMap::from([
+        (("intranet".to_string(), RecordType::A), loopback()),
+        (("two.labels".to_string(), RecordType::A), loopback()),
+        (
+            ("intranet.corp.example".to_string(), RecordType::A),
+            loopback(),
+        ),
+        (
+            ("two.labels.corp.example".to_string(), RecordType::A),
+            loopback(),
+        ),
+        (
+            ("missing.corp.example".to_string(), RecordType::A),
+            loopback(),
+        ),
+    ]));
+    let corp = hickory_resolver::Name::from_ascii("corp.example.").unwrap();
+    let config = ResolverConfig::from_parts(
+        Some(corp.clone()),
+        vec![corp],
+        dns.config().name_servers().to_vec(),
+    );
+    let mut options = ResolverOpts::default();
+    options.ndots = 5;
+    let dns_config = DnsConfig::custom(config, options);
+    assert!(dns_config.config().search().is_empty());
+    assert_eq!(dns_config.config().domain(), None);
+    assert_eq!(dns_config.options().ndots, 0);
+
+    let mut configured = ConfiguredTargets::new();
+    for url in [
+        format!("http://intranet:{}/", http.port),
+        format!("http://two.labels:{}/", http.port),
+        format!("http://missing:{}/", http.port),
+        format!("http://127.0.0.1:{}/", canary.port),
+    ] {
+        configured.add_url(&parse_url(&url).unwrap()).unwrap();
+    }
+    let network = Network::with_dns(
+        NetworkPolicy::direct(
+            configured,
+            doh(),
+            Addresses::Checked(Nat64Handle::fixed(Nat64State::NONE)),
+        )
+        .unwrap(),
+        dns_config,
+    )
+    .unwrap();
+    let client = network.http_client(ClientConfig::new(Duration::from_secs(5), 0));
+    let keypair = Keypair::generate_ed25519();
+    let transports = Transports::new(&network);
+    for name in ["intranet", "two.labels"] {
+        let status = client
+            .get(format!("http://{name}:{}/", http.port))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status.as_u16(), 200, "{name}");
+        let mut transport = transports.dht(&keypair).unwrap();
+        let before = canary.accepted();
+        let addr = multiaddr(&format!("/dns4/{name}/tcp/{}/p2p/{PEER}", canary.port));
+        dial_through(&mut transport, &addr, Duration::from_secs(3)).await;
+        assert!(
+            wait_until(Duration::from_secs(2), || canary.accepted() > before).await,
+            "{name}"
+        );
+    }
+    let served = http.accepted();
+    assert!(client
+        .get(format!("http://missing:{}/", http.port))
+        .send()
+        .await
+        .is_err());
+    assert_eq!(http.accepted(), served);
+    let mut transport = transports.dht(&keypair).unwrap();
+    let before = canary.accepted();
+    let addr = multiaddr(&format!("/dns4/missing/tcp/{}/p2p/{PEER}", canary.port));
+    dial_through(&mut transport, &addr, Duration::from_secs(3)).await;
+    assert!(!wait_until(Duration::from_millis(500), || canary.accepted() > before).await);
+
+    let queries = dns.queries();
+    assert!(dns.asked("intranet", RecordType::A) && dns.asked("two.labels", RecordType::A));
+    assert!(dns.asked("missing", RecordType::A));
+    assert!(
+        queries
+            .iter()
+            .all(|(name, _)| ["intranet", "two.labels", "missing"].contains(&name.as_str())),
+        "{queries:?}"
+    );
+}
+
 /// The legacy policy's network reads no configuration: its crates resolve
 /// as they did before.
 #[test]
@@ -342,52 +449,153 @@ mod resolv_conf {
         );
         assert_eq!(dns.options().timeout, Duration::from_secs(3));
         assert_eq!(dns.options().attempts, 4);
+        // Names are looked up as written: the file's search list is
+        // dropped, and ndots is 0.
+        assert!(dns.config().search().is_empty());
+        assert_eq!(dns.config().domain(), None);
+        assert_eq!(dns.options().ndots, 0);
+    }
+
+    /// The loopback interface's name and index here: `lo` on Linux, `lo0`
+    /// on macOS and the BSDs.
+    fn loopback() -> (&'static str, u32) {
+        for name in ["lo", "lo0"] {
+            let c_name = std::ffi::CString::new(name).unwrap();
+            // SAFETY: a NUL-terminated string that outlives the call.
+            let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+            if index != 0 {
+                return (name, index);
+            }
+        }
+        panic!("no loopback interface named lo or lo0");
     }
 
     /// The resolv.conf files users have, as their systems write them
     /// (`tests/fixtures/resolv-conf/`), are the system's configuration, not
-    /// the fallback: each one's nameservers, and its options where it sets
-    /// any. None has a line the strict parser refuses: comments, `search .`,
-    /// `options edns0 trust-ad`, a zoned link-local nameserver, OpenBSD's
-    /// `lookup` and `family`, and glibc's `sortlist` all parse.
+    /// the fallback: each one's nameservers, a link-local one with its
+    /// zone. None has a line the strict parser refuses: comments,
+    /// `search .`, `options edns0 trust-ad`, a zoned link-local
+    /// nameserver, OpenBSD's `lookup` and `family`, and glibc's `sortlist`
+    /// all parse. Their search lists and ndots are dropped: names are
+    /// looked up as written.
+    ///
+    /// NetworkManager's and macOS's files name their link-local server's
+    /// interface (`%wlp2s0`, `%en0`), which this host may not have: the
+    /// test reads them with that name replaced by this host's loopback
+    /// interface, and expects its index as the server's scope.
     #[test]
     fn the_resolv_conf_files_users_have_are_used() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")
             .join("resolv-conf");
-        for (file, nameservers, ndots) in [
-            ("ubuntu-systemd-resolved-stub", &["127.0.0.53"][..], 1),
-            ("ubuntu-systemd-resolved-stub-no-search", &["127.0.0.53"], 1),
+        let scratch = Scratch::new("fixtures");
+        let (loopback, index) = loopback();
+        let link_local =
+            |zone| SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 53, 0, zone));
+        let at = |ip: &str| SocketAddr::new(ip.parse().unwrap(), 53);
+        for (file, zone, nameservers) in [
+            ("ubuntu-systemd-resolved-stub", None, vec![at("127.0.0.53")]),
+            (
+                "ubuntu-systemd-resolved-stub-no-search",
+                None,
+                vec![at("127.0.0.53")],
+            ),
             (
                 "systemd-resolved-uplink",
-                &["192.168.1.1", "fd00::1", "192.168.1.2"],
-                1,
+                None,
+                vec![at("192.168.1.1"), at("fd00::1"), at("192.168.1.2")],
             ),
-            ("networkmanager", &["192.168.1.1", "fe80::1"], 1),
-            ("fedora-systemd-resolved-stub", &["127.0.0.53"], 1),
-            ("debian-resolvconf", &["192.168.1.1", "2001:db8::1"], 1),
-            ("debian-dhclient", &["192.168.1.1"], 1),
-            ("alpine-udhcpc", &["192.168.1.1"], 1),
-            ("docker-default-bridge", &["8.8.8.8", "8.8.4.4"], 1),
-            ("docker-user-network", &["127.0.0.11"], 0),
-            ("kubernetes-pod", &["10.96.0.10"], 5),
-            ("wsl", &["172.29.112.1"], 1),
-            ("wsl-dns-tunneling", &["10.255.255.254"], 1),
-            ("macos", &["192.168.1.1", "fe80::1"], 1),
-            ("freebsd-resolvconf", &["192.168.1.1"], 1),
-            ("openbsd", &["192.168.1.1"], 1),
-            ("glibc-options", &["192.168.1.1", "192.168.1.2"], 1),
+            (
+                "networkmanager",
+                Some("wlp2s0"),
+                vec![at("192.168.1.1"), link_local(index)],
+            ),
+            ("fedora-systemd-resolved-stub", None, vec![at("127.0.0.53")]),
+            (
+                "debian-resolvconf",
+                None,
+                vec![at("192.168.1.1"), at("2001:db8::1")],
+            ),
+            ("debian-dhclient", None, vec![at("192.168.1.1")]),
+            ("alpine-udhcpc", None, vec![at("192.168.1.1")]),
+            (
+                "docker-default-bridge",
+                None,
+                vec![at("8.8.8.8"), at("8.8.4.4")],
+            ),
+            ("docker-user-network", None, vec![at("127.0.0.11")]),
+            ("kubernetes-pod", None, vec![at("10.96.0.10")]),
+            ("wsl", None, vec![at("172.29.112.1")]),
+            ("wsl-dns-tunneling", None, vec![at("10.255.255.254")]),
+            (
+                "macos",
+                Some("en0"),
+                vec![at("192.168.1.1"), link_local(index)],
+            ),
+            ("freebsd-resolvconf", None, vec![at("192.168.1.1")]),
+            ("openbsd", None, vec![at("192.168.1.1")]),
+            (
+                "glibc-options",
+                None,
+                vec![at("192.168.1.1"), at("192.168.1.2")],
+            ),
         ] {
-            let dns = DnsConfig::from_resolv_conf(&dir.join(file));
+            let path = match zone {
+                None => dir.join(file),
+                Some(zone) => {
+                    let contents = std::fs::read_to_string(dir.join(file)).unwrap();
+                    let named = format!("%{zone}");
+                    assert!(contents.contains(&named), "{file} names {zone}");
+                    scratch.file(file, &contents.replace(&named, &format!("%{loopback}")))
+                }
+            };
+            let dns = DnsConfig::from_resolv_conf(&path);
             assert_eq!(dns.source(), &DnsSource::System, "{file}");
-            let expected: Vec<SocketAddr> = nameservers
-                .iter()
-                .map(|ip| SocketAddr::new(ip.parse().unwrap(), 53))
-                .collect();
-            assert_eq!(servers(dns.config()), expected, "{file}");
-            assert_eq!(dns.options().ndots, ndots, "{file}");
+            assert_eq!(servers(dns.config()), nameservers, "{file}");
+            assert!(dns.config().search().is_empty(), "{file}");
+            assert_eq!(dns.options().ndots, 0, "{file}");
         }
+    }
+
+    /// A nameserver's zone is kept on both its servers (UDP and TCP): a
+    /// numeric one as it is, a named one as its interface's index. A name
+    /// no interface has here can't be used: the fallback, reported as
+    /// unparseable, with the zone named.
+    #[test]
+    fn a_nameservers_zone_is_kept_or_reported() {
+        let scratch = Scratch::new("zones");
+        let (loopback, index) = loopback();
+        for (file, line, scope) in [
+            ("numeric", "nameserver fe80::1%3".to_string(), 3),
+            ("named", format!("nameserver fe80::1%{loopback}"), index),
+        ] {
+            let path = scratch.file(file, &format!("nameserver 192.0.2.53\n{line}\n"));
+            let dns = DnsConfig::from_resolv_conf(&path);
+            assert_eq!(dns.source(), &DnsSource::System, "{file}");
+            let zoned: Vec<u32> = dns
+                .config()
+                .name_servers()
+                .iter()
+                .filter_map(|server| match server.socket_addr {
+                    SocketAddr::V6(addr) => Some(addr.scope_id()),
+                    SocketAddr::V4(_) => None,
+                })
+                .collect();
+            assert_eq!(zoned, [scope, scope], "{file}: UDP and TCP");
+        }
+        let path = scratch.file("unknown", "nameserver fe80::1%nosuchif0\n");
+        let dns = DnsConfig::from_resolv_conf(&path);
+        match dns.source() {
+            DnsSource::Fallback(DnsFallback::Unparseable(why)) => {
+                assert!(why.contains("nosuchif0"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            servers(dns.config()),
+            servers(&ResolverConfig::cloudflare())
+        );
     }
 
     /// A resolv.conf that is readable but malformed, or names no
