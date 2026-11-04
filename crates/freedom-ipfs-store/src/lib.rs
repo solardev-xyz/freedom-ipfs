@@ -239,7 +239,12 @@ impl SqliteBlockStore {
     pub fn get(&self, cid: &Cid) -> Result<Option<Block>> {
         let cid_bytes = block_key(cid);
         let now = now_secs();
-        if let Some(hit) = self.hot.lock().get_verified(&cid_bytes, now) {
+        // The hot cache's guard ends with this statement, before
+        // `touch_at` takes the connection: the lock order is the
+        // connection, the retained set, then the hot cache, and nothing
+        // holds the hot cache while it takes either.
+        let hit = self.hot.lock().get_verified(&cid_bytes, now);
+        if let Some(hit) = hit {
             if hit.touch_persistent {
                 self.touch_at(cid, now)?;
             }
@@ -270,11 +275,13 @@ impl SqliteBlockStore {
     pub fn get_range(&self, cid: &Cid, start: u64, end: u64) -> Result<Option<Vec<u8>>> {
         let cid_bytes = block_key(cid);
         let now = now_secs();
-        if let Some(hit) = self
+        // As in `get`: the hot cache's guard ends here, before `touch_at`
+        // takes the connection.
+        let hit = self
             .hot
             .lock()
-            .get_verified_range(&cid_bytes, now, start, end)
-        {
+            .get_verified_range(&cid_bytes, now, start, end);
+        if let Some(hit) = hit {
             if hit.touch_persistent {
                 self.touch_at(cid, now)?;
             }
@@ -545,7 +552,10 @@ impl SqliteBlockStore {
     /// Lock order: the connection, then the retained set, then the hot
     /// cache. `retain_block` and `release_block` take the retained set
     /// alone, and nothing else takes it, so none waits on the connection
-    /// while holding it.
+    /// while holding it. Every other use of the hot cache ends its guard
+    /// before taking the connection (a hit in `get` and `get_range` is
+    /// taken out of the cache first, then touched); the close takes the
+    /// hot cache under the connection, in this order.
     fn evict_until_tracking(&self, max_bytes: u64, tracked_cid_bytes: &[u8]) -> Result<bool> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
@@ -1185,6 +1195,72 @@ mod tests {
         assert_eq!(store.get(&cid).unwrap().unwrap().data(), data);
 
         assert!(block_last_accessed_at(&store, &cid) > 1);
+    }
+
+    /// A hot-cache hit whose persistent touch is due lets the hot cache go
+    /// before it takes the connection, so it can't deadlock with eviction,
+    /// which takes the connection, the retained set, then the hot cache.
+    /// The schedule, for `get` and `get_range`:
+    /// - eviction holds the connection and waits for the retained set;
+    /// - the read hits the hot cache and waits for the connection, to touch;
+    /// - the retained set is let go.
+    ///
+    /// When the read held the hot cache while it waited, eviction then
+    /// waited for the hot cache, and neither finished.
+    #[test]
+    fn a_hot_hit_that_touches_never_deadlocks_with_eviction() {
+        for range in [false, true] {
+            let store = SqliteBlockStore::in_memory(1024 * 1024).unwrap();
+            let data = b"a hot block, its touch due".to_vec();
+            let cid = cid_from_data(CODEC_RAW, &data);
+            store.put_block(&cid, &data).unwrap();
+            store
+                .hot
+                .lock()
+                .entries
+                .get_mut(&block_key(&cid))
+                .unwrap()
+                .last_persistent_touch = 0;
+
+            let retained = store.retained.lock();
+            let trim = {
+                let store = store.clone();
+                std::thread::spawn(move || store.trim_blocks_to(0))
+            };
+            // Eviction has the connection: it waits for the retained set.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while store.conn.try_lock().is_some() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the trim never took the connection"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let read = {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    if range {
+                        store.get_range(&cid, 0, 4).map(|bytes| bytes.is_some())
+                    } else {
+                        store.get(&cid).map(|block| block.is_some())
+                    }
+                })
+            };
+            // The read has hit the hot cache and waits for the connection.
+            std::thread::sleep(Duration::from_millis(100));
+            drop(retained);
+
+            let (done, finished) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done.send((trim.join(), read.join()));
+            });
+            let (trimmed, read) = finished
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("range {range}: the trim and the read deadlocked"));
+            trimmed.unwrap().unwrap();
+            assert!(read.unwrap().unwrap(), "range {range}: the hit is answered");
+            assert_eq!(store.block_count().unwrap(), 0);
+        }
     }
 
     #[test]
