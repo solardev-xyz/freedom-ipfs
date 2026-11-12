@@ -51,7 +51,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use hickory_resolver::config::{
-    ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverConfig, ResolverOpts, CLOUDFLARE,
+    ConnectionConfig, LookupIpStrategy, NameServerConfig, ProtocolConfig, ResolverConfig,
+    ResolverOpts, CLOUDFLARE,
 };
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::tcp::TcpClientStream;
@@ -141,11 +142,13 @@ impl DnsConfig {
         }
         #[cfg(windows)]
         {
+            // Hickory's Windows reader gives its default options, which
+            // the compatible ones replace.
             match hickory_resolver::system_conf::read_system_conf() {
-                Ok((config, options)) => Self::absolute(
+                Ok((config, _)) => Self::absolute(
                     config.name_servers().to_vec(),
                     Vec::new(),
-                    options,
+                    compatible_options(),
                     DnsSource::System,
                 ),
                 Err(err) => Self::fallback(DnsFallback::Unreadable(err.to_string())),
@@ -200,20 +203,20 @@ impl DnsConfig {
                 .name_servers()
                 .to_vec(),
             Vec::new(),
-            ResolverOpts::default(),
+            compatible_options(),
             DnsSource::Fallback(why),
         )
     }
 
-    /// `config` as it is, with hickory's default options: its search list,
-    /// its domain and `ndots` 1 kept. The legacy policy's transports ask
+    /// `config` as it is, with the default options ([`compatible_options`]):
+    /// its search list, its domain and `ndots` 1 kept. The legacy policy's transports ask
     /// Cloudflare's resolvers so ([`DnsConfig::cloudflare`]), as the crates'
     /// swarms did before, and a test points a network's transports at its
     /// own server so (`Transports::with_dns`).
     pub(crate) fn as_given(config: ResolverConfig) -> Self {
         Self {
             config,
-            options: ResolverOpts::default(),
+            options: compatible_options(),
             zones: Arc::new([]),
             source: DnsSource::Custom,
         }
@@ -427,7 +430,11 @@ const MAX_NAMESERVERS: usize = 3;
 /// an error, though [`DnsConfig::absolute`] drops the list. Hickory 0.26's
 /// own parser can't stand in: it skips a line it can't read, and it exists
 /// only off Apple and Android, where this is still how `/etc/resolv.conf`
-/// is read. Errors read as hickory 0.25's did.
+/// is read. The options it doesn't set are [`compatible_options`]'s. An
+/// error is the fallback's reason, free text for logs and the confinement
+/// report: its wording isn't hickory 0.25's (which wrapped it in `proto
+/// error: io error: `), and nothing matches on it; the `Unparseable`
+/// variant, and its own text, are what callers read.
 #[cfg(unix)]
 fn parse_resolv_conf(data: &[u8]) -> Result<(Vec<NameServerConfig>, ResolverOpts), String> {
     let parsed = resolv_conf::Config::parse(data)
@@ -438,7 +445,7 @@ fn parse_resolv_conf(data: &[u8]) -> Result<(Vec<NameServerConfig>, ResolverOpts
         .map(|ip| NameServerConfig::udp_and_tcp(ip.into()))
         .collect();
     if servers.is_empty() {
-        return Err("io error: no nameservers found in config".to_string());
+        return Err("no nameservers found in config".to_string());
     }
     for domain in parsed.get_last_search_or_domain() {
         if domain == "--" {
@@ -447,12 +454,31 @@ fn parse_resolv_conf(data: &[u8]) -> Result<(Vec<NameServerConfig>, ResolverOpts
         hickory_resolver::proto::rr::Name::from_str_relaxed(domain)
             .map_err(|err| format!("Error parsing resolv.conf: {err}"))?;
     }
-    let mut options = ResolverOpts::default();
+    let mut options = compatible_options();
     options.ndots = parsed.ndots as usize;
     options.timeout = std::time::Duration::from_secs(u64::from(parsed.timeout));
     options.attempts = parsed.attempts as usize;
     options.edns0 = parsed.edns0;
     Ok((servers, options))
+}
+
+/// Hickory's default resolver options, but those hickory 0.26 changed set
+/// back to 0.25's, so that moving to 0.26 changes no lookup: A then AAAA,
+/// the AAAA query only when the A query found nothing
+/// (`Ipv4thenIpv6`, where 0.26 asks both at once and puts IPv6 first); 32
+/// cached responses per resolver (0.26: 8,192); and no EDNS(0) unless
+/// resolv.conf asks for it (`options edns0`; 0.26 sends it by default).
+/// Every configuration built here starts from them: the system's, the
+/// fallback and the legacy policy's. A host's own ([`DnsConfig::custom`])
+/// keeps the options it gives. The one change kept from 0.26 is a
+/// nameserver's `trust_negative_responses`: an NXDOMAIN is the answer, as
+/// glibc takes it, where 0.25 asked the next server.
+pub fn compatible_options() -> ResolverOpts {
+    let mut options = ResolverOpts::default();
+    options.ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
+    options.cache_size = 32;
+    options.edns0 = false;
+    options
 }
 
 /// The resolv.conf `data` with every `nameserver` line after the first
@@ -1265,6 +1291,126 @@ mod tests {
             "{answer:?}"
         );
         assert!(asked.load(Ordering::SeqCst) > 0);
+    }
+
+    /// A resolv.conf with `contents`, parsed as the system's.
+    #[cfg(unix)]
+    fn parsed(name: &str, contents: &str) -> DnsConfig {
+        let dir = std::env::temp_dir().join(format!(
+            "freedom-ipfs-net-{name}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("resolv.conf");
+        std::fs::write(&path, contents).unwrap();
+        let dns = DnsConfig::from_resolv_conf(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        dns
+    }
+
+    /// The options hickory 0.26 changed are hickory 0.25's in every
+    /// configuration built here: A then AAAA, 32 cached responses, and no
+    /// EDNS(0) unless resolv.conf asks for it. A host's own keeps its.
+    #[cfg(unix)]
+    #[test]
+    fn the_options_hickory_0_26_changed_are_0_25s() {
+        let compatible = |options: &ResolverOpts, edns0: bool, what: &str| {
+            assert_eq!(
+                options.ip_strategy,
+                LookupIpStrategy::Ipv4thenIpv6,
+                "{what}"
+            );
+            assert_eq!(options.cache_size, 32, "{what}");
+            assert_eq!(options.edns0, edns0, "{what}");
+        };
+        let system = parsed("options", "nameserver 192.0.2.53\n");
+        assert_eq!(system.source(), &DnsSource::System);
+        compatible(system.options(), false, "the system's");
+        // resolv.conf's own options still apply.
+        let edns = parsed(
+            "options-edns0",
+            "nameserver 192.0.2.53\noptions edns0 timeout:3 attempts:4\n",
+        );
+        compatible(edns.options(), true, "the system's, with edns0");
+        assert_eq!(edns.options().timeout, std::time::Duration::from_secs(3));
+        assert_eq!(edns.options().attempts, 4);
+        let fallback = parsed("options-fallback", "search example.com\n");
+        assert!(matches!(fallback.source(), DnsSource::Fallback(_)));
+        compatible(fallback.options(), false, "the fallback");
+        compatible(
+            DnsConfig::cloudflare().options(),
+            false,
+            "the legacy policy's",
+        );
+        compatible(&compatible_options(), false, "compatible_options");
+        // A host's own options are its own.
+        let custom = DnsConfig::custom(ResolverConfig::default(), ResolverOpts::default());
+        assert_eq!(
+            custom.options().cache_size,
+            ResolverOpts::default().cache_size
+        );
+    }
+
+    /// A lookup over the system's configuration asks for A first, and for
+    /// AAAA only when A gives nothing, with no EDNS(0) record: hickory 0.25's
+    /// way, where 0.26's defaults ask both at once, with EDNS(0).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lookup_asks_a_then_aaaa_without_edns() {
+        use hickory_resolver::proto::op::{Message, OpCode};
+        use hickory_resolver::proto::rr::rdata::A;
+        use hickory_resolver::proto::rr::{RData, Record, RecordType};
+
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let recorded = asked.clone();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 1500];
+            while let Ok((len, from)) = socket.recv_from(&mut buffer) {
+                let Ok(request) = Message::from_vec(&buffer[..len]) else {
+                    continue;
+                };
+                let Some(query) = request.queries.first().cloned() else {
+                    continue;
+                };
+                let name = query.name().to_ascii();
+                recorded.lock().unwrap().push((
+                    name.clone(),
+                    query.query_type(),
+                    request.edns.is_some(),
+                ));
+                let mut response = Message::response(request.metadata.id, OpCode::Query);
+                response.metadata.recursion_desired = true;
+                response.metadata.recursion_available = true;
+                response.add_query(query.clone());
+                if query.query_type() == RecordType::A && name == "v4.example." {
+                    response.add_answer(Record::from_rdata(
+                        query.name().clone(),
+                        60,
+                        RData::A(A::new(192, 0, 2, 1)),
+                    ));
+                }
+                let _ = socket.send_to(&response.to_vec().unwrap(), from);
+            }
+        });
+        let dns = parsed("a-then-aaaa", "nameserver 127.0.0.1\n").with_port(port);
+        let lookup = dns.lookup();
+        assert_eq!(
+            lookup.lookup("v4.example").await.unwrap(),
+            ["192.0.2.1".parse::<IpAddr>().unwrap()]
+        );
+        // A name with no A record: then AAAA, which has none either.
+        assert!(lookup.lookup("none.example").await.is_err());
+        assert_eq!(
+            asked.lock().unwrap().clone(),
+            [
+                ("v4.example.".to_string(), RecordType::A, false),
+                ("none.example.".to_string(), RecordType::A, false),
+                ("none.example.".to_string(), RecordType::AAAA, false),
+            ]
+        );
     }
 
     #[test]
