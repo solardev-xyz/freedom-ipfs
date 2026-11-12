@@ -552,15 +552,12 @@ async fn socks5_asks_no_local_resolver() {
     let local = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let local_addr = local.local_addr().unwrap();
     local.set_nonblocking(true).unwrap();
-    let config = hickory_resolver::config::ResolverConfig::from_parts(
-        None,
-        Vec::new(),
-        hickory_resolver::config::NameServerConfigGroup::from_ips_clear(
-            &[local_addr.ip()],
-            local_addr.port(),
-            true,
-        ),
-    );
+    let mut server = hickory_resolver::config::NameServerConfig::udp_and_tcp(local_addr.ip());
+    for connection in &mut server.connections {
+        connection.port = local_addr.port();
+    }
+    let config =
+        hickory_resolver::config::ResolverConfig::from_parts(None, Vec::new(), vec![server]);
     let fixture = SocksFixture::start().await;
     fixture.answer("peer.example", Answer::Ip("8.8.8.8".parse().unwrap()));
     let network = Network::with_dns(

@@ -18,6 +18,9 @@ freedom-ipfs-store.workspace = true
 futures.workspace = true
 libp2p.workspace = true
 libp2p-stream.workspace = true
+# The WebSocket transport of a client with no network, which libp2p's
+# `websocket` feature would re-export.
+libp2p-websocket.workspace = true
 multihash.workspace = true
 multihash-codetable.workspace = true
 prost.workspace = true

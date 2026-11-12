@@ -14,9 +14,7 @@ use libp2p::kad::{
 };
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{
-    connection_limits, identify, noise, ping, tcp, tls, yamux, Multiaddr, PeerId, SwarmBuilder,
-};
+use libp2p::{connection_limits, identify, ping, Multiaddr, PeerId, SwarmBuilder};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -1746,22 +1744,14 @@ async fn build_dht_swarm(
 ) -> Result<libp2p::Swarm<DhtBehaviour>> {
     let error = |err: &dyn std::fmt::Display| RoutingError::Dht(err.to_string());
     let Some(transports) = transports else {
+        // TCP or QUIC under the DNS layer, asking Cloudflare's resolvers
+        // rather than the system's: iOS devices do not expose a Unix-style
+        // /etc/resolv.conf, and bootstrap/provider addresses often arrive
+        // as /dnsaddr multiaddrs.
         return SwarmBuilder::with_new_identity()
             .with_tokio()
-            .with_tcp(
-                tcp::Config::default(),
-                (tls::Config::new, noise::Config::new),
-                yamux::Config::default,
-            )
+            .with_other_transport(freedom_ipfs_net::transport::ungated_dht)
             .map_err(|err| error(&err))?
-            .with_quic()
-            // Avoid libp2p's system DNS path: iOS devices do not expose a
-            // Unix-style /etc/resolv.conf, and bootstrap/provider addresses
-            // often arrive as /dnsaddr multiaddrs.
-            .with_dns_config(
-                libp2p::dns::ResolverConfig::cloudflare(),
-                libp2p::dns::ResolverOpts::default(),
-            )
             .with_behaviour(move |key| dht_behaviour(key, query_timeout))
             .map_err(|err| error(&err))
             .map(|builder| {
@@ -1957,6 +1947,7 @@ fn http_url_from_multiaddr(addr: &str) -> Option<Url> {
 mod tests {
     use super::*;
     use ipld_core::ipld::Ipld;
+    use libp2p::{noise, tcp, tls, yamux};
     use libp2p_identity::Keypair;
     use multihash::Multihash;
     use prost::Message;

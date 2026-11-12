@@ -38,8 +38,8 @@ use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, Stream as Libp2pStream, SwarmEvent};
 use libp2p::StreamProtocol;
 use libp2p::{
-    connection_limits, identify, noise, ping, tcp, tls, websocket, yamux, Multiaddr, PeerId,
-    SwarmBuilder, Transport,
+    connection_limits, identify, noise, ping, tcp, tls, yamux, Multiaddr, PeerId, SwarmBuilder,
+    Transport,
 };
 use libp2p_stream::{Control as StreamControl, IncomingStreams};
 use multihash::Multihash;
@@ -9937,13 +9937,9 @@ fn cloudflare_websocket_transport(
 ) -> std::result::Result<Boxed<(PeerId, StreamMuxerBox)>, Box<dyn std::error::Error + Send + Sync>>
 {
     let tcp = tcp::tokio::Transport::new(tcp::Config::default());
-    let dns_tcp = libp2p::dns::tokio::Transport::custom(
-        tcp,
-        libp2p::dns::ResolverConfig::cloudflare(),
-        libp2p::dns::ResolverOpts::default(),
-    );
+    let dns_tcp = freedom_ipfs_net::transport::cloudflare_dns(tcp)?;
     let security = noise::Config::new(keypair)?;
-    Ok(websocket::Config::new(dns_tcp)
+    Ok(libp2p_websocket::Config::new(dns_tcp)
         .upgrade(upgrade::Version::V1Lazy)
         .authenticate(security)
         .multiplex(yamux::Config::default())

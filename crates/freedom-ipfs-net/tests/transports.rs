@@ -20,8 +20,8 @@ use freedom_ipfs_net::{
 };
 use futures::future::BoxFuture;
 use futures::FutureExt;
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig};
-use hickory_resolver::proto::op::{Message, MessageType, ResponseCode};
+use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+use hickory_resolver::proto::op::{Message, OpCode, ResponseCode};
 use hickory_resolver::proto::rr::rdata::{A, TXT};
 use hickory_resolver::proto::rr::{RData, Record, RecordType};
 use libp2p::core::transport::{DialOpts, ListenerId, PortUse, TransportError, TransportEvent};
@@ -319,7 +319,7 @@ impl Dns {
                 let Ok(request) = Message::from_vec(&buffer[..len]) else {
                     continue;
                 };
-                let Some(query) = request.queries().first().cloned() else {
+                let Some(query) = request.queries.first().cloned() else {
                     continue;
                 };
                 let name = query.name().to_ascii().trim_end_matches('.').to_string();
@@ -330,13 +330,10 @@ impl Dns {
                 if !answer {
                     continue;
                 }
-                let mut response = Message::new();
-                response
-                    .set_id(request.id())
-                    .set_message_type(MessageType::Response)
-                    .set_recursion_desired(true)
-                    .set_recursion_available(true)
-                    .add_query(query.clone());
+                let mut response = Message::response(request.metadata.id, OpCode::Query);
+                response.metadata.recursion_desired = true;
+                response.metadata.recursion_available = true;
+                response.add_query(query.clone());
                 match answers.get(&(name, query.query_type())) {
                     Some(records) => {
                         for rdata in records {
@@ -348,7 +345,7 @@ impl Dns {
                         }
                     }
                     None => {
-                        response.set_response_code(ResponseCode::NXDomain);
+                        response.metadata.response_code = ResponseCode::NXDomain;
                     }
                 }
                 counted.fetch_add(1, Ordering::SeqCst);
@@ -363,11 +360,11 @@ impl Dns {
     }
 
     fn config(&self) -> ResolverConfig {
-        ResolverConfig::from_parts(
-            None,
-            Vec::new(),
-            NameServerConfigGroup::from_ips_clear(&[self.addr.ip()], self.addr.port(), true),
-        )
+        let mut server = NameServerConfig::udp_and_tcp(self.addr.ip());
+        for connection in &mut server.connections {
+            connection.port = self.addr.port();
+        }
+        ResolverConfig::from_parts(None, Vec::new(), vec![server])
     }
 
     fn queries(&self) -> Vec<(String, RecordType)> {
@@ -407,11 +404,12 @@ async fn a_dnsaddr_is_expanded_under_the_gate() {
         true,
     );
     let network = unchecked();
-    let resolver = hickory_resolver::TokioResolver::builder_with_config(
+    let resolver = hickory_resolver::Resolver::builder_with_config(
         dns.config(),
-        hickory_resolver::name_server::TokioConnectionProvider::default(),
+        freedom_ipfs_net::resolve::Zoned::default(),
     )
-    .build();
+    .build()
+    .unwrap();
     let counting = Counting::default();
     let mut gated = freedom_ipfs_net::transport::Gated::outer_expanding_dnsaddr(
         counting.clone(),

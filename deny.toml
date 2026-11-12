@@ -9,19 +9,6 @@ all-features = true
 [advisories]
 yanked = "deny"
 ignore = [
-    # hickory-proto 0.25.2, through libp2p-dns 0.44 (libp2p's `/dns`
-    # transport) and freedom-ipfs-net's resolver (`direct`'s DNS
-    # configuration, design 0007's gate). The unbounded loop is in DNSSEC's
-    # NSEC3 validation, which needs hickory's `dnssec-ring` or
-    # `dnssec-aws-lc-rs` feature: this graph builds hickory-proto without
-    # either. No 0.25 release fixes it; hickory 0.26 needs a libp2p-dns
-    # release that takes it.
-    { id = "RUSTSEC-2026-0118", reason = "DNSSEC validation only; hickory-proto is built without its dnssec features" },
-    # The same crate and paths. The quadratic name compression is in message
-    # encoding: these stub resolvers encode only their own one-question
-    # queries, and decode the answers. The fix is hickory-proto 0.26.1, as
-    # above.
-    { id = "RUSTSEC-2026-0119", reason = "encoding only: the resolvers encode their own queries, never a received message" },
     # paste 1.0.15, a proc macro, through netlink-packet-core (if-watch, for
     # libp2p's QUIC and TCP listeners): unmaintained, with no maintained
     # release to move to. It runs at compile time only, and nothing of it

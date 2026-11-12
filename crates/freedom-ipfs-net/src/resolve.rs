@@ -34,10 +34,11 @@
 //! local domain.
 //!
 //! **A nameserver's zone** (`nameserver fe80::1%eth0`, or `%3`) is kept:
-//! hickory's parser drops it, so the zones are read beside it, a named one
-//! through `if_nametoindex`, and set on the servers' addresses. A zone that
-//! names no interface here is a configuration that can't be used: the
-//! fallback, reported as unparseable.
+//! hickory's parser drops it, and hickory keeps a nameserver's IP alone, so
+//! the zones are read beside it, a named one through `if_nametoindex`, and
+//! the resolver's connections ([`Zoned`]) reach that server at its zone. A
+//! zone that names no interface here is a configuration that can't be used:
+//! the fallback, reported as unparseable.
 //!
 //! **Only the first three nameservers** are used, as glibc's, musl's and
 //! the BSDs' resolvers use them (`MAXNS`): a later `nameserver` line, and
@@ -45,13 +46,18 @@
 
 use std::fmt;
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
-use hickory_resolver::name_server::TokioConnectionProvider;
-use hickory_resolver::TokioResolver;
+use hickory_resolver::config::{
+    ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverConfig, ResolverOpts, CLOUDFLARE,
+};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::tcp::TcpClientStream;
+use hickory_resolver::net::udp::UdpClientStream;
+use hickory_resolver::net::NetError;
+use hickory_resolver::{ConnectionProvider, PoolContext, Resolver};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 use crate::capability::{NetworkCapability, Revoked};
@@ -80,6 +86,9 @@ pub struct LookupError(pub String);
 pub struct DnsConfig {
     config: ResolverConfig,
     options: ResolverOpts,
+    /// The zone of each IPv6 nameserver its line gives one, by its address
+    /// (see the module's documentation): hickory keeps the IP alone.
+    zones: Arc<[(Ipv6Addr, u32)]>,
     source: DnsSource,
 }
 
@@ -133,9 +142,12 @@ impl DnsConfig {
         #[cfg(windows)]
         {
             match hickory_resolver::system_conf::read_system_conf() {
-                Ok((config, options)) => {
-                    Self::absolute(config.name_servers().to_vec(), options, DnsSource::System)
-                }
+                Ok((config, options)) => Self::absolute(
+                    config.name_servers().to_vec(),
+                    Vec::new(),
+                    options,
+                    DnsSource::System,
+                ),
                 Err(err) => Self::fallback(DnsFallback::Unreadable(err.to_string())),
             }
         }
@@ -159,12 +171,25 @@ impl DnsConfig {
         // Only the first three nameservers are used: hickory never sees a
         // later `nameserver` line, so a malformed one can't fail the file.
         let data = first_nameservers_only(&data);
+        // A line that can't be read fails the file, as hickory 0.25's strict
+        // parse failed it: hickory 0.26 skips the line and goes on, which
+        // would use a configuration other than the one the file says.
+        if let Err(err) = resolv_conf::Config::parse(&data) {
+            return Self::fallback(DnsFallback::Unparseable(format!(
+                "Error parsing resolv.conf: {err}"
+            )));
+        }
         let (config, options) = match hickory_resolver::system_conf::parse_resolv_conf(&data) {
             Ok(parsed) => parsed,
             Err(err) => return Self::fallback(DnsFallback::Unparseable(err.to_string())),
         };
-        match zoned(config.name_servers(), &data) {
-            Ok(servers) => Self::absolute(servers, options, DnsSource::System),
+        match zones(config.name_servers(), &data) {
+            Ok(zones) => Self::absolute(
+                config.name_servers().to_vec(),
+                zones,
+                options,
+                DnsSource::System,
+            ),
             Err(why) => Self::fallback(DnsFallback::Unparseable(why)),
         }
     }
@@ -173,23 +198,51 @@ impl DnsConfig {
     /// its nameservers and options, its names looked up as written (no
     /// search list or domain, `ndots` 0).
     pub fn custom(config: ResolverConfig, options: ResolverOpts) -> Self {
-        Self::absolute(config.name_servers().to_vec(), options, DnsSource::Custom)
+        Self::absolute(
+            config.name_servers().to_vec(),
+            Vec::new(),
+            options,
+            DnsSource::Custom,
+        )
     }
 
     /// The built-in fallback, Cloudflare's resolvers, for `why`.
     fn fallback(why: DnsFallback) -> Self {
         Self::absolute(
-            ResolverConfig::cloudflare().name_servers().to_vec(),
+            ResolverConfig::udp_and_tcp(&CLOUDFLARE)
+                .name_servers()
+                .to_vec(),
+            Vec::new(),
             ResolverOpts::default(),
             DnsSource::Fallback(why),
         )
     }
 
-    /// `servers` with `options`, every name looked up exactly as written
-    /// (see the module's documentation): no search list, no domain, and
-    /// `ndots` 0.
+    /// `config` as it is, with hickory's default options: its search list,
+    /// its domain and `ndots` 1 kept. The legacy policy's transports ask
+    /// Cloudflare's resolvers so ([`DnsConfig::cloudflare`]), as the crates'
+    /// swarms did before, and a test points a network's transports at its
+    /// own server so (`Transports::with_dns`).
+    pub(crate) fn as_given(config: ResolverConfig) -> Self {
+        Self {
+            config,
+            options: ResolverOpts::default(),
+            zones: Arc::new([]),
+            source: DnsSource::Custom,
+        }
+    }
+
+    /// Cloudflare's resolvers, as [`DnsConfig::as_given`] takes them.
+    pub(crate) fn cloudflare() -> Self {
+        Self::as_given(ResolverConfig::udp_and_tcp(&CLOUDFLARE))
+    }
+
+    /// `servers` with `options` (and the link-local ones' `zones`), every
+    /// name looked up exactly as written (see the module's documentation):
+    /// no search list, no domain, and `ndots` 0.
     fn absolute(
         servers: Vec<NameServerConfig>,
+        zones: Vec<(Ipv6Addr, u32)>,
         mut options: ResolverOpts,
         source: DnsSource,
     ) -> Self {
@@ -197,6 +250,7 @@ impl DnsConfig {
         Self {
             config: ResolverConfig::from_parts(None, Vec::new(), servers),
             options,
+            zones: zones.into(),
             source,
         }
     }
@@ -216,16 +270,158 @@ impl DnsConfig {
         &self.options
     }
 
-    /// A resolver over this configuration.
-    pub(crate) fn resolver(&self) -> TokioResolver {
-        TokioResolver::builder_with_config(self.config.clone(), TokioConnectionProvider::default())
+    /// Each nameserver's address as its lookups reach it: its IP, the port
+    /// of its first connection, and a link-local one's zone.
+    pub fn servers(&self) -> Vec<SocketAddr> {
+        self.config
+            .name_servers()
+            .iter()
+            .map(|server| {
+                let port = server.connections.first().map_or(53, |c| c.port);
+                match (server.ip, self.zone(server.ip)) {
+                    (IpAddr::V6(ip), Some(zone)) => {
+                        SocketAddr::V6(SocketAddrV6::new(ip, port, 0, zone))
+                    }
+                    (ip, _) => SocketAddr::new(ip, port),
+                }
+            })
+            .collect()
+    }
+
+    /// The same configuration with every nameserver asked on `port`, its
+    /// zone, the options and the source kept: a test's fixture server, on a
+    /// port of its own.
+    #[doc(hidden)]
+    pub fn with_port(mut self, port: u16) -> Self {
+        for server in &mut self.config.name_servers {
+            for connection in &mut server.connections {
+                connection.port = port;
+            }
+        }
+        self
+    }
+
+    /// The zone `ip`'s nameserver is reached at, if it has one.
+    fn zone(&self, ip: IpAddr) -> Option<u32> {
+        zone_of(&self.zones, ip)
+    }
+
+    /// A resolver over this configuration. Hickory's builder fails only
+    /// for a TLS configuration, and this crate builds hickory without TLS.
+    pub(crate) fn resolver(&self) -> Result<DnsResolver, NetError> {
+        let provider = Zoned {
+            runtime: TokioRuntimeProvider::default(),
+            zones: self.zones.clone(),
+        };
+        Resolver::builder_with_config(self.config.clone(), provider)
             .with_options(self.options.clone())
             .build()
     }
 
-    /// The gate's resolver's lookups over this configuration.
+    /// The gate's resolver's lookups over this configuration: every lookup
+    /// fails, with why, if no resolver could be built over it.
     pub(crate) fn lookup(&self) -> Arc<dyn NameLookup> {
-        Arc::new(HickoryLookup(self.resolver()))
+        match self.resolver() {
+            Ok(resolver) => Arc::new(HickoryLookup(resolver)),
+            Err(err) => Arc::new(Unbuilt(err.to_string())),
+        }
+    }
+}
+
+/// The resolver over a [`DnsConfig`]: hickory's, its connections through
+/// [`Zoned`].
+pub type DnsResolver = Resolver<Zoned>;
+
+/// The zone of `ip`, a link-local nameserver, in `zones`: the first one
+/// given for its address.
+fn zone_of(zones: &[(Ipv6Addr, u32)], ip: IpAddr) -> Option<u32> {
+    match ip {
+        IpAddr::V6(ip) => zones
+            .iter()
+            .find(|(zoned, _)| *zoned == ip)
+            .map(|&(_, zone)| zone),
+        IpAddr::V4(_) => None,
+    }
+}
+
+/// Hickory's own connections, UDP and TCP over tokio, but a nameserver with
+/// a zone is reached at it. Hickory 0.26 keeps a nameserver's IP alone
+/// (`NameServerConfig::ip`) and connects to it with no zone, which reaches
+/// no link-local address; so a zoned server's connections are made here,
+/// as hickory makes them, to its address with the zone.
+///
+/// Its default knows no zone: hickory's connections, unchanged, as a
+/// resolver over a configuration without link-local servers (a test's) has.
+#[derive(Clone, Default)]
+pub struct Zoned {
+    runtime: TokioRuntimeProvider,
+    zones: Arc<[(Ipv6Addr, u32)]>,
+}
+
+impl Zoned {
+    /// Where a connection to `ip` on `port` goes when `ip` has a zone: its
+    /// address with the zone; `None` for one without, which hickory's own
+    /// connections reach.
+    fn zoned(&self, ip: IpAddr, port: u16) -> Option<SocketAddr> {
+        match (ip, zone_of(&self.zones, ip)) {
+            (IpAddr::V6(ip), Some(zone)) => {
+                Some(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, zone)))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl ConnectionProvider for Zoned {
+    type Conn = <TokioRuntimeProvider as ConnectionProvider>::Conn;
+    type FutureConn = <TokioRuntimeProvider as ConnectionProvider>::FutureConn;
+    type RuntimeProvider = TokioRuntimeProvider;
+
+    fn new_connection(
+        &self,
+        ip: IpAddr,
+        config: &ConnectionConfig,
+        cx: &PoolContext,
+    ) -> Result<Self::FutureConn, NetError> {
+        let Some(remote) = self.zoned(ip, config.port) else {
+            return self.runtime.new_connection(ip, config, cx);
+        };
+        let runtime = self.runtime.clone();
+        let bind_addr = config.bind_addr;
+        let timeout = cx.options.timeout;
+        match config.protocol {
+            ProtocolConfig::Udp => {
+                let os_port_selection = cx.options.os_port_selection;
+                let avoid_local_ports = cx.options.avoid_local_udp_ports.clone();
+                Ok(Box::pin(async move {
+                    Ok(UdpClientStream::builder(remote, runtime)
+                        .with_timeout(Some(timeout))
+                        .with_os_port_selection(os_port_selection)
+                        .avoid_local_ports(avoid_local_ports)
+                        .with_bind_addr(bind_addr)
+                        .exchange())
+                }))
+            }
+            ProtocolConfig::Tcp => Ok(Box::pin(TcpClientStream::exchange(
+                remote,
+                bind_addr,
+                timeout,
+                Some(cx.options.max_active_requests),
+                runtime,
+            ))),
+            // A system configuration's servers are plain DNS, over UDP
+            // and TCP. hickory's other protocols exist only with features
+            // this crate doesn't enable, which another crate in a graph
+            // might.
+            #[allow(unreachable_patterns)]
+            _ => Err(NetError::from(
+                "a zoned nameserver is asked over UDP or TCP only",
+            )),
+        }
+    }
+
+    fn runtime_provider(&self) -> &TokioRuntimeProvider {
+        &self.runtime
     }
 }
 
@@ -271,44 +467,40 @@ fn directive(line: &str) -> std::str::SplitWhitespace<'_> {
         .split_whitespace()
 }
 
-/// `servers`, as hickory parsed them from the resolv.conf `data` (its
-/// first [`MAX_NAMESERVERS`] `nameserver` lines, [`first_nameservers_only`]),
-/// each with the zone its line gives its address: hickory 0.25 builds every
-/// server's address from the IP alone. A numeric zone is the interface's
-/// index; a named one is looked up (`if_nametoindex`). Hickory gives two
-/// servers per `nameserver` line, UDP then TCP, in the file's order; a
-/// zone that names no interface, or servers that don't line up with the
-/// lines, are an error.
+/// The zone each of `servers`, as hickory parsed them from the resolv.conf
+/// `data` (its first [`MAX_NAMESERVERS`] `nameserver` lines,
+/// [`first_nameservers_only`]), is given by its line: hickory keeps every
+/// server's IP alone. A numeric zone is the interface's index; a named one
+/// is looked up (`if_nametoindex`). Hickory gives one server per
+/// `nameserver` line, in the file's order; a zone that names no interface,
+/// or servers that don't line up with the lines, are an error. Two lines
+/// with one link-local address on two interfaces both reach it at the
+/// first one's.
 #[cfg(unix)]
-fn zoned(servers: &[NameServerConfig], data: &[u8]) -> Result<Vec<NameServerConfig>, String> {
+fn zones(servers: &[NameServerConfig], data: &[u8]) -> Result<Vec<(Ipv6Addr, u32)>, String> {
     let lines = nameserver_lines(data)?;
-    if servers.len() != 2 * lines.len() {
+    if servers.len() != lines.len() {
         return Err(format!(
             "{} nameserver lines, but {} servers parsed",
             lines.len(),
             servers.len()
         ));
     }
-    servers
-        .iter()
-        .zip(lines.iter().flat_map(|line| [line, line]))
-        .map(|(server, line)| {
-            if server.socket_addr.ip() != line.ip {
-                return Err(format!(
-                    "nameserver {} parsed as {}",
-                    line.address, server.socket_addr
-                ));
-            }
-            let mut server = server.clone();
-            if let (SocketAddr::V6(addr), Some(zone)) = (&mut server.socket_addr, line.zone) {
-                let index = zone_index(zone).ok_or_else(|| {
-                    format!("nameserver {}: no interface {zone} here", line.address)
-                })?;
-                addr.set_scope_id(index);
-            }
-            Ok(server)
-        })
-        .collect()
+    let mut zones = Vec::new();
+    for (server, line) in servers.iter().zip(&lines) {
+        if server.ip != line.ip {
+            return Err(format!(
+                "nameserver {} parsed as {}",
+                line.address, server.ip
+            ));
+        }
+        if let (IpAddr::V6(ip), Some(zone)) = (line.ip, line.zone) {
+            let index = zone_index(zone)
+                .ok_or_else(|| format!("nameserver {}: no interface {zone} here", line.address))?;
+            zones.push((ip, index));
+        }
+    }
+    Ok(zones)
 }
 
 /// One `nameserver` line of a resolv.conf.
@@ -368,11 +560,23 @@ fn zone_index(zone: &str) -> Option<u32> {
     (index != 0).then_some(index)
 }
 
-struct HickoryLookup(TokioResolver);
+struct HickoryLookup(DnsResolver);
 
 impl fmt::Debug for HickoryLookup {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("HickoryLookup")
+    }
+}
+
+/// Lookups over a configuration no resolver could be built for: each one
+/// fails, with why.
+#[derive(Debug)]
+struct Unbuilt(String);
+
+impl NameLookup for Unbuilt {
+    fn lookup(&self, _name: &str) -> LookupFuture {
+        let why = self.0.clone();
+        Box::pin(async move { Err(LookupError(why)) })
     }
 }
 
@@ -387,7 +591,7 @@ impl NameLookup for HickoryLookup {
                 .lookup_ip(name)
                 .await
                 .map(|lookup| lookup.iter().collect())
-                .map_err(|err| LookupError(err.kind().to_string()))
+                .map_err(|err| LookupError(err.to_string()))
         })
     }
 }
@@ -953,6 +1157,91 @@ mod tests {
                 "{kind}"
             );
         }
+    }
+
+    #[test]
+    fn a_zoned_server_is_reached_at_its_zone_and_another_as_hickory_reaches_it() {
+        let link_local: Ipv6Addr = "fe80::1".parse().unwrap();
+        let zoned = Zoned {
+            runtime: TokioRuntimeProvider::default(),
+            zones: Arc::new([(link_local, 3), (link_local, 4)]),
+        };
+        assert_eq!(
+            zoned.zoned(IpAddr::V6(link_local), 53),
+            Some(SocketAddr::V6(SocketAddrV6::new(link_local, 53, 0, 3))),
+            "the first zone given for its address"
+        );
+        for ip in ["fe80::2", "2001:db8::53", "192.0.2.53"] {
+            assert_eq!(zoned.zoned(ip.parse().unwrap(), 53), None, "{ip}");
+        }
+        assert_eq!(Zoned::default().zoned(IpAddr::V6(link_local), 53), None);
+    }
+
+    /// A lookup through a zoned server's own connections (UDP, as hickory
+    /// asks first) gets its answer: the server is `::1`, given a numeric
+    /// zone, which loopback ignores, so a fixture on it answers whichever
+    /// connections ask.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lookup_through_a_zoned_servers_connections_is_answered() {
+        use hickory_resolver::proto::op::{Message, OpCode};
+        use hickory_resolver::proto::rr::rdata::A;
+        use hickory_resolver::proto::rr::{RData, Record, RecordType};
+
+        let socket = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 1500];
+            while let Ok((len, from)) = socket.recv_from(&mut buffer) {
+                let Ok(request) = Message::from_vec(&buffer[..len]) else {
+                    continue;
+                };
+                let Some(query) = request.queries.first().cloned() else {
+                    continue;
+                };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut response = Message::response(request.metadata.id, OpCode::Query);
+                response.metadata.recursion_desired = true;
+                response.metadata.recursion_available = true;
+                response.add_query(query.clone());
+                if query.query_type() == RecordType::A {
+                    response.add_answer(Record::from_rdata(
+                        query.name().clone(),
+                        60,
+                        RData::A(A::new(192, 0, 2, 1)),
+                    ));
+                }
+                let _ = socket.send_to(&response.to_vec().unwrap(), from);
+            }
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "freedom-ipfs-net-zoned-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("resolv.conf");
+        std::fs::write(&path, "nameserver ::1%1\n").unwrap();
+        let dns = DnsConfig::from_resolv_conf(&path).with_port(port);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(dns.source(), &DnsSource::System);
+        assert_eq!(
+            dns.servers(),
+            [SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::LOCALHOST,
+                port,
+                0,
+                1
+            ))]
+        );
+        let answer = dns.lookup().lookup("zoned.example").await.unwrap();
+        assert!(
+            answer.contains(&"192.0.2.1".parse::<IpAddr>().unwrap()),
+            "{answer:?}"
+        );
+        assert!(asked.load(Ordering::SeqCst) > 0);
     }
 
     #[test]

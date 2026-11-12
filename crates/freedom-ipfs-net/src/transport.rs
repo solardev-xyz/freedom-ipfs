@@ -24,19 +24,21 @@
 //! Under the legacy policy the transports are those the crates built before,
 //! by the same constructors, behind a capability-only outer gate.
 //!
-//! **DNS.** Under `direct`, the DNS layer and the `/dnsaddr` expansion ask
-//! the network's own DNS configuration ([`Network::dns`]): the one the
-//! gate's HTTP resolver asks, the system's, or the fallback only where that
-//! can't be read or parsed. Every name is looked up exactly as written,
-//! with no search list ([`crate::resolve`]): a peer's `/dns4/intranet` is
-//! `intranet.`, never the user's `intranet.<search domain>`. Under the
-//! legacy policy they ask Cloudflare's resolvers, as the crates' swarms did
-//! before.
+//! **DNS.** The DNS layer ([`dns`]) is libp2p-dns's, adapted to hickory
+//! 0.26 over libp2p 0.56's transports. Under `direct`, it and the
+//! `/dnsaddr` expansion ask the network's own DNS configuration
+//! ([`Network::dns`]): the one the gate's HTTP resolver asks, the system's,
+//! or the fallback only where that can't be read or parsed. Every name is
+//! looked up exactly as written, with no search list ([`crate::resolve`]):
+//! a peer's `/dns4/intranet` is `intranet.`, never the user's
+//! `intranet.<search domain>`. Under the legacy policy they ask
+//! Cloudflare's resolvers, as the crates' swarms did before.
 //!
 //! Under `socks5` (cargo feature `socks`) every dial goes through the proxy
 //! (`Socks5Transport`), behind the outer gate: no QUIC, no DNS layer, and
 //! no `/dnsaddr` expansion, which would need a local lookup.
 
+pub mod dns;
 mod select_security;
 #[cfg(feature = "socks")]
 mod socks;
@@ -50,14 +52,14 @@ use std::task::{Context, Poll};
 
 use futures::future::BoxFuture;
 use futures::{FutureExt, TryFutureExt};
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-use hickory_resolver::name_server::TokioConnectionProvider;
-use hickory_resolver::TokioResolver;
+use hickory_resolver::config::ResolverConfig;
+use hickory_resolver::proto::rr::RData;
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::{Boxed, DialOpts, ListenerId, TransportError, TransportEvent};
 use libp2p::core::upgrade::Version;
 use libp2p::identity::Keypair;
-use libp2p::{noise, quic, tcp, tls, websocket, yamux, PeerId, Transport};
+use libp2p::{noise, quic, tcp, tls, yamux, PeerId, Transport};
+use libp2p_websocket as websocket;
 use multiaddr::{Multiaddr, Protocol};
 use parking_lot::Mutex;
 
@@ -69,6 +71,7 @@ use crate::capability::{NetworkCapability, Revoked};
 use crate::dial::{DialPolicy, DialRefusal};
 use crate::gate::{classify_host, AddressRefusal, OnionHost};
 use crate::policy::{Mode, Network};
+use crate::resolve::{DnsConfig, DnsResolver};
 
 /// The most TXT lookups one `/dnsaddr` dial makes, nested ones included:
 /// libp2p-dns's own bound.
@@ -91,7 +94,7 @@ enum Layer {
         policy: DialPolicy,
         /// Expands `/dnsaddr` here, under the gate, rather than in the DNS
         /// layer below.
-        dnsaddr: Option<Box<TokioResolver>>,
+        dnsaddr: Option<Box<DnsResolver>>,
     },
     Inner {
         policy: DialPolicy,
@@ -129,7 +132,7 @@ impl<T> Gated<T> {
         inner: T,
         capability: NetworkCapability,
         policy: DialPolicy,
-        resolver: TokioResolver,
+        resolver: DnsResolver,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -410,7 +413,7 @@ fn is_dnsaddr(addr: &Multiaddr) -> bool {
 /// addresses, until one connects.
 async fn dial_dnsaddr<T>(
     inner: Arc<Mutex<T>>,
-    resolver: TokioResolver,
+    resolver: DnsResolver,
     policy: DialPolicy,
     addr: Multiaddr,
     opts: DialOpts,
@@ -455,14 +458,17 @@ where
         let records = match resolver.txt_lookup(format!("_dnsaddr.{name}")).await {
             Ok(records) => records,
             Err(err) => {
-                refusals.push(err.kind().to_string());
+                refusals.push(err.to_string());
                 continue;
             }
         };
         let mut added = 0usize;
-        for record in records.iter() {
+        for record in records.answers() {
+            let RData::TXT(record) = &record.data else {
+                continue;
+            };
             let Some(text) = record
-                .txt_data()
+                .txt_data
                 .first()
                 .and_then(|chars| std::str::from_utf8(chars).ok())
             else {
@@ -494,8 +500,7 @@ where
 #[derive(Clone, Debug)]
 pub struct Transports {
     network: Network,
-    dns: ResolverConfig,
-    options: ResolverOpts,
+    dns: DnsConfig,
 }
 
 /// Why a transport couldn't be built: a security upgrade refused the
@@ -506,29 +511,23 @@ pub type TransportBuildError = Box<dyn StdError + Send + Sync>;
 pub type SwarmTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
 impl Transports {
-    /// `network`'s transports. Under `direct`, libp2p's DNS layer and the
+    /// `network`'s transports. Under `direct`, the DNS layer and the
     /// `/dnsaddr` expansion ask the network's DNS configuration
     /// ([`Network::dns`]), as its HTTP clients' resolver does; under the
     /// legacy policy, Cloudflare's resolvers, as the crates' swarms did
     /// before. `socks5`'s transports have no DNS layer: names go to the
     /// proxy.
     pub fn new(network: &Network) -> Self {
-        let (dns, options) = match network.dns() {
-            Some(dns) => (dns.config().clone(), dns.options().clone()),
-            None => (ResolverConfig::cloudflare(), ResolverOpts::default()),
-        };
         Self {
             network: network.clone(),
-            dns,
-            options,
+            dns: network.dns().cloned().unwrap_or_else(DnsConfig::cloudflare),
         }
     }
 
     /// The same, with the DNS layer asking `dns`: tests.
     #[doc(hidden)]
     pub fn with_dns(mut self, dns: ResolverConfig) -> Self {
-        self.dns = dns;
-        self.options = ResolverOpts::default();
+        self.dns = DnsConfig::as_given(dns);
         self
     }
 
@@ -536,14 +535,12 @@ impl Transports {
         &self.network
     }
 
-    fn resolver(&self) -> TokioResolver {
-        TokioResolver::builder_with_config(self.dns.clone(), TokioConnectionProvider::default())
-            .with_options(self.options.clone())
-            .build()
+    fn resolver(&self) -> Result<DnsResolver, TransportBuildError> {
+        Ok(self.dns.resolver()?)
     }
 
-    fn dns<T>(&self, inner: T) -> libp2p::dns::tokio::Transport<T> {
-        libp2p::dns::tokio::Transport::custom(inner, self.dns.clone(), self.options.clone())
+    fn dns<T>(&self, inner: T) -> Result<dns::Transport<T>, TransportBuildError> {
+        Ok(dns::Transport::new(inner, self.resolver()?))
     }
 
     fn gated(&self) -> bool {
@@ -572,7 +569,7 @@ impl Transports {
     #[cfg(feature = "socks")]
     fn socks5_dht(&self, keypair: &Keypair) -> Result<SwarmTransport, TransportBuildError> {
         let tcp = upgraded(self.socks5()?, keypair)?;
-        Ok(self.outer(tcp, false).boxed())
+        Ok(self.outer(tcp, false)?.boxed())
     }
 
     /// Bitswap's transport under `socks5`: TCP (TLS or Noise, then Yamux),
@@ -585,7 +582,7 @@ impl Transports {
         let both = tcp
             .or_transport(websocket)
             .map(|either, _| either.into_inner());
-        Ok(self.outer(both, false).boxed())
+        Ok(self.outer(both, false)?.boxed())
     }
 
     #[cfg(not(feature = "socks"))]
@@ -598,18 +595,18 @@ impl Transports {
         Err(NO_SOCKS.into())
     }
 
-    fn outer<T>(&self, inner: T, expand_dnsaddr: bool) -> Gated<T> {
+    fn outer<T>(&self, inner: T, expand_dnsaddr: bool) -> Result<Gated<T>, TransportBuildError> {
         let capability = self.network.capability().clone();
         let policy = self.network.dial_policy();
-        if expand_dnsaddr && self.gated() {
-            Gated::outer_expanding_dnsaddr(inner, capability, policy, self.resolver())
+        Ok(if expand_dnsaddr && self.gated() {
+            Gated::outer_expanding_dnsaddr(inner, capability, policy, self.resolver()?)
         } else {
             Gated::outer(inner, capability, policy)
-        }
+        })
     }
 
     /// The light DHT's transport: TCP (TLS or Noise, then Yamux) or QUIC,
-    /// under libp2p's DNS layer, as `SwarmBuilder`'s
+    /// under the DNS layer ([`dns`]), as `SwarmBuilder`'s
     /// `with_tcp(..).with_quic().with_dns_config(..)` builds it. Under
     /// `direct`, with the outer gate above the DNS layer (expanding
     /// `/dnsaddr` itself) and the inner gate below it.
@@ -622,15 +619,15 @@ impl Transports {
         let direct = tcp.or_transport(quic).map(|either, _| either.into_inner());
         Ok(if self.gated() {
             let inner = Gated::inner(direct, self.network.dial_policy());
-            self.outer(self.dns(inner), true).boxed()
+            self.outer(self.dns(inner)?, true)?.boxed()
         } else {
-            self.outer(self.dns(direct), false).boxed()
+            self.outer(self.dns(direct)?, false)?.boxed()
         })
     }
 
     /// Bitswap's transport, as the retriever built it: TCP (TLS or Noise,
     /// then Yamux) and QUIC without DNS, or WebSocket (Noise, then Yamux)
-    /// over libp2p's DNS layer, so a WSS name reaches TLS for SNI. Under
+    /// over the DNS layer ([`dns`]), so a WSS name reaches TLS for SNI. Under
     /// `direct`, with the outer gate above both and the inner gate below
     /// the DNS layer and below TCP and QUIC.
     pub fn bitswap(&self, keypair: &Keypair) -> Result<SwarmTransport, TransportBuildError> {
@@ -649,15 +646,37 @@ impl Transports {
         };
         let tcp = tcp::tokio::Transport::new(tcp::Config::default());
         let websocket = if gated {
-            websocket_upgraded(self.dns(Gated::inner(tcp, policy)), keypair)?
+            websocket_upgraded(self.dns(Gated::inner(tcp, policy))?, keypair)?
         } else {
-            websocket_upgraded(self.dns(tcp), keypair)?
+            websocket_upgraded(self.dns(tcp)?, keypair)?
         };
         let both = direct
             .or_transport(websocket)
             .map(|either, _| either.into_inner());
-        Ok(self.outer(both, false).boxed())
+        Ok(self.outer(both, false)?.boxed())
     }
+}
+
+/// The light DHT's transport for a client with no network: TCP (TLS or
+/// Noise, then Yamux) or QUIC, under the DNS layer asking Cloudflare's
+/// resolvers, as `SwarmBuilder`'s
+/// `with_tcp(..).with_quic().with_dns_config(cloudflare, default)` built it
+/// before. No gate: there is no network, and so no policy or capability.
+pub fn ungated_dht(keypair: &Keypair) -> Result<SwarmTransport, TransportBuildError> {
+    let direct = tcp_upgraded(keypair)?
+        .or_transport(quic_transport(keypair))
+        .map(|either, _| either.into_inner());
+    Ok(cloudflare_dns(direct)?.boxed())
+}
+
+/// The DNS layer over `inner` for a client with no network, asking
+/// Cloudflare's resolvers with hickory's default options, as libp2p-dns's
+/// `Transport::custom(inner, ResolverConfig::cloudflare(), default)` did.
+pub fn cloudflare_dns<T>(inner: T) -> Result<dns::Transport<T>, TransportBuildError> {
+    Ok(dns::Transport::new(
+        inner,
+        DnsConfig::cloudflare().resolver()?,
+    ))
 }
 
 /// Why a `socks5` network's transports can't be built without the `socks`

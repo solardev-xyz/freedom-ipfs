@@ -14,9 +14,11 @@ data-encoding.workspace = true
 # `gate` re-exports.
 freedom-ipfs-addr.workspace = true
 # The gate's resolver under `direct` with checked addresses: async and
-# cancellable, over the system's DNS configuration (D3). Already in the
-# graph through libp2p-dns, at this version; no DNSSEC feature.
-hickory-resolver = { version = "0.25", default-features = false, features = ["system-config", "tokio"] }
+# cancellable, over the system's DNS configuration (D3); and the libp2p
+# transports' DNS layer's (`transport::dns`). 0.26.2 at least, whose
+# message decoder no longer reserves room for as many records as a header
+# claims before reading any (RUSTSEC-2026-0491). No DNSSEC feature.
+hickory-resolver = { version = "0.26.2", default-features = false, features = ["system-config", "tokio"] }
 # The SelectSecurityUpgrade copied from libp2p (decision D10): its protocol
 # names, as libp2p's own. Already in the graph.
 either = "1"
@@ -25,8 +27,9 @@ futures.workspace = true
 # Header names and values for requests, as reqwest takes them.
 http.workspace = true
 # The libp2p transports the gate wraps, and those it builds for the swarms:
-# the workspace's own version and features.
+# the workspace's own version and features, and its WebSocket transport.
 libp2p.workspace = true
+libp2p-websocket.workspace = true
 # The multiaddrs libp2p dials; the version libp2p re-exports, so the types
 # are the same ones.
 multiaddr.workspace = true
@@ -48,6 +51,9 @@ tower-service = "0.3"
 tokio = { version = "1", default-features = false, features = ["sync", "time"] }
 # WHATWG host and URL parsing: the rules reqwest's URLs follow.
 url.workspace = true
+# The DNS layer's debug and trace events (`transport::dns`), as libp2p-dns
+# logs them. Already in the graph.
+tracing.workspace = true
 # Under `socks5`, reqwest's SOCKS connector is hyper-util's: 0.1.20 and
 # older send a resolved IPv6 address to the proxy as a domain
 # ("[2001:db8::1]"); 0.1.21 sends it as an address (design 0007, "What can
@@ -65,6 +71,11 @@ freedom-ipfs-socks = { workspace = true, optional = true }
 # `if_nametoindex`, for a resolv.conf nameserver's named zone
 # (`fe80::1%eth0`), which hickory's parser drops. Already in the graph.
 libc = "0.2"
+# resolv.conf's strict parse (`Config::parse`), which refuses a file with a
+# line it can't read: hickory 0.26 skips such a line, and a configuration
+# with one is the fallback here (see `resolve`). hickory-resolver's own
+# parser, at its version.
+resolv-conf = { version = "0.7.6", default-features = false }
 
 [features]
 # `socks5` mode's SOCKS5 client and libp2p transport (design 0007,
