@@ -34,11 +34,11 @@
 //! local domain.
 //!
 //! **A nameserver's zone** (`nameserver fe80::1%eth0`, or `%3`) is kept:
-//! hickory's parser drops it, and hickory keeps a nameserver's IP alone, so
-//! the zones are read beside it, a named one through `if_nametoindex`, and
-//! the resolver's connections ([`Zoned`]) reach that server at its zone. A
-//! zone that names no interface here is a configuration that can't be used:
-//! the fallback, reported as unparseable.
+//! hickory keeps a nameserver's IP alone, so the zones are read beside the
+//! parsed configuration, a named one through `if_nametoindex`, and the
+//! resolver's connections ([`Zoned`]) reach that server at its zone. A zone
+//! that names no interface here is a configuration that can't be used: the
+//! fallback, reported as unparseable.
 //!
 //! **Only the first three nameservers** are used, as glibc's, musl's and
 //! the BSDs' resolvers use them (`MAXNS`): a later `nameserver` line, and
@@ -168,28 +168,15 @@ impl DnsConfig {
             Ok(data) => data,
             Err(err) => return Self::fallback(DnsFallback::Unreadable(err.to_string())),
         };
-        // Only the first three nameservers are used: hickory never sees a
-        // later `nameserver` line, so a malformed one can't fail the file.
+        // Only the first three nameservers are used: the parser never sees
+        // a later `nameserver` line, so a malformed one can't fail the file.
         let data = first_nameservers_only(&data);
-        // A line that can't be read fails the file, as hickory 0.25's strict
-        // parse failed it: hickory 0.26 skips the line and goes on, which
-        // would use a configuration other than the one the file says.
-        if let Err(err) = resolv_conf::Config::parse(&data) {
-            return Self::fallback(DnsFallback::Unparseable(format!(
-                "Error parsing resolv.conf: {err}"
-            )));
-        }
-        let (config, options) = match hickory_resolver::system_conf::parse_resolv_conf(&data) {
+        let (servers, options) = match parse_resolv_conf(&data) {
             Ok(parsed) => parsed,
-            Err(err) => return Self::fallback(DnsFallback::Unparseable(err.to_string())),
+            Err(why) => return Self::fallback(DnsFallback::Unparseable(why)),
         };
-        match zones(config.name_servers(), &data) {
-            Ok(zones) => Self::absolute(
-                config.name_servers().to_vec(),
-                zones,
-                options,
-                DnsSource::System,
-            ),
+        match zones(&servers, &data) {
+            Ok(zones) => Self::absolute(servers, zones, options, DnsSource::System),
             Err(why) => Self::fallback(DnsFallback::Unparseable(why)),
         }
     }
@@ -432,8 +419,44 @@ impl ConnectionProvider for Zoned {
 #[cfg(unix)]
 const MAX_NAMESERVERS: usize = 3;
 
+/// The resolv.conf `data` parsed into hickory's configuration, as hickory
+/// 0.25's `system_conf::parse_resolv_conf` parsed it on every Unix: with
+/// resolv-conf's strict parser, so a line it can't read fails the file;
+/// each nameserver asked over UDP and TCP on port 53; `ndots`, `timeout`,
+/// `attempts` and `edns0` from its options; and an invalid search domain
+/// an error, though [`DnsConfig::absolute`] drops the list. Hickory 0.26's
+/// own parser can't stand in: it skips a line it can't read, and it exists
+/// only off Apple and Android, where this is still how `/etc/resolv.conf`
+/// is read. Errors read as hickory 0.25's did.
+#[cfg(unix)]
+fn parse_resolv_conf(data: &[u8]) -> Result<(Vec<NameServerConfig>, ResolverOpts), String> {
+    let parsed = resolv_conf::Config::parse(data)
+        .map_err(|err| format!("Error parsing resolv.conf: {err}"))?;
+    let servers: Vec<NameServerConfig> = parsed
+        .nameservers
+        .iter()
+        .map(|ip| NameServerConfig::udp_and_tcp(ip.into()))
+        .collect();
+    if servers.is_empty() {
+        return Err("io error: no nameservers found in config".to_string());
+    }
+    for domain in parsed.get_last_search_or_domain() {
+        if domain == "--" {
+            continue;
+        }
+        hickory_resolver::proto::rr::Name::from_str_relaxed(domain)
+            .map_err(|err| format!("Error parsing resolv.conf: {err}"))?;
+    }
+    let mut options = ResolverOpts::default();
+    options.ndots = parsed.ndots as usize;
+    options.timeout = std::time::Duration::from_secs(u64::from(parsed.timeout));
+    options.attempts = parsed.attempts as usize;
+    options.edns0 = parsed.edns0;
+    Ok((servers, options))
+}
+
 /// The resolv.conf `data` with every `nameserver` line after the first
-/// [`MAX_NAMESERVERS`] emptied, so neither hickory's parser nor the zone
+/// [`MAX_NAMESERVERS`] emptied, so neither the parser nor the zone
 /// scan reads it. Every other line stays as it is, in its place, and so
 /// does the line count.
 #[cfg(unix)]
@@ -456,7 +479,7 @@ fn first_nameservers_only(data: &[u8]) -> Vec<u8> {
     kept
 }
 
-/// A resolv.conf line's words, as resolv-conf (hickory's parser) reads
+/// A resolv.conf line's words, as resolv-conf (the parser) reads
 /// them: a line whose first character other than a space or tab is `#` or
 /// `;` is a comment, and so is everything after one.
 #[cfg(unix)]
@@ -467,12 +490,12 @@ fn directive(line: &str) -> std::str::SplitWhitespace<'_> {
         .split_whitespace()
 }
 
-/// The zone each of `servers`, as hickory parsed them from the resolv.conf
-/// `data` (its first [`MAX_NAMESERVERS`] `nameserver` lines,
-/// [`first_nameservers_only`]), is given by its line: hickory keeps every
-/// server's IP alone. A numeric zone is the interface's index; a named one
-/// is looked up (`if_nametoindex`). Hickory gives one server per
-/// `nameserver` line, in the file's order; a zone that names no interface,
+/// The zone each of `servers`, as [`parse_resolv_conf`] parsed them from
+/// the resolv.conf `data` (its first [`MAX_NAMESERVERS`] `nameserver`
+/// lines, [`first_nameservers_only`]), is given by its line: hickory keeps
+/// every server's IP alone. A numeric zone is the interface's index; a
+/// named one is looked up (`if_nametoindex`). The parse gives one server
+/// per `nameserver` line, in the file's order; a zone that names no interface,
 /// or servers that don't line up with the lines, are an error. Two lines
 /// with one link-local address on two interfaces both reach it at the
 /// first one's.

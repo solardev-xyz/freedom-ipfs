@@ -71,10 +71,11 @@ freedom-ipfs-socks = { workspace = true, optional = true }
 # `if_nametoindex`, for a resolv.conf nameserver's named zone
 # (`fe80::1%eth0`), which hickory's parser drops. Already in the graph.
 libc = "0.2"
-# resolv.conf's strict parse (`Config::parse`), which refuses a file with a
-# line it can't read: hickory 0.26 skips such a line, and a configuration
-# with one is the fallback here (see `resolve`). hickory-resolver's own
-# parser, at its version.
+# resolv.conf's parser, strict (`Config::parse`): a file with a line it
+# can't read is the fallback here (see `resolve`). Hickory 0.26 parses
+# leniently, and only off Apple and Android, so `resolve` reads the file
+# itself, as hickory 0.25 did on every Unix. hickory-resolver's own parser,
+# at its version.
 resolv-conf = { version = "0.7.6", default-features = false }
 
 [features]
