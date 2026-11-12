@@ -16,8 +16,8 @@ use freedom_ipfs_net::transport::{SwarmTransport, Transports};
 use freedom_ipfs_net::{
     Addresses, ClientConfig, DnsConfig, DnsSource, Nat64Handle, Network, NetworkPolicy,
 };
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-use hickory_resolver::proto::op::{Message, MessageType, ResponseCode};
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+use hickory_resolver::proto::op::{Message, OpCode, ResponseCode};
 use hickory_resolver::proto::rr::rdata::{A, TXT};
 use hickory_resolver::proto::rr::{RData, Record, RecordType};
 use libp2p::core::transport::{DialOpts, PortUse, TransportError};
@@ -60,7 +60,7 @@ impl Dns {
                 let Ok(request) = Message::from_vec(&buffer[..len]) else {
                     continue;
                 };
-                let Some(query) = request.queries().first().cloned() else {
+                let Some(query) = request.queries.first().cloned() else {
                     continue;
                 };
                 let name = query.name().to_ascii().trim_end_matches('.').to_string();
@@ -68,13 +68,10 @@ impl Dns {
                     .lock()
                     .unwrap()
                     .push((name.clone(), query.query_type()));
-                let mut response = Message::new();
-                response
-                    .set_id(request.id())
-                    .set_message_type(MessageType::Response)
-                    .set_recursion_desired(true)
-                    .set_recursion_available(true)
-                    .add_query(query.clone());
+                let mut response = Message::response(request.metadata.id, OpCode::Query);
+                response.metadata.recursion_desired = true;
+                response.metadata.recursion_available = true;
+                response.add_query(query.clone());
                 match answers.get(&(name, query.query_type())) {
                     Some(records) => {
                         for rdata in records {
@@ -86,7 +83,7 @@ impl Dns {
                         }
                     }
                     None => {
-                        response.set_response_code(ResponseCode::NXDomain);
+                        response.metadata.response_code = ResponseCode::NXDomain;
                     }
                 }
                 let _ = socket.send_to(&response.to_vec().unwrap(), from);
@@ -96,11 +93,11 @@ impl Dns {
     }
 
     fn config(&self) -> ResolverConfig {
-        ResolverConfig::from_parts(
-            None,
-            Vec::new(),
-            NameServerConfigGroup::from_ips_clear(&[self.addr.ip()], self.addr.port(), true),
-        )
+        let mut server = NameServerConfig::udp_and_tcp(self.addr.ip());
+        for connection in &mut server.connections {
+            connection.port = self.addr.port();
+        }
+        ResolverConfig::from_parts(None, Vec::new(), vec![server])
     }
 
     fn queries(&self) -> Vec<(String, RecordType)> {
@@ -291,7 +288,7 @@ async fn names_are_looked_up_exactly_as_written() {
             loopback(),
         ),
     ]));
-    let corp = hickory_resolver::Name::from_ascii("corp.example.").unwrap();
+    let corp = hickory_resolver::proto::rr::Name::from_ascii("corp.example.").unwrap();
     let config = ResolverConfig::from_parts(
         Some(corp.clone()),
         vec![corp],
@@ -418,14 +415,17 @@ mod resolv_conf {
         }
     }
 
-    fn servers(config: &ResolverConfig) -> Vec<SocketAddr> {
-        let mut servers: Vec<SocketAddr> = config
-            .name_servers()
+    fn servers(dns: &DnsConfig) -> Vec<SocketAddr> {
+        dns.servers()
+    }
+
+    /// Cloudflare's resolvers, the fallback, as [`servers`] gives them.
+    fn cloudflare() -> Vec<SocketAddr> {
+        hickory_resolver::config::CLOUDFLARE
+            .ips
             .iter()
-            .map(|server| server.socket_addr)
-            .collect();
-        servers.dedup();
-        servers
+            .map(|ip| SocketAddr::new(*ip, 53))
+            .collect()
     }
 
     /// A resolv.conf that reads and parses is the system's: its
@@ -441,7 +441,7 @@ mod resolv_conf {
         let dns = DnsConfig::from_resolv_conf(&path);
         assert_eq!(dns.source(), &DnsSource::System);
         assert_eq!(
-            servers(dns.config()),
+            servers(&dns),
             [
                 "192.0.2.53:53".parse::<SocketAddr>().unwrap(),
                 "[2001:db8::53]:53".parse().unwrap(),
@@ -552,14 +552,14 @@ mod resolv_conf {
             };
             let dns = DnsConfig::from_resolv_conf(&path);
             assert_eq!(dns.source(), &DnsSource::System, "{file}");
-            assert_eq!(servers(dns.config()), nameservers, "{file}");
+            assert_eq!(servers(&dns), nameservers, "{file}");
             assert!(dns.config().search().is_empty(), "{file}");
             assert_eq!(dns.options().ndots, 0, "{file}");
         }
     }
 
-    /// A nameserver's zone is kept on both its servers (UDP and TCP): a
-    /// numeric one as it is, a named one as its interface's index. A name
+    /// A nameserver's zone is kept: a numeric one as it is, a named one as
+    /// its interface's index. A name
     /// no interface has here can't be used: the fallback, reported as
     /// unparseable, with the zone named. Only the first three nameservers
     /// count: a fourth, its zone, or a fourth that doesn't parse at all, is
@@ -575,17 +575,25 @@ mod resolv_conf {
             let path = scratch.file(file, &format!("nameserver 192.0.2.53\n{line}\n"));
             let dns = DnsConfig::from_resolv_conf(&path);
             assert_eq!(dns.source(), &DnsSource::System, "{file}");
-            let zoned: Vec<u32> = dns
-                .config()
-                .name_servers()
-                .iter()
-                .filter_map(|server| match server.socket_addr {
+            let zoned: Vec<u32> = servers(&dns)
+                .into_iter()
+                .filter_map(|server| match server {
                     SocketAddr::V6(addr) => Some(addr.scope_id()),
                     SocketAddr::V4(_) => None,
                 })
                 .collect();
-            assert_eq!(zoned, [scope, scope], "{file}: UDP and TCP");
+            assert_eq!(zoned, [scope], "{file}");
         }
+        // One link-local address on two interfaces: both lines reach it at
+        // the first one's zone, as the resolver keeps a server's IP alone.
+        let path = scratch.file(
+            "same-address",
+            "nameserver fe80::1%3\nnameserver fe80::1%4\n",
+        );
+        let dns = DnsConfig::from_resolv_conf(&path);
+        assert_eq!(dns.source(), &DnsSource::System);
+        let first = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 53, 0, 3));
+        assert_eq!(servers(&dns), [first, first]);
         // Only the first three nameservers are used, as glibc's, musl's and
         // the BSDs' resolvers use them: a usable fourth one is ignored, and
         // so is a fourth one's zone that names no interface.
@@ -610,7 +618,7 @@ mod resolv_conf {
             );
             let dns = DnsConfig::from_resolv_conf(&path);
             assert_eq!(dns.source(), &DnsSource::System, "{file}");
-            assert_eq!(servers(dns.config()), first_three, "{file}");
+            assert_eq!(servers(&dns), first_three, "{file}");
             assert_eq!(dns.options().timeout, Duration::from_secs(3), "{file}");
             assert_eq!(dns.options().attempts, 4, "{file}");
         }
@@ -633,10 +641,7 @@ mod resolv_conf {
             }
             other => panic!("{other:?}"),
         }
-        assert_eq!(
-            servers(dns.config()),
-            servers(&ResolverConfig::cloudflare())
-        );
+        assert_eq!(servers(&dns), cloudflare());
     }
 
     /// A resolv.conf that is readable but malformed, or names no
@@ -646,7 +651,7 @@ mod resolv_conf {
     #[test]
     fn a_malformed_or_unreadable_resolv_conf_takes_the_fallback_and_says_why() {
         let scratch = Scratch::new("malformed");
-        let cloudflare = servers(&ResolverConfig::cloudflare());
+        let cloudflare = cloudflare();
         for (name, contents, reason) in [
             ("bad-address", "nameserver not-an-address\n", "invalid IP"),
             (
@@ -669,7 +674,7 @@ mod resolv_conf {
                 }
                 other => panic!("{name}: {other:?}"),
             }
-            assert_eq!(servers(dns.config()), cloudflare, "{name}");
+            assert_eq!(servers(&dns), cloudflare, "{name}");
             assert!(dns.source().to_string().starts_with("Cloudflare's resolvers, the fallback: the system's DNS configuration couldn't be parsed"));
 
             let network = Network::with_dns(
@@ -698,7 +703,7 @@ mod resolv_conf {
                 path.display(),
                 dns.source()
             );
-            assert_eq!(servers(dns.config()), cloudflare);
+            assert_eq!(servers(&dns), cloudflare);
         }
     }
 }
