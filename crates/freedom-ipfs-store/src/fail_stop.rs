@@ -5,7 +5,9 @@
 //!
 //! The store's only FFI is here: the two `sqlite3_config` calls, the
 //! wrappers around SQLite's allocator, and `_exit`, each with its `SAFETY`
-//! comment.
+//! comment. [`fail_stop_on_oom`] is an `unsafe fn`: SQLite's configuration
+//! is process-global and not thread-safe, which no safe function can
+//! guarantee on its caller's behalf.
 
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,19 +42,12 @@ pub enum FailStopError {
 /// is answered with it. For a service under freedom-core's memory cap
 /// (design 0010, "The memory cap").
 ///
-/// **When to call it:** first in `main`, before anything in the process
-/// uses SQLite: before the first [`SqliteBlockStore`](crate::SqliteBlockStore)
-/// opens, and before any other code calls into SQLite (through rusqlite or
-/// otherwise). SQLite takes an allocator only before it initializes, which
-/// its first use does. A call after that installs nothing and returns
-/// [`FailStopError::TooLate`]: after a store of this crate has opened, or
-/// once SQLite answers that it has initialized. A call after one that
-/// succeeded returns `Ok` again. The wrappers stay for the process's life.
-///
-/// **Threads:** SQLite's configuration isn't thread-safe. This call is
-/// serialized with this crate's own opens, on any thread, but not with
-/// other code's use of SQLite: none may run on another thread while it
-/// does, which calling it first in `main` ensures.
+/// **What it detects:** a call too late to install anything returns
+/// [`FailStopError::TooLate`] and changes nothing, in the two cases it can
+/// tell: a store of this crate has opened (the call and the opens take one
+/// lock), or SQLite answers that it has initialized (`SQLITE_MISUSE`). A
+/// call after one that succeeded does nothing and returns `Ok`. The
+/// wrappers stay for the process's life.
 ///
 /// **What it does:** it reads SQLite's allocator (`SQLITE_CONFIG_GETMALLOC`)
 /// and installs it back (`SQLITE_CONFIG_MALLOC`) with its `xMalloc` and
@@ -68,7 +63,19 @@ pub enum FailStopError {
 /// on it) is still an error,
 /// [`StoreError::OutOfMemory`](crate::StoreError::OutOfMemory), which the
 /// host ends the process for.
-pub fn fail_stop_on_oom() -> Result<(), FailStopError> {
+///
+/// # Safety
+///
+/// Call it once, in `main`, before any thread starts and before any SQLite
+/// use in the process: before the first
+/// [`SqliteBlockStore`](crate::SqliteBlockStore) opens, and before any other
+/// code calls into SQLite, through rusqlite or otherwise. `sqlite3_config`
+/// isn't thread-safe: SQLite requires that no other thread call any SQLite
+/// interface while it runs, and SQLite takes an allocator only before it
+/// initializes, which its first use does. The cases above are the only ones
+/// it detects; another thread using SQLite during the call is a data race
+/// in SQLite's global configuration.
+pub unsafe fn fail_stop_on_oom() -> Result<(), FailStopError> {
     let mut state = state();
     match *state {
         State::FailStop => return Ok(()),
@@ -90,10 +97,10 @@ pub fn fail_stop_on_oom() -> Result<(), FailStopError> {
     };
     // SAFETY: SQLITE_CONFIG_GETMALLOC takes one argument, a pointer to a
     // `sqlite3_mem_methods` it fills in; `methods` is one, live and writable
-    // for the call. `sqlite3_config` isn't thread-safe: the state's lock
-    // keeps this crate's opens out while it runs, and the contract above
-    // keeps other code's SQLite use out. Once SQLite has initialized, it
-    // changes nothing and answers SQLITE_MISUSE.
+    // for the call. `sqlite3_config` isn't thread-safe: the caller's
+    // contract (# Safety) keeps every other SQLite use out while it runs,
+    // and the state's lock keeps this crate's opens out besides. Once SQLite
+    // has initialized, it changes nothing and answers SQLITE_MISUSE.
     let code = unsafe {
         ffi::sqlite3_config(
             ffi::SQLITE_CONFIG_GETMALLOC,
@@ -116,7 +123,7 @@ pub fn fail_stop_on_oom() -> Result<(), FailStopError> {
     // is live for the call. Its methods are the ones SQLite just gave but
     // for the two wrappers, which keep their contracts: each returns what
     // the default returns, or doesn't return. As for GETMALLOC above, the
-    // lock and the contract keep every other SQLite use out.
+    // caller's contract and the lock keep every other SQLite use out.
     let code = unsafe {
         ffi::sqlite3_config(
             ffi::SQLITE_CONFIG_MALLOC,

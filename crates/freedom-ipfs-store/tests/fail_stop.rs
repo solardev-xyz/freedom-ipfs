@@ -1,6 +1,7 @@
-//! `fail_stop_on_oom` (freedom-core's design 0010, "The memory cap"): with
-//! it installed, an allocation SQLite can't make ends the process with exit
-//! 71, and no store method returns an error for it.
+//! `fail_stop_on_oom` (freedom-core's design 0010, "The memory cap"), an
+//! `unsafe fn` the service calls first in `main`: with it installed, an
+//! allocation SQLite can't make ends the process with exit 71, and no store
+//! method returns an error for it.
 //!
 //! Each case runs in a child of its own (this binary again, with
 //! `FREEDOM_IPFS_STORE_FAIL_STOP_CASE` set): the hook is process-wide, and
@@ -43,6 +44,18 @@ const BLOCK: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_BLOCKS: u64 = 16 * 1024;
 
+/// The hook, in a child that has one thread: no other thread uses SQLite
+/// while it runs. `hooked` and the fills call it first; the late cases call
+/// it after SQLite's first use on purpose, on that one thread, to see it
+/// refuse, and `hooked` calls it twice to see the second do nothing.
+fn install() -> Result<(), FailStopError> {
+    // SAFETY: this process has one thread (a harness-free test binary that
+    // starts none), so no other thread calls into SQLite during the call.
+    // A late or repeated call changes nothing: it returns before any FFI,
+    // or SQLite refuses it (`SQLITE_MISUSE`), on this thread.
+    unsafe { fail_stop_on_oom() }
+}
+
 fn main() {
     if let Ok(case) = std::env::var(CASE) {
         child(&case);
@@ -56,8 +69,8 @@ fn child(case: &str) {
         "hooked" => hooked(),
         "late-store" => {
             let store = SqliteBlockStore::in_memory(1 << 20).unwrap();
-            assert_eq!(fail_stop_on_oom(), Err(FailStopError::TooLate));
-            assert_eq!(fail_stop_on_oom(), Err(FailStopError::TooLate));
+            assert_eq!(install(), Err(FailStopError::TooLate));
+            assert_eq!(install(), Err(FailStopError::TooLate));
             round_trip(&store);
             println!("LATE refused");
         }
@@ -65,14 +78,14 @@ fn child(case: &str) {
             // Other code's SQLite, initialized before the call.
             let conn = rusqlite::Connection::open_in_memory().unwrap();
             conn.execute_batch("CREATE TABLE t(x);").unwrap();
-            assert_eq!(fail_stop_on_oom(), Err(FailStopError::TooLate));
+            assert_eq!(install(), Err(FailStopError::TooLate));
             round_trip(&SqliteBlockStore::in_memory(1 << 20).unwrap());
             println!("LATE refused");
         }
         #[cfg(target_os = "linux")]
         "fill" => {
             lower_data_limit();
-            fail_stop_on_oom().unwrap();
+            install().unwrap();
             fill();
         }
         #[cfg(target_os = "linux")]
@@ -86,8 +99,8 @@ fn child(case: &str) {
 
 /// Installed first, the hook leaves the store as it was.
 fn hooked() {
-    assert_eq!(fail_stop_on_oom(), Ok(()));
-    assert_eq!(fail_stop_on_oom(), Ok(()), "a second call");
+    assert_eq!(install(), Ok(()));
+    assert_eq!(install(), Ok(()), "a second call");
     let store = SqliteBlockStore::in_memory(4 << 20).unwrap();
     round_trip(&store);
     let mut blocks = Vec::new();
