@@ -710,6 +710,10 @@ impl FixedPool {
             None => {
                 let needed = bytes.footprint();
                 let capacity = self.inner.capacity;
+                // `fetch_update` is deprecated from Rust 1.100 for
+                // `try_update`, which is stable only from 1.95, past the
+                // workspace's rust-version (1.89).
+                #[allow(deprecated)]
                 self.inner
                     .used
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -740,6 +744,9 @@ impl FixedPool {
     pub fn hold_copy(&self, len: usize, copy: impl FnOnce() -> Vec<u8>) -> Option<HeldBytes> {
         let capacity = self.inner.capacity;
         let footprint = len.saturating_add(ChargedBytes::HEADER_BYTES);
+        // `fetch_update` is deprecated from Rust 1.100 for `try_update`, which is
+        // stable only from 1.95, past the workspace's rust-version (1.89).
+        #[allow(deprecated)]
         self.inner
             .used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -838,6 +845,9 @@ impl PoolShare {
     /// takes nothing.
     pub fn try_grow(&mut self, bytes: usize) -> bool {
         let capacity = self.cover.pool.capacity;
+        // `fetch_update` is deprecated from Rust 1.100 for `try_update`, which is
+        // stable only from 1.95, past the workspace's rust-version (1.89).
+        #[allow(deprecated)]
         let taken = self
             .cover
             .pool

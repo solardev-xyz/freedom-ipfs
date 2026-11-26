@@ -10,6 +10,9 @@ repository.workspace = true
 [dependencies]
 cid.workspace = true
 freedom-ipfs-core.workspace = true
+# `_exit`, which ends the process when SQLite can't allocate
+# (`fail_stop_on_oom`). Already in the graph.
+libc = "0.2"
 parking_lot.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
@@ -17,4 +20,15 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# `functions`: the tests' SQL function that answers `SQLITE_NOMEM`, so an
+# out-of-memory error is forced through the store's statements with no
+# allocation failing.
+rusqlite = { workspace = true, features = ["functions"] }
 tempfile.workspace = true
+
+# The fail-stop hook, each case in a child of its own (this binary again):
+# the hook is process-wide, and a lowered memory limit must never reach the
+# test runner.
+[[test]]
+name = "fail_stop"
+harness = false

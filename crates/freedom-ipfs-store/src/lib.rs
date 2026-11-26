@@ -14,6 +14,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+mod fail_stop;
+
+pub use fail_stop::{fail_stop_on_oom, FailStopError, OUT_OF_MEMORY_EXIT, OUT_OF_MEMORY_LINE};
+
 const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_HOT_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const HOT_CACHE_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
@@ -76,8 +80,23 @@ impl StoredIpnsRecord {
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    /// Any SQLite error but out of memory.
     #[error("sqlite: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(#[source] rusqlite::Error),
+    /// SQLite ran out of memory: `SQLITE_NOMEM`, or `SQLITE_IOERR_NOMEM`
+    /// from its file layer. Its own kind, never a [`StoreError::Sqlite`],
+    /// and never left uncached as a write that meets the page cap is: under
+    /// a memory cap, a host ends the process when one reaches it (exit 71),
+    /// and answers no request with it (freedom-core's design 0010, "The
+    /// memory cap"). Every SQLite error the store returns is classified
+    /// here, whichever method it comes from.
+    ///
+    /// With [`fail_stop_on_oom`] installed, SQLite's own allocation failures
+    /// end the process before they become one. What is left is an
+    /// `SQLITE_NOMEM` SQLite reports without its allocator failing: a size
+    /// past its allocation limit, or a heap limit set on it.
+    #[error("out of memory: sqlite: {0}")]
+    OutOfMemory(#[source] rusqlite::Error),
     #[error("core: {0}")]
     Core(#[from] CoreError),
     #[error("json: {0}")]
@@ -86,6 +105,45 @@ pub enum StoreError {
     /// already has more pages, or the cap is past SQLite's own limit.
     #[error("page cap {requested} can't be installed (SQLite keeps {installed})")]
     PageCap { requested: u32, installed: i64 },
+}
+
+impl From<rusqlite::Error> for StoreError {
+    /// Out of memory is [`StoreError::OutOfMemory`], anything else
+    /// [`StoreError::Sqlite`].
+    fn from(error: rusqlite::Error) -> Self {
+        if sqlite_out_of_memory(&error) {
+            Self::OutOfMemory(error)
+        } else {
+            Self::Sqlite(error)
+        }
+    }
+}
+
+impl StoreError {
+    /// Whether the error is out of memory: [`StoreError::OutOfMemory`], or
+    /// a variant built elsewhere around an out-of-memory error
+    /// ([`CoreError::OutOfMemory`], or an `SQLITE_NOMEM` in
+    /// [`StoreError::Sqlite`]). A host under a memory cap ends the process
+    /// on it.
+    pub fn is_out_of_memory(&self) -> bool {
+        match self {
+            Self::OutOfMemory(_) => true,
+            Self::Sqlite(error) => sqlite_out_of_memory(error),
+            Self::Core(error) => error.is_out_of_memory(),
+            Self::Json(_) | Self::PageCap { .. } => false,
+        }
+    }
+}
+
+/// Whether SQLite failed for want of memory: `SQLITE_NOMEM`, or its file
+/// layer's `SQLITE_IOERR_NOMEM` (an extended code, which rusqlite turns on).
+fn sqlite_out_of_memory(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == ErrorCode::OutOfMemory
+                || failure.extended_code == rusqlite::ffi::SQLITE_IOERR_NOMEM
+    )
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -207,6 +265,7 @@ impl SqliteBlockStore {
 
     /// A store in the file at `path`, sized by `options`.
     pub fn open_with(path: impl AsRef<Path>, options: StoreOptions) -> Result<Self> {
+        fail_stop::opening();
         Self::with_connection(Connection::open(path)?, options)
     }
 
@@ -214,6 +273,7 @@ impl SqliteBlockStore {
     /// indices are kept in memory too (`PRAGMA temp_store = MEMORY`), so it
     /// never writes a temporary file.
     pub fn in_memory_with(options: StoreOptions) -> Result<Self> {
+        fail_stop::opening();
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA temp_store = MEMORY;")?;
         Self::with_connection(conn, options)
@@ -379,7 +439,9 @@ impl SqliteBlockStore {
     /// later calls through any clone fail with an SQLite error instead of
     /// touching the file, and the file can be reopened right away. Waits at
     /// most `timeout` for a statement already in progress; returns `false`,
-    /// leaving the connection open, if that does not finish in time.
+    /// leaving the connection open, if that does not finish in time, or if
+    /// the empty database can't be opened. Under [`fail_stop_on_oom`], an
+    /// out-of-memory opening it ends the process instead (exit 71).
     pub fn close(&self, timeout: Duration) -> bool {
         match self.conn.try_lock_for(timeout) {
             Some(conn) => self.close_locked(conn),
@@ -415,8 +477,18 @@ impl SqliteBlockStore {
     }
 
     fn close_locked(&self, mut conn: parking_lot::MutexGuard<'_, Connection>) -> bool {
-        let Ok(closed) = Connection::open_in_memory() else {
-            return false;
+        let closed = match Connection::open_in_memory() {
+            Ok(closed) => closed,
+            Err(error) => {
+                // A close answers only whether it closed, which can't carry
+                // the kind: under fail-stop, out of memory here ends the
+                // process as SQLite's allocator does. Otherwise the store
+                // stays open, as for a close that timed out.
+                if sqlite_out_of_memory(&error) {
+                    fail_stop::exit_if_fail_stop();
+                }
+                return false;
+            }
         };
         drop(std::mem::replace(&mut *conn, closed));
         // No hot cache at all from now on: one a store handle kept after
@@ -1017,13 +1089,11 @@ impl SqliteBlockStore {
 
 impl BlockProvider for SqliteBlockStore {
     fn get_block(&self, cid: &Cid) -> CoreResult<Option<Block>> {
-        self.get(cid)
-            .map_err(|err| CoreError::Storage(err.to_string()))
+        self.get(cid).map_err(provider_error)
     }
 
     fn get_block_range(&self, cid: &Cid, start: u64, end: u64) -> CoreResult<Option<Vec<u8>>> {
-        self.get_range(cid, start, end)
-            .map_err(|err| CoreError::Storage(err.to_string()))
+        self.get_range(cid, start, end).map_err(provider_error)
     }
 
     fn retain_block(&self, cid: &Cid) -> CoreResult<()> {
@@ -1033,6 +1103,17 @@ impl BlockProvider for SqliteBlockStore {
 
     fn release_block(&self, cid: &Cid) {
         self.release_cid_bytes(&block_key(cid));
+    }
+}
+
+/// A store error as the block provider reports it: out of memory stays its
+/// own kind ([`CoreError::OutOfMemory`]); anything else is a
+/// [`CoreError::Storage`], with the error's text.
+fn provider_error(error: StoreError) -> CoreError {
+    if error.is_out_of_memory() {
+        CoreError::OutOfMemory(error.to_string())
+    } else {
+        CoreError::Storage(error.to_string())
     }
 }
 
@@ -1101,11 +1182,6 @@ fn hot_cache_bytes(max_bytes: u64) -> u64 {
     max_bytes.min(DEFAULT_HOT_CACHE_BYTES)
 }
 
-/// A cache write's outcome: whether the entry was stored. One that met the
-/// page cap (`SQLITE_FULL`) wasn't, and that is not an error: the entry is
-/// left uncached, and the request it served goes on. SQLite rolls back the
-/// failed statement, so nothing of it is left behind; but a refused update
-/// leaves the row it would have replaced, which a metadata caller deletes.
 /// The most blocks eviction reads and holds at once.
 const EVICTION_BATCH: usize = 64;
 
@@ -1124,6 +1200,14 @@ fn total_bytes_in(conn: &Connection) -> Result<u64> {
     Ok(total.max(0) as u64)
 }
 
+/// A cache write's outcome: whether the entry was stored. One that met the
+/// page cap (`SQLITE_FULL`) wasn't, and that is not an error: the entry is
+/// left uncached, and the request it served goes on. SQLite rolls back the
+/// failed statement, so nothing of it is left behind; but a refused update
+/// leaves the row it would have replaced, which a metadata caller deletes.
+///
+/// Only `SQLITE_FULL` is left uncached. Out of memory isn't a full store: it
+/// is [`StoreError::OutOfMemory`], passed up as every other error is.
 fn cached_unless_full(written: rusqlite::Result<usize>) -> Result<bool> {
     match written {
         Ok(_) => Ok(true),
@@ -2045,6 +2129,160 @@ mod tests {
         let cid = cid_from_data(CODEC_RAW, &data);
         store.put_block(&cid, &data).unwrap();
         assert!(store.get(&cid).unwrap().is_some());
+    }
+
+    /// An SQLite error with `code`, as rusqlite gives it.
+    fn sqlite_error(code: std::ffi::c_int) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+    }
+
+    #[track_caller]
+    fn assert_out_of_memory<T: std::fmt::Debug>(result: Result<T>) {
+        assert!(
+            matches!(result, Err(StoreError::OutOfMemory(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn out_of_memory_is_its_own_kind() {
+        use rusqlite::ffi;
+        for code in [ffi::SQLITE_NOMEM, ffi::SQLITE_IOERR_NOMEM] {
+            let error = StoreError::from(sqlite_error(code));
+            assert!(matches!(error, StoreError::OutOfMemory(_)), "{error:?}");
+            assert!(error.is_out_of_memory());
+        }
+        // Anything else is an SQLite error, as before.
+        for code in [
+            ffi::SQLITE_FULL,
+            ffi::SQLITE_ERROR,
+            ffi::SQLITE_IOERR,
+            ffi::SQLITE_IOERR_WRITE,
+            ffi::SQLITE_BUSY,
+            ffi::SQLITE_TOOBIG,
+        ] {
+            let error = StoreError::from(sqlite_error(code));
+            assert!(matches!(error, StoreError::Sqlite(_)), "{error:?}");
+            assert!(!error.is_out_of_memory());
+        }
+        // Built around one elsewhere, it is told all the same.
+        assert!(StoreError::Sqlite(sqlite_error(ffi::SQLITE_NOMEM)).is_out_of_memory());
+        assert!(StoreError::Core(CoreError::OutOfMemory("sqlite".into())).is_out_of_memory());
+        assert!(!StoreError::Core(CoreError::Storage("sqlite".into())).is_out_of_memory());
+
+        // A full store's write is left uncached; out of memory passes up.
+        assert!(!cached_unless_full(Err(sqlite_error(ffi::SQLITE_FULL))).unwrap());
+        assert_out_of_memory(cached_unless_full(Err(sqlite_error(ffi::SQLITE_NOMEM))));
+
+        // The block provider keeps the kind, and anything else's text.
+        let provided = provider_error(StoreError::from(sqlite_error(ffi::SQLITE_NOMEM)));
+        assert!(provided.is_out_of_memory(), "{provided:?}");
+        let other = StoreError::from(sqlite_error(ffi::SQLITE_ERROR));
+        let text = other.to_string();
+        assert!(matches!(provider_error(other), CoreError::Storage(kept) if kept == text));
+    }
+
+    /// Makes every insert, update and delete on `tables` fail as SQLite does
+    /// when it runs out of memory, with no allocation failing: a temporary
+    /// trigger calls a function that answers `SQLITE_NOMEM`.
+    fn writes_run_out_of_memory(store: &SqliteBlockStore, tables: &[&str]) {
+        let conn = store.conn.lock();
+        conn.create_scalar_function(
+            "out_of_memory",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            |_| Err::<i64, _>(sqlite_error(rusqlite::ffi::SQLITE_NOMEM)),
+        )
+        .unwrap();
+        for table in tables {
+            for event in ["INSERT", "UPDATE", "DELETE"] {
+                conn.execute_batch(&format!(
+                    "CREATE TEMP TRIGGER out_of_memory_{table}_{event} BEFORE {event} ON {table} \
+                     BEGIN SELECT out_of_memory(); END;"
+                ))
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_memory_passes_up_from_every_write() {
+        let store = SqliteBlockStore::in_memory(1 << 20).unwrap();
+        let ttl = Duration::from_secs(60);
+        // Seeded first: a block a read finds cold, and expired entries a
+        // read deletes.
+        let kept = vec![1u8; 1024];
+        let kept_cid = cid_from_data(CODEC_RAW, &kept);
+        store.put_block(&kept_cid, &kept).unwrap();
+        store.hot.lock().clear();
+        store
+            .put_name_record("expired.example", "/ipfs/target", ttl)
+            .unwrap();
+        store.put_provider_records(&kept_cid, &[], ttl).unwrap();
+        store
+            .mark_bad_provider("expired-peer", "slow", ttl)
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .execute_batch(
+                "UPDATE name_cache SET expires_at = 0;
+                 UPDATE provider_cache SET expires_at = 0;
+                 UPDATE bad_providers SET expires_at = 0;",
+            )
+            .unwrap();
+        writes_run_out_of_memory(
+            &store,
+            &[
+                "blocks",
+                "name_cache",
+                "provider_cache",
+                "bad_providers",
+                "ipns_records",
+            ],
+        );
+
+        // The writes a full store leaves uncached (`cached_unless_full`).
+        let data = vec![2u8; 1024];
+        let cid = cid_from_data(CODEC_RAW, &data);
+        assert_out_of_memory(store.put_block(&cid, &data));
+        assert_out_of_memory(store.put(&Block::new(cid, data.clone()).unwrap()));
+        assert_out_of_memory(store.put_name_record("example.com", "/ipfs/target", ttl));
+        assert_out_of_memory(store.put_provider_records(&cid, &[], ttl));
+        assert_out_of_memory(store.mark_bad_provider("peer", "slow", ttl));
+        assert_out_of_memory(store.install_ipns_record("name", &ipns_record(1, eol_in(3600))));
+        // Reads that write: a cold block's touch, and expired entries'
+        // deletes; and the block provider's reads.
+        assert_out_of_memory(store.get(&kept_cid));
+        assert_out_of_memory(store.get_range(&kept_cid, 0, 9));
+        let provided = store.get_block(&kept_cid);
+        assert!(
+            matches!(provided, Err(CoreError::OutOfMemory(_))),
+            "{provided:?}"
+        );
+        let provided = store.get_block_range(&kept_cid, 0, 9);
+        assert!(
+            matches!(provided, Err(CoreError::OutOfMemory(_))),
+            "{provided:?}"
+        );
+        assert_out_of_memory(store.get_name_record("expired.example"));
+        assert_out_of_memory(store.get_provider_records(&kept_cid));
+        assert_out_of_memory(store.is_bad_provider("expired-peer"));
+        // Eviction, and clearing.
+        assert_out_of_memory(store.trim_blocks_to(0));
+        assert_out_of_memory(store.clear());
+        assert_out_of_memory(store.clear_provider_metadata());
+        // Nothing was written.
+        store
+            .conn
+            .lock()
+            .execute_batch(
+                "DROP TRIGGER out_of_memory_blocks_INSERT;
+                 DROP TRIGGER out_of_memory_blocks_UPDATE;",
+            )
+            .unwrap();
+        assert_eq!(store.block_count().unwrap(), 1);
+        assert_eq!(store.get(&cid).unwrap(), None);
     }
 
     #[test]
