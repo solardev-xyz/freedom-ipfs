@@ -65,8 +65,9 @@ pub enum FailStopError {
 ///
 /// **What it leaves:** an `SQLITE_NOMEM` that SQLite reports without its
 /// allocator failing (a size past its allocation limit, or a heap limit set
-/// on it) is still an error, [`StoreError::OutOfMemory`](crate::StoreError),
-/// which the host ends the process for.
+/// on it) is still an error,
+/// [`StoreError::OutOfMemory`](crate::StoreError::OutOfMemory), which the
+/// host ends the process for.
 pub fn fail_stop_on_oom() -> Result<(), FailStopError> {
     let mut state = state();
     match *state {
