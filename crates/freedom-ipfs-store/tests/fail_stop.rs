@@ -23,7 +23,8 @@ use std::time::Duration;
 
 use freedom_ipfs_core::{cid_from_data, CODEC_RAW};
 use freedom_ipfs_store::{
-    fail_stop_on_oom, FailStopError, SqliteBlockStore, StoreError, StoreOptions, OUT_OF_MEMORY_EXIT,
+    fail_stop_on_oom, FailStopError, SqliteBlockStore, StoreError, StoreOptions,
+    OUT_OF_MEMORY_EXIT, OUT_OF_MEMORY_LINE,
 };
 
 const CASE: &str = "FREEDOM_IPFS_STORE_FAIL_STOP_CASE";
@@ -223,6 +224,11 @@ fn parent() {
         // The hook: exit 71, after some puts, and no put returned.
         let fill = expect("fill", OUT_OF_MEMORY_EXIT, "STORED 32\n");
         assert!(!fill.contains("RETURNED"), "fill: {fill}");
+        let line = String::from_utf8_lossy(OUT_OF_MEMORY_LINE);
+        assert!(
+            fill.contains(line.as_ref()),
+            "fill: no diagnostic line: {fill}"
+        );
         // The control: the put returns out of memory, its own kind.
         let control = expect("fill-unhooked", RETURNED_OUT_OF_MEMORY, "STORED 32\n");
         assert!(control.contains("RETURNED out of memory"), "{control}");

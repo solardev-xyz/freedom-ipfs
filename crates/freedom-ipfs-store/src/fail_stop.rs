@@ -20,6 +20,10 @@ use rusqlite::ffi;
 /// `Exit::OutOfMemory`.
 pub const OUT_OF_MEMORY_EXIT: i32 = 71;
 
+/// The line the hook writes to standard error before it exits: static, so
+/// nothing is formatted or allocated on the way out.
+pub const OUT_OF_MEMORY_LINE: &[u8] = b"freedom-ipfs-store: SQLite is out of memory; exiting 71\n";
+
 /// Why [`fail_stop_on_oom`] installed nothing. SQLite's allocator is then
 /// unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -225,8 +229,20 @@ unsafe extern "C" fn fail_stop_realloc(prior: *mut c_void, bytes: c_int) -> *mut
     allocation
 }
 
-/// Ends the process with [`OUT_OF_MEMORY_EXIT`] at once.
+/// Ends the process with [`OUT_OF_MEMORY_EXIT`] at once, after writing
+/// [`OUT_OF_MEMORY_LINE`] to standard error.
+///
+/// Only async-signal-safe calls: a `write` of a static buffer and `_exit`,
+/// with nothing formatted, allocated or unwound.
 fn out_of_memory() -> ! {
+    #[cfg(unix)]
+    let len = OUT_OF_MEMORY_LINE.len();
+    #[cfg(windows)]
+    let len = OUT_OF_MEMORY_LINE.len() as std::ffi::c_uint;
+    // SAFETY: `write` reads `len` bytes from `OUT_OF_MEMORY_LINE`, a static
+    // buffer of that length, and touches no other memory. A short or failed
+    // write is ignored: the exit code is what the host reads.
+    let _ = unsafe { libc::write(2, OUT_OF_MEMORY_LINE.as_ptr().cast(), len) };
     // SAFETY: `_exit` takes no pointer and reads no Rust state: it ends the
     // process with the code, running no destructor, `atexit` handler or
     // stdio flush (POSIX `_exit`, and the C runtime's on Windows).

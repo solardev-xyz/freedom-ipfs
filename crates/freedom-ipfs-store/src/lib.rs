@@ -16,7 +16,7 @@ use thiserror::Error;
 
 mod fail_stop;
 
-pub use fail_stop::{fail_stop_on_oom, FailStopError, OUT_OF_MEMORY_EXIT};
+pub use fail_stop::{fail_stop_on_oom, FailStopError, OUT_OF_MEMORY_EXIT, OUT_OF_MEMORY_LINE};
 
 const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_HOT_CACHE_BYTES: u64 = 16 * 1024 * 1024;
