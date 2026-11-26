@@ -39,6 +39,20 @@ pub enum CoreError {
     /// Memory for the work could not be reserved: a host maps it to busy.
     #[error("memory budget: {0}")]
     MemoryBudget(#[from] BudgetError),
+    /// A native library ran out of memory: the store's SQLite
+    /// (`freedom_ipfs_store::StoreError::OutOfMemory`). Its own kind, never a
+    /// [`CoreError::Storage`]: under a memory cap, a host ends the process
+    /// when one reaches it, and answers no request with it (freedom-core's
+    /// design 0010, "The memory cap").
+    #[error("out of memory: {0}")]
+    OutOfMemory(String),
+}
+
+impl CoreError {
+    /// Whether this is [`CoreError::OutOfMemory`].
+    pub fn is_out_of_memory(&self) -> bool {
+        matches!(self, Self::OutOfMemory(_))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
