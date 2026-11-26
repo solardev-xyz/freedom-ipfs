@@ -26,3 +26,9 @@ thiserror.workspace = true
 rusqlite = { workspace = true, features = ["functions"] }
 tempfile.workspace = true
 
+# The fail-stop hook, each case in a child of its own (this binary again):
+# the hook is process-wide, and a lowered memory limit must never reach the
+# test runner.
+[[test]]
+name = "fail_stop"
+harness = false
