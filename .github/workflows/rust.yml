@@ -2,9 +2,10 @@ name: Rust
 
 # The workspace's tests on every pull request, and clippy on
 # `freedom-ipfs-net`, the network policy's crate (freedom-core design 0007,
-# upstream item 3), `freedom-ipfs-addr`, its gate's pure half, and
-# `freedom-ipfs-socks`, its SOCKS5 byte layer. The other crates aren't linted
-# here.
+# upstream item 3), `freedom-ipfs-addr`, its gate's pure half,
+# `freedom-ipfs-socks`, its SOCKS5 byte layer, `freedom-ipfs-store`, which
+# holds the out-of-memory hook's FFI (freedom-core design 0010), and
+# `freedom-ipfs-core`, beneath it. The other crates aren't linted here.
 
 # The paths are the Rust tree plus the two files the tests read with
 # `include_str!`: the add-on's packaging script and the iOS evidence template.
@@ -94,7 +95,7 @@ jobs:
         run: cargo test --workspace --all-features --locked
 
   clippy:
-    name: cargo clippy (freedom-ipfs-net, freedom-ipfs-addr, freedom-ipfs-socks)
+    name: cargo clippy (freedom-ipfs-net, freedom-ipfs-addr, freedom-ipfs-socks, freedom-ipfs-store, freedom-ipfs-core)
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -123,3 +124,11 @@ jobs:
       - name: Lint freedom-ipfs-socks
         run: |
           cargo clippy -p freedom-ipfs-socks --all-targets --all-features --locked -- -D warnings
+      - name: Lint freedom-ipfs-store
+        run: |
+          cargo clippy -p freedom-ipfs-store --all-targets --all-features --locked -- -D warnings
+          cargo clippy -p freedom-ipfs-store --lib --no-default-features --locked -- -D warnings
+      - name: Lint freedom-ipfs-core
+        run: |
+          cargo clippy -p freedom-ipfs-core --all-targets --all-features --locked -- -D warnings
+          cargo clippy -p freedom-ipfs-core --lib --no-default-features --locked -- -D warnings
