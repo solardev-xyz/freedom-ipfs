@@ -10,6 +10,9 @@ repository.workspace = true
 [dependencies]
 cid.workspace = true
 freedom-ipfs-core.workspace = true
+# `_exit`, which ends the process when SQLite can't allocate
+# (`fail_stop_on_oom`). Already in the graph.
+libc = "0.2"
 parking_lot.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
@@ -22,3 +25,4 @@ thiserror.workspace = true
 # allocation failing.
 rusqlite = { workspace = true, features = ["functions"] }
 tempfile.workspace = true
+

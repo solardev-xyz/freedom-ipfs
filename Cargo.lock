@@ -1130,6 +1130,7 @@ version = "0.4.6"
 dependencies = [
  "cid",
  "freedom-ipfs-core",
+ "libc",
  "parking_lot",
  "rusqlite",
  "serde",

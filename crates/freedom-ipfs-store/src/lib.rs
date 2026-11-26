@@ -14,6 +14,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+mod fail_stop;
+
+pub use fail_stop::{fail_stop_on_oom, FailStopError, OUT_OF_MEMORY_EXIT};
+
 const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_HOT_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const HOT_CACHE_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
@@ -261,6 +265,7 @@ impl SqliteBlockStore {
 
     /// A store in the file at `path`, sized by `options`.
     pub fn open_with(path: impl AsRef<Path>, options: StoreOptions) -> Result<Self> {
+        fail_stop::opening();
         Self::with_connection(Connection::open(path)?, options)
     }
 
@@ -268,6 +273,7 @@ impl SqliteBlockStore {
     /// indices are kept in memory too (`PRAGMA temp_store = MEMORY`), so it
     /// never writes a temporary file.
     pub fn in_memory_with(options: StoreOptions) -> Result<Self> {
+        fail_stop::opening();
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA temp_store = MEMORY;")?;
         Self::with_connection(conn, options)
@@ -433,7 +439,9 @@ impl SqliteBlockStore {
     /// later calls through any clone fail with an SQLite error instead of
     /// touching the file, and the file can be reopened right away. Waits at
     /// most `timeout` for a statement already in progress; returns `false`,
-    /// leaving the connection open, if that does not finish in time.
+    /// leaving the connection open, if that does not finish in time, or if
+    /// the empty database can't be opened. Under [`fail_stop_on_oom`], an
+    /// out-of-memory opening it ends the process instead (exit 71).
     pub fn close(&self, timeout: Duration) -> bool {
         match self.conn.try_lock_for(timeout) {
             Some(conn) => self.close_locked(conn),
@@ -469,8 +477,18 @@ impl SqliteBlockStore {
     }
 
     fn close_locked(&self, mut conn: parking_lot::MutexGuard<'_, Connection>) -> bool {
-        let Ok(closed) = Connection::open_in_memory() else {
-            return false;
+        let closed = match Connection::open_in_memory() {
+            Ok(closed) => closed,
+            Err(error) => {
+                // A close answers only whether it closed, which can't carry
+                // the kind: under fail-stop, out of memory here ends the
+                // process as SQLite's allocator does. Otherwise the store
+                // stays open, as for a close that timed out.
+                if sqlite_out_of_memory(&error) {
+                    fail_stop::exit_if_fail_stop();
+                }
+                return false;
+            }
         };
         drop(std::mem::replace(&mut *conn, closed));
         // No hot cache at all from now on: one a store handle kept after
